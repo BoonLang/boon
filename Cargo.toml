@@ -1,25 +1,5 @@
-[package]
-name = "boon"
-version = "0.1.0"
-edition = "2024"
-repository = "https://github.com/BoonLang/boon"
-authors = ["Martin Kavík <martin@kavik.cz>"]
-description = "Boon Lang"
-categories = ["Compilers"]
-license = "MIT"
-readme = "../README.md"
-
-[dev-dependencies]
-wasm-bindgen-test = "0.3.19"
-
-[dependencies]
-chumsky = { version = "1.0.0-alpha.8", features = ["pratt", "serde"] }
-ariadne = "0.5"
-pin-project = "1"
-serde_json_any_key = "2.0.0"
-
-ulid = { version = "1.2.0", features = ["serde"] }
-# `rustflags = ["--cfg", 'getrandom_backend="wasm_js"']` has to be in workspace .cargo/config.toml
-getrandom = { version = "0.3", features = ["wasm_js"] }
-
-zoon = { git = "https://github.com/MoonZoon/MoonZoon", rev = "8ee7546bf42ff8e87d14d498bf9863728a18ebe5" }
+[workspace]
+resolver = "3"
+members = [
+    "crates/*"
+]

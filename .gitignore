@@ -1,9 +1,3 @@
 **/target
 .idea
 **/.DS_Store
-wasm-bindgen*
-binaryen
-pkg
-MoonZoonCustom.toml
-frontend_dist/_api
-frontend_dist/index.html

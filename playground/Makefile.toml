@@ -1,0 +1,50 @@
+[config]
+default_to_workspace = false
+min_version = "0.35.13"
+unstable_features = ["CTRL_C_HANDLING"]
+skip_core_tasks = true
+
+[config.modify_core_tasks]
+private = true
+namespace = "default"
+
+#######  MAIN TASKS  #######
+
+[tasks.install]
+description = "Install all dependencies. It's NoOp if all deps are already installed."
+dependencies = [
+    "install_wasm_target", 
+    "install_mzoon", 
+]
+
+[tasks.mzoon]
+description = "Run MZoon"
+command = "mzoon/bin/mzoon"
+args = ["${@}"]
+
+# [tasks.mzoon]
+# description = "Run MZoon"
+# command = "cargo"
+# args = ["run", "--manifest-path", "../../MoonZoon/crates/mzoon/Cargo.toml", "${@}"]
+
+######  HELPER TASKS  ######
+
+[tasks.install_wasm_target]
+description = "Install Rust target `wasm32-unknown-unknown`"
+command = "rustup"
+args = ["target", "add", "wasm32-unknown-unknown"]
+
+[tasks.install_mzoon]
+description = "Install MoonZoon CLI (mzoon) locally"
+command = "cargo"
+args = [
+    "install", 
+    "mzoon", 
+    "--git", 
+    "https://github.com/MoonZoon/MoonZoon",
+    "--locked",
+    "--rev",
+    "8ee7546bf42ff8e87d14d498bf9863728a18ebe5",
+    "--root",
+    "mzoon",
+]
