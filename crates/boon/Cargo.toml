@@ -6,7 +6,7 @@ repository = "https://github.com/BoonLang/boon"
 authors = ["Martin Kavík <martin@kavik.cz>"]
 description = "Boon Lang"
 categories = ["Compilers"]
-license = "MIT"
+license = "UPL-1.0"
 readme = "../README.md"
 
 [dev-dependencies]
