@@ -1,13 +1,3 @@
-local_storage_key: 'todomvc-zoon'
-
-local_storage: LocalStorage/new(pairs: MAP {
-    local_storage_key: store.todos |> List/map(old, new: [
-        id: old.id
-        title: old.title
-        completed: old.completed
-    ])
-}) 
-
 router: Router/new(
     routes: MAP {
         Active: LIST { 'active' }
@@ -46,16 +36,7 @@ store: [
         Completed => Completed
         other => All
     }
-    todos: local_storage 
-        |> LocalStorage/value(key: local_storage_key) 
-        |> WHEN {
-            Error => LIST {}
-            loaded_todos => loaded_todos |> List/map(old, new: new_todo(
-                id: old.id
-                title: old.title
-                completed: old.completed
-            ))
-        }
+    todos: LIST {}
         |> List/append(item: title_to_save |> new_todo_from_title())
         |> List/retain(item, if: LATEST {
             True
