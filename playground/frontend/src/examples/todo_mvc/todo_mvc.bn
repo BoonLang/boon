@@ -1,40 +1,32 @@
-router: Router/new(
-    routes: MAP {
-        Active: LIST { 'active' }
-        Completed: LIST { 'completed' }
-        Root: LIST { '/' }
-    }
-    go_to_route: store.filters 
-        |> List/map(old, new: old |> WHILE {
-            [filter, element] => element.event.press |> THEN { filter }
-        })
-        |> List/latest()
-        |> WHEN {
-            Active => Active
-            Completed => Completed
-            All => Root
-        }
-)
-
 store: [
     elements: [
-        filter_buttons: LINK
+        filter_buttons: [ 
+            all: LINK
+            active: LINK
+            completed: LINK 
+        ]
         remove_completed_button: LINK
         toggle_all_checkbox: LINK
         new_todo_title_text_input: LINK
     ]
-    title_to_save: BLOCK { 
+    selected_filter: Router/route() |> WHEN {
+        '/active' => Active
+        '/completed' => Completed
+        __ => All
+    }
+    go_to_result: 
+        LATEST {
+            filter_buttons.all.event.press |> THEN { '/' }
+            filter_buttons.active.event.press |> THEN { '/active' }
+            filter_buttons.completed.event.press |> THEN { '/completed' }
+        } 
+        |> Router/go_to()
+    title_to_save: BLOCK {
         trimmed_text: elements.new_todo_title_text_input.text |> Text/trim()
         elements.new_todo_title_text_input.event.key_down.key |> WHEN {
             Enter => trimmed_text |> Text/empty() |> Bool/not() |> WHEN { True => trimmed_text, False => SKIP }
             __ => SKIP
         }
-    }
-    filters: LINK
-    selected_filter: Router/route() |> WHEN {
-        Active => Active
-        Completed => Completed
-        other => All
     }
     todos: LIST {}
         |> List/append(item: title_to_save |> new_todo_from_title())
@@ -45,9 +37,9 @@ store: [
         })
     selected_todo_id: LATEST {
         None
-        todos 
-            |> List/map(old, new: LATEST { 
-                old.todo_elements.editing_todo_title_element.event.key_down.key 
+        todos
+            |> List/map(old, new: LATEST {
+                old.todo_elements.editing_todo_title_element.event.key_down.key
                     |> WHEN { Escape => None, __ => SKIP }
                 old.title_to_update |> THEN { None }
                 old.todo_elements.todo_title_element.event.double_click |> THEN { old.id }
@@ -72,23 +64,23 @@ FUNCTION new_todo(id, title, completed) {
             todo_title_element: LINK
             todo_checkbox: LINK
         ]
-        title_to_update: 
+        title_to_update:
             LATEST {
                 todo_elements.editing_todo_title_element.event.blur
                 todo_elements.editing_todo_title_element.event.key_down.key |> WHEN { Enter => [], __ => SKIP }
-            } 
-            |> THEN { todo_elements.editing_todo_title_element.text } 
+            }
+            |> THEN { todo_elements.editing_todo_title_element.text }
         id: id
         title: LATEST {
             title
             title_to_update
         }
-        completed: 
+        completed:
             LATEST {
                 completed
-                store.elements.toggle_all_checkbox.event.click 
+                store.elements.toggle_all_checkbox.event.click
                     |> THEN { store.todos |> List/every(item, if: item.completed) |> Bool/not() }
-            } 
+            }
             |> WHILE { completed => LATEST {
                 completed
                 todo_elements.todo_checkbox.event.click |> THEN { completed |> Bool/not() }
@@ -108,7 +100,7 @@ FUNCTION new_todo(id, title, completed) {
 
 document: Document/new(root: root_element(PASS: [store: store]))
 
-FUNCTION root_element() { 
+FUNCTION root_element() {
     Element/stripe(
         element: []
         direction: Column
@@ -128,7 +120,7 @@ FUNCTION root_element() {
     )
 }
 
-FUNCTION content_element() { 
+FUNCTION content_element() {
     Element/stripe(
         element: []
         direction: Column
@@ -150,8 +142,8 @@ FUNCTION content_element() {
     )
 }
 
-FUNCTION header() { 
-    Element/container( 
+FUNCTION header() {
+    Element/container(
         element: [tag: Header]
         style: [
             padding: [top: 10]
@@ -164,10 +156,10 @@ FUNCTION header() {
             ]
         ]
         child: Element/container(element: [tag: H1], style: [], child: 'todos')
-    ) 
+    )
 }
 
-FUNCTION main_panel() { 
+FUNCTION main_panel() {
     Element/stripe(
         element: [tag: Section]
         direction: Column
@@ -216,8 +208,8 @@ FUNCTION new_todo_title_text_input() {
 
 }
 
-FUNCTION todos_element() { 
-    Element/stripe( 
+FUNCTION todos_element() {
+    Element/stripe(
         element: [
             nearby_element: [
                 position: Above
@@ -232,7 +224,7 @@ FUNCTION todos_element() {
         ]
         items: PASSED.store.todos
             |> List/retain(item, if: PASSED.store.selected_filter |> WHILE {
-                All => True 
+                All => True
                 Active => item.completed |> Bool/not()
                 Completed => item.completed
             })
@@ -257,7 +249,7 @@ FUNCTION todo_element(todo) {
                 todo |> todo_title_element() |> LINK { todo.todo_elements.todo_title_element }
             }
         }
-    ) 
+    )
 }
 
 FUNCTION toggle_all_checkbox() {
@@ -266,13 +258,13 @@ FUNCTION toggle_all_checkbox() {
         style: [width: 60, height: Fill]
         label: Hidden[text: 'Toggle all']
         checked: PASSED.store.todos |> List/every(item, if: item.completed)
-        icon: Element/container( 
+        icon: Element/container(
             element: []
             style: [
                 height: 34
                 padding: [row: 27, column: 6]
                 font: [
-                    size: 22, 
+                    size: 22,
                     color: Oklch[lightness: checked |> WHEN { True => 0.555, False => 0.92 }]
                 ]
                 transform: [rotate: 90, move_up: 18]
@@ -324,7 +316,7 @@ FUNCTION todo_checkbox(todo) {
         )
     }
 }
-                    
+
 FUNCTION todo_title_element(todo) {
     Element/label(
         element: [
@@ -349,8 +341,8 @@ FUNCTION todo_title_element(todo) {
             clip: Row
         ]
         label: todo.title
-    ) 
-}          
+    )
+}
 
 FUNCTION remove_todo_button() {
     Element/button(
@@ -400,7 +392,7 @@ FUNCTION panel_footer() {
             }
         } |> List/map(old, new: Element/container(
             element: []
-            style: [width: Fill] 
+            style: [width: Fill]
             child: old
         ))
     )
@@ -414,16 +406,17 @@ FUNCTION active_items_count_text() {
     }
 }
 
-FUNCTION filters_element() { 
+FUNCTION filters_element() {
     Element/stripe(
         element: []
         direction: Row
         gap: 10
         style: []
-        items: 
-            LIST { All, Active, Completed } 
-            |> List/map(old, new: [filter: old, element: old |> filter_button()])
-            |> LINK { PASSED.store.filters }
+        items: LIST {
+            filter_button(All) |> LINK { PASSED.store.elements.filter_buttons.all }
+            filter_button(Active) |> LINK { PASSED.store.elements.filter_buttons.active }
+            filter_button(Completed) |> LINK { PASSED.store.elements.filter_buttons.completed }
+        }
     )
 }
 
@@ -493,7 +486,7 @@ FUNCTION footer() {
             )
             Element/paragraph(
                 element: []
-                style: [] 
+                style: []
                 contents: LIST {
                     'Part of '
                     footer_link(label: 'TodoMVC', to: 'http://todomvc.com')
