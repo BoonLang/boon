@@ -85,7 +85,12 @@ FUNCTION new_todo(title) {
                         |> Bool/not() 
                 }
             } 
-            |> Bool/toggle(when: todo_elements.todo_checkbox.event.click)
+            |> WHILE { completed => LATEST {
+                completed
+                todo_elements.todo_checkbox.event.click |> THEN { 
+                    completed |> Bool/not() 
+                }
+            }}
         edited_title:
             LATEST {
                 ''
