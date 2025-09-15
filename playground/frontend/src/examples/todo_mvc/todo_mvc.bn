@@ -21,19 +21,24 @@ store: [
             filter_buttons.completed.event.press |> THEN { '/completed' }
         } 
         |> Router/go_to()
-    title_to_save: BLOCK {
-        trimmed_text: elements.new_todo_title_text_input.text |> Text/trim()
-        elements.new_todo_title_text_input.event.key_down.key |> WHEN {
-            Enter => trimmed_text |> Text/empty() |> Bool/not() |> WHEN { True => trimmed_text, False => SKIP }
-            __ => SKIP
+    title_to_save: elements.new_todo_title_text_input.event.key_down.key |> WHEN {
+        Enter => BLOCK {
+            new_todo_title: elements.new_todo_title_text_input.text |> Text/trim()
+            new_todo_title 
+                |> Text/empty() 
+                |> Bool/not() 
+                |> WHEN { True => new_todo_title, False => SKIP }
         }
+        __ => SKIP
     }
     todos: LIST {}
-        |> List/append(item: title_to_save |> new_todo_from_title())
+        |> List/append(item: title_to_save |> new_todo())
         |> List/retain(item, if: LATEST {
             True
-            item.todo_elements.remove_todo_button.event.press |> THEN { False }
-            elements.remove_completed_button.event.press |> THEN { item.completed |> Bool/not() }
+            item.todo_elements.remove_todo_button.event.press 
+                |> THEN { False }
+            elements.remove_completed_button.event.press 
+                |> THEN { item.completed |> Bool/not() }
         })
     selected_todo_id: LATEST {
         None
@@ -41,22 +46,16 @@ store: [
             |> List/map(old, new: LATEST {
                 old.todo_elements.editing_todo_title_element.event.key_down.key
                     |> WHEN { Escape => None, __ => SKIP }
-                old.title_to_update |> THEN { None }
-                old.todo_elements.todo_title_element.event.double_click |> THEN { old.id }
+                old.title_to_update 
+                    |> THEN { None }
+                old.todo_elements.todo_title_element.event.double_click 
+                    |> THEN { old.id }
             })
             |> List/latest()
     }
 ]
 
-FUNCTION new_todo_from_title(title) {
-    new_todo(
-        id: TodoId[id: Ulid/generate()]
-        title: title
-        completed: False
-    )
-}
-
-FUNCTION new_todo(id, title, completed) {
+FUNCTION new_todo(title) {
     [
         todo_elements: [
             remove_todo_button: LINK
@@ -64,27 +63,29 @@ FUNCTION new_todo(id, title, completed) {
             todo_title_element: LINK
             todo_checkbox: LINK
         ]
+        id: TodoId[id: Ulid/generate()]
         title_to_update:
             LATEST {
                 todo_elements.editing_todo_title_element.event.blur
-                todo_elements.editing_todo_title_element.event.key_down.key |> WHEN { Enter => [], __ => SKIP }
+                    |> THEN { [] }
+                todo_elements.editing_todo_title_element.event.key_down.key 
+                    |> WHEN { Enter => [], __ => SKIP }
             }
             |> THEN { todo_elements.editing_todo_title_element.text }
-        id: id
         title: LATEST {
             title
             title_to_update
         }
-        completed:
+        completed: 
             LATEST {
-                completed
-                store.elements.toggle_all_checkbox.event.click
-                    |> THEN { store.todos |> List/every(item, if: item.completed) |> Bool/not() }
-            }
-            |> WHILE { completed => LATEST {
-                completed
-                todo_elements.todo_checkbox.event.click |> THEN { completed |> Bool/not() }
-            }}
+                False
+                store.elements.toggle_all_checkbox.event.click |> THEN { 
+                    store.todos 
+                        |> List/every(item, if: item.completed) 
+                        |> Bool/not() 
+                }
+            } 
+            |> Bool/toggle(when: todo_elements.todo_checkbox.event.click)
         edited_title:
             LATEST {
                 ''
@@ -92,8 +93,11 @@ FUNCTION new_todo(id, title, completed) {
                 title_to_update |> THEN { '' }
             } |> WHILE { edited_title => LATEST {
                 edited_title
-                todo_elements.todo_title_element.event.double_click
-                    |> THEN { edited_title |> Text/empty() |> WHEN { True => title, False => SKIP } }
+                todo_elements.todo_title_element.event.double_click |> THEN { 
+                    edited_title 
+                        |> Text/empty() 
+                        |> WHEN { True => title, False => SKIP } 
+                }
             }}
     ]
 }
@@ -173,12 +177,21 @@ FUNCTION main_panel() {
             background: [color: Oklch[lightness: 1]]
         ]
         items: LIST {
-            new_todo_title_text_input() |> LINK { PASSED.store.elements.new_todo_title_text_input }
-            PASSED.store.todos |> List/empty() |> WHILE { True => NoElement, False => Stripe/new(
-                element: []
-                style: [direction: Column]
-                items: LIST { todos_element(), panel_footer() }
-            )}
+            new_todo_title_text_input() 
+                |> LINK { PASSED.store.elements.new_todo_title_text_input }
+            PASSED.store.todos 
+                |> List/empty() 
+                |> WHILE { 
+                    True => NoElement
+                    False => Stripe/new(
+                        element: []
+                        style: [direction: Column]
+                        items: LIST { 
+                            todos_element()
+                            panel_footer() 
+                        }
+                    )
+                }
         }
     )
 }
@@ -195,10 +208,16 @@ FUNCTION new_todo_title_text_input() {
             padding: [column: 19, left: 60, right: 16]
             font: [size: 24, color: Oklch[lightness: 0.42]]
             background: [color: Oklch[alpha: 0.003]]
-            shadows: LIST { [direction: Inwards, y: -2, blur: 1, color: Oklch[alpha: 0.03]] }
+            shadows: LIST { 
+                [direction: Inwards, y: -2, blur: 1, color: Oklch[alpha: 0.03]] 
+            }
         ]
         label: Hidden[text: 'What needs to be done?']
-        text: LATEST { '', element.event.change.text, PASSED.store.title_to_save |> THEN { '' } }
+        text: LATEST { 
+            ''
+            element.event.change.text
+            PASSED.store.title_to_save |> THEN { '' }
+        }
         placeholder: [
             style: [font: [style: Italic, color: Oklch[lightness: 0.925]]]
             text: 'What needs to be done?'
@@ -213,7 +232,8 @@ FUNCTION todos_element() {
         element: [
             nearby_element: [
                 position: Above
-                element: toggle_all_checkbox() |> LINK { PASSED.store.elements.toggle_all_checkbox }
+                element: toggle_all_checkbox() 
+                    |> LINK { PASSED.store.elements.toggle_all_checkbox }
             ]
         ]
         direction: Column
@@ -243,10 +263,15 @@ FUNCTION todo_element(todo) {
             font: [size: 24]
         ]
         items: PASSED.store.selected_todo_id = todo.id |> WHILE {
-            True => LIST { todo |> editing_todo_title_element() |> LINK { todo.todo_elements.editing_todo_title_element }}
+            True => LIST { 
+                editing_todo_title_element(todo: todo) 
+                    |> LINK { todo.todo_elements.editing_todo_title_element }
+            }
             False => LIST {
-                todo |> todo_checkbox() |> LINK { todo.todo_elements.todo_checkbox }
-                todo |> todo_title_element() |> LINK { todo.todo_elements.todo_title_element }
+                todo_checkbox(todo: todo) 
+                    |> LINK { todo.todo_elements.todo_checkbox }
+                todo_title_element(todo: todo) 
+                    |> LINK { todo.todo_elements.todo_title_element }
             }
         }
     )
@@ -265,7 +290,10 @@ FUNCTION toggle_all_checkbox() {
                 padding: [row: 27, column: 6]
                 font: [
                     size: 22,
-                    color: Oklch[lightness: checked |> WHEN { True => 0.555, False => 0.92 }]
+                    color: Oklch[lightness: checked |> WHEN { 
+                        True => 0.555
+                        False => 0.92 }
+                    ]
                 ]
                 transform: [rotate: 90, move_up: 18]
             ]
@@ -288,7 +316,9 @@ FUNCTION editing_todo_title_element(todo) {
             padding: [row: 17, top: 17, bottom: 16]
             align: Right
             borders: [color: Oklch[lightness: 0.68]]
-            shadows: LIST { [direction: Inwards, y: -1, blur: 5, color: Oklch[lightness: 0.2]] }
+            shadows: LIST { 
+                [direction: Inwards, y: -1, blur: 5, color: Oklch[lightness: 0.2]]        
+            }
             font: [color: Oklch[lightness: 0.42]]
         ]
         label: Hidden[text: 'selected todo title']
@@ -310,7 +340,10 @@ FUNCTION todo_checkbox(todo) {
                 element: []
                 style: [
                     size: 40
-                    background: [url: checked |> WHEN { True => icon_completed, False => icon_active }]
+                    background: [url: checked |> WHEN { 
+                        True => icon_completed
+                        False => icon_active 
+                    }]
                 ]
             )
         )
@@ -325,7 +358,8 @@ FUNCTION todo_title_element(todo) {
             nearby_element: [
                 position: Right
                 element: hovered |> WHILE {
-                    True => remove_todo_button() |> LINK { todo.todo_elements.remove_todo_button }
+                    True => remove_todo_button()
+                        |> LINK { todo.todo_elements.remove_todo_button }
                     False => NoElement
                 }
             ]
@@ -335,7 +369,10 @@ FUNCTION todo_title_element(todo) {
             font: [
                 size: 24
                 line: [strike: todo.completed]
-                color: Oklch[lightness: todo.completed |> WHEN { True => 0.885, False => 0.42 }]
+                color: Oklch[lightness: todo.completed |> WHEN { 
+                    True => 0.885
+                    False => 0.42 
+                }]
             ]
             padding: [column: 15, left: 15, right: 60]
             clip: Row
@@ -387,7 +424,8 @@ FUNCTION panel_footer() {
             active_items_count_text
             filters_element
             PASSED.store.todos |> List/any(item, if: item.completed) |> WHILE {
-                True => remove_completed_button() |> LINK { PASSED.store.elements.remove_completed_button }
+                True => remove_completed_button() 
+                    |> LINK { PASSED.store.elements.remove_completed_button }
                 False => NoElement
             }
         } |> List/map(old, new: Element/container(
@@ -399,11 +437,13 @@ FUNCTION panel_footer() {
 }
 
 FUNCTION active_items_count_text() {
-    BLOCK {
-        count: PASSED.store.todos |> List/retain(item, if: item.completed |> Bool/not()) |> List/count
-        maybe_s: count > 1 |> WHEN { True => 's', False => '' }
-        '{count} item{maybe_s} left'
-    }
+    PASSED.store.todos 
+        |> List/retain(item, if: item.completed |> Bool/not()) 
+        |> List/count
+        |> WHEN { count => BLOCK {
+            maybe_s: count > 1 |> WHEN { True => 's', False => '' }
+            '{count} item{maybe_s} left'
+        }}
 }
 
 FUNCTION filters_element() {
@@ -413,9 +453,12 @@ FUNCTION filters_element() {
         gap: 10
         style: []
         items: LIST {
-            filter_button(All) |> LINK { PASSED.store.elements.filter_buttons.all }
-            filter_button(Active) |> LINK { PASSED.store.elements.filter_buttons.active }
-            filter_button(Completed) |> LINK { PASSED.store.elements.filter_buttons.completed }
+            filter_button(All) 
+                |> LINK { PASSED.store.elements.filter_buttons.all }
+            filter_button(Active) 
+                |> LINK { PASSED.store.elements.filter_buttons.active }
+            filter_button(Completed) 
+                |> LINK { PASSED.store.elements.filter_buttons.completed }
         }
     )
 }
@@ -437,7 +480,14 @@ FUNCTION filter_button(filter) {
                     LIST { False, False } => 0
                 }
                 selected |> Bool/or(that: element.hovered) |> WHILE {
-                    True => [side: Inner, color: Oklch[lightness: 0.5, chroma: 0.165, hue: 25.36, alpha: alpha] ]
+                    True => [
+                        side: Inner
+                        color: Oklch[
+                            lightness: 0.5
+                            chroma: 0.165
+                            hue: 25.36
+                            alpha: alpha
+                        ] ]
                     False => NoOutline
                 }
             }
@@ -481,7 +531,10 @@ FUNCTION footer() {
                 style: []
                 contents: LIST {
                     'Created by '
-                    footer_link(label: 'Martin Kavík', to: 'https://github.com/MartinKavik')
+                    footer_link(
+                        label: 'Martin Kavík'
+                        to: 'https://github.com/MartinKavik'
+                    )
                 }
             )
             Element/paragraph(
