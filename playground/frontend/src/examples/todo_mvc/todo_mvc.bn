@@ -92,6 +92,16 @@ FUNCTION new_todo(title) {
                 } 
             }
         }
+        completed:
+            LATEST {
+                False
+                store.elements.toggle_all_checkbox.event.click |> THEN { 
+                    store.todos 
+                        |> List/every(item, if: item.completed) 
+                        |> Bool/not() 
+                }
+            }
+            |> Bool/toggle(when: todo_elements.todo_checkbox.event.click)
         edited_title: BLOCK {
             edited_title: LATEST {
                 ''
