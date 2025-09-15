@@ -76,34 +76,37 @@ FUNCTION new_todo(title) {
             title
             title_to_update
         }
-        completed: 
-            LATEST {
+        completed: BLOCK {
+            completed: LATEST {
                 False
                 store.elements.toggle_all_checkbox.event.click |> THEN { 
                     store.todos 
                         |> List/every(item, if: item.completed) 
                         |> Bool/not() 
                 }
-            } 
-            |> WHILE { completed => LATEST {
+            }
+            LATEST {
                 completed
                 todo_elements.todo_checkbox.event.click |> THEN { 
-                    completed |> Bool/not() 
-                }
-            }}
-        edited_title:
-            LATEST {
+                    completed |> Bool/not()
+                } 
+            }
+        }
+        edited_title: BLOCK {
+            edited_title: LATEST {
                 ''
                 todo_elements.editing_todo_title_element.event.change.text
                 title_to_update |> THEN { '' }
-            } |> WHILE { edited_title => LATEST {
+            }
+            LATEST {
                 edited_title
                 todo_elements.todo_title_element.event.double_click |> THEN { 
                     edited_title 
                         |> Text/empty() 
                         |> WHEN { True => title, False => SKIP } 
                 }
-            }}
+            }
+        }
     ]
 }
 
