@@ -1,0 +1,194 @@
+@top Program { TopItem* }
+
+@tokens {
+  // multi-char operators & punctuation (longest-first)
+  Pipe { "|>" }
+  Wildcard { "__" }
+  Implies { "=>" }
+  NotEqual { "=/=" }
+  GreaterOrEqual { ">=" }
+  LessOrEqual { "<=" }
+
+  // punctuation
+  Colon { ":" }
+  Comma { "," }
+  Dot { "." }
+  BracketRoundOpen { "(" }
+  BracketRoundClose { ")" }
+  BracketCurlyOpen { "{" }
+  BracketCurlyClose { "}" }
+  BracketSquareOpen { "[" }
+  BracketSquareClose { "]" }
+
+  // single-char operators
+  Greater { ">" }
+  Less { "<" }
+  Equal { "=" }
+  Minus { "-" }
+  Plus { "+" }
+  Asterisk { "*" }
+  Slash { "/" }
+
+  // newline token
+  Newline { "\n" }
+
+  // comments: starts with -- until newline
+  LineComment { "--" ![\n]* }
+
+  // text literal: single quoted (allow escapes)
+  Text { "'" (![\\\n'] | "\\" _)* "'" }
+
+  // number: optional leading '-' then digits, optional fractional part
+  Number { "-"? @digit+ ("." @digit+)? }
+
+  // identifiers
+  SnakeCaseIdentifier { $[a-z] $[a-z0-9_]* }
+  PascalCaseIdentifier { $[A-Z] $[A-Za-z0-9]* }
+
+  // keywords (ALL CAPS) \u2014 exact strings so they win before identifiers
+  K_LIST { "LIST" }
+  K_MAP { "MAP" }
+  K_FUNCTION { "FUNCTION" }
+  K_LINK { "LINK" }
+  K_LATEST { "LATEST" }
+  K_THEN { "THEN" }
+  K_WHEN { "WHEN" }
+  K_WHILE { "WHILE" }
+  K_SKIP { "SKIP" }
+  K_BLOCK { "BLOCK" }
+  K_PASS { "PASS" }
+  K_PASSED { "PASSED" }
+
+  // whitespace
+  WS { $[ \t\r]+ }
+}
+
+@skip { WS | LineComment | Newline }
+
+/////////////////////
+// Grammar: resolved conflicts (Postfix / Primary, inline optional lists)
+/////////////////////
+
+TopItem {
+  FunctionDef
+  | Definition
+  | Expr
+}
+
+Definition {
+  Name Colon Expr
+}
+
+FunctionDef {
+  K_FUNCTION Name? BracketRoundOpen (Name (Comma Name)*)? BracketRoundClose FunctionBody
+}
+
+FunctionBody {
+  BracketCurlyOpen Statement* BracketCurlyClose
+}
+
+Statement {
+  Definition
+  | Expr
+  | ListSquare
+  | ListCurly
+}
+
+Expr { PipeChain }
+
+@precedence {
+  Pipe 40
+  Compare 30
+  Add 20
+  Mul 10
+}
+
+PipeChain {
+  BinaryExpr (Pipe BinaryExpr)*
+}
+
+BinaryExpr {
+  UnaryExpr ( (Equal | NotEqual | GreaterOrEqual | LessOrEqual | Greater | Less) UnaryExpr )*
+}
+
+UnaryExpr {
+  Postfix ( (Plus | Minus | Asterisk | Slash) Postfix )*
+}
+
+/* Postfix + Primary: avoids Name vs Call ambiguity.
+   Primary contains base values; Postfix applies zero-or-more call suffixes.
+*/
+Postfix {
+  Primary ( BracketRoundOpen (NamedArg (Comma NamedArg)*)? BracketRoundClose )*
+}
+
+Primary {
+  Number
+  | Text
+  | Name
+  | BracketRoundOpen Expr BracketRoundClose
+  | ListCurly
+  | ListSquare
+  | BlockExpr
+}
+
+NamedArg {
+  Name Colon Expr
+  | Expr
+}
+
+BlockExpr {
+  KeywordBlock BracketCurlyOpen BlockBody BracketCurlyClose
+  // NOTE: do NOT attach PipeCall here; PipeChain handles pipes between expressions
+}
+
+KeywordBlock {
+  K_LATEST
+  | K_WHEN
+  | K_WHILE
+  | K_BLOCK
+}
+
+BlockBody {
+  (Arm | Statement)*
+}
+
+Arm {
+  PascalCaseIdentifier Implies BracketCurlyOpen Statement* BracketCurlyClose
+}
+
+/* ListCurly: inline optional items to avoid reduction ambiguity with K_LIST as SimpleName */
+ListCurly {
+  K_LIST BracketCurlyOpen (CurlyItem (Comma CurlyItem)*)? BracketCurlyClose
+  | BracketCurlyOpen (CurlyItem (Comma CurlyItem)*)? BracketCurlyClose
+}
+
+CurlyItem {
+  Name
+  | Name Colon Expr
+  | Expr
+}
+
+/* ListSquare: inline optional items */
+ListSquare {
+  BracketSquareOpen (SquareItem (Comma SquareItem)*)? BracketSquareClose
+}
+
+SquareItem {
+  Name Colon Expr
+  | Expr
+}
+
+/* Name / SimpleName:
+   - SimpleName no longer includes ALL-CAPS keyword tokens like K_LIST
+   - Wildcard included here so '__' is treated as a name piece
+*/
+Name {
+  SimpleName ( (Dot | Slash) SimpleName )*
+}
+
+SimpleName {
+  SnakeCaseIdentifier
+  | PascalCaseIdentifier
+  | Wildcard
+}
