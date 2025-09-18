@@ -169,6 +169,7 @@ impl Playground {
                                     &keyboard_event.raw_event;
                                 if keyboard_event.key() == &Key::Enter && raw_event.shift_key() {
                                     keyboard_event.pass_to_parent(false);
+                                    raw_event.prevent_default();
                                     run_command.set(Some(RunCommand { filename: None }));
                                 }
                             }
