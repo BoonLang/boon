@@ -21,6 +21,7 @@ frontend = [
     # "../../MoonZoon/crates/zoon/src",
     "../crates/boon/Cargo.toml",
     "../crates/boon/src",
+    "frontend/typescript/bundles",
 ]
 backend = [
     "backend/Cargo.toml",

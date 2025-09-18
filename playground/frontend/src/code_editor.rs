@@ -55,6 +55,20 @@ impl CodeEditor {
         self.after_remove(move |_| drop(task))
     }
 
+    pub fn snippet_screenshot_mode_signal(
+        self,
+        snippet_screenshot_mode: impl Signal<Item = bool> + 'static,
+    ) -> Self {
+        let controller = self.controller.clone();
+        let task = Task::start_droppable(async move {
+            let controller = controller.wait_for_some_cloned().await;
+            snippet_screenshot_mode
+                .for_each_sync(|snippet_screenshot_mode| controller.set_snippet_screenshot_mode(snippet_screenshot_mode))
+                .await;
+        });
+        self.after_remove(move |_| drop(task))
+    }
+
     pub fn on_change(self, mut on_change: impl FnMut(String) + 'static) -> Self {
         let callback = move |content: JsString| {
             let content = content
@@ -91,6 +105,9 @@ mod js_bridge {
 
         #[wasm_bindgen(method)]
         pub fn set_content(this: &CodeEditorController, content: &str);
+
+        #[wasm_bindgen(method)]
+        pub fn set_snippet_screenshot_mode(this: &CodeEditorController, mode: bool);
 
         #[wasm_bindgen(method)]
         pub fn on_change(this: &CodeEditorController, on_change: &Closure<dyn FnMut(JsString)>);

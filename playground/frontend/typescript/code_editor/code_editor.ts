@@ -10,21 +10,18 @@ export class CodeEditorController {
 
     editor_view: EditorView | null = null
     on_change_handler = new Compartment
+    editor_style = new Compartment
 
     init(parent_element: HTMLElement) {
-        const min_height_editor = EditorView.theme({
-            ".cm-content, .cm-gutter": { minHeight: "200px" },
-            ".cm-content": { "font-family": "Fira Code" },
-        })
         const state = EditorState.create({
             extensions: [
                 basicSetup,
                 oneDark,
-                min_height_editor,
+                this.editor_style.of([]),
                 keymap.of(defaultKeymap),
                 keymap.of([indentWithTab]),
                 indentUnit.of("    "),
-                this.on_change_handler.of([])
+                this.on_change_handler.of([]),
             ],
         })
         this.editor_view = new EditorView({
@@ -43,6 +40,28 @@ export class CodeEditorController {
                 ]
             })
         }
+    }
+
+    set_snippet_screenshot_mode(mode: boolean) {
+        const basic_editor_style = EditorView.theme({
+            ".cm-content, .cm-gutter": { minHeight: "200px" },
+            ".cm-content": { "font-family": "Fira Code" },
+        });
+        // https://codemirror.net/examples/styling/
+        const snippet_screenshot_mode_editor_style = EditorView.theme({
+            ".cm-content, .cm-gutter": { minHeight: "200px" },
+            ".cm-content": { 
+                "font-family": "Fira Code", 
+                paddingTop: "22px", 
+                paddingBottom: "20px", 
+            },
+            ".cm-gutter": { paddingLeft: "8px" },
+        });
+        this.editor_view!.dispatch({
+            effects: this.editor_style.reconfigure(
+                mode ? snippet_screenshot_mode_editor_style : basic_editor_style
+            )
+        })
     }
 
     on_change(on_change: (content: string) => void) {

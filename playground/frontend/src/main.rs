@@ -51,6 +51,7 @@ fn main() {
 struct Playground {
     source_code: Mutable<Rc<Cow<'static, str>>>,
     run_command: Mutable<Option<RunCommand>>,
+    snippet_screenshot_mode: Mutable<bool>,
     _store_source_code_task: Rc<TaskHandle>,
 }
 
@@ -75,6 +76,7 @@ impl Playground {
             )),
             source_code,
             run_command: Mutable::new(None),
+            snippet_screenshot_mode: Mutable::new(false),
         }
         .root()
     }
@@ -94,7 +96,13 @@ impl Playground {
                     )
                     .item(self.clear_saved_states_button()),
             )
-            .item(self.run_button())
+            .item(
+                Row::new()
+                    .s(Gap::both(20))
+                    .s(Align::new().center_x())
+                    .item(self.run_button())
+                    .item(self.snippet_screenshot_mode_button())
+            )
             .item(
                 Row::new()
                     .s(Padding::new().top(5))
@@ -102,14 +110,16 @@ impl Playground {
                     .s(Height::fill())
                     .s(Scrollbars::both())
                     .item(self.code_editor_panel())
-                    .item(self.example_panel()),
+                    .item_signal(self.snippet_screenshot_mode.signal().map_false({
+                        let this = self.clone();
+                        move || this.example_panel()
+                    })),
             )
     }
 
     fn run_button(&self) -> impl Element {
         let (hovered, hovered_signal) = Mutable::new_and_signal(false);
         Button::new()
-            .s(Align::new().center_x())
             .s(Padding::all(5))
             .label(
                 Paragraph::new()
@@ -134,6 +144,27 @@ impl Playground {
             })
     }
 
+    fn snippet_screenshot_mode_button(&self) -> impl Element {
+        let (hovered, hovered_signal) = Mutable::new_and_signal(false);
+        Button::new()
+            .s(Padding::all(5))
+            .label(
+                El::new()
+                    .s(Font::new().color_signal(
+                        hovered_signal
+                            .map_bool(|| color!("DarkGrey"), || color!("Grey")),
+                    ))
+                    .child("Snippet screenshot mode")
+            )
+            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+            .on_press({
+                let snippet_screenshot_mode = self.snippet_screenshot_mode.clone();
+                move || {
+                    snippet_screenshot_mode.update(|mode| not(mode));
+                }
+            })
+    }
+
     fn clear_saved_states_button(&self) -> impl Element {
         let (hovered, hovered_signal) = Mutable::new_and_signal(false);
         Button::new()
@@ -154,7 +185,7 @@ impl Playground {
             .s(Align::new().top())
             .s(Width::fill())
             .s(Height::fill())
-            .s(Padding::all(5))
+            .s(Padding::all_signal(self.snippet_screenshot_mode.signal().map_bool(|| 100, || 5)))
             .s(Scrollbars::both())
             .child(
                 CodeEditor::new()
@@ -176,6 +207,7 @@ impl Playground {
                         },
                     )
                     .content_signal(self.source_code.signal_cloned())
+                    .snippet_screenshot_mode_signal(self.snippet_screenshot_mode.signal())
                     .on_change({
                         let source_code = self.source_code.clone();
                         move |content| source_code.set_neq(Rc::new(Cow::from(content)))
@@ -183,7 +215,7 @@ impl Playground {
             )
     }
 
-    fn example_panel(&self) -> impl Element {
+    fn example_panel(&self) -> impl Element + use<> {
         El::new()
             .s(Align::new().top())
             .s(Width::fill())
