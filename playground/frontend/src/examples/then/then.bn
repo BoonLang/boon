@@ -4,46 +4,42 @@ current_sum:
 
 -------------------------------------
 
-input_a: 
-    Duration[seconds: 0.5]
+input_a: sum_of_steps(step: 1, seconds: 0.5)
+input_b: sum_of_steps(step: 10, seconds: 1)
+
+FUNCTION sum_of_steps(step, seconds) {
+    Duration[seconds: seconds]
     |> Timer/interval() 
-    |> THEN { 1 } 
+    |> THEN { step } 
     |> Math/sum()
-
-input_b: 
-    Duration[seconds: 1]
-    |> Timer/interval() 
-    |> THEN { 10 } 
-    |> Math/sum()
-
-document: Document/new(root: Element/stripe(
-    element: []
-    direction: Column
-    style: []
-    items: LIST {
-        input_a_row
-        input_b_row
-        addition_button
-        current_sum
-    }
-))
-
-input_a_row: Element/stripe(
-    element: []
-    direction: Row
-    style: []
-    items: LIST { 'A: ', input_a }
-)
-
-input_b_row: Element/stripe(
-    element: []
-    direction: Row
-    style: []
-    items: LIST { 'B: ', input_b }
-)
+}
 
 addition_button: Element/button(
     element: [event: [press: LINK]]
     style: []
     label: 'A + B'
 )
+
+document: Document/new(root: Element/stripe(
+    element: []
+    direction: Column
+    style: []
+    items: LIST {
+        input_a |> input_row(name: 'A')
+        input_b |> input_row(name: 'B')
+        addition_button
+        Element/container(
+            element: []
+            style: [align: [row: Center]]
+            child: current_sum
+        )
+    }
+))
+
+FUNCTION input_row(input, name) {
+    Element/container(
+        element: []
+        style: [align: [row: Center]]
+        child: '{name}: {input}'
+    )
+}

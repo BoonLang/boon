@@ -9,6 +9,9 @@ sum: value |> Math/sum()
 
 ------------------------------------------------
 
+send_1_button: send_button(label: 'Send 1')
+send_2_button: send_button(label: 'Send 2')
+
 document: Document/new(root: Element/stripe(
     element: []
     direction: Column
@@ -16,25 +19,24 @@ document: Document/new(root: Element/stripe(
     items: LIST {
         send_1_button
         send_2_button
-        value
-        Element/stripe(
-            element: []
-            direction: Row
-            style: []
-            items: LIST { 'Sum: ', sum }
-        )
+        value |> value_container
+        'Sum: {sum}' |> value_container
     }
 ))
 
-send_1_button: Element/button(
-    element: [event: [press: LINK]]
-    style: []
-    label: 'Send 1'
-)
+FUNCTION send_button(label) {
+    Element/button(
+        element: [event: [press: LINK]]
+        style: []
+        label: label
+    )
+}
 
-send_2_button: Element/button(
-    element: [event: [press: LINK]]
-    style: []
-    label: 'Send 2'
-)
+FUNCTION value_container(value) {
+    Element/container(
+        element: []
+        style: [align: [row: Center]]
+        child: value
+    )
+}
 
