@@ -2,6 +2,7 @@
 #![allow(unused_variables)]
 
 use boon::zoon::{eprintln, println, *};
+use boon::zoon::map_ref;
 use std::borrow::Cow;
 use std::rc::Rc;
 
@@ -15,6 +16,13 @@ static SOURCE_CODE_STORAGE_KEY: &str = "boon-playground-source-code";
 static OLD_SOURCE_CODE_STORAGE_KEY: &str = "boon-playground-old-source-code";
 static OLD_SPAN_ID_PAIRS_STORAGE_KEY: &str = "boon-playground-span-id-pairs";
 static STATES_STORAGE_KEY: &str = "boon-playground-states";
+static PANEL_SPLIT_STORAGE_KEY: &str = "boon-playground-panel-split";
+
+const DEFAULT_PANEL_SPLIT_RATIO: f64 = 0.5;
+const MIN_PANEL_RATIO: f64 = 0.1;
+const MAX_PANEL_RATIO: f64 = 0.9;
+const MIN_EDITOR_WIDTH_PX: f64 = 260.0;
+const MIN_PREVIEW_WIDTH_PX: f64 = 260.0;
 
 #[derive(Clone, Copy)]
 struct ExampleData {
@@ -52,7 +60,11 @@ struct Playground {
     source_code: Mutable<Rc<Cow<'static, str>>>,
     run_command: Mutable<Option<RunCommand>>,
     snippet_screenshot_mode: Mutable<bool>,
+    panel_split_ratio: Mutable<f64>,
+    panel_container_width: Mutable<u32>,
+    is_dragging_panel_split: Mutable<bool>,
     _store_source_code_task: Rc<TaskHandle>,
+    _store_panel_split_task: Rc<TaskHandle>,
 }
 
 impl Playground {
@@ -64,24 +76,63 @@ impl Playground {
                 Cow::Borrowed(EXAMPLE_DATAS[0].source_code)
             };
         let source_code = Mutable::new(Rc::new(source_code));
-        Self {
-            _store_source_code_task: Rc::new(Task::start_droppable(
-                source_code.signal_cloned().for_each_sync(|source_code| {
-                    if let Err(error) =
-                        local_storage().insert(SOURCE_CODE_STORAGE_KEY, &source_code)
-                    {
-                        eprintln!("Failed to store source code: {error:#?}");
+        let panel_split_ratio_value =
+            if let Some(Ok(ratio)) = local_storage().get(PANEL_SPLIT_STORAGE_KEY) {
+                ratio
+            } else {
+                DEFAULT_PANEL_SPLIT_RATIO
+            };
+        let panel_split_ratio =
+            Mutable::new(Self::clamp_panel_split_ratio(panel_split_ratio_value));
+        let _store_source_code_task = Rc::new(Task::start_droppable(
+            source_code.signal_cloned().for_each_sync(|source_code| {
+                if let Err(error) = local_storage().insert(SOURCE_CODE_STORAGE_KEY, &source_code)
+                {
+                    eprintln!("Failed to store source code: {error:#?}");
+                }
+            }),
+        ));
+        let _store_panel_split_task = Rc::new(Task::start_droppable(
+            panel_split_ratio
+                .signal_cloned()
+                .for_each_sync(|ratio| {
+                    if let Err(error) = local_storage().insert(PANEL_SPLIT_STORAGE_KEY, &ratio) {
+                        eprintln!("Failed to store panel split ratio: {error:#?}");
                     }
                 }),
-            )),
+        ));
+        Self {
             source_code,
             run_command: Mutable::new(None),
             snippet_screenshot_mode: Mutable::new(false),
+            panel_split_ratio,
+            panel_container_width: Mutable::new(0),
+            is_dragging_panel_split: Mutable::new(false),
+            _store_source_code_task,
+            _store_panel_split_task,
         }
         .root()
     }
 
     fn root(&self) -> impl Element + use<> {
+        Stack::new()
+            .s(Width::fill())
+            .s(Height::fill())
+            .on_pointer_up({
+                let this = self.clone();
+                move || this.stop_panel_drag()
+            })
+            .layer(self.main_layout())
+            .layer_signal(self.is_dragging_panel_split.signal().map_bool(
+                {
+                    let this = self.clone();
+                    move || Some(this.panel_drag_overlay())
+                },
+                || None,
+            ))
+    }
+
+    fn main_layout(&self) -> impl Element + use<> {
         Column::new()
             .s(Width::fill())
             .s(Height::fill())
@@ -101,20 +152,198 @@ impl Playground {
                     .s(Gap::both(20))
                     .s(Align::new().center_x())
                     .item(self.run_button())
-                    .item(self.snippet_screenshot_mode_button())
+                    .item(self.snippet_screenshot_mode_button()),
             )
-            .item(
-                Row::new()
-                    .s(Padding::new().top(5))
-                    .s(Width::fill())
-                    .s(Height::fill())
-                    .s(Scrollbars::both())
-                    .item(self.code_editor_panel())
-                    .item_signal(self.snippet_screenshot_mode.signal().map_false({
-                        let this = self.clone();
-                        move || this.example_panel()
-                    })),
-            )
+            .item(self.panels_row())
+    }
+
+    fn panels_row(&self) -> impl Element + use<> {
+        Row::new()
+            .s(Padding::new().top(5))
+            .s(Width::fill())
+            .s(Height::fill())
+            .s(Scrollbars::both())
+            .update_raw_el(|raw_el| raw_el.class("panels-row"))
+            .on_viewport_size_change({
+                let panel_container_width = self.panel_container_width.clone();
+                let panel_split_ratio = self.panel_split_ratio.clone();
+                move |width, _| {
+                    panel_container_width.set_neq(width);
+                    let current_ratio = *panel_split_ratio.lock_ref();
+                    let clamped = Self::clamp_panel_split_ratio_for_width(current_ratio, width);
+                    panel_split_ratio.set_neq(clamped);
+                }
+            })
+            .item(self.code_editor_panel_container())
+            .item_signal(self.snippet_screenshot_mode.signal().map_bool(
+                || None,
+                {
+                    let this = self.clone();
+                    move || Some(this.panel_divider())
+                },
+            ))
+            .item_signal(self.snippet_screenshot_mode.signal().map_bool(
+                || None,
+                {
+                    let this = self.clone();
+                    move || Some(this.example_panel_container())
+                },
+            ))
+    }
+
+    fn code_editor_panel_container(&self) -> impl Element + use<> {
+        El::new()
+            .s(Align::new().top())
+            .s(Height::fill())
+            .s(Width::with_signal_self(map_ref! {
+                let snippet = self.snippet_screenshot_mode.signal(),
+                let ratio = self.panel_split_ratio.signal() =>
+                if *snippet {
+                    Some(Width::fill())
+                } else {
+                    Some(Width::percent((ratio * 100.0).clamp(0.0, 100.0)))
+                }
+            }))
+            .child(self.code_editor_panel())
+    }
+
+    fn panel_divider(&self) -> impl Element + use<> {
+        let hovered = Mutable::new(false);
+        let hovered_for_signal = hovered.clone();
+        El::new()
+            .s(Align::new().top())
+            .s(Width::exact(10))
+            .s(Height::fill())
+            .s(Cursor::new(CursorIcon::ColumnResize))
+            .s(Background::new().color_signal(map_ref! {
+                let hovered = hovered_for_signal.signal(),
+                let dragging = self.is_dragging_panel_split.signal() =>
+                if *dragging {
+                    color!("#4c566a")
+                } else if *hovered {
+                    color!("#3b404a")
+                } else {
+                    color!("#2c3038")
+                }
+            }))
+            .s(Borders::new()
+                .left(Border::new().color(color!("#1d2026")).width(1))
+                .right(Border::new().color(color!("#1d2026")).width(1)))
+            .on_hovered_change(move |is_hovered| hovered.set_neq(is_hovered))
+            .text_content_selecting(TextContentSelecting::none())
+            .on_pointer_down_event({
+                let this = self.clone();
+                move |event| this.start_panel_drag(event)
+            })
+    }
+
+    fn example_panel_container(&self) -> impl Element + use<> {
+        El::new()
+            .s(Align::new().top())
+            .s(Height::fill())
+            .s(Width::percent_signal::<f64>(
+                self.panel_split_ratio
+                    .signal_cloned()
+                    .map(|ratio| Some((1.0 - ratio).clamp(0.0, 1.0) * 100.0)),
+            ))
+            .child(self.example_panel())
+    }
+
+    fn panel_drag_overlay(&self) -> impl Element + use<> {
+        El::new()
+            .s(Align::new().top())
+            .s(Width::fill())
+            .s(Height::fill())
+            .s(Cursor::new(CursorIcon::ColumnResize))
+            .s(Background::new().color(color!("rgba(0, 0, 0, 0)")))
+            .text_content_selecting(TextContentSelecting::none())
+            .on_pointer_move_event({
+                let this = self.clone();
+                move |event| this.adjust_panel_split(&event)
+            })
+            .on_pointer_up({
+                let this = self.clone();
+                move || this.stop_panel_drag()
+            })
+            .on_pointer_leave({
+                let this = self.clone();
+                move || this.stop_panel_drag()
+            })
+    }
+
+    fn start_panel_drag(&self, pointer_event: PointerEvent) {
+        if !*self.is_dragging_panel_split.lock_ref() {
+            if let RawPointerEvent::PointerDown(raw_event) = &pointer_event.raw_event {
+                raw_event.prevent_default();
+                if let Some(target) = raw_event.dyn_target::<web_sys::Element>() {
+                    if let Ok(Some(container)) = target.closest(".panels-row") {
+                        let width = container.get_bounding_client_rect().width();
+                        if width.is_finite() && width > 0.0 {
+                            self.panel_container_width
+                                .set_neq(width.round().max(1.0) as u32);
+                        }
+                    }
+                }
+            }
+        }
+        if *self.is_dragging_panel_split.lock_ref() {
+            return;
+        }
+        self.is_dragging_panel_split.set_neq(true);
+    }
+
+    fn stop_panel_drag(&self) {
+        if !*self.is_dragging_panel_split.lock_ref() {
+            return;
+        }
+        self.is_dragging_panel_split.set_neq(false);
+        let width = *self.panel_container_width.lock_ref();
+        if width > 0 {
+            let current_ratio = *self.panel_split_ratio.lock_ref();
+            let clamped = Self::clamp_panel_split_ratio_for_width(current_ratio, width);
+            self.panel_split_ratio.set_neq(clamped);
+        }
+    }
+
+    fn adjust_panel_split(&self, pointer_event: &PointerEvent) {
+        if !*self.is_dragging_panel_split.lock_ref() {
+            return;
+        }
+        let delta_x = pointer_event.movement_x();
+        if delta_x == 0 {
+            return;
+        }
+        let width = *self.panel_container_width.lock_ref();
+        if width == 0 {
+            return;
+        }
+        let current_ratio = *self.panel_split_ratio.lock_ref();
+        let ratio_delta = f64::from(delta_x) / width as f64;
+        if ratio_delta == 0.0 {
+            return;
+        }
+        let new_ratio = Self::clamp_panel_split_ratio_for_width(current_ratio + ratio_delta, width);
+        self.panel_split_ratio.set_neq(new_ratio);
+    }
+
+    fn clamp_panel_split_ratio(ratio: f64) -> f64 {
+        ratio.clamp(MIN_PANEL_RATIO, MAX_PANEL_RATIO)
+    }
+
+    fn clamp_panel_split_ratio_for_width(ratio: f64, width: u32) -> f64 {
+        if width == 0 {
+            return Self::clamp_panel_split_ratio(ratio);
+        }
+        let width = width as f64;
+        if width <= (MIN_EDITOR_WIDTH_PX + MIN_PREVIEW_WIDTH_PX) {
+            return Self::clamp_panel_split_ratio(ratio);
+        }
+        let min_ratio = (MIN_EDITOR_WIDTH_PX / width).max(MIN_PANEL_RATIO);
+        let max_ratio = (1.0 - (MIN_PREVIEW_WIDTH_PX / width)).min(MAX_PANEL_RATIO);
+        if min_ratio > max_ratio {
+            return Self::clamp_panel_split_ratio(ratio);
+        }
+        ratio.clamp(min_ratio, max_ratio)
     }
 
     fn run_button(&self) -> impl Element {
