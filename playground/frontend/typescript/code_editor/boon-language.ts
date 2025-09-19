@@ -49,6 +49,7 @@ const modulePathSlashMark = Decoration.mark({class: "cm-boon-module-slash"})
 const functionNameMark = Decoration.mark({class: "cm-boon-function-name"})
 const variableDefinitionMark = Decoration.mark({class: "cm-boon-variable-definition"})
 const dotMark = Decoration.mark({class: "cm-boon-dot"})
+const apostropheMark = Decoration.mark({class: "cm-boon-apostrophe"})
 
 const boonSemanticHighlight = ViewPlugin.fromClass(class {
   decorations
@@ -120,6 +121,16 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
           pendingDefinition = null
           expectFunctionName = false
           return
+        }
+
+        if (node.name === "Text") {
+          for (let index = text.indexOf("'"); index !== -1; index = text.indexOf("'", index + 1)) {
+            const position = node.from + index
+            builder.add(position, position + 1, apostropheMark)
+          }
+          pendingDefinition = null
+          expectFunctionName = false
+          return false
         }
 
         if (

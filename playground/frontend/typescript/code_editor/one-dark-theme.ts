@@ -13,21 +13,21 @@ const tooltipBackground = "#353a42"
 const selection = "#3E4451"
 const cursor = "#528bff"
 
-const keywordWhite = "#f6f7fb"
+const keywordChocolate = "chocolate"
 const namespaceBlue = "#6cb6ff"
 const tagGreen = "#6df59a"
 const typeLavender = "#6f9cff"
-const variableGray = "#b0bacd"
+const variableWhite = "#ffffff"
 const functionAmber = "#fcbf49"
 const definitionPink = "#ff6ec7"
 const operatorOrange = "#ff9f43"
 const stringGold = "#ffea7a"
-const numberAqua = "#78dce8"
+const numberAqua = "#ff66ff"
 const wildcardViolet = "#bd93f9"
 const punctuationSnow = "#f5f7ff"
 const slashRed = "#ff5c57"
-const dotWhite = "#fdfdff"
-const commentGray = stone
+const dotRed = "#ff0000"
+const commentGray = "lightslategray"
 
 export const oneDarkColors = {
   invalid,
@@ -39,11 +39,11 @@ export const oneDarkColors = {
   tooltipBackground,
   selection,
   cursor,
-  keywordWhite,
+  keywordChocolate,
   namespaceBlue,
   tagGreen,
   typeLavender,
-  variableGray,
+  variableWhite,
   functionAmber,
   definitionPink,
   operatorOrange,
@@ -52,6 +52,7 @@ export const oneDarkColors = {
   wildcardViolet,
   punctuationSnow,
   slashRed,
+  dotRed,
 }
 
 export const oneDarkTheme = EditorView.theme({
@@ -87,11 +88,19 @@ export const oneDarkTheme = EditorView.theme({
     fontWeight: "600",
   },
   ".cm-content span.cm-boon-dot": {
-    color: `${dotWhite} !important`,
+    color: `${dotRed} !important`,
     fontWeight: "700",
   },
   ".cm-content span.cm-boon-dot > span": {
-    color: `${dotWhite} !important`,
+    color: `${dotRed} !important`,
+    fontWeight: "700",
+  },
+  ".cm-content span.cm-boon-apostrophe": {
+    color: `${punctuationSnow} !important`,
+    fontWeight: "700",
+  },
+  ".cm-content span.cm-boon-apostrophe > span": {
+    color: `${punctuationSnow} !important`,
     fontWeight: "700",
   },
 
@@ -158,11 +167,11 @@ export const oneDarkTheme = EditorView.theme({
 }, { dark: true })
 
 export const oneDarkHighlightStyle = HighlightStyle.define([
-  { tag: t.keyword, color: keywordWhite },
+  { tag: t.keyword, color: keywordChocolate, fontStyle: "italic", fontWeight: "bolder" },
   { tag: t.namespace, color: namespaceBlue },
   { tag: t.tagName, color: tagGreen },
   { tag: t.typeName, color: typeLavender },
-  { tag: t.variableName, color: variableGray },
+  { tag: t.variableName, color: variableWhite },
   { tag: [t.operator, t.operatorKeyword], color: operatorOrange, fontWeight: "600" },
   { tag: [t.separator, t.paren, t.brace, t.squareBracket], color: punctuationSnow, fontWeight: "700" },
   { tag: t.number, color: numberAqua },
@@ -173,7 +182,7 @@ export const oneDarkHighlightStyle = HighlightStyle.define([
   { tag: t.emphasis, fontStyle: "italic" },
   { tag: t.strikethrough, textDecoration: "line-through" },
   { tag: t.link, color: namespaceBlue, textDecoration: "underline" },
-  { tag: t.heading, fontWeight: "bold", color: keywordWhite },
+  { tag: t.heading, fontWeight: "bold", color: keywordChocolate },
   { tag: t.invalid, color: invalid },
 ])
 

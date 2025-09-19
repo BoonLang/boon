@@ -23070,6 +23070,7 @@ const modulePathSlashMark = Decoration.mark({ class: "cm-boon-module-slash" });
 const functionNameMark = Decoration.mark({ class: "cm-boon-function-name" });
 const variableDefinitionMark = Decoration.mark({ class: "cm-boon-variable-definition" });
 const dotMark = Decoration.mark({ class: "cm-boon-dot" });
+const apostropheMark = Decoration.mark({ class: "cm-boon-apostrophe" });
 const boonSemanticHighlight = ViewPlugin.fromClass(class {
 	decorations;
 	constructor(view) {
@@ -23131,6 +23132,15 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 					expectFunctionName = false;
 					return;
 				}
+				if (node.name === "Text") {
+					for (let index = text.indexOf("'"); index !== -1; index = text.indexOf("'", index + 1)) {
+						const position = node.from + index;
+						builder.add(position, position + 1, apostropheMark);
+					}
+					pendingDefinition = null;
+					expectFunctionName = false;
+					return false;
+				}
 				if (node.name === "WS" || node.name === "Punctuation" || node.name === "Piece" || node.name === "Program" || node.name === "ProgramItems" || node.name === "ObjectLiteral" || node.name === "ListLiteral" || node.name === "TaggedObject") return;
 				pendingDefinition = null;
 				expectFunctionName = false;
@@ -23166,21 +23176,21 @@ const background = "#282c34";
 const tooltipBackground = "#353a42";
 const selection = "#3E4451";
 const cursor = "#528bff";
-const keywordWhite = "#f6f7fb";
+const keywordChocolate = "chocolate";
 const namespaceBlue = "#6cb6ff";
 const tagGreen = "#6df59a";
 const typeLavender = "#6f9cff";
-const variableGray = "#b0bacd";
+const variableWhite = "#ffffff";
 const functionAmber = "#fcbf49";
 const definitionPink = "#ff6ec7";
 const operatorOrange = "#ff9f43";
 const stringGold = "#ffea7a";
-const numberAqua = "#78dce8";
+const numberAqua = "#ff66ff";
 const wildcardViolet = "#bd93f9";
 const punctuationSnow = "#f5f7ff";
 const slashRed = "#ff5c57";
-const dotWhite = "#fdfdff";
-const commentGray = stone;
+const dotRed = "#ff0000";
+const commentGray = "lightslategray";
 const oneDarkTheme = EditorView.theme({
 	"&": {
 		color: ivory,
@@ -23213,11 +23223,19 @@ const oneDarkTheme = EditorView.theme({
 		fontWeight: "600"
 	},
 	".cm-content span.cm-boon-dot": {
-		color: `${dotWhite} !important`,
+		color: `${dotRed} !important`,
 		fontWeight: "700"
 	},
 	".cm-content span.cm-boon-dot > span": {
-		color: `${dotWhite} !important`,
+		color: `${dotRed} !important`,
+		fontWeight: "700"
+	},
+	".cm-content span.cm-boon-apostrophe": {
+		color: `${punctuationSnow} !important`,
+		fontWeight: "700"
+	},
+	".cm-content span.cm-boon-apostrophe > span": {
+		color: `${punctuationSnow} !important`,
 		fontWeight: "700"
 	},
 	".cm-content": { caretColor: cursor },
@@ -23268,7 +23286,9 @@ const oneDarkTheme = EditorView.theme({
 const oneDarkHighlightStyle = HighlightStyle.define([
 	{
 		tag: tags.keyword,
-		color: keywordWhite
+		color: keywordChocolate,
+		fontStyle: "italic",
+		fontWeight: "bolder"
 	},
 	{
 		tag: tags.namespace,
@@ -23284,7 +23304,7 @@ const oneDarkHighlightStyle = HighlightStyle.define([
 	},
 	{
 		tag: tags.variableName,
-		color: variableGray
+		color: variableWhite
 	},
 	{
 		tag: [tags.operator, tags.operatorKeyword],
@@ -23346,7 +23366,7 @@ const oneDarkHighlightStyle = HighlightStyle.define([
 	{
 		tag: tags.heading,
 		fontWeight: "bold",
-		color: keywordWhite
+		color: keywordChocolate
 	},
 	{
 		tag: tags.invalid,
