@@ -48,7 +48,6 @@
   Plus { "+" }
   Minus { "-" ![-] }
   Asterisk { "*" }
-  PathSlash { "/" ![ \t\r\n] }
   Slash { "/" }
   Text { "'" (![\\\n'] | "\\" _)* "'" }
   Number { @digit+ ("." @digit+)? }
@@ -61,7 +60,7 @@
 
 @skip { WS | LineComment }
 
-@precedence { PathSlash, PascalCaseIdentifier, LineComment, Minus }
+@precedence { modulePath @cut, PascalCaseIdentifier, LineComment, Minus }
 
 ProgramItems {
   Newline* Item (Newline+ Item)* Newline*
@@ -270,10 +269,10 @@ PassLiteral { "PASS" }
 Name { SnakeCaseIdentifier (Dot SnakeCaseIdentifier)* }
 
 ModulePath {
-  PascalCaseIdentifier PathSlash ModulePathTail
+  !modulePath PascalCaseIdentifier Slash ModulePathTail
 }
 
 ModulePathTail {
-  PascalCaseIdentifier PathSlash ModulePathTail
+  !modulePath PascalCaseIdentifier Slash ModulePathTail
   | SnakeCaseIdentifier
 }
