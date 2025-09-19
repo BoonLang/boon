@@ -23015,8 +23015,8 @@ function getSpecializer(spec) {
 //#region boon-parser.ts
 const parser$1 = LRParser.deserialize({
 	version: 14,
-	states: "!pQVQPOOO#VQPO'#CdO#^QPO'#C_OOQO'#Ck'#CkOOQO'#Cz'#CzOOQO'#C_'#C_OOQO'#DT'#DTQVQPOOOOQO,59O,59OO%dQPO,59OOOQO,58|,58|OOQO-E7R-E7ROOQO1G.j1G.j",
-	stateData: "%q~OPOS~OSTOTTOVQOXPOZTO[TO]TO^TO`ROaRObROcROdROeROfROgROhROiROjROkROlROmROoSOpSOqSOrSOsSOtSOuSOvTO~OYWO~PVOXPOSRXTRXVRXZRX[RX]RX^RX`RXaRXbRXcRXdRXeRXfRXgRXhRXiRXjRXkRXlRXmRXoRXpRXqRXrRXsRXtRXuRXvRXxRXYRX~OY[O~PVOTVviS~",
+	states: "!pQVQPOOO#VQPO'#CdO#^QPO'#CbOOQO'#Ck'#CkOOQO'#Cz'#CzOOQO'#C_'#C_OOQO'#DT'#DTQVQPOOOOQO,59O,59OO#cQPO,59OOOQO,58|,58|OOQO-E7R-E7ROOQO1G.j1G.j",
+	stateData: "#p~OPOS~OSTOTTOVQOXPOZTO[TO]TO^TO`ROaRObROcROdROeROfROgROhROiROjROkROlROmROoSOpSOqSOrSOsSOtSOuSOvTO~OYWO~PVOXPO~OY[O~PVOTVviS~",
 	goto: "!jxPPPyPP!PP!VPPPPPP!PPPPPPPPPPPPPPP!PPPPPPPPP!`XUOPVXXTOPVXWTOPVXRYQQVOQXPTZVX",
 	nodeNames: "⚠ WS Program Piece Keyword ModulePath TaggedObject PascalCase ObjectLiteral BracketSquareOpen BracketSquareClose SnakeCase Wildcard Number Text Operator Pipe Arrow NotEqual GreaterOrEqual LessOrEqual Greater Less Equal Plus Minus Asterisk Slash Percent Caret Punctuation Colon Comma Dot BracketRoundOpen BracketRoundClose BracketCurlyOpen BracketCurlyClose LineComment",
 	maxTerm: 41,
@@ -23025,7 +23025,7 @@ const parser$1 = LRParser.deserialize({
 	tokenData: "+m~RlXY!yYZ!y]^!ypq!yuv#[wx#axy%Tyz%Yz{%_{|%d|}%i}!O%n!O!P&b!P!Q&g!Q![&l![!]'V!^!_'[!_!`'i!`!a(U!c!}(c!}#O*^#P#Q*c#Q#R*h#R#S*m#T#o*x#o#p+W#p#q+]#q#r+h~#OSP~XY!yYZ!y]^!ypq!y~#aOl~~#dWOY#aZw#awx#|x#O#a#O#P$R#P;'S#a;'S;=`$}<%lO#a~$RO^~~$URO;'S#a;'S;=`$_;=`O#a~$bXOY#aZw#awx#|x#O#a#O#P$R#P;'S#a;'S;=`$};=`<%l#a<%lO#a~%QP;=`<%l#a~%YOr~~%_Os~~%dOj~~%iOh~~%nOp~~%sPi~}!O%v~%{Tv~OY%vZ]%v^;'S%v;'S;=`&[<%lO%v~&_P;=`<%l%v~&gOq~~&lOk~~&qQ]~!O!P&w!Q![&l~&zP!Q![&}~'SP]~!Q![&}~'[Oo~~'aPf~!_!`'d~'iOd~~'nQg~!P!Q't!`!a(P~'wP!_!`'z~(POb~~(UOa~~(ZPe~!_!`(^~(cOc~~(fS!P!Q(r!Q![)j!c!}){#T#o)j~(uQ!c!}({#T#o)[~)OS!P!Q(r!Q![({!c!}({#T#o({~)aRT~!Q![)[#R#S)[#T#o)[~)oSV~!P!Q(r!Q![)j!c!})j#T#o)j~*QSS~!P!Q(r!Q![)j!c!}){#T#o)j~*cOX~~*hOY~~*mOm~~*pP#R#S*s~*xO[~~*}RZ~!Q![*x#R#S*x#T#o*x~+]Ot~~+`P!`!a+c~+hO`~~+mOu~",
 	tokenizers: [0],
 	topRules: { "Program": [0, 2] },
-	tokenPrec: 211
+	tokenPrec: 118
 });
 
 //#endregion
@@ -23038,6 +23038,7 @@ const parser = parser$1.configure({ props: [styleTags({
 	Wildcard: tags.special(tags.variableName),
 	Number: tags.number,
 	Text: tags.string,
+	LineComment: tags.lineComment,
 	Operator: tags.operator,
 	Pipe: tags.operator,
 	Arrow: tags.operator,
@@ -23061,11 +23062,40 @@ const parser = parser$1.configure({ props: [styleTags({
 	BracketRoundClose: tags.paren,
 	BracketCurlyOpen: tags.brace,
 	BracketCurlyClose: tags.brace,
-	LineComment: tags.lineComment,
-	"ObjectLiteral/BracketSquareOpen": tags.squareBracket,
-	"ObjectLiteral/BracketSquareClose": tags.squareBracket,
+	BracketSquareOpen: tags.squareBracket,
+	BracketSquareClose: tags.squareBracket,
 	"TaggedObject/PascalCase": tags.tagName
 })] });
+const modulePathSlashMark = Decoration.mark({ class: "cm-boon-module-slash" });
+const modulePathSlashHighlight = ViewPlugin.fromClass(class {
+	decorations;
+	constructor(view) {
+		this.decorations = this.buildDecorations(view);
+	}
+	update(update) {
+		if (update.docChanged || update.viewportChanged || update.treeChanged) this.decorations = this.buildDecorations(update.view);
+	}
+	buildDecorations(view) {
+		const builder = new RangeSetBuilder();
+		const { from, to } = view.viewport;
+		syntaxTree(view.state).iterate({
+			from,
+			to,
+			enter: (node) => {
+				if (node.name === "ModulePath") {
+					const text = view.state.doc.sliceString(node.from, node.to);
+					for (let index = text.indexOf("/"); index !== -1; index = text.indexOf("/", index + 1)) {
+						const position = node.from + index;
+						builder.add(position, position + 1, modulePathSlashMark);
+					}
+					return false;
+				}
+				return undefined;
+			}
+		});
+		return builder.finish();
+	}
+}, { decorations: (plugin) => plugin.decorations });
 const boonLanguage = LRLanguage.define({
 	parser,
 	languageData: {
@@ -23078,7 +23108,7 @@ const boonLanguage = LRLanguage.define({
 	}
 });
 function boon() {
-	return new LanguageSupport(boonLanguage);
+	return new LanguageSupport(boonLanguage, [modulePathSlashHighlight]);
 }
 
 //#endregion
@@ -23104,6 +23134,8 @@ const oneDarkTheme = EditorView.theme({
 		color: ivory,
 		backgroundColor: background
 	},
+	".cm-content span.cm-boon-module-slash": { color: "#ff9a44 !important" },
+	".cm-content span.cm-boon-module-slash > span": { color: "#ff9a44 !important" },
 	".cm-content": { caretColor: cursor },
 	".cm-cursor, .cm-dropCursor": { borderLeftColor: cursor },
 	"&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection": { backgroundColor: selection },

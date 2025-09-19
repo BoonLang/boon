@@ -15,10 +15,10 @@ Piece {
   | LineComment
 }
 
-@precedence { tag }
+@precedence { tag @cut }
 
 TaggedObject {
-  PascalCase !tag ObjectLiteral
+  !tag PascalCase ObjectLiteral
 }
 
 ObjectLiteral {

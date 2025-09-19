@@ -1,4 +1,6 @@
-import {LRLanguage, LanguageSupport} from "@codemirror/language"
+import {LRLanguage, LanguageSupport, syntaxTree} from "@codemirror/language"
+import {RangeSetBuilder} from "@codemirror/state"
+import {Decoration, EditorView, ViewPlugin, ViewUpdate} from "@codemirror/view"
 import {styleTags, tags as t} from "@lezer/highlight"
 import {parser as baseParser} from "./boon-parser"
 
@@ -12,6 +14,7 @@ const parser = baseParser.configure({
       Wildcard: t.special(t.variableName),
       Number: t.number,
       Text: t.string,
+      LineComment: t.lineComment,
       Operator: t.operator,
       Pipe: t.operator,
       Arrow: t.operator,
@@ -35,12 +38,52 @@ const parser = baseParser.configure({
       BracketRoundClose: t.paren,
       BracketCurlyOpen: t.brace,
       BracketCurlyClose: t.brace,
-      LineComment: t.lineComment,
-      'ObjectLiteral/BracketSquareOpen': t.squareBracket,
-      'ObjectLiteral/BracketSquareClose': t.squareBracket,
+      BracketSquareOpen: t.squareBracket,
+      BracketSquareClose: t.squareBracket,
       'TaggedObject/PascalCase': t.tagName
     })
   ]
+})
+
+const modulePathSlashMark = Decoration.mark({class: "cm-boon-module-slash"})
+
+const modulePathSlashHighlight = ViewPlugin.fromClass(class {
+  decorations
+
+  constructor(view: EditorView) {
+    this.decorations = this.buildDecorations(view)
+  }
+
+  update(update: ViewUpdate) {
+    if (update.docChanged || update.viewportChanged || update.treeChanged) {
+      this.decorations = this.buildDecorations(update.view)
+    }
+  }
+
+  buildDecorations(view: EditorView) {
+    const builder = new RangeSetBuilder<Decoration>()
+    const {from, to} = view.viewport
+
+    syntaxTree(view.state).iterate({
+      from,
+      to,
+      enter: node => {
+        if (node.name === "ModulePath") {
+          const text = view.state.doc.sliceString(node.from, node.to)
+          for (let index = text.indexOf('/') ; index !== -1 ; index = text.indexOf('/', index + 1)) {
+            const position = node.from + index
+            builder.add(position, position + 1, modulePathSlashMark)
+          }
+          return false
+        }
+        return undefined
+      }
+    })
+
+    return builder.finish()
+  }
+}, {
+  decorations: plugin => plugin.decorations
 })
 
 export const boonLanguage = LRLanguage.define({
@@ -52,5 +95,5 @@ export const boonLanguage = LRLanguage.define({
 })
 
 export function boon() {
-  return new LanguageSupport(boonLanguage)
+  return new LanguageSupport(boonLanguage, [modulePathSlashHighlight])
 }

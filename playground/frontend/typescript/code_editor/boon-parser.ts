@@ -2,8 +2,8 @@
 import {LRParser} from "@lezer/lr"
 export const parser = LRParser.deserialize({
   version: 14,
-  states: "!pQVQPOOO#VQPO'#CdO#^QPO'#C_OOQO'#Ck'#CkOOQO'#Cz'#CzOOQO'#C_'#C_OOQO'#DT'#DTQVQPOOOOQO,59O,59OO%dQPO,59OOOQO,58|,58|OOQO-E7R-E7ROOQO1G.j1G.j",
-  stateData: "%q~OPOS~OSTOTTOVQOXPOZTO[TO]TO^TO`ROaRObROcROdROeROfROgROhROiROjROkROlROmROoSOpSOqSOrSOsSOtSOuSOvTO~OYWO~PVOXPOSRXTRXVRXZRX[RX]RX^RX`RXaRXbRXcRXdRXeRXfRXgRXhRXiRXjRXkRXlRXmRXoRXpRXqRXrRXsRXtRXuRXvRXxRXYRX~OY[O~PVOTVviS~",
+  states: "!pQVQPOOO#VQPO'#CdO#^QPO'#CbOOQO'#Ck'#CkOOQO'#Cz'#CzOOQO'#C_'#C_OOQO'#DT'#DTQVQPOOOOQO,59O,59OO#cQPO,59OOOQO,58|,58|OOQO-E7R-E7ROOQO1G.j1G.j",
+  stateData: "#p~OPOS~OSTOTTOVQOXPOZTO[TO]TO^TO`ROaRObROcROdROeROfROgROhROiROjROkROlROmROoSOpSOqSOrSOsSOtSOuSOvTO~OYWO~PVOXPO~OY[O~PVOTVviS~",
   goto: "!jxPPPyPP!PP!VPPPPPP!PPPPPPPPPPPPPPP!PPPPPPPPP!`XUOPVXXTOPVXWTOPVXRYQQVOQXPTZVX",
   nodeNames: "⚠ WS Program Piece Keyword ModulePath TaggedObject PascalCase ObjectLiteral BracketSquareOpen BracketSquareClose SnakeCase Wildcard Number Text Operator Pipe Arrow NotEqual GreaterOrEqual LessOrEqual Greater Less Equal Plus Minus Asterisk Slash Percent Caret Punctuation Colon Comma Dot BracketRoundOpen BracketRoundClose BracketCurlyOpen BracketCurlyClose LineComment",
   maxTerm: 41,
@@ -12,5 +12,5 @@ export const parser = LRParser.deserialize({
   tokenData: "+m~RlXY!yYZ!y]^!ypq!yuv#[wx#axy%Tyz%Yz{%_{|%d|}%i}!O%n!O!P&b!P!Q&g!Q![&l![!]'V!^!_'[!_!`'i!`!a(U!c!}(c!}#O*^#P#Q*c#Q#R*h#R#S*m#T#o*x#o#p+W#p#q+]#q#r+h~#OSP~XY!yYZ!y]^!ypq!y~#aOl~~#dWOY#aZw#awx#|x#O#a#O#P$R#P;'S#a;'S;=`$}<%lO#a~$RO^~~$URO;'S#a;'S;=`$_;=`O#a~$bXOY#aZw#awx#|x#O#a#O#P$R#P;'S#a;'S;=`$};=`<%l#a<%lO#a~%QP;=`<%l#a~%YOr~~%_Os~~%dOj~~%iOh~~%nOp~~%sPi~}!O%v~%{Tv~OY%vZ]%v^;'S%v;'S;=`&[<%lO%v~&_P;=`<%l%v~&gOq~~&lOk~~&qQ]~!O!P&w!Q![&l~&zP!Q![&}~'SP]~!Q![&}~'[Oo~~'aPf~!_!`'d~'iOd~~'nQg~!P!Q't!`!a(P~'wP!_!`'z~(POb~~(UOa~~(ZPe~!_!`(^~(cOc~~(fS!P!Q(r!Q![)j!c!}){#T#o)j~(uQ!c!}({#T#o)[~)OS!P!Q(r!Q![({!c!}({#T#o({~)aRT~!Q![)[#R#S)[#T#o)[~)oSV~!P!Q(r!Q![)j!c!})j#T#o)j~*QSS~!P!Q(r!Q![)j!c!}){#T#o)j~*cOX~~*hOY~~*mOm~~*pP#R#S*s~*xO[~~*}RZ~!Q![*x#R#S*x#T#o*x~+]Ot~~+`P!`!a+c~+hO`~~+mOu~",
   tokenizers: [0],
   topRules: {"Program":[0,2]},
-  tokenPrec: 211
+  tokenPrec: 118
 })

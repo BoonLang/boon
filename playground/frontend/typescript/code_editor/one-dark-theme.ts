@@ -45,6 +45,13 @@ export const oneDarkTheme = EditorView.theme({
     backgroundColor: background,
   },
 
+  ".cm-content span.cm-boon-module-slash": {
+    color: "#ff9a44 !important",
+  },
+  ".cm-content span.cm-boon-module-slash > span": {
+    color: "#ff9a44 !important",
+  },
+
   ".cm-content": {
     caretColor: cursor,
   },
