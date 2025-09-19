@@ -52,7 +52,7 @@
   Text { "'" (![\\\n'] | "\\" _)* "'" }
   Number { @digit+ ("." @digit+)? }
   SnakeCaseIdentifier { $[a-z] $[a-z0-9_]* }
-  PascalCaseIdentifier { $[A-Z] $[a-z] $[A-Za-z0-9]* ![/] }
+  PascalCaseIdentifier { $[A-Z] $[a-z] $[A-Za-z0-9]* }
   Wildcard { "__" }
   WS { $[ \t\r]+ }
   Newline { "\n" }
@@ -60,7 +60,7 @@
 
 @skip { WS | LineComment }
 
-@precedence { modulePath @cut, PascalCaseIdentifier, LineComment, Minus }
+@precedence { modulePath @right, pascal, LineComment, Minus }
 
 ProgramItems {
   Newline* Item (Newline+ Item)* Newline*
@@ -154,7 +154,8 @@ UnaryExpr {
 }
 
 PostfixExpr {
-  PrimaryExpr CallSuffix*
+  ModulePathLiteral CallSuffix*
+  | PrimaryBase CallSuffix*
 }
 
 CallSuffix {
@@ -176,9 +177,8 @@ MultilineArguments {
 
 NamedArgument { SnakeCaseIdentifier Colon Expression }
 
-PrimaryExpr {
-  ModulePath
-  | PascalCaseIdentifier
+PrimaryBase {
+  !pascal PascalCaseIdentifier
   | Number
   | Text
   | Name
@@ -226,7 +226,7 @@ MapEntry {
   MapKey Colon Expression
 }
 
-MapKey { Text | Number | Name | ModulePath | PascalCaseIdentifier }
+MapKey { Text | Number | Name | ModulePathLiteral | PascalCaseIdentifier }
 
 ObjectLiteral {
   BracketSquareOpen BracketSquareClose
@@ -250,7 +250,7 @@ WhenExpr {
 
 WhenArm { WhenPattern Implies WhenBody }
 
-WhenPattern { Text | Number | Name | ModulePath | Wildcard }
+WhenPattern { Text | Number | Name | PascalCaseIdentifier | ModulePathLiteral | Wildcard }
 
 WhenBody { Block | Expression }
 
@@ -268,11 +268,15 @@ PassLiteral { "PASS" }
 
 Name { SnakeCaseIdentifier (Dot SnakeCaseIdentifier)* }
 
-ModulePath {
-  !modulePath PascalCaseIdentifier Slash ModulePathTail
+ModulePathLiteral {
+  ModulePathStart ModulePathTail
+}
+
+ModulePathStart {
+  PascalCaseIdentifier Slash
 }
 
 ModulePathTail {
-  !modulePath PascalCaseIdentifier Slash ModulePathTail
+  ModulePathStart ModulePathTail
   | SnakeCaseIdentifier
 }
