@@ -46,8 +46,11 @@ const parser = baseParser.configure({
 })
 
 const modulePathSlashMark = Decoration.mark({class: "cm-boon-module-slash"})
+const functionNameMark = Decoration.mark({class: "cm-boon-function-name"})
+const variableDefinitionMark = Decoration.mark({class: "cm-boon-variable-definition"})
+const dotMark = Decoration.mark({class: "cm-boon-dot"})
 
-const modulePathSlashHighlight = ViewPlugin.fromClass(class {
+const boonSemanticHighlight = ViewPlugin.fromClass(class {
   decorations
 
   constructor(view: EditorView) {
@@ -63,19 +66,77 @@ const modulePathSlashHighlight = ViewPlugin.fromClass(class {
   buildDecorations(view: EditorView) {
     const builder = new RangeSetBuilder<Decoration>()
     const {from, to} = view.viewport
+    let expectFunctionName = false
+    let pendingDefinition: {from: number, to: number} | null = null
 
     syntaxTree(view.state).iterate({
       from,
       to,
       enter: node => {
+        const text = view.state.doc.sliceString(node.from, node.to)
+
+        if (node.name === "Keyword") {
+          expectFunctionName = text === "FUNCTION"
+          pendingDefinition = null
+          return
+        }
+
+        if (node.name === "SnakeCase") {
+          if (expectFunctionName) {
+            builder.add(node.from, node.to, functionNameMark)
+            expectFunctionName = false
+            pendingDefinition = null
+          } else {
+            pendingDefinition = {from: node.from, to: node.to}
+          }
+          return
+        }
+
+        if (node.name === "Colon") {
+          if (pendingDefinition) {
+            builder.add(pendingDefinition.from, pendingDefinition.to, variableDefinitionMark)
+            pendingDefinition = null
+          }
+          expectFunctionName = false
+          return
+        }
+
         if (node.name === "ModulePath") {
-          const text = view.state.doc.sliceString(node.from, node.to)
           for (let index = text.indexOf('/') ; index !== -1 ; index = text.indexOf('/', index + 1)) {
             const position = node.from + index
             builder.add(position, position + 1, modulePathSlashMark)
           }
+          const lastSlash = text.lastIndexOf('/')
+          if (lastSlash !== -1 && lastSlash + 1 < text.length) {
+            const fnStart = node.from + lastSlash + 1
+            builder.add(fnStart, node.to, functionNameMark)
+          }
+          pendingDefinition = null
           return false
         }
+
+        if (node.name === "Dot") {
+          builder.add(node.from, node.to, dotMark)
+          pendingDefinition = null
+          expectFunctionName = false
+          return
+        }
+
+        if (
+          node.name === "WS" ||
+          node.name === "Punctuation" ||
+          node.name === "Piece" ||
+          node.name === "Program" ||
+          node.name === "ProgramItems" ||
+          node.name === "ObjectLiteral" ||
+          node.name === "ListLiteral" ||
+          node.name === "TaggedObject"
+        ) {
+          return
+        }
+
+        pendingDefinition = null
+        expectFunctionName = false
         return undefined
       }
     })
@@ -95,5 +156,5 @@ export const boonLanguage = LRLanguage.define({
 })
 
 export function boon() {
-  return new LanguageSupport(boonLanguage, [modulePathSlashHighlight])
+  return new LanguageSupport(boonLanguage, [boonSemanticHighlight])
 }

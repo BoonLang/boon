@@ -23067,7 +23067,10 @@ const parser = parser$1.configure({ props: [styleTags({
 	"TaggedObject/PascalCase": tags.tagName
 })] });
 const modulePathSlashMark = Decoration.mark({ class: "cm-boon-module-slash" });
-const modulePathSlashHighlight = ViewPlugin.fromClass(class {
+const functionNameMark = Decoration.mark({ class: "cm-boon-function-name" });
+const variableDefinitionMark = Decoration.mark({ class: "cm-boon-variable-definition" });
+const dotMark = Decoration.mark({ class: "cm-boon-dot" });
+const boonSemanticHighlight = ViewPlugin.fromClass(class {
 	decorations;
 	constructor(view) {
 		this.decorations = this.buildDecorations(view);
@@ -23078,18 +23081,59 @@ const modulePathSlashHighlight = ViewPlugin.fromClass(class {
 	buildDecorations(view) {
 		const builder = new RangeSetBuilder();
 		const { from, to } = view.viewport;
+		let expectFunctionName = false;
+		let pendingDefinition = null;
 		syntaxTree(view.state).iterate({
 			from,
 			to,
 			enter: (node) => {
+				const text = view.state.doc.sliceString(node.from, node.to);
+				if (node.name === "Keyword") {
+					expectFunctionName = text === "FUNCTION";
+					pendingDefinition = null;
+					return;
+				}
+				if (node.name === "SnakeCase") {
+					if (expectFunctionName) {
+						builder.add(node.from, node.to, functionNameMark);
+						expectFunctionName = false;
+						pendingDefinition = null;
+					} else pendingDefinition = {
+						from: node.from,
+						to: node.to
+					};
+					return;
+				}
+				if (node.name === "Colon") {
+					if (pendingDefinition) {
+						builder.add(pendingDefinition.from, pendingDefinition.to, variableDefinitionMark);
+						pendingDefinition = null;
+					}
+					expectFunctionName = false;
+					return;
+				}
 				if (node.name === "ModulePath") {
-					const text = view.state.doc.sliceString(node.from, node.to);
 					for (let index = text.indexOf("/"); index !== -1; index = text.indexOf("/", index + 1)) {
 						const position = node.from + index;
 						builder.add(position, position + 1, modulePathSlashMark);
 					}
+					const lastSlash = text.lastIndexOf("/");
+					if (lastSlash !== -1 && lastSlash + 1 < text.length) {
+						const fnStart = node.from + lastSlash + 1;
+						builder.add(fnStart, node.to, functionNameMark);
+					}
+					pendingDefinition = null;
 					return false;
 				}
+				if (node.name === "Dot") {
+					builder.add(node.from, node.to, dotMark);
+					pendingDefinition = null;
+					expectFunctionName = false;
+					return;
+				}
+				if (node.name === "WS" || node.name === "Punctuation" || node.name === "Piece" || node.name === "Program" || node.name === "ProgramItems" || node.name === "ObjectLiteral" || node.name === "ListLiteral" || node.name === "TaggedObject") return;
+				pendingDefinition = null;
+				expectFunctionName = false;
 				return undefined;
 			}
 		});
@@ -23108,7 +23152,7 @@ const boonLanguage = LRLanguage.define({
 	}
 });
 function boon() {
-	return new LanguageSupport(boonLanguage, [modulePathSlashHighlight]);
+	return new LanguageSupport(boonLanguage, [boonSemanticHighlight]);
 }
 
 //#endregion
@@ -23123,6 +23167,9 @@ const malibu = "#61afef";
 const sage = "#98c379";
 const whiskey = "#d19a66";
 const violet = "#c678dd";
+const mango = "#fcbf49";
+const scarlet = "#ff5c57";
+const blossom = "#ff6ec7";
 const darkBackground = "#21252b";
 const highlightBackground = "#2c313a";
 const background = "#282c34";
@@ -23134,8 +23181,26 @@ const oneDarkTheme = EditorView.theme({
 		color: ivory,
 		backgroundColor: background
 	},
-	".cm-content span.cm-boon-module-slash": { color: "#ff9a44 !important" },
-	".cm-content span.cm-boon-module-slash > span": { color: "#ff9a44 !important" },
+	".cm-content span.cm-boon-module-slash": {
+		color: `${scarlet} !important`,
+		fontWeight: "700"
+	},
+	".cm-content span.cm-boon-module-slash > span": {
+		color: `${scarlet} !important`,
+		fontWeight: "700"
+	},
+	".cm-content span.cm-boon-function-name": { color: `${mango} !important` },
+	".cm-content span.cm-boon-function-name > span": { color: `${mango} !important` },
+	".cm-content span.cm-boon-variable-definition": { color: `${blossom} !important` },
+	".cm-content span.cm-boon-variable-definition > span": { color: `${blossom} !important` },
+	".cm-content span.cm-boon-dot": {
+		color: `${scarlet} !important`,
+		fontWeight: "700"
+	},
+	".cm-content span.cm-boon-dot > span": {
+		color: `${scarlet} !important`,
+		fontWeight: "700"
+	},
 	".cm-content": { caretColor: cursor },
 	".cm-cursor, .cm-dropCursor": { borderLeftColor: cursor },
 	"&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection": { backgroundColor: selection },

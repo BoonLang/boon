@@ -13,6 +13,9 @@ const malibu = "#61afef"
 const sage = "#98c379"
 const whiskey = "#d19a66"
 const violet = "#c678dd"
+const mango = "#fcbf49"
+const scarlet = "#ff5c57"
+const blossom = "#ff6ec7"
 const darkBackground = "#21252b"
 const highlightBackground = "#2c313a"
 const background = "#282c34"
@@ -31,6 +34,9 @@ export const oneDarkColors = {
   sage,
   whiskey,
   violet,
+  mango,
+  scarlet,
+  blossom,
   darkBackground,
   highlightBackground,
   background,
@@ -46,10 +52,32 @@ export const oneDarkTheme = EditorView.theme({
   },
 
   ".cm-content span.cm-boon-module-slash": {
-    color: "#ff9a44 !important",
+    color: `${scarlet} !important`,
+    fontWeight: "700",
   },
   ".cm-content span.cm-boon-module-slash > span": {
-    color: "#ff9a44 !important",
+    color: `${scarlet} !important`,
+    fontWeight: "700",
+  },
+  ".cm-content span.cm-boon-function-name": {
+    color: `${mango} !important`,
+  },
+  ".cm-content span.cm-boon-function-name > span": {
+    color: `${mango} !important`,
+  },
+  ".cm-content span.cm-boon-variable-definition": {
+    color: `${blossom} !important`,
+  },
+  ".cm-content span.cm-boon-variable-definition > span": {
+    color: `${blossom} !important`,
+  },
+  ".cm-content span.cm-boon-dot": {
+    color: `${scarlet} !important`,
+    fontWeight: "700",
+  },
+  ".cm-content span.cm-boon-dot > span": {
+    color: `${scarlet} !important`,
+    fontWeight: "700",
   },
 
   ".cm-content": {
