@@ -1,37 +1,86 @@
-// Boon language grammar (structured for highlighting/lite parsing)
-// Enforced conventions:
-// 1. Module paths: PascalCase segments (each containing lowercase/digits) separated by '/', ending with a final '/snake_case'. Example: Foo/Bar/do_thing.
-// 2. PascalCase identifiers (standalone) also contain lowercase/digit, but no trailing slash.
-// 3. Functions: arguments are always named. Single line `(a: expr, b: expr)` uses commas. Multiline:
-//      Foo/bar(
-//        first: expr
-//        second: expr
-//      )
-//    No blank lines inside, closing paren on its own line.
-// 4. Lists/maps/objects: either single line comma-separated or multiline newline-separated blocks (no mixing).
-//      LIST { item_a, item_b }
-//      LIST {
-//        item_a
-//        item_b
-//      }
-//    Same for `MAP { key: expr }` and `[ named: expr ]`.
-// 5. Blocks (`{}`) are either empty, inline with a single statement, or multiline with one
-//    statement per line and the closing brace on its own line.
-// 6. Pipelines: `|>` must appear on the same line as the previous expression or directly at start of next line; no blank lines before it.
-// 7. Parentheses: blank line immediately after `(` or before `)` is not allowed unless there is an expression in between.
-// 8. Wildcard `__` is its own token. Comments (`--`) are skipped and not highlighted (limitation).
+@top Program { Piece* }
 
-@top Program { ProgramItems }
+Piece {
+  Keyword
+  | ModulePath
+  | TaggedObject
+  | ObjectLiteral
+  | PascalCase
+  | SnakeCase
+  | Wildcard
+  | Number
+  | Text
+  | Operator
+  | Punctuation
+  | LineComment
+}
+
+@precedence { tag }
+
+TaggedObject {
+  PascalCase !tag ObjectLiteral
+}
+
+ObjectLiteral {
+  BracketSquareOpen Piece* BracketSquareClose
+}
+
+Operator {
+  Pipe
+  | Arrow
+  | NotEqual
+  | GreaterOrEqual
+  | LessOrEqual
+  | Greater
+  | Less
+  | Equal
+  | Plus
+  | Minus
+  | Asterisk
+  | Slash
+  | Percent
+  | Caret
+}
+
+Punctuation {
+  Colon
+  | Comma
+  | Dot
+  | BracketRoundOpen
+  | BracketRoundClose
+  | BracketCurlyOpen
+  | BracketCurlyClose
+}
 
 @tokens {
+  Keyword { $[A-Z] $[A-Z]+ }
+  ModulePath { ($[A-Z] $[A-Za-z0-9]* '/')+ $[a-z] $[a-z0-9_]* }
+  PascalCase { $[A-Z] ($[A-Za-z0-9])* $[a-z0-9] ($[A-Za-z0-9])* }
+  SnakeCase { $[a-z] $[a-z0-9_]* }
+  Wildcard { "__" }
+  Number { $[0-9]+ ("." $[0-9]+)? }
+  Text { "'" (![\\\n'] | "\\" _)* "'" }
+  LineComment { "--" ![\n\r]* }
+
+  @precedence { ModulePath, PascalCase, Keyword }
+  @precedence { LineComment, Minus }
+
   Pipe { "|>" }
-  PipeBreak { "\n" $[ \t\r]* "|>" }
-  Implies { "=>" }
+  Arrow { "=>" }
   NotEqual { "=/=" }
   GreaterOrEqual { ">=" }
   LessOrEqual { "<=" }
+  Greater { ">" }
+  Less { "<" }
+  Equal { "=" }
+
+  Plus { "+" }
+  Minus { "-" }
+  Asterisk { "*" }
+  Slash { "/" }
   Percent { "%" }
   Caret { "^" }
+
   Colon { ":" }
   Comma { "," }
   Dot { "." }
@@ -41,242 +90,8 @@
   BracketCurlyClose { "}" }
   BracketSquareOpen { "[" }
   BracketSquareClose { "]" }
-  Greater { ">" }
-  Less { "<" }
-  Equal { "=" }
-  LineComment { "--" ![\n]* }
-  Plus { "+" }
-  Minus { "-" ![-] }
-  Asterisk { "*" }
-  Slash { "/" }
-  Text { "'" (![\\\n'] | "\\" _)* "'" }
-  Number { @digit+ ("." @digit+)? }
-  SnakeCaseIdentifier { $[a-z] $[a-z0-9_]* }
-  PascalCaseIdentifier { $[A-Z] $[a-z] $[A-Za-z0-9]* }
-  Wildcard { "__" }
-  WS { $[ \t\r]+ }
-  Newline { "\n" }
+
+  WS { $[ \t\n\r]+ }
 }
 
-@skip { WS | LineComment }
-
-@precedence { modulePath @right, pascal, LineComment, Minus }
-
-ProgramItems {
-  Newline* Item (Newline+ Item)* Newline*
-}
-
-Item {
-  FunctionDef
-  | Definition
-  | Expression
-}
-
-FunctionDef {
-  "FUNCTION" SnakeCaseIdentifier ParamList Block
-}
-
-ParamList {
-  BracketRoundOpen (ParamEntry (Comma ParamEntry)*)? BracketRoundClose
-}
-
-ParamEntry { SnakeCaseIdentifier }
-
-Block {
-  BracketCurlyOpen BracketCurlyClose
-  | BracketCurlyOpen Statement BracketCurlyClose
-  | BracketCurlyOpen BlockLines BracketCurlyClose
-}
-
-BlockLines {
-  Newline Statement (Newline Statement)* Newline
-}
-
-Statement {
-  Definition
-  | Expression
-}
-
-Definition { Name Colon Expression }
-
-Expression { PipeExpr }
-
-PipeExpr {
-  CompareExpr PipeTail*
-}
-
-PipeTail {
-  Pipe CompareExpr
-  | PipeBreak CompareExpr
-}
-
-CompareExpr {
-  AddExpr CompareTail*
-}
-
-CompareTail { CompareOperator AddExpr }
-
-CompareOperator {
-  Equal
-  | NotEqual
-  | GreaterOrEqual
-  | LessOrEqual
-  | Greater
-  | Less
-}
-
-AddExpr {
-  MulExpr AddTail*
-}
-
-AddTail { AddOperator MulExpr }
-
-AddOperator { Plus | Minus }
-
-MulExpr {
-  PowExpr MulTail*
-}
-
-MulTail { MulOperator PowExpr }
-
-MulOperator { Asterisk | Slash | Percent }
-
-PowExpr {
-  UnaryExpr PowTail?
-}
-
-PowTail { Caret UnaryExpr }
-
-UnaryExpr {
-  Minus UnaryExpr
-  | Plus UnaryExpr
-  | PostfixExpr
-}
-
-PostfixExpr {
-  ModulePathLiteral CallSuffix*
-  | PrimaryBase CallSuffix*
-}
-
-CallSuffix {
-  BracketRoundOpen CallArguments? BracketRoundClose
-}
-
-CallArguments {
-  NamedArgumentList
-  | MultilineArguments
-}
-
-NamedArgumentList {
-  NamedArgument (Comma NamedArgument)* Comma?
-}
-
-MultilineArguments {
-  Newline NamedArgument (Newline NamedArgument)* Newline?
-}
-
-NamedArgument { SnakeCaseIdentifier Colon Expression }
-
-PrimaryBase {
-  !pascal PascalCaseIdentifier
-  | Number
-  | Text
-  | Name
-  | Wildcard
-  | Parenthesized
-  | ListLiteral
-  | MapLiteral
-  | ObjectLiteral
-  | LatestExpr
-  | ThenExpr
-  | WhenExpr
-  | WhileExpr
-  | BlockExpr
-  | LinkExpr
-  | SkipLiteral
-  | PassLiteral
-}
-
-Parenthesized {
-  BracketRoundOpen BracketRoundClose
-  | BracketRoundOpen Expression BracketRoundClose
-}
-
-ListLiteral {
-  "LIST" BracketCurlyOpen BracketCurlyClose
-  | "LIST" BracketCurlyOpen ListCommaEntries BracketCurlyClose
-  | "LIST" BracketCurlyOpen Newline Expression (Newline Expression)* Newline? BracketCurlyClose
-}
-
-ListCommaEntries {
-  Expression (Comma Expression)* Comma?
-}
-
-MapLiteral {
-  "MAP" BracketCurlyOpen BracketCurlyClose
-  | "MAP" BracketCurlyOpen MapCommaEntries BracketCurlyClose
-  | "MAP" BracketCurlyOpen Newline MapEntry (Newline MapEntry)* Newline? BracketCurlyClose
-}
-
-MapCommaEntries {
-  MapEntry (Comma MapEntry)* Comma?
-}
-
-MapEntry {
-  MapKey Colon Expression
-}
-
-MapKey { Text | Number | Name | ModulePathLiteral | PascalCaseIdentifier }
-
-ObjectLiteral {
-  BracketSquareOpen BracketSquareClose
-  | BracketSquareOpen ObjectCommaEntries BracketSquareClose
-  | BracketSquareOpen Newline ObjectEntry (Newline ObjectEntry)* Newline? BracketSquareClose
-}
-
-ObjectCommaEntries {
-  ObjectEntry (Comma ObjectEntry)* Comma?
-}
-
-ObjectEntry { NamedArgument | Expression }
-
-LatestExpr { "LATEST" Block }
-ThenExpr { "THEN" Block }
-
-WhenExpr {
-  "WHEN" BracketCurlyOpen BracketCurlyClose
-  | "WHEN" BracketCurlyOpen Newline WhenArm (Newline WhenArm)* Newline? BracketCurlyClose
-}
-
-WhenArm { WhenPattern Implies WhenBody }
-
-WhenPattern { Text | Number | Name | PascalCaseIdentifier | ModulePathLiteral | Wildcard }
-
-WhenBody { Block | Expression }
-
-WhileExpr {
-  "WHILE" BracketCurlyOpen BracketCurlyClose
-  | "WHILE" BracketCurlyOpen Newline WhenArm (Newline WhenArm)* Newline? BracketCurlyClose
-}
-
-BlockExpr { "BLOCK" Block }
-
-LinkExpr { "LINK" | "LINK" BracketCurlyOpen Expression BracketCurlyClose }
-
-SkipLiteral { "SKIP" }
-PassLiteral { "PASS" }
-
-Name { SnakeCaseIdentifier (Dot SnakeCaseIdentifier)* }
-
-ModulePathLiteral {
-  ModulePathStart ModulePathTail
-}
-
-ModulePathStart {
-  PascalCaseIdentifier Slash
-}
-
-ModulePathTail {
-  ModulePathStart ModulePathTail
-  | SnakeCaseIdentifier
-}
+@skip { WS }

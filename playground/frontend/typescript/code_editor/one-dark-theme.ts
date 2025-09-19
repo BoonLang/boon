@@ -109,22 +109,21 @@ export const oneDarkTheme = EditorView.theme({
 
 export const oneDarkHighlightStyle = HighlightStyle.define([
   { tag: t.keyword, color: violet },
-  { tag: [t.name, t.deleted, t.character, t.propertyName, t.macroName], color: coral },
-  { tag: [t.function(t.variableName), t.labelName], color: malibu },
-  { tag: [t.color, t.constant(t.name), t.standard(t.name)], color: whiskey },
-  { tag: [t.definition(t.name), t.separator], color: ivory },
-  { tag: [t.typeName, t.className, t.number, t.changed, t.annotation, t.modifier, t.self], color: chalky },
-  // Module paths now use malibu instead of chalky so they stand out from PascalCase tags like True
   { tag: t.namespace, color: malibu },
-  { tag: [t.operator, t.operatorKeyword, t.url, t.escape, t.regexp, t.link, t.special(t.string)], color: cyan },
-  { tag: [t.meta, t.comment], color: stone },
+  { tag: t.tagName, color: coral },
+  { tag: t.typeName, color: chalky },
+  { tag: t.variableName, color: whiskey },
+  { tag: [t.operator, t.operatorKeyword, t.special(t.string)], color: cyan },
+  { tag: [t.separator, t.paren, t.brace, t.squareBracket], color: ivory },
+  { tag: t.number, color: chalky },
+  { tag: [t.string, t.processingInstruction, t.inserted], color: sage },
+  { tag: [t.lineComment, t.comment, t.meta], color: stone },
+  { tag: t.special(t.variableName), color: whiskey },
   { tag: t.strong, fontWeight: "bold" },
   { tag: t.emphasis, fontStyle: "italic" },
   { tag: t.strikethrough, textDecoration: "line-through" },
   { tag: t.link, color: stone, textDecoration: "underline" },
   { tag: t.heading, fontWeight: "bold", color: coral },
-  { tag: [t.atom, t.bool, t.special(t.variableName)], color: whiskey },
-  { tag: [t.processingInstruction, t.string, t.inserted], color: sage },
   { tag: t.invalid, color: invalid },
 ])
 
