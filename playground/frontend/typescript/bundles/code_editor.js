@@ -23197,7 +23197,7 @@ function boon() {
 }
 
 //#endregion
-//#region one-dark-theme.ts
+//#region boon-theme.ts
 const invalid = "#ffffff";
 const ivory = "#d9e1f2";
 const stone = "#5c6773";

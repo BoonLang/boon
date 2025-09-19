@@ -4,7 +4,7 @@ import { basicSetup } from 'codemirror'
 import { indentWithTab, defaultKeymap } from "@codemirror/commands"
 import { indentUnit } from "@codemirror/language"
 import { boon } from "./boon-language"
-import { oneDark } from "./one-dark-theme"
+import { oneDark } from "./boon-theme"
 
 export class CodeEditorController {
     constructor() {}
