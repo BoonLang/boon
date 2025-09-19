@@ -34,7 +34,7 @@ const parser = baseParser.configure({
       BracketSquareClose: t.squareBracket,
       'FUNCTION THEN WHEN WHILE LATEST BLOCK LINK SKIP PASS LIST MAP': t.keyword,
       'FunctionDef/SnakeCaseIdentifier': t.definition(t.function(t.variableName)),
-      'ParamEntry/SnakeCaseIdentifier': t.parameterName,
+      'ParamEntry/SnakeCaseIdentifier': t.local(t.variableName),
       'NamedArgument/SnakeCaseIdentifier': t.propertyName,
       'Definition/Name/SnakeCaseIdentifier': t.definition(t.variableName)
     })
