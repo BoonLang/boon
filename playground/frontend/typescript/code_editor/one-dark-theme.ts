@@ -3,19 +3,9 @@ import {Extension} from "@codemirror/state"
 import {HighlightStyle, syntaxHighlighting} from "@codemirror/language"
 import {tags as t} from "@lezer/highlight"
 
-const chalky = "#e5c07b"
-const coral = "#e06c75"
-const cyan = "#56b6c2"
 const invalid = "#ffffff"
-const ivory = "#abb2bf"
-const stone = "#7d8799"
-const malibu = "#61afef"
-const sage = "#98c379"
-const whiskey = "#d19a66"
-const violet = "#c678dd"
-const mango = "#fcbf49"
-const scarlet = "#ff5c57"
-const blossom = "#ff6ec7"
+const ivory = "#d9e1f2"
+const stone = "#5c6773"
 const darkBackground = "#21252b"
 const highlightBackground = "#2c313a"
 const background = "#282c34"
@@ -23,26 +13,45 @@ const tooltipBackground = "#353a42"
 const selection = "#3E4451"
 const cursor = "#528bff"
 
+const keywordWhite = "#f6f7fb"
+const namespaceBlue = "#6cb6ff"
+const tagGreen = "#6df59a"
+const typeLavender = "#6f9cff"
+const variableGray = "#b0bacd"
+const functionAmber = "#fcbf49"
+const definitionPink = "#ff6ec7"
+const operatorOrange = "#ff9f43"
+const stringGold = "#ffea7a"
+const numberAqua = "#78dce8"
+const wildcardViolet = "#bd93f9"
+const punctuationSnow = "#f5f7ff"
+const slashRed = "#ff5c57"
+const dotWhite = "#fdfdff"
+const commentGray = stone
+
 export const oneDarkColors = {
-  chalky,
-  coral,
-  cyan,
   invalid,
   ivory,
   stone,
-  malibu,
-  sage,
-  whiskey,
-  violet,
-  mango,
-  scarlet,
-  blossom,
   darkBackground,
   highlightBackground,
   background,
   tooltipBackground,
   selection,
   cursor,
+  keywordWhite,
+  namespaceBlue,
+  tagGreen,
+  typeLavender,
+  variableGray,
+  functionAmber,
+  definitionPink,
+  operatorOrange,
+  stringGold,
+  numberAqua,
+  wildcardViolet,
+  punctuationSnow,
+  slashRed,
 }
 
 export const oneDarkTheme = EditorView.theme({
@@ -52,31 +61,37 @@ export const oneDarkTheme = EditorView.theme({
   },
 
   ".cm-content span.cm-boon-module-slash": {
-    color: `${scarlet} !important`,
+    color: `${slashRed} !important`,
     fontWeight: "700",
   },
   ".cm-content span.cm-boon-module-slash > span": {
-    color: `${scarlet} !important`,
+    color: `${slashRed} !important`,
     fontWeight: "700",
   },
   ".cm-content span.cm-boon-function-name": {
-    color: `${mango} !important`,
+    color: `${functionAmber} !important`,
+    fontWeight: "600",
   },
   ".cm-content span.cm-boon-function-name > span": {
-    color: `${mango} !important`,
+    color: `${functionAmber} !important`,
+    fontWeight: "600",
   },
   ".cm-content span.cm-boon-variable-definition": {
-    color: `${blossom} !important`,
+    color: `${definitionPink} !important`,
+    fontStyle: "italic",
+    fontWeight: "600",
   },
   ".cm-content span.cm-boon-variable-definition > span": {
-    color: `${blossom} !important`,
+    color: `${definitionPink} !important`,
+    fontStyle: "italic",
+    fontWeight: "600",
   },
   ".cm-content span.cm-boon-dot": {
-    color: `${scarlet} !important`,
+    color: `${dotWhite} !important`,
     fontWeight: "700",
   },
   ".cm-content span.cm-boon-dot > span": {
-    color: `${scarlet} !important`,
+    color: `${dotWhite} !important`,
     fontWeight: "700",
   },
 
@@ -143,22 +158,22 @@ export const oneDarkTheme = EditorView.theme({
 }, { dark: true })
 
 export const oneDarkHighlightStyle = HighlightStyle.define([
-  { tag: t.keyword, color: violet },
-  { tag: t.namespace, color: malibu },
-  { tag: t.tagName, color: coral },
-  { tag: t.typeName, color: chalky },
-  { tag: t.variableName, color: whiskey },
-  { tag: [t.operator, t.operatorKeyword, t.special(t.string)], color: cyan },
-  { tag: [t.separator, t.paren, t.brace, t.squareBracket], color: ivory },
-  { tag: t.number, color: chalky },
-  { tag: [t.string, t.processingInstruction, t.inserted], color: sage },
-  { tag: [t.lineComment, t.comment, t.meta], color: stone },
-  { tag: t.special(t.variableName), color: whiskey },
+  { tag: t.keyword, color: keywordWhite },
+  { tag: t.namespace, color: namespaceBlue },
+  { tag: t.tagName, color: tagGreen },
+  { tag: t.typeName, color: typeLavender },
+  { tag: t.variableName, color: variableGray },
+  { tag: [t.operator, t.operatorKeyword], color: operatorOrange, fontWeight: "600" },
+  { tag: [t.separator, t.paren, t.brace, t.squareBracket], color: punctuationSnow, fontWeight: "700" },
+  { tag: t.number, color: numberAqua },
+  { tag: [t.string, t.processingInstruction, t.inserted], color: stringGold },
+  { tag: [t.lineComment, t.comment, t.meta], color: commentGray, fontStyle: "italic" },
+  { tag: t.special(t.variableName), color: wildcardViolet },
   { tag: t.strong, fontWeight: "bold" },
   { tag: t.emphasis, fontStyle: "italic" },
   { tag: t.strikethrough, textDecoration: "line-through" },
-  { tag: t.link, color: stone, textDecoration: "underline" },
-  { tag: t.heading, fontWeight: "bold", color: coral },
+  { tag: t.link, color: namespaceBlue, textDecoration: "underline" },
+  { tag: t.heading, fontWeight: "bold", color: keywordWhite },
   { tag: t.invalid, color: invalid },
 ])
 

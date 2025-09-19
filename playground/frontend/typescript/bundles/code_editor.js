@@ -23157,48 +23157,67 @@ function boon() {
 
 //#endregion
 //#region one-dark-theme.ts
-const chalky = "#e5c07b";
-const coral = "#e06c75";
-const cyan = "#56b6c2";
 const invalid = "#ffffff";
-const ivory = "#abb2bf";
-const stone = "#7d8799";
-const malibu = "#61afef";
-const sage = "#98c379";
-const whiskey = "#d19a66";
-const violet = "#c678dd";
-const mango = "#fcbf49";
-const scarlet = "#ff5c57";
-const blossom = "#ff6ec7";
+const ivory = "#d9e1f2";
+const stone = "#5c6773";
 const darkBackground = "#21252b";
 const highlightBackground = "#2c313a";
 const background = "#282c34";
 const tooltipBackground = "#353a42";
 const selection = "#3E4451";
 const cursor = "#528bff";
+const keywordWhite = "#f6f7fb";
+const namespaceBlue = "#6cb6ff";
+const tagGreen = "#6df59a";
+const typeLavender = "#6f9cff";
+const variableGray = "#b0bacd";
+const functionAmber = "#fcbf49";
+const definitionPink = "#ff6ec7";
+const operatorOrange = "#ff9f43";
+const stringGold = "#ffea7a";
+const numberAqua = "#78dce8";
+const wildcardViolet = "#bd93f9";
+const punctuationSnow = "#f5f7ff";
+const slashRed = "#ff5c57";
+const dotWhite = "#fdfdff";
+const commentGray = stone;
 const oneDarkTheme = EditorView.theme({
 	"&": {
 		color: ivory,
 		backgroundColor: background
 	},
 	".cm-content span.cm-boon-module-slash": {
-		color: `${scarlet} !important`,
+		color: `${slashRed} !important`,
 		fontWeight: "700"
 	},
 	".cm-content span.cm-boon-module-slash > span": {
-		color: `${scarlet} !important`,
+		color: `${slashRed} !important`,
 		fontWeight: "700"
 	},
-	".cm-content span.cm-boon-function-name": { color: `${mango} !important` },
-	".cm-content span.cm-boon-function-name > span": { color: `${mango} !important` },
-	".cm-content span.cm-boon-variable-definition": { color: `${blossom} !important` },
-	".cm-content span.cm-boon-variable-definition > span": { color: `${blossom} !important` },
+	".cm-content span.cm-boon-function-name": {
+		color: `${functionAmber} !important`,
+		fontWeight: "600"
+	},
+	".cm-content span.cm-boon-function-name > span": {
+		color: `${functionAmber} !important`,
+		fontWeight: "600"
+	},
+	".cm-content span.cm-boon-variable-definition": {
+		color: `${definitionPink} !important`,
+		fontStyle: "italic",
+		fontWeight: "600"
+	},
+	".cm-content span.cm-boon-variable-definition > span": {
+		color: `${definitionPink} !important`,
+		fontStyle: "italic",
+		fontWeight: "600"
+	},
 	".cm-content span.cm-boon-dot": {
-		color: `${scarlet} !important`,
+		color: `${dotWhite} !important`,
 		fontWeight: "700"
 	},
 	".cm-content span.cm-boon-dot > span": {
-		color: `${scarlet} !important`,
+		color: `${dotWhite} !important`,
 		fontWeight: "700"
 	},
 	".cm-content": { caretColor: cursor },
@@ -23249,31 +23268,28 @@ const oneDarkTheme = EditorView.theme({
 const oneDarkHighlightStyle = HighlightStyle.define([
 	{
 		tag: tags.keyword,
-		color: violet
+		color: keywordWhite
 	},
 	{
 		tag: tags.namespace,
-		color: malibu
+		color: namespaceBlue
 	},
 	{
 		tag: tags.tagName,
-		color: coral
+		color: tagGreen
 	},
 	{
 		tag: tags.typeName,
-		color: chalky
+		color: typeLavender
 	},
 	{
 		tag: tags.variableName,
-		color: whiskey
+		color: variableGray
 	},
 	{
-		tag: [
-			tags.operator,
-			tags.operatorKeyword,
-			tags.special(tags.string)
-		],
-		color: cyan
+		tag: [tags.operator, tags.operatorKeyword],
+		color: operatorOrange,
+		fontWeight: "600"
 	},
 	{
 		tag: [
@@ -23282,11 +23298,12 @@ const oneDarkHighlightStyle = HighlightStyle.define([
 			tags.brace,
 			tags.squareBracket
 		],
-		color: ivory
+		color: punctuationSnow,
+		fontWeight: "700"
 	},
 	{
 		tag: tags.number,
-		color: chalky
+		color: numberAqua
 	},
 	{
 		tag: [
@@ -23294,7 +23311,7 @@ const oneDarkHighlightStyle = HighlightStyle.define([
 			tags.processingInstruction,
 			tags.inserted
 		],
-		color: sage
+		color: stringGold
 	},
 	{
 		tag: [
@@ -23302,11 +23319,12 @@ const oneDarkHighlightStyle = HighlightStyle.define([
 			tags.comment,
 			tags.meta
 		],
-		color: stone
+		color: commentGray,
+		fontStyle: "italic"
 	},
 	{
 		tag: tags.special(tags.variableName),
-		color: whiskey
+		color: wildcardViolet
 	},
 	{
 		tag: tags.strong,
@@ -23322,13 +23340,13 @@ const oneDarkHighlightStyle = HighlightStyle.define([
 	},
 	{
 		tag: tags.link,
-		color: stone,
+		color: namespaceBlue,
 		textDecoration: "underline"
 	},
 	{
 		tag: tags.heading,
 		fontWeight: "bold",
-		color: coral
+		color: keywordWhite
 	},
 	{
 		tag: tags.invalid,
