@@ -47,13 +47,13 @@ export class CodeEditorController {
     set_snippet_screenshot_mode(mode: boolean) {
         const basic_editor_style = EditorView.theme({
             ".cm-content, .cm-gutter": { minHeight: "200px" },
-            ".cm-content": { "font-family": "Fira Code" },
+            ".cm-content": { "font-family": "'JetBrains Mono', monospace", fontFeatureSettings: "'zero' 1" },
         });
         // https://codemirror.net/examples/styling/
         const snippet_screenshot_mode_editor_style = EditorView.theme({
             ".cm-content, .cm-gutter": { minHeight: "200px" },
             ".cm-content": { 
-                "font-family": "Fira Code", 
+                "font-family": "'JetBrains Mono', monospace", 
                 paddingTop: "22px", 
                 paddingBottom: "20px", 
             },

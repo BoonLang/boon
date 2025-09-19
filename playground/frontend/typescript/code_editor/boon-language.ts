@@ -69,6 +69,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
     const {from, to} = view.viewport
     let expectFunctionName = false
     let pendingDefinition: {from: number, to: number} | null = null
+    let pendingFunctionCall: {from: number, to: number} | null = null
 
     syntaxTree(view.state).iterate({
       from,
@@ -79,6 +80,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
         if (node.name === "Keyword") {
           expectFunctionName = text === "FUNCTION"
           pendingDefinition = null
+          pendingFunctionCall = null
           return
         }
 
@@ -87,8 +89,10 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
             builder.add(node.from, node.to, functionNameMark)
             expectFunctionName = false
             pendingDefinition = null
+            pendingFunctionCall = null
           } else {
             pendingDefinition = {from: node.from, to: node.to}
+            pendingFunctionCall = {from: node.from, to: node.to}
           }
           return
         }
@@ -99,6 +103,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
             pendingDefinition = null
           }
           expectFunctionName = false
+          pendingFunctionCall = null
           return
         }
 
@@ -113,6 +118,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
             builder.add(fnStart, node.to, functionNameMark)
           }
           pendingDefinition = null
+          pendingFunctionCall = null
           return false
         }
 
@@ -120,6 +126,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
           builder.add(node.from, node.to, dotMark)
           pendingDefinition = null
           expectFunctionName = false
+          pendingFunctionCall = null
           return
         }
 
@@ -130,7 +137,18 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
           }
           pendingDefinition = null
           expectFunctionName = false
+          pendingFunctionCall = null
           return false
+        }
+
+        if (node.name === "BracketRoundOpen") {
+          if (pendingFunctionCall) {
+            builder.add(pendingFunctionCall.from, pendingFunctionCall.to, functionNameMark)
+            pendingFunctionCall = null
+            pendingDefinition = null
+          }
+          expectFunctionName = false
+          return
         }
 
         if (
@@ -148,6 +166,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 
         pendingDefinition = null
         expectFunctionName = false
+        pendingFunctionCall = null
         return undefined
       }
     })

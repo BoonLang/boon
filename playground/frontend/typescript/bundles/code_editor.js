@@ -23084,6 +23084,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 		const { from, to } = view.viewport;
 		let expectFunctionName = false;
 		let pendingDefinition = null;
+		let pendingFunctionCall = null;
 		syntaxTree(view.state).iterate({
 			from,
 			to,
@@ -23092,6 +23093,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 				if (node.name === "Keyword") {
 					expectFunctionName = text === "FUNCTION";
 					pendingDefinition = null;
+					pendingFunctionCall = null;
 					return;
 				}
 				if (node.name === "SnakeCase") {
@@ -23099,10 +23101,17 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 						builder.add(node.from, node.to, functionNameMark);
 						expectFunctionName = false;
 						pendingDefinition = null;
-					} else pendingDefinition = {
-						from: node.from,
-						to: node.to
-					};
+						pendingFunctionCall = null;
+					} else {
+						pendingDefinition = {
+							from: node.from,
+							to: node.to
+						};
+						pendingFunctionCall = {
+							from: node.from,
+							to: node.to
+						};
+					}
 					return;
 				}
 				if (node.name === "Colon") {
@@ -23111,6 +23120,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 						pendingDefinition = null;
 					}
 					expectFunctionName = false;
+					pendingFunctionCall = null;
 					return;
 				}
 				if (node.name === "ModulePath") {
@@ -23124,12 +23134,14 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 						builder.add(fnStart, node.to, functionNameMark);
 					}
 					pendingDefinition = null;
+					pendingFunctionCall = null;
 					return false;
 				}
 				if (node.name === "Dot") {
 					builder.add(node.from, node.to, dotMark);
 					pendingDefinition = null;
 					expectFunctionName = false;
+					pendingFunctionCall = null;
 					return;
 				}
 				if (node.name === "Text") {
@@ -23139,11 +23151,22 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 					}
 					pendingDefinition = null;
 					expectFunctionName = false;
+					pendingFunctionCall = null;
 					return false;
+				}
+				if (node.name === "BracketRoundOpen") {
+					if (pendingFunctionCall) {
+						builder.add(pendingFunctionCall.from, pendingFunctionCall.to, functionNameMark);
+						pendingFunctionCall = null;
+						pendingDefinition = null;
+					}
+					expectFunctionName = false;
+					return;
 				}
 				if (node.name === "WS" || node.name === "Punctuation" || node.name === "Piece" || node.name === "Program" || node.name === "ProgramItems" || node.name === "ObjectLiteral" || node.name === "ListLiteral" || node.name === "TaggedObject") return;
 				pendingDefinition = null;
 				expectFunctionName = false;
+				pendingFunctionCall = null;
 				return undefined;
 			}
 		});
@@ -23411,12 +23434,15 @@ var CodeEditorController = class {
 	set_snippet_screenshot_mode(mode) {
 		const basic_editor_style = EditorView.theme({
 			".cm-content, .cm-gutter": { minHeight: "200px" },
-			".cm-content": { "font-family": "Fira Code" }
+			".cm-content": {
+				"font-family": "'JetBrains Mono', monospace",
+				fontFeatureSettings: "'zero' 1"
+			}
 		});
 		const snippet_screenshot_mode_editor_style = EditorView.theme({
 			".cm-content, .cm-gutter": { minHeight: "200px" },
 			".cm-content": {
-				"font-family": "Fira Code",
+				"font-family": "'JetBrains Mono', monospace",
 				paddingTop: "22px",
 				paddingBottom: "20px"
 			},
