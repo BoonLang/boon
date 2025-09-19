@@ -50,6 +50,7 @@ const functionNameMark = Decoration.mark({class: "cm-boon-function-name"})
 const variableDefinitionMark = Decoration.mark({class: "cm-boon-variable-definition"})
 const dotMark = Decoration.mark({class: "cm-boon-dot"})
 const apostropheMark = Decoration.mark({class: "cm-boon-apostrophe"})
+const pipeMark = Decoration.mark({class: "cm-boon-pipe"})
 
 const boonSemanticHighlight = ViewPlugin.fromClass(class {
   decorations
@@ -139,6 +140,14 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
           expectFunctionName = false
           pendingFunctionCall = null
           return false
+        }
+
+        if (node.name === "Pipe" || node.name === "PipeBreak") {
+          builder.add(node.from, node.to, pipeMark)
+          pendingDefinition = null
+          expectFunctionName = false
+          pendingFunctionCall = null
+          return
         }
 
         if (node.name === "BracketRoundOpen") {

@@ -13,7 +13,7 @@ const tooltipBackground = "#353a42"
 const selection = "#3E4451"
 const cursor = "#528bff"
 
-const keywordChocolate = "chocolate"
+const chocolate = "chocolate"
 const namespaceBlue = "#6cb6ff"
 const tagGreen = "#6df59a"
 const typeLavender = "#6f9cff"
@@ -21,8 +21,8 @@ const variableWhite = "#eeeeee"
 const functionAmber = "#fcbf49"
 const definitionPink = "#ff6ec7"
 const operatorOrange = "#ff9f43"
-const stringGold = "#ffea7a"
-const numberAqua = "#ff66ff"
+const stringGold = "#fff59e"
+const numberBlue = "#7ad1ff"
 const wildcardViolet = "#bd93f9"
 const punctuationSnow = "#f5f7ff"
 const slashRed = "#ff5c57"
@@ -39,7 +39,7 @@ export const oneDarkColors = {
   tooltipBackground,
   selection,
   cursor,
-  keywordChocolate,
+  chocolate,
   namespaceBlue,
   tagGreen,
   typeLavender,
@@ -48,7 +48,7 @@ export const oneDarkColors = {
   definitionPink,
   operatorOrange,
   stringGold,
-  numberAqua,
+  numberBlue,
   wildcardViolet,
   punctuationSnow,
   slashRed,
@@ -62,11 +62,11 @@ export const oneDarkTheme = EditorView.theme({
   },
 
   ".cm-content span.cm-boon-module-slash": {
-    color: `${slashRed} !important`,
+    color: `${chocolate} !important`,
     fontWeight: "700",
   },
   ".cm-content span.cm-boon-module-slash > span": {
-    color: `${slashRed} !important`,
+    color: `${chocolate} !important`,
     fontWeight: "700",
   },
   ".cm-content span.cm-boon-function-name": {
@@ -88,19 +88,27 @@ export const oneDarkTheme = EditorView.theme({
     fontWeight: "600",
   },
   ".cm-content span.cm-boon-dot": {
-    color: `${dotRed} !important`,
+    color: `${chocolate} !important`,
     fontWeight: "700",
   },
   ".cm-content span.cm-boon-dot > span": {
-    color: `${dotRed} !important`,
+    color: `${chocolate} !important`,
     fontWeight: "700",
   },
   ".cm-content span.cm-boon-apostrophe": {
-    color: `${punctuationSnow} !important`,
+    color: `${chocolate} !important`,
     fontWeight: "700",
   },
   ".cm-content span.cm-boon-apostrophe > span": {
-    color: `${punctuationSnow} !important`,
+    color: `${chocolate} !important`,
+    fontWeight: "700",
+  },
+  ".cm-content span.cm-boon-pipe": {
+    color: `${chocolate} !important`,
+    fontWeight: "700",
+  },
+  ".cm-content span.cm-boon-pipe > span": {
+    color: `${chocolate} !important`,
     fontWeight: "700",
   },
 
@@ -167,22 +175,22 @@ export const oneDarkTheme = EditorView.theme({
 }, { dark: true })
 
 export const oneDarkHighlightStyle = HighlightStyle.define([
-  { tag: t.keyword, color: keywordChocolate, fontStyle: "italic", fontWeight: "bolder" },
+  { tag: t.keyword, color: chocolate, fontStyle: "italic", fontWeight: "bolder" },
   { tag: t.namespace, color: namespaceBlue },
   { tag: t.tagName, color: tagGreen },
   { tag: t.typeName, color: typeLavender },
   { tag: t.variableName, color: variableWhite },
   { tag: [t.operator, t.operatorKeyword], color: operatorOrange, fontWeight: "600" },
-  { tag: [t.separator, t.paren, t.brace, t.squareBracket], color: punctuationSnow, fontWeight: "700" },
-  { tag: t.number, color: numberAqua },
+  { tag: [t.separator, t.paren, t.brace, t.squareBracket], color: chocolate, fontWeight: "700" },
+  { tag: t.number, color: numberBlue },
   { tag: [t.string, t.processingInstruction, t.inserted], color: stringGold },
   { tag: [t.lineComment, t.comment, t.meta], color: commentGray, fontStyle: "italic" },
-  { tag: t.special(t.variableName), color: wildcardViolet },
+  { tag: t.special(t.variableName), color: chocolate },
   { tag: t.strong, fontWeight: "bold" },
   { tag: t.emphasis, fontStyle: "italic" },
   { tag: t.strikethrough, textDecoration: "line-through" },
   { tag: t.link, color: namespaceBlue, textDecoration: "underline" },
-  { tag: t.heading, fontWeight: "bold", color: keywordChocolate },
+  { tag: t.heading, fontWeight: "bold", color: chocolate },
   { tag: t.invalid, color: invalid },
 ])
 

@@ -23071,6 +23071,7 @@ const functionNameMark = Decoration.mark({ class: "cm-boon-function-name" });
 const variableDefinitionMark = Decoration.mark({ class: "cm-boon-variable-definition" });
 const dotMark = Decoration.mark({ class: "cm-boon-dot" });
 const apostropheMark = Decoration.mark({ class: "cm-boon-apostrophe" });
+const pipeMark = Decoration.mark({ class: "cm-boon-pipe" });
 const boonSemanticHighlight = ViewPlugin.fromClass(class {
 	decorations;
 	constructor(view) {
@@ -23154,6 +23155,13 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 					pendingFunctionCall = null;
 					return false;
 				}
+				if (node.name === "Pipe" || node.name === "PipeBreak") {
+					builder.add(node.from, node.to, pipeMark);
+					pendingDefinition = null;
+					expectFunctionName = false;
+					pendingFunctionCall = null;
+					return;
+				}
 				if (node.name === "BracketRoundOpen") {
 					if (pendingFunctionCall) {
 						builder.add(pendingFunctionCall.from, pendingFunctionCall.to, functionNameMark);
@@ -23199,7 +23207,7 @@ const background = "#282c34";
 const tooltipBackground = "#353a42";
 const selection = "#3E4451";
 const cursor = "#528bff";
-const keywordChocolate = "chocolate";
+const chocolate = "chocolate";
 const namespaceBlue = "#6cb6ff";
 const tagGreen = "#6df59a";
 const typeLavender = "#6f9cff";
@@ -23207,12 +23215,8 @@ const variableWhite = "#eeeeee";
 const functionAmber = "#fcbf49";
 const definitionPink = "#ff6ec7";
 const operatorOrange = "#ff9f43";
-const stringGold = "#ffea7a";
-const numberAqua = "#ff66ff";
-const wildcardViolet = "#bd93f9";
-const punctuationSnow = "#f5f7ff";
-const slashRed = "#ff5c57";
-const dotRed = "#ff0000";
+const stringGold = "#fff59e";
+const numberBlue = "#7ad1ff";
 const commentGray = "lightslategray";
 const oneDarkTheme = EditorView.theme({
 	"&": {
@@ -23220,11 +23224,11 @@ const oneDarkTheme = EditorView.theme({
 		backgroundColor: background
 	},
 	".cm-content span.cm-boon-module-slash": {
-		color: `${slashRed} !important`,
+		color: `${chocolate} !important`,
 		fontWeight: "700"
 	},
 	".cm-content span.cm-boon-module-slash > span": {
-		color: `${slashRed} !important`,
+		color: `${chocolate} !important`,
 		fontWeight: "700"
 	},
 	".cm-content span.cm-boon-function-name": {
@@ -23246,19 +23250,27 @@ const oneDarkTheme = EditorView.theme({
 		fontWeight: "600"
 	},
 	".cm-content span.cm-boon-dot": {
-		color: `${dotRed} !important`,
+		color: `${chocolate} !important`,
 		fontWeight: "700"
 	},
 	".cm-content span.cm-boon-dot > span": {
-		color: `${dotRed} !important`,
+		color: `${chocolate} !important`,
 		fontWeight: "700"
 	},
 	".cm-content span.cm-boon-apostrophe": {
-		color: `${punctuationSnow} !important`,
+		color: `${chocolate} !important`,
 		fontWeight: "700"
 	},
 	".cm-content span.cm-boon-apostrophe > span": {
-		color: `${punctuationSnow} !important`,
+		color: `${chocolate} !important`,
+		fontWeight: "700"
+	},
+	".cm-content span.cm-boon-pipe": {
+		color: `${chocolate} !important`,
+		fontWeight: "700"
+	},
+	".cm-content span.cm-boon-pipe > span": {
+		color: `${chocolate} !important`,
 		fontWeight: "700"
 	},
 	".cm-content": { caretColor: cursor },
@@ -23309,7 +23321,7 @@ const oneDarkTheme = EditorView.theme({
 const oneDarkHighlightStyle = HighlightStyle.define([
 	{
 		tag: tags.keyword,
-		color: keywordChocolate,
+		color: chocolate,
 		fontStyle: "italic",
 		fontWeight: "bolder"
 	},
@@ -23341,12 +23353,12 @@ const oneDarkHighlightStyle = HighlightStyle.define([
 			tags.brace,
 			tags.squareBracket
 		],
-		color: punctuationSnow,
+		color: chocolate,
 		fontWeight: "700"
 	},
 	{
 		tag: tags.number,
-		color: numberAqua
+		color: numberBlue
 	},
 	{
 		tag: [
@@ -23367,7 +23379,7 @@ const oneDarkHighlightStyle = HighlightStyle.define([
 	},
 	{
 		tag: tags.special(tags.variableName),
-		color: wildcardViolet
+		color: chocolate
 	},
 	{
 		tag: tags.strong,
@@ -23389,7 +23401,7 @@ const oneDarkHighlightStyle = HighlightStyle.define([
 	{
 		tag: tags.heading,
 		fontWeight: "bold",
-		color: keywordChocolate
+		color: chocolate
 	},
 	{
 		tag: tags.invalid,
