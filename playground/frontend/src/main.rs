@@ -104,7 +104,7 @@ impl Playground {
         Self {
             source_code,
             run_command: Mutable::new(None),
-            snippet_screenshot_mode: Mutable::new(false),
+            snippet_screenshot_mode: Mutable::new(true),
             panel_split_ratio,
             panel_container_width: Mutable::new(0),
             is_dragging_panel_split: Mutable::new(false),
@@ -409,39 +409,179 @@ impl Playground {
             })
     }
 
-    fn code_editor_panel(&self) -> impl Element {
+    fn code_editor_panel(&self) -> impl Element + use<> {
+        El::new()
+            .s(Height::fill())
+            .child_signal(self.snippet_screenshot_mode.signal().map_bool(
+            {
+                let this = self.clone();
+                move || Some(Either::Left(this.snippet_screenshot_surface()))
+            },
+            {
+                let this = self.clone();
+                move || Some(Either::Right(this.standard_code_editor_surface()))
+            },
+        ))
+    }
+
+    fn standard_code_editor_surface(&self) -> impl Element + use<> {
         El::new()
             .s(Align::new().top())
             .s(Width::fill())
             .s(Height::fill())
-            .s(Padding::all_signal(self.snippet_screenshot_mode.signal().map_bool(|| 100, || 5)))
-            .s(Scrollbars::both())
+            .s(Padding::all(12))
             .child(
-                CodeEditor::new()
-                    .s(RoundedCorners::all(10))
-                    .s(Scrollbars::both())
-                    .on_key_down_event_with_options(
-                        EventOptions::new().preventable().parents_first(),
-                        {
-                            let run_command = self.run_command.clone();
-                            move |keyboard_event| {
-                                let RawKeyboardEvent::KeyDown(raw_event) =
-                                    &keyboard_event.raw_event;
-                                if keyboard_event.key() == &Key::Enter && raw_event.shift_key() {
-                                    keyboard_event.pass_to_parent(false);
-                                    raw_event.prevent_default();
-                                    run_command.set(Some(RunCommand { filename: None }));
-                                }
-                            }
-                        },
-                    )
-                    .content_signal(self.source_code.signal_cloned())
-                    .snippet_screenshot_mode_signal(self.snippet_screenshot_mode.signal())
-                    .on_change({
-                        let source_code = self.source_code.clone();
-                        move |content| source_code.set_neq(Rc::new(Cow::from(content)))
-                    }),
+                self.code_editor_widget()
+                    .s(RoundedCorners::all(12))
             )
+    }
+
+    fn snippet_screenshot_surface(&self) -> impl Element + use<> {
+        Stack::new()
+            .s(Width::fill())
+            .s(Height::fill())
+            .s(Align::new().center_x().top())
+            .s(Padding::new().left(48).right(48).top(64).bottom(64))
+            .update_raw_el(|raw_el| {
+                raw_el.style(
+                    "background",
+                    "radial-gradient(120% 120% at 10% 0%, rgba(255,255,255,0.25) 0%, rgba(255,255,255,0) 40%), linear-gradient(135deg, #7c3aed 0%, #4f46e5 40%, #0ea5e9 80%, #14b8a6 100%)",
+                )
+            })
+            .layer(
+                Stack::new()
+                    .s(Align::center())
+                    .s(Width::fill().max(960))
+                    .s(Height::fill())
+                    .s(Background::new().color(color!("rgba(11, 18, 35, 0.78)")))
+                    .s(Shadows::new([
+                        Shadow::new().color(color!("rgba(12, 16, 35, 0.55)")).y(40).blur(70),
+                        Shadow::new().color(color!("rgba(91, 33, 182, 0.35)")).y(18).blur(36),
+                    ]))
+                    .s(RoundedCorners::all(28))
+                    .s(Clip::both())
+                    .s(Borders::all(
+                        Border::new().color(color!("rgba(255, 255, 255, 0.05)")).width(1),
+                    ))
+                    .update_raw_el(|raw_el| raw_el.style("backdrop-filter", "blur(28px)"))
+                    .layer(
+                        Column::new()
+                            .s(Width::fill())
+                            .s(Height::fill())
+                            .item(self.snippet_window_header())
+                            .item(
+                                Stack::new()
+                                    .s(Width::fill())
+                                    .s(Height::fill())
+                                    .s(Height::fill())
+                                    .s(Padding::new().bottom(40))
+                                    .s(Background::new().color(color!("#101a2c")))
+                                    .layer(
+                                        El::new()
+                                            .s(Width::fill())
+                                            .s(Height::fill())
+                                            .pointer_handling(PointerHandling::none())
+                                            .update_raw_el(|raw_el| {
+                                                raw_el.style(
+                                                    "background",
+                                                    "radial-gradient(140% 140% at 20% 10%, rgba(48,72,112,0.18) 0%, rgba(16,26,44,0.0) 65%)",
+                                                )
+                                            })
+                                    )
+                                    .layer(
+                                        El::new()
+                                            .s(Width::fill())
+                                            .s(Height::fill())
+                                            .s(Padding::new().x(28).y(24))
+                                            .s(Scrollbars::both())
+                                            .child(
+                                                self.code_editor_widget()
+                                                    .s(RoundedCorners::all(20))
+                                                    .s(Clip::both())
+                                                    .s(Height::fill())
+                                                    .s(Scrollbars::both())
+                                                    .update_raw_el(|raw_el| {
+                                                        raw_el.style(
+                                                            "background",
+                                                            "linear-gradient(120deg, rgba(24,32,52,0.28) 0%, rgba(8,10,18,0.92) 65%)",
+                                                        )
+                                                    })
+                                                    .s(Background::new().color(color!("#0b1223")))
+                                                    .s(Shadows::new([
+                                                        Shadow::new()
+                                                            .color(color!("rgba(0, 0, 0, 0.25)"))
+                                                            .y(22)
+                                                            .blur(46),
+                                                    ]))
+                                            ),
+                                    )
+                                    .layer(
+                                        El::new()
+                                            .s(Width::fill())
+                                            .s(Height::fill())
+                                            .pointer_handling(PointerHandling::none())
+                                            .s(Background::new().color(color!("rgba(0, 0, 0, 0.18)")))
+                                    )
+                            ),
+                    ),
+            )
+    }
+
+    fn snippet_window_header(&self) -> impl Element {
+        Stack::new()
+            .s(Width::fill())
+            .s(Background::new().color(color!("rgba(20, 26, 43, 0.9)")))
+            .s(Padding::new().x(20).y(12))
+            .s(Borders::new().bottom(
+                Border::new().color(color!("rgba(255, 255, 255, 0.06)")).width(1),
+            ))
+            .layer(
+                Row::new()
+                    .s(Gap::new().x(12))
+                    .items([
+                        color!("#3b6dac"),
+                        color!("#c9962d"),
+                        color!("#3fa869"),
+                    ]
+                    .into_iter()
+                    .map(|color| self.snippet_window_control(color)))
+            )
+    }
+
+    fn snippet_window_control(&self, color: impl IntoColor) -> impl Element {
+        let color = color.into_color();
+        El::new()
+            .s(Width::exact(14))
+            .s(Height::exact(14))
+            .s(RoundedCorners::all_max())
+            .s(Background::new().color(color))
+            .s(Shadows::new([Shadow::new().color(color!("rgba(0,0,0,0.25)")).y(1).blur(2)]))
+    }
+
+    fn code_editor_widget(&self) -> CodeEditor {
+        CodeEditor::new()
+            .s(Width::fill())
+            .s(Height::fill())
+            .on_key_down_event_with_options(
+                EventOptions::new().preventable().parents_first(),
+                {
+                    let run_command = self.run_command.clone();
+                    move |keyboard_event| {
+                        let RawKeyboardEvent::KeyDown(raw_event) = &keyboard_event.raw_event;
+                        if keyboard_event.key() == &Key::Enter && raw_event.shift_key() {
+                            keyboard_event.pass_to_parent(false);
+                            raw_event.prevent_default();
+                            run_command.set(Some(RunCommand { filename: None }));
+                        }
+                    }
+                },
+            )
+            .content_signal(self.source_code.signal_cloned())
+            .snippet_screenshot_mode_signal(self.snippet_screenshot_mode.signal())
+            .on_change({
+                let source_code = self.source_code.clone();
+                move |content| source_code.set_neq(Rc::new(Cow::from(content)))
+            })
     }
 
     fn example_panel(&self) -> impl Element + use<> {

@@ -19,6 +19,11 @@ export class CodeEditorController {
                 basicSetup,
                 oneDark,
                 boon(),
+                // Make the editor fill its parent so scrolling happens inside
+                EditorView.theme({
+                    ".cm-editor": { height: "100%" },
+                    ".cm-scroller": { overflow: "auto" },
+                }),
                 this.editor_style.of([]),
                 keymap.of(defaultKeymap),
                 keymap.of([indentWithTab]),

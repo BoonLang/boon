@@ -23422,6 +23422,10 @@ var CodeEditorController = class {
 			basicSetup,
 			oneDark,
 			boon(),
+			EditorView.theme({
+				".cm-editor": { height: "100%" },
+				".cm-scroller": { overflow: "auto" }
+			}),
 			this.editor_style.of([]),
 			keymap.of(defaultKeymap),
 			keymap.of([indentWithTab]),
