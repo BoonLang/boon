@@ -228,9 +228,7 @@ impl Playground {
                             .s(Font::new().size(18).weight(FontWeight::SemiBold).no_wrap())
                             .content("Boon Playground"),
                     )
-                    .item(self.example_tabs())
-                    .item(El::new().s(Width::fill()))
-                    .item(self.clear_saved_states_button()),
+                    .item(self.example_tabs()),
             )
     }
 
@@ -251,6 +249,8 @@ impl Playground {
             .item(self.run_button())
             .item(El::new().s(Width::fill()))
             .item(self.snippet_screenshot_mode_button())
+            .item(El::new().s(Width::fill()))
+            .item(self.clear_saved_states_button())
     }
 
     fn primary_panel<T: Element>(&self, content: T) -> impl Element + use<T> {
