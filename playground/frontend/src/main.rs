@@ -2,7 +2,7 @@
 #![allow(unused_variables)]
 
 use boon::zoon::{eprintln, println, *};
-use boon::zoon::map_ref;
+use boon::zoon::{map_ref, Rgba};
 use std::borrow::Cow;
 use std::rc::Rc;
 
@@ -23,6 +23,25 @@ const MIN_PANEL_RATIO: f64 = 0.1;
 const MAX_PANEL_RATIO: f64 = 0.9;
 const MIN_EDITOR_WIDTH_PX: f64 = 260.0;
 const MIN_PREVIEW_WIDTH_PX: f64 = 260.0;
+
+const APP_BACKGROUND_GRADIENT: &str =
+    "linear-gradient(155deg, #231746 0%, #141f33 48%, #0d323f 100%)";
+
+fn shell_surface_color() -> Rgba {
+    color!("rgba(13, 18, 30, 0.76)")
+}
+
+fn primary_surface_color() -> Rgba {
+    color!("rgba(21, 27, 44, 0.92)")
+}
+
+fn primary_text_color() -> Rgba {
+    color!("#f1f4ff")
+}
+
+fn muted_text_color() -> Rgba {
+    color!("rgba(226, 232, 255, 0.7)")
+}
 
 #[derive(Clone, Copy)]
 struct ExampleData {
@@ -118,6 +137,12 @@ impl Playground {
         Stack::new()
             .s(Width::fill())
             .s(Height::fill())
+            .layer(
+                El::new()
+                    .s(Width::fill())
+                    .s(Height::fill())
+                    .update_raw_el(|raw_el| raw_el.style("background", APP_BACKGROUND_GRADIENT)),
+            )
             .on_pointer_up({
                 let this = self.clone();
                 move || this.stop_panel_drag()
@@ -136,34 +161,126 @@ impl Playground {
         Column::new()
             .s(Width::fill())
             .s(Height::fill())
-            .s(Font::new().color(color!("oklch(0.8 0 0)")))
-            .s(Scrollbars::both())
+            .s(Padding::new().x(36).top(32).bottom(44))
+            .s(Gap::new().y(28))
+            .s(Font::new().color(primary_text_color()))
+            .update_raw_el(|raw_el| {
+                raw_el
+                    .style("overflow-y", "auto")
+                    .style("overflow-x", "hidden")
+            })
+            .item(self.header_bar())
             .item(
+                self.shell_surface(
+                    Column::new()
+                        .s(Width::fill())
+                        .s(Gap::new().y(20))
+                        .item(self.controls_row())
+                        .item(self.panels_row()),
+                ),
+            )
+    }
+
+    fn shell_surface<T: Element>(&self, content: T) -> impl Element + use<T> {
+        El::new()
+            .s(Width::fill())
+            .s(Background::new().color(shell_surface_color()))
+            .s(RoundedCorners::all(32))
+            .s(Borders::all(
+                Border::new().color(color!("rgba(255, 255, 255, 0.05)")).width(1),
+            ))
+            .s(Shadows::new([
+                Shadow::new()
+                    .color(color!("rgba(5, 10, 18, 0.55)"))
+                    .y(34)
+                    .blur(60)
+                    .spread(-18),
+            ]))
+            .s(Padding::new().x(32).y(28))
+            .update_raw_el(|raw_el| raw_el.style("backdrop-filter", "blur(24px)"))
+            .child(content)
+    }
+
+    fn header_bar(&self) -> impl Element + use<> {
+        El::new()
+            .s(Width::fill())
+            .s(Background::new().color(shell_surface_color()))
+            .s(RoundedCorners::all(28))
+            .s(Padding::new().x(28).y(16))
+            .s(Borders::all(
+                Border::new().color(color!("rgba(255, 255, 255, 0.06)")).width(1),
+            ))
+            .s(Shadows::new([
+                Shadow::new()
+                    .color(color!("rgba(5, 10, 20, 0.45)"))
+                    .y(26)
+                    .blur(48)
+                    .spread(-12),
+            ]))
+            .update_raw_el(|raw_el| raw_el.style("backdrop-filter", "blur(24px)"))
+            .child(
                 Row::new()
+                    .s(Width::fill())
+                    .s(Align::new().center_y())
+                    .s(Gap::new().x(16))
                     .item(
-                        Row::new().s(Gap::new().x(20)).multiline().items(
-                            EXAMPLE_DATAS.map(|example_data| self.example_button(example_data)),
-                        ),
+                        Paragraph::new()
+                            .s(Font::new().size(18).weight(FontWeight::SemiBold).no_wrap())
+                            .content("Boon Playground"),
                     )
+                    .item(self.example_tabs())
+                    .item(El::new().s(Width::fill()))
                     .item(self.clear_saved_states_button()),
             )
-            .item(
-                Row::new()
-                    .s(Gap::both(20))
-                    .s(Align::new().center_x())
-                    .item(self.run_button())
-                    .item(self.snippet_screenshot_mode_button()),
-            )
-            .item(self.panels_row())
+    }
+
+    fn example_tabs(&self) -> impl Element + use<> {
+        Row::new()
+            .s(Width::fill())
+            .s(Align::new().center_y())
+            .s(Gap::new().x(12).y(8))
+            .multiline()
+            .items(EXAMPLE_DATAS.map(|example_data| self.example_button(example_data)))
+    }
+
+    fn controls_row(&self) -> impl Element + use<> {
+        Row::new()
+            .s(Width::fill())
+            .s(Align::new().center_y())
+            .s(Gap::new().x(16))
+            .item(self.run_button())
+            .item(El::new().s(Width::fill()))
+            .item(self.snippet_screenshot_mode_button())
+    }
+
+    fn primary_panel<T: Element>(&self, content: T) -> impl Element + use<T> {
+        El::new()
+            .s(Width::fill())
+            .s(Height::fill())
+            .s(Background::new().color(primary_surface_color()))
+            .s(RoundedCorners::all(28))
+            .s(Padding::new().x(28).y(28))
+            .s(Borders::all(
+                Border::new().color(color!("rgba(255, 255, 255, 0.05)")).width(1),
+            ))
+            .s(Shadows::new([
+                Shadow::new()
+                    .color(color!("rgba(4, 12, 24, 0.32)"))
+                    .y(30)
+                    .blur(60)
+                    .spread(-18),
+            ]))
+            .update_raw_el(|raw_el| raw_el.style("backdrop-filter", "blur(20px)"))
+            .child(content)
     }
 
     fn panels_row(&self) -> impl Element + use<> {
         Row::new()
-            .s(Padding::new().top(5))
             .s(Width::fill())
             .s(Height::fill())
-            .s(Scrollbars::both())
-            .update_raw_el(|raw_el| raw_el.class("panels-row"))
+            .s(Gap::new().x(28))
+            .s(Align::new().top())
+            .update_raw_el(|raw_el| raw_el.class("panels-row").style("min-height", "520px"))
             .on_viewport_size_change({
                 let panel_container_width = self.panel_container_width.clone();
                 let panel_split_ratio = self.panel_split_ratio.clone();
@@ -204,7 +321,17 @@ impl Playground {
                     Some(Width::percent((ratio * 100.0).clamp(0.0, 100.0)))
                 }
             }))
-            .child(self.code_editor_panel())
+            .child_signal(self.snippet_screenshot_mode.signal().map({
+                let this = self.clone();
+                move |snippet| {
+                    let playground = this.clone();
+                    if snippet {
+                        Some(Either::Left(playground.snippet_screenshot_surface()))
+                    } else {
+                        Some(Either::Right(playground.code_editor_panel()))
+                    }
+                }
+            }))
     }
 
     fn panel_divider(&self) -> impl Element + use<> {
@@ -212,23 +339,28 @@ impl Playground {
         let hovered_for_signal = hovered.clone();
         El::new()
             .s(Align::new().top())
-            .s(Width::exact(10))
+            .s(Width::exact(14))
             .s(Height::fill())
             .s(Cursor::new(CursorIcon::ColumnResize))
             .s(Background::new().color_signal(map_ref! {
                 let hovered = hovered_for_signal.signal(),
                 let dragging = self.is_dragging_panel_split.signal() =>
                 if *dragging {
-                    color!("#4c566a")
+                    color!("rgba(76, 204, 255, 0.62)")
                 } else if *hovered {
-                    color!("#3b404a")
+                    color!("rgba(66, 112, 168, 0.55)")
                 } else {
-                    color!("#2c3038")
+                    color!("rgba(32, 46, 72, 0.45)")
                 }
             }))
-            .s(Borders::new()
-                .left(Border::new().color(color!("#1d2026")).width(1))
-                .right(Border::new().color(color!("#1d2026")).width(1)))
+            .s(RoundedCorners::all(18))
+            .s(Shadows::new([
+                Shadow::new()
+                    .color(color!("rgba(8, 14, 30, 0.55)"))
+                    .y(12)
+                    .blur(24)
+                    .spread(-8),
+            ]))
             .on_hovered_change(move |is_hovered| hovered.set_neq(is_hovered))
             .text_content_selecting(TextContentSelecting::none())
             .on_pointer_down_event({
@@ -246,7 +378,7 @@ impl Playground {
                     .signal_cloned()
                     .map(|ratio| Some((1.0 - ratio).clamp(0.0, 1.0) * 100.0)),
             ))
-            .child(self.example_panel())
+            .child(self.primary_panel(self.example_panel()))
     }
 
     fn panel_drag_overlay(&self) -> impl Element + use<> {
@@ -347,22 +479,42 @@ impl Playground {
     }
 
     fn run_button(&self) -> impl Element {
-        let (hovered, hovered_signal) = Mutable::new_and_signal(false);
+        let hovered = Mutable::new(false);
         Button::new()
-            .s(Padding::all(5))
+            .s(Padding::new().x(20).y(12))
+            .s(RoundedCorners::all(24))
+            .s(Font::new().color(color!("#052039")))
+            .s(Font::new().weight(FontWeight::SemiBold))
+            .s(Shadows::new([
+                Shadow::new()
+                    .color(color!("rgba(15, 23, 42, 0.22)"))
+                    .y(12)
+                    .blur(22)
+                    .spread(-8),
+            ]))
+            .s(Background::new().color_signal(
+                hovered
+                    .signal()
+                    .map_bool(|| color!("#3fd5ff"), || color!("#2ed0f3")),
+            ))
             .label(
-                Paragraph::new()
-                    .s(Font::new().color_signal(
-                        hovered_signal
-                            .map_bool(|| color!("MediumSpringGreen"), || color!("LimeGreen")),
-                    ))
-                    .content("Run (")
-                    .content(
+                Row::new()
+                    .s(Align::new().center_y())
+                    .s(Gap::new().x(12))
+                    .item(
                         El::new()
-                            .s(Font::new().weight(FontWeight::Bold))
-                            .child("Shift + Enter"),
+                            .s(Font::new().size(16).weight(FontWeight::SemiBold).no_wrap())
+                            .child("Run"),
                     )
-                    .content(" in editor)"),
+                    .item(
+                        Column::new()
+                            .s(Gap::new().y(2))
+                            .item(
+                                El::new()
+                                    .s(Font::new().size(13).color(color!("rgba(5, 32, 57, 0.78)")).no_wrap())
+                                    .child("Shift + Enter"),
+                            ),
+                    ),
             )
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press({
@@ -374,16 +526,56 @@ impl Playground {
     }
 
     fn snippet_screenshot_mode_button(&self) -> impl Element {
-        let (hovered, hovered_signal) = Mutable::new_and_signal(false);
+        let hovered = Mutable::new(false);
         Button::new()
-            .s(Padding::all(5))
+            .s(Padding::new().x(18).y(11))
+            .s(RoundedCorners::all(24))
+            .s(Font::new().size(13).color(primary_text_color()))
+            .s(Shadows::new([
+                Shadow::new()
+                    .color(color!("rgba(8, 13, 28, 0.26)"))
+                    .y(12)
+                    .blur(22)
+                    .spread(-8),
+            ]))
+            .s(Background::new().color_signal(map_ref! {
+                let hovered = hovered.signal(),
+                let active = self.snippet_screenshot_mode.signal() =>
+                match (*active, *hovered) {
+                    (true, true) => color!("rgba(70, 104, 178, 0.6)"),
+                    (true, false) => color!("rgba(60, 94, 168, 0.52)"),
+                    (false, true) => color!("rgba(36, 48, 72, 0.44)"),
+                    (false, false) => color!("rgba(26, 36, 58, 0.32)"),
+                }
+            }))
             .label(
-                El::new()
-                    .s(Font::new().color_signal(
-                        hovered_signal
-                            .map_bool(|| color!("DarkGrey"), || color!("Grey")),
-                    ))
-                    .child("Snippet screenshot mode")
+                Row::new()
+                    .s(Align::new().center_y())
+                    .s(Gap::new().x(12))
+                    .item(
+                        Column::new()
+                            .s(Gap::new().y(1))
+                            .item(
+                                El::new()
+                                    .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
+                                    .child("Screenshot mode"),
+                            ),
+                    )
+                    .item(
+                        El::new()
+                            .s(Padding::new().x(10).y(5))
+                            .s(RoundedCorners::all(999))
+                            .s(Font::new().size(11).weight(FontWeight::SemiBold).no_wrap())
+                            .s(Background::new().color_signal(map_ref! {
+                                let active = self.snippet_screenshot_mode.signal() =>
+                                if *active {
+                                    color!("rgba(0, 0, 0, 0.18)")
+                                } else {
+                                    color!("rgba(0, 0, 0, 0.12)")
+                                }
+                            }))
+                            .child_signal(self.snippet_screenshot_mode.signal().map_bool(|| "ON", || "OFF")),
+                    ),
             )
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press({
@@ -395,12 +587,32 @@ impl Playground {
     }
 
     fn clear_saved_states_button(&self) -> impl Element {
-        let (hovered, hovered_signal) = Mutable::new_and_signal(false);
+        let hovered = Mutable::new(false);
         Button::new()
-            .s(Padding::new().x(10).y(5))
+            .s(Padding::new().x(18).y(10))
+            .s(RoundedCorners::all(24))
+            .s(Borders::all(
+                Border::new()
+                    .color(color!("rgba(255, 134, 134, 0.45)"))
+                    .width(1),
+            ))
+            .s(Background::new().color_signal(
+                hovered
+                    .signal()
+                    .map_bool(|| color!("rgba(255, 134, 134, 0.12)"), || color!("rgba(255, 134, 134, 0.08)")),
+            ))
             .s(Font::new()
-                .color_signal(hovered_signal.map_bool(|| color!("Coral"), || color!("LightCoral"))))
-            .label("Clear saved states")
+                .size(13)
+                .weight(FontWeight::Medium)
+                .color_signal(hovered.signal().map_bool(
+                    || color!("rgba(255, 199, 199, 0.95)"),
+                    || color!("rgba(255, 210, 210, 0.85)"),
+                )))
+            .label(
+                El::new()
+                    .s(Font::new().size(13).weight(FontWeight::Medium).no_wrap())
+                    .child("Clear saved states"),
+            )
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press(|| {
                 local_storage().remove(STATES_STORAGE_KEY);
@@ -410,30 +622,78 @@ impl Playground {
     }
 
     fn code_editor_panel(&self) -> impl Element + use<> {
-        El::new()
-            .s(Height::fill())
-            .child_signal(self.snippet_screenshot_mode.signal().map_bool(
-            {
-                let this = self.clone();
-                move || Some(Either::Left(this.snippet_screenshot_surface()))
-            },
-            {
-                let this = self.clone();
-                move || Some(Either::Right(this.standard_code_editor_surface()))
-            },
-        ))
+        self.primary_panel(self.editor_panel_content())
     }
 
     fn standard_code_editor_surface(&self) -> impl Element + use<> {
-        El::new()
+        Stack::new()
             .s(Align::new().top())
             .s(Width::fill())
             .s(Height::fill())
-            .s(Padding::all(12))
-            .child(
-                self.code_editor_widget()
-                    .s(RoundedCorners::all(12))
+            .layer(
+                El::new()
+                    .s(Width::fill())
+                    .s(Height::fill())
+                    .s(RoundedCorners::all(24))
+                    .update_raw_el(|raw_el| {
+                        raw_el.style(
+                            "background",
+                            "radial-gradient(140% 140% at 0% 10%, rgba(64,99,161,0.16) 0%, rgba(18,24,39,0.0) 55%), linear-gradient(145deg, rgba(13,19,33,0.94) 10%, rgba(7,12,24,0.96) 90%)",
+                        )
+                    })
+                    .s(Shadows::new([
+                        Shadow::new()
+                            .color(color!("rgba(10, 16, 32, 0.45)"))
+                            .y(28)
+                            .blur(50)
+                            .spread(-18),
+                    ])),
             )
+            .layer(
+                El::new()
+                    .s(Width::fill())
+                    .s(Height::fill())
+                    .s(Padding::new().x(18).y(18))
+                    .child(
+                        self.code_editor_widget()
+                            .s(RoundedCorners::all(20))
+                            .s(Clip::both())
+                            .s(Shadows::new([
+                                Shadow::new()
+                                    .color(color!("rgba(8, 10, 18, 0.5)"))
+                                    .y(18)
+                                    .blur(36)
+                                    .spread(-12),
+                            ])),
+                    ),
+            )
+    }
+
+    fn editor_panel_content(&self) -> impl Element + use<> {
+        Column::new()
+            .s(Align::new().top())
+            .s(Width::fill())
+            .s(Height::fill())
+            .s(Gap::new().y(14))
+            .item(
+                Row::new()
+                    .s(Width::fill())
+                    .s(Align::new().center_y())
+                    .s(Gap::new().x(10))
+                    .item(
+                        El::new()
+                            .s(Width::exact(6))
+                            .s(Height::exact(6))
+                            .s(RoundedCorners::all_max())
+                            .s(Background::new().color(color!("#7dd3fc"))),
+                    )
+                    .item(
+                        El::new()
+                            .s(Font::new().size(13).color(muted_text_color()).no_wrap())
+                            .child("Editor"),
+                    ),
+            )
+            .item(self.standard_code_editor_surface())
     }
 
     fn snippet_screenshot_surface(&self) -> impl Element + use<> {
@@ -472,7 +732,6 @@ impl Playground {
                             .item(
                                 Stack::new()
                                     .s(Width::fill())
-                                    .s(Height::fill())
                                     .s(Height::fill())
                                     .s(Padding::new().bottom(40))
                                     .s(Background::new().color(color!("#101a2c")))
@@ -585,22 +844,61 @@ impl Playground {
     }
 
     fn example_panel(&self) -> impl Element + use<> {
-        El::new()
+        Column::new()
             .s(Align::new().top())
             .s(Width::fill())
             .s(Height::fill())
-            .s(Padding::all(5))
-            .child(
-                El::new()
-                    .s(RoundedCorners::all(10))
+            .s(Gap::new().y(14))
+            .item(
+                Row::new()
+                    .s(Width::fill())
+                    .s(Align::new().center_y())
+                    .s(Gap::new().x(10))
+                    .item(
+                        El::new()
+                            .s(Width::exact(6))
+                            .s(Height::exact(6))
+                            .s(RoundedCorners::all_max())
+                            .s(Background::new().color(color!("#86efac"))),
+                    )
+                    .item(
+                        El::new()
+                            .s(Font::new().size(13).color(muted_text_color()).no_wrap())
+                            .child("Live preview"),
+                    ),
+            )
+            .item(
+                Stack::new()
+                    .s(Width::fill())
+                    .s(Height::fill())
+                    .s(RoundedCorners::all(24))
                     .s(Clip::both())
-                    .s(Borders::all(
-                        Border::new().color(color!("#282c34")).width(4),
-                    ))
-                    .child_signal(self.run_command.signal().map_some({
-                        let this = self.clone();
-                        move |run_command| this.example_runner(run_command)
-                    })),
+                    .layer(
+                        El::new()
+                            .s(Width::fill())
+                            .s(Height::fill())
+                            .update_raw_el(|raw_el| {
+                                raw_el.style(
+                                    "background",
+                                    "radial-gradient(120% 120% at 84% 0%, rgba(76, 214, 255, 0.16) 0%, rgba(5, 9, 18, 0.0) 55%), linear-gradient(165deg, rgba(9, 13, 24, 0.94) 15%, rgba(5, 8, 14, 0.96) 85%)",
+                                )
+                            }),
+                    )
+                    .layer(
+                        El::new()
+                            .s(Width::fill())
+                            .s(Height::fill())
+                            .s(Padding::new().x(20).y(20))
+                            .update_raw_el(|raw_el| {
+                                raw_el
+                                    .style("overflow-y", "auto")
+                                    .style("overflow-x", "hidden")
+                            })
+                            .child_signal(self.run_command.signal().map_some({
+                                let this = self.clone();
+                                move |run_command| this.example_runner(run_command)
+                            })),
+                    ),
             )
     }
 
@@ -633,10 +931,44 @@ impl Playground {
     }
 
     fn example_button(&self, example_data: ExampleData) -> impl Element {
+        let hovered = Mutable::new(false);
+        let hovered_signal = hovered.signal().broadcast();
+        let source_signal = self.source_code.signal_cloned().broadcast();
         Button::new()
-            .s(Padding::new().x(10).y(5))
-            .s(Font::new().line(FontLine::new().underline().offset(3)))
-            .label(example_data.filename)
+            .s(Padding::new().x(18).y(9))
+            .s(RoundedCorners::all(24))
+            .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
+            .s(Background::new().color_signal(map_ref! {
+                let hovered = hovered_signal.signal(),
+                let source_code = source_signal.signal_cloned() => {
+                    let is_active = source_code.as_ref() == example_data.source_code;
+                    match (is_active, *hovered) {
+                        (true, _) => color!("rgba(80, 112, 188, 0.55)"),
+                        (false, true) => color!("rgba(36, 48, 72, 0.45)"),
+                        (false, false) => color!("rgba(24, 32, 54, 0.35)"),
+                    }
+                }
+            }))
+            .s(Borders::all(
+                Border::new().color(color!("rgba(88, 126, 194, 0.4)")).width(1),
+            ))
+            .s(Font::new().color_signal(map_ref! {
+                let hovered = hovered_signal.signal(),
+                let source_code = source_signal.signal_cloned() =>
+                if source_code.as_ref() == example_data.source_code {
+                    color!("#f6f8ff")
+                } else if *hovered {
+                    color!("rgba(214, 223, 255, 0.86)")
+                } else {
+                    muted_text_color()
+                }
+            }))
+            .label(
+                El::new()
+                    .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
+                    .child(example_data.filename),
+            )
+            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press({
                 let source_code = self.source_code.clone();
                 let run_command = self.run_command.clone();
@@ -648,4 +980,5 @@ impl Playground {
                 }
             })
     }
+
 }
