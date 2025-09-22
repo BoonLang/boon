@@ -23,6 +23,7 @@ const MIN_PANEL_RATIO: f64 = 0.1;
 const MAX_PANEL_RATIO: f64 = 0.9;
 const MIN_EDITOR_WIDTH_PX: f64 = 260.0;
 const MIN_PREVIEW_WIDTH_PX: f64 = 260.0;
+const PANEL_DIVIDER_WIDTH: f64 = 14.0;
 
 const APP_BACKGROUND_GRADIENT: &str =
     "linear-gradient(155deg, #231746 0%, #141f33 48%, #0d323f 100%)";
@@ -292,9 +293,8 @@ impl Playground {
         Row::new()
             .s(Width::fill())
             .s(Height::fill())
-            .s(Gap::new().x(28))
             .s(Align::new().top())
-            .update_raw_el(|raw_el| raw_el.class("panels-row").style("min-height", "520px"))
+            .s(Scrollbars::both())
             .on_viewport_size_change({
                 let panel_container_width = self.panel_container_width.clone();
                 let panel_split_ratio = self.panel_split_ratio.clone();
@@ -326,13 +326,29 @@ impl Playground {
         El::new()
             .s(Align::new().top())
             .s(Height::fill())
+            .s(Padding::new().right_signal(
+                self.snippet_screenshot_mode
+                    .signal()
+                    .map_bool(|| 0, || 14),
+            ))
             .s(Width::with_signal_self(map_ref! {
                 let snippet = self.snippet_screenshot_mode.signal(),
-                let ratio = self.panel_split_ratio.signal() =>
+                let ratio = self.panel_split_ratio.signal(),
+                let container = self.panel_container_width.signal() =>
                 if *snippet {
                     Some(Width::fill())
                 } else {
-                    Some(Width::percent((ratio * 100.0).clamp(0.0, 100.0)))
+                    let container_width = *container as f64;
+                    if container_width > PANEL_DIVIDER_WIDTH {
+                        let available = container_width - PANEL_DIVIDER_WIDTH;
+                        let desired = (available * ratio).clamp(
+                            MIN_EDITOR_WIDTH_PX,
+                            available - MIN_PREVIEW_WIDTH_PX,
+                        );
+                        Some(Width::exact(desired.max(0.0) as u32))
+                    } else {
+                        Some(Width::percent((ratio * 100.0).clamp(0.0, 100.0)))
+                    }
                 }
             }))
             .child_signal(self.snippet_screenshot_mode.signal().map({
@@ -387,11 +403,32 @@ impl Playground {
         El::new()
             .s(Align::new().top())
             .s(Height::fill())
-            .s(Width::percent_signal::<f64>(
-                self.panel_split_ratio
-                    .signal_cloned()
-                    .map(|ratio| Some((1.0 - ratio).clamp(0.0, 1.0) * 100.0)),
+            .s(Padding::new().left_signal(
+                self.snippet_screenshot_mode
+                    .signal()
+                    .map_bool(|| 0, || 14),
             ))
+            .s(Width::with_signal_self(map_ref! {
+                let snippet = self.snippet_screenshot_mode.signal(),
+                let ratio = self.panel_split_ratio.signal(),
+                let container = self.panel_container_width.signal() =>
+                if *snippet {
+                    Some(Width::fill())
+                } else {
+                    let container_width = *container as f64;
+                    if container_width > PANEL_DIVIDER_WIDTH {
+                        let available = container_width - PANEL_DIVIDER_WIDTH;
+                        let editor = (available * ratio).clamp(
+                            MIN_EDITOR_WIDTH_PX,
+                            available - MIN_PREVIEW_WIDTH_PX,
+                        );
+                        let preview = (available - editor).max(0.0);
+                        Some(Width::exact(preview as u32))
+                    } else {
+                        Some(Width::percent(((1.0 - ratio) * 100.0).clamp(0.0, 100.0)))
+                    }
+                }
+            }))
             .child(self.primary_panel(self.example_panel()))
     }
 
