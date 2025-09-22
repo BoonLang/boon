@@ -164,11 +164,7 @@ impl Playground {
             .s(Padding::new().x(36).top(32).bottom(44))
             .s(Gap::new().y(28))
             .s(Font::new().color(primary_text_color()))
-            .update_raw_el(|raw_el| {
-                raw_el
-                    .style("overflow-y", "auto")
-                    .style("overflow-x", "hidden")
-            })
+            .s(Scrollbars::both())
             .item_signal(self.snippet_screenshot_mode.signal().map({
                 let this = self.clone();
                 move |enabled| if enabled {
@@ -178,14 +174,19 @@ impl Playground {
                 }
             }))
             .item(
-                self.shell_surface(
-                    Column::new()
-                        .s(Width::fill())
-                        .s(Height::fill())
-                        .s(Gap::new().y(20))
-                        .item(self.controls_row())
-                        .item(self.panels_row()),
-                ),
+                El::new()
+                    .s(Width::fill())
+                    .s(Height::fill())
+                    .s(Scrollbars::both())
+                    .child(self.shell_surface(
+                        Column::new()
+                            .s(Width::fill())
+                            .s(Height::fill())
+                            .s(Gap::new().y(20))
+                            .s(Scrollbars::both())
+                            .item(self.controls_row())
+                            .item(self.panels_row()),
+                    )),
             )
     }
 
@@ -205,9 +206,14 @@ impl Playground {
                     .blur(60)
                     .spread(-18),
             ]))
-            .s(Padding::new().x(32).y(28))
             .update_raw_el(|raw_el| raw_el.style("backdrop-filter", "blur(24px)"))
-            .child(content)
+            .child(
+                El::new()
+                    .s(Width::fill())
+                    .s(Height::fill())
+                    .s(Padding::new().x(32).y(28))
+                    .child(content),
+            )
     }
 
     fn header_bar(&self) -> impl Element + use<> {
