@@ -285,6 +285,7 @@ impl Playground {
                     .blur(60)
                     .spread(-18),
             ]))
+            .s(Scrollbars::both())
             .update_raw_el(|raw_el| raw_el.style("backdrop-filter", "blur(20px)"))
             .child(content)
     }
@@ -331,6 +332,7 @@ impl Playground {
                     .signal()
                     .map_bool(|| 0, || 14),
             ))
+            .s(Scrollbars::both())
             .s(Width::with_signal_self(map_ref! {
                 let snippet = self.snippet_screenshot_mode.signal(),
                 let ratio = self.panel_split_ratio.signal(),
@@ -408,6 +410,7 @@ impl Playground {
                     .signal()
                     .map_bool(|| 0, || 14),
             ))
+            .s(Scrollbars::both())
             .s(Width::with_signal_self(map_ref! {
                 let snippet = self.snippet_screenshot_mode.signal(),
                 let ratio = self.panel_split_ratio.signal(),
@@ -681,6 +684,7 @@ impl Playground {
             .s(Align::new().top())
             .s(Width::fill())
             .s(Height::fill())
+            .s(Scrollbars::both())
             .layer(
                 El::new()
                     .s(Width::fill())
@@ -726,6 +730,7 @@ impl Playground {
             .s(Width::fill())
             .s(Height::fill())
             .s(Gap::new().y(14))
+            .s(Scrollbars::both())
             .item(
                 Row::new()
                     .s(Width::fill())
@@ -940,11 +945,7 @@ impl Playground {
                             .s(Width::fill())
                             .s(Height::fill())
                             .s(Padding::new().x(20).y(20))
-                            .update_raw_el(|raw_el| {
-                                raw_el
-                                    .style("overflow-y", "auto")
-                                    .style("overflow-x", "hidden")
-                            })
+                            .s(Scrollbars::both())
                             .child_signal(self.run_command.signal().map_some({
                                 let this = self.clone();
                                 move |run_command| this.example_runner(run_command)
