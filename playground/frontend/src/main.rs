@@ -144,6 +144,24 @@ impl Playground {
                     .s(Height::fill())
                     .update_raw_el(|raw_el| raw_el.style("background", APP_BACKGROUND_GRADIENT)),
             )
+            .update_raw_el({
+                let run_command = self.run_command.clone();
+                move |raw_el| {
+                    let run_command = run_command.clone();
+                    raw_el.global_event_handler_with_options(
+                        EventOptions::new().preventable().parents_first(),
+                        move |event: events::KeyDown| {
+                            if event.repeat() {
+                                return;
+                            }
+                            if event.shift_key() && event.key() == "Enter" {
+                                event.prevent_default();
+                                run_command.set(Some(RunCommand { filename: None }));
+                            }
+                        },
+                    )
+                }
+            })
             .on_pointer_up({
                 let this = self.clone();
                 move || this.stop_panel_drag()
@@ -877,20 +895,6 @@ impl Playground {
         CodeEditor::new()
             .s(Width::fill())
             .s(Height::fill())
-            .on_key_down_event_with_options(
-                EventOptions::new().preventable().parents_first(),
-                {
-                    let run_command = self.run_command.clone();
-                    move |keyboard_event| {
-                        let RawKeyboardEvent::KeyDown(raw_event) = &keyboard_event.raw_event;
-                        if keyboard_event.key() == &Key::Enter && raw_event.shift_key() {
-                            keyboard_event.pass_to_parent(false);
-                            raw_event.prevent_default();
-                            run_command.set(Some(RunCommand { filename: None }));
-                        }
-                    }
-                },
-            )
             .content_signal(self.source_code.signal_cloned())
             .snippet_screenshot_mode_signal(self.snippet_screenshot_mode.signal())
             .on_change({
