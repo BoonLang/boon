@@ -123,7 +123,7 @@ impl Playground {
         Self {
             source_code,
             run_command: Mutable::new(None),
-            snippet_screenshot_mode: Mutable::new(true),
+            snippet_screenshot_mode: Mutable::new(false),
             panel_split_ratio,
             panel_container_width: Mutable::new(0),
             is_dragging_panel_split: Mutable::new(false),
@@ -169,7 +169,14 @@ impl Playground {
                     .style("overflow-y", "auto")
                     .style("overflow-x", "hidden")
             })
-            .item(self.header_bar())
+            .item_signal(self.snippet_screenshot_mode.signal().map({
+                let this = self.clone();
+                move |enabled| if enabled {
+                    None
+                } else {
+                    Some(this.header_bar())
+                }
+            }))
             .item(
                 self.shell_surface(
                     Column::new()
@@ -245,12 +252,11 @@ impl Playground {
         Row::new()
             .s(Width::fill())
             .s(Align::new().center_y())
-            .s(Gap::new().x(16))
-            .item(self.run_button())
-            .item(El::new().s(Width::fill()))
-            .item(self.snippet_screenshot_mode_button())
-            .item(El::new().s(Width::fill()))
-            .item(self.clear_saved_states_button())
+            .s(Gap::new().x(16).y(12))
+            .multiline()
+            .item(El::new().s(Align::new().left()).child(self.run_button()))
+            .item(El::new().s(Align::new().center_x()).child(self.snippet_screenshot_mode_button()))
+            .item(El::new().s(Align::new().right()).child(self.clear_saved_states_button()))
     }
 
     fn primary_panel<T: Element>(&self, content: T) -> impl Element + use<T> {
