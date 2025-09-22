@@ -181,6 +181,7 @@ impl Playground {
                 self.shell_surface(
                     Column::new()
                         .s(Width::fill())
+                        .s(Height::fill())
                         .s(Gap::new().y(20))
                         .item(self.controls_row())
                         .item(self.panels_row()),
@@ -191,6 +192,7 @@ impl Playground {
     fn shell_surface<T: Element>(&self, content: T) -> impl Element + use<T> {
         El::new()
             .s(Width::fill())
+            .s(Height::fill())
             .s(Background::new().color(shell_surface_color()))
             .s(RoundedCorners::all(32))
             .s(Borders::all(
