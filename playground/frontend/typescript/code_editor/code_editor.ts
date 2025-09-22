@@ -21,7 +21,7 @@ export class CodeEditorController {
                 boon(),
                 // Make the editor fill its parent so scrolling happens inside
                 EditorView.theme({
-                    ".cm-editor": { height: "100%" },
+                    "&": { height: "100%" },
                     ".cm-scroller": { overflow: "auto" },
                 }),
                 this.editor_style.of([]),

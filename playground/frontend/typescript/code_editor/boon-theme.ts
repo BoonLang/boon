@@ -119,6 +119,30 @@ export const oneDarkTheme = EditorView.theme({
   ".cm-cursor, .cm-dropCursor": { borderLeftColor: cursor },
   "&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection": { backgroundColor: selection },
 
+  ".cm-scroller": {
+    scrollbarWidth: "thin",
+    scrollbarColor: "rgba(59, 109, 172, 0.6) transparent",
+  },
+  ".cm-scroller::-webkit-scrollbar": {
+    width: "10px",
+    height: "10px",
+  },
+  ".cm-scroller::-webkit-scrollbar-track": {
+    background: "rgba(255, 255, 255, 0.02)",
+  },
+  ".cm-scroller::-webkit-scrollbar-thumb": {
+    backgroundColor: "rgba(59, 109, 172, 0.6)",
+    borderRadius: "999px",
+    border: "2px solid transparent",
+    backgroundClip: "content-box",
+  },
+  ".cm-scroller::-webkit-scrollbar-thumb:hover": {
+    backgroundColor: "rgba(59, 109, 172, 0.85)",
+  },
+  ".cm-scroller::-webkit-scrollbar-corner": {
+    background: "transparent",
+  },
+
   ".cm-panels": { backgroundColor: darkBackground, color: ivory },
   ".cm-panels.cm-panels-top": { borderBottom: "2px solid black" },
   ".cm-panels.cm-panels-bottom": { borderTop: "2px solid black" },
