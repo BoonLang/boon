@@ -56,7 +56,6 @@ export class CodeEditorController {
             paddingRight: "12px",
         }
         const basic_editor_style = EditorView.theme({
-            ".cm-content, .cm-gutter": { minHeight: "200px" },
             ".cm-content": base_content_style,
             ".cm-scroller": {
                 paddingTop: "10px",
@@ -66,7 +65,6 @@ export class CodeEditorController {
         });
         // https://codemirror.net/examples/styling/
         const snippet_screenshot_mode_editor_style = EditorView.theme({
-            ".cm-content, .cm-gutter": { minHeight: "200px" },
             ".cm-content": { 
                 ...base_content_style,
                 paddingTop: "22px", 

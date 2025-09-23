@@ -215,7 +215,15 @@ impl Playground {
             .s(Height::fill())
             .s(Scrollbars::both())
             .s(Background::new().color(shell_surface_color()))
-            .s(RoundedCorners::all(32))
+            .s(
+                RoundedCorners::new()
+                    .top(32)
+                    .bottom_signal(
+                        self.snippet_screenshot_mode
+                            .signal()
+                            .map_bool(|| 0, || 32),
+                    ),
+            )
             .s(Borders::all(
                 Border::new().color(color!("rgba(255, 255, 255, 0.05)")).width(1),
             ))
@@ -787,7 +795,6 @@ impl Playground {
                                 Stack::new()
                                     .s(Width::fill())
                                     .s(Height::fill())
-                                    .s(Padding::new().bottom(40))
                                     .s(Background::new().color(color!("#101a2c")))
                                     .layer(
                                         El::new()

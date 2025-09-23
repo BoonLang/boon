@@ -23488,7 +23488,6 @@ var CodeEditorController = class {
 			paddingRight: "12px"
 		};
 		const basic_editor_style = EditorView.theme({
-			".cm-content, .cm-gutter": { minHeight: "200px" },
 			".cm-content": base_content_style,
 			".cm-scroller": {
 				paddingTop: "10px",
@@ -23497,7 +23496,6 @@ var CodeEditorController = class {
 			".cm-gutter:not(.cm-foldGutter)": { paddingLeft: "8px" }
 		});
 		const snippet_screenshot_mode_editor_style = EditorView.theme({
-			".cm-content, .cm-gutter": { minHeight: "200px" },
 			".cm-content": {
 				...base_content_style,
 				paddingTop: "22px",
