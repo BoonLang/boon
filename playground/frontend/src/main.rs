@@ -180,8 +180,8 @@ impl Playground {
         Column::new()
             .s(Width::fill())
             .s(Height::fill())
-            .s(Padding::new().x(16).top(16).bottom(20))
-            .s(Gap::new().y(16))
+            .s(Padding::new().x(6).top(8).bottom(10))
+            .s(Gap::new().y(8))
             .s(Font::new().color(primary_text_color()))
             .s(Scrollbars::both())
             .item_signal(self.snippet_screenshot_mode.signal().map({
@@ -200,7 +200,7 @@ impl Playground {
                         Column::new()
                             .s(Width::fill())
                             .s(Height::fill())
-                            .s(Gap::new().y(12))
+                            .s(Gap::new().y(8))
                             .item(self.controls_row())
                             .item(self.panels_row()),
                     )),
@@ -228,7 +228,7 @@ impl Playground {
                 El::new()
                     .s(Width::fill())
                     .s(Height::fill())
-                    .s(Padding::new().x(14).y(14))
+                    .s(Padding::new().x(10).y(10))
                     .child(content),
             )
     }
@@ -289,8 +289,7 @@ impl Playground {
             .s(Width::fill())
             .s(Height::fill())
             .s(Background::new().color(primary_surface_color()))
-            .s(RoundedCorners::all(28))
-            .s(Padding::new().x(12).y(12))
+            .s(RoundedCorners::all(24))
             .s(Borders::all(
                 Border::new().color(color!("rgba(255, 255, 255, 0.05)")).width(1),
             ))
@@ -344,7 +343,7 @@ impl Playground {
             .s(Padding::new().right_signal(
                 self.snippet_screenshot_mode
                     .signal()
-                    .map_bool(|| 0, || 8),
+                    .map_bool(|| 0, || 6),
             ))
             .s(Width::with_signal_self(map_ref! {
                 let snippet = self.snippet_screenshot_mode.signal(),
@@ -391,11 +390,11 @@ impl Playground {
                 let hovered = hovered_for_signal.signal(),
                 let dragging = self.is_dragging_panel_split.signal() =>
                 if *dragging {
-                    color!("rgba(76, 204, 255, 0.62)")
+                    color!("rgba(140, 196, 255, 0.85)")
                 } else if *hovered {
-                    color!("rgba(66, 112, 168, 0.55)")
+                    color!("rgba(108, 162, 255, 0.75)")
                 } else {
-                    color!("rgba(32, 46, 72, 0.45)")
+                    color!("rgba(72, 108, 176, 0.6)")
                 }
             }))
             .s(RoundedCorners::all(18))
@@ -421,7 +420,7 @@ impl Playground {
             .s(Padding::new().left_signal(
                 self.snippet_screenshot_mode
                     .signal()
-                    .map_bool(|| 0, || 8),
+                    .map_bool(|| 0, || 6),
             ))
             .s(Width::with_signal_self(map_ref! {
                 let snippet = self.snippet_screenshot_mode.signal(),
@@ -561,7 +560,10 @@ impl Playground {
             .s(Background::new().color_signal(
                 hovered
                     .signal()
-                    .map_bool(|| color!("#3fd5ff"), || color!("#2ed0f3")),
+                    .map_bool(
+                        || color!("rgba(140, 196, 255, 0.9)"),
+                        || color!("rgba(108, 162, 255, 0.75)"),
+                    ),
             ))
             .label(
                 Row::new()
@@ -697,36 +699,38 @@ impl Playground {
                     .s(Width::fill())
                     .s(Height::fill())
                     .s(RoundedCorners::all(24))
-                    .update_raw_el(|raw_el| {
-                        raw_el.style(
-                            "background",
-                            "radial-gradient(140% 140% at 0% 10%, rgba(64,99,161,0.16) 0%, rgba(18,24,39,0.0) 55%), linear-gradient(145deg, rgba(13,19,33,0.94) 10%, rgba(7,12,24,0.96) 90%)",
-                        )
-                    })
+                    .s(Background::new().color(color!("#101a2c")))
                     .s(Shadows::new([
                         Shadow::new()
                             .color(color!("rgba(10, 16, 32, 0.45)"))
-                            .y(28)
-                            .blur(50)
-                            .spread(-18),
+                            .y(26)
+                            .blur(52)
+                            .spread(-20),
                     ])),
             )
             .layer(
                 El::new()
                     .s(Width::fill())
                     .s(Height::fill())
-                    .s(Padding::new().x(10).y(10))
+                    .s(Padding::all(10))
                     .child(
                         self.code_editor_widget()
                             .s(RoundedCorners::all(20))
                             .s(Clip::both())
                             .s(Shadows::new([
                                 Shadow::new()
-                                    .color(color!("rgba(8, 10, 18, 0.5)"))
+                                    .color(color!("rgba(8, 10, 18, 0.45)"))
                                     .y(18)
                                     .blur(36)
                                     .spread(-12),
-                            ])),
+                            ]))
+                            .s(Background::new().color(color!("#0b1223")))
+                            .update_raw_el(|raw_el| {
+                                raw_el.style(
+                                    "background",
+                                    "linear-gradient(120deg, rgba(24,32,52,0.24) 0%, rgba(8,10,18,0.88) 65%)",
+                                )
+                            }),
                     ),
             )
     }

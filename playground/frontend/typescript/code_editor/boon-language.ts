@@ -51,6 +51,7 @@ const variableDefinitionMark = Decoration.mark({class: "cm-boon-variable-definit
 const dotMark = Decoration.mark({class: "cm-boon-dot"})
 const apostropheMark = Decoration.mark({class: "cm-boon-apostrophe"})
 const pipeMark = Decoration.mark({class: "cm-boon-pipe"})
+const chainAlternateMark = Decoration.mark({class: "cm-boon-chain-alt"})
 
 const boonSemanticHighlight = ViewPlugin.fromClass(class {
   decorations
@@ -71,6 +72,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
     let expectFunctionName = false
     let pendingDefinition: {from: number, to: number} | null = null
     let pendingFunctionCall: {from: number, to: number} | null = null
+    let chainIndex = 0
 
     syntaxTree(view.state).iterate({
       from,
@@ -86,6 +88,15 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
         }
 
         if (node.name === "SnakeCase") {
+          const before = node.from > 0 ? view.state.doc.sliceString(node.from - 1, node.from) : ""
+          if (before === ".") {
+            chainIndex += 1
+          } else {
+            chainIndex = 0
+          }
+          if (chainIndex % 2 === 1) {
+            builder.add(node.from, node.to, chainAlternateMark)
+          }
           if (expectFunctionName) {
             builder.add(node.from, node.to, functionNameMark)
             expectFunctionName = false
@@ -170,12 +181,16 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
           node.name === "ListLiteral" ||
           node.name === "TaggedObject"
         ) {
+          if (node.name !== "WS") {
+            chainIndex = 0
+          }
           return
         }
 
         pendingDefinition = null
         expectFunctionName = false
         pendingFunctionCall = null
+        chainIndex = 0
         return undefined
       }
     })

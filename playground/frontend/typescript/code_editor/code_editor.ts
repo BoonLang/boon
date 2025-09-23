@@ -50,19 +50,36 @@ export class CodeEditorController {
     }
 
     set_snippet_screenshot_mode(mode: boolean) {
+        const base_content_style = {
+            "font-family": "'JetBrains Mono', monospace",
+            fontFeatureSettings: "'zero' 1",
+            paddingLeft: "16px",
+            paddingRight: "16px",
+        }
         const basic_editor_style = EditorView.theme({
             ".cm-content, .cm-gutter": { minHeight: "200px" },
-            ".cm-content": { "font-family": "'JetBrains Mono', monospace", fontFeatureSettings: "'zero' 1" },
+            ".cm-content": base_content_style,
+            ".cm-scroller": {
+                paddingTop: "10px",
+                paddingBottom: "10px",
+            },
+            ".cm-gutter": { paddingLeft: "12px" },
         });
         // https://codemirror.net/examples/styling/
         const snippet_screenshot_mode_editor_style = EditorView.theme({
             ".cm-content, .cm-gutter": { minHeight: "200px" },
             ".cm-content": { 
-                "font-family": "'JetBrains Mono', monospace", 
+                ...base_content_style,
                 paddingTop: "22px", 
                 paddingBottom: "20px", 
             },
-            ".cm-gutter": { paddingLeft: "8px" },
+            ".cm-gutter": { 
+                paddingLeft: "8px",
+            },
+            ".cm-scroller": {
+                paddingTop: "22px",
+                paddingBottom: "20px",
+            },
         });
         this.editor_view!.dispatch({
             effects: this.editor_style.reconfigure(

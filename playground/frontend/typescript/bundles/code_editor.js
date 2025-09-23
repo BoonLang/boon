@@ -23072,6 +23072,7 @@ const variableDefinitionMark = Decoration.mark({ class: "cm-boon-variable-defini
 const dotMark = Decoration.mark({ class: "cm-boon-dot" });
 const apostropheMark = Decoration.mark({ class: "cm-boon-apostrophe" });
 const pipeMark = Decoration.mark({ class: "cm-boon-pipe" });
+const chainAlternateMark = Decoration.mark({ class: "cm-boon-chain-alt" });
 const boonSemanticHighlight = ViewPlugin.fromClass(class {
 	decorations;
 	constructor(view) {
@@ -23086,6 +23087,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 		let expectFunctionName = false;
 		let pendingDefinition = null;
 		let pendingFunctionCall = null;
+		let chainIndex = 0;
 		syntaxTree(view.state).iterate({
 			from,
 			to,
@@ -23098,6 +23100,10 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 					return;
 				}
 				if (node.name === "SnakeCase") {
+					const before = node.from > 0 ? view.state.doc.sliceString(node.from - 1, node.from) : "";
+					if (before === ".") chainIndex += 1;
+					else chainIndex = 0;
+					if (chainIndex % 2 === 1) builder.add(node.from, node.to, chainAlternateMark);
 					if (expectFunctionName) {
 						builder.add(node.from, node.to, functionNameMark);
 						expectFunctionName = false;
@@ -23171,10 +23177,14 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 					expectFunctionName = false;
 					return;
 				}
-				if (node.name === "WS" || node.name === "Punctuation" || node.name === "Piece" || node.name === "Program" || node.name === "ProgramItems" || node.name === "ObjectLiteral" || node.name === "ListLiteral" || node.name === "TaggedObject") return;
+				if (node.name === "WS" || node.name === "Punctuation" || node.name === "Piece" || node.name === "Program" || node.name === "ProgramItems" || node.name === "ObjectLiteral" || node.name === "ListLiteral" || node.name === "TaggedObject") {
+					if (node.name !== "WS") chainIndex = 0;
+					return;
+				}
 				pendingDefinition = null;
 				expectFunctionName = false;
 				pendingFunctionCall = null;
+				chainIndex = 0;
 				return undefined;
 			}
 		});
@@ -23249,6 +23259,8 @@ const oneDarkTheme = EditorView.theme({
 		fontStyle: "italic",
 		fontWeight: "600"
 	},
+	".cm-content span.cm-boon-chain-alt": { color: "rgba(140, 145, 164, 0.85) !important" },
+	".cm-content span.cm-boon-chain-alt > span": { color: "rgba(140, 145, 164, 0.85) !important" },
 	".cm-content span.cm-boon-dot": {
 		color: `${chocolate} !important`,
 		fontWeight: "700"
@@ -23465,21 +23477,33 @@ var CodeEditorController = class {
 		}] });
 	}
 	set_snippet_screenshot_mode(mode) {
+		const base_content_style = {
+			"font-family": "'JetBrains Mono', monospace",
+			fontFeatureSettings: "'zero' 1",
+			paddingLeft: "16px",
+			paddingRight: "16px"
+		};
 		const basic_editor_style = EditorView.theme({
 			".cm-content, .cm-gutter": { minHeight: "200px" },
-			".cm-content": {
-				"font-family": "'JetBrains Mono', monospace",
-				fontFeatureSettings: "'zero' 1"
-			}
+			".cm-content": base_content_style,
+			".cm-scroller": {
+				paddingTop: "10px",
+				paddingBottom: "10px"
+			},
+			".cm-gutter": { paddingLeft: "12px" }
 		});
 		const snippet_screenshot_mode_editor_style = EditorView.theme({
 			".cm-content, .cm-gutter": { minHeight: "200px" },
 			".cm-content": {
-				"font-family": "'JetBrains Mono', monospace",
+				...base_content_style,
 				paddingTop: "22px",
 				paddingBottom: "20px"
 			},
-			".cm-gutter": { paddingLeft: "8px" }
+			".cm-gutter": { paddingLeft: "8px" },
+			".cm-scroller": {
+				paddingTop: "22px",
+				paddingBottom: "20px"
+			}
 		});
 		this.editor_view.dispatch({ effects: this.editor_style.reconfigure(mode ? snippet_screenshot_mode_editor_style : basic_editor_style) });
 	}
