@@ -787,95 +787,61 @@ impl Playground {
                     ))
                     .update_raw_el(|raw_el| raw_el.style("backdrop-filter", "blur(28px)"))
                     .layer(
-                        Column::new()
+                        Stack::new()
                             .s(Width::fill())
                             .s(Height::fill())
-                            .item(self.snippet_window_header())
-                            .item(
-                                Stack::new()
+                            .s(Background::new().color(color!("#101a2c")))
+                            .s(Borders::new().top(
+                                Border::new().color(color!("indigo")).width(4),
+                            ))
+                            .layer(
+                                El::new()
                                     .s(Width::fill())
                                     .s(Height::fill())
-                                    .s(Background::new().color(color!("#101a2c")))
-                                    .layer(
-                                        El::new()
-                                            .s(Width::fill())
+                                    .pointer_handling(PointerHandling::none())
+                                    .update_raw_el(|raw_el| {
+                                        raw_el.style(
+                                            "background",
+                                            "radial-gradient(140% 140% at 20% 10%, rgba(48,72,112,0.18) 0%, rgba(16,26,44,0.0) 65%)",
+                                        )
+                                    })
+                            )
+                            .layer(
+                                El::new()
+                                    .s(Width::fill())
+                                    .s(Height::fill())
+                                    .s(Padding::new().x(28).y(24))
+                                    .s(Scrollbars::both())
+                                    .child(
+                                        self.code_editor_widget()
+                                            .s(RoundedCorners::all(20))
+                                            .s(Clip::both())
                                             .s(Height::fill())
-                                            .pointer_handling(PointerHandling::none())
+                                            .s(Scrollbars::both())
                                             .update_raw_el(|raw_el| {
                                                 raw_el.style(
                                                     "background",
-                                                    "radial-gradient(140% 140% at 20% 10%, rgba(48,72,112,0.18) 0%, rgba(16,26,44,0.0) 65%)",
+                                                    "linear-gradient(120deg, rgba(24,32,52,0.28) 0%, rgba(8,10,18,0.92) 65%)",
                                                 )
                                             })
-                                    )
-                                    .layer(
-                                        El::new()
-                                            .s(Width::fill())
-                                            .s(Height::fill())
-                                            .s(Padding::new().x(28).y(24))
-                                            .s(Scrollbars::both())
-                                            .child(
-                                                self.code_editor_widget()
-                                                    .s(RoundedCorners::all(20))
-                                                    .s(Clip::both())
-                                                    .s(Height::fill())
-                                                    .s(Scrollbars::both())
-                                                    .update_raw_el(|raw_el| {
-                                                        raw_el.style(
-                                                            "background",
-                                                            "linear-gradient(120deg, rgba(24,32,52,0.28) 0%, rgba(8,10,18,0.92) 65%)",
-                                                        )
-                                                    })
-                                                    .s(Background::new().color(color!("#0b1223")))
-                                                    .s(Shadows::new([
-                                                        Shadow::new()
-                                                            .color(color!("rgba(0, 0, 0, 0.25)"))
-                                                            .y(22)
-                                                            .blur(46),
-                                                    ]))
-                                            ),
-                                    )
-                                    .layer(
-                                        El::new()
-                                            .s(Width::fill())
-                                            .s(Height::fill())
-                                            .pointer_handling(PointerHandling::none())
-                                            .s(Background::new().color(color!("rgba(0, 0, 0, 0.18)")))
-                                    )
-                            ),
+                                            .s(Background::new().color(color!("#0b1223")))
+                                            .s(Shadows::new([
+                                                Shadow::new()
+                                                    .color(color!("rgba(0, 0, 0, 0.25)"))
+                                                    .y(22)
+                                                    .blur(46),
+                                            ]))
+                                    ),
+                            )
+                            .layer(
+                                El::new()
+                                    .s(Width::fill())
+                                    .s(Height::fill())
+                                    .pointer_handling(PointerHandling::none())
+                                    .s(Background::new().color(color!("rgba(0, 0, 0, 0.18)")))
+                            )
                     ),
             )
-    }
-
-    fn snippet_window_header(&self) -> impl Element {
-        Stack::new()
-            .s(Width::fill())
-            .s(Background::new().color(color!("rgba(20, 26, 43, 0.9)")))
-            .s(Padding::new().x(20).y(12))
-            .s(Borders::new().bottom(
-                Border::new().color(color!("rgba(255, 255, 255, 0.06)")).width(1),
-            ))
-            .layer(
-                Row::new()
-                    .s(Gap::new().x(12))
-                    .items([
-                        color!("#3b6dac"),
-                        color!("#c9962d"),
-                        color!("#3fa869"),
-                    ]
-                    .into_iter()
-                    .map(|color| self.snippet_window_control(color)))
-            )
-    }
-
-    fn snippet_window_control(&self, color: impl IntoColor) -> impl Element {
-        let color = color.into_color();
-        El::new()
-            .s(Width::exact(14))
-            .s(Height::exact(14))
-            .s(RoundedCorners::all_max())
-            .s(Background::new().color(color))
-            .s(Shadows::new([Shadow::new().color(color!("rgba(0,0,0,0.25)")).y(1).blur(2)]))
     }
 
     fn code_editor_widget(&self) -> CodeEditor {
