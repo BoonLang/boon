@@ -196,10 +196,12 @@ impl Playground {
                 El::new()
                     .s(Width::fill())
                     .s(Height::fill())
+                    .s(Scrollbars::both())
                     .child(self.shell_surface(
                         Column::new()
                             .s(Width::fill())
                             .s(Height::fill())
+                            .s(Scrollbars::both())
                             .s(Gap::new().y(8))
                             .item(self.controls_row())
                             .item(self.panels_row()),
@@ -211,6 +213,7 @@ impl Playground {
         El::new()
             .s(Width::fill())
             .s(Height::fill())
+            .s(Scrollbars::both())
             .s(Background::new().color(shell_surface_color()))
             .s(RoundedCorners::all(32))
             .s(Borders::all(
@@ -228,6 +231,7 @@ impl Playground {
                 El::new()
                     .s(Width::fill())
                     .s(Height::fill())
+                    .s(Scrollbars::both())
                     .s(Padding::new().x(10).y(10))
                     .child(content),
             )
@@ -288,6 +292,7 @@ impl Playground {
         El::new()
             .s(Width::fill())
             .s(Height::fill())
+            .s(Scrollbars::both())
             .s(Background::new().color(primary_surface_color()))
             .s(RoundedCorners::all(24))
             .s(Borders::all(
@@ -309,6 +314,7 @@ impl Playground {
             .s(Width::fill())
             .s(Height::fill())
             .s(Align::new().top())
+            .s(Scrollbars::both())
             .on_viewport_size_change({
                 let panel_container_width = self.panel_container_width.clone();
                 let panel_split_ratio = self.panel_split_ratio.clone();
