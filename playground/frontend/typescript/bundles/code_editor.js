@@ -23480,8 +23480,7 @@ var CodeEditorController = class {
 		const base_content_style = {
 			"font-family": "'JetBrains Mono', monospace",
 			fontFeatureSettings: "'zero' 1",
-			paddingLeft: "16px",
-			paddingRight: "16px"
+			paddingRight: "12px"
 		};
 		const basic_editor_style = EditorView.theme({
 			".cm-content, .cm-gutter": { minHeight: "200px" },
@@ -23490,7 +23489,7 @@ var CodeEditorController = class {
 				paddingTop: "10px",
 				paddingBottom: "10px"
 			},
-			".cm-gutter": { paddingLeft: "12px" }
+			".cm-gutter:not(.cm-foldGutter)": { paddingLeft: "8px" }
 		});
 		const snippet_screenshot_mode_editor_style = EditorView.theme({
 			".cm-content, .cm-gutter": { minHeight: "200px" },
@@ -23499,11 +23498,7 @@ var CodeEditorController = class {
 				paddingTop: "22px",
 				paddingBottom: "20px"
 			},
-			".cm-gutter": { paddingLeft: "8px" },
-			".cm-scroller": {
-				paddingTop: "22px",
-				paddingBottom: "20px"
-			}
+			".cm-gutter:not(.cm-foldGutter)": { paddingLeft: "4px" }
 		});
 		this.editor_view.dispatch({ effects: this.editor_style.reconfigure(mode ? snippet_screenshot_mode_editor_style : basic_editor_style) });
 	}
