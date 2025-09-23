@@ -23,7 +23,7 @@ const MIN_PANEL_RATIO: f64 = 0.1;
 const MAX_PANEL_RATIO: f64 = 0.9;
 const MIN_EDITOR_WIDTH_PX: f64 = 260.0;
 const MIN_PREVIEW_WIDTH_PX: f64 = 260.0;
-const PANEL_DIVIDER_WIDTH: f64 = 14.0;
+const PANEL_DIVIDER_WIDTH: f64 = 10.0;
 
 const APP_BACKGROUND_GRADIENT: &str =
     "linear-gradient(155deg, #231746 0%, #141f33 48%, #0d323f 100%)";
@@ -180,8 +180,8 @@ impl Playground {
         Column::new()
             .s(Width::fill())
             .s(Height::fill())
-            .s(Padding::new().x(36).top(32).bottom(44))
-            .s(Gap::new().y(28))
+            .s(Padding::new().x(16).top(16).bottom(20))
+            .s(Gap::new().y(16))
             .s(Font::new().color(primary_text_color()))
             .s(Scrollbars::both())
             .item_signal(self.snippet_screenshot_mode.signal().map({
@@ -196,13 +196,11 @@ impl Playground {
                 El::new()
                     .s(Width::fill())
                     .s(Height::fill())
-                    .s(Scrollbars::both())
                     .child(self.shell_surface(
                         Column::new()
                             .s(Width::fill())
                             .s(Height::fill())
-                            .s(Gap::new().y(20))
-                            .s(Scrollbars::both())
+                            .s(Gap::new().y(12))
                             .item(self.controls_row())
                             .item(self.panels_row()),
                     )),
@@ -230,7 +228,7 @@ impl Playground {
                 El::new()
                     .s(Width::fill())
                     .s(Height::fill())
-                    .s(Padding::new().x(32).y(28))
+                    .s(Padding::new().x(14).y(14))
                     .child(content),
             )
     }
@@ -240,7 +238,7 @@ impl Playground {
             .s(Width::fill())
             .s(Background::new().color(shell_surface_color()))
             .s(RoundedCorners::all(28))
-            .s(Padding::new().x(28).y(16))
+            .s(Padding::new().x(18).y(12))
             .s(Borders::all(
                 Border::new().color(color!("rgba(255, 255, 255, 0.06)")).width(1),
             ))
@@ -256,7 +254,7 @@ impl Playground {
                 Row::new()
                     .s(Width::fill())
                     .s(Align::new().center_y())
-                    .s(Gap::new().x(16))
+                    .s(Gap::new().x(12))
                     .item(
                         Paragraph::new()
                             .s(Font::new().size(18).weight(FontWeight::SemiBold).no_wrap())
@@ -270,7 +268,7 @@ impl Playground {
         Row::new()
             .s(Width::fill())
             .s(Align::new().center_y())
-            .s(Gap::new().x(12).y(8))
+            .s(Gap::new().x(10).y(6))
             .multiline()
             .items(EXAMPLE_DATAS.map(|example_data| self.example_button(example_data)))
     }
@@ -279,10 +277,10 @@ impl Playground {
         Row::new()
             .s(Width::fill())
             .s(Align::new().center_y())
-            .s(Gap::new().x(16).y(12))
+            .s(Gap::new().x(12).y(8))
             .multiline()
-            .item(El::new().s(Align::new().left()).child(self.run_button()))
-            .item(El::new().s(Align::new().center_x()).child(self.snippet_screenshot_mode_button()))
+            .item(El::new().s(Align::new().left()).child(self.snippet_screenshot_mode_button()))
+            .item(El::new().s(Align::new().center_x()).child(self.run_button()))
             .item(El::new().s(Align::new().right()).child(self.clear_saved_states_button()))
     }
 
@@ -292,7 +290,7 @@ impl Playground {
             .s(Height::fill())
             .s(Background::new().color(primary_surface_color()))
             .s(RoundedCorners::all(28))
-            .s(Padding::new().x(28).y(28))
+            .s(Padding::new().x(12).y(12))
             .s(Borders::all(
                 Border::new().color(color!("rgba(255, 255, 255, 0.05)")).width(1),
             ))
@@ -303,7 +301,6 @@ impl Playground {
                     .blur(60)
                     .spread(-18),
             ]))
-            .s(Scrollbars::both())
             .update_raw_el(|raw_el| raw_el.style("backdrop-filter", "blur(20px)"))
             .child(content)
     }
@@ -313,7 +310,6 @@ impl Playground {
             .s(Width::fill())
             .s(Height::fill())
             .s(Align::new().top())
-            .s(Scrollbars::both())
             .on_viewport_size_change({
                 let panel_container_width = self.panel_container_width.clone();
                 let panel_split_ratio = self.panel_split_ratio.clone();
@@ -348,9 +344,8 @@ impl Playground {
             .s(Padding::new().right_signal(
                 self.snippet_screenshot_mode
                     .signal()
-                    .map_bool(|| 0, || 14),
+                    .map_bool(|| 0, || 8),
             ))
-            .s(Scrollbars::both())
             .s(Width::with_signal_self(map_ref! {
                 let snippet = self.snippet_screenshot_mode.signal(),
                 let ratio = self.panel_split_ratio.signal(),
@@ -389,7 +384,7 @@ impl Playground {
         let hovered_for_signal = hovered.clone();
         El::new()
             .s(Align::new().top())
-            .s(Width::exact(14))
+            .s(Width::exact(10))
             .s(Height::fill())
             .s(Cursor::new(CursorIcon::ColumnResize))
             .s(Background::new().color_signal(map_ref! {
@@ -426,9 +421,8 @@ impl Playground {
             .s(Padding::new().left_signal(
                 self.snippet_screenshot_mode
                     .signal()
-                    .map_bool(|| 0, || 14),
+                    .map_bool(|| 0, || 8),
             ))
-            .s(Scrollbars::both())
             .s(Width::with_signal_self(map_ref! {
                 let snippet = self.snippet_screenshot_mode.signal(),
                 let ratio = self.panel_split_ratio.signal(),
@@ -553,8 +547,8 @@ impl Playground {
     fn run_button(&self) -> impl Element {
         let hovered = Mutable::new(false);
         Button::new()
-            .s(Padding::new().x(20).y(12))
-            .s(RoundedCorners::all(24))
+            .s(Padding::new().x(14).y(7))
+            .s(RoundedCorners::all(22))
             .s(Font::new().color(color!("#052039")))
             .s(Font::new().weight(FontWeight::SemiBold))
             .s(Shadows::new([
@@ -572,10 +566,10 @@ impl Playground {
             .label(
                 Row::new()
                     .s(Align::new().center_y())
-                    .s(Gap::new().x(12))
+                    .s(Gap::new().x(6))
                     .item(
                         El::new()
-                            .s(Font::new().size(16).weight(FontWeight::SemiBold).no_wrap())
+                            .s(Font::new().size(14).weight(FontWeight::SemiBold).no_wrap())
                             .child("Run"),
                     )
                     .item(
@@ -600,8 +594,8 @@ impl Playground {
     fn snippet_screenshot_mode_button(&self) -> impl Element {
         let hovered = Mutable::new(false);
         Button::new()
-            .s(Padding::new().x(18).y(11))
-            .s(RoundedCorners::all(24))
+            .s(Padding::new().x(12).y(7))
+            .s(RoundedCorners::all(22))
             .s(Font::new().size(13).color(primary_text_color()))
             .s(Shadows::new([
                 Shadow::new()
@@ -623,19 +617,15 @@ impl Playground {
             .label(
                 Row::new()
                     .s(Align::new().center_y())
-                    .s(Gap::new().x(12))
+                    .s(Gap::new().x(6))
                     .item(
-                        Column::new()
-                            .s(Gap::new().y(1))
-                            .item(
-                                El::new()
-                                    .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
-                                    .child("Screenshot mode"),
-                            ),
+                        El::new()
+                            .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
+                            .child("Screenshot mode"),
                     )
                     .item(
                         El::new()
-                            .s(Padding::new().x(10).y(5))
+                            .s(Padding::new().x(9).y(3))
                             .s(RoundedCorners::all(999))
                             .s(Font::new().size(11).weight(FontWeight::SemiBold).no_wrap())
                             .s(Background::new().color_signal(map_ref! {
@@ -661,8 +651,8 @@ impl Playground {
     fn clear_saved_states_button(&self) -> impl Element {
         let hovered = Mutable::new(false);
         Button::new()
-            .s(Padding::new().x(18).y(10))
-            .s(RoundedCorners::all(24))
+            .s(Padding::new().x(12).y(7))
+            .s(RoundedCorners::all(22))
             .s(Borders::all(
                 Border::new()
                     .color(color!("rgba(255, 134, 134, 0.45)"))
@@ -682,7 +672,7 @@ impl Playground {
                 )))
             .label(
                 El::new()
-                    .s(Font::new().size(13).weight(FontWeight::Medium).no_wrap())
+                    .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
                     .child("Clear saved states"),
             )
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
@@ -702,7 +692,6 @@ impl Playground {
             .s(Align::new().top())
             .s(Width::fill())
             .s(Height::fill())
-            .s(Scrollbars::both())
             .layer(
                 El::new()
                     .s(Width::fill())
@@ -726,7 +715,7 @@ impl Playground {
                 El::new()
                     .s(Width::fill())
                     .s(Height::fill())
-                    .s(Padding::new().x(18).y(18))
+                    .s(Padding::new().x(10).y(10))
                     .child(
                         self.code_editor_widget()
                             .s(RoundedCorners::all(20))
@@ -747,26 +736,7 @@ impl Playground {
             .s(Align::new().top())
             .s(Width::fill())
             .s(Height::fill())
-            .s(Gap::new().y(14))
-            .s(Scrollbars::both())
-            .item(
-                Row::new()
-                    .s(Width::fill())
-                    .s(Align::new().center_y())
-                    .s(Gap::new().x(10))
-                    .item(
-                        El::new()
-                            .s(Width::exact(6))
-                            .s(Height::exact(6))
-                            .s(RoundedCorners::all_max())
-                            .s(Background::new().color(color!("#7dd3fc"))),
-                    )
-                    .item(
-                        El::new()
-                            .s(Font::new().size(13).color(muted_text_color()).no_wrap())
-                            .child("Editor"),
-                    ),
-            )
+            .s(Gap::new().y(8))
             .item(self.standard_code_editor_surface())
     }
 
@@ -908,25 +878,7 @@ impl Playground {
             .s(Align::new().top())
             .s(Width::fill())
             .s(Height::fill())
-            .s(Gap::new().y(14))
-            .item(
-                Row::new()
-                    .s(Width::fill())
-                    .s(Align::new().center_y())
-                    .s(Gap::new().x(10))
-                    .item(
-                        El::new()
-                            .s(Width::exact(6))
-                            .s(Height::exact(6))
-                            .s(RoundedCorners::all_max())
-                            .s(Background::new().color(color!("#86efac"))),
-                    )
-                    .item(
-                        El::new()
-                            .s(Font::new().size(13).color(muted_text_color()).no_wrap())
-                            .child("Live preview"),
-                    ),
-            )
+            .s(Gap::new().y(8))
             .item(
                 Stack::new()
                     .s(Width::fill())
@@ -948,13 +900,28 @@ impl Playground {
                         El::new()
                             .s(Width::fill())
                             .s(Height::fill())
-                            .s(Padding::new().x(20).y(20))
+                            .s(Padding::new().x(12).y(12))
                             .s(Scrollbars::both())
-                            .child_signal(self.run_command.signal().map_some({
+                            .child_signal(self.run_command.signal().map({
                                 let this = self.clone();
-                                move |run_command| this.example_runner(run_command)
+                                move |maybe_run| Some(match maybe_run {
+                                    Some(run_command) => Either::Right(this.example_runner(run_command)),
+                                    None => Either::Left(this.preview_placeholder()),
+                                })
                             })),
                     ),
+            )
+    }
+
+    fn preview_placeholder(&self) -> impl Element + use<> {
+        Stack::new()
+            .s(Width::fill())
+            .s(Height::fill())
+            .layer(
+                El::new()
+                    .s(Align::new().center_x().center_y())
+                    .s(Font::new().size(14).color(muted_text_color()).no_wrap())
+                    .child("Run to see preview"),
             )
     }
 
@@ -991,7 +958,7 @@ impl Playground {
         let hovered_signal = hovered.signal().broadcast();
         let source_signal = self.source_code.signal_cloned().broadcast();
         Button::new()
-            .s(Padding::new().x(18).y(9))
+            .s(Padding::new().x(14).y(7))
             .s(RoundedCorners::all(24))
             .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
             .s(Background::new().color_signal(map_ref! {
