@@ -23177,8 +23177,13 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 					expectFunctionName = false;
 					return;
 				}
-				if (node.name === "WS" || node.name === "Punctuation" || node.name === "Piece" || node.name === "Program" || node.name === "ProgramItems" || node.name === "ObjectLiteral" || node.name === "ListLiteral" || node.name === "TaggedObject") {
-					if (node.name !== "WS") chainIndex = 0;
+				if (node.name === "WS" || node.name === "Piece") return;
+				if (node.name === "Punctuation" || node.name === "Program" || node.name === "ProgramItems" || node.name === "ObjectLiteral" || node.name === "ListLiteral" || node.name === "TaggedObject") {
+					if (node.name === "Punctuation") {
+						const punctuationText = view.state.doc.sliceString(node.from, node.to);
+						if (punctuationText === ".") return;
+					}
+					chainIndex = 0;
 					return;
 				}
 				pendingDefinition = null;
@@ -23259,8 +23264,8 @@ const oneDarkTheme = EditorView.theme({
 		fontStyle: "italic",
 		fontWeight: "600"
 	},
-	".cm-content span.cm-boon-chain-alt": { color: "rgba(140, 145, 164, 0.85) !important" },
-	".cm-content span.cm-boon-chain-alt > span": { color: "rgba(140, 145, 164, 0.85) !important" },
+	".cm-content span.cm-boon-chain-alt": { color: "#bbbbbb !important" },
+	".cm-content span.cm-boon-chain-alt > span": { color: "#bbbbbb !important" },
 	".cm-content span.cm-boon-dot": {
 		color: `${chocolate} !important`,
 		fontWeight: "700"

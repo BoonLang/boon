@@ -88,10 +88,10 @@ export const oneDarkTheme = EditorView.theme({
     fontWeight: "600",
   },
   ".cm-content span.cm-boon-chain-alt": {
-    color: "rgba(140, 145, 164, 0.85) !important",
+    color: "#bbbbbb !important",
   },
   ".cm-content span.cm-boon-chain-alt > span": {
-    color: "rgba(140, 145, 164, 0.85) !important",
+    color: "#bbbbbb !important",
   },
   ".cm-content span.cm-boon-dot": {
     color: `${chocolate} !important`,
