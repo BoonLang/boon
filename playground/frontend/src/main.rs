@@ -267,12 +267,47 @@ impl Playground {
                     .s(Width::fill())
                     .s(Align::new().center_y())
                     .s(Gap::new().x(12))
-                    .item(
-                        Paragraph::new()
-                            .s(Font::new().size(18).weight(FontWeight::SemiBold).no_wrap())
-                            .content("Boon Playground"),
-                    )
+                    .item(self.header_title())
                     .item(self.example_tabs()),
+            )
+    }
+
+    fn header_title(&self) -> impl Element + use<> {
+        Row::new()
+            .s(Align::new().center_y())
+            .s(
+                Font::new()
+                    .size(18)
+                    .weight(FontWeight::SemiBold)
+                    .family([
+                        FontFamily::new("JetBrains Mono"),
+                        FontFamily::Monospace,
+                    ])
+                    .no_wrap(),
+            )
+            .s(Transform::new().move_up(2))
+            .item(
+                Link::new()
+                    .s(
+                        Font::new().color(color!("#6cb6ff")).line(
+                            FontLine::new()
+                                .underline()
+                                .color(color!("#6cb6ff"))
+                                .offset(4),
+                        ),
+                    )
+                    .label("Boon")
+                    .to("https://boon.run"),
+            )
+            .item(
+                El::new()
+                    .s(Font::new().color(color!("#d2691e")))
+                    .child("/"),
+            )
+            .item(
+                El::new()
+                    .s(Font::new().color(color!("#fcbf49")))
+                    .child("play"),
             )
     }
 

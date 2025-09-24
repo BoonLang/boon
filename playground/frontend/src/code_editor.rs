@@ -63,7 +63,9 @@ impl CodeEditor {
         let task = Task::start_droppable(async move {
             let controller = controller.wait_for_some_cloned().await;
             snippet_screenshot_mode
-                .for_each_sync(|snippet_screenshot_mode| controller.set_snippet_screenshot_mode(snippet_screenshot_mode))
+                .for_each_sync(|snippet_screenshot_mode| {
+                    controller.set_snippet_screenshot_mode(snippet_screenshot_mode)
+                })
                 .await;
         });
         self.after_remove(move |_| drop(task))
