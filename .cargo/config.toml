@@ -1,5 +1,9 @@
 [build]
 target-dir = "target"
 
+[env]
+FRONTEND_BUILD_ID = "dev"
+CACHE_BUSTING = "false"
+
 [target.wasm32-unknown-unknown]
 rustflags = ["--cfg", 'getrandom_backend="wasm_js"']
