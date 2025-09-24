@@ -44,7 +44,7 @@ args = [
     "https://github.com/MoonZoon/MoonZoon",
     "--locked",
     "--rev",
-    "8ee7546bf42ff8e87d14d498bf9863728a18ebe5",
+    "19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d",
     "--root",
     "mzoon",
 ]

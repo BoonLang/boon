@@ -139,6 +139,7 @@ dependencies = [
 [[package]]
 name = "color_macro"
 version = "0.1.0"
+source = "git+https://github.com/MoonZoon/MoonZoon?rev=19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d#19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d"
 dependencies = [
  "cssparser",
  "cssparser-color",
@@ -357,6 +358,7 @@ dependencies = [
 [[package]]
 name = "futures_signals_ext"
 version = "0.1.0"
+source = "git+https://github.com/MoonZoon/MoonZoon?rev=19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d#19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d"
 dependencies = [
  "futures-signals",
  "futures_util_ext",
@@ -366,6 +368,7 @@ dependencies = [
 [[package]]
 name = "futures_util_ext"
 version = "0.1.0"
+source = "git+https://github.com/MoonZoon/MoonZoon?rev=19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d#19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d"
 dependencies = [
  "futures-util",
  "pin-project",
@@ -440,6 +443,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 [[package]]
 name = "hsluv"
 version = "0.1.0"
+source = "git+https://github.com/MoonZoon/MoonZoon?rev=19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d#19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d"
 dependencies = [
  "hsluv_macro",
  "rust-hsluv",
@@ -448,6 +452,7 @@ dependencies = [
 [[package]]
 name = "hsluv_macro"
 version = "0.1.0"
+source = "git+https://github.com/MoonZoon/MoonZoon?rev=19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d#19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d"
 dependencies = [
  "quote",
  "syn",
@@ -495,6 +500,7 @@ dependencies = [
 [[package]]
 name = "lang"
 version = "0.1.0"
+source = "git+https://github.com/MoonZoon/MoonZoon?rev=19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d#19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d"
 dependencies = [
  "serde",
 ]
@@ -530,6 +536,7 @@ dependencies = [
 [[package]]
 name = "moonlight"
 version = "0.1.0"
+source = "git+https://github.com/MoonZoon/MoonZoon?rev=19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d#19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d"
 dependencies = [
  "chrono",
  "futures_signals_ext",
@@ -751,6 +758,7 @@ checksum = "dbb5fb1acd8a1a18b3dd5be62d25485eb770e05afb408a9627d14d451bae12da"
 [[package]]
 name = "route_macro"
 version = "0.1.0"
+source = "git+https://github.com/MoonZoon/MoonZoon?rev=19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d#19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -898,6 +906,7 @@ dependencies = [
 [[package]]
 name = "static_ref_macro"
 version = "0.1.0"
+source = "git+https://github.com/MoonZoon/MoonZoon?rev=19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d#19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1299,6 +1308,7 @@ dependencies = [
 [[package]]
 name = "zoon"
 version = "0.1.0"
+source = "git+https://github.com/MoonZoon/MoonZoon?rev=19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d#19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d"
 dependencies = [
  "apply",
  "async-once-cell",
