@@ -1,11 +1,11 @@
-operation: LATEST {
-    addition_button.event.press |> THEN { Addition }
-    subtraction_button.event.press |> THEN { Subtraction }
-}
-
 current_result: operation |> WHEN {
     Addition => { input_a + input_b }
     Subtraction => { input_a - input_b }
+}
+
+operation: LATEST {
+    addition_button.event.press |> THEN { Addition }
+    subtraction_button.event.press |> THEN { Subtraction }
 }
 
 ---------------------------------------------------
