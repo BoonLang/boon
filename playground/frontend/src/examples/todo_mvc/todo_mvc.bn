@@ -310,8 +310,8 @@ FUNCTION toggle_all_checkbox() {
                     size: 22,
                     color: Oklch[lightness: checked |> WHEN { 
                         True => 0.555
-                        False => 0.92 }
-                    ]
+                        False => 0.92
+                    }]
                 ]
                 transform: [rotate: 90, move_up: 18]
             ]
@@ -505,7 +505,8 @@ FUNCTION filter_button(filter) {
                             chroma: 0.165
                             hue: 25.36
                             alpha: alpha
-                        ] ]
+                        ] 
+                    ]
                     False => NoOutline
                 }
             }

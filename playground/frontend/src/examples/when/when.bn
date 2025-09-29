@@ -1,6 +1,6 @@
 current_result: operation |> WHEN {
-    Addition => { input_a + input_b }
-    Subtraction => { input_a - input_b }
+    Addition => input_a + input_b
+    Subtraction => input_a - input_b
 }
 
 operation: LATEST {
