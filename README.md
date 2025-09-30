@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/images/logo/ascii-art-boon.png" alt="boon logo" style="max-width: 380px; width: 100%; border-radius: 24px; border: 1px solid #111629; box-shadow: 0 18px 36px rgba(0, 0, 0, 0.35);" />
+  <img src="docs/images/logo/ascii-art-boon.png" alt="boon logo" />
 </p>
 
-<p align="center"><strong>Timeless playful programming language.</strong></p>
+<p align="center">Timeless & Playful Language</p>
 
 > noob or hacker, web or chip,  
 boon will guide your coding trip
