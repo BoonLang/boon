@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Boon Programming Language</title>
+    <meta name="description" content="Boon is a programming language bridging browsers, chips, and everything between." />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="hero">
+      <div class="hero__inner">
+        <div class="cta">
+          <a class="button" href="https://play.boon.run" target="_blank" rel="noreferrer">Try the Playground</a>
+          <a class="button button--outline button--icon" href="https://github.com/BoonLang/boon" target="_blank" rel="noreferrer">
+            <svg class="button__icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+              <path d="M8 .2a8 8 0 0 0-2.53 15.6c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2 .37-2.53-.49-2.69-.94-.09-.22-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.2 1.87.86 2.33.65.07-.52.28-.86.5-1.06-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.01.08-2.1 0 0 .67-.21 2.2.82a7.53 7.53 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.03 2.2-.82 2.2-.82.44 1.09.16 1.9.08 2.1.51.56.82 1.28.82 2.15 0 3.07-1.87 3.74-3.65 3.94.29.25.54.73.54 1.48 0 1.07-.01 1.94-.01 2.21 0 .21.15.46.55.38A8 8 0 0 0 8 .2Z"></path>
+            </svg>
+            <span class="button__label">GitHub</span>
+          </a>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <article id="readme" class="readme">
+        <h1 class="sr-only">Boon</h1>
+        <pre><code> ▄▄                                     
+ ██                                     
+ ██▄███▄    ▄████▄    ▄████▄   ██▄████▄ 
+ ██▀  ▀██  ██▀  ▀██  ██▀  ▀██  ██▀   ██ 
+ ██    ██  ██    ██  ██    ██  ██    ██ 
+ ███▄▄██▀  ▀██▄▄██▀  ▀██▄▄██▀  ██    ██ 
+ ▀▀ ▀▀▀      ▀▀▀▀      ▀▀▀▀    ▀▀    ▀▀
+ programming language bridging worlds
+</code></pre>
+<blockquote>
+<p>noob or hacker, web or chip,<br />
+boon will guide your coding trip</p>
+</blockquote>
+<h2 id="first-look">First Look</h2>
+<p><strong>1</strong>...  <strong>2</strong>...  <strong>3</strong>...  every second<br />
+<img alt="interval code" src="docs/images/snippets/interval.png" /></p>
+<p><strong>1</strong>...  <strong>2</strong>...  <strong>3</strong>...  on a button click
+<img alt="counter code" src="docs/images/snippets/counter.png" /></p>
+<p>You can try out the examples on <a href="https://play.boon.run/">play.boon.run</a></p>
+<h2 id="super-counter">Super Counter</h2>
+<ul>
+<li>Do you like open source?</li>
+<li>Do you like small computers like Raspberry Pi?</li>
+<li>Do you like hardware or FPGA boards like iCESugar? </li>
+</ul>
+<p><img alt="raspberry pi and icesugar pro" src="docs/images/photos/raspbery_pi_and_icesugar.jpg" /></p>
+<ul>
+<li>Would you like to program and configure everything in one language?</li>
+<li>Would you like to unplug it whenever you want to without losing data?</li>
+</ul>
+<p><img alt="pi and sugar diagram" src="docs/images/diagrams/pi_and_sugar.png" /></p>
+<p>What's on that diagram? Super counter!</p>
+<ol>
+<li>You press a button on the iCESugar dev board.</li>
+<li>The board sends a message to the Raspberry Pi.</li>
+<li>The computer increments the counter in its database.</li>
+<li>The board, the CLI (<em>command-line interface</em>), and the web app are notified that the counter value has changed.</li>
+<li>The board turns on the LED for a moment to signal that the counter has been incremented.</li>
+<li>The web app updates the rendered counter value and changes its color according to the defined script rules (e.g. green when the counter is less than 10, otherwise red).</li>
+<li>The CLI displays the new counter value and runs a configured command (e.g. show a notification or write something into the terminal/console).</li>
+<li>You can watch how data flows through the entire Super counter on the Monitor.</li>
+</ol>
+<h2 id="flow-combinators">Flow Combinators</h2>
+<h3 id="latest">LATEST</h3>
+<p><img alt="LATEST code example" src="docs/images/snippets/latest.png" /></p>
+<ul>
+<li>The first value flying in is the first one flying out.</li>
+<li>When it's not possible to determine which value arrived first, the order in the LATEST block matters: <code>LATEST { first, second }</code>.</li>
+<li>The LATEST combinator also works across code changes. That means when you run the code <code>LATEST { 1, 2 }</code>, change the code to <code>LATEST { 3, 2 }</code>, and run the program again, the values coming out of that combinator will be: <code>1</code>, then <code>2</code>, and then <code>3</code>. Number <code>2</code> hasn't changed, so it doesn't fly out on the second run.</li>
+</ul>
+<p><img alt="LATEST diagram" src="docs/images/diagrams/latest.png" /></p>
+<ul>
+<li><strong>EXTRA:</strong> <code>Math/sum(increment&lt;Number&gt;) -&gt; Number</code> and other function calls, operators and combinators are actually <em>actors</em>. It means a stream of data flows inside and outside of them and they keep their internal state. In the case of <code>Math/sum</code>, it remembers the current sum and outputs it on every change, that is, on every new incoming value.</li>
+</ul>
+<p><img alt="Math/sum diagram" src="docs/images/diagrams/math_sum.png" /></p>
+<h3 id="while">WHILE</h3>
+<p><img alt="WHILE code example" src="docs/images/snippets/while.png" /></p>
+<ul>
+<li>Let's say you have sensors counting cars on two roads:<ol>
+<li><code>input_a</code> is the changing sum of the cars passed on road <code>A</code></li>
+<li><code>input_b</code> is the changing sum of the cars passed on road <code>B</code></li>
+</ol>
+</li>
+<li>Both inputs are connected to your fancy computer, where you can switch between their:<ol>
+<li><code>Addition</code> - to know how many cars were on both roads</li>
+<li><code>Subtraction</code> - to know which road is more used</li>
+</ol>
+</li>
+<li>That means when <code>input_a</code> is <code>15</code> and <code>input_b</code> is <code>7</code>, you can see either <code>22</code> or <code>8</code>, and the displayed value changes in real time with every car that passes by.  </li>
+</ul>
+<p><img alt="WHILE diagram" src="docs/images/diagrams/while.png" /></p>
+<h3 id="when">WHEN</h3>
+<p><img alt="WHEN code example" src="docs/images/snippets/when.png" /></p>
+<ul>
+<li>Bob doesn't have such a fancy computer. Bob has a paper and a pen.</li>
+<li>Every time he wants to record <code>Addition</code> or <code>Subtraction</code>, he has to write the result down.</li>
+<li>That means he loses input values between entries, but the written results never change.</li>
+<li>Everything inside the <code>WHEN { ... }</code> block is "frozen in time" when an <em>input value</em> arrives (<code>Sub</code> or <code>Add</code> on the diagram below, <code>operation</code> in the code above) - values are copied, and they no longer change according to their <em>dependencies</em> (<code>A</code> and <code>B</code> in the diagram, <code>input_a</code> and <code>input_b</code> in the code). </li>
+</ul>
+<p><img alt="WHEN diagram" src="docs/images/diagrams/when.png" /></p>
+<h3 id="then">THEN</h3>
+<p><img alt="THEN code example" src="docs/images/snippets/then.png" /></p>
+<ul>
+<li>Alice only has paper and a pen like Bob, but she writes down only additions.</li>
+<li><code>THEN</code> is basically <code>WHEN</code> without <em>arms</em> (<code>Abc =&gt; 123</code>). You can replace <code>THEN { 123 }</code> with <code>WHEN { __  =&gt; 123 }</code>; that means you don't care about the actual input value, you just want to do something when a new input arrives. </li>
+</ul>
+<p><img alt="THEN diagram" src="docs/images/diagrams/then.png" /></p>
+<h3 id="summary">Summary</h3>
+<ul>
+<li>Data flow continuously <strong>WH</strong>ILE an arm is selected.</li>
+<li>Data are copied <strong>WH</strong><em>EN</em> an arm is selected.</li>
+<li>Input arrives, and TH<em>EN</em> data are copied.</li>
+</ul>
+<h3 id="real-world-examples">Real-world examples</h3>
+<ol>
+<li>When the user presses Enter or clicks a send button in your chat application, use WHEN or THEN to copy the message written in the new-message input. With the WHILE combinator, you'd risk changing already sent messages with every change to the text input.</li>
+<li>Use WHILE to update texts in your multilingual application. With WHEN/THEN you'd update all dynamic texts only when the user decides to switch languages.</li>
+</ol>
+<h2 id="durable-state-code-changes">Durable State &amp; Code Changes</h2>
+<p>Every program is a living organism, sooner or later you'll want to change its code but ideally not lose any data during the process or tell your users to not use your app during the weekend while you are "migrating data".</p>
+<p>Let's say we want to upgrade our simple counter example - rename the variable <code>counter</code> to <code>counter_2</code> and increment its value by 2 on a button click.</p>
+<p>It would be a pretty straightforward operation, but we don't want to reset our counter value while deploying a new app version.</p>
+<p>You can go to <a href="https://play.boon.run/">play.boon.run</a>, click the button <code>counter.bn</code> in the header and follow the steps below with me.</p>
+<ol>
+<li>Look at the original counter code, run it and press the <code>+</code> button to change counter state a bit.
+<img alt="counter upgrade step 1" src="docs/images/snippets/state_migrations/counter_1.png" /></li>
+<li>Add the <code>counter_2</code> definition, replace <code>counter</code> with <code>counter_2</code> in HTML document items, and prevent the old <code>counter</code> from listening to button-press events. Also include the old <code>counter</code> in <code>counter_2</code>'s LATEST blocks to do the actual state migration from the old counter to the new one. Then run the example again. Nothing should change visually, but you're already using the upgraded app.
+<img alt="counter upgrade step 2" src="docs/images/snippets/state_migrations/counter_2.png" /></li>
+<li>Remove the references to the old <code>counter</code>, delete its definition, and we are done!
+<img alt="counter upgrade step 3" src="docs/images/snippets/state_migrations/counter_3.png" /></li>
+<li>When you want to reset the counter, click the <strong>Clear saved states</strong> button just above the preview pane on the playground to remove all states stored in the browser's LocalStorage, and then click the <strong>Run</strong> button to restart the app; the counter resets back to 0.</li>
+</ol>
+<p><strong>EXTRA:</strong> Variables in our playground examples are stored in the browser. However, the general idea is that some variables in your app will be stored in the browser, some variables in a standard database, and some of them nowhere to save memory or quickly forget things like passwords or tokens.</p>
+<h2 id="all-roads-lead-to-rome-document">All roads lead to ~~Rome~~ <code>document</code></h2>
+<p><img alt="counter flow diagram" src="docs/images/diagrams/counter_flow.png" /></p>
+<p>Look at that counter example dataflow diagram again. Do all paths really lead to the <code>document</code>? Almost! The only exception is that blue <code>LINK</code> rectangle and the bottom left corner coming from the <code>Element/button(..)</code> function call. </p>
+<p>What is that <code>LINK</code> good for? Why does it make the only loop in the entire diagram to ruin my otherwise perfect tree?!</p>
+<p>Look at the counter code again:</p>
+<p><img alt="counter code" src="docs/images/snippets/counter.png" /></p>
+<ol>
+<li>Notice the <code>press: LINK</code> object field being passed to the <code>Element/button</code> function call as part of the <code>element</code> argument.</li>
+<li>Function <code>Element/button</code> transforms the arguments into a data structure compatible with the element tree and digestible by the <code>Document/new</code> function.</li>
+<li>Boon browser runtime finds the global <code>document</code> variable and creates browser elements described in the passed element tree. When it finds <code>event.press</code>, it <em>links</em> it with events produced by those browser HTML/DOM elements.</li>
+<li>When linked, you can listen for new events with code like <code>my_button.event.press |&gt; THEN { .. }</code></li>
+</ol>
+<p>So, for our current understanding, <code>variable_name: LINK</code> basically means that the variable's value can be set <strong>after</strong> the variable is defined - no other variables can be set once they are defined.</p>
+<h2 id="finally-perfect-trees">Finally, perfect trees!</h2>
+<p>We cannot really get rid of all loops in dataflow graphs - they are a natural part of programs and the things we do - we can only monitor them and try to remove accidental infinite loops.</p>
+<p>However, look at this nice forest!:</p>
+<p><img alt="counter state diagram" src="docs/images/diagrams/counter_state.png" /></p>
+<ul>
+<li>In Boon, every piece of state has a place in the <em>ownership hierarchy</em>.
+Detach an <em>object</em> or a <em>list</em>, and all of its descendants vanish with it.
+Nothing is “freed” manually — the runtime simply drops what’s no longer owned, whether data or actors.</li>
+<li>Global variables - <code>document</code>, <code>counter</code>, <code>increment_button</code> - own all other items in our counter example. Everything has only one owner: the place where it was defined; everything else is just a <em>reference</em> marked with dashed arrows.</li>
+<li>That's why <code>LINK</code> is actually a link/reference - the variable defined with <code>LINK</code> doesn't <em>own</em> the linked browser element (notice the blue dashed OBJECT at the bottom of the state diagram above).</li>
+</ul>
+<h2 id="enough-diagrams-more-code">Enough diagrams! More code!</h2>
+<p><img alt="complex counter example" src="docs/images/snippets/complex_counter.png" /></p>
+<h3 id="pass-passed">PASS + PASSED</h3>
+<p>Notice in the code above: </p>
+<ol>
+<li><code>root_element(PASS: store)</code></li>
+<li><code>FUNCTION root_element()</code>  </li>
+<li><code>PASSED.elements.increment_button</code></li>
+</ol>
+<p>The only purpose is to <em>pass</em> data through multiple function calls without the need to mention them explicitly among function arguments.</p>
+<p>Without PASS + PASSED, the same lines would look like:
+1. <code>root_element(store: store)</code> or <code>store |&gt; root_element()</code>
+2. <code>FUNCTION root_element(store)</code>   &lt;- new function argument
+3. <code>store.elements.increment_button</code></p>
+<p>So PASS + PASSED is useful when you have deep function call tree (typically element tree) and bottom levels need something from top levels.</p>
+<h3 id="link">LINK { .. }</h3>
+<p>You already know what <code>variable: LINK</code> means and now you'll find out how to set it by yourself (instead of setting it by Boon runtime). </p>
+<p>Notice these lines: </p>
+<ol>
+<li><code>decrement_button: LINK</code></li>
+<li><code>counter_button(label: '-') |&gt; LINK { PASSED.elements.decrement_button }</code></li>
+</ol>
+<p>The element data returned from the <code>counter_button</code> function call are <em>linked</em> to <code>decrement_button</code> and returned from <code>LINK {}</code> without any changes. </p>
+<h2 id="where-is-fibonacci">Where is Fibonacci??</h2>
+<p><img alt="fibonacci example" src="docs/images/snippets/fibonacci.png" /></p>
+<p>This idea was driven by design decisions to avoid recursions and keep loops as tight and hidden as possible. However, I want the Boon design to be driven by real applications, so I'll revisit this API/example when the need for channels, (infinite) streams, generators, lazy evaluation, tail recursions, or other related concepts emerges.</p>
+<h2 id="see-the-problem-fix-the-flow">See the Problem, Fix the Flow</h2>
+<ol>
+<li>
+<p>A monitor/debugger is your friend. Have you ever played a Factorio-like game? I want to:</p>
+<ul>
+<li>SEE the problem.</li>
+<li>See statistics.</li>
+<li>Be able to immediately fix the problem.</li>
+<li>Want to know why the problem happened.</li>
+<li>Want to see slow parts.</li>
+<li>Want to see loops.</li>
+<li>Want to see what is waiting and why.</li>
+<li>Want to just watch and enjoy it while everything works as expected.</li>
+<li>Want to be notified when something fails. 
+Just show me! Yes, you understand correctly, monitoring and a short feedback loop have high priority for Boon tools and design in general. </li>
+</ul>
+</li>
+<li>
+<p>A compiler is your friend. Nice error messages, fast type checking, hints. </p>
+</li>
+</ol>
+<p><img alt="error example" src="docs/images/snippets/errors/unknown_function_in_browser.png" /></p>
+<ol start="3">
+<li>A formatter is your friend. No need to think about the correct number of spaces. No confusing code diffs. Constant reading speed for a code reviewer.</li>
+</ol>
+<h2 id="status-future">Status &amp; Future</h2>
+<p>A lot of things have to be implemented and explained, but the core is there and I don't plan to stop!</p>
+<p>Examples on <a href="https://play.boon.run/">play.boon.run</a> are guaranteed to run. I'll continuously add more there, and examples running outside the browser environment will appear as well.</p>
+<p>Questions ▷ martin@kavik.cz</p>
+<h2 id="credits">Credits</h2>
+<ul>
+<li>ASCII Art: <a href="https://patorjk.com/software/taag/#p=display&amp;f=Mono+12&amp;t=boon&amp;x=none&amp;v=4&amp;h=4&amp;w=80&amp;we=false">patorjk.com + Mono 12</a></li>
+</ul></article>
+    </main>
+
+    <footer class="footer">
+      <p class="footer__line footer__line--primary">Made with &#10084; for builders of chips, web apps, and everything between.</p>
+      <p class="footer__line footer__line--secondary">Martin Kavík 2025</p>
+    </footer>
+  </body>
+</html>
