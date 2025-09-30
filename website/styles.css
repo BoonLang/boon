@@ -124,6 +124,19 @@ main {
   position: relative;
 }
 
+.readme__logo {
+  text-align: center;
+  margin-bottom: 1rem;
+}
+
+.readme__tagline {
+  margin: 0 0 2rem;
+  text-align: center;
+  font-size: 1.1rem;
+  color: var(--text-primary);
+  letter-spacing: 0.04em;
+}
+
 .readme > *:first-child {
   margin-top: 0;
 }

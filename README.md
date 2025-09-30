@@ -1,13 +1,9 @@
-```                
- ▄▄                                     
- ██                                     
- ██▄███▄    ▄████▄    ▄████▄   ██▄████▄ 
- ██▀  ▀██  ██▀  ▀██  ██▀  ▀██  ██▀   ██ 
- ██    ██  ██    ██  ██    ██  ██    ██ 
- ███▄▄██▀  ▀██▄▄██▀  ▀██▄▄██▀  ██    ██ 
- ▀▀ ▀▀▀      ▀▀▀▀      ▀▀▀▀    ▀▀    ▀▀
- programming language bridging worlds
-```
+<p align="center">
+  <img src="docs/images/logo/ascii-art-boon.png" alt="boon logo" style="max-width: 380px; width: 100%; border-radius: 24px; border: 1px solid #111629; box-shadow: 0 18px 36px rgba(0, 0, 0, 0.35);" />
+</p>
+
+<p align="center"><strong>Timeless playful programming language.</strong></p>
+
 > noob or hacker, web or chip,  
 boon will guide your coding trip
 
@@ -227,4 +223,4 @@ Questions ▷ martin@kavik.cz
 
 ## Credits
 
-- ASCII Art: [patorjk.com + Mono 12](https://patorjk.com/software/taag/#p=display&f=Mono+12&t=boon&x=none&v=4&h=4&w=80&we=false)
+- ASCII Art: [patorjk.com + Mono 12](https://patorjk.com/software/taag/#p=display&f=Mono+12&t=boon&x=rainbow3&v=4&h=4&w=80&we=false)
