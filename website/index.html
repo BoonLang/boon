@@ -133,7 +133,7 @@ boon will guide your coding trip</p>
 <li>When you want to reset the counter, click the <strong>Clear saved states</strong> button just above the preview pane on the playground to remove all states stored in the browser's LocalStorage, and then click the <strong>Run</strong> button to restart the app; the counter resets back to 0.</li>
 </ol>
 <p><strong>EXTRA:</strong> Variables in our playground examples are stored in the browser. However, the general idea is that some variables in your app will be stored in the browser, some variables in a standard database, and some of them nowhere to save memory or quickly forget things like passwords or tokens.</p>
-<h2 id="all-roads-lead-to-rome-document">All roads lead to ~~Rome~~ <code>document</code></h2>
+<h2 id="all-roads-lead-to-rome-document">All roads lead to <del>Rome</del> <code>document</code></h2>
 <p><img alt="counter flow diagram" src="docs/images/diagrams/counter_flow.png" /></p>
 <p>Look at that counter example dataflow diagram again. Do all paths really lead to the <code>document</code>? Almost! The only exception is that blue <code>LINK</code> rectangle and the bottom left corner coming from the <code>Element/button(..)</code> function call. </p>
 <p>What is that <code>LINK</code> good for? Why does it make the only loop in the entire diagram to ruin my otherwise perfect tree?!</p>
