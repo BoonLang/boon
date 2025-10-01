@@ -123,19 +123,20 @@ boon will guide your coding trip</p>
 <p>Let's say we want to upgrade our simple counter example - rename the variable <code>counter</code> to <code>counter_2</code> and increment its value by 2 on a button click.</p>
 <p>It would be a pretty straightforward operation, but we don't want to reset our counter value while deploying a new app version.</p>
 <p>You can go to <a href="https://play.boon.run/">play.boon.run</a>, click the button <code>counter.bn</code> in the header and follow the steps below with me.</p>
+<p><strong>NOTE:</strong> You'll write <em>pipe operator</em> ▷ by typing <code>|</code> and <code>&gt;</code>. Boon Playground uses the <a href="https://www.jetbrains.com/lp/mono/">JetBrains Mono</a> font with enabled ligatures to combine them visually. I would also like to add support for <a href="https://github.com/JetBrains/JetBrainsMono/issues/542">infinite length ligatures</a> to that font to have nice continuous lines for comments / dividers.</p>
 <ol>
 <li>Look at the original counter code, run it and press the <code>+</code> button to change counter state a bit.
 <img alt="counter upgrade step 1" src="docs/images/snippets/state_migrations/counter_1.png" /></li>
-<li>Add the <code>counter_2</code> definition, replace <code>counter</code> with <code>counter_2</code> in HTML document items, and prevent the old <code>counter</code> from listening to button-press events. Also include the old <code>counter</code> in <code>counter_2</code>'s LATEST blocks to do the actual state migration from the old counter to the new one. Then run the example again. Nothing should change visually, but you're already using the upgraded app.
+<li>Add the <code>counter_2</code> definition, replace <code>counter</code> with <code>counter_2</code> in HTML document items, and prevent the old <code>counter</code> from listening to button-press events. Notice old <code>counter</code> in <code>counter_2</code>'s LATEST block to do the actual state migration from the old counter to the new one. Then run the example again. Nothing should change visually, but you're already using the upgraded app.
 <img alt="counter upgrade step 2" src="docs/images/snippets/state_migrations/counter_2.png" /></li>
-<li>Remove the references to the old <code>counter</code>, delete its definition, and we are done!
+<li>Remove the references to the old <code>counter</code>, delete its definition, and we are done! Run the example and click <code>+</code> to verify that it's incremented by 2.
 <img alt="counter upgrade step 3" src="docs/images/snippets/state_migrations/counter_3.png" /></li>
 <li>When you want to reset the counter, click the <strong>Clear saved states</strong> button just above the preview pane on the playground to remove all states stored in the browser's LocalStorage, and then click the <strong>Run</strong> button to restart the app; the counter resets back to 0.</li>
 </ol>
 <p><strong>EXTRA:</strong> Variables in our playground examples are stored in the browser. However, the general idea is that some variables in your app will be stored in the browser, some variables in a standard database, and some of them nowhere to save memory or quickly forget things like passwords or tokens.</p>
 <h2 id="all-roads-lead-to-rome-document">All roads lead to <del>Rome</del> <code>document</code></h2>
 <p><img alt="counter flow diagram" src="docs/images/diagrams/counter_flow.png" /></p>
-<p>Look at that counter example dataflow diagram again. Do all paths really lead to the <code>document</code>? Almost! The only exception is that blue <code>LINK</code> rectangle and the bottom left corner coming from the <code>Element/button(..)</code> function call. </p>
+<p>Look at that counter example dataflow diagram again. Do all paths really lead to the <code>document</code>? Almost! The only exception is that blue <code>LINK</code> rectangle at the bottom left corner coming from the <code>Element/button(..)</code> function call. </p>
 <p>What is that <code>LINK</code> good for? Why does it make the only loop in the entire diagram to ruin my otherwise perfect tree?!</p>
 <p>Look at the counter code again:</p>
 <p><img alt="counter code" src="docs/images/snippets/counter.png" /></p>
@@ -167,19 +168,21 @@ Nothing is “freed” manually — the runtime simply drops what’s no longer 
 <li><code>PASSED.elements.increment_button</code></li>
 </ol>
 <p>The only purpose is to <em>pass</em> data through multiple function calls without the need to mention them explicitly among function arguments.</p>
-<p>Without PASS + PASSED, the same lines would look like:
-1. <code>root_element(store: store)</code> or <code>store |&gt; root_element()</code>
-2. <code>FUNCTION root_element(store)</code>   &lt;- new function argument
-3. <code>store.elements.increment_button</code></p>
+<p>Without PASS + PASSED, the same lines would look like:</p>
+<ol>
+<li><code>root_element(store: store)</code> or <code>store |&gt; root_element()</code></li>
+<li><code>FUNCTION root_element(store)</code>   &lt;- new function argument</li>
+<li><code>store.elements.increment_button</code></li>
+</ol>
 <p>So PASS + PASSED is useful when you have deep function call tree (typically element tree) and bottom levels need something from top levels.</p>
 <h3 id="link">LINK { .. }</h3>
-<p>You already know what <code>variable: LINK</code> means and now you'll find out how to set it by yourself (instead of setting it by Boon runtime). </p>
+<p>You already know what <code>variable: LINK</code> means and now you'll find out how to set it by yourself (instead of setting it by the Boon runtime). </p>
 <p>Notice these lines: </p>
 <ol>
 <li><code>decrement_button: LINK</code></li>
 <li><code>counter_button(label: '-') |&gt; LINK { PASSED.elements.decrement_button }</code></li>
 </ol>
-<p>The element data returned from the <code>counter_button</code> function call are <em>linked</em> to <code>decrement_button</code> and returned from <code>LINK {}</code> without any changes. </p>
+<p>The element data returned from the <code>counter_button(..)</code> function call are <em>linked</em> to <code>decrement_button</code> and returned from <code>LINK {}</code> without any changes. </p>
 <h2 id="where-is-fibonacci">Where is Fibonacci??</h2>
 <p><img alt="fibonacci example" src="docs/images/snippets/fibonacci.png" /></p>
 <p>This idea was driven by design decisions to avoid recursions and keep loops as tight and hidden as possible. However, I want the Boon design to be driven by real applications, so I'll revisit this API/example when the need for channels, (infinite) streams, generators, lazy evaluation, tail recursions, or other related concepts emerges.</p>
@@ -188,7 +191,7 @@ Nothing is “freed” manually — the runtime simply drops what’s no longer 
 <li>
 <p>A monitor/debugger is your friend. Have you ever played a Factorio-like game? I want to:</p>
 <ul>
-<li>SEE the problem.</li>
+<li>See the problem.</li>
 <li>See statistics.</li>
 <li>Be able to immediately fix the problem.</li>
 <li>Want to know why the problem happened.</li>
@@ -196,9 +199,9 @@ Nothing is “freed” manually — the runtime simply drops what’s no longer 
 <li>Want to see loops.</li>
 <li>Want to see what is waiting and why.</li>
 <li>Want to just watch and enjoy it while everything works as expected.</li>
-<li>Want to be notified when something fails. 
-Just show me! Yes, you understand correctly, monitoring and a short feedback loop have high priority for Boon tools and design in general. </li>
+<li>Want to be notified when something fails. </li>
 </ul>
+<p>Yes, you understand correctly, monitoring and a short feedback loop have high priority for Boon tools and design in general. </p>
 </li>
 <li>
 <p>A compiler is your friend. Nice error messages, fast type checking, hints. </p>

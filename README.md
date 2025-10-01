@@ -111,11 +111,13 @@ It would be a pretty straightforward operation, but we don't want to reset our c
 
 You can go to [play.boon.run](https://play.boon.run/), click the button `counter.bn` in the header and follow the steps below with me.
 
+**NOTE:** You'll write _pipe operator_ ▷ by typing `|` and `>`. Boon Playground uses the [JetBrains Mono](https://www.jetbrains.com/lp/mono/) font with enabled ligatures to combine them visually. I would also like to add support for [infinite length ligatures](https://github.com/JetBrains/JetBrainsMono/issues/542) to that font to have nice continuous lines for comments / dividers.
+
 1. Look at the original counter code, run it and press the `+` button to change counter state a bit.
 ![counter upgrade step 1](docs/images/snippets/state_migrations/counter_1.png)
-2. Add the `counter_2` definition, replace `counter` with `counter_2` in HTML document items, and prevent the old `counter` from listening to button-press events. Also include the old `counter` in `counter_2`'s LATEST blocks to do the actual state migration from the old counter to the new one. Then run the example again. Nothing should change visually, but you're already using the upgraded app.
+2. Add the `counter_2` definition, replace `counter` with `counter_2` in HTML document items, and prevent the old `counter` from listening to button-press events. Notice old `counter` in `counter_2`'s LATEST block to do the actual state migration from the old counter to the new one. Then run the example again. Nothing should change visually, but you're already using the upgraded app.
 ![counter upgrade step 2](docs/images/snippets/state_migrations/counter_2.png)
-3. Remove the references to the old `counter`, delete its definition, and we are done!
+3. Remove the references to the old `counter`, delete its definition, and we are done! Run the example and click `+` to verify that it's incremented by 2.
 ![counter upgrade step 3](docs/images/snippets/state_migrations/counter_3.png)
 4. When you want to reset the counter, click the **Clear saved states** button just above the preview pane on the playground to remove all states stored in the browser's LocalStorage, and then click the **Run** button to restart the app; the counter resets back to 0.
 
@@ -125,7 +127,7 @@ You can go to [play.boon.run](https://play.boon.run/), click the button `counter
 
 ![counter flow diagram](docs/images/diagrams/counter_flow.png)
 
-Look at that counter example dataflow diagram again. Do all paths really lead to the `document`? Almost! The only exception is that blue `LINK` rectangle and the bottom left corner coming from the `Element/button(..)` function call. 
+Look at that counter example dataflow diagram again. Do all paths really lead to the `document`? Almost! The only exception is that blue `LINK` rectangle at the bottom left corner coming from the `Element/button(..)` function call. 
 
 What is that `LINK` good for? Why does it make the only loop in the entire diagram to ruin my otherwise perfect tree?!
 
@@ -170,6 +172,7 @@ Notice in the code above:
 The only purpose is to _pass_ data through multiple function calls without the need to mention them explicitly among function arguments.
 
 Without PASS + PASSED, the same lines would look like:
+
 1. `root_element(store: store)` or `store |> root_element()`
 2. `FUNCTION root_element(store)`   <- new function argument
 3. `store.elements.increment_button`
@@ -178,14 +181,14 @@ So PASS + PASSED is useful when you have deep function call tree (typically elem
 
 ### LINK { .. }
 
-You already know what `variable: LINK` means and now you'll find out how to set it by yourself (instead of setting it by Boon runtime). 
+You already know what `variable: LINK` means and now you'll find out how to set it by yourself (instead of setting it by the Boon runtime). 
 
 Notice these lines: 
 
 1. `decrement_button: LINK`
 2. `counter_button(label: '-') |> LINK { PASSED.elements.decrement_button }`
 
-The element data returned from the `counter_button` function call are _linked_ to `decrement_button` and returned from `LINK {}` without any changes. 
+The element data returned from the `counter_button(..)` function call are _linked_ to `decrement_button` and returned from `LINK {}` without any changes. 
 
 ## Where is Fibonacci??
 
@@ -196,7 +199,7 @@ This idea was driven by design decisions to avoid recursions and keep loops as t
 ## See the Problem, Fix the Flow
 
 1. A monitor/debugger is your friend. Have you ever played a Factorio-like game? I want to:
-    - SEE the problem.
+    - See the problem.
     - See statistics.
     - Be able to immediately fix the problem.
     - Want to know why the problem happened.
@@ -205,7 +208,8 @@ This idea was driven by design decisions to avoid recursions and keep loops as t
     - Want to see what is waiting and why.
     - Want to just watch and enjoy it while everything works as expected.
     - Want to be notified when something fails. 
-Just show me! Yes, you understand correctly, monitoring and a short feedback loop have high priority for Boon tools and design in general. 
+
+    Yes, you understand correctly, monitoring and a short feedback loop have high priority for Boon tools and design in general. 
 
 2. A compiler is your friend. Nice error messages, fast type checking, hints. 
 
