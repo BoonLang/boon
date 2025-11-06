@@ -1,0 +1,665 @@
+store: [
+    elements: [
+        filter_buttons: [ 
+            all: LINK
+            active: LINK
+            completed: LINK 
+        ]
+        remove_completed_button: LINK
+        toggle_all_checkbox: LINK
+        new_todo_title_text_input: LINK
+    ]
+    selected_filter: Router/route() |> WHEN {
+        '/active' => Active
+        '/completed' => Completed
+        __ => All
+    }
+    go_to_result: 
+        LATEST {
+            filter_buttons.all.event.press |> THEN { '/' }
+            filter_buttons.active.event.press |> THEN { '/active' }
+            filter_buttons.completed.event.press |> THEN { '/completed' }
+        } 
+        |> Router/go_to()
+    title_to_save: elements.new_todo_title_text_input.event.key_down.key |> WHEN {
+        Enter => BLOCK {
+            new_todo_title: elements.new_todo_title_text_input.text |> Text/trim()
+            new_todo_title 
+                |> Text/empty() 
+                |> Bool/not() 
+                |> WHEN { True => new_todo_title, False => SKIP }
+        }
+        __ => SKIP
+    }
+    todos: LIST {}
+        |> List/append(item: title_to_save |> new_todo())
+        |> List/retain(item, if: LATEST {
+            True
+            item.todo_elements.remove_todo_button.event.press 
+                |> THEN { False }
+            elements.remove_completed_button.event.press 
+                |> THEN { item.completed |> Bool/not() }
+        })
+    selected_todo_id: LATEST {
+        None
+        todos
+            |> List/map(old, new: LATEST {
+                old.todo_elements.editing_todo_title_element.event.key_down.key
+                    |> WHEN { Escape => None, __ => SKIP }
+                old.title_to_update 
+                    |> THEN { None }
+                old.todo_elements.todo_title_element.event.double_click 
+                    |> THEN { old.id }
+            })
+            |> List/latest()
+    }
+]
+
+FUNCTION new_todo(title) {
+    [
+        todo_elements: [
+            remove_todo_button: LINK
+            editing_todo_title_element: LINK
+            todo_title_element: LINK
+            todo_checkbox: LINK
+        ]
+        id: TodoId[id: Ulid/generate()]
+        title_to_update:
+            LATEST {
+                todo_elements.editing_todo_title_element.event.blur
+                    |> THEN { [] }
+                todo_elements.editing_todo_title_element.event.key_down.key 
+                    |> WHEN { Enter => [], __ => SKIP }
+            }
+            |> THEN { todo_elements.editing_todo_title_element.text }
+        title: LATEST {
+            title
+            title_to_update
+        }
+        completed: BLOCK {
+            completed: LATEST {
+                False
+                store.elements.toggle_all_checkbox.event.click |> THEN { 
+                    store.todos 
+                        |> List/every(item, if: item.completed) 
+                        |> Bool/not() 
+                }
+            }
+            LATEST {
+                completed
+                todo_elements.todo_checkbox.event.click |> THEN { 
+                    completed |> Bool/not()
+                } 
+            }
+        }
+        completed:
+            LATEST {
+                False
+                store.elements.toggle_all_checkbox.event.click |> THEN { 
+                    store.todos 
+                        |> List/every(item, if: item.completed) 
+                        |> Bool/not() 
+                }
+            }
+            |> Bool/toggle(when: todo_elements.todo_checkbox.event.click)
+        edited_title: BLOCK {
+            edited_title: LATEST {
+                ''
+                todo_elements.editing_todo_title_element.event.change.text
+                title_to_update |> THEN { '' }
+            }
+            LATEST {
+                edited_title
+                todo_elements.todo_title_element.event.double_click |> THEN { 
+                    edited_title 
+                        |> Text/empty() 
+                        |> WHEN { True => title, False => SKIP } 
+                }
+            }
+        }
+    ]
+}
+
+document: Document/new(root: root_element(PASS: [store: store]))
+
+FUNCTION root_element() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: [
+            width: Fill
+            height: [sizing: Fill, minimum: Screen]
+            font: [
+                size: 14
+                color: Oklch[lightness: 0.16]
+                weight: Light
+                family: LIST { 'Helvetica Neue', 'Helvetica', 'Arial', SansSerif }
+            ]
+            background: [color: Oklch[lightness: 0.16, chroma: 0.02, hue: 245]]
+            lighting: LIST {
+                [
+                    direction: [x: -0.4, y: -0.6, z: -0.5]
+                    color: Oklch[lightness: 0.78, chroma: 0.11, hue: 40]
+                    intensity: 1
+                ]
+                [
+                    direction: [x: 0.3, y: -1, z: -0.2]
+                    color: Oklch[lightness: 0.52, chroma: 0.03, hue: 210]
+                    intensity: 0.35
+                ]
+            ]
+            receive_shadow: True
+        ]
+        items: LIST { content_element() }
+    )
+}
+
+FUNCTION content_element() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: [
+            width: [sizing: Fill, minimum: 230, maximum: 550]
+            align: [row: Center]
+            transform: [move_z: 24]
+        ]
+        items: LIST {
+            header()
+            Element/stripe(
+                element: []
+                direction: Column
+                gap: 65
+                style: [width: Fill]
+                items: LIST { main_panel(), footer() }
+            )
+        }
+    )
+}
+
+FUNCTION header() {
+    Element/container(
+        element: [tag: Header]
+        style: [
+            padding: [top: 10]
+            align: [row: Center]
+            height: 130
+            font: [
+                size: 100
+                color: Oklch[lightness: 0.54, chroma: 0.156, hue: 21.24, alpha: 0.15]
+                weight: Hairline
+            ]
+            transform: [move_z: 28]
+            cast_shadow: True
+        ]
+        child: Element/container(element: [tag: H1], style: [], child: 'todos')
+    )
+}
+
+FUNCTION main_panel() {
+    Element/stripe(
+        element: [tag: Section, hovered: LINK, pressed: LINK]
+        direction: Column
+        gap: 0
+        style: [
+            width: Fill
+            geometry: [shape: Box, depth: 28, bevel: 3]
+            background: [color: Oklch[lightness: 0.98]]
+            cast_shadow: True
+            receive_shadow: True
+            transform: LIST { element.pressed, element.hovered } |> WHEN {
+                LIST { True, __ } => [move_z: 30]
+                LIST { False, True } => [move_z: 36]
+                LIST { False, False } => [move_z: 32]
+            }
+        ]
+        items: LIST {
+            new_todo_title_text_input() 
+                |> LINK { PASSED.store.elements.new_todo_title_text_input }
+            PASSED.store.todos 
+                |> List/empty() 
+                |> WHILE { 
+                    True => NoElement
+                    False => Stripe/new(
+                        element: []
+                        style: [direction: Column]
+                        items: LIST { 
+                            todos_element()
+                            panel_footer() 
+                        }
+                    )
+                }
+        }
+    )
+}
+
+FUNCTION new_todo_title_text_input() {
+    Element/text_input(
+        element:[
+            event: [
+                change: LINK
+                key_down: LINK
+            ]
+            hovered: LINK
+        ]
+        style: [
+            padding: [column: 20, left: 64, right: 20]
+            font: [size: 24, color: Oklch[lightness: 0.43]]
+            background: [color: Oklch[lightness: 0.985]]
+            geometry: [shape: ThinBox, depth: 10, bevel: 2]
+            cast_shadow: True
+            outline: [side: Outer, color: Oklch[lightness: 0.72, alpha: 0.18], width: 1]
+            transform: element.hovered |> WHEN {
+                True => [move_z: 1]
+                False => [move_z: -1]
+            }
+        ]
+        label: Hidden[text: 'What needs to be done?']
+        text: LATEST { 
+            ''
+            element.event.change.text
+            PASSED.store.title_to_save |> THEN { '' }
+        }
+        placeholder: [
+            style: [font: [style: Italic, color: Oklch[lightness: 0.92]]]
+            text: 'What needs to be done?'
+        ]
+        focus: True
+    )
+
+}
+
+FUNCTION todos_element() {
+    Element/stripe(
+        element: [
+            nearby_element: [
+                position: Above
+                element: toggle_all_checkbox() 
+                    |> LINK { PASSED.store.elements.toggle_all_checkbox }
+            ]
+        ]
+        direction: Column
+        gap: 1
+        style: [
+            borders: [top: [color: Oklch[lightness: 0.915, alpha: 0.6]]]
+            background: [color: Oklch[lightness: 0.95]]
+        ]
+        items: PASSED.store.todos
+            |> List/retain(item, if: PASSED.store.selected_filter |> WHILE {
+                All => True
+                Active => item.completed |> Bool/not()
+                Completed => item.completed
+            })
+            |> List/map(old, new: old |> todo_element())
+    )
+}
+
+FUNCTION todo_element(todo) {
+    Element/stripe(
+        element: [hovered: LINK]
+        direction: Row
+        gap: 5
+        style: [
+            width: Fill
+            background: [color: Oklch[lightness: 0.992]]
+            font: [size: 24]
+            geometry: [shape: ThinBox, depth: 6, bevel: 1.5]
+            cast_shadow: True
+            receive_shadow: True
+            transform: element.hovered |> WHEN {
+                True => [move_z: 4]
+                False => [move_z: 1]
+            }
+        ]
+        items: PASSED.store.selected_todo_id = todo.id |> WHILE {
+            True => LIST { 
+                editing_todo_title_element(todo: todo) 
+                    |> LINK { todo.todo_elements.editing_todo_title_element }
+            }
+            False => LIST {
+                todo_checkbox(todo: todo) 
+                    |> LINK { todo.todo_elements.todo_checkbox }
+                todo_title_element(todo: todo) 
+                    |> LINK { todo.todo_elements.todo_title_element }
+            }
+        }
+    )
+}
+
+FUNCTION toggle_all_checkbox() {
+    Element/checkbox(
+        element: [event: [click: LINK], hovered: LINK, pressed: LINK]
+        style: [
+            width: 64
+            height: Fill
+            geometry: [shape: Column, depth: 12, bevel: 3]
+            background: [color: Oklch[lightness: 0.96]]
+            cast_shadow: True
+            transform: LIST { element.pressed, element.hovered } |> WHEN {
+                LIST { True, __ } => [move_z: 1]
+                LIST { False, True } => [move_z: 4]
+                LIST { False, False } => [move_z: 2]
+            }
+        ]
+        label: Hidden[text: 'Toggle all']
+        checked: PASSED.store.todos |> List/every(item, if: item.completed)
+        icon: Element/container(
+            element: []
+            style: [
+                height: 34
+                padding: [row: 27, column: 6]
+                font: [
+                    size: 22,
+                    color: Oklch[lightness: checked |> WHEN { 
+                        True => 0.555
+                        False => 0.92
+                    }]
+                ]
+                transform: LIST { element.pressed, element.hovered } |> WHEN {
+                    LIST { True, __ } => [rotate: 90, move_up: 18, move_z: 0]
+                    LIST { False, True } => [rotate: 90, move_up: 18, move_z: 3]
+                    LIST { False, False } => [rotate: 90, move_up: 18, move_z: 1]
+                }
+            ]
+            child: '>'
+        )
+    )
+}
+
+FUNCTION editing_todo_title_element(todo) {
+    Element/text_input(
+        element: [
+            event: [
+                blur: LINK
+                change: LINK
+                key_down: LINK
+            ]
+            hovered: LINK
+        ]
+        style: [
+            width: 506
+            padding: [row: 17, top: 17, bottom: 16]
+            align: Right
+            borders: [color: Oklch[lightness: 0.7, alpha: 0.4]]
+            background: [color: Oklch[lightness: 0.99]]
+            geometry: [shape: ThinBox, depth: 8, bevel: 2]
+            cast_shadow: True
+            font: [color: Oklch[lightness: 0.42]]
+            transform: LIST { PASSED.store.selected_todo_id = todo.id, element.hovered } |> WHEN {
+                LIST { True, __ } => [move_z: 4]
+                LIST { False, True } => [move_z: 2]
+                LIST { False, False } => [move_z: 0]
+            }
+        ]
+        label: Hidden[text: 'selected todo title']
+        text: todo.edited_title
+        placeholder: []
+        focus: True
+    )
+}
+
+FUNCTION todo_checkbox(todo) {
+    BLOCK {
+        icon_completed: 'data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23bddad5%22%20stroke-width%3D%223%22/%3E%3Cpath%20fill%3D%22%235dc2af%22%20d%3D%22M72%2025L42%2071%2027%2056l-4%204%2020%2020%2034-52z%22/%3E%3C/svg%3E'
+        icon_active: 'data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23ededed%22%20stroke-width%3D%223%22/%3E%3C/svg%3E'
+        Element/checkbox(
+            element: [event: [click: LINK], hovered: LINK, pressed: LINK]
+            label: Reference[element: todo.todo_elements.todo_title_element]
+            checked: todo.completed
+            icon: Element/container(
+                element: []
+                style: [
+                    size: 40
+                    geometry: [shape: Box, depth: 6, bevel: 2]
+                    background: [url: checked |> WHEN { 
+                        True => icon_completed
+                        False => icon_active 
+                    }]
+                    cast_shadow: True
+                    transform: LIST { element.pressed, element.hovered } |> WHEN {
+                        LIST { True, __ } => [move_z: 0]
+                        LIST { False, True } => [move_z: 3]
+                        LIST { False, False } => [move_z: 1]
+                    }
+                ]
+            )
+        )
+    }
+}
+
+FUNCTION todo_title_element(todo) {
+    Element/label(
+        element: [
+            event: [double_click: LINK]
+            hovered: LINK
+            nearby_element: [
+                position: Right
+                element: hovered |> WHILE {
+                    True => remove_todo_button()
+                        |> LINK { todo.todo_elements.remove_todo_button }
+                    False => NoElement
+                }
+            ]
+        ]
+        style: [
+            width: Fill
+            font: [
+                size: 24
+                line: [strike: todo.completed]
+                color: Oklch[lightness: todo.completed |> WHEN { 
+                    True => 0.885
+                    False => 0.42 
+                }]
+            ]
+            padding: [column: 15, left: 15, right: 60]
+            clip: Row
+            background: [
+                color: todo.completed |> WHEN {
+                    True => Oklch[lightness: 0.97]
+                    False => Oklch[lightness: 0.995]
+                }
+            ]
+            geometry: [shape: Ribbon, depth: 3, bevel: 1]
+            transform: element.hovered |> WHEN {
+                True => [move_z: 3]
+                False => [move_z: 1]
+            }
+        ]
+        label: todo.title
+    )
+}
+
+FUNCTION remove_todo_button() {
+    Element/button(
+        element:[
+            event: [press: LINK]
+            hovered: LINK
+        ]
+        style: [
+            size: 40
+            geometry: [shape: Box, depth: 8, bevel: 2]
+            background: [color: Oklch[lightness: 0.97]]
+            cast_shadow: True
+            transform: LIST { element.hovered } |> WHEN {
+                True => [move_left: 50, move_down: 14, move_z: 6]
+                False => [move_left: 50, move_down: 14, move_z: 3]
+            }
+            font: [
+                size: 30
+                align: Center
+                color: element.hovered |> WHEN {
+                    True => Oklch[lightness: 0.570, chroma: 0.109, hue: 18.87]
+                    False => Oklch[lightness: 0.733, chroma: 0.060, hue: 18.62]
+                }
+            ]
+        ]
+        label: '×'
+    )
+}
+
+FUNCTION panel_footer() {
+    Element/stripe(
+        element: [tag: Footer]
+        direction: Row
+        gap: 0
+        style: [
+            padding: [row: 15, column: 8]
+            font: [color: Oklch[lightness: 0.57]]
+            borders: [top: [color: Oklch[lightness: 0.92, alpha: 0.6]]]
+            geometry: [shape: ThinBox, depth: 10, bevel: 2]
+            background: [color: Oklch[lightness: 0.965]]
+            cast_shadow: True
+            receive_shadow: True
+            transform: [move_z: 6]
+        ]
+        items: LIST {
+            active_items_count_text
+            filters_element
+            PASSED.store.todos |> List/any(item, if: item.completed) |> WHILE {
+                True => remove_completed_button() 
+                    |> LINK { PASSED.store.elements.remove_completed_button }
+                False => NoElement
+            }
+        } |> List/map(old, new: Element/container(
+            element: []
+            style: [width: Fill]
+            child: old
+        ))
+    )
+}
+
+FUNCTION active_items_count_text() {
+    PASSED.store.todos 
+        |> List/retain(item, if: item.completed |> Bool/not()) 
+        |> List/count
+        |> WHEN { count => BLOCK {
+            maybe_s: count > 1 |> WHEN { True => 's', False => '' }
+            '{count} item{maybe_s} left'
+        }}
+}
+
+FUNCTION filters_element() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: [transform: [move_z: 8]]
+        items: LIST {
+            filter_button(All) 
+                |> LINK { PASSED.store.elements.filter_buttons.all }
+            filter_button(Active) 
+                |> LINK { PASSED.store.elements.filter_buttons.active }
+            filter_button(Completed) 
+                |> LINK { PASSED.store.elements.filter_buttons.completed }
+        }
+    )
+}
+
+FUNCTION filter_button(filter) {
+    Element/button(
+        element: [
+            event: [press: LINK]
+            hovered: LINK
+            pressed: LINK
+        ]
+        style: [
+            padding: [row: 8, column: 16]
+            geometry: [shape: Box, depth: 12, bevel: 2]
+            background: BLOCK {
+                selected: PASSED.store.selected_filter = filter
+                selected |> WHEN {
+                    True => [color: Oklch[lightness: 0.93, chroma: 0.13, hue: 28]]
+                    False => [color: Oklch[lightness: 0.97]]
+                }
+            }
+            cast_shadow: True
+            transform: LIST { PASSED.store.selected_filter = filter, element.pressed, element.hovered } |> WHEN {
+                LIST { __, True, __ } => [move_z: 8]
+                LIST { True, False, __ } => [move_z: 12]
+                LIST { False, False, True } => [move_z: 10]
+                LIST { False, False, False } => [move_z: 8]
+            }
+        ]
+        label: filter |> WHEN {
+            All => 'All'
+            Active => 'Active'
+            Completed => 'Completed'
+        }
+    )
+}
+
+FUNCTION remove_completed_button() {
+    Element/button(
+        element: [
+            event: [press: LINK]
+            hovered: LINK
+            pressed: LINK
+        ]
+        style: [
+            align: Right
+            padding: [row: 6, column: 12]
+            geometry: [shape: ThinBox, depth: 10, bevel: 2]
+            background: [color: Oklch[lightness: 0.965]]
+            cast_shadow: True
+            transform: LIST { element.pressed, element.hovered } |> WHEN {
+                LIST { True, __ } => [move_z: 4]
+                LIST { False, True } => [move_z: 7]
+                LIST { False, False } => [move_z: 5]
+            }
+            font: [line: [underline: element.hovered], color: Oklch[lightness: 0.56]]
+        ]
+        label: 'Clear completed'
+    )
+}
+
+FUNCTION footer() {
+    Element/stripe(
+        element: [tag: Footer]
+        direction: Column
+        gap: 9
+        style: [font: [size: 10, align: Center, color: Oklch[lightness: 0.805]], transform: [move_z: 4]]
+        items: LIST {
+            Element/paragraph(
+                element: []
+                style: []
+                contents: LIST { 'Double-click to edit a todo' }
+            )
+            Element/paragraph(
+                element: []
+                style: []
+                contents: LIST {
+                    'Created by '
+                    footer_link(
+                        label: 'Martin Kavík'
+                        to: 'https://github.com/MartinKavik'
+                    )
+                }
+            )
+            Element/paragraph(
+                element: []
+                style: []
+                contents: LIST {
+                    'Part of '
+                    footer_link(label: 'TodoMVC', to: 'http://todomvc.com')
+                }
+            )
+        }
+    )
+}
+
+FUNCTION footer_link(label, to) {
+    Element/link(
+        element: [hovered: LINK]
+        style: [
+            font: [line: [underline: element.hovered]]
+            transform: element.hovered |> WHEN {
+                True => [move_z: 2]
+                False => [move_z: 1]
+            }
+        ]
+        label: label
+        to: to
+        new_tab: []
+    )
+}
