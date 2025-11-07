@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the 3D API design for physically-based UIs in Boon. Elements are real 3D objects that can be raised, recessed, and have physical materials.
+This document describes the 3D API design for physically-based UIs in Boon. Elements are real 3D objects with physical materials. Geometry (bevels, recesses, shadows) emerges automatically from element properties - no explicit geometric operations needed.
 
 ---
 
@@ -60,6 +60,13 @@ All geometry values are in **pixels**.
 depth: 8  -- Object is 8px thick
 ```
 
+**For built-in elements:**
+- `Element/button` - Creates raised convex shape (automatic beveled edges)
+- `Element/text_input` - Creates recessed well (automatic cavity with walls)
+- `Element/checkbox` - Creates small recessed well
+
+**Geometry emerges from element type + depth value.** No manual configuration needed!
+
 #### `rounded_corners` - Corner rounding
 ```boon
 rounded_corners: 4     -- 4px radius on all corners
@@ -67,39 +74,26 @@ rounded_corners: Fully -- Maximum rounding (pill shape)
 rounded_corners: None  -- Sharp 90° corners
 ```
 
-#### `edges` - Edge treatment (defines raised vs recessed shape!)
+#### `borders` - Flat decorative outlines
+
 ```boon
--- Raised object (button, card) - beveled edges
-edges: [
-    side: Outside
-    radius: 0.5
+borders: [
+    width: 2                     -- Border width
+    color: Oklch[...]            -- Border color
+    glow: [                      -- Optional glow effect
+        color: Oklch[...]
+        intensity: 0.2
+    ]
 ]
 
--- Recessed object (input, well) - filleted edges
-edges: [
-    side: Inside
-    radius: 0.8
-]
-
--- Advanced: different top and bottom
-edges: [
-    top: [side: Outside, radius: 0.5]
-    bottom: [side: Inside, radius: 0.8]
-]
+-- Specific sides
+borders: [top: [color: Oklch[...]]]
+borders: [bottom: [width: 1, color: Oklch[...]]]
 ```
 
-**The `side` property is what makes an object raised or recessed!**
+**Use for:** Focus rings, divider lines, decorative outlines, visual feedback.
 
-#### `rim` (formerly `borders`) - Raised/recessed rim around object
-```boon
-rim: [
-    width: 2              -- Rim width
-    elevation: 1          -- How much rim sticks up (or down if negative)
-    radius: 0.3           -- Bevel/fillet on rim
-    color: Oklch[...]     -- Rim color
-    gloss: 0.4            -- Rim material
-]
-```
+**Note:** `borders` creates flat 2D lines, not 3D frames. Physical depth comes from automatic geometry generation.
 
 ---
 
@@ -118,6 +112,11 @@ gloss: 1.0   -- Mirror (chrome, glass)
 ```
 
 **For most UI elements, use 0.15-0.4** (low gloss plastic look).
+
+**Built-in elements automatically:**
+- Make button exteriors slightly matte
+- Make input interiors glossier than exteriors
+- Create natural material contrast
 
 #### `metal` - Metallic vs non-metallic reflections
 
@@ -166,103 +165,78 @@ glow: [
 
 ---
 
-## How Objects Define Their Shape
+## Automatic Geometry Generation
 
-### The Key Insight: Edge Placement
+### Built-in Elements Create Their Own 3D Geometry
 
-**Outside edges** → Object is **raised/convex** (button, card, badge)
-```
-Side view:
-  ╱─────╲  ← Top beveled (outside)
- │Button │
- └───────┘  ← Bottom sharp
-```
+**No manual configuration needed!** Elements automatically generate appropriate geometry based on their type and properties.
 
-**Inside edges** → Object is **recessed/concave** (input, well, tray)
-```
-Side view:
- ╲──────╱  ← Top concave (inside)
- │ Well │
- ╰──────╯  ← Bottom filleted (inside)
-```
-
----
-
-## Parent-Child Interaction
-
-### Children Define ALL Their Geometry
-
-When a child is positioned relative to parent:
-1. Child defines its complete 3D volume (including bevels/fillets)
-2. Parent automatically "makes room" by cutting holes where needed
-3. No special "cavity" or "recess" logic in parent
+#### Text Input - Recessed Well
 
 ```boon
--- Parent card
-Element/stripe(
+Element/text_input(
     style: [
-        transform: [move_closer: 50]
-        depth: 8
+        depth: 6              -- Creates ~4px deep cavity automatically
+        padding: [all: 10]    -- Controls wall thickness
+        gloss: 0.65          -- Shiny interior
     ]
-    items: LIST {
-        -- Child input recessed into card
-        Element/text_input(
-            style: [
-                transform: [move_further: 4]
-                depth: 6
-                edges: [side: Inside]  -- Well shape
-            ]
-        )
-    }
+    text: 'Hello'
 )
 ```
 
-**Renderer automatically:**
-- Positions input 4px back from card surface
-- Cuts hole in card where input's top edge intersects card surface
-- Renders both objects normally
+**Renderer automatically creates:**
+- Outer block (6px deep, matte exterior)
+- Inner cavity (~4px deep, glossy interior)
+- Walls (thickness from padding)
+- Text on cavity floor
+- Natural inset shadow from lighting
+
+---
+
+#### Button - Raised Surface
+
+```boon
+Element/button(
+    style: [
+        depth: 6              -- Creates solid convex shape
+        transform: [move_closer: 4]  -- Floats 4px above surface
+        gloss: 0.3
+    ]
+    label: 'Click'
+)
+```
+
+**Renderer automatically creates:**
+- Solid raised block (6px deep)
+- Beveled edges (convex)
+- Drop shadow below (from lighting)
+
+---
+
+#### Checkbox - Small Recessed Box
+
+```boon
+Element/checkbox(
+    style: [
+        depth: 5              -- Creates small shallow well
+        gloss: 0.25
+    ]
+    checked: True
+)
+```
+
+**Renderer automatically creates:**
+- Outer box (5px deep)
+- Inner cavity (~3px deep)
+- 2px walls
+- Checkmark on cavity floor or raised inside well
 
 ---
 
 ## Common Patterns
 
-### 1. Raised Button
-```boon
-Element/button(
-    style: [
-        depth: 6
-        rounded_corners: 4
-        gloss: 0.3
-        transform: [move_closer: 4]
-        -- edges: [side: Outside] (automatic for buttons)
-    ]
-    label: 'Click me'
-)
-```
+### 1. Raised Button with Interaction
 
-**Result:** Button with beveled edges, floats 4px above parent.
-
----
-
-### 2. Recessed Input
-```boon
-Element/text_input(
-    style: [
-        depth: 6
-        rounded_corners: 4
-        gloss: 0.65
-        transform: [move_further: 4]
-        -- edges: [side: Inside] (automatic for inputs)
-    ]
-    text: '...'
-)
-```
-
-**Result:** Input well recessed 4px into parent, with filleted edges.
-
----
-
-### 3. Button Press Interaction
 ```boon
 Element/button(
     element: [
@@ -279,75 +253,38 @@ Element/button(
             LIST { False, False } => [move_closer: 4] -- Resting raised
         }
         gloss: 0.3
-        -- edges: Outside (stays convex even when pressed!)
     ]
     label: 'Press me'
 )
 ```
 
-**Key:** Button keeps its convex shape, only position changes! Minimum 4px movements for visibility.
+**Key:** Button geometry stays constant, only position changes! Minimum 4px movements for visibility.
 
 ---
 
-### 4. Input with Raised Border Frame
-```boon
-Element/text_input(
-    style: [
-        depth: 3
-        rounded_corners: 2
-        gloss: 0.65
-        transform: [move_further: 1]
-        rim: [
-            width: 2
-            elevation: 1         -- Rim raised 1 unit above parent
-            radius: 0.3
-            color: Oklch[lightness: 0.88]
-        ]
-        edges: [
-            side: Inside         -- Well shape
-            radius: 0.8          -- Smooth fillet
-        ]
-    ]
-    text: '...'
-)
-```
+### 2. Recessed Input
 
-**Result:**
-```
-Visual (side view):
-        ┌─────────┐  ← Raised rim (elevation: 1)
-        │╲       ╱│  ← Concave well opening
-Parent══│ │Input│ │══
-        │ ╰─────╯ │  ← Filleted bottom
-        └─────────┘
-```
-
-Light from above creates natural inset shadow effect!
-
----
-
-### 5. Floating Input (Above Parent)
 ```boon
 Element/text_input(
     style: [
         depth: 6
         rounded_corners: 4
-        edges: [side: Inside]    -- Still a well shape!
-        transform: [move_closer: 24]  -- Floats 24px above parent
+        gloss: 0.65
+        transform: [move_further: 4]
+        padding: [all: 10]
     ]
+    text: 'Type here...'
 )
 ```
 
-**Result:** Input floats above parent but still looks like a well (concave), not a button.
+**Result:** Input well recessed 4px into parent, walls from padding, automatic inset shadow.
 
 ---
 
-### 6. Glossy Card with Multiple Depths
+### 3. Floating Card with Multiple Elements
+
 ```boon
 Element/stripe(
-    element: [tag: Section]
-    direction: Column
-    gap: 0
     style: [
         width: Fill
         depth: 8
@@ -359,13 +296,7 @@ Element/stripe(
     ]
     items: LIST {
         -- Header (flush with card surface)
-        Element/container(
-            style: [
-                transform: []  -- No movement = at surface
-                padding: [all: 20]
-            ]
-            child: 'Header'
-        )
+        Element/text(content: 'Header')
 
         -- Input (recessed into card)
         Element/text_input(
@@ -374,6 +305,7 @@ Element/stripe(
                 depth: 6
                 gloss: 0.65
             ]
+            text: 'Username'
         )
 
         -- Button (raised from card)
@@ -389,90 +321,40 @@ Element/stripe(
 )
 ```
 
+**Result:** Card with automatic drop shadow, input with automatic inset shadow, button with automatic elevation shadow.
+
 ---
 
-## Automatic Defaults
+### 4. Focus State with Glowing Border
 
-### Element types have smart defaults:
-
-```boon
-Element/button(...)
--- Automatic: edges: [side: Outside]
-
-Element/text_input(...)
--- Automatic: edges: [side: Inside]
-
-Element/checkbox(...)
--- Automatic: edges: [side: Outside]
-
-Element/label(...)
--- Automatic: no depth, flat on surface
-```
-
-### Can override:
 ```boon
 Element/text_input(
+    element: [focused: LINK]
     style: [
-        edges: [side: Outside]  -- Weird raised input!
+        depth: 6
+        borders: element.focused |> WHEN {
+            True => [
+                width: 2
+                color: Oklch[lightness: 0.68, chroma: 0.08, hue: 220]
+                glow: [
+                    color: Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
+                    intensity: 0.2
+                ]
+            ]
+            False => []
+        }
     ]
+    text: '...'
 )
 ```
 
----
-
-## Edge Configurations
-
-### Outside (Raised/Convex)
-```boon
-edges: [side: Outside, radius: 0.5]
-```
-```
-  ╱─────╲  ← Beveled top
- │Object │
- └───────┘  ← Sharp bottom
-```
-
-### Inside (Recessed/Concave)
-```boon
-edges: [side: Inside, radius: 0.8]
-```
-```
- ╲──────╱  ← Concave top
- │Object │
- ╰──────╯  ← Filleted bottom
-```
-
-### Both Outside (Floating Panel)
-```boon
-edges: [
-    top: [side: Outside, radius: 0.5]
-    bottom: [side: Outside, radius: 0.5]
-]
-```
-```
-  ╱─────╲  ← Top beveled
- │ Panel │
- ╰───────╯  ← Bottom beveled
-```
-
-### Both Inside (Tube/Pipe)
-```boon
-edges: [
-    top: [side: Inside, radius: 0.8]
-    bottom: [side: Inside, radius: 0.8]
-]
-```
-```
- ╲──────╱  ← Top concave
- │ Tube │
- ╱──────╲  ← Bottom concave
-```
+**Result:** Input with glowing flat border when focused. Physical geometry unchanged.
 
 ---
 
 ## Material Properties Reference
 
-### `gloss` (Combined roughness + shine)
+### `gloss` (Surface roughness)
 - **0.0 - 0.2:** Matte (chalk, flat paint, unfinished wood)
 - **0.2 - 0.4:** Low gloss (matte plastic, concrete)
 - **0.4 - 0.6:** Satin (brushed metal, semi-gloss paint)
@@ -484,7 +366,7 @@ edges: [
 - **0.5:** Semi-metallic (metallic paint)
 - **1.0:** Full metal (steel, aluminum, copper)
 
-### `shine` (Clearcoat/additional gloss layer)
+### `shine` (Clearcoat layer)
 - **0.0:** No clearcoat
 - **0.5:** Moderate coating (satin varnish)
 - **1.0:** Full clearcoat (car paint, lacquer)
@@ -514,9 +396,11 @@ scene: Scene/new(
 )
 ```
 
-**Note:** Shadow casting is automatic based on light type:
+**Shadow casting is automatic:**
 - Directional lights: Always cast shadows
 - Ambient lights: Never cast shadows
+- Shadows emerge from real geometry + lighting
+- No fake shadow properties needed!
 
 ---
 
@@ -527,18 +411,17 @@ scene: Scene/new(
 3. **Minimum 4px movements** for noticeable effects (otherwise remove them)
 4. **`move_closer`/`move_further`** are pure positioning (don't change geometry)
 5. **All positioning is relative to parent** - no absolute positioning needed
-6. **`edges: [side: Inside/Outside]`** defines object shape (raised vs recessed)
-7. **Children own all their geometry** including bevels/fillets
-8. **Parent just "makes room"** by cutting holes where children intersect
-9. **`gloss`** is the main material property (0 = matte to 1 = mirror)
-10. **`metal`** controls metallic vs non-metallic reflections
-11. **`rim`** creates raised/recessed borders around objects
-12. **Automatic defaults** for common element types (button, input, checkbox)
-13. **Light naturally creates shadows** - no fake "inset shadow" properties
+6. **Geometry emerges automatically** from element type + properties
+7. **Built-in elements know their shape** - buttons raised, inputs recessed
+8. **`gloss`** is the main material property (0 = matte to 1 = mirror)
+9. **`metal`** controls metallic vs non-metallic reflections (rarely used)
+10. **`shine`** adds clearcoat layer (optional, for premium surfaces)
+11. **`borders`** creates flat decorative outlines (not 3D frames)
+12. **Physical lighting creates real shadows** - no fake shadow properties
 
 ---
 
-## TodoMVC Example (Simplified)
+## TodoMVC Example
 
 ```boon
 scene: Scene/new(
@@ -576,8 +459,9 @@ FUNCTION new_todo_input() {
             depth: 6
             rounded_corners: 2
             gloss: 0.65
-            -- edges: Inside (automatic for inputs)
+            -- Cavity geometry automatic!
         ]
+        text: 'What needs to be done?'
     )
 }
 
@@ -593,8 +477,26 @@ FUNCTION todo_button() {
             }
             gloss: 0.25
             metal: 0.03
-            -- edges: Outside (automatic for buttons)
+            -- Raised geometry automatic!
         ]
+        label: 'Remove'
     )
 }
 ```
+
+---
+
+## Implementation Notes (For Renderer Developers)
+
+**Internal geometry generation:**
+- `Element/text_input` uses `Model/cut(from: outer_block, remove: cavity_block)` internally
+- Cavity dimensions calculated from `depth`, `padding`, `rounded_corners`
+- Wall thickness emerges from size difference between outer and cavity
+- Cavity interior automatically made glossier than exterior
+- Text positioned on cavity floor automatically
+
+**Users never see these details!** They just write semantic elements with visual properties.
+
+---
+
+**End of 3D API Design Document**

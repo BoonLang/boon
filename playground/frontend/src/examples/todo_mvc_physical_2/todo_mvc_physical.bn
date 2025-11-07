@@ -1,7 +1,7 @@
--- TodoMVC with 3D depth and physical materials
--- Elements are 3D objects floating in space
--- Light shines on them and casts shadows
--- Buttons physically move when you press them
+-- TodoMVC with Emergent Physical Geometry
+-- Elements are positioned in 3D space
+-- Bevels, fillets, and shadows emerge naturally from spatial relationships
+-- No explicit edge/shadow definitions needed!
 
 ------------------------------------------------------------------------
 -- STORE AND STATE
@@ -118,7 +118,7 @@ FUNCTION new_todo(title) {
 }
 
 ------------------------------------------------------------------------
--- SCENE - 3D scene with lighting
+-- SCENE - Physical 3D with lighting
 ------------------------------------------------------------------------
 
 scene: Scene/new(
@@ -137,11 +137,11 @@ scene: Scene/new(
             intensity: 0.6
             -- Ambient lights never cast shadows
         ]
-    ]
+    }
 )
 
 ------------------------------------------------------------------------
--- ROOT ELEMENT - 3D scene background
+-- ROOT ELEMENT - Background plane
 ------------------------------------------------------------------------
 
 FUNCTION root_element() {
@@ -222,7 +222,7 @@ FUNCTION header() {
 }
 
 ------------------------------------------------------------------------
--- MAIN PANEL - Floating card
+-- MAIN PANEL - Floating card with automatic drop shadow
 ------------------------------------------------------------------------
 
 FUNCTION main_panel() {
@@ -232,9 +232,9 @@ FUNCTION main_panel() {
         gap: 0
         style: [
             width: Fill
+            -- Physical 3D properties (replaces fake shadows!)
             depth: 8
-            -- Card floats 50 units above background
-            transform: [move_closer: 50]
+            transform: [move_closer: 50]  -- Floats 50px above background
             rounded_corners: 4
             background: [color: Oklch[lightness: 1]]
             gloss: 0.12
@@ -262,7 +262,7 @@ FUNCTION main_panel() {
 }
 
 ------------------------------------------------------------------------
--- NEW TODO INPUT - Pressed into panel
+-- NEW TODO INPUT - Recessed into panel (automatic inset shadow)
 ------------------------------------------------------------------------
 
 FUNCTION new_todo_title_text_input() {
@@ -276,13 +276,12 @@ FUNCTION new_todo_title_text_input() {
         style: [
             padding: [column: 19, left: 60, right: 16]
             font: [size: 24, color: Oklch[lightness: 0.42]]
-            -- Recessed into the panel
-            transform: [move_further: 4]
+            -- Recessed into panel (creates automatic inset shadow from lighting)
             depth: 6
+            transform: [move_further: 4]
             rounded_corners: 2
             background: [color: Oklch[lightness: 0.99]]
             gloss: 0.65
-            -- edges: [side: Inside] (automatic for text inputs)
         ]
         label: Hidden[text: 'What needs to be done?']
         text: LATEST {
@@ -329,7 +328,7 @@ FUNCTION todos_element() {
 }
 
 ------------------------------------------------------------------------
--- TODO ITEM
+-- TODO ITEM - Slightly raised above list
 ------------------------------------------------------------------------
 
 FUNCTION todo_element(todo) {
@@ -339,6 +338,7 @@ FUNCTION todo_element(todo) {
         gap: 5
         style: [
             width: Fill
+            -- Slightly raised (creates subtle shadow)
             depth: 2
             transform: [move_closer: 4]
             background: [color: Oklch[lightness: 1]]
@@ -361,7 +361,7 @@ FUNCTION todo_element(todo) {
 }
 
 ------------------------------------------------------------------------
--- TOGGLE ALL CHECKBOX - Button with physical travel
+-- TOGGLE ALL CHECKBOX - Button with physical movement
 ------------------------------------------------------------------------
 
 FUNCTION toggle_all_checkbox() {
@@ -379,15 +379,14 @@ FUNCTION toggle_all_checkbox() {
                 height: Fill
                 depth: 6
                 rounded_corners: 2
-                -- Button moves in space when pressed
+                -- Button physically moves when interacted with
                 transform: LIST { element.hovered, element.pressed } |> WHEN {
-                    LIST { __, True } => [move_further: 4]
-                    LIST { True, False } => [move_closer: 6]
-                    LIST { False, False } => [move_closer: 4]
+                    LIST { __, True } => [move_further: 4]      -- Pressed down
+                    LIST { True, False } => [move_closer: 6]    -- Lifted on hover
+                    LIST { False, False } => [move_closer: 4]   -- Resting raised
                 }
                 gloss: 0.3
                 metal: 0.05
-                -- edges: [side: Outside] (automatic for checkboxes/buttons)
             ]
             label: Hidden[text: 'Toggle all']
             checked: checked
@@ -412,7 +411,7 @@ FUNCTION toggle_all_checkbox() {
 }
 
 ------------------------------------------------------------------------
--- EDITING TODO INPUT - Pops up when focused
+-- EDITING TODO INPUT - Pops up dramatically when focused
 ------------------------------------------------------------------------
 
 FUNCTION editing_todo_title_element(todo) {
@@ -431,7 +430,7 @@ FUNCTION editing_todo_title_element(todo) {
             font: [color: Oklch[lightness: 0.42]]
             depth: 6
             rounded_corners: 2
-            -- Pops up significantly when editing
+            -- Pops up dramatically when editing
             transform: [move_closer: 24]
             background: [color: Oklch[lightness: 1]]
             gloss: 0.15
@@ -456,7 +455,7 @@ FUNCTION editing_todo_title_element(todo) {
 }
 
 ------------------------------------------------------------------------
--- TODO CHECKBOX - Round button
+-- TODO CHECKBOX - Round button that moves physically
 ------------------------------------------------------------------------
 
 FUNCTION todo_checkbox(todo) {
@@ -475,13 +474,12 @@ FUNCTION todo_checkbox(todo) {
                 depth: 6
                 rounded_corners: Fully
                 transform: LIST { element.hovered, element.pressed } |> WHEN {
-                    LIST { __, True } => []
-                    LIST { True, False } => [move_closer: 6]
-                    LIST { False, False } => [move_closer: 4]
+                    LIST { __, True } => []                      -- Pressed flush
+                    LIST { True, False } => [move_closer: 6]    -- Lifted on hover
+                    LIST { False, False } => [move_closer: 4]   -- Resting raised
                 }
                 gloss: 0.25
                 metal: 0.03
-                -- edges: [side: Outside] (automatic for checkboxes)
             ]
             label: Reference[element: todo.todo_elements.todo_title_element]
             checked: todo.completed
@@ -500,7 +498,7 @@ FUNCTION todo_checkbox(todo) {
 }
 
 ------------------------------------------------------------------------
--- TODO TITLE LABEL
+-- TODO TITLE LABEL - Flat on surface
 ------------------------------------------------------------------------
 
 FUNCTION todo_title_element(todo) {
@@ -535,7 +533,7 @@ FUNCTION todo_title_element(todo) {
 }
 
 ------------------------------------------------------------------------
--- REMOVE TODO BUTTON - Appears on hover
+-- REMOVE TODO BUTTON - Appears on hover, floats dramatically
 ------------------------------------------------------------------------
 
 FUNCTION remove_todo_button() {
@@ -556,7 +554,6 @@ FUNCTION remove_todo_button() {
             }
             background: [color: Oklch[lightness: 0.98, chroma: 0.005, hue: 18.87]]
             gloss: 0.35
-            -- edges: [side: Outside] (automatic for buttons)
             glow: [
                 color: Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87]
                 intensity: element.hovered |> WHEN {
@@ -575,7 +572,7 @@ FUNCTION remove_todo_button() {
 }
 
 ------------------------------------------------------------------------
--- PANEL FOOTER - Slightly recessed
+-- PANEL FOOTER - Flat on panel surface
 ------------------------------------------------------------------------
 
 FUNCTION panel_footer() {
@@ -621,7 +618,7 @@ FUNCTION active_items_count_text() {
 }
 
 ------------------------------------------------------------------------
--- FILTER BUTTONS - Pill-shaped buttons
+-- FILTER BUTTONS - Pills that physically move when selected/hovered
 ------------------------------------------------------------------------
 
 FUNCTION filters_element() {
@@ -655,11 +652,12 @@ FUNCTION filter_button(filter) {
                 padding: [row: 8, column: 4]
                 depth: 5
                 rounded_corners: 6
+                -- Button physically moves based on state
                 transform: LIST { selected, element.hovered, element.pressed } |> WHEN {
-                    LIST { __, __, True } => []
-                    LIST { True, __, False } => [move_closer: 6]
-                    LIST { False, True, False } => [move_closer: 4]
-                    LIST { False, False, False } => []
+                    LIST { __, __, True } => []                      -- Pressed flat
+                    LIST { True, __, False } => [move_closer: 6]    -- Selected raised
+                    LIST { False, True, False } => [move_closer: 4] -- Hovered
+                    LIST { False, False, False } => []               -- Resting flat
                 }
                 background: [
                     color: selected |> WHEN {
@@ -672,7 +670,6 @@ FUNCTION filter_button(filter) {
                     False => 0.35
                 }
                 metal: 0.03
-                -- edges: [side: Outside] (automatic for buttons)
                 glow: [
                     color: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
                     intensity: selected |> WHEN {
@@ -698,7 +695,7 @@ FUNCTION filter_button(filter) {
 }
 
 ------------------------------------------------------------------------
--- CLEAR COMPLETED BUTTON
+-- CLEAR COMPLETED BUTTON - Subtle depth on hover
 ------------------------------------------------------------------------
 
 FUNCTION remove_completed_button() {
@@ -714,13 +711,12 @@ FUNCTION remove_completed_button() {
             depth: 4
             rounded_corners: 2
             transform: LIST { element.hovered, element.pressed } |> WHEN {
-                LIST { __, True } => []
-                LIST { True, False } => [move_closer: 4]
-                LIST { False, False } => []
+                LIST { __, True } => []                  -- Pressed flat
+                LIST { True, False } => [move_closer: 4] -- Raised on hover
+                LIST { False, False } => []              -- Resting flat
             }
             background: [color: Oklch[lightness: 0.99]]
             gloss: 0.4
-            -- edges: [side: Outside] (automatic for buttons)
             font: [
                 line: [underline: element.hovered]
                 color: Oklch[lightness: 0.57]
