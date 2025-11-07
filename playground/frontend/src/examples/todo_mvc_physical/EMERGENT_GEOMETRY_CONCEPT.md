@@ -189,7 +189,7 @@ scene: Scene/new(
     -- Global defaults (can be omitted, these ARE the defaults)
     -- geometry: [
     --     edge_radius: 2              -- Rounded transitions
-    --     edge_bevel_angle: 45        -- Standard bevels
+    --     bevel_angle: 45        -- Standard bevels
     -- ]
 )
 ```
@@ -213,7 +213,7 @@ scene: Scene/new(
     }
     geometry: [
         edge_radius: 0                -- CHAMFERED (sharp) transitions
-        edge_bevel_angle: 30          -- Aggressive sharp bevels
+        bevel_angle: 30          -- Aggressive sharp bevels
     ]
 )
 ```
@@ -237,7 +237,7 @@ scene: Scene/new(
     }
     geometry: [
         edge_radius: 4           -- Very rounded
-        edge_bevel_angle: 60     -- Gentle bevels
+        bevel_angle: 60     -- Gentle bevels
     ]
 )
 ```
@@ -261,7 +261,7 @@ scene: Scene/new(
     }
     geometry: [
         edge_radius: 2
-        edge_bevel_angle: 45
+        bevel_angle: 45
     ]
 )
 
@@ -428,7 +428,7 @@ rounded_corners: 4            -- XY plane rounding
 ### Per-element (rare overrides):
 ```boon
 edge_radius: 8                -- Override global rounding
-edge_bevel_angle: 30          -- Override global bevel
+bevel_angle: 30          -- Override global bevel
 ```
 
 ### Scene-level (design system):
@@ -452,7 +452,7 @@ lights: LIST {
 }
 geometry: [                   -- Optional global overrides
     edge_radius: 0            -- For neobrutalism, etc.
-    edge_bevel_angle: 30      -- For aggressive bevels
+    bevel_angle: 30      -- For aggressive bevels
 ]
 ```
 
@@ -466,7 +466,7 @@ These are **hardcoded defaults or internal renderer settings**:
 // Internal renderer defaults (not exposed in API):
 const GEOMETRY_DEFAULTS = {
   edge_radius: 2,              // How rounded (0 = chamfer)
-  edge_bevel_angle: 45,        // Bevel slope
+  bevel_angle: 45,        // Bevel slope
   min_intersection: 1,         // Overlap threshold (px)
   contact_tolerance: 0.5,      // How close = "touching"
 }
@@ -694,7 +694,7 @@ This could be a **defining feature of Boon**:
 ## Next Steps
 
 1. **Prototype the concept**: Start with simple parent-child cases
-2. **Define hardcoded defaults**: `edge_radius`, `edge_bevel_angle`, etc.
+2. **Define hardcoded defaults**: `edge_radius`, `bevel_angle`, etc.
 3. **Implement basic CSG**: Union (raised) and subtract (recessed)
 4. **Add global geometry settings**: Scene-level design control
 5. **Create escape hatches**: Manual overrides when needed

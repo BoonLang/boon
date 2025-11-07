@@ -124,6 +124,7 @@ FUNCTION new_todo(title) {
 scene: Scene/new(
     root: root_element(PASS: [store: store])
     lights: Lights/basic()
+    geometry: []
 )
 
 ------------------------------------------------------------------------
