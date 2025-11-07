@@ -123,21 +123,7 @@ FUNCTION new_todo(title) {
 
 scene: Scene/new(
     root: root_element(PASS: [store: store])
-    lighting: LIST {
-        [
-            type: Directional
-            direction: [x: -0.3, y: -0.7, z: -0.6]
-            color: Oklch[lightness: 0.98, chroma: 0.015, hue: 65]
-            intensity: 2.8
-            -- Directional lights automatically cast shadows
-        ]
-        [
-            type: Ambient
-            color: Oklch[lightness: 0.8, chroma: 0.01, hue: 220]
-            intensity: 0.6
-            -- Ambient lights never cast shadows
-        ]
-    }
+    lights: Lights/basic()
 )
 
 ------------------------------------------------------------------------

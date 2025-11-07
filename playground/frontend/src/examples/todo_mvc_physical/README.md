@@ -13,7 +13,7 @@ This directory contains the TodoMVC implementation with physically-based 3D rend
   - User API (semantic elements)
   - Automatic cavity generation
   - Material properties
-  - Scene lighting
+  - Scene lighting (`Lights/basic()` helper or custom light lists)
   - Internal implementation details
 
 - **`3D_API_DESIGN.md`** - Detailed API reference for 3D properties

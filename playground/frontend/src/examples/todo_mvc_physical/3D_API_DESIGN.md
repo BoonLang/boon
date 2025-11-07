@@ -11,12 +11,27 @@ This document describes the 3D API design for physically-based UIs in Boon. Elem
 ### 1. Scene vs Document
 
 ```boon
--- 3D scene with physical rendering and lighting
+-- 3D scene with physical rendering and lighting (simple)
 scene: Scene/new(
     root: root_element(...)
-    lighting: LIST {
-        [type: Directional, intensity: 2.8]
-        [type: Ambient, intensity: 0.6]
+    lights: Lights/basic()  -- Good default lighting
+)
+
+-- 3D scene with custom lighting
+scene: Scene/new(
+    root: root_element(...)
+    lights: LIST {
+        Light/directional(
+            azimuth: 30
+            altitude: 45
+            spread: 1
+            intensity: 1.2
+            color: Oklch[lightness: 0.98, chroma: 0.015, hue: 65]
+        )
+        Light/ambient(
+            intensity: 0.4
+            color: Oklch[lightness: 0.8, chroma: 0.01, hue: 220]
+        )
     }
 )
 
@@ -25,6 +40,8 @@ document: Document/new(root: root_element(...))
 ```
 
 **`Scene/new`** automatically enables physically-based rendering for all elements.
+
+**Recommended:** Use `Lights/basic()` to start, customize only if needed.
 
 ---
 
@@ -403,30 +420,197 @@ Element/text_input(
 
 ## Scene Lighting
 
+### Simple Setup (Recommended)
+
+**For most UIs, use the built-in helper:**
+
 ```boon
 scene: Scene/new(
     root: root_element(...)
-    lighting: LIST {
-        [
-            type: Directional       -- Main light (sun/key light)
-            direction: [x: -0.3, y: -0.7, z: -0.6]
+    lights: Lights/basic()
+)
+```
+
+This provides good default lighting (directional + ambient) without configuration.
+
+### Custom Lighting
+
+**For full control, specify custom lights:**
+
+```boon
+scene: Scene/new(
+    root: root_element(...)
+    lights: LIST {
+        Light/directional(
+            azimuth: 30           -- Degrees (0-360°) - rotation clockwise from top
+            altitude: 45          -- Degrees (0-180°) - angle from screen toward viewer
+            spread: 1             -- Multiplier (0 = sharp, 1 = sun-like, 2+ = softer)
+            intensity: 1.2        -- Multiplier (1 = normal)
             color: Oklch[lightness: 0.98, chroma: 0.015, hue: 65]
-            intensity: 2.8
-            -- Directional lights automatically cast shadows
-        ]
-        [
-            type: Ambient           -- Ambient fill light
+        )
+        Light/point(
+            at: [x: 200, y: 150, z: 300]  -- Pixels - position in viewport space
+            radius: 30                     -- Pixels - sphere radius
+            intensity: 3.0                 -- Multiplier
+            color: Oklch[lightness: 0.95, chroma: 0.2, hue: 30]
+            range: 150                     -- Pixels - falloff distance
+        )
+        Light/ambient(
+            intensity: 0.4        -- Multiplier
             color: Oklch[lightness: 0.8, chroma: 0.01, hue: 220]
-            intensity: 0.6
-            -- Ambient lights never cast shadows
-        ]
+        )
     }
 )
 ```
 
-**Shadow casting is automatic:**
-- Directional lights: Always cast shadows
-- Ambient lights: Never cast shadows
+### Lights/basic() Implementation
+
+```boon
+FUNCTION Lights/basic() {
+    LIST {
+        Light/directional(
+            azimuth: 30
+            altitude: 45
+            spread: 1
+            intensity: 1.2
+            color: Oklch[lightness: 0.98, chroma: 0.015, hue: 65]
+        )
+        Light/ambient(
+            intensity: 0.4
+            color: Oklch[lightness: 0.8, chroma: 0.01, hue: 220]
+        )
+    }
+}
+```
+
+### Light Types
+
+#### Light/directional - Distant Light Source
+
+Simulates a distant light like the sun. Casts parallel shadows.
+
+```boon
+Light/directional(
+    azimuth: 30           -- Degrees (0-360°)
+    altitude: 45          -- Degrees (0-180°)
+    spread: 1             -- Multiplier
+    intensity: 1.2        -- Multiplier
+    color: Oklch[lightness: 0.98, chroma: 0.015, hue: 65]
+)
+```
+
+**Parameters:**
+- **`azimuth`**: 0-360° clockwise from top (0° = top, 90° = right, 180° = bottom, 270° = left)
+- **`altitude`**: 0-180° from screen toward viewer (0° = parallel to screen, 45° = typical overhead, 90° = perpendicular, 135-180° = backlight)
+- **`spread`**: Normalized multiplier where 1 = sun-like shadows (0 = sharp point source, 1 = realistic sun, 2-10 = progressively softer)
+- **`intensity`**: Brightness multiplier (1 = normal)
+- **`color`**: Light color (warm whites for key lights)
+
+**Always casts shadows.**
+
+#### Light/point - Localized Light Source
+
+Simulates a localized light like a bulb or softbox.
+
+```boon
+Light/point(
+    at: [x: 200, y: 150, z: 300]  -- Pixels - position in viewport space
+    radius: 30                     -- Pixels - sphere radius
+    intensity: 3.0                 -- Multiplier
+    color: Oklch[lightness: 0.95, chroma: 0.2, hue: 30]
+    range: 150                     -- Pixels - falloff distance
+)
+```
+
+**Parameters:**
+- **`at`**: Position in pixels [x, y, z] where x=left, y=top, z=depth from screen
+- **`radius`**: Sphere radius in pixels (larger = softer shadows)
+- **`intensity`**: Brightness multiplier
+- **`color`**: Light color
+- **`range`**: Falloff distance in pixels
+
+**Casts shadows.**
+
+#### Light/ambient - Omnidirectional Fill
+
+Provides uniform fill light from all directions. Softens shadows.
+
+```boon
+Light/ambient(
+    intensity: 0.4        -- Multiplier
+    color: Oklch[lightness: 0.8, chroma: 0.01, hue: 220]
+)
+```
+
+**Parameters:**
+- **`intensity`**: Brightness multiplier (typically 0.3-0.5)
+- **`color`**: Fill light color (often cool/blue tinted)
+
+**Never casts shadows.**
+
+### Common Examples
+
+**Sharp dramatic shadows:**
+```boon
+Light/directional(
+    azimuth: 90
+    altitude: 30
+    spread: 0
+    intensity: 1.5
+    color: Oklch[lightness: 0.98, chroma: 0.01, hue: 50]
+)
+```
+
+**Soft studio lighting:**
+```boon
+Light/directional(
+    azimuth: 0
+    altitude: 60
+    spread: 3
+    intensity: 1.0
+    color: Oklch[lightness: 0.95, chroma: 0.015, hue: 65]
+)
+```
+
+**Point light (small bulb):**
+```boon
+Light/point(
+    at: [x: 200, y: 150, z: 300]
+    radius: 10
+    intensity: 3.0
+    color: Oklch[lightness: 0.95, chroma: 0.2, hue: 30]
+    range: 150
+)
+```
+
+**Point light (large softbox):**
+```boon
+Light/point(
+    at: [x: 200, y: 150, z: 300]
+    radius: 80
+    intensity: 2.5
+    color: Oklch[lightness: 0.98, chroma: 0.05, hue: 65]
+    range: 200
+)
+```
+
+### Units Reference Table
+
+| Parameter | Light Type | Units | Typical Range | Meaning |
+|-----------|-----------|-------|---------------|---------|
+| `azimuth` | Directional | Degrees | 0-360° | Rotation around screen (clockwise from top) |
+| `altitude` | Directional | Degrees | 0-180° | Angle from screen (0=parallel, 90=perpendicular) |
+| `spread` | Directional | Multiplier | 0-10 | Shadow softness (0=sharp, 1=sun, 2+=softer) |
+| `at` | Point | Pixels | - | Position [x, y, z] in viewport |
+| `radius` | Point | Pixels | 5-100 | Light sphere radius |
+| `range` | Point | Pixels | 100-500 | Distance falloff |
+| `intensity` | All | Multiplier | 0.5-2.0 | Brightness (1=normal) |
+
+### Shadow Casting
+
+- **Directional lights:** Always cast shadows
+- **Point lights:** Always cast shadows
+- **Ambient lights:** Never cast shadows
 - Shadows emerge from real geometry + lighting
 - No fake shadow properties needed!
 
@@ -454,10 +638,7 @@ scene: Scene/new(
 ```boon
 scene: Scene/new(
     root: root_element(PASS: [store: store])
-    lighting: LIST {
-        [type: Directional, intensity: 2.8]
-        [type: Ambient, intensity: 0.6]
-    }
+    lights: Lights/basic()  -- Simple default lighting
 )
 
 FUNCTION main_panel() {

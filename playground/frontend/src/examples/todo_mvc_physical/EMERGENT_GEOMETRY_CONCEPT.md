@@ -185,10 +185,7 @@ The KILLER feature: **change entire design aesthetic with ONE setting**
 ```boon
 scene: Scene/new(
     root: root_element(...)
-    lighting: LIST {
-        [type: Directional, intensity: 2.8, softness: 0.8]  -- Soft shadows
-        [type: Ambient, intensity: 0.6]
-    }
+    lights: Lights/basic()  -- Good default for most UIs
     -- Global defaults (can be omitted, these ARE the defaults)
     -- geometry: [
     --     edge_radius: 2              -- Rounded transitions
@@ -201,9 +198,18 @@ scene: Scene/new(
 ```boon
 scene: Scene/new(
     root: root_element(...)
-    lighting: LIST {
-        [type: Directional, intensity: 3.5, softness: 0]  -- HARD shadows
-        [type: Ambient, intensity: 0.3]
+    lights: LIST {
+        Light/directional(
+            azimuth: 90
+            altitude: 60
+            spread: 0
+            intensity: 1.5
+            color: Oklch[lightness: 1.0, chroma: 0.0, hue: 0]
+        )
+        Light/ambient(
+            intensity: 0.3
+            color: Oklch[lightness: 0.7, chroma: 0.0, hue: 0]
+        )
     }
     geometry: [
         edge_radius: 0                -- CHAMFERED (sharp) transitions
@@ -216,9 +222,18 @@ scene: Scene/new(
 ```boon
 scene: Scene/new(
     root: root_element(...)
-    lighting: LIST {
-        [type: Directional, intensity: 2.0, softness: 0.9]
-        [type: Ambient, intensity: 0.8]
+    lights: LIST {
+        Light/directional(
+            azimuth: 0
+            altitude: 30
+            spread: 2
+            intensity: 1.0
+            color: Oklch[lightness: 0.95, chroma: 0.01, hue: 50]
+        )
+        Light/ambient(
+            intensity: 0.5
+            color: Oklch[lightness: 0.85, chroma: 0.01, hue: 220]
+        )
     }
     geometry: [
         edge_radius: 4           -- Very rounded
@@ -231,9 +246,18 @@ scene: Scene/new(
 ```boon
 scene: Scene/new(
     root: root_element(...)
-    lighting: LIST {
-        [type: Directional, intensity: 2.5, softness: 0.7]
-        [type: Ambient, intensity: 0.7]
+    lights: LIST {
+        Light/directional(
+            azimuth: 345
+            altitude: 40
+            spread: 1.5
+            intensity: 1.1
+            color: Oklch[lightness: 0.97, chroma: 0.02, hue: 200]
+        )
+        Light/ambient(
+            intensity: 0.45
+            color: Oklch[lightness: 0.82, chroma: 0.01, hue: 220]
+        )
     }
     geometry: [
         edge_radius: 2
@@ -266,10 +290,7 @@ Element/stripe(
 -- Change Document to Scene
 scene: Scene/new(
     root: root_element(PASS: [store: store])
-    lighting: LIST {
-        [type: Directional, intensity: 2.8]
-        [type: Ambient, intensity: 0.6]
-    }
+    lights: Lights/basic()  -- Simple default lighting
 )
 
 -- Main panel
@@ -412,7 +433,23 @@ edge_bevel_angle: 30          -- Override global bevel
 
 ### Scene-level (design system):
 ```boon
-lighting: LIST { ... }        -- Light setup
+-- Simple (recommended for most UIs)
+lights: Lights/basic()
+
+-- Or custom:
+lights: LIST {
+    Light/directional(
+        azimuth: 30
+        altitude: 45
+        spread: 1
+        intensity: 1.2
+        color: Oklch[...]
+    )
+    Light/ambient(
+        intensity: 0.4
+        color: Oklch[...]
+    )
+}
 geometry: [                   -- Optional global overrides
     edge_radius: 0            -- For neobrutalism, etc.
     edge_bevel_angle: 30      -- For aggressive bevels
