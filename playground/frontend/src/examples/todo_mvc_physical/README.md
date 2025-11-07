@@ -37,9 +37,9 @@ Users write semantic elements with visual properties:
 ```boon
 Element/text_input(
     style: [
-        depth: 6              -- Creates automatic recess
-        gloss: 0.65           -- Shiny interior
-        padding: [all: 10]    -- Controls wall thickness
+        depth: 6                   -- Creates automatic recess
+        material: [gloss: 0.65]    -- Shiny interior
+        padding: [all: 10]         -- Controls wall thickness
     ]
     text: 'Hello'
 )

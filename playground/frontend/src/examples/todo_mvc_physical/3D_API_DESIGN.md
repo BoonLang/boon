@@ -80,9 +80,11 @@ rounded_corners: None  -- Sharp 90° corners
 borders: [
     width: 2                     -- Border width
     color: Oklch[...]            -- Border color
-    glow: [                      -- Optional glow effect
-        color: Oklch[...]
-        intensity: 0.2
+    material: [
+        glow: [                  -- Optional glow effect
+            color: Oklch[...]
+            intensity: 0.2
+        ]
     ]
 ]
 
@@ -126,13 +128,17 @@ gloss: 1.0   -- Mirror (chrome, glass)
 
 ```boon
 -- Non-metal button (typical UI)
-gloss: 0.3
-metal: 0.0   -- White reflections
+material: [
+    gloss: 0.3
+    metal: 0.0   -- White reflections
+]
 
 -- Metal button (unusual)
 background: [color: Oklch[lightness: 0.6, chroma: 0.15, hue: 30]]  -- Gold color
-gloss: 0.8
-metal: 1.0   -- Gold-tinted reflections
+material: [
+    gloss: 0.8
+    metal: 1.0   -- Gold-tinted reflections
+]
 ```
 
 **For UI elements, use 0.0-0.05** or omit entirely (defaults to 0).
@@ -142,8 +148,10 @@ metal: 1.0   -- Gold-tinted reflections
 **Optional clearcoat effect.** Adds a second glossy layer over the base material, like car paint or varnished wood.
 
 ```boon
-gloss: 0.12   -- Base material (somewhat matte)
-shine: 0.6    -- Glossy clearcoat on top = sophisticated look
+material: [
+    gloss: 0.12   -- Base material (somewhat matte)
+    shine: 0.6    -- Glossy clearcoat on top = sophisticated look
+]
 ```
 
 **Use `shine` for premium/polished surfaces.** Otherwise omit it.
@@ -155,9 +163,11 @@ shine: 0.6    -- Glossy clearcoat on top = sophisticated look
 
 #### `glow` - Emissive light
 ```boon
-glow: [
-    color: Oklch[lightness: 0.7, chroma: 0.08, hue: 220]
-    intensity: 0.15
+material: [
+    glow: [
+        color: Oklch[lightness: 0.7, chroma: 0.08, hue: 220]
+        intensity: 0.15
+    ]
 ]
 ```
 
@@ -178,7 +188,9 @@ Element/text_input(
     style: [
         depth: 6              -- Creates ~4px deep cavity automatically
         padding: [all: 10]    -- Controls wall thickness
-        gloss: 0.65          -- Shiny interior
+        material: [
+            gloss: 0.65       -- Shiny interior
+        ]
     ]
     text: 'Hello'
 )
@@ -200,7 +212,9 @@ Element/button(
     style: [
         depth: 6              -- Creates solid convex shape
         transform: [move_closer: 4]  -- Floats 4px above surface
-        gloss: 0.3
+        material: [
+            gloss: 0.3
+        ]
     ]
     label: 'Click'
 )
@@ -219,7 +233,9 @@ Element/button(
 Element/checkbox(
     style: [
         depth: 5              -- Creates small shallow well
-        gloss: 0.25
+        material: [
+            gloss: 0.25
+        ]
     ]
     checked: True
 )
@@ -252,7 +268,9 @@ Element/button(
             LIST { True, False } => [move_closer: 6] -- Lifted on hover
             LIST { False, False } => [move_closer: 4] -- Resting raised
         }
-        gloss: 0.3
+        material: [
+            gloss: 0.3
+        ]
     ]
     label: 'Press me'
 )
@@ -269,7 +287,9 @@ Element/text_input(
     style: [
         depth: 6
         rounded_corners: 4
-        gloss: 0.65
+        material: [
+            gloss: 0.65
+        ]
         transform: [move_further: 4]
         padding: [all: 10]
     ]
@@ -290,9 +310,11 @@ Element/stripe(
         depth: 8
         transform: [move_closer: 50]  -- Card floats 50px above background
         rounded_corners: 4
-        gloss: 0.12        -- Very glossy
-        metal: 0.02
-        shine: 0.6         -- Clearcoat finish
+        material: [
+            gloss: 0.12    -- Very glossy
+            metal: 0.02
+            shine: 0.6     -- Clearcoat finish
+        ]
     ]
     items: LIST {
         -- Header (flush with card surface)
@@ -303,7 +325,9 @@ Element/stripe(
             style: [
                 transform: [move_further: 4]
                 depth: 6
-                gloss: 0.65
+                material: [
+                    gloss: 0.65
+                ]
             ]
             text: 'Username'
         )
@@ -313,7 +337,9 @@ Element/stripe(
             style: [
                 transform: [move_closer: 4]
                 depth: 6
-                gloss: 0.3
+                material: [
+                    gloss: 0.3
+                ]
             ]
             label: 'Submit'
         )
@@ -336,9 +362,11 @@ Element/text_input(
             True => [
                 width: 2
                 color: Oklch[lightness: 0.68, chroma: 0.08, hue: 220]
-                glow: [
-                    color: Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
-                    intensity: 0.2
+                material: [
+                    glow: [
+                        color: Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
+                        intensity: 0.2
+                    ]
                 ]
             ]
             False => []
@@ -440,9 +468,11 @@ FUNCTION main_panel() {
             depth: 8
             transform: [move_closer: 50]  -- Floats 50px above background
             rounded_corners: 4
-            gloss: 0.12            -- Very glossy card
-            metal: 0.02
-            shine: 0.6
+            material: [
+                gloss: 0.12        -- Very glossy card
+                metal: 0.02
+                shine: 0.6
+            ]
         ]
         items: LIST {
             new_todo_input()
@@ -458,7 +488,9 @@ FUNCTION new_todo_input() {
             transform: [move_further: 4]  -- Recessed 4px into card
             depth: 6
             rounded_corners: 2
-            gloss: 0.65
+            material: [
+                gloss: 0.65
+            ]
             -- Cavity geometry automatic!
         ]
         text: 'What needs to be done?'
@@ -475,8 +507,10 @@ FUNCTION todo_button() {
                 LIST { True, False } => [move_closer: 6] -- Lifted 6px
                 LIST { False, False } => [move_closer: 4] -- Resting 4px up
             }
-            gloss: 0.25
-            metal: 0.03
+            material: [
+                gloss: 0.25
+                metal: 0.03
+            ]
             -- Raised geometry automatic!
         ]
         label: 'Remove'

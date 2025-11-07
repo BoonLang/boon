@@ -24,7 +24,7 @@ This document describes Boon's physically-based 3D rendering system for UI eleme
 **Users write semantic UI elements:**
 ```boon
 Element/text_input(
-    style: [depth: 6, gloss: 0.65]
+    style: [depth: 6, material: [gloss: 0.65]]
     text: 'Hello'
 )
 ```
@@ -56,7 +56,7 @@ Element/text_input(
         width: 200
         padding: [all: 10]    -- Controls wall thickness
         rounded_corners: 4
-        gloss: 0.65           -- Shiny interior
+        material: [gloss: 0.65]  -- Shiny interior
         background: [color: Oklch[lightness: 0.99]]
     ]
     text: 'Type here...'
@@ -83,7 +83,7 @@ Element/checkbox(
         width: 20
         height: 20
         rounded_corners: 3
-        gloss: 0.25
+        material: [gloss: 0.25]
     ]
     checked: True
 )
@@ -101,7 +101,7 @@ Element/button(
         depth: 6              -- Button thickness (convex, not recessed)
         transform: [move_closer: 4]  -- Floats above surface
         rounded_corners: 4
-        gloss: 0.3
+        material: [gloss: 0.3]
     ]
     label: 'Click me'
 )
@@ -122,9 +122,9 @@ Element/block(
         width: 200
         transform: [move_closer: 50]  -- Distance from background
         rounded_corners: 4
-        gloss: 0.12
+        material: [gloss: 0.12]
     ]
-    child: Element/text(content: 'Card content')
+    child: Element/text(text: 'Card content')
 )
 ```
 
@@ -182,12 +182,12 @@ For visible depth effects:
 Controls how rough or smooth the surface appears:
 
 ```boon
-gloss: 0.0   -- Matte (chalk, flat paint)
-gloss: 0.3   -- Low gloss (matte plastic) - good for buttons
-gloss: 0.5   -- Satin (brushed metal)
-gloss: 0.65  -- Medium gloss - good for input interiors
-gloss: 0.8   -- High gloss (glossy plastic, polished wood)
-gloss: 1.0   -- Mirror (chrome, glass)
+material: [gloss: 0.0]   -- Matte (chalk, flat paint)
+material: [gloss: 0.3]   -- Low gloss (matte plastic) - good for buttons
+material: [gloss: 0.5]   -- Satin (brushed metal)
+material: [gloss: 0.65]  -- Medium gloss - good for input interiors
+material: [gloss: 0.8]   -- High gloss (glossy plastic, polished wood)
+material: [gloss: 1.0]   -- Mirror (chrome, glass)
 ```
 
 **For most UI elements, use 0.15-0.4 for exteriors, 0.6-0.8 for input interiors.**
@@ -199,8 +199,8 @@ gloss: 1.0   -- Mirror (chrome, glass)
 Controls whether reflections are colored or white:
 
 ```boon
-metal: 0.0   -- Non-metal: white reflections (plastic, wood, glass) - DEFAULT
-metal: 1.0   -- Metal: colored reflections (gold, copper, steel)
+material: [metal: 0.0]   -- Non-metal: white reflections (plastic, wood, glass) - DEFAULT
+material: [metal: 1.0]   -- Metal: colored reflections (gold, copper, steel)
 ```
 
 **For UI elements, use 0.0-0.05 or omit entirely.**
@@ -212,8 +212,10 @@ metal: 1.0   -- Metal: colored reflections (gold, copper, steel)
 Adds glossy coating over base material:
 
 ```boon
-gloss: 0.12   -- Base material (matte)
-shine: 0.6    -- Glossy clearcoat on top = sophisticated look
+material: [
+    gloss: 0.12   -- Base material (matte)
+    shine: 0.6    -- Glossy clearcoat on top = sophisticated look
+]
 ```
 
 **Use for premium cards/panels. Otherwise omit.**
@@ -223,9 +225,11 @@ shine: 0.6    -- Glossy clearcoat on top = sophisticated look
 ### glow - Emissive Light
 
 ```boon
-glow: [
-    color: Oklch[lightness: 0.7, chroma: 0.08, hue: 220]
-    intensity: 0.15
+material: [
+    glow: [
+        color: Oklch[lightness: 0.7, chroma: 0.08, hue: 220]
+        intensity: 0.15
+    ]
 ]
 ```
 
@@ -284,7 +288,7 @@ FUNCTION render_text_input(props) {
             depth: props.depth
             width: props.width
             height: props.height
-            gloss: 0.2  -- Matte exterior
+            material: [gloss: 0.2]  -- Matte exterior
         ]
     )
 
@@ -294,7 +298,7 @@ FUNCTION render_text_input(props) {
             depth: props.depth * 0.66              -- Shallower
             width: props.width - (2 * props.padding.horizontal)
             height: props.height - (2 * props.padding.vertical)
-            gloss: props.gloss                     -- User-specified gloss
+            material: [gloss: props.gloss]         -- User-specified gloss
             transform: [move_further: 1]
         ]
     )
@@ -376,7 +380,7 @@ Element/text_input(
         transform: [move_further: 4]  -- Position relative to parent
         rounded_corners: 2
         background: [color: Oklch[lightness: 0.99]]
-        gloss: 0.65                 -- Shiny interior
+        material: [gloss: 0.65]     -- Shiny interior
     ]
     text: 'What needs to be done?'
     placeholder: [text: 'What needs to be done?']
@@ -402,9 +406,11 @@ Element/stripe(
         transform: [move_closer: 50]  -- Floats 50px above background
         rounded_corners: 4
         background: [color: Oklch[lightness: 1]]
-        gloss: 0.12                   -- Very glossy
-        metal: 0.02
-        shine: 0.6                    -- Clearcoat finish
+        material: [                   -- Material properties
+            gloss: 0.12               -- Very glossy
+            metal: 0.02
+            shine: 0.6                -- Clearcoat finish
+        ]
     ]
     items: LIST {
         new_todo_input()

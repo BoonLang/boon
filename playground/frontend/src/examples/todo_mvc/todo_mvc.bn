@@ -197,16 +197,18 @@ FUNCTION main_panel() {
         items: LIST {
             new_todo_title_text_input() 
                 |> LINK { PASSED.store.elements.new_todo_title_text_input }
-            PASSED.store.todos 
-                |> List/empty() 
-                |> WHILE { 
+            PASSED.store.todos
+                |> List/empty()
+                |> WHILE {
                     True => NoElement
-                    False => Stripe/new(
+                    False => Element/stripe(
                         element: []
-                        style: [direction: Column]
-                        items: LIST { 
+                        direction: Column
+                        gap: 0
+                        style: []
+                        items: LIST {
                             todos_element()
-                            panel_footer() 
+                            panel_footer()
                         }
                     )
                 }

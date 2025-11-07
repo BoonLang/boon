@@ -247,7 +247,9 @@ Element/stripe(
         depth: 8
         background: [color: Oklch[lightness: 0.95, alpha: 0.3]]
         backdrop_blur: 10        -- Glass effect
-        gloss: 0.8               -- Very reflective
+        material: [
+            gloss: 0.8           -- Very reflective
+        ]
     ]
 )
 ```
@@ -626,7 +628,7 @@ Element/button(
 )
 
 -- Disable: None (sharp edges)
-Element/container(
+Element/block(
     style: [
         depth: 4
         edge_treatment: None       -- No interaction, sharp 90° edges
