@@ -1,0 +1,165 @@
+-- Glassmorphism Theme
+-- Translucent surfaces, high gloss materials, backdrop blur
+-- Soft diffuse lighting, subtle colors
+
+FUNCTION theme(mode) {
+    [
+        -- Lighting: Soft diffuse from upper-left, strong ambient
+        lights: LIST {
+            Light/directional(
+                azimuth: 345
+                altitude: 40
+                spread: 1.5            -- Soft shadows
+                intensity: 1.1
+                color: Oklch[lightness: 0.97, chroma: 0.02, hue: 200]
+            )
+            Light/ambient(
+                intensity: 0.45        -- More ambient for softer look
+                color: mode |> WHEN {
+                    Light => Oklch[lightness: 0.82, chroma: 0.01, hue: 220]
+                    Dark => Oklch[lightness: 0.35, chroma: 0.02, hue: 220]
+                }
+            )
+        }
+
+        -- Geometry: Rounded edges, standard bevels
+        geometry: [
+            edge_radius: 2
+            bevel_angle: 45
+        ]
+
+        -- Materials: High gloss, glossy finishes
+        materials: [
+            panel: [
+                gloss: 0.8             -- Very glossy
+                metal: 0.0
+                shine: 0.0
+            ]
+            surface: [
+                gloss: 0.75
+            ]
+            input_exterior: [
+                gloss: 0.7
+            ]
+            input_interior: [
+                gloss: 0.85            -- Mirror-like interior
+            ]
+            button: [
+                gloss: 0.8
+                metal: 0.0
+            ]
+            button_emphasis: [
+                gloss: 0.85
+            ]
+        ]
+
+        -- Elevation: Moderate floating
+        elevation: [
+            card: 40
+            popup: 20
+            floating: 8
+            raised: 4
+            grounded: 0
+            recessed: -4
+        ]
+
+        -- Depth: Thinner elements (glass is thin)
+        depth: [
+            major: 6
+            standard: 4
+            subtle: 2
+            emphasis: 8
+        ]
+
+        -- Interaction: Smooth gentle movement
+        interaction: [
+            hover_lift: 2
+            press_depth: 3
+            emphasis_lift: 3
+            transition_ms: 200     -- Slower, smoother
+        ]
+
+        -- Corners: Very rounded
+        corners: [
+            sharp: 0
+            subtle: 4
+            standard: 8
+            round: 12
+            full: Fully
+        ]
+
+        -- Colors: Translucent surfaces, low chroma, heavy use of alpha
+        colors: mode |> WHEN {
+            Light => [
+                -- Surfaces (translucent whites with blur)
+                surface: Oklch[lightness: 0.95, chroma: 0.01, hue: 220, alpha: 0.3]
+                surface_variant: Oklch[lightness: 0.92, chroma: 0.01, hue: 220, alpha: 0.4]
+                surface_bright: Oklch[lightness: 0.98, chroma: 0.01, hue: 220, alpha: 0.25]
+                surface_dim: Oklch[lightness: 0.88, chroma: 0.01, hue: 220, alpha: 0.5]
+
+                -- Primary accent (subtle, low chroma)
+                primary: Oklch[lightness: 0.7, chroma: 0.08, hue: 260, alpha: 0.8]
+                primary_glow: Oklch[lightness: 0.8, chroma: 0.1, hue: 260, alpha: 0.6]
+                primary_container: Oklch[lightness: 0.95, chroma: 0.05, hue: 260, alpha: 0.3]
+
+                -- Focus (cool blue, subtle)
+                focus: Oklch[lightness: 0.65, chroma: 0.1, hue: 220, alpha: 0.8]
+                focus_glow: Oklch[lightness: 0.75, chroma: 0.12, hue: 220, alpha: 0.6]
+
+                -- Danger (subtle pink)
+                danger: Oklch[lightness: 0.65, chroma: 0.12, hue: 10, alpha: 0.8]
+                danger_glow: Oklch[lightness: 0.75, chroma: 0.12, hue: 10, alpha: 0.6]
+
+                -- Text (semi-transparent)
+                on_surface: Oklch[lightness: 0.25, chroma: 0.02, hue: 240, alpha: 0.9]
+                on_surface_variant: Oklch[lightness: 0.45, chroma: 0.02, hue: 240, alpha: 0.8]
+                on_surface_disabled: Oklch[lightness: 0.65, chroma: 0.01, hue: 240, alpha: 0.5]
+
+                -- Borders (subtle, translucent)
+                border: Oklch[lightness: 0.85, chroma: 0.01, hue: 220, alpha: 0.4]
+                border_strong: Oklch[lightness: 0.75, chroma: 0.02, hue: 220, alpha: 0.6]
+
+                -- Background (light gradient backdrop)
+                background: Oklch[lightness: 0.92, chroma: 0.02, hue: 240]
+
+                -- Special: Backdrop blur setting (not a color but related)
+                backdrop_blur: 10      -- px of blur
+            ]
+            Dark => [
+                -- Surfaces (translucent darks with blur)
+                surface: Oklch[lightness: 0.2, chroma: 0.01, hue: 240, alpha: 0.3]
+                surface_variant: Oklch[lightness: 0.25, chroma: 0.01, hue: 240, alpha: 0.4]
+                surface_bright: Oklch[lightness: 0.3, chroma: 0.01, hue: 240, alpha: 0.35]
+                surface_dim: Oklch[lightness: 0.15, chroma: 0.01, hue: 240, alpha: 0.5]
+
+                -- Primary accent (subtle, low chroma)
+                primary: Oklch[lightness: 0.75, chroma: 0.1, hue: 260, alpha: 0.8]
+                primary_glow: Oklch[lightness: 0.85, chroma: 0.12, hue: 260, alpha: 0.6]
+                primary_container: Oklch[lightness: 0.3, chroma: 0.08, hue: 260, alpha: 0.3]
+
+                -- Focus (cool blue, brighter)
+                focus: Oklch[lightness: 0.75, chroma: 0.12, hue: 220, alpha: 0.8]
+                focus_glow: Oklch[lightness: 0.85, chroma: 0.14, hue: 220, alpha: 0.6]
+
+                -- Danger (subtle pink, brighter)
+                danger: Oklch[lightness: 0.75, chroma: 0.14, hue: 10, alpha: 0.8]
+                danger_glow: Oklch[lightness: 0.85, chroma: 0.14, hue: 10, alpha: 0.6]
+
+                -- Text (light, semi-transparent)
+                on_surface: Oklch[lightness: 0.9, chroma: 0.01, hue: 240, alpha: 0.9]
+                on_surface_variant: Oklch[lightness: 0.75, chroma: 0.01, hue: 240, alpha: 0.8]
+                on_surface_disabled: Oklch[lightness: 0.5, chroma: 0.01, hue: 240, alpha: 0.5]
+
+                -- Borders (subtle, translucent)
+                border: Oklch[lightness: 0.35, chroma: 0.02, hue: 240, alpha: 0.4]
+                border_strong: Oklch[lightness: 0.45, chroma: 0.03, hue: 240, alpha: 0.6]
+
+                -- Background (dark gradient backdrop)
+                background: Oklch[lightness: 0.1, chroma: 0.03, hue: 260]
+
+                -- Special: Backdrop blur setting
+                backdrop_blur: 12      -- More blur in dark mode
+            ]
+        }
+    ]
+}

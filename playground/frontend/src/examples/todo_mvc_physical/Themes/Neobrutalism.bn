@@ -1,0 +1,156 @@
+-- Neobrutalism Theme
+-- Sharp chamfered edges, hard shadows, flat materials
+-- High contrast lighting, bold colors, thick borders
+
+FUNCTION theme(mode) {
+    [
+        -- Lighting: Hard directional from right, minimal ambient
+        lights: LIST {
+            Light/directional(
+                azimuth: 90
+                altitude: 60
+                spread: 0              -- Sharp hard shadows
+                intensity: 1.5         -- Strong contrast
+                color: Oklch[lightness: 1.0, chroma: 0.0, hue: 0]  -- Pure white
+            )
+            Light/ambient(
+                intensity: 0.3         -- Less fill = harder shadows
+                color: Oklch[lightness: 0.7, chroma: 0.0, hue: 0]  -- Pure gray
+            )
+        }
+
+        -- Geometry: Sharp chamfered edges, aggressive bevels
+        geometry: [
+            edge_radius: 0         -- CHAMFERED (no rounding)
+            bevel_angle: 30        -- Aggressive sharp bevels
+        ]
+
+        -- Materials: Flat matte surfaces, no fancy finishes
+        materials: [
+            panel: [
+                gloss: 0.05        -- Very matte
+                metal: 0.0
+                shine: 0.0         -- No clearcoat
+            ]
+            surface: [
+                gloss: 0.08
+            ]
+            input_exterior: [
+                gloss: 0.1
+            ]
+            input_interior: [
+                gloss: 0.15        -- Slightly less matte inside
+            ]
+            button: [
+                gloss: 0.12
+                metal: 0.0
+            ]
+            button_emphasis: [
+                gloss: 0.15
+            ]
+        ]
+
+        -- Elevation: Dramatic height differences
+        elevation: [
+            card: 60               -- Float higher for drama
+            popup: 32              -- Very prominent
+            floating: 12           -- More dramatic
+            raised: 6              -- Bolder raises
+            grounded: 0
+            recessed: -6           -- Deeper recesses
+        ]
+
+        -- Depth: Chunky thick elements
+        depth: [
+            major: 12              -- Thicker structures
+            standard: 8            -- Thicker standard
+            subtle: 4              -- Even "subtle" is chunky
+            emphasis: 16           -- Very bold
+        ]
+
+        -- Interaction: Snappy, dramatic movement
+        interaction: [
+            hover_lift: 4          -- Bigger lifts
+            press_depth: 6         -- Deeper presses
+            emphasis_lift: 8       -- Much more dramatic
+            transition_ms: 100     -- Faster, snappier
+        ]
+
+        -- Corners: Sharp or very round, no in-between
+        corners: [
+            sharp: 0               -- Always sharp
+            subtle: 0              -- No subtle rounding
+            standard: 0            -- Default sharp
+            round: 12              -- When rounded, go big
+            full: Fully
+        ]
+
+        -- Colors: High contrast, bold primaries, pure blacks/whites
+        colors: mode |> WHEN {
+            Light => [
+                -- Surfaces (pure white with slight warm tint)
+                surface: Oklch[lightness: 1.0]
+                surface_variant: Oklch[lightness: 0.98]
+                surface_bright: Oklch[lightness: 1.0]
+                surface_dim: Oklch[lightness: 0.95]
+
+                -- Primary accent (BOLD saturated colors)
+                primary: Oklch[lightness: 0.55, chroma: 0.25, hue: 350]  -- Bold red
+                primary_glow: Oklch[lightness: 0.7, chroma: 0.25, hue: 350]
+                primary_container: Oklch[lightness: 1.0]
+
+                -- Focus (bold cyan)
+                focus: Oklch[lightness: 0.5, chroma: 0.2, hue: 200]
+                focus_glow: Oklch[lightness: 0.7, chroma: 0.2, hue: 200]
+
+                -- Danger (bold magenta)
+                danger: Oklch[lightness: 0.5, chroma: 0.25, hue: 330]
+                danger_glow: Oklch[lightness: 0.7, chroma: 0.25, hue: 330]
+
+                -- Text (pure black)
+                on_surface: Oklch[lightness: 0.0]
+                on_surface_variant: Oklch[lightness: 0.25]
+                on_surface_disabled: Oklch[lightness: 0.6]
+
+                -- Borders (thick, pure black)
+                border: Oklch[lightness: 0.0]
+                border_strong: Oklch[lightness: 0.0]
+
+                -- Background (bright yellow tint)
+                background: Oklch[lightness: 0.95, chroma: 0.05, hue: 90]
+            ]
+            Dark => [
+                -- Surfaces (pure black/dark gray)
+                surface: Oklch[lightness: 0.0]
+                surface_variant: Oklch[lightness: 0.08]
+                surface_bright: Oklch[lightness: 0.12]
+                surface_dim: Oklch[lightness: 0.0]
+
+                -- Primary accent (BOLD neon colors)
+                primary: Oklch[lightness: 0.7, chroma: 0.28, hue: 350]  -- Neon red
+                primary_glow: Oklch[lightness: 0.8, chroma: 0.3, hue: 350]
+                primary_container: Oklch[lightness: 0.0]
+
+                -- Focus (neon cyan)
+                focus: Oklch[lightness: 0.75, chroma: 0.25, hue: 200]
+                focus_glow: Oklch[lightness: 0.85, chroma: 0.25, hue: 200]
+
+                -- Danger (neon magenta)
+                danger: Oklch[lightness: 0.75, chroma: 0.28, hue: 330]
+                danger_glow: Oklch[lightness: 0.85, chroma: 0.3, hue: 330]
+
+                -- Text (pure white)
+                on_surface: Oklch[lightness: 1.0]
+                on_surface_variant: Oklch[lightness: 0.8]
+                on_surface_disabled: Oklch[lightness: 0.4]
+
+                -- Borders (thick, pure white or neon)
+                border: Oklch[lightness: 1.0]
+                border_strong: Oklch[lightness: 1.0]
+
+                -- Background (dark with purple tint)
+                background: Oklch[lightness: 0.05, chroma: 0.03, hue: 280]
+            ]
+        }
+    ]
+}

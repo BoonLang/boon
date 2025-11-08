@@ -2,6 +2,12 @@
 -- Elements are positioned in 3D space
 -- Bevels, fillets, and shadows emerge naturally from spatial relationships
 -- No explicit edge/shadow definitions needed!
+--
+-- THEMES: See Themes/ directory for complete design presets
+-- - Professional.bn (default - soft, rounded, neutral)
+-- - Neobrutalism.bn (sharp, bold, high-contrast)
+-- - Glassmorphism.bn (translucent, glossy, blurred)
+-- - Neumorphism.bn (soft, monochrome, subtle)
 
 ------------------------------------------------------------------------
 -- STORE AND STATE
@@ -120,6 +126,29 @@ FUNCTION new_todo(title) {
 ------------------------------------------------------------------------
 -- SCENE - Physical 3D with lighting
 ------------------------------------------------------------------------
+
+-- THEME SYSTEM (future):
+-- When imports work, you'll be able to switch the entire design in one line:
+--
+--   theme: Themes/Professional/theme(mode: Light)
+--   -- or: Themes/Neobrutalism/theme(mode: Dark)
+--   -- or: Themes/Glassmorphism/theme(mode: Light)
+--   -- or: Themes/Neumorphism/theme(mode: Dark)
+--
+--   scene: Scene/new(
+--       root: root_element(PASS: [store: store, theme: theme])
+--       lights: theme.lights
+--       geometry: theme.geometry
+--       materials: theme.materials
+--       elevation: theme.elevation
+--       depth: theme.depth
+--       interaction: theme.interaction
+--       corners: theme.corners
+--       colors: theme.colors
+--   )
+--
+-- For now, geometry: [] shows the API shape.
+-- See Themes/ directory for complete theme definitions.
 
 scene: Scene/new(
     root: root_element(PASS: [store: store])
