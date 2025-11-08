@@ -91,68 +91,40 @@ FUNCTION theme(mode) {
         -- Colors: Semantic palette with light/dark modes
         colors: mode |> WHEN {
             Light => [
-                -- Surfaces (light, warm whites)
+                background: Oklch[lightness: 0.96, chroma: 0.01, hue: 220]
                 surface: Oklch[lightness: 1]
                 surface_variant: Oklch[lightness: 0.985]
                 surface_bright: Oklch[lightness: 0.99]
-                surface_dim: Oklch[lightness: 0.92]
-
-                -- Primary accent (warm orange)
                 primary: Oklch[lightness: 0.7, chroma: 0.165, hue: 25.36]
                 primary_glow: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
                 primary_container: Oklch[lightness: 0.98, chroma: 0.01, hue: 25.36]
-
-                -- Focus (cool blue)
                 focus: Oklch[lightness: 0.68, chroma: 0.08, hue: 220]
                 focus_glow: Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
-
-                -- Danger/error (warm red)
                 danger: Oklch[lightness: 0.6, chroma: 0.109, hue: 18.87]
                 danger_glow: Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87]
-
-                -- Text
-                on_surface: Oklch[lightness: 0.42]
-                on_surface_variant: Oklch[lightness: 0.57]
-                on_surface_disabled: Oklch[lightness: 0.75]
-
-                -- Borders
+                text: Oklch[lightness: 0.42]
+                text_secondary: Oklch[lightness: 0.57]
+                text_disabled: Oklch[lightness: 0.75]
+                text_header: Oklch[lightness: 0.54, chroma: 0.156, hue: 21.24, alpha: 0.15]
                 border: Oklch[lightness: 0.92]
-                border_strong: Oklch[lightness: 0.85]
-
-                -- Background
-                background: Oklch[lightness: 0.96, chroma: 0.01, hue: 220]
             ]
             Dark => [
-                -- Surfaces (dark, slightly warm grays)
+                background: Oklch[lightness: 0.08, chroma: 0.005, hue: 220]
                 surface: Oklch[lightness: 0.15]
                 surface_variant: Oklch[lightness: 0.18]
                 surface_bright: Oklch[lightness: 0.22]
-                surface_dim: Oklch[lightness: 0.12]
-
-                -- Primary accent (warm orange - brighter in dark mode)
                 primary: Oklch[lightness: 0.75, chroma: 0.165, hue: 25.36]
                 primary_glow: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
                 primary_container: Oklch[lightness: 0.25, chroma: 0.08, hue: 25.36]
-
-                -- Focus (cool blue - brighter in dark mode)
                 focus: Oklch[lightness: 0.75, chroma: 0.1, hue: 220]
                 focus_glow: Oklch[lightness: 0.8, chroma: 0.12, hue: 220]
-
-                -- Danger/error (warm red - brighter in dark mode)
                 danger: Oklch[lightness: 0.7, chroma: 0.12, hue: 18.87]
                 danger_glow: Oklch[lightness: 0.8, chroma: 0.12, hue: 18.87]
-
-                -- Text
-                on_surface: Oklch[lightness: 0.9]
-                on_surface_variant: Oklch[lightness: 0.75]
-                on_surface_disabled: Oklch[lightness: 0.5]
-
-                -- Borders
+                text: Oklch[lightness: 0.9]
+                text_secondary: Oklch[lightness: 0.75]
+                text_disabled: Oklch[lightness: 0.5]
+                text_header: Oklch[lightness: 0.75, chroma: 0.165, hue: 25.36, alpha: 0.2]
                 border: Oklch[lightness: 0.3]
-                border_strong: Oklch[lightness: 0.4]
-
-                -- Background
-                background: Oklch[lightness: 0.08, chroma: 0.005, hue: 220]
             ]
         }
     ]

@@ -6,6 +6,7 @@ This directory contains the TodoMVC implementation with physically-based 3D rend
 
 ### Code
 - **`todo_mvc_physical.bn`** - Main TodoMVC implementation using physically-based 3D UI
+- **`Themes/`** - Complete design system presets (Professional, Neobrutalism, Glassmorphism, Neumorphism)
 
 ### Documentation
 
@@ -62,6 +63,46 @@ The renderer uses internal geometric operations to construct 3D geometry:
 
 **These are implementation details, not user-facing API.**
 
+## Theme System
+
+**Ultra-thin control over the entire visual design.** Change the complete look and feel with one line:
+
+```boon
+-- Select a theme
+theme: Themes/Professional/theme(mode: Light)
+-- or: Themes/Neobrutalism/theme(mode: Dark)
+
+scene: Scene/new(
+    root: root_element(...)
+    lights: theme.lights
+    geometry: theme.geometry
+    materials: theme.materials
+    colors: theme.colors
+)
+```
+
+### Available Themes
+
+- **Professional** - Soft rounded edges, subtle shadows, neutral colors (default)
+- **Neobrutalism** - Sharp chamfered edges, hard shadows, bold saturated colors
+- **Glassmorphism** - Translucent surfaces, high gloss, backdrop blur
+- **Neumorphism** - Very soft edges, monochrome, low contrast
+
+### What Themes Control
+
+Each theme bundles **8 properties** that cascade through the entire scene:
+
+1. **Lights** - Directional/ambient lighting setup
+2. **Geometry** - Edge radius, bevel angles (emergent edge shapes)
+3. **Materials** - Semantic presets (panel, button, input gloss/metal/shine)
+4. **Elevation** - Z-position scale (card, popup, raised, recessed)
+5. **Depth** - Thickness scale (major, standard, subtle)
+6. **Interaction** - Physical behavior (hover lift, press depth, animation speed)
+7. **Corners** - Radius scale (sharp, subtle, standard, round)
+8. **Colors** - Semantic palette with automatic light/dark mode
+
+**See `Themes/` directory for complete theme definitions and documentation.**
+
 ## Design Philosophy
 
 **Keep it Simple:**
@@ -87,6 +128,7 @@ cargo run
 ✅ **User API:** Clean and simple - semantic elements only
 ✅ **Documentation:** Complete guides for users and implementers
 ✅ **Code:** TodoMVC working with automatic 3D geometry
+✅ **Theme System:** 4 complete design presets, fully integrated with demo elements
 ⏳ **Renderer:** Internal `Model/cut()` implementation pending
 
 ## Future Possibilities

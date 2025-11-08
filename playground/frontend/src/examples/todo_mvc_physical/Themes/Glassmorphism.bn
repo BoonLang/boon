@@ -91,75 +91,47 @@ FUNCTION theme(mode) {
         -- Colors: Translucent surfaces, low chroma, heavy use of alpha
         colors: mode |> WHEN {
             Light => [
-                -- Surfaces (translucent whites with blur)
+                background: Oklch[lightness: 0.92, chroma: 0.02, hue: 240]
                 surface: Oklch[lightness: 0.95, chroma: 0.01, hue: 220, alpha: 0.3]
                 surface_variant: Oklch[lightness: 0.92, chroma: 0.01, hue: 220, alpha: 0.4]
                 surface_bright: Oklch[lightness: 0.98, chroma: 0.01, hue: 220, alpha: 0.25]
-                surface_dim: Oklch[lightness: 0.88, chroma: 0.01, hue: 220, alpha: 0.5]
-
-                -- Primary accent (subtle, low chroma)
                 primary: Oklch[lightness: 0.7, chroma: 0.08, hue: 260, alpha: 0.8]
                 primary_glow: Oklch[lightness: 0.8, chroma: 0.1, hue: 260, alpha: 0.6]
                 primary_container: Oklch[lightness: 0.95, chroma: 0.05, hue: 260, alpha: 0.3]
-
-                -- Focus (cool blue, subtle)
                 focus: Oklch[lightness: 0.65, chroma: 0.1, hue: 220, alpha: 0.8]
                 focus_glow: Oklch[lightness: 0.75, chroma: 0.12, hue: 220, alpha: 0.6]
-
-                -- Danger (subtle pink)
                 danger: Oklch[lightness: 0.65, chroma: 0.12, hue: 10, alpha: 0.8]
                 danger_glow: Oklch[lightness: 0.75, chroma: 0.12, hue: 10, alpha: 0.6]
-
-                -- Text (semi-transparent)
-                on_surface: Oklch[lightness: 0.25, chroma: 0.02, hue: 240, alpha: 0.9]
-                on_surface_variant: Oklch[lightness: 0.45, chroma: 0.02, hue: 240, alpha: 0.8]
-                on_surface_disabled: Oklch[lightness: 0.65, chroma: 0.01, hue: 240, alpha: 0.5]
-
-                -- Borders (subtle, translucent)
+                text: Oklch[lightness: 0.25, chroma: 0.02, hue: 240, alpha: 0.9]
+                text_secondary: Oklch[lightness: 0.45, chroma: 0.02, hue: 240, alpha: 0.8]
+                text_disabled: Oklch[lightness: 0.65, chroma: 0.01, hue: 240, alpha: 0.5]
+                text_header: Oklch[lightness: 0.7, chroma: 0.08, hue: 260, alpha: 0.2]
                 border: Oklch[lightness: 0.85, chroma: 0.01, hue: 220, alpha: 0.4]
-                border_strong: Oklch[lightness: 0.75, chroma: 0.02, hue: 220, alpha: 0.6]
-
-                -- Background (light gradient backdrop)
-                background: Oklch[lightness: 0.92, chroma: 0.02, hue: 240]
-
-                -- Special: Backdrop blur setting (not a color but related)
-                backdrop_blur: 10      -- px of blur
             ]
             Dark => [
-                -- Surfaces (translucent darks with blur)
+                background: Oklch[lightness: 0.1, chroma: 0.03, hue: 260]
                 surface: Oklch[lightness: 0.2, chroma: 0.01, hue: 240, alpha: 0.3]
                 surface_variant: Oklch[lightness: 0.25, chroma: 0.01, hue: 240, alpha: 0.4]
                 surface_bright: Oklch[lightness: 0.3, chroma: 0.01, hue: 240, alpha: 0.35]
-                surface_dim: Oklch[lightness: 0.15, chroma: 0.01, hue: 240, alpha: 0.5]
-
-                -- Primary accent (subtle, low chroma)
                 primary: Oklch[lightness: 0.75, chroma: 0.1, hue: 260, alpha: 0.8]
                 primary_glow: Oklch[lightness: 0.85, chroma: 0.12, hue: 260, alpha: 0.6]
                 primary_container: Oklch[lightness: 0.3, chroma: 0.08, hue: 260, alpha: 0.3]
-
-                -- Focus (cool blue, brighter)
                 focus: Oklch[lightness: 0.75, chroma: 0.12, hue: 220, alpha: 0.8]
                 focus_glow: Oklch[lightness: 0.85, chroma: 0.14, hue: 220, alpha: 0.6]
-
-                -- Danger (subtle pink, brighter)
                 danger: Oklch[lightness: 0.75, chroma: 0.14, hue: 10, alpha: 0.8]
                 danger_glow: Oklch[lightness: 0.85, chroma: 0.14, hue: 10, alpha: 0.6]
-
-                -- Text (light, semi-transparent)
-                on_surface: Oklch[lightness: 0.9, chroma: 0.01, hue: 240, alpha: 0.9]
-                on_surface_variant: Oklch[lightness: 0.75, chroma: 0.01, hue: 240, alpha: 0.8]
-                on_surface_disabled: Oklch[lightness: 0.5, chroma: 0.01, hue: 240, alpha: 0.5]
-
-                -- Borders (subtle, translucent)
+                text: Oklch[lightness: 0.9, chroma: 0.01, hue: 240, alpha: 0.9]
+                text_secondary: Oklch[lightness: 0.75, chroma: 0.01, hue: 240, alpha: 0.8]
+                text_disabled: Oklch[lightness: 0.5, chroma: 0.01, hue: 240, alpha: 0.5]
+                text_header: Oklch[lightness: 0.75, chroma: 0.1, hue: 260, alpha: 0.25]
                 border: Oklch[lightness: 0.35, chroma: 0.02, hue: 240, alpha: 0.4]
-                border_strong: Oklch[lightness: 0.45, chroma: 0.03, hue: 240, alpha: 0.6]
-
-                -- Background (dark gradient backdrop)
-                background: Oklch[lightness: 0.1, chroma: 0.03, hue: 260]
-
-                -- Special: Backdrop blur setting
-                backdrop_blur: 12      -- More blur in dark mode
             ]
+        }
+
+        -- Effects: Backdrop blur (glassmorphism specific)
+        backdrop_blur: mode |> WHEN {
+            Light => 10
+            Dark => 12
         }
     ]
 }

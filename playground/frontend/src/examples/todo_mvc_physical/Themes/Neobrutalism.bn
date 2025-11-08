@@ -88,68 +88,40 @@ FUNCTION theme(mode) {
         -- Colors: High contrast, bold primaries, pure blacks/whites
         colors: mode |> WHEN {
             Light => [
-                -- Surfaces (pure white with slight warm tint)
+                background: Oklch[lightness: 0.95, chroma: 0.05, hue: 90]
                 surface: Oklch[lightness: 1.0]
                 surface_variant: Oklch[lightness: 0.98]
                 surface_bright: Oklch[lightness: 1.0]
-                surface_dim: Oklch[lightness: 0.95]
-
-                -- Primary accent (BOLD saturated colors)
-                primary: Oklch[lightness: 0.55, chroma: 0.25, hue: 350]  -- Bold red
+                primary: Oklch[lightness: 0.55, chroma: 0.25, hue: 350]
                 primary_glow: Oklch[lightness: 0.7, chroma: 0.25, hue: 350]
                 primary_container: Oklch[lightness: 1.0]
-
-                -- Focus (bold cyan)
                 focus: Oklch[lightness: 0.5, chroma: 0.2, hue: 200]
                 focus_glow: Oklch[lightness: 0.7, chroma: 0.2, hue: 200]
-
-                -- Danger (bold magenta)
                 danger: Oklch[lightness: 0.5, chroma: 0.25, hue: 330]
                 danger_glow: Oklch[lightness: 0.7, chroma: 0.25, hue: 330]
-
-                -- Text (pure black)
-                on_surface: Oklch[lightness: 0.0]
-                on_surface_variant: Oklch[lightness: 0.25]
-                on_surface_disabled: Oklch[lightness: 0.6]
-
-                -- Borders (thick, pure black)
+                text: Oklch[lightness: 0.0]
+                text_secondary: Oklch[lightness: 0.25]
+                text_disabled: Oklch[lightness: 0.6]
+                text_header: Oklch[lightness: 0.55, chroma: 0.25, hue: 350, alpha: 0.15]
                 border: Oklch[lightness: 0.0]
-                border_strong: Oklch[lightness: 0.0]
-
-                -- Background (bright yellow tint)
-                background: Oklch[lightness: 0.95, chroma: 0.05, hue: 90]
             ]
             Dark => [
-                -- Surfaces (pure black/dark gray)
+                background: Oklch[lightness: 0.05, chroma: 0.03, hue: 280]
                 surface: Oklch[lightness: 0.0]
                 surface_variant: Oklch[lightness: 0.08]
                 surface_bright: Oklch[lightness: 0.12]
-                surface_dim: Oklch[lightness: 0.0]
-
-                -- Primary accent (BOLD neon colors)
-                primary: Oklch[lightness: 0.7, chroma: 0.28, hue: 350]  -- Neon red
+                primary: Oklch[lightness: 0.7, chroma: 0.28, hue: 350]
                 primary_glow: Oklch[lightness: 0.8, chroma: 0.3, hue: 350]
                 primary_container: Oklch[lightness: 0.0]
-
-                -- Focus (neon cyan)
                 focus: Oklch[lightness: 0.75, chroma: 0.25, hue: 200]
                 focus_glow: Oklch[lightness: 0.85, chroma: 0.25, hue: 200]
-
-                -- Danger (neon magenta)
                 danger: Oklch[lightness: 0.75, chroma: 0.28, hue: 330]
                 danger_glow: Oklch[lightness: 0.85, chroma: 0.3, hue: 330]
-
-                -- Text (pure white)
-                on_surface: Oklch[lightness: 1.0]
-                on_surface_variant: Oklch[lightness: 0.8]
-                on_surface_disabled: Oklch[lightness: 0.4]
-
-                -- Borders (thick, pure white or neon)
+                text: Oklch[lightness: 1.0]
+                text_secondary: Oklch[lightness: 0.8]
+                text_disabled: Oklch[lightness: 0.4]
+                text_header: Oklch[lightness: 0.7, chroma: 0.28, hue: 350, alpha: 0.2]
                 border: Oklch[lightness: 1.0]
-                border_strong: Oklch[lightness: 1.0]
-
-                -- Background (dark with purple tint)
-                background: Oklch[lightness: 0.05, chroma: 0.03, hue: 280]
             ]
         }
     ]

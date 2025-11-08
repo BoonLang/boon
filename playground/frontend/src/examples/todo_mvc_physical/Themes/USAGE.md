@@ -50,9 +50,9 @@ Element/button(
 
 ### 3. Complete Theme Application
 
-**Future syntax:**
+**With external theme file:**
 ```boon
--- Create theme
+-- Load theme from Themes/ directory
 theme: Themes/Professional/theme(mode: Light)
 
 scene: Scene/new(
@@ -70,7 +70,7 @@ Element/button(
 )
 ```
 
-**Current workaround (manual expansion):**
+**With inline theme definition:**
 
 Copy the theme configuration directly into `Scene/new`:
 
@@ -145,7 +145,7 @@ scene: Scene/new(
 )
 ```
 
-### At Runtime (future):
+### At Runtime:
 ```boon
 -- User preference
 user_theme: LATEST {

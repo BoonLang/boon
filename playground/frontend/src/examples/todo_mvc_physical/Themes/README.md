@@ -16,7 +16,7 @@ Themes bundle all visual design decisions into reusable configurations. Each the
 ## Usage
 
 ```boon
--- Future syntax:
+-- Select a theme
 theme: Themes/Professional/theme(mode: Light)
 -- or: Themes/Neobrutalism/theme(mode: Dark)
 
