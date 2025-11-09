@@ -1,5 +1,7 @@
 -- Glassmorphism Theme
--- Translucent surfaces, high gloss materials, backdrop blur
+-- Transparent glass-like surfaces with physical refraction
+-- High transparency + medium roughness creates frosted glass effect
+-- Renderer approximates this with backdrop blur for performance
 -- Soft diffuse lighting, subtle colors
 
 FUNCTION theme(mode) {
@@ -28,27 +30,45 @@ FUNCTION theme(mode) {
             bevel_angle: 45
         ]
 
-        -- Materials: High gloss, glossy finishes
+        -- Materials: High gloss, glass-like with transparency
         materials: [
             panel: [
-                gloss: 0.8             -- Very glossy
+                transparency: 1.0      -- Fully transparent
+                refraction: 1.5        -- Glass
+                roughness: 0.3         -- Slight frosting
+                gloss: 0.8
                 metal: 0.0
                 shine: 0.0
             ]
             surface: [
+                transparency: 0.9
+                refraction: 1.5
+                roughness: 0.35
                 gloss: 0.75
             ]
             input_exterior: [
+                transparency: 0.8
+                refraction: 1.5
+                roughness: 0.4
                 gloss: 0.7
             ]
             input_interior: [
-                gloss: 0.85            -- Mirror-like interior
+                transparency: 0.7      -- Less transparent inside
+                refraction: 1.5
+                roughness: 0.2
+                gloss: 0.85
             ]
             button: [
+                transparency: 0.85
+                refraction: 1.5
+                roughness: 0.3
                 gloss: 0.8
                 metal: 0.0
             ]
             button_emphasis: [
+                transparency: 0.8
+                refraction: 1.5
+                roughness: 0.25
                 gloss: 0.85
             ]
         ]
@@ -126,12 +146,6 @@ FUNCTION theme(mode) {
                 text_header: Oklch[lightness: 0.75, chroma: 0.1, hue: 260, alpha: 0.25]
                 border: Oklch[lightness: 0.35, chroma: 0.02, hue: 240, alpha: 0.4]
             ]
-        }
-
-        -- Effects: Backdrop blur (glassmorphism specific)
-        backdrop_blur: mode |> WHEN {
-            Light => 10
-            Dark => 12
         }
     ]
 }

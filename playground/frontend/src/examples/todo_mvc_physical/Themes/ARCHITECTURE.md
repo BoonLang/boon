@@ -9,17 +9,41 @@ The theme system provides **global control over the entire visual design** throu
 The theme system extracts **6 major patterns** discovered in the TodoMVC Physical code:
 
 ### 1. Material Presets
-**Problem**: Gloss values scattered everywhere (0.12, 0.65, 0.25, 0.3, 0.35, 0.4, 0.18)
-**Solution**: Semantic material presets
+**Problem**: Material properties scattered everywhere (gloss, transparency, roughness values)
+**Solution**: Semantic material presets with physical properties
 
 ```boon
 materials: [
-    panel: [gloss: 0.12, metal: 0.02, shine: 0.6]
+    panel: [
+        transparency: 0.0     -- Defaults to opaque (0.0)
+        refraction: 1.0       -- Defaults to no refraction (1.0 = air)
+        roughness: 0.5        -- Surface roughness (affects light scattering)
+        gloss: 0.12           -- Surface glossiness
+        metal: 0.02           -- Metallic property
+        shine: 0.6            -- Clearcoat shine
+    ]
     button: [gloss: 0.3, metal: 0.03]
     input_interior: [gloss: 0.65]
-    -- etc
+    -- Glassmorphism example
+    glass_panel: [
+        transparency: 1.0     -- Fully transparent
+        refraction: 1.5       -- Glass IOR
+        roughness: 0.4        -- Frosted glass effect
+        gloss: 0.8
+    ]
 ]
 ```
+
+**Material Properties:**
+- `transparency: 0.0-1.0` - How much light passes through (0 = opaque, 1 = fully transparent)
+- `refraction: 1.0+` - Index of refraction (1.0 = air, 1.5 = glass, 2.4 = diamond)
+- `roughness: 0.0-1.0` - Surface roughness (high roughness + transparency = frosted glass)
+- `gloss`, `metal`, `shine` - Standard PBR surface properties
+
+**Renderer behavior:**
+- Physical renderers: Use transmission/refraction for accurate light transport
+- UI renderers: Approximate transparency+roughness with backdrop blur for performance
+- Simple renderers: Fall back to alpha transparency
 
 ### 2. Elevation Hierarchy
 **Problem**: Z-positions like 50, 24, 8, 4, -4 with unclear meaning
@@ -140,7 +164,7 @@ Each theme function contains `mode |> WHEN { Light => ..., Dark => ... }` for pr
 
 **Properties that stay the same:**
 - Geometry (edge_radius, bevel_angle)
-- Material properties (gloss, metal, shine - mostly)
+- Material properties (transparency, refraction, roughness, gloss, metal, shine)
 - Elevation scale
 - Depth scale
 - Interaction physics

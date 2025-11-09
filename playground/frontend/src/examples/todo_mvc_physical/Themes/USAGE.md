@@ -48,6 +48,50 @@ Element/button(
 )
 ```
 
+### Material Properties
+
+Themes define physically-based material properties that control how surfaces interact with light:
+
+```boon
+materials: [
+    panel: [
+        transparency: 1.0     -- 0.0 = opaque, 1.0 = fully transparent
+        refraction: 1.5       -- Index of refraction (1.0 = air, 1.5 = glass, 2.4 = diamond)
+        roughness: 0.4        -- Surface roughness (high roughness + transparency = frosted glass)
+        gloss: 0.8            -- Surface glossiness
+        metal: 0.0            -- Metallic property
+        shine: 0.0            -- Clearcoat shine
+    ]
+]
+```
+
+**How it works:**
+- You define materials using physical properties (transparency, refraction, roughness)
+- The renderer decides how to implement these (ray-traced refraction, backdrop blur, etc.)
+- This keeps material definitions portable across different rendering backends
+
+**Examples:**
+```boon
+-- Opaque matte surface (Professional/Neobrutalism/Neumorphism)
+material: [gloss: 0.1, metal: 0.0]  -- transparency/refraction default to 0.0/1.0
+
+-- Frosted glass (Glassmorphism)
+material: [
+    transparency: 1.0      -- Light passes through
+    refraction: 1.5        -- Glass IOR
+    roughness: 0.4         -- Creates frosted effect
+    gloss: 0.8             -- Glossy surface
+]
+
+-- Clear glass
+material: [
+    transparency: 1.0
+    refraction: 1.5
+    roughness: 0.0         -- No frosting = clear
+    gloss: 0.9
+]
+```
+
 ### 3. Complete Theme Application
 
 **With external theme file:**
@@ -104,6 +148,9 @@ scene: Scene/new(
 | **Edge Radius** | 2 | 0 (sharp) | 2 | 4 (soft) |
 | **Bevel Angle** | 45° | 30° (sharp) | 45° | 60° (gentle) |
 | **Shadow Spread** | 1 (soft) | 0 (hard) | 1.5 (very soft) | 2 (very soft) |
+| **Transparency** | 0.0 (opaque) | 0.0 (opaque) | 0.7-1.0 (glass) | 0.0 (opaque) |
+| **Refraction** | 1.0 (none) | 1.0 (none) | 1.5 (glass) | 1.0 (none) |
+| **Roughness** | - | - | 0.2-0.4 (frosted) | - |
 | **Gloss Range** | 0.12-0.65 | 0.05-0.15 (matte) | 0.7-0.85 (glossy) | 0.2-0.3 (low) |
 | **Elevation** | Moderate | Dramatic | Moderate | Subtle |
 | **Depth** | Standard | Chunky | Thin | Standard |
