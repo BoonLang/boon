@@ -186,6 +186,190 @@ FUNCTION material(material) {
     }
 }
 
+FUNCTION font(font) {
+    BLOCK {
+        colors: PASSED.mode |> WHEN {
+            Light => [
+                text: Oklch[lightness: 0.42]
+                text_secondary: Oklch[lightness: 0.57]
+                text_disabled: Oklch[lightness: 0.75]
+                text_header: Oklch[lightness: 0.54, chroma: 0.156, hue: 21.24]
+                danger: Oklch[lightness: 0.6, chroma: 0.109, hue: 18.87]
+            ]
+            Dark => [
+                text: Oklch[lightness: 0.9]
+                text_secondary: Oklch[lightness: 0.75]
+                text_disabled: Oklch[lightness: 0.5]
+                text_header: Oklch[lightness: 0.75, chroma: 0.165, hue: 25.36]
+                danger: Oklch[lightness: 0.7, chroma: 0.12, hue: 18.87]
+            ]
+        }
+
+        font |> WHEN {
+            -- Simple fonts (no state)
+            Body => [
+                size: 14
+                color: colors.text
+                weight: Light
+                family: LIST { 'Helvetica Neue', 'Helvetica', 'Arial', SansSerif }
+            ]
+
+            Header => [
+                size: 100
+                color: colors.text_header
+                weight: Hairline
+            ]
+
+            Input => [
+                size: 24
+                color: colors.text
+            ]
+
+            Placeholder => [
+                size: 24
+                style: Italic
+                color: colors.text_secondary
+            ]
+
+            Button => [
+                size: 24
+                color: colors.text
+            ]
+
+            ButtonDelete => [
+                size: 30
+                align: Center
+                color: colors.danger
+            ]
+
+            Secondary => [
+                color: colors.text_secondary
+            ]
+
+            Small => [
+                size: 10
+                align: Center
+                color: colors.text_secondary
+            ]
+
+            -- Fonts with state
+            ButtonIcon[checked] => [
+                size: 22
+                color: checked |> WHEN {
+                    True => colors.text
+                    False => colors.text_disabled
+                }
+            ]
+
+            TodoTitle[completed] => [
+                size: 24
+                line: [strike: completed]
+                color: completed |> WHEN {
+                    True => colors.text_disabled
+                    False => colors.text
+                }
+            ]
+
+            ClearButton[hover] => [
+                color: colors.text_secondary
+                line: [underline: hover]
+            ]
+        }
+    }
+}
+
+FUNCTION border(border) {
+    border |> WHEN {
+        BorderStandard => [
+            top: [
+                color: PASSED.mode |> WHEN {
+                    Light => Oklch[lightness: 0.92]
+                    Dark => Oklch[lightness: 0.3]
+                }
+            ]
+        ]
+
+        BorderFocus => [
+            width: 2
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.68, chroma: 0.08, hue: 220]
+                Dark => Oklch[lightness: 0.75, chroma: 0.1, hue: 220]
+            }
+            glow: [
+                color: PASSED.mode |> WHEN {
+                    Light => Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
+                    Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 220]
+                }
+                intensity: 0.2
+            ]
+        ]
+
+        OutlinePrimary => [
+            width: 1
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.7, chroma: 0.165, hue: 25.36]
+                Dark => Oklch[lightness: 0.75, chroma: 0.165, hue: 25.36]
+            }
+        ]
+    }
+}
+
+FUNCTION depth() {
+    [
+        major: 8
+        standard: 6
+        subtle: 2
+        emphasis: 10
+    ]
+}
+
+FUNCTION elevation() {
+    [
+        card: 50
+        popup: 24
+        floating: 8
+        raised: 4
+        grounded: 0
+        recessed: -4
+    ]
+}
+
+FUNCTION corners() {
+    [
+        sharp: 0
+        subtle: 2
+        standard: 4
+        round: 6
+        full: Fully
+    ]
+}
+
+FUNCTION lights(mode) {
+    LIST {
+        Light/directional(
+            azimuth: 30
+            altitude: 45
+            spread: 1
+            intensity: 1.2
+            color: Oklch[lightness: 0.98, chroma: 0.015, hue: 65]
+        )
+        Light/ambient(
+            intensity: 0.4
+            color: mode |> WHEN {
+                Light => Oklch[lightness: 0.8, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.3, chroma: 0.01, hue: 220]
+            }
+        )
+    }
+}
+
+FUNCTION geometry() {
+    [
+        edge_radius: 2
+        bevel_angle: 45
+    ]
+}
+
 FUNCTION theme(mode) {
     [
         -- Lighting: Neutral warm from upper-right, soft ambient fill

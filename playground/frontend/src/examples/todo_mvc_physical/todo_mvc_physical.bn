@@ -1,11 +1,12 @@
 -- TodoMVC with Emergent Physical Geometry + Theme System
 --
 -- GEOMETRY: Elements positioned in 3D space, bevels/shadows emerge naturally
--- THEME: Professional preset (inline). See Themes/ for Neobrutalism, Glassmorphism, Neumorphism
--- DEMO: Main panel, text input, and buttons use theme values for consistency
+-- THEME: Professional preset. See Themes/ for Neobrutalism, Glassmorphism, Neumorphism
+-- DEMO: Consistent theme API - materials, fonts, borders use tagged functions
 --
--- Theme controls: lights, geometry, materials, elevation, depth, interaction, corners, colors
--- Switch themes: theme: Themes/Neobrutalism/theme(mode: Dark)
+-- Theme provides: materials, fonts, borders, lights, geometry, depth, elevation, corners
+-- Switch theme: Change theme_options.name (Professional, Neobrutalism, Glassmorphism, Neumorphism)
+-- Switch mode: Change theme_options.mode (Light, Dark)
 
 ------------------------------------------------------------------------
 -- STORE AND STATE
@@ -124,102 +125,29 @@ FUNCTION new_todo(title) {
 ------------------------------------------------------------------------
 -- THEME - Professional design preset
 ------------------------------------------------------------------------
--- Inline theme definition. See Themes/ directory for other presets:
--- Neobrutalism, Glassmorphism, Neumorphism
--- To use external: theme: Themes/Professional/theme(mode: Light)
+-- Theme functions (materials, fonts, borders) in Themes/Professional.bn
+-- Structural properties (depth, elevation, corners, lights, geometry) also from theme
+-- To switch themes: Change theme_options.name to Neobrutalism, Glassmorphism, or Neumorphism
+-- To switch mode: Change theme_options.mode to Dark
 
-theme: [
-    lights: LIST {
-        Light/directional(
-            azimuth: 30
-            altitude: 45
-            spread: 1
-            intensity: 1.2
-            color: Oklch[lightness: 0.98, chroma: 0.015, hue: 65]
-        )
-        Light/ambient(
-            intensity: 0.4
-            color: Oklch[lightness: 0.8, chroma: 0.01, hue: 220]
-        )
-    }
-    geometry: [
-        edge_radius: 2
-        bevel_angle: 45
-    ]
-    materials: [
-        background: [color: Oklch[lightness: 0.96, chroma: 0.01, hue: 220]]
-        panel: [color: Oklch[lightness: 1], gloss: 0.12, metal: 0.02, shine: 0.6]
-        surface: [color: Oklch[lightness: 1], gloss: 0.25]
-        surface_variant: [color: Oklch[lightness: 0.985], gloss: 0.25]
-        surface_bright: [color: Oklch[lightness: 0.99], gloss: 0.25]
-        input_exterior: [color: Oklch[lightness: 0.985], gloss: 0.18]
-        input_interior: [color: Oklch[lightness: 1], gloss: 0.65]
-        button: [color: Oklch[lightness: 0.985], gloss: 0.3, metal: 0.03]
-        button_emphasis: [color: Oklch[lightness: 0.7, chroma: 0.165, hue: 25.36], gloss: 0.35]
-        primary: [color: Oklch[lightness: 0.7, chroma: 0.165, hue: 25.36]]
-        primary_container: [color: Oklch[lightness: 0.98, chroma: 0.01, hue: 25.36]]
-
-        -- Additional interactive materials
-        toggle_checkbox: [color: Oklch[lightness: 0.985], gloss: 0.3, metal: 0.05]
-        todo_checkbox: [color: Oklch[lightness: 0.985], gloss: 0.25, metal: 0.03]
-        input_focused: [color: Oklch[lightness: 1], gloss: 0.15, glow: [color: Oklch[lightness: 0.7, chroma: 0.1, hue: 220], intensity: 0.15]]
-        button_delete: [color: Oklch[lightness: 0.99], gloss: 0.35, glow: [color: Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87], intensity: 0]]
-        button_delete_hovered: [color: Oklch[lightness: 0.99], gloss: 0.35, glow: [color: Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87], intensity: 0.08]]
-        panel_footer: [color: Oklch[lightness: 0.99], gloss: 0.4]
-        button_filter_selected: [color: Oklch[lightness: 0.98, chroma: 0.01, hue: 25.36], gloss: 0.2, metal: 0.03, glow: [color: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36], intensity: 0.05]]
-        button_filter_unselected: [color: Oklch[lightness: 0.985], gloss: 0.35, metal: 0.03]
-        button_clear: [color: Oklch[lightness: 0.99], gloss: 0.4]
-    ]
-    elevation: [
-        card: 50
-        popup: 24
-        floating: 8
-        raised: 4
-        grounded: 0
-        recessed: -4
-    ]
-    depth: [
-        major: 8
-        standard: 6
-        subtle: 2
-        emphasis: 10
-    ]
-    interaction: [
-        hover_lift: 2
-        press_depth: 4
-        emphasis_lift: 4
-        transition_ms: 150
-    ]
-    corners: [
-        sharp: 0
-        subtle: 2
-        standard: 4
-        round: 6
-        full: Fully
-    ]
-    colors: [
-        primary_glow: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
-        focus: Oklch[lightness: 0.68, chroma: 0.08, hue: 220]
-        focus_glow: Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
-        danger: Oklch[lightness: 0.6, chroma: 0.109, hue: 18.87]
-        danger_glow: Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87]
-        text: Oklch[lightness: 0.42]
-        text_secondary: Oklch[lightness: 0.57]
-        text_disabled: Oklch[lightness: 0.75]
-        text_header: Oklch[lightness: 0.54, chroma: 0.156, hue: 21.24]
-        border: Oklch[lightness: 0.92]
-    ]
+theme_options: [
+    name: Professional
+    mode: Light
 ]
 
 ------------------------------------------------------------------------
 -- SCENE - Physical 3D with theme
 ------------------------------------------------------------------------
 
-scene: Scene/new(
-    root: root_element(PASS: [store: store, theme: theme])
-    lights: theme.lights
-    geometry: theme.geometry
-)
+scene: create_scene(PASS: [store: store, theme_options: theme_options])
+
+FUNCTION create_scene() {
+    Scene/new(
+        root: root_element()
+        lights: Themes/lights()
+        geometry: Themes/geometry()
+    )
+}
 
 ------------------------------------------------------------------------
 -- ROOT ELEMENT - Background plane
@@ -233,12 +161,6 @@ FUNCTION root_element() {
         style: [
             width: Fill
             height: [sizing: Fill, minimum: Screen]
-            font: [
-                size: 14
-                color: PASSED.theme.colors.text
-                weight: Light
-                family: LIST { 'Helvetica Neue', 'Helvetica', 'Arial', SansSerif }
-            ]
             material: Background |> Themes/material()
         ]
         items: LIST { content_element() }
@@ -282,13 +204,12 @@ FUNCTION header() {
             padding: [top: 10]
             align: [row: Center]
             height: 130
-            font: [
-                size: 100
-                color: PASSED.theme.colors.text_header
-                weight: Hairline
-            ]
         ]
-        child: Element/text(element: [tag: H1], style: [], text: 'todos')
+        child: Element/text(
+            element: [tag: H1]
+            style: [font: Header |> Themes/font()]
+            text: 'todos'
+        )
     )
 }
 
@@ -303,9 +224,9 @@ FUNCTION main_panel() {
         gap: 0
         style: [
             width: Fill
-            depth: PASSED.theme.depth.major
-            transform: [move_closer: PASSED.theme.elevation.card]
-            rounded_corners: PASSED.theme.corners.standard
+            depth: Themes/depth().major
+            transform: [move_closer: Themes/elevation().card]
+            rounded_corners: Themes/corners().standard
             material: Panel |> Themes/material()
         ]
         items: LIST {
@@ -344,10 +265,10 @@ FUNCTION new_todo_title_text_input() {
         ]
         style: [
             padding: [column: 19, left: 60, right: 16]
-            font: [size: 24, color: PASSED.theme.colors.text]
-            depth: PASSED.theme.depth.standard
-            transform: [move_further: PASSED.theme.elevation.recessed]
-            rounded_corners: PASSED.theme.corners.subtle
+            font: Input |> Themes/font()
+            depth: Themes/depth().standard
+            transform: [move_further: Themes/elevation().recessed]
+            rounded_corners: Themes/corners().subtle
             material: InputInterior[focus: element.focused] |> Themes/material()
         ]
         label: Hidden[text: 'What needs to be done?']
@@ -357,7 +278,7 @@ FUNCTION new_todo_title_text_input() {
             PASSED.store.title_to_save |> THEN { '' }
         }
         placeholder: [
-            style: [font: [style: Italic, color: PASSED.theme.colors.text_secondary]]
+            style: [font: Placeholder |> Themes/font()]
             text: 'What needs to be done?'
         ]
         focus: True
@@ -380,7 +301,7 @@ FUNCTION todos_element() {
         direction: Column
         gap: 0
         style: [
-            borders: [top: [color: PASSED.theme.colors.border]]
+            borders: BorderStandard |> Themes/border()
             material: SurfaceVariant |> Themes/material()
         ]
         items: PASSED.store.todos
@@ -407,7 +328,6 @@ FUNCTION todo_element(todo) {
             depth: 2
             transform: [move_closer: 4]
             material: InputExterior[hover: False] |> Themes/material()
-            font: [size: 24]
         ]
         items: PASSED.store.selected_todo_id = todo.id |> WHILE {
             True => LIST {
@@ -458,13 +378,7 @@ FUNCTION toggle_all_checkbox() {
                 style: [
                     height: 34
                     padding: [row: 27, column: 6]
-                    font: [
-                        size: 22
-                        color: checked |> WHEN {
-                            True => PASSED.theme.colors.text
-                            False => PASSED.theme.colors.text_disabled
-                        }
-                    ]
+                    font: ButtonIcon[checked: checked] |> Themes/font()
                     transform: [rotate: 90, move_up: 18]
                 ]
                 text: '>'
@@ -490,19 +404,12 @@ FUNCTION editing_todo_title_element(todo) {
             width: 506
             padding: [row: 17, top: 17, bottom: 16]
             align: Right
-            font: [color: PASSED.theme.colors.text]
+            font: Input |> Themes/font()
             depth: 6
             rounded_corners: 2
             transform: [move_closer: 24]
             material: InputInterior[focus: True] |> Themes/material()
-            borders: [
-                width: 2
-                color: PASSED.theme.colors.focus
-                glow: [
-                    color: PASSED.theme.colors.focus_glow
-                    intensity: 0.2
-                ]
-            ]
+            borders: BorderFocus |> Themes/border()
         ]
         label: Hidden[text: 'selected todo title']
         text: todo.edited_title
@@ -573,14 +480,7 @@ FUNCTION todo_title_element(todo) {
         ]
         style: [
             width: Fill
-            font: [
-                size: 24
-                line: [strike: todo.completed]
-                color: todo.completed |> WHEN {
-                    True => PASSED.theme.colors.text_disabled
-                    False => PASSED.theme.colors.text
-                }
-            ]
+            font: TodoTitle[completed: todo.completed] |> Themes/font()
             padding: [column: 15, left: 15, right: 60]
             clip: Row
         ]
@@ -609,11 +509,7 @@ FUNCTION remove_todo_button() {
                 LIST { False, False } => [move_closer: 8, move_left: 50, move_down: 14]
             }
             material: ButtonDelete[hover: element.hovered] |> Themes/material()
-            font: [
-                size: 30
-                align: Center
-                color: PASSED.theme.colors.danger
-            ]
+            font: ButtonDelete |> Themes/font()
         ]
         label: '×'
     )
@@ -630,12 +526,11 @@ FUNCTION panel_footer() {
         gap: 0
         style: [
             padding: [row: 15, column: 8]
-            font: [color: PASSED.theme.colors.text_secondary]
             material: PanelFooter |> Themes/material()
-            borders: [top: [color: PASSED.theme.colors.border]]
+            borders: BorderStandard |> Themes/border()
         ]
         items: LIST {
-            active_items_count_text
+            active_items_count_text()
             filters_element
             PASSED.store.todos |> List/any(item, if: item.completed) |> WHILE {
                 True => remove_completed_button()
@@ -655,13 +550,17 @@ FUNCTION panel_footer() {
 ------------------------------------------------------------------------
 
 FUNCTION active_items_count_text() {
-    PASSED.store.todos
-        |> List/retain(item, if: item.completed |> Bool/not())
-        |> List/count
-        |> WHEN { count => BLOCK {
-            maybe_s: count > 1 |> WHEN { True => 's', False => '' }
-            '{count} item{maybe_s} left'
-        }}
+    Element/text(
+        element: []
+        style: [font: Secondary |> Themes/font()]
+        text: PASSED.store.todos
+            |> List/retain(item, if: item.completed |> Bool/not())
+            |> List/count
+            |> WHEN { count => BLOCK {
+                maybe_s: count > 1 |> WHEN { True => 's', False => '' }
+                '{count} item{maybe_s} left'
+            }}
+    )
 }
 
 ------------------------------------------------------------------------
@@ -697,20 +596,18 @@ FUNCTION filter_button(filter) {
             ]
             style: [
                 padding: [row: 8, column: 4]
-                depth: PASSED.theme.depth.standard
-                rounded_corners: PASSED.theme.corners.round
+                depth: Themes/depth().standard
+                rounded_corners: Themes/corners().round
                 transform: LIST { selected, element.hovered, element.pressed } |> WHEN {
                     LIST { __, __, True } => []
-                    LIST { True, __, False } => [move_closer: PASSED.theme.elevation.raised |> Num/add(PASSED.theme.interaction.hover_lift)]
-                    LIST { False, True, False } => [move_closer: PASSED.theme.elevation.raised]
+                    LIST { True, __, False } => [move_closer: 6]  -- raised + hover_lift
+                    LIST { False, True, False } => [move_closer: 4]
                     LIST { False, False, False } => []
                 }
                 material: ButtonFilter[selected: selected, hover: element.hovered] |> Themes/material()
+                font: Secondary |> Themes/font()
                 outline: selected |> WHEN {
-                    True => [
-                        width: 1
-                        color: PASSED.theme.materials.primary.color
-                    ]
+                    True => OutlinePrimary |> Themes/border()
                     False => NoOutline
                 }
             ]
@@ -745,10 +642,7 @@ FUNCTION remove_completed_button() {
                 LIST { False, False } => []              -- Resting flat
             }
             material: ButtonClear[hover: element.hovered] |> Themes/material()
-            font: [
-                line: [underline: element.hovered]
-                color: PASSED.theme.colors.text_secondary
-            ]
+            font: ClearButton[hover: element.hovered] |> Themes/font()
         ]
         label: 'Clear completed'
     )
@@ -763,18 +657,16 @@ FUNCTION footer() {
         element: [tag: Footer]
         direction: Column
         gap: 9
-        style: [
-            font: [size: 10, align: Center, color: PASSED.theme.colors.text_secondary]
-        ]
+        style: []
         items: LIST {
             Element/paragraph(
                 element: []
-                style: []
+                style: [font: Small |> Themes/font()]
                 contents: LIST { 'Double-click to edit a todo' }
             )
             Element/paragraph(
                 element: []
-                style: []
+                style: [font: Small |> Themes/font()]
                 contents: LIST {
                     'Created by '
                     footer_link(
@@ -785,7 +677,7 @@ FUNCTION footer() {
             )
             Element/paragraph(
                 element: []
-                style: []
+                style: [font: Small |> Themes/font()]
                 contents: LIST {
                     'Part of '
                     footer_link(label: 'TodoMVC', to: 'http://todomvc.com')
