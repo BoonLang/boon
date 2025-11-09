@@ -2,6 +2,193 @@
 -- Sharp chamfered edges, hard shadows, flat materials
 -- High contrast lighting, bold colors, thick borders
 
+FUNCTION material(material) {
+    material |> WHEN {
+        -- Simple materials (no state)
+        Background => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.95, chroma: 0.05, hue: 90]
+                Dark => Oklch[lightness: 0.05, chroma: 0.03, hue: 280]
+            }
+        ]
+
+        Panel => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 1.0]
+                Dark => Oklch[lightness: 0.0]
+            }
+            gloss: 0.05
+            metal: 0.0
+            shine: 0.0
+        ]
+
+        Surface => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 1.0]
+                Dark => Oklch[lightness: 0.0]
+            }
+            gloss: 0.08
+        ]
+
+        SurfaceVariant => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.98]
+                Dark => Oklch[lightness: 0.08]
+            }
+            gloss: 0.08
+        ]
+
+        SurfaceBright => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 1.0]
+                Dark => Oklch[lightness: 0.12]
+            }
+            gloss: 0.08
+        ]
+
+        Primary => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.55, chroma: 0.25, hue: 350]
+                Dark => Oklch[lightness: 0.7, chroma: 0.28, hue: 350]
+            }
+        ]
+
+        PrimaryContainer => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 1.0]
+                Dark => Oklch[lightness: 0.0]
+            }
+        ]
+
+        PanelFooter => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 1.0]
+                Dark => Oklch[lightness: 0.12]
+            }
+            gloss: 0.12
+        ]
+
+        -- Interactive materials (with state)
+        InputExterior[hover] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.98]
+                Dark => Oklch[lightness: 0.08]
+            }
+            gloss: 0.1
+        ]
+
+        InputInterior[focus] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 1.0]
+                Dark => Oklch[lightness: 0.0]
+            }
+            gloss: focus |> WHEN {
+                False => 0.15
+                True => 0.08
+            }
+            glow: focus |> WHEN {
+                True => [
+                    color: PASSED.mode |> WHEN {
+                        Light => Oklch[lightness: 0.7, chroma: 0.2, hue: 200]
+                        Dark => Oklch[lightness: 0.85, chroma: 0.25, hue: 200]
+                    }
+                    intensity: 0.15
+                ]
+                False => None
+            }
+        ]
+
+        Button[hover, press] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.98]
+                Dark => Oklch[lightness: 0.08]
+            }
+            gloss: 0.12
+            metal: 0.0
+        ]
+
+        ButtonEmphasis[hover, press] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.55, chroma: 0.25, hue: 350]
+                Dark => Oklch[lightness: 0.7, chroma: 0.28, hue: 350]
+            }
+            gloss: 0.15
+        ]
+
+        ButtonDelete[hover] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 1.0]
+                Dark => Oklch[lightness: 0.12]
+            }
+            gloss: 0.15
+            glow: hover |> WHEN {
+                True => [
+                    color: PASSED.mode |> WHEN {
+                        Light => Oklch[lightness: 0.7, chroma: 0.25, hue: 330]
+                        Dark => Oklch[lightness: 0.85, chroma: 0.3, hue: 330]
+                    }
+                    intensity: 0.08
+                ]
+                False => None
+            }
+        ]
+
+        ButtonClear[hover] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 1.0]
+                Dark => Oklch[lightness: 0.12]
+            }
+            gloss: 0.12
+        ]
+
+        ButtonFilter[selected, hover] => [
+            color: PASSED.mode |> WHEN {
+                Light => selected |> WHEN {
+                    False => Oklch[lightness: 0.98]
+                    True => Oklch[lightness: 1.0]
+                }
+                Dark => selected |> WHEN {
+                    False => Oklch[lightness: 0.08]
+                    True => Oklch[lightness: 0.0]
+                }
+            }
+            gloss: selected |> WHEN {
+                False => 0.15
+                True => 0.1
+            }
+            metal: 0.03
+            glow: selected |> WHEN {
+                True => [
+                    color: PASSED.mode |> WHEN {
+                        Light => Oklch[lightness: 0.7, chroma: 0.25, hue: 350]
+                        Dark => Oklch[lightness: 0.8, chroma: 0.3, hue: 350]
+                    }
+                    intensity: 0.05
+                ]
+                False => None
+            }
+        ]
+
+        ToggleCheckbox[checked, hover] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.98]
+                Dark => Oklch[lightness: 0.08]
+            }
+            gloss: 0.15
+            metal: 0.05
+        ]
+
+        TodoCheckbox[checked, hover] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.98]
+                Dark => Oklch[lightness: 0.08]
+            }
+            gloss: 0.12
+            metal: 0.03
+        ]
+    }
+}
+
 FUNCTION theme(mode) {
     [
         -- Lighting: Hard directional from right, minimal ambient
@@ -23,31 +210,6 @@ FUNCTION theme(mode) {
         geometry: [
             edge_radius: 0         -- CHAMFERED (no rounding)
             bevel_angle: 30        -- Aggressive sharp bevels
-        ]
-
-        -- Materials: Flat matte surfaces, no fancy finishes
-        materials: [
-            panel: [
-                gloss: 0.05        -- Very matte
-                metal: 0.0
-                shine: 0.0         -- No clearcoat
-            ]
-            surface: [
-                gloss: 0.08
-            ]
-            input_exterior: [
-                gloss: 0.1
-            ]
-            input_interior: [
-                gloss: 0.15        -- Slightly less matte inside
-            ]
-            button: [
-                gloss: 0.12
-                metal: 0.0
-            ]
-            button_emphasis: [
-                gloss: 0.15
-            ]
         ]
 
         -- Elevation: Dramatic height differences
@@ -85,16 +247,10 @@ FUNCTION theme(mode) {
             full: Fully
         ]
 
-        -- Colors: High contrast, bold primaries, pure blacks/whites
+        -- Colors: Text, borders, and glow effects (surfaces are in materials)
         colors: mode |> WHEN {
             Light => [
-                background: Oklch[lightness: 0.95, chroma: 0.05, hue: 90]
-                surface: Oklch[lightness: 1.0]
-                surface_variant: Oklch[lightness: 0.98]
-                surface_bright: Oklch[lightness: 1.0]
-                primary: Oklch[lightness: 0.55, chroma: 0.25, hue: 350]
                 primary_glow: Oklch[lightness: 0.7, chroma: 0.25, hue: 350]
-                primary_container: Oklch[lightness: 1.0]
                 focus: Oklch[lightness: 0.5, chroma: 0.2, hue: 200]
                 focus_glow: Oklch[lightness: 0.7, chroma: 0.2, hue: 200]
                 danger: Oklch[lightness: 0.5, chroma: 0.25, hue: 330]
@@ -102,17 +258,11 @@ FUNCTION theme(mode) {
                 text: Oklch[lightness: 0.0]
                 text_secondary: Oklch[lightness: 0.25]
                 text_disabled: Oklch[lightness: 0.6]
-                text_header: Oklch[lightness: 0.55, chroma: 0.25, hue: 350, alpha: 0.15]
+                text_header: Oklch[lightness: 0.55, chroma: 0.25, hue: 350]
                 border: Oklch[lightness: 0.0]
             ]
             Dark => [
-                background: Oklch[lightness: 0.05, chroma: 0.03, hue: 280]
-                surface: Oklch[lightness: 0.0]
-                surface_variant: Oklch[lightness: 0.08]
-                surface_bright: Oklch[lightness: 0.12]
-                primary: Oklch[lightness: 0.7, chroma: 0.28, hue: 350]
                 primary_glow: Oklch[lightness: 0.8, chroma: 0.3, hue: 350]
-                primary_container: Oklch[lightness: 0.0]
                 focus: Oklch[lightness: 0.75, chroma: 0.25, hue: 200]
                 focus_glow: Oklch[lightness: 0.85, chroma: 0.25, hue: 200]
                 danger: Oklch[lightness: 0.75, chroma: 0.28, hue: 330]
@@ -120,7 +270,7 @@ FUNCTION theme(mode) {
                 text: Oklch[lightness: 1.0]
                 text_secondary: Oklch[lightness: 0.8]
                 text_disabled: Oklch[lightness: 0.4]
-                text_header: Oklch[lightness: 0.7, chroma: 0.28, hue: 350, alpha: 0.2]
+                text_header: Oklch[lightness: 0.7, chroma: 0.28, hue: 350]
                 border: Oklch[lightness: 1.0]
             ]
         }

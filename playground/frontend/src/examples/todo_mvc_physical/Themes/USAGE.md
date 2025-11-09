@@ -57,8 +57,7 @@ materials: [
     panel: [
         transparency: 1.0     -- 0.0 = opaque, 1.0 = fully transparent
         refraction: 1.5       -- Index of refraction (1.0 = air, 1.5 = glass, 2.4 = diamond)
-        roughness: 0.4        -- Surface roughness (high roughness + transparency = frosted glass)
-        gloss: 0.8            -- Surface glossiness
+        gloss: 0.6            -- Surface glossiness (0 = rough/matte, 1 = mirror-smooth)
         metal: 0.0            -- Metallic property
         shine: 0.0            -- Clearcoat shine
     ]
@@ -66,8 +65,9 @@ materials: [
 ```
 
 **How it works:**
-- You define materials using physical properties (transparency, refraction, roughness)
+- You define materials using physical properties (transparency, refraction, gloss)
 - The renderer decides how to implement these (ray-traced refraction, backdrop blur, etc.)
+- Gloss controls surface smoothness: low gloss = rough (roughness = 1.0 - gloss)
 - This keeps material definitions portable across different rendering backends
 
 **Examples:**
@@ -79,16 +79,14 @@ material: [gloss: 0.1, metal: 0.0]  -- transparency/refraction default to 0.0/1.
 material: [
     transparency: 1.0      -- Light passes through
     refraction: 1.5        -- Glass IOR
-    roughness: 0.4         -- Creates frosted effect
-    gloss: 0.8             -- Glossy surface
+    gloss: 0.6             -- Lower gloss = frosted effect (roughness = 0.4)
 ]
 
 -- Clear glass
 material: [
     transparency: 1.0
     refraction: 1.5
-    roughness: 0.0         -- No frosting = clear
-    gloss: 0.9
+    gloss: 0.9             -- High gloss = clear, smooth surface
 ]
 ```
 
@@ -150,8 +148,7 @@ scene: Scene/new(
 | **Shadow Spread** | 1 (soft) | 0 (hard) | 1.5 (very soft) | 2 (very soft) |
 | **Transparency** | 0.0 (opaque) | 0.0 (opaque) | 0.7-1.0 (glass) | 0.0 (opaque) |
 | **Refraction** | 1.0 (none) | 1.0 (none) | 1.5 (glass) | 1.0 (none) |
-| **Roughness** | - | - | 0.2-0.4 (frosted) | - |
-| **Gloss Range** | 0.12-0.65 | 0.05-0.15 (matte) | 0.7-0.85 (glossy) | 0.2-0.3 (low) |
+| **Gloss Range** | 0.12-0.65 | 0.05-0.15 (matte) | 0.6-0.8 (frosted glass) | 0.2-0.3 (low) |
 | **Elevation** | Moderate | Dramatic | Moderate | Subtle |
 | **Depth** | Standard | Chunky | Thin | Standard |
 | **Interaction** | Subtle (150ms) | Snappy (100ms) | Smooth (200ms) | Gentle (200ms) |

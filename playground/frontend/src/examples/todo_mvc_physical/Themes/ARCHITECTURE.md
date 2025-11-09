@@ -9,7 +9,7 @@ The theme system provides **global control over the entire visual design** throu
 The theme system extracts **6 major patterns** discovered in the TodoMVC Physical code:
 
 ### 1. Material Presets
-**Problem**: Material properties scattered everywhere (gloss, transparency, roughness values)
+**Problem**: Material properties scattered everywhere (gloss, transparency values)
 **Solution**: Semantic material presets with physical properties
 
 ```boon
@@ -17,8 +17,7 @@ materials: [
     panel: [
         transparency: 0.0     -- Defaults to opaque (0.0)
         refraction: 1.0       -- Defaults to no refraction (1.0 = air)
-        roughness: 0.5        -- Surface roughness (affects light scattering)
-        gloss: 0.12           -- Surface glossiness
+        gloss: 0.12           -- Surface glossiness (low gloss = rough/matte)
         metal: 0.02           -- Metallic property
         shine: 0.6            -- Clearcoat shine
     ]
@@ -28,8 +27,7 @@ materials: [
     glass_panel: [
         transparency: 1.0     -- Fully transparent
         refraction: 1.5       -- Glass IOR
-        roughness: 0.4        -- Frosted glass effect
-        gloss: 0.8
+        gloss: 0.6            -- Lower gloss = frosted glass effect
     ]
 ]
 ```
@@ -37,13 +35,14 @@ materials: [
 **Material Properties:**
 - `transparency: 0.0-1.0` - How much light passes through (0 = opaque, 1 = fully transparent)
 - `refraction: 1.0+` - Index of refraction (1.0 = air, 1.5 = glass, 2.4 = diamond)
-- `roughness: 0.0-1.0` - Surface roughness (high roughness + transparency = frosted glass)
-- `gloss`, `metal`, `shine` - Standard PBR surface properties
+- `gloss: 0.0-1.0` - Surface glossiness (0 = matte/rough, 1 = mirror-smooth). When combined with transparency, lower gloss creates frosted glass effect.
+- `metal: 0.0-1.0` - Metallic property
+- `shine: 0.0-1.0` - Clearcoat shine
 
 **Renderer behavior:**
-- Physical renderers: Use transmission/refraction for accurate light transport
-- UI renderers: Approximate transparency+roughness with backdrop blur for performance
-- Simple renderers: Fall back to alpha transparency
+- Physical renderers: Use transparency+refraction for accurate light transport. Gloss controls surface roughness (roughness = 1.0 - gloss).
+- UI renderers: Approximate transparency+low gloss with backdrop blur for performance
+- Simple renderers: Fall back to simple alpha blending
 
 ### 2. Elevation Hierarchy
 **Problem**: Z-positions like 50, 24, 8, 4, -4 with unclear meaning
@@ -164,7 +163,7 @@ Each theme function contains `mode |> WHEN { Light => ..., Dark => ... }` for pr
 
 **Properties that stay the same:**
 - Geometry (edge_radius, bevel_angle)
-- Material properties (transparency, refraction, roughness, gloss, metal, shine)
+- Material properties (transparency, refraction, gloss, metal, shine)
 - Elevation scale
 - Depth scale
 - Interaction physics

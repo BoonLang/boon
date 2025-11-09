@@ -1,0 +1,16 @@
+-- Material Router
+-- Routes material requests to the appropriate theme's material function
+-- based on PASSED.theme_name and PASSED.mode
+--
+-- Usage:
+--   Simple materials (no state): Background |> Themes/material()
+--   Interactive materials: ButtonDelete[hover: element.hovered] |> Themes/material()
+
+FUNCTION material(material) {
+    PASSED.theme_name |> WHEN {
+        Professional => material |> Professional/material()
+        Glassmorphism => material |> Glassmorphism/material()
+        Neobrutalism => material |> Neobrutalism/material()
+        Neumorphism => material |> Neumorphism/material()
+    }
+}

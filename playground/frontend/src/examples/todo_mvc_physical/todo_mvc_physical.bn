@@ -147,12 +147,28 @@ theme: [
         bevel_angle: 45
     ]
     materials: [
-        panel: [gloss: 0.12, metal: 0.02, shine: 0.6]
-        surface: [gloss: 0.25]
-        input_exterior: [gloss: 0.18]
-        input_interior: [gloss: 0.65]
-        button: [gloss: 0.3, metal: 0.03]
-        button_emphasis: [gloss: 0.35]
+        background: [color: Oklch[lightness: 0.96, chroma: 0.01, hue: 220]]
+        panel: [color: Oklch[lightness: 1], gloss: 0.12, metal: 0.02, shine: 0.6]
+        surface: [color: Oklch[lightness: 1], gloss: 0.25]
+        surface_variant: [color: Oklch[lightness: 0.985], gloss: 0.25]
+        surface_bright: [color: Oklch[lightness: 0.99], gloss: 0.25]
+        input_exterior: [color: Oklch[lightness: 0.985], gloss: 0.18]
+        input_interior: [color: Oklch[lightness: 1], gloss: 0.65]
+        button: [color: Oklch[lightness: 0.985], gloss: 0.3, metal: 0.03]
+        button_emphasis: [color: Oklch[lightness: 0.7, chroma: 0.165, hue: 25.36], gloss: 0.35]
+        primary: [color: Oklch[lightness: 0.7, chroma: 0.165, hue: 25.36]]
+        primary_container: [color: Oklch[lightness: 0.98, chroma: 0.01, hue: 25.36]]
+
+        -- Additional interactive materials
+        toggle_checkbox: [color: Oklch[lightness: 0.985], gloss: 0.3, metal: 0.05]
+        todo_checkbox: [color: Oklch[lightness: 0.985], gloss: 0.25, metal: 0.03]
+        input_focused: [color: Oklch[lightness: 1], gloss: 0.15, glow: [color: Oklch[lightness: 0.7, chroma: 0.1, hue: 220], intensity: 0.15]]
+        button_delete: [color: Oklch[lightness: 0.99], gloss: 0.35, glow: [color: Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87], intensity: 0]]
+        button_delete_hovered: [color: Oklch[lightness: 0.99], gloss: 0.35, glow: [color: Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87], intensity: 0.08]]
+        panel_footer: [color: Oklch[lightness: 0.99], gloss: 0.4]
+        button_filter_selected: [color: Oklch[lightness: 0.98, chroma: 0.01, hue: 25.36], gloss: 0.2, metal: 0.03, glow: [color: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36], intensity: 0.05]]
+        button_filter_unselected: [color: Oklch[lightness: 0.985], gloss: 0.35, metal: 0.03]
+        button_clear: [color: Oklch[lightness: 0.99], gloss: 0.4]
     ]
     elevation: [
         card: 50
@@ -182,13 +198,7 @@ theme: [
         full: Fully
     ]
     colors: [
-        background: Oklch[lightness: 0.96, chroma: 0.01, hue: 220]
-        surface: Oklch[lightness: 1]
-        surface_variant: Oklch[lightness: 0.985]
-        surface_bright: Oklch[lightness: 0.99]
-        primary: Oklch[lightness: 0.7, chroma: 0.165, hue: 25.36]
         primary_glow: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
-        primary_container: Oklch[lightness: 0.98, chroma: 0.01, hue: 25.36]
         focus: Oklch[lightness: 0.68, chroma: 0.08, hue: 220]
         focus_glow: Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
         danger: Oklch[lightness: 0.6, chroma: 0.109, hue: 18.87]
@@ -196,7 +206,7 @@ theme: [
         text: Oklch[lightness: 0.42]
         text_secondary: Oklch[lightness: 0.57]
         text_disabled: Oklch[lightness: 0.75]
-        text_header: Oklch[lightness: 0.54, chroma: 0.156, hue: 21.24, alpha: 0.15]
+        text_header: Oklch[lightness: 0.54, chroma: 0.156, hue: 21.24]
         border: Oklch[lightness: 0.92]
     ]
 ]
@@ -229,7 +239,7 @@ FUNCTION root_element() {
                 weight: Light
                 family: LIST { 'Helvetica Neue', 'Helvetica', 'Arial', SansSerif }
             ]
-            background: [color: PASSED.theme.colors.background]
+            material: Background |> Themes/material()
         ]
         items: LIST { content_element() }
     )
@@ -296,8 +306,7 @@ FUNCTION main_panel() {
             depth: PASSED.theme.depth.major
             transform: [move_closer: PASSED.theme.elevation.card]
             rounded_corners: PASSED.theme.corners.standard
-            background: [color: PASSED.theme.colors.surface]
-            material: PASSED.theme.materials.panel
+            material: Panel |> Themes/material()
         ]
         items: LIST {
             new_todo_title_text_input()
@@ -339,8 +348,7 @@ FUNCTION new_todo_title_text_input() {
             depth: PASSED.theme.depth.standard
             transform: [move_further: PASSED.theme.elevation.recessed]
             rounded_corners: PASSED.theme.corners.subtle
-            background: [color: PASSED.theme.colors.surface_bright]
-            material: PASSED.theme.materials.input_interior
+            material: InputInterior[focus: element.focused] |> Themes/material()
         ]
         label: Hidden[text: 'What needs to be done?']
         text: LATEST {
@@ -373,8 +381,7 @@ FUNCTION todos_element() {
         gap: 0
         style: [
             borders: [top: [color: PASSED.theme.colors.border]]
-            background: [color: PASSED.theme.colors.surface_variant]
-            material: [gloss: 0.25]
+            material: SurfaceVariant |> Themes/material()
         ]
         items: PASSED.store.todos
             |> List/retain(item, if: PASSED.store.selected_filter |> WHILE {
@@ -399,9 +406,8 @@ FUNCTION todo_element(todo) {
             width: Fill
             depth: 2
             transform: [move_closer: 4]
-            background: [color: PASSED.theme.colors.surface]
+            material: InputExterior[hover: False] |> Themes/material()
             font: [size: 24]
-            material: [gloss: 0.18]
         ]
         items: PASSED.store.selected_todo_id = todo.id |> WHILE {
             True => LIST {
@@ -443,10 +449,7 @@ FUNCTION toggle_all_checkbox() {
                     LIST { True, False } => [move_closer: 6]    -- Lifted on hover
                     LIST { False, False } => [move_closer: 4]   -- Resting raised
                 }
-                material: [
-                    gloss: 0.3
-                    metal: 0.05
-                ]
+                material: ToggleCheckbox[checked: element.checked, hover: element.hovered] |> Themes/material()
             ]
             label: Hidden[text: 'Toggle all']
             checked: checked
@@ -491,14 +494,7 @@ FUNCTION editing_todo_title_element(todo) {
             depth: 6
             rounded_corners: 2
             transform: [move_closer: 24]
-            background: [color: PASSED.theme.colors.surface]
-            material: [
-                gloss: 0.15
-                glow: [
-                    color: PASSED.theme.colors.focus_glow
-                    intensity: 0.15
-                ]
-            ]
+            material: InputInterior[focus: True] |> Themes/material()
             borders: [
                 width: 2
                 color: PASSED.theme.colors.focus
@@ -539,10 +535,7 @@ FUNCTION todo_checkbox(todo) {
                     LIST { True, False } => [move_closer: 6]    -- Lifted on hover
                     LIST { False, False } => [move_closer: 4]   -- Resting raised
                 }
-                material: [
-                    gloss: 0.25
-                    metal: 0.03
-                ]
+                material: TodoCheckbox[checked: todo.completed, hover: element.hovered] |> Themes/material()
             ]
             label: Reference[element: todo.todo_elements.todo_title_element]
             checked: todo.completed
@@ -615,17 +608,7 @@ FUNCTION remove_todo_button() {
                 LIST { True, False } => [move_closer: 12, move_left: 50, move_down: 14]
                 LIST { False, False } => [move_closer: 8, move_left: 50, move_down: 14]
             }
-            background: [color: PASSED.theme.colors.surface_bright]
-            material: [
-                gloss: 0.35
-                glow: [
-                    color: PASSED.theme.colors.danger_glow
-                    intensity: element.hovered |> WHEN {
-                        True => 0.08
-                        False => 0
-                    }
-                ]
-            ]
+            material: ButtonDelete[hover: element.hovered] |> Themes/material()
             font: [
                 size: 30
                 align: Center
@@ -648,8 +631,7 @@ FUNCTION panel_footer() {
         style: [
             padding: [row: 15, column: 8]
             font: [color: PASSED.theme.colors.text_secondary]
-            background: [color: PASSED.theme.colors.surface_bright]
-            material: [gloss: 0.4]
+            material: PanelFooter |> Themes/material()
             borders: [top: [color: PASSED.theme.colors.border]]
         ]
         items: LIST {
@@ -723,30 +705,11 @@ FUNCTION filter_button(filter) {
                     LIST { False, True, False } => [move_closer: PASSED.theme.elevation.raised]
                     LIST { False, False, False } => []
                 }
-                background: [
-                    color: selected |> WHEN {
-                        True => PASSED.theme.colors.primary_container
-                        False => PASSED.theme.colors.surface_variant
-                    }
-                ]
-                material: [
-                    gloss: selected |> WHEN {
-                        True => 0.2
-                        False => 0.35
-                    }
-                    metal: 0.03
-                    glow: [
-                        color: PASSED.theme.colors.primary_glow
-                        intensity: selected |> WHEN {
-                            True => 0.05
-                            False => 0
-                        }
-                    ]
-                ]
+                material: ButtonFilter[selected: selected, hover: element.hovered] |> Themes/material()
                 outline: selected |> WHEN {
                     True => [
                         width: 1
-                        color: PASSED.theme.colors.primary
+                        color: PASSED.theme.materials.primary.color
                     ]
                     False => NoOutline
                 }
@@ -781,8 +744,7 @@ FUNCTION remove_completed_button() {
                 LIST { True, False } => [move_closer: 4] -- Raised on hover
                 LIST { False, False } => []              -- Resting flat
             }
-            background: [color: PASSED.theme.colors.surface_bright]
-            material: [gloss: 0.4]
+            material: ButtonClear[hover: element.hovered] |> Themes/material()
             font: [
                 line: [underline: element.hovered]
                 color: PASSED.theme.colors.text_secondary

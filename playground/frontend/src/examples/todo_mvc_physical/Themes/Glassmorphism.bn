@@ -1,8 +1,227 @@
 -- Glassmorphism Theme
 -- Transparent glass-like surfaces with physical refraction
--- High transparency + medium roughness creates frosted glass effect
+-- High transparency + lower gloss (= higher roughness) creates frosted glass effect
 -- Renderer approximates this with backdrop blur for performance
 -- Soft diffuse lighting, subtle colors
+
+FUNCTION material(material) {
+    material |> WHEN {
+        -- Simple materials (no state)
+        Background => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.92, chroma: 0.02, hue: 240]
+                Dark => Oklch[lightness: 0.1, chroma: 0.03, hue: 260]
+            }
+        ]
+
+        Panel => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.95, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.2, chroma: 0.01, hue: 240]
+            }
+            transparency: 1.0
+            refraction: 1.5
+            gloss: 0.7
+            metal: 0.0
+            shine: 0.0
+        ]
+
+        Surface => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.95, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.2, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.9
+            refraction: 1.5
+            gloss: 0.65
+        ]
+
+        SurfaceVariant => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.92, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.25, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.9
+            refraction: 1.5
+            gloss: 0.65
+        ]
+
+        SurfaceBright => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.98, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.3, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.85
+            refraction: 1.5
+            gloss: 0.7
+        ]
+
+        Primary => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.7, chroma: 0.08, hue: 260]
+                Dark => Oklch[lightness: 0.75, chroma: 0.1, hue: 260]
+            }
+            transparency: 0.8
+            refraction: 1.5
+        ]
+
+        PrimaryContainer => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.95, chroma: 0.05, hue: 260]
+                Dark => Oklch[lightness: 0.3, chroma: 0.08, hue: 260]
+            }
+            transparency: 0.9
+            refraction: 1.5
+        ]
+
+        PanelFooter => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.98, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.3, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.85
+            refraction: 1.5
+            gloss: 0.7
+        ]
+
+        -- Interactive materials (with state)
+        InputExterior[hover] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.92, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.25, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.8
+            refraction: 1.5
+            gloss: 0.6
+        ]
+
+        InputInterior[focus] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.95, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.2, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.7
+            refraction: 1.5
+            gloss: focus |> WHEN {
+                False => 0.8
+                True => 0.6
+            }
+            glow: focus |> WHEN {
+                True => [
+                    color: PASSED.mode |> WHEN {
+                        Light => Oklch[lightness: 0.75, chroma: 0.12, hue: 220]
+                        Dark => Oklch[lightness: 0.85, chroma: 0.14, hue: 220]
+                    }
+                    intensity: 0.15
+                ]
+                False => None
+            }
+        ]
+
+        Button[hover, press] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.92, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.25, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.85
+            refraction: 1.5
+            gloss: 0.7
+            metal: 0.0
+        ]
+
+        ButtonEmphasis[hover, press] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.7, chroma: 0.08, hue: 260]
+                Dark => Oklch[lightness: 0.75, chroma: 0.1, hue: 260]
+            }
+            transparency: 0.8
+            refraction: 1.5
+            gloss: 0.75
+        ]
+
+        ButtonDelete[hover] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.98, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.3, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.85
+            refraction: 1.5
+            gloss: 0.75
+            glow: hover |> WHEN {
+                True => [
+                    color: PASSED.mode |> WHEN {
+                        Light => Oklch[lightness: 0.75, chroma: 0.12, hue: 10]
+                        Dark => Oklch[lightness: 0.85, chroma: 0.14, hue: 10]
+                    }
+                    intensity: 0.08
+                ]
+                False => None
+            }
+        ]
+
+        ButtonClear[hover] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.98, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.3, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.85
+            refraction: 1.5
+            gloss: 0.7
+        ]
+
+        ButtonFilter[selected, hover] => [
+            color: PASSED.mode |> WHEN {
+                Light => selected |> WHEN {
+                    False => Oklch[lightness: 0.92, chroma: 0.01, hue: 220]
+                    True => Oklch[lightness: 0.95, chroma: 0.05, hue: 260]
+                }
+                Dark => selected |> WHEN {
+                    False => Oklch[lightness: 0.25, chroma: 0.01, hue: 240]
+                    True => Oklch[lightness: 0.3, chroma: 0.08, hue: 260]
+                }
+            }
+            transparency: 0.85
+            refraction: 1.5
+            gloss: selected |> WHEN {
+                False => 0.75
+                True => 0.6
+            }
+            metal: 0.03
+            glow: selected |> WHEN {
+                True => [
+                    color: PASSED.mode |> WHEN {
+                        Light => Oklch[lightness: 0.8, chroma: 0.1, hue: 260]
+                        Dark => Oklch[lightness: 0.85, chroma: 0.12, hue: 260]
+                    }
+                    intensity: 0.05
+                ]
+                False => None
+            }
+        ]
+
+        ToggleCheckbox[checked, hover] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.92, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.25, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.85
+            refraction: 1.5
+            gloss: 0.7
+            metal: 0.05
+        ]
+
+        TodoCheckbox[checked, hover] => [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.92, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.25, chroma: 0.01, hue: 240]
+            }
+            transparency: 0.85
+            refraction: 1.5
+            gloss: 0.65
+            metal: 0.03
+        ]
+    }
+}
 
 FUNCTION theme(mode) {
     [
@@ -28,49 +247,6 @@ FUNCTION theme(mode) {
         geometry: [
             edge_radius: 2
             bevel_angle: 45
-        ]
-
-        -- Materials: High gloss, glass-like with transparency
-        materials: [
-            panel: [
-                transparency: 1.0      -- Fully transparent
-                refraction: 1.5        -- Glass
-                roughness: 0.3         -- Slight frosting
-                gloss: 0.8
-                metal: 0.0
-                shine: 0.0
-            ]
-            surface: [
-                transparency: 0.9
-                refraction: 1.5
-                roughness: 0.35
-                gloss: 0.75
-            ]
-            input_exterior: [
-                transparency: 0.8
-                refraction: 1.5
-                roughness: 0.4
-                gloss: 0.7
-            ]
-            input_interior: [
-                transparency: 0.7      -- Less transparent inside
-                refraction: 1.5
-                roughness: 0.2
-                gloss: 0.85
-            ]
-            button: [
-                transparency: 0.85
-                refraction: 1.5
-                roughness: 0.3
-                gloss: 0.8
-                metal: 0.0
-            ]
-            button_emphasis: [
-                transparency: 0.8
-                refraction: 1.5
-                roughness: 0.25
-                gloss: 0.85
-            ]
         ]
 
         -- Elevation: Moderate floating
@@ -108,43 +284,31 @@ FUNCTION theme(mode) {
             full: Fully
         ]
 
-        -- Colors: Translucent surfaces, low chroma, heavy use of alpha
+        -- Colors: Text, borders, and glow effects (surfaces are in materials)
         colors: mode |> WHEN {
             Light => [
-                background: Oklch[lightness: 0.92, chroma: 0.02, hue: 240]
-                surface: Oklch[lightness: 0.95, chroma: 0.01, hue: 220, alpha: 0.3]
-                surface_variant: Oklch[lightness: 0.92, chroma: 0.01, hue: 220, alpha: 0.4]
-                surface_bright: Oklch[lightness: 0.98, chroma: 0.01, hue: 220, alpha: 0.25]
-                primary: Oklch[lightness: 0.7, chroma: 0.08, hue: 260, alpha: 0.8]
-                primary_glow: Oklch[lightness: 0.8, chroma: 0.1, hue: 260, alpha: 0.6]
-                primary_container: Oklch[lightness: 0.95, chroma: 0.05, hue: 260, alpha: 0.3]
-                focus: Oklch[lightness: 0.65, chroma: 0.1, hue: 220, alpha: 0.8]
-                focus_glow: Oklch[lightness: 0.75, chroma: 0.12, hue: 220, alpha: 0.6]
-                danger: Oklch[lightness: 0.65, chroma: 0.12, hue: 10, alpha: 0.8]
-                danger_glow: Oklch[lightness: 0.75, chroma: 0.12, hue: 10, alpha: 0.6]
-                text: Oklch[lightness: 0.25, chroma: 0.02, hue: 240, alpha: 0.9]
-                text_secondary: Oklch[lightness: 0.45, chroma: 0.02, hue: 240, alpha: 0.8]
-                text_disabled: Oklch[lightness: 0.65, chroma: 0.01, hue: 240, alpha: 0.5]
-                text_header: Oklch[lightness: 0.7, chroma: 0.08, hue: 260, alpha: 0.2]
-                border: Oklch[lightness: 0.85, chroma: 0.01, hue: 220, alpha: 0.4]
+                primary_glow: Oklch[lightness: 0.8, chroma: 0.1, hue: 260]
+                focus: Oklch[lightness: 0.65, chroma: 0.1, hue: 220]
+                focus_glow: Oklch[lightness: 0.75, chroma: 0.12, hue: 220]
+                danger: Oklch[lightness: 0.65, chroma: 0.12, hue: 10]
+                danger_glow: Oklch[lightness: 0.75, chroma: 0.12, hue: 10]
+                text: Oklch[lightness: 0.25, chroma: 0.02, hue: 240]
+                text_secondary: Oklch[lightness: 0.45, chroma: 0.02, hue: 240]
+                text_disabled: Oklch[lightness: 0.65, chroma: 0.01, hue: 240]
+                text_header: Oklch[lightness: 0.7, chroma: 0.08, hue: 260]
+                border: Oklch[lightness: 0.85, chroma: 0.01, hue: 220]
             ]
             Dark => [
-                background: Oklch[lightness: 0.1, chroma: 0.03, hue: 260]
-                surface: Oklch[lightness: 0.2, chroma: 0.01, hue: 240, alpha: 0.3]
-                surface_variant: Oklch[lightness: 0.25, chroma: 0.01, hue: 240, alpha: 0.4]
-                surface_bright: Oklch[lightness: 0.3, chroma: 0.01, hue: 240, alpha: 0.35]
-                primary: Oklch[lightness: 0.75, chroma: 0.1, hue: 260, alpha: 0.8]
-                primary_glow: Oklch[lightness: 0.85, chroma: 0.12, hue: 260, alpha: 0.6]
-                primary_container: Oklch[lightness: 0.3, chroma: 0.08, hue: 260, alpha: 0.3]
-                focus: Oklch[lightness: 0.75, chroma: 0.12, hue: 220, alpha: 0.8]
-                focus_glow: Oklch[lightness: 0.85, chroma: 0.14, hue: 220, alpha: 0.6]
-                danger: Oklch[lightness: 0.75, chroma: 0.14, hue: 10, alpha: 0.8]
-                danger_glow: Oklch[lightness: 0.85, chroma: 0.14, hue: 10, alpha: 0.6]
-                text: Oklch[lightness: 0.9, chroma: 0.01, hue: 240, alpha: 0.9]
-                text_secondary: Oklch[lightness: 0.75, chroma: 0.01, hue: 240, alpha: 0.8]
-                text_disabled: Oklch[lightness: 0.5, chroma: 0.01, hue: 240, alpha: 0.5]
-                text_header: Oklch[lightness: 0.75, chroma: 0.1, hue: 260, alpha: 0.25]
-                border: Oklch[lightness: 0.35, chroma: 0.02, hue: 240, alpha: 0.4]
+                primary_glow: Oklch[lightness: 0.85, chroma: 0.12, hue: 260]
+                focus: Oklch[lightness: 0.75, chroma: 0.12, hue: 220]
+                focus_glow: Oklch[lightness: 0.85, chroma: 0.14, hue: 220]
+                danger: Oklch[lightness: 0.75, chroma: 0.14, hue: 10]
+                danger_glow: Oklch[lightness: 0.85, chroma: 0.14, hue: 10]
+                text: Oklch[lightness: 0.9, chroma: 0.01, hue: 240]
+                text_secondary: Oklch[lightness: 0.75, chroma: 0.01, hue: 240]
+                text_disabled: Oklch[lightness: 0.5, chroma: 0.01, hue: 240]
+                text_header: Oklch[lightness: 0.75, chroma: 0.1, hue: 260]
+                border: Oklch[lightness: 0.35, chroma: 0.02, hue: 240]
             ]
         }
     ]
