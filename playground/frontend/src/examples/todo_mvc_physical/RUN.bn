@@ -536,7 +536,6 @@ FUNCTION remove_todo_button() {
             depth: Theme/depth(of: Hero)
             rounded_corners: Theme/corners(of: Pill)
             pointer_response: Theme/pointer_response(of: ButtonDestructive)
-            transform: [move_left: 50, move_down: 14]
             material: Theme/material(of: ButtonDelete[hover: element.hovered])
             font: Theme/font(of: ButtonDelete)
         ]
@@ -653,43 +652,22 @@ FUNCTION filter_button(filter) {
 ------------------------------------------------------------------------
 
 FUNCTION remove_completed_button() {
-    BLOCK {
-        has_completed: PASSED.store.todos |> List/any(item, if: item.completed)
-        is_disabled: has_completed |> Bool/not()
-
-        Element/button(
-            element: [
-                event: [press: LINK]
-                hovered: LINK
-            ]
-            style: [
-                align: Right
-                padding: [row: 4, column: 2]
-                ...is_disabled |> WHEN {
-                    True => Theme/disabled_transform()
-                    False => []
-                }
-                depth: is_disabled |> WHEN {
-                    False => Theme/depth(of: Element)
-                    True => Theme/depth(of: Detail)
-                }
-                rounded_corners: Theme/corners(of: Comfort)
-                ...is_disabled |> WHEN {
-                    False => [pointer_response: Theme/pointer_response(of: Button)]
-                    True => []
-                }
-                transform: is_disabled |> WHEN {
-                    True => [move_further: 2]
-                    False => []
-                }
-                material: Theme/material(of: ButtonClear[hover: element.hovered])
-                font: Theme/font(of: ClearButton[hover: element.hovered])
-                opacity: is_disabled |> WHEN { True => 0.3, False => 1.0 }
-            ]
-            label: 'Clear completed'
-            disabled: is_disabled
-        )
-    }
+    Element/button(
+        element: [
+            event: [press: LINK]
+            hovered: LINK
+        ]
+        style: [
+            align: Right
+            padding: [row: 4, column: 2]
+            depth: Theme/depth(of: Element)
+            rounded_corners: Theme/corners(of: Comfort)
+            pointer_response: Theme/pointer_response(of: Button)
+            material: Theme/material(of: ButtonClear[hover: element.hovered])
+            font: Theme/font(of: ClearButton[hover: element.hovered])
+        ]
+        label: 'Clear completed'
+    )
 }
 
 ------------------------------------------------------------------------
