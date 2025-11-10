@@ -827,7 +827,16 @@ FUNCTION add_emissive(material, state) {
 -- Pattern 6: Pointer Magnetic Response (Simplified Spring Model)
 -- Elements respond to pointer proximity with lift/press behavior
 -- Mental model: Elements on springs, pointer exerts magnetic force
--- Usage: pointer_response: Theme/pointer_response(of: Button)
+--
+-- USER API: pointer_response: Theme/pointer_response(of: Button)
+-- Theme returns [lift: X, press: Y], rendering engine applies physics automatically
+--
+-- Rendering engine handles:
+-- - Pointer position tracking (mouse/touch/stylus/gamepad/VR/etc)
+-- - Element position calculation
+-- - Distance calculation and linear falloff
+-- - Pressed state detection (pole reversal: press = repulsion)
+-- - Elevation offset application
 
 -- Pointer response values per element type
 -- Returns: [lift: X, press: Y] where X/Y are maximum displacement in pixels
@@ -856,6 +865,10 @@ FUNCTION pointer_field() {
     ]
 }
 
+-- NOTE: pointer_elevation is for DOCUMENTATION/REFERENCE only
+-- The rendering engine implements this logic internally
+-- Users don't call this function - they just set: pointer_response: Theme/pointer_response(of: Button)
+--
 -- Calculate pointer magnetic elevation
 -- Returns: elevation offset to add to element's natural position
 -- Positive = lift up (attraction), Negative = push down (repulsion when pressed)

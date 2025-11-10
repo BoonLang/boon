@@ -7,11 +7,11 @@
 -- EMERGENT PATTERNS IMPLEMENTED:
 --   Pattern 1: Material physics (elasticity) → REPLACED by Pattern 6 magnetic response
 --   Pattern 2: Beveled geometry → automatic edge definition (replaces borders)
---   Pattern 3: Depth from element type + importance (semantic depth scaling)
+--   Pattern 3: Semantic depth tokens (Container, Element, Hero, Detail) - simple API
 --   Pattern 4: Text hierarchy from z-position (depth-based lighting affects brightness)
 --   Pattern 5: Focus spotlight (dynamic lighting for focused elements)
 --   Pattern 6: Pointer magnetic response → elements lift/depress based on proximity (spring model)
---   Pattern 7: Corner radius from material hardness (soft materials = rounder)
+--   Pattern 7: Semantic corner tokens (Touch, Comfort, Soft, Pill) - simple API
 --   Pattern 8: Disabled state as ghost material (translucent, recessed)
 --   Pattern 9: Sweep/shimmer lights for loading states (when applicable)
 --   Pattern 10: Emissive materials for state indication (error, success, warning)
@@ -40,7 +40,6 @@ store: [
         elements.new_todo_title_text_input.focused
             |> WHEN { True => Some[elements.new_todo_title_text_input], False => None }
     }
-    cursor_position: Mouse/position()
     selected_filter: Router/route() |> WHEN {
         '/active' => Active
         '/completed' => Completed
@@ -388,23 +387,14 @@ FUNCTION toggle_all_checkbox() {
         Element/checkbox(
             element: [
                 event: [click: LINK]
-                position: LINK
                 hovered: LINK
-                pressed: LINK
             ]
             style: [
                 width: 60
                 height: Fill
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Touch)
-                transform: [
-                    move_closer: Theme/pointer_elevation(
-                        element_type: Checkbox,
-                        element_center: element.position.center,
-                        pointer_position: PASSED.store.cursor_position,
-                        pressed: element.pressed
-                    )
-                ]
+                pointer_response: Theme/pointer_response(of: Checkbox)
                 material: Theme/material(of: ToggleCheckbox[checked: element.checked, hover: element.hovered])
             ]
             label: Hidden[text: 'Toggle all']
@@ -466,22 +456,13 @@ FUNCTION todo_checkbox(todo) {
         Element/checkbox(
             element: [
                 event: [click: LINK]
-                position: LINK
                 hovered: LINK
-                pressed: LINK
             ]
             style: [
                 size: 40
-                depth: Theme/depth_scale(element_type: Checkbox, importance: Secondary)
-                rounded_corners: Theme/corners_from_material(of: Circular)
-                transform: [
-                    move_closer: Theme/pointer_elevation(
-                        element_type: Checkbox,
-                        element_center: element.position.center,
-                        pointer_position: PASSED.store.cursor_position,
-                        pressed: element.pressed
-                    )
-                ]
+                depth: Theme/depth(of: Element)
+                rounded_corners: Theme/corners(of: Pill)
+                pointer_response: Theme/pointer_response(of: Checkbox)
                 material: Theme/material(of: TodoCheckbox[checked: todo.completed, hover: element.hovered])
             ]
             label: Reference[element: todo.todo_elements.todo_title_element]
@@ -540,24 +521,14 @@ FUNCTION remove_todo_button() {
     Element/button(
         element:[
             event: [press: LINK]
-            position: LINK
             hovered: LINK
-            pressed: LINK
         ]
         style: [
             size: 40
-            depth: Theme/depth_scale(element_type: Button, importance: Destructive)
-            rounded_corners: Theme/corners_from_material(of: Circular)
-            transform: [
-                move_closer: Theme/pointer_elevation(
-                    element_type: ButtonDestructive,
-                    element_center: element.position.center,
-                    pointer_position: PASSED.store.cursor_position,
-                    pressed: element.pressed
-                ),
-                move_left: 50,
-                move_down: 14
-            ]
+            depth: Theme/depth(of: Hero)
+            rounded_corners: Theme/corners(of: Pill)
+            pointer_response: Theme/pointer_response(of: ButtonDestructive)
+            transform: [move_left: 50, move_down: 14]
             material: Theme/material(of: ButtonDelete[hover: element.hovered])
             font: Theme/font(of: ButtonDelete)
         ]
@@ -645,22 +616,14 @@ FUNCTION filter_button(filter) {
         Element/button(
             element: [
                 event: [press: LINK]
-                position: LINK
                 hovered: LINK
-                pressed: LINK
             ]
             style: [
                 padding: [row: 8, column: 4]
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Soft)
-                transform: [
-                    move_closer: Theme/pointer_elevation(
-                        element_type: ButtonFilter,
-                        element_center: element.position.center,
-                        pointer_position: PASSED.store.cursor_position,
-                        pressed: element.pressed
-                    ) + selected_offset
-                ]
+                pointer_response: Theme/pointer_response(of: ButtonFilter)
+                transform: [move_closer: selected_offset]
                 material: Theme/material(of: ButtonFilter[selected: selected, hover: element.hovered])
                 font: Theme/font(of: Secondary)
                 outline: selected |> WHEN {
@@ -689,9 +652,7 @@ FUNCTION remove_completed_button() {
         Element/button(
             element: [
                 event: [press: LINK]
-                position: LINK
                 hovered: LINK
-                pressed: LINK
             ]
             style: [
                 align: Right
@@ -701,20 +662,17 @@ FUNCTION remove_completed_button() {
                     False => []
                 }
                 depth: is_disabled |> WHEN {
-                    False => Theme/depth_scale(element_type: Button, importance: Secondary)
-                    True => 1
+                    False => Theme/depth(of: Element)
+                    True => Theme/depth(of: Detail)
                 }
-                rounded_corners: Theme/corners_from_material(of: Plastic)
+                rounded_corners: Theme/corners(of: Comfort)
+                ...is_disabled |> WHEN {
+                    False => [pointer_response: Theme/pointer_response(of: Button)]
+                    True => []
+                }
                 transform: is_disabled |> WHEN {
                     True => [move_further: 2]
-                    False => [
-                        move_closer: Theme/pointer_elevation(
-                            element_type: Button,
-                            element_center: element.position.center,
-                            pointer_position: PASSED.store.cursor_position,
-                            pressed: element.pressed
-                        )
-                    ]
+                    False => []
                 }
                 material: Theme/material(of: ButtonClear[hover: element.hovered])
                 font: Theme/font(of: ClearButton[hover: element.hovered])
