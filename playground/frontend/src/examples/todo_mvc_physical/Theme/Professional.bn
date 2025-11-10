@@ -824,6 +824,77 @@ FUNCTION add_emissive(material, state) {
     }
 }
 
+-- Pattern 6: Pointer Magnetic Response (Simplified Spring Model)
+-- Elements respond to pointer proximity with lift/press behavior
+-- Mental model: Elements on springs, pointer exerts magnetic force
+-- Usage: pointer_response: Theme/pointer_response(of: Button)
+
+-- Pointer response values per element type
+-- Returns: [lift: X, press: Y] where X/Y are maximum displacement in pixels
+FUNCTION pointer_response(of) {
+    of |> WHEN {
+        -- Interactive elements (magnetic)
+        Button => [lift: 6, press: 4]           -- Standard button feel
+        ButtonDestructive => [lift: 4, press: 6] -- Heavy press for destructive actions
+        ButtonFilter => [lift: 6, press: 4]      -- Same as standard button
+        Checkbox => [lift: 4, press: 8]          -- Deep press for tactile feedback
+
+        -- Non-interactive elements (not magnetic)
+        Panel => [lift: 0, press: 0]
+        Container => [lift: 0, press: 0]
+        Background => [lift: 0, press: 0]
+        Input => [lift: 0, press: 0]             -- Inputs don't respond to pointer field
+    }
+}
+
+-- Global pointer magnetic field configuration
+FUNCTION pointer_field() {
+    [
+        radius: 120         -- Effective range in pixels
+        falloff: Linear     -- Linear distance falloff (UX optimized)
+        depth_limit: 10     -- Safety: prevent elements from going too deep (absolute clamp)
+    ]
+}
+
+-- Calculate pointer magnetic elevation
+-- Returns: elevation offset to add to element's natural position
+-- Positive = lift up (attraction), Negative = push down (repulsion when pressed)
+FUNCTION pointer_elevation(element_type, element_center, pointer_position, pressed) {
+    BLOCK {
+        response: pointer_response(element_type)
+        field: pointer_field()
+
+        -- Early exit if element is not magnetic
+        response.lift = 0 |> WHEN {
+            True => 0
+            False => BLOCK {
+                -- Calculate distance to pointer
+                distance: Math/distance(element_center, pointer_position)
+
+                -- Outside field radius = no effect
+                distance > field.radius |> WHEN {
+                    True => 0
+                    False => BLOCK {
+                        -- Linear falloff: 1.0 at distance=0, 0.0 at distance=radius
+                        distance_factor: 1.0 - (distance / field.radius)
+
+                        -- Calculate displacement based on pressed state
+                        displacement: pressed |> WHEN {
+                            -- Pressed: Magnetic poles reversed (repulsion, push down)
+                            True => -(response.press * distance_factor)
+                            -- Not pressed: Normal attraction (lift up)
+                            False => response.lift * distance_factor
+                        }
+
+                        -- Safety clamp: prevent going too deep
+                        displacement |> Math/max(-field.depth_limit)
+                    }
+                }
+            }
+        }
+    }
+}
+
 FUNCTION theme(mode) {
     [
         -- Lighting: Neutral warm from upper-right, soft ambient fill

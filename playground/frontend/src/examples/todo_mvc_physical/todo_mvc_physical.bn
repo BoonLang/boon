@@ -5,12 +5,12 @@
 -- DEMO: Consistent theme API - materials, fonts, borders use tagged functions
 --
 -- EMERGENT PATTERNS IMPLEMENTED:
---   Pattern 1: Material physics (elasticity) → automatic interaction transforms
+--   Pattern 1: Material physics (elasticity) → REPLACED by Pattern 6 magnetic response
 --   Pattern 2: Beveled geometry → automatic edge definition (replaces borders)
 --   Pattern 3: Depth from element type + importance (semantic depth scaling)
 --   Pattern 4: Text hierarchy from z-position (depth-based lighting affects brightness)
 --   Pattern 5: Focus spotlight (dynamic lighting for focused elements)
---   Pattern 6: Cursor gravity field (EXPERIMENTAL - inverse-square force)
+--   Pattern 6: Pointer magnetic response → elements lift/depress based on proximity (spring model)
 --   Pattern 7: Corner radius from material hardness (soft materials = rounder)
 --   Pattern 8: Disabled state as ghost material (translucent, recessed)
 --   Pattern 9: Sweep/shimmer lights for loading states (when applicable)
@@ -388,6 +388,7 @@ FUNCTION toggle_all_checkbox() {
         Element/checkbox(
             element: [
                 event: [click: LINK]
+                position: LINK
                 hovered: LINK
                 pressed: LINK
             ]
@@ -396,10 +397,14 @@ FUNCTION toggle_all_checkbox() {
                 height: Fill
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Touch)
-                transform: Theme/interaction_transform(
-                    material: Checkbox,
-                    state: [hovered: element.hovered, pressed: element.pressed]
-                )
+                transform: [
+                    move_closer: Theme/pointer_elevation(
+                        element_type: Checkbox,
+                        element_center: element.position.center,
+                        pointer_position: PASSED.store.cursor_position,
+                        pressed: element.pressed
+                    )
+                ]
                 material: Theme/material(of: ToggleCheckbox[checked: element.checked, hover: element.hovered])
             ]
             label: Hidden[text: 'Toggle all']
@@ -461,6 +466,7 @@ FUNCTION todo_checkbox(todo) {
         Element/checkbox(
             element: [
                 event: [click: LINK]
+                position: LINK
                 hovered: LINK
                 pressed: LINK
             ]
@@ -468,10 +474,14 @@ FUNCTION todo_checkbox(todo) {
                 size: 40
                 depth: Theme/depth_scale(element_type: Checkbox, importance: Secondary)
                 rounded_corners: Theme/corners_from_material(of: Circular)
-                transform: Theme/interaction_transform(
-                    material: Checkbox,
-                    state: [hovered: element.hovered, pressed: element.pressed]
-                )
+                transform: [
+                    move_closer: Theme/pointer_elevation(
+                        element_type: Checkbox,
+                        element_center: element.position.center,
+                        pointer_position: PASSED.store.cursor_position,
+                        pressed: element.pressed
+                    )
+                ]
                 material: Theme/material(of: TodoCheckbox[checked: todo.completed, hover: element.hovered])
             ]
             label: Reference[element: todo.todo_elements.todo_title_element]
@@ -527,33 +537,32 @@ FUNCTION todo_title_element(todo) {
 ------------------------------------------------------------------------
 
 FUNCTION remove_todo_button() {
-    BLOCK {
-        interaction: Theme/interaction_transform(
-            material: ButtonDestructive,
-            state: [hovered: element.hovered, pressed: element.pressed]
-        )
-
-        Element/button(
-            element:[
-                event: [press: LINK]
-                hovered: LINK
-                pressed: LINK
+    Element/button(
+        element:[
+            event: [press: LINK]
+            position: LINK
+            hovered: LINK
+            pressed: LINK
+        ]
+        style: [
+            size: 40
+            depth: Theme/depth_scale(element_type: Button, importance: Destructive)
+            rounded_corners: Theme/corners_from_material(of: Circular)
+            transform: [
+                move_closer: Theme/pointer_elevation(
+                    element_type: ButtonDestructive,
+                    element_center: element.position.center,
+                    pointer_position: PASSED.store.cursor_position,
+                    pressed: element.pressed
+                ),
+                move_left: 50,
+                move_down: 14
             ]
-            style: [
-                size: 40
-                depth: Theme/depth_scale(element_type: Button, importance: Destructive)
-                rounded_corners: Theme/corners_from_material(of: Circular)
-                transform: [
-                    move_closer: interaction.move_closer,
-                    move_left: 50,
-                    move_down: 14
-                ]
-                material: Theme/material(of: ButtonDelete[hover: element.hovered])
-                font: Theme/font(of: ButtonDelete)
-            ]
-            label: '×'
-        )
-    }
+            material: Theme/material(of: ButtonDelete[hover: element.hovered])
+            font: Theme/font(of: ButtonDelete)
+        ]
+        label: '×'
+    )
 }
 
 ------------------------------------------------------------------------
@@ -631,15 +640,12 @@ FUNCTION filters_element() {
 FUNCTION filter_button(filter) {
     BLOCK {
         selected: PASSED.store.selected_filter = filter
-        base_interaction: Theme/interaction_transform(
-            material: ButtonFilter,
-            state: [hovered: element.hovered, pressed: element.pressed]
-        )
         selected_offset: selected |> WHEN { True => 6, False => 0 }
 
         Element/button(
             element: [
                 event: [press: LINK]
+                position: LINK
                 hovered: LINK
                 pressed: LINK
             ]
@@ -648,7 +654,12 @@ FUNCTION filter_button(filter) {
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Soft)
                 transform: [
-                    move_closer: base_interaction.move_closer + selected_offset
+                    move_closer: Theme/pointer_elevation(
+                        element_type: ButtonFilter,
+                        element_center: element.position.center,
+                        pointer_position: PASSED.store.cursor_position,
+                        pressed: element.pressed
+                    ) + selected_offset
                 ]
                 material: Theme/material(of: ButtonFilter[selected: selected, hover: element.hovered])
                 font: Theme/font(of: Secondary)
@@ -678,6 +689,7 @@ FUNCTION remove_completed_button() {
         Element/button(
             element: [
                 event: [press: LINK]
+                position: LINK
                 hovered: LINK
                 pressed: LINK
             ]
@@ -695,10 +707,14 @@ FUNCTION remove_completed_button() {
                 rounded_corners: Theme/corners_from_material(of: Plastic)
                 transform: is_disabled |> WHEN {
                     True => [move_further: 2]
-                    False => Theme/interaction_transform(
-                        material: Button,
-                        state: [hovered: element.hovered, pressed: element.pressed]
-                    )
+                    False => [
+                        move_closer: Theme/pointer_elevation(
+                            element_type: Button,
+                            element_center: element.position.center,
+                            pointer_position: PASSED.store.cursor_position,
+                            pressed: element.pressed
+                        )
+                    ]
                 }
                 material: Theme/material(of: ButtonClear[hover: element.hovered])
                 font: Theme/font(of: ClearButton[hover: element.hovered])

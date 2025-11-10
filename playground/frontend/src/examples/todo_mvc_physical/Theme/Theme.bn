@@ -219,3 +219,51 @@ FUNCTION text_hierarchy_depth(importance) {
         Neumorphism => importance |> Neumorphism/text_hierarchy_depth()
     }
 }
+
+-- Pattern 6: Pointer magnetic response
+FUNCTION pointer_response(of) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => of |> Professional/pointer_response()
+        Glassmorphism => of |> Glassmorphism/pointer_response()
+        Neobrutalism => of |> Neobrutalism/pointer_response()
+        Neumorphism => of |> Neumorphism/pointer_response()
+    }
+}
+
+FUNCTION pointer_field() {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/pointer_field()
+        Glassmorphism => Glassmorphism/pointer_field()
+        Neobrutalism => Neobrutalism/pointer_field()
+        Neumorphism => Neumorphism/pointer_field()
+    }
+}
+
+FUNCTION pointer_elevation(element_type, element_center, pointer_position, pressed) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/pointer_elevation(
+            element_type: element_type,
+            element_center: element_center,
+            pointer_position: pointer_position,
+            pressed: pressed
+        )
+        Glassmorphism => Glassmorphism/pointer_elevation(
+            element_type: element_type,
+            element_center: element_center,
+            pointer_position: pointer_position,
+            pressed: pressed
+        )
+        Neobrutalism => Neobrutalism/pointer_elevation(
+            element_type: element_type,
+            element_center: element_center,
+            pointer_position: pointer_position,
+            pressed: pressed
+        )
+        Neumorphism => Neumorphism/pointer_elevation(
+            element_type: element_type,
+            element_center: element_center,
+            pointer_position: pointer_position,
+            pressed: pressed
+        )
+    }
+}
