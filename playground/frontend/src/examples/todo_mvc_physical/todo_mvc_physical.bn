@@ -322,27 +322,40 @@ FUNCTION new_todo_title_text_input() {
 ------------------------------------------------------------------------
 
 FUNCTION todos_element() {
-    Element/stripe(
-        element: [
-            nearby_element: [
-                position: Above
-                element: toggle_all_checkbox()
+    -- Use Stack to layer checkbox over the todo list
+    Element/stack(
+        element: []
+        style: [width: Fill]
+        layers: LIST {
+            -- Base layer: The actual todos list
+            Element/stripe(
+                element: []
+                direction: Column
+                gap: 0
+                style: [
+                    borders: Theme/border(of: Standard)
+                    material: Theme/material(of: SurfaceVariant)
+                ]
+                items: PASSED.store.todos
+                    |> List/retain(item, if: PASSED.store.selected_filter |> WHILE {
+                        All => True
+                        Active => item.completed |> Bool/not()
+                        Completed => item.completed
+                    })
+                    |> List/map(old, new: old |> todo_element())
+            )
+            -- Overlay layer: Toggle-all checkbox positioned at top-left
+            Element/block(
+                element: []
+                style: [
+                    width: 60
+                    height: Fill
+                    align: [row: Left, column: Top]
+                ]
+                child: toggle_all_checkbox()
                     |> LINK { PASSED.store.elements.toggle_all_checkbox }
-            ]
-        ]
-        direction: Column
-        gap: 0
-        style: [
-            borders: Theme/border(of: Standard)
-            material: Theme/material(of: SurfaceVariant)
-        ]
-        items: PASSED.store.todos
-            |> List/retain(item, if: PASSED.store.selected_filter |> WHILE {
-                All => True
-                Active => item.completed |> Bool/not()
-                Completed => item.completed
-            })
-            |> List/map(old, new: old |> todo_element())
+            )
+        }
     )
 }
 
@@ -352,14 +365,16 @@ FUNCTION todos_element() {
 
 FUNCTION todo_element(todo) {
     Element/stripe(
-        element: []
+        element: [
+            hovered: LINK
+        ]
         direction: Row
         gap: 5
         style: [
             width: Fill
             depth: Theme/depth(of: Detail)
             transform: [move_closer: 4]
-            material: Theme/material(of: InputExterior[hover: False])
+            material: Theme/material(of: InputExterior[hover: element.hovered])
         ]
         items: PASSED.store.selected_todo_id = todo.id |> WHILE {
             True => LIST {
@@ -371,6 +386,11 @@ FUNCTION todo_element(todo) {
                     |> LINK { todo.todo_elements.todo_checkbox }
                 todo_title_element(todo: todo)
                     |> LINK { todo.todo_elements.todo_title_element }
+                element.hovered |> WHILE {
+                    True => remove_todo_button()
+                        |> LINK { todo.todo_elements.remove_todo_button }
+                    False => NoElement
+                }
             }
         }
     )
@@ -489,15 +509,6 @@ FUNCTION todo_title_element(todo) {
     Element/label(
         element: [
             event: [double_click: LINK]
-            hovered: LINK
-            nearby_element: [
-                position: Right
-                element: hovered |> WHILE {
-                    True => remove_todo_button()
-                        |> LINK { todo.todo_elements.remove_todo_button }
-                    False => NoElement
-                }
-            ]
         ]
         style: [
             width: Fill
@@ -514,7 +525,7 @@ FUNCTION todo_title_element(todo) {
 }
 
 ------------------------------------------------------------------------
--- REMOVE TODO BUTTON - Appears on hover, floats dramatically
+-- REMOVE TODO BUTTON - Row sibling, appears on row hover, floats dramatically
 ------------------------------------------------------------------------
 
 FUNCTION remove_todo_button() {
