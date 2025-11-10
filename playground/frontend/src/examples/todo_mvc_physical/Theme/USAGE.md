@@ -11,8 +11,8 @@ Themes provide a **complete visual design system** by bundling all styling decis
 Each theme function accepts a `mode` parameter:
 
 ```boon
-theme: Themes/Professional/theme(mode: Light)   -- Light mode
-theme: Themes/Professional/theme(mode: Dark)    -- Dark mode
+theme: Theme/Professional/theme(mode: Light)   -- Light mode
+theme: Theme/Professional/theme(mode: Dark)    -- Dark mode
 ```
 
 The theme internally uses `mode |> WHEN { Light => ..., Dark => ... }` to resolve:
@@ -31,7 +31,7 @@ Element/button(
         depth: 6
         transform: [move_closer: 4]
         material: [gloss: 0.3, metal: 0.03]
-        background: [color: Oklch[lightness: 0.985]]
+        backgSoft: [color: Oklch[lightness: 0.985]]
     ]
 )
 ```
@@ -40,10 +40,10 @@ Element/button(
 ```boon
 Element/button(
     style: [
-        depth: THEME.depth.standard
-        elevation: THEME.elevation.raised
+        depth: THEME.depth.Element
+        elevation: THEME.elevation.Button
         material: THEME.materials.button
-        background: [color: THEME.colors.surface_variant]
+        backgSoft: [color: THEME.colors.surface_variant]
     ]
 )
 ```
@@ -55,7 +55,7 @@ Themes define physically-based material properties that control how surfaces int
 ```boon
 materials: [
     panel: [
-        transparency: 1.0     -- 0.0 = opaque, 1.0 = fully transparent
+        transparency: 1.0     -- 0.0 = opaque, 1.0 = Pilly transparent
         refraction: 1.5       -- Index of refraction (1.0 = air, 1.5 = glass, 2.4 = diamond)
         gloss: 0.6            -- Surface glossiness (0 = rough/matte, 1 = mirror-smooth)
         metal: 0.0            -- Metallic property
@@ -94,8 +94,8 @@ material: [
 
 **With external theme file:**
 ```boon
--- Load theme from Themes/ directory
-theme: Themes/Professional/theme(mode: Light)
+-- Load theme from Theme/ directory
+theme: Theme/Professional/theme(mode: Light)
 
 scene: Scene/new(
     root: root_element(PASS: [store: store, theme: theme])
@@ -106,7 +106,7 @@ scene: Scene/new(
 -- Elements access theme via PASSED
 Element/button(
     style: [
-        depth: PASSED.theme.depth.standard
+        depth: PASSED.theme.depth.Element
         material: PASSED.theme.materials.button
     ]
 )
@@ -143,8 +143,8 @@ scene: Scene/new(
 
 | Aspect | Professional | Neobrutalism | Glassmorphism | Neumorphism |
 |--------|-------------|--------------|---------------|-------------|
-| **Edge Radius** | 2 | 0 (sharp) | 2 | 4 (soft) |
-| **Bevel Angle** | 45° | 30° (sharp) | 45° | 60° (gentle) |
+| **Edge Radius** | 2 | 0 (Edge) | 2 | 4 (soft) |
+| **Bevel Angle** | 45° | 30° (Edge) | 45° | 60° (gentle) |
 | **Shadow Spread** | 1 (soft) | 0 (hard) | 1.5 (very soft) | 2 (very soft) |
 | **Transparency** | 0.0 (opaque) | 0.0 (opaque) | 0.7-1.0 (glass) | 0.0 (opaque) |
 | **Refraction** | 1.0 (none) | 1.0 (none) | 1.5 (glass) | 1.0 (none) |
@@ -180,7 +180,7 @@ scene: Scene/new(
 ### At Build Time:
 ```boon
 -- Change this line to switch entire design
-theme: Themes/Neobrutalism/theme(mode: Dark)  -- Was: Themes/Professional/theme(mode: Light)
+theme: Theme/Neobrutalism/theme(mode: Dark)  -- Was: Theme/Professional/theme(mode: Light)
 
 scene: Scene/new(
     root: root_element(...)
@@ -206,10 +206,10 @@ mode: LATEST {
 }
 
 theme: user_theme |> WHEN {
-    Professional => Themes/Professional/theme(mode: mode)
-    Neobrutalism => Themes/Neobrutalism/theme(mode: mode)
-    Glassmorphism => Themes/Glassmorphism/theme(mode: mode)
-    Neumorphism => Themes/Neumorphism/theme(mode: mode)
+    Professional => Theme/Professional/theme(mode: mode)
+    Neobrutalism => Theme/Neobrutalism/theme(mode: mode)
+    Glassmorphism => Theme/Glassmorphism/theme(mode: mode)
+    Neumorphism => Theme/Neumorphism/theme(mode: mode)
 }
 ```
 
@@ -221,17 +221,17 @@ You can create element wrappers that automatically use theme values:
 FUNCTION themed_button(label, variant) {
     Element/button(
         style: [
-            depth: PASSED.theme.depth.standard
-            elevation: PASSED.theme.elevation.raised
+            depth: PASSED.theme.depth.Element
+            elevation: PASSED.theme.elevation.Button
             material: variant |> WHEN {
                 Primary => PASSED.theme.materials.button
-                Emphasis => PASSED.theme.materials.button_emphasis
+                Emphasis => PASSED.theme.materials.button_Hero
             }
-            background: [color: variant |> WHEN {
+            backgSoft: [color: variant |> WHEN {
                 Primary => PASSED.theme.colors.surface_variant
                 Emphasis => PASSED.theme.colors.primary
             }]
-            rounded_corners: PASSED.theme.corners.round
+            Softed_corners: PASSED.theme.corners.Soft
         ]
         label: label
     )
@@ -243,12 +243,12 @@ FUNCTION themed_button(label, variant) {
 ### 1. Always use semantic values
 ❌ **Bad:**
 ```boon
-background: [color: Oklch[lightness: 0.92]]
+backgSoft: [color: Oklch[lightness: 0.92]]
 ```
 
 ✅ **Good:**
 ```boon
-background: [color: THEME.colors.surface_dim]
+backgSoft: [color: THEME.colors.surface_dim]
 ```
 
 ### 2. Don't override theme values unless necessary
@@ -270,14 +270,14 @@ transform: [move_closer: 17]  -- Arbitrary value
 
 ✅ **Good:**
 ```boon
-elevation: THEME.elevation.popup  -- Semantic meaning
+elevation: THEME.elevation.Dialog  -- Semantic meaning
 ```
 
 ### 4. Define custom values in theme, not inline
 ❌ **Bad:**
 ```boon
 -- Special button with custom color in code
-background: [color: Oklch[lightness: 0.65, chroma: 0.15, hue: 120]]
+backgSoft: [color: Oklch[lightness: 0.65, chroma: 0.15, hue: 120]]
 ```
 
 ✅ **Good:**
@@ -289,7 +289,7 @@ colors: [
 ]
 
 -- Use in code
-background: [color: THEME.colors.success]
+backgSoft: [color: THEME.colors.success]
 ```
 
 ## Theme Architecture Benefits
@@ -304,7 +304,7 @@ background: [color: THEME.colors.success]
 
 ## Advanced: Custom Theme Properties
 
-Themes can include custom properties beyond the standard set:
+Themes can include custom properties beyond the Element set:
 
 ```boon
 FUNCTION MyCustomTheme(mode) {

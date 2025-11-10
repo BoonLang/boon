@@ -1,0 +1,81 @@
+-- Theme System Router
+-- Routes theme requests to the appropriate theme implementation
+-- based on PASSED.theme_options.name and PASSED.theme_options.mode
+--
+-- Usage Examples:
+--   Materials: Theme/material(of: ButtonDelete[hover: element.hovered])
+--   Fonts: Theme/font(of: ButtonIcon[checked: checked])
+--   Borders: Theme/border(of: BorderFocus)
+--   Structural: Theme/depth(of: Major), Theme/elevation(of: Card), Theme/corners(of: Round)
+
+FUNCTION material(of) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => of |> Professional/material()
+        Glassmorphism => of |> Glassmorphism/material()
+        Neobrutalism => of |> Neobrutalism/material()
+        Neumorphism => of |> Neumorphism/material()
+    }
+}
+
+FUNCTION font(of) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => of |> Professional/font()
+        Glassmorphism => of |> Glassmorphism/font()
+        Neobrutalism => of |> Neobrutalism/font()
+        Neumorphism => of |> Neumorphism/font()
+    }
+}
+
+FUNCTION border(of) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => of |> Professional/border()
+        Glassmorphism => of |> Glassmorphism/border()
+        Neobrutalism => of |> Neobrutalism/border()
+        Neumorphism => of |> Neumorphism/border()
+    }
+}
+
+FUNCTION depth(of) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/depth().(of)
+        Glassmorphism => Glassmorphism/depth().(of)
+        Neobrutalism => Neobrutalism/depth().(of)
+        Neumorphism => Neumorphism/depth().(of)
+    }
+}
+
+FUNCTION elevation(of) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/elevation().(of)
+        Glassmorphism => Glassmorphism/elevation().(of)
+        Neobrutalism => Neobrutalism/elevation().(of)
+        Neumorphism => Neumorphism/elevation().(of)
+    }
+}
+
+FUNCTION corners(of) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/corners().(of)
+        Glassmorphism => Glassmorphism/corners().(of)
+        Neobrutalism => Neobrutalism/corners().(of)
+        Neumorphism => Neumorphism/corners().(of)
+    }
+}
+
+FUNCTION lights() {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/lights(mode: PASSED.theme_options.mode)
+        Glassmorphism => Glassmorphism/lights(mode: PASSED.theme_options.mode)
+        Neobrutalism => Neobrutalism/lights(mode: PASSED.theme_options.mode)
+        Neumorphism => Neumorphism/lights(mode: PASSED.theme_options.mode)
+    }
+}
+
+FUNCTION geometry() {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/geometry()
+        Glassmorphism => Glassmorphism/geometry()
+        Neobrutalism => Neobrutalism/geometry()
+        Neumorphism => Neumorphism/geometry()
+    }
+}

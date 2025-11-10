@@ -1,7 +1,7 @@
 -- TodoMVC with Emergent Physical Geometry + Theme System
 --
 -- GEOMETRY: Elements positioned in 3D space, bevels/shadows emerge naturally
--- THEME: Professional preset. See Themes/ for Neobrutalism, Glassmorphism, Neumorphism
+-- THEME: Professional preset. See Theme/ for Neobrutalism, Glassmorphism, Neumorphism
 -- DEMO: Consistent theme API - materials, fonts, borders use tagged functions
 --
 -- Theme provides: materials, fonts, borders, lights, geometry, depth, elevation, corners
@@ -125,7 +125,7 @@ FUNCTION new_todo(title) {
 ------------------------------------------------------------------------
 -- THEME - Professional design preset
 ------------------------------------------------------------------------
--- Theme functions (materials, fonts, borders) in Themes/Professional.bn
+-- Theme functions (materials, fonts, borders) in Theme/Professional.bn
 -- Structural properties (depth, elevation, corners, lights, geometry) also from theme
 -- To switch themes: Change theme_options.name to Neobrutalism, Glassmorphism, or Neumorphism
 -- To switch mode: Change theme_options.mode to Dark
@@ -144,8 +144,8 @@ scene: create_scene(PASS: [store: store, theme_options: theme_options])
 FUNCTION create_scene() {
     Scene/new(
         root: root_element()
-        lights: Themes/lights()
-        geometry: Themes/geometry()
+        lights: Theme/lights()
+        geometry: Theme/geometry()
     )
 }
 
@@ -161,7 +161,7 @@ FUNCTION root_element() {
         style: [
             width: Fill
             height: [sizing: Fill, minimum: Screen]
-            material: Background |> Themes/material()
+            material: Theme/material(of: Background)
         ]
         items: LIST { content_element() }
     )
@@ -207,7 +207,7 @@ FUNCTION header() {
         ]
         child: Element/text(
             element: [tag: H1]
-            style: [font: Header |> Themes/font()]
+            style: [font: Theme/font(of: Header)]
             text: 'todos'
         )
     )
@@ -224,10 +224,10 @@ FUNCTION main_panel() {
         gap: 0
         style: [
             width: Fill
-            depth: Themes/depth().major
-            transform: [move_closer: Themes/elevation().card]
-            rounded_corners: Themes/corners().standard
-            material: Panel |> Themes/material()
+            depth: Theme/depth(of: Container)
+            transform: [move_closer: Theme/elevation(of: Card)]
+            rounded_corners: Theme/corners(of: Comfort)
+            material: Theme/material(of: Panel)
         ]
         items: LIST {
             new_todo_title_text_input()
@@ -265,11 +265,11 @@ FUNCTION new_todo_title_text_input() {
         ]
         style: [
             padding: [column: 19, left: 60, right: 16]
-            font: Input |> Themes/font()
-            depth: Themes/depth().standard
-            transform: [move_further: Themes/elevation().recessed]
-            rounded_corners: Themes/corners().subtle
-            material: InputInterior[focus: element.focused] |> Themes/material()
+            font: Theme/font(of: Input)
+            depth: Theme/depth(of: Element)
+            transform: [move_further: Theme/elevation(of: Inset)]
+            rounded_corners: Theme/corners(of: Touch)
+            material: Theme/material(of: InputInterior[focus: element.focused])
         ]
         label: Hidden[text: 'What needs to be done?']
         text: LATEST {
@@ -278,7 +278,7 @@ FUNCTION new_todo_title_text_input() {
             PASSED.store.title_to_save |> THEN { '' }
         }
         placeholder: [
-            style: [font: Placeholder |> Themes/font()]
+            style: [font: Theme/font(of: Placeholder)]
             text: 'What needs to be done?'
         ]
         focus: True
@@ -301,8 +301,8 @@ FUNCTION todos_element() {
         direction: Column
         gap: 0
         style: [
-            borders: BorderStandard |> Themes/border()
-            material: SurfaceVariant |> Themes/material()
+            borders: Theme/border(of: Standard)
+            material: Theme/material(of: SurfaceVariant)
         ]
         items: PASSED.store.todos
             |> List/retain(item, if: PASSED.store.selected_filter |> WHILE {
@@ -327,7 +327,7 @@ FUNCTION todo_element(todo) {
             width: Fill
             depth: 2
             transform: [move_closer: 4]
-            material: InputExterior[hover: False] |> Themes/material()
+            material: Theme/material(of: InputExterior[hover: False])
         ]
         items: PASSED.store.selected_todo_id = todo.id |> WHILE {
             True => LIST {
@@ -369,7 +369,7 @@ FUNCTION toggle_all_checkbox() {
                     LIST { True, False } => [move_closer: 6]    -- Lifted on hover
                     LIST { False, False } => [move_closer: 4]   -- Resting raised
                 }
-                material: ToggleCheckbox[checked: element.checked, hover: element.hovered] |> Themes/material()
+                material: Theme/material(of: ToggleCheckbox[checked: element.checked, hover: element.hovered])
             ]
             label: Hidden[text: 'Toggle all']
             checked: checked
@@ -378,7 +378,7 @@ FUNCTION toggle_all_checkbox() {
                 style: [
                     height: 34
                     padding: [row: 27, column: 6]
-                    font: ButtonIcon[checked: checked] |> Themes/font()
+                    font: Theme/font(of: ButtonIcon[checked: checked])
                     transform: [rotate: 90, move_up: 18]
                 ]
                 text: '>'
@@ -404,12 +404,12 @@ FUNCTION editing_todo_title_element(todo) {
             width: 506
             padding: [row: 17, top: 17, bottom: 16]
             align: Right
-            font: Input |> Themes/font()
+            font: Theme/font(of: Input)
             depth: 6
             rounded_corners: 2
             transform: [move_closer: 24]
-            material: InputInterior[focus: True] |> Themes/material()
-            borders: BorderFocus |> Themes/border()
+            material: Theme/material(of: InputInterior[focus: True])
+            borders: Theme/border(of: Focus)
         ]
         label: Hidden[text: 'selected todo title']
         text: todo.edited_title
@@ -442,7 +442,7 @@ FUNCTION todo_checkbox(todo) {
                     LIST { True, False } => [move_closer: 6]    -- Lifted on hover
                     LIST { False, False } => [move_closer: 4]   -- Resting raised
                 }
-                material: TodoCheckbox[checked: todo.completed, hover: element.hovered] |> Themes/material()
+                material: Theme/material(of: TodoCheckbox[checked: todo.completed, hover: element.hovered])
             ]
             label: Reference[element: todo.todo_elements.todo_title_element]
             checked: todo.completed
@@ -480,7 +480,7 @@ FUNCTION todo_title_element(todo) {
         ]
         style: [
             width: Fill
-            font: TodoTitle[completed: todo.completed] |> Themes/font()
+            font: Theme/font(of: TodoTitle[completed: todo.completed])
             padding: [column: 15, left: 15, right: 60]
             clip: Row
         ]
@@ -508,8 +508,8 @@ FUNCTION remove_todo_button() {
                 LIST { True, False } => [move_closer: 12, move_left: 50, move_down: 14]
                 LIST { False, False } => [move_closer: 8, move_left: 50, move_down: 14]
             }
-            material: ButtonDelete[hover: element.hovered] |> Themes/material()
-            font: ButtonDelete |> Themes/font()
+            material: Theme/material(of: ButtonDelete[hover: element.hovered])
+            font: Theme/font(of: ButtonDelete)
         ]
         label: '×'
     )
@@ -526,8 +526,8 @@ FUNCTION panel_footer() {
         gap: 0
         style: [
             padding: [row: 15, column: 8]
-            material: PanelFooter |> Themes/material()
-            borders: BorderStandard |> Themes/border()
+            material: Theme/material(of: PanelFooter)
+            borders: Theme/border(of: Standard)
         ]
         items: LIST {
             active_items_count_text()
@@ -552,7 +552,7 @@ FUNCTION panel_footer() {
 FUNCTION active_items_count_text() {
     Element/text(
         element: []
-        style: [font: Secondary |> Themes/font()]
+        style: [font: Theme/font(of: Secondary)]
         text: PASSED.store.todos
             |> List/retain(item, if: item.completed |> Bool/not())
             |> List/count
@@ -596,18 +596,18 @@ FUNCTION filter_button(filter) {
             ]
             style: [
                 padding: [row: 8, column: 4]
-                depth: Themes/depth().standard
-                rounded_corners: Themes/corners().round
+                depth: Theme/depth(of: Element)
+                rounded_corners: Theme/corners(of: Soft)
                 transform: LIST { selected, element.hovered, element.pressed } |> WHEN {
                     LIST { __, __, True } => []
                     LIST { True, __, False } => [move_closer: 6]  -- raised + hover_lift
                     LIST { False, True, False } => [move_closer: 4]
                     LIST { False, False, False } => []
                 }
-                material: ButtonFilter[selected: selected, hover: element.hovered] |> Themes/material()
-                font: Secondary |> Themes/font()
+                material: Theme/material(of: ButtonFilter[selected: selected, hover: element.hovered])
+                font: Theme/font(of: Secondary)
                 outline: selected |> WHEN {
-                    True => OutlinePrimary |> Themes/border()
+                    True => Theme/border(of: Primary)
                     False => NoOutline
                 }
             ]
@@ -641,8 +641,8 @@ FUNCTION remove_completed_button() {
                 LIST { True, False } => [move_closer: 4] -- Raised on hover
                 LIST { False, False } => []              -- Resting flat
             }
-            material: ButtonClear[hover: element.hovered] |> Themes/material()
-            font: ClearButton[hover: element.hovered] |> Themes/font()
+            material: Theme/material(of: ButtonClear[hover: element.hovered])
+            font: Theme/font(of: ClearButton[hover: element.hovered])
         ]
         label: 'Clear completed'
     )
@@ -661,12 +661,12 @@ FUNCTION footer() {
         items: LIST {
             Element/paragraph(
                 element: []
-                style: [font: Small |> Themes/font()]
+                style: [font: Theme/font(of: Small)]
                 contents: LIST { 'Double-click to edit a todo' }
             )
             Element/paragraph(
                 element: []
-                style: [font: Small |> Themes/font()]
+                style: [font: Theme/font(of: Small)]
                 contents: LIST {
                     'Created by '
                     footer_link(
@@ -677,7 +677,7 @@ FUNCTION footer() {
             )
             Element/paragraph(
                 element: []
-                style: [font: Small |> Themes/font()]
+                style: [font: Theme/font(of: Small)]
                 contents: LIST {
                     'Part of '
                     footer_link(label: 'TodoMVC', to: 'http://todomvc.com')

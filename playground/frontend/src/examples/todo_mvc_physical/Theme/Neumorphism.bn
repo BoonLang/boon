@@ -225,16 +225,16 @@ FUNCTION theme(mode) {
             popup: 16
             floating: 6
             raised: 3              -- Very subtle raises
-            grounded: 0
+            Base: 0
             recessed: -3           -- Shallow recesses
         ]
 
         -- Depth: Standard thickness
         depth: [
-            major: 8
-            standard: 6
+            Container: 8
+            Element: 6
             subtle: 3
-            emphasis: 10
+            Hero: 10
         ]
 
         -- Interaction: Gentle, smooth movement
@@ -251,7 +251,7 @@ FUNCTION theme(mode) {
             subtle: 8
             standard: 12
             round: 16
-            full: Fully
+            Pill: Fully
         ]
 
         -- Colors: Text, borders, and glow effects (surfaces are in materials)

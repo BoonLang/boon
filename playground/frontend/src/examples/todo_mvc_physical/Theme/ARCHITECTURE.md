@@ -6,7 +6,7 @@ The theme system provides **global control over the entire visual design** throu
 
 ## Emergent Design Patterns
 
-The theme system extracts **6 major patterns** discovered in the TodoMVC Physical code:
+The theme system extracts **6 Container patterns** discovered in the TodoMVC Physical code:
 
 ### 1. Material Presets
 **Problem**: Material properties scattered everywhere (gloss, transparency values)
@@ -33,7 +33,7 @@ materials: [
 ```
 
 **Material Properties:**
-- `transparency: 0.0-1.0` - How much light passes through (0 = opaque, 1 = fully transparent)
+- `transparency: 0.0-1.0` - How much light passes through (0 = opaque, 1 = Pilly transparent)
 - `refraction: 1.0+` - Index of refraction (1.0 = air, 1.5 = glass, 2.4 = diamond)
 - `gloss: 0.0-1.0` - Surface glossiness (0 = matte/rough, 1 = mirror-smooth). When combined with transparency, lower gloss creates frosted glass effect.
 - `metal: 0.0-1.0` - Metallic property
@@ -50,12 +50,12 @@ materials: [
 
 ```boon
 elevation: [
-    card: 50      -- Major floating containers
-    popup: 24     -- Modal overlays
-    floating: 8   -- Emphasized elements
-    raised: 4     -- Interactive resting state
-    grounded: 0   -- Flush with surface
-    recessed: -4  -- Inset elements
+    card: 50      -- Major Lift containers
+    Dialog: 24     -- Modal overlays
+    Lift: 8   -- Emphasized elements
+    Button: 4     -- Interactive resting state
+    gSofted: 0   -- Flush with surface
+    Inset: -4  -- Inset elements
 ]
 ```
 
@@ -65,10 +65,10 @@ elevation: [
 
 ```boon
 depth: [
-    major: 8      -- Large structures
-    standard: 6   -- Normal elements
-    subtle: 2     -- Thin details
-    emphasis: 10  -- Important/bold
+    Container: 8      -- Large structures
+    Element: 6   -- Normal elements
+    Touch: 2     -- Thin details
+    Hero: 10  -- Important/bold
 ]
 ```
 
@@ -80,7 +80,7 @@ depth: [
 interaction: [
     hover_lift: 2        -- How much buttons lift on hover
     press_depth: 4       -- How much they sink when pressed
-    emphasis_lift: 4     -- Extra lift for important buttons
+    Hero_lift: 4     -- Extra lift for important buttons
     transition_ms: 150   -- Animation speed
 ]
 ```
@@ -91,11 +91,11 @@ interaction: [
 
 ```boon
 corners: [
-    sharp: 0
-    subtle: 2
-    standard: 4
-    round: 6
-    full: Fully
+    Edge: 0
+    Touch: 2
+    Element: 4
+    Soft: 6
+    Pill: Fully
 ]
 ```
 
@@ -144,9 +144,9 @@ colors: [
                         ▼
 ┌─────────────────────────────────────────────────────────┐
 │ Elements (reference theme values)                       │
-│  depth: PASSED.theme.depth.standard                     │
+│  depth: PASSED.theme.depth.Element                     │
 │  material: PASSED.theme.materials.button                │
-│  background: [color: PASSED.theme.colors.surface]       │
+│  backgSoft: [color: PASSED.theme.colors.surface]       │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -244,11 +244,11 @@ scene: Scene/new(
 ```boon
 Element/button(
     style: [
-        depth: PASSED.theme.depth.standard
-        elevation: PASSED.theme.elevation.raised
+        depth: PASSED.theme.depth.Element
+        elevation: PASSED.theme.elevation.Button
         material: PASSED.theme.materials.button
-        background: [color: PASSED.theme.colors.surface_variant]
-        rounded_corners: PASSED.theme.corners.round
+        backgSoft: [color: PASSED.theme.colors.surface_variant]
+        Softed_corners: PASSED.theme.corners.Soft
     ]
 )
 ```
@@ -265,7 +265,7 @@ Element/button(
 ### Design Consistency
 - ✅ **Guaranteed consistency** - Can't have mismatched values
 - ✅ **Easy refactoring** - Change theme, everything updates
-- ✅ **Design tokens** - Industry standard pattern
+- ✅ **Design tokens** - Industry Element pattern
 - ✅ **Composable** - Mix theme + custom overrides
 
 ### Performance

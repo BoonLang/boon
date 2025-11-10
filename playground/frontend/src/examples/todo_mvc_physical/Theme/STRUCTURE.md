@@ -5,7 +5,7 @@
 ```
 todo_mvc_physical/
 ├── todo_mvc_physical.bn          (Main app - references themes)
-└── Themes/                        (Theme definitions)
+└── Theme/                        (Theme definitions)
     ├── README.md                  (Overview)
     ├── USAGE.md                   (Usage guide)
     ├── ARCHITECTURE.md            (System design)
@@ -18,7 +18,7 @@ todo_mvc_physical/
 
 ## Naming Convention
 
-### Folder: `Themes/` (capitalized)
+### Folder: `Theme/` (capitalized)
 - Capital `T` to indicate it's a module/namespace
 - Matches Boon convention for folders that export definitions
 
@@ -35,7 +35,7 @@ todo_mvc_physical/
 The syntax follows: `Folder/File/function(args)`
 
 ```boon
-theme: Themes/Professional/theme(mode: Light)
+theme: Theme/Professional/theme(mode: Light)
         ↑         ↑           ↑          ↑
      folder     file      function    argument
 ```
@@ -44,22 +44,22 @@ theme: Themes/Professional/theme(mode: Light)
 
 ```boon
 -- Professional theme, light mode
-theme: Themes/Professional/theme(mode: Light)
+theme: Theme/Professional/theme(mode: Light)
 
 -- Neobrutalism theme, dark mode
-theme: Themes/Neobrutalism/theme(mode: Dark)
+theme: Theme/Neobrutalism/theme(mode: Dark)
 
 -- Glassmorphism theme, light mode
-theme: Themes/Glassmorphism/theme(mode: Light)
+theme: Theme/Glassmorphism/theme(mode: Light)
 
 -- Neumorphism theme, dark mode
-theme: Themes/Neumorphism/theme(mode: Dark)
+theme: Theme/Neumorphism/theme(mode: Dark)
 ```
 
 ## Why This Structure?
 
 ### ✅ Clear namespace
-- `Themes/Professional` is unambiguous
+- `Theme/Professional` is unambiguous
 - No conflicts with other `Professional` definitions
 
 ### ✅ Consistent function name
@@ -67,11 +67,11 @@ theme: Themes/Neumorphism/theme(mode: Dark)
 - No need to remember different function names
 
 ### ✅ Clean syntax
-- `Themes/Professional/theme(mode: Light)` is concise
+- `Theme/Professional/theme(mode: Light)` is concise
 - Easy to switch: just change the file name
 
 ### ✅ Discoverable
-- IDE can autocomplete: `Themes/` → shows all available themes
+- IDE can autocomplete: `Theme/` → shows all available themes
 - Folder structure makes it obvious what themes exist
 
 ### ✅ Follows patterns
@@ -108,14 +108,14 @@ FUNCTION theme(mode) {
         -- Elevation scale
         elevation: [
             card: N
-            raised: N
+            Button: N
             -- etc
         ]
 
         -- Depth scale
         depth: [
-            major: N
-            standard: N
+            Container: N
+            Element: N
             -- etc
         ]
 
@@ -128,8 +128,8 @@ FUNCTION theme(mode) {
 
         -- Corner radius scale
         corners: [
-            sharp: N
-            standard: N
+            Edge: N
+            Element: N
             -- etc
         ]
 
@@ -148,7 +148,7 @@ FUNCTION theme(mode) {
 -- todo_mvc_physical.bn
 
 -- Define theme
-theme: Themes/Professional/theme(mode: Light)
+theme: Theme/Professional/theme(mode: Light)
 
 -- Apply theme to scene
 scene: Scene/new(
@@ -167,10 +167,10 @@ scene: Scene/new(
 FUNCTION my_button() {
     Element/button(
         style: [
-            depth: PASSED.theme.depth.standard
-            elevation: PASSED.theme.elevation.raised
+            depth: PASSED.theme.depth.Element
+            elevation: PASSED.theme.elevation.Button
             material: PASSED.theme.materials.button
-            background: [color: PASSED.theme.colors.surface_variant]
+            backgSoft: [color: PASSED.theme.colors.surface_variant]
         ]
         label: 'Click me'
     )
@@ -181,11 +181,11 @@ FUNCTION my_button() {
 
 To create a new theme:
 
-1. **Create file**: `Themes/MyTheme.bn`
+1. **Create file**: `Theme/MyTheme.bn`
 2. **Define function**: `FUNCTION theme(mode) { [...] }`
 3. **Fill in all properties**: lights, geometry, materials, etc.
 4. **Test both modes**: Light and Dark
-5. **Use it**: `theme: Themes/MyTheme/theme(mode: Light)`
+5. **Use it**: `theme: Theme/MyTheme/theme(mode: Light)`
 
 ## Comparison to Old Approach
 
@@ -199,8 +199,8 @@ theme: Neobrutalism(mode: Dark)       -- Where is this defined?
 ### New (current):
 ```boon
 -- Clear namespace:
-theme: Themes/Professional/theme(mode: Light)   -- Folder/File/function
-theme: Themes/Neobrutalism/theme(mode: Dark)    -- Obvious structure
+theme: Theme/Professional/theme(mode: Light)   -- Folder/File/function
+theme: Theme/Neobrutalism/theme(mode: Dark)    -- Obvious structure
 ```
 
 ## Future Enhancements
@@ -208,20 +208,20 @@ theme: Themes/Neobrutalism/theme(mode: Dark)    -- Obvious structure
 ### Custom Theme Paths
 ```boon
 -- User-defined themes in different folder
-theme: MyThemes/CorporateBrand/theme(mode: Light)
+theme: MyTheme/CorporateBrand/theme(mode: Light)
 ```
 
 ### Theme Composition
 ```boon
 -- Merge themes
-base: Themes/Professional/theme(mode: Light)
-custom: Themes/MyCustom/theme(mode: Light)
+base: Theme/Professional/theme(mode: Light)
+custom: Theme/MyCustom/theme(mode: Light)
 theme: Theme/merge(base, custom)
 ```
 
 ### Theme Variants
 ```boon
 -- Theme with preset mode
-theme: Themes/Professional/light()  -- Shorthand for theme(mode: Light)
-theme: Themes/Professional/dark()   -- Shorthand for theme(mode: Dark)
+theme: Theme/Professional/light()  -- Shorthand for theme(mode: Light)
+theme: Theme/Professional/dark()   -- Shorthand for theme(mode: Dark)
 ```

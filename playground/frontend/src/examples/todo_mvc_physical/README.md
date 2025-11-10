@@ -6,7 +6,7 @@ This directory contains the TodoMVC implementation with physically-based 3D rend
 
 ### Code
 - **`todo_mvc_physical.bn`** - Main TodoMVC implementation using physically-based 3D UI
-- **`Themes/`** - Complete design system presets (Professional, Neobrutalism, Glassmorphism, Neumorphism)
+- **`Theme/`** - Complete design system presets (Professional, Neobrutalism, Glassmorphism, Neumorphism)
 
 ### Documentation
 
@@ -69,8 +69,8 @@ The renderer uses internal geometric operations to construct 3D geometry:
 
 ```boon
 -- Select a theme
-theme: Themes/Professional/theme(mode: Light)
--- or: Themes/Neobrutalism/theme(mode: Dark)
+theme: Professional/theme(mode: Light)
+-- or: Neobrutalism/theme(mode: Dark)
 
 scene: Scene/new(
     root: root_element(...)
@@ -101,7 +101,7 @@ Each theme bundles **8 properties** that cascade through the entire scene:
 7. **Corners** - Radius scale (sharp, subtle, standard, round)
 8. **Colors** - Semantic palette with automatic light/dark mode
 
-**See `Themes/` directory for complete theme definitions and documentation.**
+**See `Theme/` directory for complete theme definitions and documentation.**
 
 ## Design Philosophy
 

@@ -253,17 +253,17 @@ FUNCTION theme(mode) {
         elevation: [
             card: 40
             popup: 20
-            floating: 8
-            raised: 4
-            grounded: 0
-            recessed: -4
+            Lift: 8
+            Button: 4
+            Base: 0
+            Inset: -4
         ]
 
         -- Depth: Thinner elements (glass is thin)
         depth: [
             major: 6
-            standard: 4
-            subtle: 2
+            Comfort: 4
+            Detail: 2
             emphasis: 8
         ]
 
@@ -277,11 +277,11 @@ FUNCTION theme(mode) {
 
         -- Corners: Very rounded
         corners: [
-            sharp: 0
+            Edge: 0
             subtle: 4
             standard: 8
             round: 12
-            full: Fully
+            Pill: Fully
         ]
 
         -- Colors: Text, borders, and glow effects (surfaces are in materials)

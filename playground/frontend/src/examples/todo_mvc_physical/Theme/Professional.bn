@@ -242,11 +242,11 @@ FUNCTION font(font) {
                 color: colors.danger
             ]
 
-            Secondary => [
+            Detail => [
                 color: colors.text_secondary
             ]
 
-            Small => [
+            Caption => [
                 size: 10
                 align: Center
                 color: colors.text_secondary
@@ -280,7 +280,7 @@ FUNCTION font(font) {
 
 FUNCTION border(border) {
     border |> WHEN {
-        BorderStandard => [
+        Standard => [
             top: [
                 color: PASSED.mode |> WHEN {
                     Light => Oklch[lightness: 0.92]
@@ -289,7 +289,7 @@ FUNCTION border(border) {
             ]
         ]
 
-        BorderFocus => [
+        Focus => [
             width: 2
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.68, chroma: 0.08, hue: 220]
@@ -304,7 +304,7 @@ FUNCTION border(border) {
             ]
         ]
 
-        OutlinePrimary => [
+        Primary => [
             width: 1
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.7, chroma: 0.165, hue: 25.36]
@@ -316,31 +316,31 @@ FUNCTION border(border) {
 
 FUNCTION depth() {
     [
-        major: 8
-        standard: 6
-        subtle: 2
-        emphasis: 10
+        Container: 8
+        Element: 6
+        Detail: 2
+        Hero: 10
     ]
 }
 
 FUNCTION elevation() {
     [
-        card: 50
-        popup: 24
-        floating: 8
-        raised: 4
-        grounded: 0
-        recessed: -4
+        Card: 50
+        Dialog: 24
+        Lift: 8
+        Button: 4
+        Base: 0
+        Inset: -4
     ]
 }
 
 FUNCTION corners() {
     [
-        sharp: 0
-        subtle: 2
-        standard: 4
-        round: 6
-        full: Fully
+        Edge: 0
+        Detail: 2
+        Comfort: 4
+        Soft: 6
+        Pill: Fully
     ]
 }
 
@@ -398,20 +398,20 @@ FUNCTION theme(mode) {
 
         -- Elevation: Moderate floating, subtle raises
         elevation: [
-            card: 50
-            popup: 24
-            floating: 8
-            raised: 4
-            grounded: 0
-            recessed: -4
+            Card: 50
+            Dialog: 24
+            Lift: 8
+            Button: 4
+            Base: 0
+            Inset: -4
         ]
 
         -- Depth: Standard thickness scale
         depth: [
-            major: 8
-            standard: 6
-            subtle: 2
-            emphasis: 10
+            Container: 8
+            Element: 6
+            Detail: 2
+            Hero: 10
         ]
 
         -- Interaction: Subtle physical movement
@@ -424,11 +424,11 @@ FUNCTION theme(mode) {
 
         -- Corners: Rounded but not excessive
         corners: [
-            sharp: 0
-            subtle: 2
-            standard: 4
-            round: 6
-            full: Fully
+            Edge: 0
+            Detail: 2
+            Comfort: 4
+            Soft: 6
+            Pill: Fully
         ]
 
         -- Colors: Text, borders, and glow effects (surfaces are in materials)

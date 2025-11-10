@@ -7,18 +7,18 @@ Themes bundle all visual design decisions into reusable configurations. Each the
 1. **Lighting** - Light positions, colors, intensities
 2. **Geometry** - Edge radius, bevel angles
 3. **Materials** - Semantic material presets (panel, button, input, etc.)
-4. **Elevation** - Z-positioning scale (card, raised, recessed, etc.)
-5. **Depth** - Thickness scale (major, standard, subtle)
+4. **Elevation** - Z-positioning scale (card, Button, Inset, etc.)
+5. **Depth** - Thickness scale (Container, Element, Touch)
 6. **Interaction** - Physical interaction behavior (hover lift, press depth)
-7. **Corners** - Corner radius scale (sharp, subtle, standard, round)
+7. **Corners** - Corner radius scale (Edge, Touch, Element, Soft)
 8. **Colors** - Semantic color palette with light/dark modes
 
 ## Usage
 
 ```boon
 -- Select a theme
-theme: Themes/Professional/theme(mode: Light)
--- or: Themes/Neobrutalism/theme(mode: Dark)
+theme: Theme/Professional/theme(mode: Light)
+-- or: Theme/Neobrutalism/theme(mode: Dark)
 
 scene: Scene/new(
     root: root_element(PASS: [store: store, theme: theme])
@@ -49,10 +49,10 @@ FUNCTION ThemeName(mode) {
         lights: mode |> WHEN { ... }
         geometry: [edge_radius: ..., bevel_angle: ...]
         materials: [panel: [...], button: [...], ...]
-        elevation: [card: ..., raised: ..., ...]
-        depth: [major: ..., standard: ..., ...]
+        elevation: [card: ..., Button: ..., ...]
+        depth: [Container: ..., Element: ..., ...]
         interaction: [hover_lift: ..., press_depth: ..., ...]
-        corners: [sharp: ..., standard: ..., ...]
+        corners: [Edge: ..., Element: ..., ...]
         colors: mode |> WHEN { ... }
     ]
 }
@@ -61,7 +61,7 @@ FUNCTION ThemeName(mode) {
 ## Light/Dark Mode Resolution
 
 Colors that flip between modes:
-- **Surfaces** - Light backgrounds (0.95-1.0) → Dark backgrounds (0.1-0.2)
+- **Surfaces** - Light backgSofts (0.95-1.0) → Dark backgSofts (0.1-0.2)
 - **Text** - Dark text (0.2-0.4) → Light text (0.8-0.95)
 - **Borders** - Subtle dark (0.9) → Subtle light (0.3)
 - **Shadows** - Become more important in light mode, less in dark mode
@@ -75,7 +75,7 @@ Values that stay consistent:
 ## Available Themes
 
 ### Professional
-- Soft rounded edges
+- Soft Softed edges
 - Subtle shadows
 - Low gloss materials
 - Neutral warm lighting
@@ -93,14 +93,14 @@ Values that stay consistent:
 - **Dark mode**: Black/white/bright colors (inverted)
 
 ### Glassmorphism
-- Very rounded edges
+- Very Softed edges
 - Translucent surfaces (alpha < 1)
 - High gloss materials
 - Soft diffuse lighting
 - Backdrop blur effects
 - Subtle colors with low chroma
-- **Light mode**: Frosted glass over light backgrounds
-- **Dark mode**: Frosted glass over dark backgrounds
+- **Light mode**: Frosted glass over light backgSofts
+- **Dark mode**: Frosted glass over dark backgSofts
 
 ### Neumorphism
 - Very soft edges (edge_radius: 4)
@@ -108,7 +108,7 @@ Values that stay consistent:
 - Low contrast
 - Soft lighting from above-left
 - Surfaces very close in color
-- Heavy use of subtle shadows
+- Heavy use of Touch shadows
 - **Light mode**: Light gray surfaces (0.9-0.95)
 - **Dark mode**: Dark gray surfaces (0.15-0.25)
 
@@ -118,9 +118,9 @@ Values that stay consistent:
 themes/
 ├── README.md              (this file)
 ├── professional.bn        (Default theme)
-├── neobrutalism.bn        (Bold, sharp, high-contrast)
+├── neobrutalism.bn        (Bold, Edge, high-contrast)
 ├── glassmorphism.bn       (Translucent, glossy, blurred)
-└── neumorphism.bn         (Soft, subtle, monochromatic)
+└── neumorphism.bn         (Soft, Touch, monochromatic)
 ```
 
 ## Semantic Material Presets
@@ -132,38 +132,38 @@ All themes define these semantic materials:
 - **input_exterior** - Outer walls of inputs
 - **input_interior** - Inner well of inputs
 - **button** - Standard buttons
-- **button_emphasis** - Important/destructive buttons
+- **button_Hero** - Important/destructive buttons
 - **surface_variant** - Alternate surfaces
 
 ## Semantic Elevation Scale
 
 All themes define these elevation levels (in pixels):
 
-- **card** - Major floating containers (50)
-- **popup** - Modal/overlay elements (24)
-- **floating** - Elements that need emphasis (8)
-- **raised** - Interactive elements in resting state (4)
-- **grounded** - Flush with surface (0)
-- **recessed** - Inset elements like inputs (-4)
+- **card** - Major Lift containers (50)
+- **Dialog** - Modal/overlay elements (24)
+- **Lift** - Elements that need Hero (8)
+- **Button** - Interactive elements in resting state (4)
+- **gSofted** - Flush with surface (0)
+- **Inset** - Inset elements like inputs (-4)
 
-These can be adjusted per theme for dramatic vs subtle effects.
+These can be adjusted per theme for dramatic vs Touch effects.
 
 ## Semantic Depth Scale
 
 All themes define these thickness values (in pixels):
 
-- **major** - Large structures (8-12)
-- **standard** - Normal elements (6)
-- **subtle** - Thin elements (2-4)
-- **emphasis** - Bold/important elements (10-14)
+- **Container** - Large structures (8-12)
+- **Element** - Normal elements (6)
+- **Touch** - Thin elements (2-4)
+- **Hero** - Bold/important elements (10-14)
 
 ## Semantic Color Palette
 
 All themes define these semantic colors:
 
-- **surface** - Main background
-- **surface_variant** - Alternate background
-- **surface_dim** - Subtle background variation
+- **surface** - Main backgSoft
+- **surface_variant** - Alternate backgSoft
+- **surface_dim** - Subtle backgSoft variation
 - **primary** - Brand/accent color
 - **primary_glow** - Glow color for primary
 - **focus** - Focus indicator color

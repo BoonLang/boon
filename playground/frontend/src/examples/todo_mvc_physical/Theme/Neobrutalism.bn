@@ -218,7 +218,7 @@ FUNCTION theme(mode) {
             popup: 32              -- Very prominent
             floating: 12           -- More dramatic
             raised: 6              -- Bolder raises
-            grounded: 0
+            Base: 0
             recessed: -6           -- Deeper recesses
         ]
 
@@ -240,11 +240,11 @@ FUNCTION theme(mode) {
 
         -- Corners: Sharp or very round, no in-between
         corners: [
-            sharp: 0               -- Always sharp
+            Edge: 0               -- Always sharp
             subtle: 0              -- No subtle rounding
             standard: 0            -- Default sharp
             round: 12              -- When rounded, go big
-            full: Fully
+            Pill: Fully
         ]
 
         -- Colors: Text, borders, and glow effects (surfaces are in materials)
