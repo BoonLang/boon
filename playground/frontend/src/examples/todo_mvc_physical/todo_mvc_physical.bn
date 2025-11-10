@@ -4,6 +4,18 @@
 -- THEME: Professional preset. See Theme/ for Neobrutalism, Glassmorphism, Neumorphism
 -- DEMO: Consistent theme API - materials, fonts, borders use tagged functions
 --
+-- EMERGENT PATTERNS IMPLEMENTED:
+--   Pattern 1: Material physics (elasticity) → automatic interaction transforms
+--   Pattern 2: Beveled geometry → automatic edge definition (replaces borders)
+--   Pattern 3: Depth from element type + importance (semantic depth scaling)
+--   Pattern 4: Text hierarchy from z-position (depth-based lighting affects brightness)
+--   Pattern 5: Focus spotlight (dynamic lighting for focused elements)
+--   Pattern 6: Cursor gravity field (EXPERIMENTAL - inverse-square force)
+--   Pattern 7: Corner radius from material hardness (soft materials = rounder)
+--   Pattern 8: Disabled state as ghost material (translucent, recessed)
+--   Pattern 9: Sweep/shimmer lights for loading states (when applicable)
+--   Pattern 10: Emissive materials for state indication (error, success, warning)
+--
 -- Theme provides: materials, fonts, borders, lights, geometry, depth, elevation, corners
 -- Switch theme: Change theme_options.name (Professional, Neobrutalism, Glassmorphism, Neumorphism)
 -- Switch mode: Change theme_options.mode (Light, Dark)
@@ -23,6 +35,12 @@ store: [
         toggle_all_checkbox: LINK
         new_todo_title_text_input: LINK
     ]
+    focused_element: LATEST {
+        None
+        elements.new_todo_title_text_input.focused
+            |> WHEN { True => Some[elements.new_todo_title_text_input], False => None }
+    }
+    cursor_position: Mouse/position()
     selected_filter: Router/route() |> WHEN {
         '/active' => Active
         '/completed' => Completed
@@ -145,6 +163,18 @@ FUNCTION create_scene() {
     Scene/new(
         root: root_element()
         lights: Theme/lights()
+            |> List/append(
+                PASSED.store.focused_element |> WHEN {
+                    Some[el] => Light/spot(
+                        target: el.position,
+                        color: Oklch[lightness: 0.7, chroma: 0.1, hue: 220],
+                        intensity: 0.3,
+                        radius: 60,
+                        falloff: Gaussian
+                    )
+                    None => SKIP
+                }
+            )
         geometry: Theme/geometry()
     )
 }
@@ -207,7 +237,10 @@ FUNCTION header() {
         ]
         child: Element/text(
             element: [tag: H1]
-            style: [font: Theme/font(of: Header)]
+            style: [
+                font: Theme/font(of: Header)
+                transform: [move_closer: 6]  -- Hero text: raised above surface (catches light)
+            ]
             text: 'todos'
         )
     )
@@ -325,7 +358,7 @@ FUNCTION todo_element(todo) {
         gap: 5
         style: [
             width: Fill
-            depth: 2
+            depth: Theme/depth(of: Detail)
             transform: [move_closer: 4]
             material: Theme/material(of: InputExterior[hover: False])
         ]
@@ -361,14 +394,12 @@ FUNCTION toggle_all_checkbox() {
             style: [
                 width: 60
                 height: Fill
-                depth: 6
-                rounded_corners: 2
-                -- Button physically moves when interacted with
-                transform: LIST { element.hovered, element.pressed } |> WHEN {
-                    LIST { __, True } => [move_further: 4]      -- Pressed down
-                    LIST { True, False } => [move_closer: 6]    -- Lifted on hover
-                    LIST { False, False } => [move_closer: 4]   -- Resting raised
-                }
+                depth: Theme/depth(of: Element)
+                rounded_corners: Theme/corners(of: Touch)
+                transform: Theme/interaction_transform(
+                    material: Checkbox,
+                    state: [hovered: element.hovered, pressed: element.pressed]
+                )
                 material: Theme/material(of: ToggleCheckbox[checked: element.checked, hover: element.hovered])
             ]
             label: Hidden[text: 'Toggle all']
@@ -405,8 +436,8 @@ FUNCTION editing_todo_title_element(todo) {
             padding: [row: 17, top: 17, bottom: 16]
             align: Right
             font: Theme/font(of: Input)
-            depth: 6
-            rounded_corners: 2
+            depth: Theme/depth(of: Element)
+            rounded_corners: Theme/corners(of: Touch)
             transform: [move_closer: 24]
             material: Theme/material(of: InputInterior[focus: True])
             borders: Theme/border(of: Focus)
@@ -435,13 +466,12 @@ FUNCTION todo_checkbox(todo) {
             ]
             style: [
                 size: 40
-                depth: 6
-                rounded_corners: Fully
-                transform: LIST { element.hovered, element.pressed } |> WHEN {
-                    LIST { __, True } => []                      -- Pressed flush
-                    LIST { True, False } => [move_closer: 6]    -- Lifted on hover
-                    LIST { False, False } => [move_closer: 4]   -- Resting raised
-                }
+                depth: Theme/depth_scale(element_type: Checkbox, importance: Secondary)
+                rounded_corners: Theme/corners_from_material(of: Circular)
+                transform: Theme/interaction_transform(
+                    material: Checkbox,
+                    state: [hovered: element.hovered, pressed: element.pressed]
+                )
                 material: Theme/material(of: TodoCheckbox[checked: todo.completed, hover: element.hovered])
             ]
             label: Reference[element: todo.todo_elements.todo_title_element]
@@ -483,6 +513,10 @@ FUNCTION todo_title_element(todo) {
             font: Theme/font(of: TodoTitle[completed: todo.completed])
             padding: [column: 15, left: 15, right: 60]
             clip: Row
+            transform: todo.completed |> WHEN {
+                True => [move_further: Theme/text_hierarchy_depth(Tertiary)]   -- Completed: recessed, dimmer
+                False => [move_further: Theme/text_hierarchy_depth(Primary)]   -- Active: surface level
+            }
         ]
         label: todo.title
     )
@@ -493,26 +527,33 @@ FUNCTION todo_title_element(todo) {
 ------------------------------------------------------------------------
 
 FUNCTION remove_todo_button() {
-    Element/button(
-        element:[
-            event: [press: LINK]
-            hovered: LINK
-            pressed: LINK
-        ]
-        style: [
-            size: 40
-            depth: 10
-            rounded_corners: Fully
-            transform: LIST { element.hovered, element.pressed } |> WHEN {
-                LIST { __, True } => [move_closer: 4, move_left: 50, move_down: 14]
-                LIST { True, False } => [move_closer: 12, move_left: 50, move_down: 14]
-                LIST { False, False } => [move_closer: 8, move_left: 50, move_down: 14]
-            }
-            material: Theme/material(of: ButtonDelete[hover: element.hovered])
-            font: Theme/font(of: ButtonDelete)
-        ]
-        label: '×'
-    )
+    BLOCK {
+        interaction: Theme/interaction_transform(
+            material: ButtonDestructive,
+            state: [hovered: element.hovered, pressed: element.pressed]
+        )
+
+        Element/button(
+            element:[
+                event: [press: LINK]
+                hovered: LINK
+                pressed: LINK
+            ]
+            style: [
+                size: 40
+                depth: Theme/depth_scale(element_type: Button, importance: Destructive)
+                rounded_corners: Theme/corners_from_material(of: Circular)
+                transform: [
+                    move_closer: interaction.move_closer,
+                    move_left: 50,
+                    move_down: 14
+                ]
+                material: Theme/material(of: ButtonDelete[hover: element.hovered])
+                font: Theme/font(of: ButtonDelete)
+            ]
+            label: '×'
+        )
+    }
 }
 
 ------------------------------------------------------------------------
@@ -552,7 +593,10 @@ FUNCTION panel_footer() {
 FUNCTION active_items_count_text() {
     Element/text(
         element: []
-        style: [font: Theme/font(of: Secondary)]
+        style: [
+            font: Theme/font(of: Secondary)
+            transform: [move_further: Theme/text_hierarchy_depth(Secondary)]
+        ]
         text: PASSED.store.todos
             |> List/retain(item, if: item.completed |> Bool/not())
             |> List/count
@@ -587,6 +631,11 @@ FUNCTION filters_element() {
 FUNCTION filter_button(filter) {
     BLOCK {
         selected: PASSED.store.selected_filter = filter
+        base_interaction: Theme/interaction_transform(
+            material: ButtonFilter,
+            state: [hovered: element.hovered, pressed: element.pressed]
+        )
+        selected_offset: selected |> WHEN { True => 6, False => 0 }
 
         Element/button(
             element: [
@@ -598,12 +647,9 @@ FUNCTION filter_button(filter) {
                 padding: [row: 8, column: 4]
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Soft)
-                transform: LIST { selected, element.hovered, element.pressed } |> WHEN {
-                    LIST { __, __, True } => []
-                    LIST { True, __, False } => [move_closer: 6]  -- raised + hover_lift
-                    LIST { False, True, False } => [move_closer: 4]
-                    LIST { False, False, False } => []
-                }
+                transform: [
+                    move_closer: base_interaction.move_closer + selected_offset
+                ]
                 material: Theme/material(of: ButtonFilter[selected: selected, hover: element.hovered])
                 font: Theme/font(of: Secondary)
                 outline: selected |> WHEN {
@@ -625,27 +671,43 @@ FUNCTION filter_button(filter) {
 ------------------------------------------------------------------------
 
 FUNCTION remove_completed_button() {
-    Element/button(
-        element: [
-            event: [press: LINK]
-            hovered: LINK
-            pressed: LINK
-        ]
-        style: [
-            align: Right
-            padding: [row: 4, column: 2]
-            depth: 4
-            rounded_corners: 2
-            transform: LIST { element.hovered, element.pressed } |> WHEN {
-                LIST { __, True } => []                  -- Pressed flat
-                LIST { True, False } => [move_closer: 4] -- Raised on hover
-                LIST { False, False } => []              -- Resting flat
-            }
-            material: Theme/material(of: ButtonClear[hover: element.hovered])
-            font: Theme/font(of: ClearButton[hover: element.hovered])
-        ]
-        label: 'Clear completed'
-    )
+    BLOCK {
+        has_completed: PASSED.store.todos |> List/any(item, if: item.completed)
+        is_disabled: has_completed |> Bool/not()
+
+        Element/button(
+            element: [
+                event: [press: LINK]
+                hovered: LINK
+                pressed: LINK
+            ]
+            style: [
+                align: Right
+                padding: [row: 4, column: 2]
+                ...is_disabled |> WHEN {
+                    True => Theme/disabled_transform()
+                    False => []
+                }
+                depth: is_disabled |> WHEN {
+                    False => Theme/depth_scale(element_type: Button, importance: Secondary)
+                    True => 1
+                }
+                rounded_corners: Theme/corners_from_material(of: Plastic)
+                transform: is_disabled |> WHEN {
+                    True => [move_further: 2]
+                    False => Theme/interaction_transform(
+                        material: Button,
+                        state: [hovered: element.hovered, pressed: element.pressed]
+                    )
+                }
+                material: Theme/material(of: ButtonClear[hover: element.hovered])
+                font: Theme/font(of: ClearButton[hover: element.hovered])
+                opacity: is_disabled |> WHEN { True => 0.3, False => 1.0 }
+            ]
+            label: 'Clear completed'
+            disabled: is_disabled
+        )
+    }
 }
 
 ------------------------------------------------------------------------
@@ -661,12 +723,18 @@ FUNCTION footer() {
         items: LIST {
             Element/paragraph(
                 element: []
-                style: [font: Theme/font(of: Small)]
+                style: [
+                    font: Theme/font(of: Small)
+                    transform: [move_further: Theme/text_hierarchy_depth(Tertiary)]
+                ]
                 contents: LIST { 'Double-click to edit a todo' }
             )
             Element/paragraph(
                 element: []
-                style: [font: Theme/font(of: Small)]
+                style: [
+                    font: Theme/font(of: Small)
+                    transform: [move_further: Theme/text_hierarchy_depth(Tertiary)]
+                ]
                 contents: LIST {
                     'Created by '
                     footer_link(
@@ -677,7 +745,10 @@ FUNCTION footer() {
             )
             Element/paragraph(
                 element: []
-                style: [font: Theme/font(of: Small)]
+                style: [
+                    font: Theme/font(of: Small)
+                    transform: [move_further: Theme/text_hierarchy_depth(Tertiary)]
+                ]
                 contents: LIST {
                     'Part of '
                     footer_link(label: 'TodoMVC', to: 'http://todomvc.com')

@@ -44,6 +44,15 @@ FUNCTION depth(of) {
     }
 }
 
+FUNCTION depth_scale(element_type, importance) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/depth_scale(element_type: element_type, importance: importance)
+        Glassmorphism => Glassmorphism/depth_scale(element_type: element_type, importance: importance)
+        Neobrutalism => Neobrutalism/depth_scale(element_type: element_type, importance: importance)
+        Neumorphism => Neumorphism/depth_scale(element_type: element_type, importance: importance)
+    }
+}
+
 FUNCTION elevation(of) {
     PASSED.theme_options.name |> WHEN {
         Professional => of |> Professional/elevation()
@@ -62,6 +71,15 @@ FUNCTION corners(of) {
     }
 }
 
+FUNCTION corners_from_material(of) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => of |> Professional/corners_from_material()
+        Glassmorphism => of |> Glassmorphism/corners_from_material()
+        Neobrutalism => of |> Neobrutalism/corners_from_material()
+        Neumorphism => of |> Neumorphism/corners_from_material()
+    }
+}
+
 FUNCTION lights() {
     PASSED.theme_options.name |> WHEN {
         Professional => Professional/lights(mode: PASSED.theme_options.mode)
@@ -77,5 +95,127 @@ FUNCTION geometry() {
         Glassmorphism => Glassmorphism/geometry()
         Neobrutalism => Neobrutalism/geometry()
         Neumorphism => Neumorphism/geometry()
+    }
+}
+
+FUNCTION interaction() {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/interaction()
+        Glassmorphism => Glassmorphism/interaction()
+        Neobrutalism => Neobrutalism/interaction()
+        Neumorphism => Neumorphism/interaction()
+    }
+}
+
+FUNCTION material_physics(of) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => of |> Professional/material_physics()
+        Glassmorphism => of |> Glassmorphism/material_physics()
+        Neobrutalism => of |> Neobrutalism/material_physics()
+        Neumorphism => of |> Neumorphism/material_physics()
+    }
+}
+
+FUNCTION interaction_transform(material, state) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/interaction_transform(material: material, state: state)
+        Glassmorphism => Glassmorphism/interaction_transform(material: material, state: state)
+        Neobrutalism => Neobrutalism/interaction_transform(material: material, state: state)
+        Neumorphism => Neumorphism/interaction_transform(material: material, state: state)
+    }
+}
+
+-- Pattern 8: Disabled state helpers
+FUNCTION disabled_transform() {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/disabled_transform()
+        Glassmorphism => Glassmorphism/disabled_transform()
+        Neobrutalism => Neobrutalism/disabled_transform()
+        Neumorphism => Neumorphism/disabled_transform()
+    }
+}
+
+-- Pattern 10: Emissive materials
+FUNCTION emissive_state(state) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => state |> Professional/emissive_state()
+        Glassmorphism => state |> Glassmorphism/emissive_state()
+        Neobrutalism => state |> Neobrutalism/emissive_state()
+        Neumorphism => state |> Neumorphism/emissive_state()
+    }
+}
+
+FUNCTION add_emissive(material, state) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/add_emissive(material: material, state: state)
+        Glassmorphism => Glassmorphism/add_emissive(material: material, state: state)
+        Neobrutalism => Neobrutalism/add_emissive(material: material, state: state)
+        Neumorphism => Neumorphism/add_emissive(material: material, state: state)
+    }
+}
+
+-- Pattern 9: Loading lights
+FUNCTION loading_light(brand_color) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/loading_light(mode: PASSED.theme_options.mode, brand_color: brand_color)
+        Glassmorphism => Glassmorphism/loading_light(mode: PASSED.theme_options.mode, brand_color: brand_color)
+        Neobrutalism => Neobrutalism/loading_light(mode: PASSED.theme_options.mode, brand_color: brand_color)
+        Neumorphism => Neumorphism/loading_light(mode: PASSED.theme_options.mode, brand_color: brand_color)
+    }
+}
+
+FUNCTION shimmer_light() {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/shimmer_light(mode: PASSED.theme_options.mode)
+        Glassmorphism => Glassmorphism/shimmer_light(mode: PASSED.theme_options.mode)
+        Neobrutalism => Neobrutalism/shimmer_light(mode: PASSED.theme_options.mode)
+        Neumorphism => Neumorphism/shimmer_light(mode: PASSED.theme_options.mode)
+    }
+}
+
+-- Pattern 6: Cursor gravity field
+FUNCTION cursor_gravity_field() {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/cursor_gravity_field()
+        Glassmorphism => Glassmorphism/cursor_gravity_field()
+        Neobrutalism => Neobrutalism/cursor_gravity_field()
+        Neumorphism => Neumorphism/cursor_gravity_field()
+    }
+}
+
+FUNCTION cursor_lift(element_center, cursor_position) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/cursor_lift(element_center: element_center, cursor_position: cursor_position)
+        Glassmorphism => Glassmorphism/cursor_lift(element_center: element_center, cursor_position: cursor_position)
+        Neobrutalism => Neobrutalism/cursor_lift(element_center: element_center, cursor_position: cursor_position)
+        Neumorphism => Neumorphism/cursor_lift(element_center: element_center, cursor_position: cursor_position)
+    }
+}
+
+FUNCTION cursor_tilt(element_center, cursor_position) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/cursor_tilt(element_center: element_center, cursor_position: cursor_position)
+        Glassmorphism => Glassmorphism/cursor_tilt(element_center: element_center, cursor_position: cursor_position)
+        Neobrutalism => Neobrutalism/cursor_tilt(element_center: element_center, cursor_position: cursor_position)
+        Neumorphism => Neumorphism/cursor_tilt(element_center: element_center, cursor_position: cursor_position)
+    }
+}
+
+-- Pattern 4: Text depth color
+FUNCTION text_depth_color(z_position, base_color) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => Professional/text_depth_color(z_position: z_position, base_color: base_color)
+        Glassmorphism => Glassmorphism/text_depth_color(z_position: z_position, base_color: base_color)
+        Neobrutalism => Neobrutalism/text_depth_color(z_position: z_position, base_color: base_color)
+        Neumorphism => Neumorphism/text_depth_color(z_position: z_position, base_color: base_color)
+    }
+}
+
+FUNCTION text_hierarchy_depth(importance) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => importance |> Professional/text_hierarchy_depth()
+        Glassmorphism => importance |> Glassmorphism/text_hierarchy_depth()
+        Neobrutalism => importance |> Neobrutalism/text_hierarchy_depth()
+        Neumorphism => importance |> Neumorphism/text_hierarchy_depth()
     }
 }
