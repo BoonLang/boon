@@ -211,12 +211,12 @@ FUNCTION text_depth_color(z_position, base_color) {
     }
 }
 
-FUNCTION text_hierarchy_depth(importance) {
+FUNCTION text_depth(importance) {
     PASSED.theme_options.name |> WHEN {
-        Professional => importance |> Professional/text_hierarchy_depth()
-        Glassmorphism => importance |> Glassmorphism/text_hierarchy_depth()
-        Neobrutalism => importance |> Neobrutalism/text_hierarchy_depth()
-        Neumorphism => importance |> Neumorphism/text_hierarchy_depth()
+        Professional => importance |> Professional/text_depth()
+        Glassmorphism => importance |> Glassmorphism/text_depth()
+        Neobrutalism => importance |> Neobrutalism/text_depth()
+        Neumorphism => importance |> Neumorphism/text_depth()
     }
 }
 

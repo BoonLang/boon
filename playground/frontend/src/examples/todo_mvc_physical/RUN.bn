@@ -513,8 +513,8 @@ FUNCTION todo_title_element(todo) {
             padding: [column: 15, left: 15, right: 60]
             clip: Row
             transform: todo.completed |> WHEN {
-                True => [move_further: Theme/text_hierarchy_depth(Tertiary)]   -- Completed: recessed, dimmer
-                False => [move_further: Theme/text_hierarchy_depth(Primary)]   -- Active: surface level
+                True => [move_further: Theme/text_depth(Tertiary)]   -- Completed: recessed, dimmer
+                False => [move_further: Theme/text_depth(Primary)]   -- Active: surface level
             }
         ]
         label: todo.title
@@ -583,7 +583,7 @@ FUNCTION active_items_count_text() {
         element: []
         style: [
             font: Theme/font(of: Secondary)
-            transform: [move_further: Theme/text_hierarchy_depth(Secondary)]
+            transform: [move_further: Theme/text_depth(Secondary)]
         ]
         text: PASSED.store.todos
             |> List/retain(item, if: item.completed |> Bool/not())
@@ -707,7 +707,7 @@ FUNCTION footer() {
                 element: []
                 style: [
                     font: Theme/font(of: Small)
-                    transform: [move_further: Theme/text_hierarchy_depth(Tertiary)]
+                    transform: [move_further: Theme/text_depth(Tertiary)]
                 ]
                 contents: LIST { 'Double-click to edit a todo' }
             )
@@ -715,7 +715,7 @@ FUNCTION footer() {
                 element: []
                 style: [
                     font: Theme/font(of: Small)
-                    transform: [move_further: Theme/text_hierarchy_depth(Tertiary)]
+                    transform: [move_further: Theme/text_depth(Tertiary)]
                 ]
                 contents: LIST {
                     'Created by '
@@ -729,7 +729,7 @@ FUNCTION footer() {
                 element: []
                 style: [
                     font: Theme/font(of: Small)
-                    transform: [move_further: Theme/text_hierarchy_depth(Tertiary)]
+                    transform: [move_further: Theme/text_depth(Tertiary)]
                 ]
                 contents: LIST {
                     'Part of '

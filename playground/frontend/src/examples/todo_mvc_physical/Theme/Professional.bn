@@ -209,7 +209,7 @@ FUNCTION text_depth_color(z_position, base_color) {
 
 -- Pattern 4: Semantic text hierarchy via z-position
 -- Returns z-offset for text importance levels
-FUNCTION text_hierarchy_depth(importance) {
+FUNCTION text_depth(importance) {
     importance |> WHEN {
         Primary => 0        -- Surface level: full brightness
         Secondary => -2     -- Slightly recessed: ~85% brightness
