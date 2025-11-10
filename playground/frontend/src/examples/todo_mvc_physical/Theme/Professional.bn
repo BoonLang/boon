@@ -314,34 +314,34 @@ FUNCTION border(border) {
     }
 }
 
-FUNCTION depth() {
-    [
-        Container: 8
-        Element: 6
-        Detail: 2
-        Hero: 10
-    ]
+FUNCTION depth(of) {
+    of |> WHEN {
+        Container => 8
+        Element => 6
+        Detail => 2
+        Hero => 10
+    }
 }
 
-FUNCTION elevation() {
-    [
-        Card: 50
-        Dialog: 24
-        Lift: 8
-        Button: 4
-        Base: 0
-        Inset: -4
-    ]
+FUNCTION elevation(of) {
+    of |> WHEN {
+        Card => 50
+        Dialog => 24
+        Lift => 8
+        Button => 4
+        Base => 0
+        Inset => -4
+    }
 }
 
-FUNCTION corners() {
-    [
-        Edge: 0
-        Detail: 2
-        Comfort: 4
-        Soft: 6
-        Pill: Fully
-    ]
+FUNCTION corners(of) {
+    of |> WHEN {
+        Edge => 0
+        Touch => 2
+        Comfort => 4
+        Soft => 6
+        Pill => Fully
+    }
 }
 
 FUNCTION lights(mode) {

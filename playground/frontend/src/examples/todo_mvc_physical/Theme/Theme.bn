@@ -37,28 +37,28 @@ FUNCTION border(of) {
 
 FUNCTION depth(of) {
     PASSED.theme_options.name |> WHEN {
-        Professional => Professional/depth().(of)
-        Glassmorphism => Glassmorphism/depth().(of)
-        Neobrutalism => Neobrutalism/depth().(of)
-        Neumorphism => Neumorphism/depth().(of)
+        Professional => of |> Professional/depth()
+        Glassmorphism => of |> Glassmorphism/depth()
+        Neobrutalism => of |> Neobrutalism/depth()
+        Neumorphism => of |> Neumorphism/depth()
     }
 }
 
 FUNCTION elevation(of) {
     PASSED.theme_options.name |> WHEN {
-        Professional => Professional/elevation().(of)
-        Glassmorphism => Glassmorphism/elevation().(of)
-        Neobrutalism => Neobrutalism/elevation().(of)
-        Neumorphism => Neumorphism/elevation().(of)
+        Professional => of |> Professional/elevation()
+        Glassmorphism => of |> Glassmorphism/elevation()
+        Neobrutalism => of |> Neobrutalism/elevation()
+        Neumorphism => of |> Neumorphism/elevation()
     }
 }
 
 FUNCTION corners(of) {
     PASSED.theme_options.name |> WHEN {
-        Professional => Professional/corners().(of)
-        Glassmorphism => Glassmorphism/corners().(of)
-        Neobrutalism => Neobrutalism/corners().(of)
-        Neumorphism => Neumorphism/corners().(of)
+        Professional => of |> Professional/corners()
+        Glassmorphism => of |> Glassmorphism/corners()
+        Neobrutalism => of |> Neobrutalism/corners()
+        Neumorphism => of |> Neumorphism/corners()
     }
 }
 

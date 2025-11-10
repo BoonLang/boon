@@ -189,6 +189,74 @@ FUNCTION material(material) {
     }
 }
 
+FUNCTION font(font) {
+    font |> WHEN {
+        -- Implement font variants if needed
+        _ => [size: 16]
+    }
+}
+
+FUNCTION border(border) {
+    border |> WHEN {
+        Standard => [width: 3, color: Oklch[lightness: 0.0]]
+        Focus => [width: 3, color: Oklch[lightness: 0.5, chroma: 0.2, hue: 200]]
+        Primary => [width: 3, color: Oklch[lightness: 0.55, chroma: 0.25, hue: 350]]
+    }
+}
+
+FUNCTION depth(of) {
+    of |> WHEN {
+        Container => 12
+        Element => 8
+        Detail => 4
+        Hero => 16
+    }
+}
+
+FUNCTION elevation(of) {
+    of |> WHEN {
+        Card => 60
+        Dialog => 32
+        Lift => 12
+        Button => 6
+        Base => 0
+        Inset => -6
+    }
+}
+
+FUNCTION corners(of) {
+    of |> WHEN {
+        Edge => 0
+        Touch => 0
+        Comfort => 0
+        Soft => 12
+        Pill => Fully
+    }
+}
+
+FUNCTION lights(mode) {
+    LIST {
+        Light/directional(
+            azimuth: 90
+            altitude: 60
+            spread: 0
+            intensity: 1.5
+            color: Oklch[lightness: 1.0, chroma: 0.0, hue: 0]
+        )
+        Light/ambient(
+            intensity: 0.3
+            color: Oklch[lightness: 0.7, chroma: 0.0, hue: 0]
+        )
+    }
+}
+
+FUNCTION geometry() {
+    [
+        edge_radius: 0
+        bevel_angle: 30
+    ]
+}
+
 FUNCTION theme(mode) {
     [
         -- Lighting: Hard directional from right, minimal ambient
