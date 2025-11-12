@@ -21,6 +21,16 @@
 -- Switch mode: Change theme_options.mode (Light, Dark)
 
 ------------------------------------------------------------------------
+-- FILTER ROUTES - Single source of truth
+------------------------------------------------------------------------
+
+filter_routes: [
+    all: '/'
+    active: '/active'
+    completed: '/completed'
+]
+
+------------------------------------------------------------------------
 -- STORE AND STATE
 ------------------------------------------------------------------------
 
@@ -36,15 +46,15 @@ store: [
         new_todo_title_text_input: LINK
     ]
     selected_filter: Router/route() |> WHEN {
-        '/active' => Active
-        '/completed' => Completed
+        filter_routes.active => Active
+        filter_routes.completed => Completed
         __ => All
     }
     go_to_result:
         LATEST {
-            filter_buttons.all.event.press |> THEN { '/' }
-            filter_buttons.active.event.press |> THEN { '/active' }
-            filter_buttons.completed.event.press |> THEN { '/completed' }
+            filter_buttons.all.event.press |> THEN { filter_routes.all }
+            filter_buttons.active.event.press |> THEN { filter_routes.active }
+            filter_buttons.completed.event.press |> THEN { filter_routes.completed }
         }
         |> Router/go_to()
     title_to_save: elements.new_todo_title_text_input.event.key_down.key |> WHEN {

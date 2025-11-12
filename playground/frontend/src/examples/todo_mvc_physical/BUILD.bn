@@ -2,37 +2,49 @@
 --
 -- This script runs before compilation to create Generated/Assets.bn
 -- with inlined SVG data URLs from the assets/icons/ directory.
+--
+-- Uses BuildFS abstraction for Node.js and browser compatibility.
 
 ------------------------------------------------------------------------
--- MAIN BUILD SCRIPT
+-- CONFIGURATION
 ------------------------------------------------------------------------
 
-FUNCTION main() {
-    icons_dir: './assets/icons'
-    output_dir: './Generated'
-    output_file: output_dir ++ '/Assets.bn'
+icons_dir: './assets/icons'
+output_dir: './Generated'
+output_file: output_dir ++ '/Assets.bn'
 
-    -- Ensure Generated directory exists
-    File/create_dir_all(output_dir)
+------------------------------------------------------------------------
+-- READ INPUTS
+------------------------------------------------------------------------
 
-    -- Read all SVG files from icons directory
-    svg_files: File/read_dir(icons_dir)
-        |> List/retain(item, if: item.name |> Text/ends_with('.svg'))
-        |> List/sort_by(item, key: item.name)
+-- Read all SVG files from icons directory
+svg_files: BuildFS/read_dir(icons_dir)
+    |> List/retain(item, if: item.name |> Text/ends_with('.svg'))
+    |> List/sort_by(item, key: item.name)
 
-    -- Generate Assets.bn code
-    code: generate_assets_module(svg_files)
+------------------------------------------------------------------------
+-- GENERATE CODE
+------------------------------------------------------------------------
 
-    -- Write to output file
-    File/write_string(output_file, code)
+-- Generate Assets.bn code
+generated_code: generate_assets_module(svg_files)
 
-    -- Log completion
-    Build/info('Generated {svg_files |> List/count()} icons to {output_file}')
+------------------------------------------------------------------------
+-- WRITE OUTPUT
+------------------------------------------------------------------------
 
-    -- Tell build system when to rerun this script
-    Build/rerun_if_dir_changed(icons_dir)
-    Build/rerun_if_changed('BUILD.bn')
-}
+-- Ensure Generated directory exists
+BuildFS/create_dir_all(output_dir)
+
+-- Write to output file
+BuildFS/write_string(output_file, generated_code)
+
+-- Log completion
+Build/info('Generated {svg_files |> List/count()} icons to {output_file}')
+
+-- Tell build system when to rerun this script
+Build/rerun_if_dir_changed(icons_dir)
+Build/rerun_if_changed('BUILD.bn')
 
 ------------------------------------------------------------------------
 -- CODE GENERATION
@@ -72,7 +84,7 @@ FUNCTION generate_icon_entry(file) {
             |> Text/trim_suffix('.svg')
 
         -- Read SVG content
-        svg_content: File/read_string(file.path)
+        svg_content: BuildFS/read_string(file.path)
 
         -- Create data URL with URL encoding
         data_url: 'data:image/svg+xml;utf8,' ++ URL/encode(svg_content)
@@ -82,8 +94,3 @@ FUNCTION generate_icon_entry(file) {
     }
 }
 
-------------------------------------------------------------------------
--- RUN MAIN
-------------------------------------------------------------------------
-
-main()
