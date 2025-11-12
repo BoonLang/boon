@@ -157,15 +157,6 @@ FUNCTION create_scene() {
     Scene/new(
         root: root_element()
         lights: Theme/lights()
-            |> List/append(
-                Light/spot(
-                    target: FocusedElement,
-                    color: Oklch[lightness: 0.7, chroma: 0.1, hue: 220],
-                    intensity: 0.3,
-                    radius: 60,
-                    falloff: Gaussian
-                )
-            )
         geometry: Theme/geometry()
     )
 }

@@ -283,6 +283,16 @@ FUNCTION lights(mode) {
                 Dark => Oklch[lightness: 0.35, chroma: 0.02, hue: 220]
             }
         )
+        Light/spot(
+            target: FocusedElement,
+            color: mode |> WHEN {
+                Light => Oklch[lightness: 0.75, chroma: 0.12, hue: 220]
+                Dark => Oklch[lightness: 0.85, chroma: 0.14, hue: 220]
+            },
+            intensity: 0.35,
+            radius: 80,
+            softness: 0.95  -- Very soft, ethereal
+        )
     }
 }
 

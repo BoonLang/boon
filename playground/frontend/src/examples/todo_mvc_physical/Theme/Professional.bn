@@ -451,6 +451,16 @@ FUNCTION lights(mode) {
                 Dark => Oklch[lightness: 0.3, chroma: 0.01, hue: 220]
             }
         )
+        Light/spot(
+            target: FocusedElement,
+            color: mode |> WHEN {
+                Light => Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
+                Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 220]
+            },
+            intensity: 0.3,
+            radius: 60,
+            softness: 0.85
+        )
     }
 }
 
@@ -997,4 +1007,20 @@ FUNCTION theme(mode) {
             ]
         }
     ]
+}
+
+-- Semantic light types
+FUNCTION light(of) {
+    of |> WHEN {
+        FocusSpotlight => Light/spot(
+            target: FocusedElement,
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
+                Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 220]
+            },
+            intensity: 0.3,
+            radius: 60,
+            softness: 0.85
+        )
+    }
 }
