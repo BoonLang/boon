@@ -310,6 +310,122 @@ FUNCTION font(font) {
     }
 }
 
+-- Unified text styling (font + 3D properties)
+FUNCTION text(of) {
+    BLOCK {
+        colors: PASSED.mode |> WHEN {
+            Light => [
+                text: Oklch[lightness: 0.42]
+                text_secondary: Oklch[lightness: 0.57]
+                text_tertiary: Oklch[lightness: 0.75]
+                text_disabled: Oklch[lightness: 0.75]
+                text_header: Oklch[lightness: 0.54, chroma: 0.156, hue: 21.24]
+                danger: Oklch[lightness: 0.6, chroma: 0.109, hue: 18.87]
+            ]
+            Dark => [
+                text: Oklch[lightness: 0.9]
+                text_secondary: Oklch[lightness: 0.75]
+                text_tertiary: Oklch[lightness: 0.65]
+                text_disabled: Oklch[lightness: 0.5]
+                text_header: Oklch[lightness: 0.75, chroma: 0.165, hue: 25.36]
+                danger: Oklch[lightness: 0.7, chroma: 0.12, hue: 18.87]
+            ]
+        }
+
+        of |> WHEN {
+            -- Hero header text
+            Header => [
+                font: [
+                    size: 100
+                    color: colors.text_header
+                    weight: Hairline
+                ]
+                depth: 6
+                transform: [move_closer: 6]
+                text_mode: Emboss
+            ]
+
+            -- Button labels
+            ButtonDelete => [
+                font: [
+                    size: 30
+                    align: Center
+                    color: colors.danger
+                ]
+                depth: 2
+                transform: [move_further: 0]
+                text_mode: Emboss
+            ]
+
+            ButtonFilter => [
+                font: [
+                    size: 14
+                    color: colors.text_secondary
+                ]
+                depth: 1.5
+                transform: [move_further: 0]
+                text_mode: Emboss
+            ]
+
+            ClearButton[hover] => [
+                font: [
+                    size: 14
+                    color: colors.text_secondary
+                    line: [underline: hover]
+                ]
+                depth: 1.5
+                transform: [move_further: 0]
+                text_mode: Emboss
+            ]
+
+            -- Todo title with state
+            TodoTitle[completed] => [
+                font: [
+                    size: 24
+                    line: [strike: completed]
+                    color: completed |> WHEN {
+                        True => colors.text_disabled
+                        False => colors.text
+                    }
+                ]
+                depth: completed |> WHEN {
+                    True => 1
+                    False => 2
+                }
+                transform: completed |> WHEN {
+                    True => [move_further: 4]
+                    False => [move_further: 0]
+                }
+                text_mode: completed |> WHEN {
+                    True => Deboss
+                    False => Emboss
+                }
+            ]
+
+            -- Body text levels
+            Secondary => [
+                font: [
+                    size: 14
+                    color: colors.text_secondary
+                ]
+                depth: 1.5
+                transform: [move_further: 2]
+                text_mode: Emboss
+            ]
+
+            Small => [
+                font: [
+                    size: 10
+                    color: colors.text_tertiary
+                ]
+                depth: 1
+                transform: [move_further: 4]
+                text_mode: Deboss
+            ]
+        }
+    }
+}
+
 FUNCTION border(border) {
     border |> WHEN {
         Standard => [

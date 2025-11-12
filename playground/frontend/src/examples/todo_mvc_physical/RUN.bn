@@ -219,10 +219,7 @@ FUNCTION header() {
         ]
         child: Element/text(
             element: [tag: H1]
-            style: [
-                font: Theme/font(of: Header)
-                transform: [move_closer: 6]  -- Hero text: raised above surface (catches light)
-            ]
+            style: Theme/text(of: Header)
             text: 'todos'
         )
     )
@@ -492,15 +489,13 @@ FUNCTION todo_title_element(todo) {
         ]
         style: [
             width: Fill
-            font: Theme/font(of: TodoTitle[completed: todo.completed])
             padding: [column: 15, left: 15, right: 60]
             clip: Row
-            transform: todo.completed |> WHEN {
-                True => [move_further: Theme/text_depth(Tertiary)]   -- Completed: recessed, dimmer
-                False => [move_further: Theme/text_depth(Primary)]   -- Active: surface level
-            }
         ]
-        label: todo.title
+        label: Element/text(
+            style: Theme/text(of: TodoTitle[completed: todo.completed])
+            text: todo.title
+        )
     )
 }
 
@@ -520,9 +515,11 @@ FUNCTION remove_todo_button() {
             rounded_corners: Theme/corners(of: Pill)
             pointer_response: Theme/pointer_response(of: ButtonDestructive)
             material: Theme/material(of: ButtonDelete[hover: element.hovered])
-            font: Theme/font(of: ButtonDelete)
         ]
-        label: '×'
+        label: Element/text(
+            style: Theme/text(of: ButtonDelete)
+            text: '×'
+        )
     )
 }
 
@@ -563,10 +560,7 @@ FUNCTION panel_footer() {
 FUNCTION active_items_count_text() {
     Element/text(
         element: []
-        style: [
-            font: Theme/font(of: Secondary)
-            transform: [move_further: Theme/text_depth(Secondary)]
-        ]
+        style: Theme/text(of: Secondary)
         text: PASSED.store.todos
             |> List/retain(item, if: item.completed |> Bool/not())
             |> List/count
@@ -615,17 +609,19 @@ FUNCTION filter_button(filter) {
                 pointer_response: Theme/pointer_response(of: ButtonFilter)
                 transform: [move_closer: selected_offset]
                 material: Theme/material(of: ButtonFilter[selected: selected, hover: element.hovered])
-                font: Theme/font(of: Secondary)
                 outline: selected |> WHEN {
                     True => Theme/border(of: Primary)
                     False => NoOutline
                 }
             ]
-            label: filter |> WHEN {
-                All => 'All'
-                Active => 'Active'
-                Completed => 'Completed'
-            }
+            label: Element/text(
+                style: Theme/text(of: ButtonFilter)
+                text: filter |> WHEN {
+                    All => 'All'
+                    Active => 'Active'
+                    Completed => 'Completed'
+                }
+            )
         )
     }
 }
@@ -647,9 +643,11 @@ FUNCTION remove_completed_button() {
             rounded_corners: Theme/corners(of: Comfort)
             pointer_response: Theme/pointer_response(of: Button)
             material: Theme/material(of: ButtonClear[hover: element.hovered])
-            font: Theme/font(of: ClearButton[hover: element.hovered])
         ]
-        label: 'Clear completed'
+        label: Element/text(
+            style: Theme/text(of: ClearButton[hover: element.hovered])
+            text: 'Clear completed'
+        )
     )
 }
 
@@ -666,18 +664,12 @@ FUNCTION footer() {
         items: LIST {
             Element/paragraph(
                 element: []
-                style: [
-                    font: Theme/font(of: Small)
-                    transform: [move_further: Theme/text_depth(Tertiary)]
-                ]
+                style: Theme/text(of: Small)
                 contents: LIST { 'Double-click to edit a todo' }
             )
             Element/paragraph(
                 element: []
-                style: [
-                    font: Theme/font(of: Small)
-                    transform: [move_further: Theme/text_depth(Tertiary)]
-                ]
+                style: Theme/text(of: Small)
                 contents: LIST {
                     'Created by '
                     footer_link(
@@ -688,10 +680,7 @@ FUNCTION footer() {
             )
             Element/paragraph(
                 element: []
-                style: [
-                    font: Theme/font(of: Small)
-                    transform: [move_further: Theme/text_depth(Tertiary)]
-                ]
+                style: Theme/text(of: Small)
                 contents: LIST {
                     'Part of '
                     footer_link(label: 'TodoMVC', to: 'http://todomvc.com')

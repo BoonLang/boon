@@ -189,6 +189,85 @@ FUNCTION material(material) {
     }
 }
 
+-- Unified text styling (font + 3D properties)
+FUNCTION text(of) {
+    BLOCK {
+        colors: PASSED.mode |> WHEN {
+            Light => [
+                text: Oklch[lightness: 0.0]
+                text_secondary: Oklch[lightness: 0.25]
+                text_tertiary: Oklch[lightness: 0.45]
+                text_disabled: Oklch[lightness: 0.6]
+                text_header: Oklch[lightness: 0.55, chroma: 0.25, hue: 350]
+                danger: Oklch[lightness: 0.5, chroma: 0.25, hue: 330]
+            ]
+            Dark => [
+                text: Oklch[lightness: 1.0]
+                text_secondary: Oklch[lightness: 0.8]
+                text_tertiary: Oklch[lightness: 0.6]
+                text_disabled: Oklch[lightness: 0.4]
+                text_header: Oklch[lightness: 0.7, chroma: 0.28, hue: 350]
+                danger: Oklch[lightness: 0.75, chroma: 0.28, hue: 330]
+            ]
+        }
+
+        of |> WHEN {
+            Header => [
+                font: [size: 100, color: colors.text_header, weight: Hairline]
+                depth: 8
+                transform: [move_closer: 8]
+                text_mode: Emboss
+            ]
+
+            ButtonDelete => [
+                font: [size: 30, align: Center, color: colors.danger]
+                depth: 4
+                transform: [move_further: 0]
+                text_mode: Emboss
+            ]
+
+            ButtonFilter => [
+                font: [size: 14, color: colors.text_secondary]
+                depth: 3
+                transform: [move_further: 0]
+                text_mode: Emboss
+            ]
+
+            ClearButton[hover] => [
+                font: [size: 14, color: colors.text_secondary, line: [underline: hover]]
+                depth: 3
+                transform: [move_further: 0]
+                text_mode: Emboss
+            ]
+
+            TodoTitle[completed] => [
+                font: [
+                    size: 24
+                    line: [strike: completed]
+                    color: completed |> WHEN { True => colors.text_disabled, False => colors.text }
+                ]
+                depth: completed |> WHEN { True => 2, False => 4 }
+                transform: completed |> WHEN { True => [move_further: 6], False => [move_further: 0] }
+                text_mode: completed |> WHEN { True => Deboss, False => Emboss }
+            ]
+
+            Secondary => [
+                font: [size: 14, color: colors.text_secondary]
+                depth: 3
+                transform: [move_further: 2]
+                text_mode: Emboss
+            ]
+
+            Small => [
+                font: [size: 10, color: colors.text_tertiary]
+                depth: 2
+                transform: [move_further: 4]
+                text_mode: Deboss
+            ]
+        }
+    }
+}
+
 FUNCTION font(font) {
     font |> WHEN {
         -- Implement font variants if needed

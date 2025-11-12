@@ -622,6 +622,159 @@ title_to_update:
 
 ---
 
+## Text Styling Implementation: Unified Theme/text() API
+
+**Status**: ✅ Implemented
+**Date**: 2025-11-12
+
+### Overview
+
+Based on Issue 1.2 (Text Depth vs Geometric Depth), we implemented a unified `Theme/text()` function that returns all text-related properties in one call:
+
+```boon
+Theme/text(of: Header) => [
+    font: [size: 100, color: ..., weight: Hairline]
+    depth: 6              // Geometric thickness of 3D text
+    transform: [move_closer: 6]  // Z-position for hierarchy
+    text_mode: Emboss     // Rendering mode (Emboss | Deboss)
+]
+```
+
+This replaces the previous pattern of separate `Theme/font()` and `Theme/text_depth()` calls:
+
+```boon
+-- Old (deprecated):
+font: Theme/font(of: Header)
+transform: [move_further: Theme/text_depth(Primary)]
+
+-- New (recommended):
+style: Theme/text(of: Header)
+```
+
+### Implementation Coverage
+
+Out of 9 text instances in RUN.bn:
+
+| Location | Element Type | Uses Theme/text() | Notes |
+|----------|-------------|-------------------|-------|
+| Line 220 | Header | ✅ Yes | Clean usage |
+| Line 561 | Item counter | ✅ Yes | Clean usage |
+| Line 485 | Todo title | ✅ Yes | Uses Element/text wrapper |
+| Line 512 | Remove button | ✅ Yes | Uses Element/text wrapper |
+| Line 606 | Filter buttons | ✅ Yes | Uses Element/text wrapper |
+| Line 638 | Clear button | ✅ Yes | Uses Element/text wrapper |
+| Line 661-685 | Footer paragraphs (3x) | ✅ Yes | Clean usage |
+| Line 405 | Checkbox icon | ⚠️ **Special** | Mixed layout + text |
+| Line 689 | Footer link | ⚠️ **Special** | Minimal override only |
+
+**Success Rate**: 7 of 9 cases (78%) use the unified API cleanly.
+
+### Special Case 1: Checkbox Icon (Mixed Layout and Text)
+
+**Location**: RUN.bn lines 405-414
+
+**Current Implementation**:
+```boon
+icon: Element/text(
+    style: [
+        height: 34                          // Layout property
+        padding: [row: 27, column: 6]       // Layout property
+        font: Theme/font(of: ButtonIcon[checked: checked])  // Text property
+        transform: [rotate: 90, move_up: 18]  // Layout transforms
+    ]
+    text: '>'
+)
+```
+
+**Why It's Special**:
+- Mixes **layout properties** (height, padding, rotate, move_up) with **text properties** (font)
+- The rotation and positioning are specific to the icon's visual design, not semantic text hierarchy
+- Using Theme/text() would incorrectly apply semantic depth/embossing meant for readable text
+
+**Pattern**: When text needs custom layout transforms (rotation, positioning) specific to its role as a visual icon, use direct property specification rather than theme function.
+
+**When to Use This Pattern**:
+- Icons or decorative text with custom transforms
+- Text used as UI geometry rather than content
+- Cases where layout and text styling are inseparable
+
+### Special Case 2: Footer Link (Minimal Style Override)
+
+**Location**: RUN.bn lines 689-706
+
+**Current Implementation**:
+```boon
+FUNCTION footer_link(label) {
+    Element/link(
+        element: [hovered: LINK]
+        style: [
+            font: [line: [underline: element.hovered]]  // Only override underline
+        ]
+        label: label
+    )
+}
+```
+
+**Why It's Special**:
+- Only needs to override **one property** (underline on hover)
+- All other text properties inherited from context
+- Creating full Theme/text() case for single property override is overkill
+- The link relies on paragraph's font styling, only adding interaction state
+
+**Pattern**: For minimal overrides of a single font property based on interaction state, use direct property specification.
+
+**When to Use This Pattern**:
+- Single property overrides (underline, weight, color)
+- Interaction-driven styling changes
+- Inheriting most styling from parent/context
+
+### Architecture Decision: Layout vs Semantic Styling
+
+The unified `Theme/text()` API is designed for **semantic text content** with hierarchy (Header, Primary, Secondary, etc.). It bundles properties that should change together:
+
+- Font properties (size, color, weight)
+- 3D thickness (depth)
+- Z-position (transform)
+- Rendering mode (Emboss/Deboss)
+
+For **layout-driven text** (icons, decorative elements) or **minimal overrides** (links), direct property specification is more appropriate.
+
+**Decision Tree**:
+
+```
+Is this readable text content?
+├─ YES: Does it represent semantic hierarchy?
+│  ├─ YES: Use Theme/text(of: SemanticLevel)  ✅
+│  └─ NO: Does it need special layout transforms?
+│     ├─ YES: Use direct properties  ⚠️ (Special Case 1)
+│     └─ NO: Use Theme/text(of: closest match)
+└─ NO: Is it a visual icon/decoration?
+   └─ YES: Use direct properties  ⚠️ (Special Case 1)
+
+Is this a minimal style override?
+└─ YES (1-2 properties): Use direct properties  ⚠️ (Special Case 2)
+```
+
+### Implementation Files
+
+The unified `Theme/text()` function is implemented in:
+
+- `Theme/Professional.bn` (lines 313-427)
+- `Theme/Neumorphism.bn` (lines 193-270)
+- `Theme/Neobrutalism.bn` (lines 192-269)
+- `Theme/Glassmorphism.bn` (lines 226-303)
+
+Router added in `Theme/Theme.bn` (lines 29-37).
+
+### Benefits
+
+1. **Consistency**: All text styling properties bundled together
+2. **Clarity**: Clear separation of geometric depth vs Z-position
+3. **Maintainability**: Single function to update for theme changes
+4. **Type Safety**: Semantic levels (Header, Secondary, etc.) document intent
+
+---
+
 ## Implementation Strategy
 
 ### Phase 1: Quick Wins (Priority 1)

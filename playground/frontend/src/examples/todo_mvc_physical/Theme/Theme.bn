@@ -26,6 +26,16 @@ FUNCTION font(of) {
     }
 }
 
+-- Unified text styling (font + 3D properties)
+FUNCTION text(of) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => of |> Professional/text()
+        Glassmorphism => of |> Glassmorphism/text()
+        Neobrutalism => of |> Neobrutalism/text()
+        Neumorphism => of |> Neumorphism/text()
+    }
+}
+
 FUNCTION border(of) {
     PASSED.theme_options.name |> WHEN {
         Professional => of |> Professional/border()
