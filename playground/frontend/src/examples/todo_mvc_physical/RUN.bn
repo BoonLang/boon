@@ -35,11 +35,6 @@ store: [
         toggle_all_checkbox: LINK
         new_todo_title_text_input: LINK
     ]
-    focused_element: LATEST {
-        None
-        elements.new_todo_title_text_input.focused
-            |> WHEN { True => Some[elements.new_todo_title_text_input], False => None }
-    }
     selected_filter: Router/route() |> WHEN {
         '/active' => Active
         '/completed' => Completed
@@ -163,16 +158,13 @@ FUNCTION create_scene() {
         root: root_element()
         lights: Theme/lights()
             |> List/append(
-                PASSED.store.focused_element |> WHEN {
-                    Some[el] => Light/spot(
-                        target: el.position,
-                        color: Oklch[lightness: 0.7, chroma: 0.1, hue: 220],
-                        intensity: 0.3,
-                        radius: 60,
-                        falloff: Gaussian
-                    )
-                    None => SKIP
-                }
+                Light/spot(
+                    target: FocusedElement,
+                    color: Oklch[lightness: 0.7, chroma: 0.1, hue: 220],
+                    intensity: 0.3,
+                    radius: 60,
+                    falloff: Gaussian
+                )
             )
         geometry: Theme/geometry()
     )
