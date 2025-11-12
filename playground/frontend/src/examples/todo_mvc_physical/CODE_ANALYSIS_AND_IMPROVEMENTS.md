@@ -17,9 +17,10 @@ RUN.bn demonstrates strong emergent physical design with a well-structured archi
 4. **Filter Routes DRY** - Single source of truth with `filter_routes` record
 5. **BUILD.bn Updated** - Flat structure using BuildFS for browser compatibility
 6. **Spring Range API** - `spring_range: [extend: X, compress: Y]` for elastic pointer response
+7. **Conditional Rendering** - Standardized True = show, False = hide pattern with `List/not_empty()`
 
 **Remaining Opportunities**:
-1. **Minor Polish** - Conditional logic clarity, spacing tokens
+1. **Minor Polish** - Spacing tokens only
 
 **Overall Grade**: A (Excellent architecture, fully implemented)
 
@@ -231,59 +232,43 @@ width: [
 
 ### Issue 3.2: Conditional Rendering Clarity
 
-**Status**: 🟢 Minor - Readability improvement
-**Location**: Lines 252-263, 372-376, 546-550
-**Impact**: Some conditionals use inverted logic
+**Status**: ✅ Resolved - Consistent conditional pattern implemented
+**Location**: Line 257-271 (was the only inverted pattern)
+**Impact**: Improved readability with standardized True = show, False = hide pattern
 
-**Example 1** - Inverted logic (lines 252-263):
+**Previous Implementation** (inverted logic):
 ```boon
 PASSED.store.todos
     |> List/empty()
     |> WHILE {
-        True => NoElement      // If empty, show nothing
-        False => Element/stripe(...)  // If NOT empty, show list
+        True => NoElement           // If empty, show nothing
+        False => Element/stripe(...) // If NOT empty, show list
     }
 ```
 
-**Example 2** - Normal logic (lines 372-376):
-```boon
-element.hovered |> WHILE {
-    True => remove_todo_button()
-    False => NoElement
-}
-```
+**Problem**: Inverted logic reduces readability - True leads to hiding, False leads to showing.
 
-**Problem**: Mixing normal and inverted conditionals reduces readability.
-
-**Proposed Solution A** (Add UNLESS combinator):
-```boon
-// Instead of:
-todos |> List/empty() |> WHILE {
-    True => NoElement
-    False => Element/stripe(...)
-}
-
-// Use:
-todos |> List/not_empty() |> UNLESS { Element/stripe(...) }
-// Or:
-Element/stripe(...) |> show_if(todos |> List/not_empty())
-```
-
-**Proposed Solution B** (Use List/not_empty):
+**Implemented Solution** (use List/not_empty):
 ```boon
 PASSED.store.todos
     |> List/not_empty()
     |> WHILE {
-        True => Element/stripe(...)
-        False => NoElement
+        True => Element/stripe(...)  // If not empty, show list
+        False => NoElement           // If empty, show nothing
     }
 ```
 
-**Recommendation**: **Solution B (use List/not_empty)** - no language changes needed, clearer logic.
+**Benefits**:
+- ✅ Clear logic: True = show, False = hide
+- ✅ No language changes needed
+- ✅ Consistent with all other conditionals in RUN.bn:
+  - Line 379-383: `element.hovered` → True shows button, False hides
+  - Line 554-558: `List/any(completed)` → True shows button, False hides
 
-**Implementation Checklist**:
-- [ ] Replace inverted conditionals with `List/not_empty()`
-- [ ] Standardize on True = show, False = hide pattern
+**Implementation Notes**:
+- Only one inverted pattern found and fixed (line 257-271)
+- All other WHILE patterns already followed the correct pattern
+- Standardized on True = show, False = hide throughout codebase
 
 ---
 
@@ -952,26 +937,21 @@ Element/paragraph(
 
 ### ✅ Phase 3: Completed
 6. ✅ **Spring range naming** - Renamed `pointer_response` → `spring_range`, `lift/press` → `extend/compress`
+7. ✅ **Conditional rendering** - Standardized on `List/not_empty()` with True = show, False = hide pattern
 
 **Status**: Completed
 
 ### Phase 4: Optional Polish (Low Priority)
-7. **Spacing tokens** - For repeated values only (CheckboxSize: 40, CheckboxWidth: 60)
-8. **Conditional rendering** - Use `List/not_empty()` pattern for clarity
+8. **Spacing tokens** - For repeated values only (CheckboxSize: 40, CheckboxWidth: 60)
 
-**Estimated Effort**: 1-2 hours
+**Estimated Effort**: 30 minutes - 1 hour
 **Impact**: Low (optional polish)
 
 ---
 
 ## Deferred for Language Design Discussion
 
-The following items could benefit from language-level features but can work with existing primitives:
-
-1. **Conditional Rendering Sugar** (Issue 3.2)
-   - UNLESS combinator
-   - show_if/hide_if helpers
-   - Current solution: Use `List/not_empty()` and standard WHILE patterns
+No items currently deferred. All proposed improvements have been implemented using existing language primitives.
 
 ---
 
@@ -986,10 +966,10 @@ RUN.bn demonstrates **excellent architectural patterns** with emergent physical 
 - ✅ Router/Filter DRY with `filter_routes` single source of truth
 - ✅ BUILD.bn updated to flat structure with BuildFS
 - ✅ Spring range API with `extend/compress` parameters
+- ✅ Conditional rendering standardized with `List/not_empty()` pattern
 
-**Remaining Opportunities** (all minor polish):
+**Remaining Opportunities** (optional minor polish):
 - Spacing tokens for repeated values (CheckboxSize, CheckboxWidth)
-- Conditional rendering clarity (`List/not_empty()` pattern)
 
 **Overall Assessment**: The code is **architecturally excellent and fully implemented**. All significant improvements completed. Remaining items are optional polish.
 
@@ -998,8 +978,7 @@ RUN.bn demonstrates **excellent architectural patterns** with emergent physical 
 ---
 
 **Next Steps**:
-1. Optionally add spacing tokens for repeated values
-2. Optionally use `List/not_empty()` for clearer conditionals
+1. Optionally add spacing tokens for repeated values (CheckboxSize, CheckboxWidth)
 
 See "Already Implemented Features" section below for details on completed work.
 

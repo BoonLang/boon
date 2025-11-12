@@ -255,10 +255,9 @@ FUNCTION main_panel() {
             new_todo_title_text_input()
                 |> LINK { PASSED.store.elements.new_todo_title_text_input }
             PASSED.store.todos
-                |> List/empty()
+                |> List/not_empty()
                 |> WHILE {
-                    True => NoElement
-                    False => Element/stripe(
+                    True => Element/stripe(
                         element: []
                         direction: Column
                         gap: 0
@@ -268,6 +267,7 @@ FUNCTION main_panel() {
                             panel_footer()
                         }
                     )
+                    False => NoElement
                 }
         }
     )
