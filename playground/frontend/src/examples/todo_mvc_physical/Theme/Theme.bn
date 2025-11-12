@@ -230,6 +230,26 @@ FUNCTION text_depth(importance) {
     }
 }
 
+-- Sizing tokens for interactive elements
+FUNCTION sizing(of) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => of |> Professional/sizing()
+        Glassmorphism => of |> Glassmorphism/sizing()
+        Neobrutalism => of |> Neobrutalism/sizing()
+        Neumorphism => of |> Neumorphism/sizing()
+    }
+}
+
+-- Spacing scale for gaps and separation
+FUNCTION spacing(of) {
+    PASSED.theme_options.name |> WHEN {
+        Professional => of |> Professional/spacing()
+        Glassmorphism => of |> Glassmorphism/spacing()
+        Neobrutalism => of |> Neobrutalism/spacing()
+        Neumorphism => of |> Neumorphism/spacing()
+    }
+}
+
 -- Pattern 6: Spring range (elastic pointer response)
 FUNCTION spring_range(of) {
     PASSED.theme_options.name |> WHEN {

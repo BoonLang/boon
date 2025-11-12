@@ -371,6 +371,25 @@ FUNCTION geometry() {
     ]
 }
 
+-- Sizing tokens for interactive elements
+FUNCTION sizing(of) {
+    of |> WHEN {
+        TouchTarget => 40
+        ToggleControl => 60
+    }
+}
+
+-- Spacing scale for gaps and separation
+FUNCTION spacing(of) {
+    of |> WHEN {
+        None => 0
+        Tight => 5
+        Small => 9
+        Standard => 10
+        Section => 65
+    }
+}
+
 -- Spring range (elastic pointer response)
 -- Neumorphism theme uses no spring behavior - soft, static aesthetic
 FUNCTION spring_range(of) {

@@ -179,7 +179,7 @@ FUNCTION root_element() {
     Element/stripe(
         element: []
         direction: Column
-        gap: 0
+        gap: Theme/spacing(of: None)
         style: [
             width: Fill
             height: [sizing: Fill, minimum: Screen]
@@ -197,7 +197,7 @@ FUNCTION content_element() {
     Element/stripe(
         element: []
         direction: Column
-        gap: 0
+        gap: Theme/spacing(of: None)
         style: [
             width: [sizing: Fill, minimum: 230, maximum: 550]
             align: [row: Center]
@@ -207,7 +207,7 @@ FUNCTION content_element() {
             Element/stripe(
                 element: []
                 direction: Column
-                gap: 65
+                gap: Theme/spacing(of: Section)
                 style: [width: Fill]
                 items: LIST { main_panel(), footer() }
             )
@@ -243,7 +243,7 @@ FUNCTION main_panel() {
     Element/stripe(
         element: [tag: Section]
         direction: Column
-        gap: 0
+        gap: Theme/spacing(of: None)
         style: [
             width: Fill
             depth: Theme/depth(of: Container)
@@ -260,7 +260,7 @@ FUNCTION main_panel() {
                     True => Element/stripe(
                         element: []
                         direction: Column
-                        gap: 0
+                        gap: Theme/spacing(of: None)
                         style: []
                         items: LIST {
                             todos_element()
@@ -321,7 +321,7 @@ FUNCTION todos_element() {
             Element/stripe(
                 element: []
                 direction: Column
-                gap: 0
+                gap: Theme/spacing(of: None)
                 style: [
                     borders: Theme/border(of: Standard)
                     material: Theme/material(of: SurfaceVariant)
@@ -338,7 +338,7 @@ FUNCTION todos_element() {
             Element/block(
                 element: []
                 style: [
-                    width: 60
+                    width: Theme/sizing(of: ToggleControl)
                     height: Fill
                     align: [row: Left, column: Top]
                 ]
@@ -359,7 +359,7 @@ FUNCTION todo_element(todo) {
             hovered: LINK
         ]
         direction: Row
-        gap: 5
+        gap: Theme/spacing(of: Tight)
         style: [
             width: Fill
             depth: Theme/depth(of: Detail)
@@ -400,7 +400,7 @@ FUNCTION toggle_all_checkbox() {
                 hovered: LINK
             ]
             style: [
-                width: 60
+                width: Theme/sizing(of: ToggleControl)
                 height: Fill
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Touch)
@@ -467,7 +467,7 @@ FUNCTION todo_checkbox(todo) {
                 hovered: LINK
             ]
             style: [
-                size: 40
+                size: Theme/sizing(of: TouchTarget)
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Pill)
                 spring_range: Theme/spring_range(of: Checkbox)
@@ -478,7 +478,7 @@ FUNCTION todo_checkbox(todo) {
             icon: Element/block(
                 element: []
                 style: [
-                    size: 40
+                    size: Theme/sizing(of: TouchTarget)
                     background: [url: todo.completed |> WHEN {
                         True => Assets/icon.checkbox_completed
                         False => Assets/icon.checkbox_active
@@ -521,7 +521,7 @@ FUNCTION remove_todo_button() {
             hovered: LINK
         ]
         style: [
-            size: 40
+            size: Theme/sizing(of: TouchTarget)
             depth: Theme/depth(of: Hero)
             rounded_corners: Theme/corners(of: Pill)
             spring_range: Theme/spring_range(of: ButtonDestructive)
@@ -542,7 +542,7 @@ FUNCTION panel_footer() {
     Element/stripe(
         element: [tag: Footer]
         direction: Row
-        gap: 0
+        gap: Theme/spacing(of: None)
         style: [
             padding: [row: 15, column: 8]
             material: Theme/material(of: PanelFooter)
@@ -590,7 +590,7 @@ FUNCTION filters_element() {
     Element/stripe(
         element: []
         direction: Row
-        gap: 10
+        gap: Theme/spacing(of: Standard)
         style: []
         items: LIST {
             filter_button(All)
@@ -670,7 +670,7 @@ FUNCTION footer() {
     Element/stripe(
         element: [tag: Footer]
         direction: Column
-        gap: 9
+        gap: Theme/spacing(of: Small)
         style: []
         items: LIST {
             Element/paragraph(

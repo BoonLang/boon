@@ -983,6 +983,27 @@ FUNCTION add_emissive(material, state) {
 -- - Pressed state detection (pole reversal: press = repulsion)
 -- - Elevation offset application
 
+-- Sizing tokens for interactive elements
+-- Returns: pixel size for consistent touch targets and controls
+FUNCTION sizing(of) {
+    of |> WHEN {
+        TouchTarget => 40      -- Standard checkbox/button size (accessible touch target)
+        ToggleControl => 60    -- Wide toggle control size
+    }
+}
+
+-- Spacing scale for gaps and separation
+-- Returns: pixel spacing for consistent visual rhythm
+FUNCTION spacing(of) {
+    of |> WHEN {
+        None => 0         -- No spacing (flush layouts)
+        Tight => 5        -- Tight spacing (between related items)
+        Small => 9        -- Small spacing (footer paragraphs)
+        Standard => 10    -- Standard spacing (component separation)
+        Section => 65     -- Section spacing (major breaks)
+    }
+}
+
 -- Spring range values per element type (elastic pointer response)
 -- Returns: [extend: X, compress: Y] where X/Y are maximum displacement in pixels
 FUNCTION spring_range(of) {
