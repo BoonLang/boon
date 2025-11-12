@@ -257,7 +257,7 @@ FUNCTION text(of) {
                 ]
                 depth: 1
                 transform: [move_further: 3]
-                text_mode: Deboss
+                relief: Carved[wall: 1]
             ]
         }
 
@@ -266,28 +266,28 @@ FUNCTION text(of) {
                 font: [size: 100, color: colors.text_header, weight: Hairline]
                 depth: 4
                 transform: [move_closer: 4]
-                text_mode: Emboss
+                relief: Raised
             ]
 
             ButtonDelete => [
                 font: [size: 30, align: Center, color: colors.danger]
                 depth: 2
                 transform: [move_further: 0]
-                text_mode: Emboss
+                relief: Raised
             ]
 
             ButtonFilter => [
                 font: [size: 14, color: colors.text_secondary]
                 depth: 1.5
                 transform: [move_further: 0]
-                text_mode: Emboss
+                relief: Raised
             ]
 
             ClearButton[hover] => [
                 font: [size: 14, color: colors.text_secondary, line: [underline: hover]]
                 depth: 1.5
                 transform: [move_further: 0]
-                text_mode: Emboss
+                relief: Raised
             ]
 
             TodoTitle[completed] => [
@@ -298,7 +298,7 @@ FUNCTION text(of) {
                 ]
                 depth: completed |> WHEN { True => 1, False => 2 }
                 transform: completed |> WHEN { True => [move_further: 3], False => [move_further: 0] }
-                text_mode: completed |> WHEN { True => Deboss, False => Emboss }
+                relief: completed |> WHEN { True => Carved[wall: 1], False => Raised }
             ]
 
             ButtonIcon[checked] => [
@@ -315,7 +315,7 @@ FUNCTION text(of) {
                 font: [size: 14, color: colors.text_secondary]
                 depth: 1.5
                 transform: [move_further: 2]
-                text_mode: Emboss
+                relief: Raised
             ]
 
             Small => make_small_style(Plain)

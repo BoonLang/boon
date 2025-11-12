@@ -344,7 +344,7 @@ FUNCTION text(of) {
                 ]
                 depth: 1
                 transform: [move_further: 4]
-                text_mode: Deboss
+                relief: Carved[wall: 1]
             ]
         }
 
@@ -358,7 +358,7 @@ FUNCTION text(of) {
                 ]
                 depth: 6
                 transform: [move_closer: 6]
-                text_mode: Emboss
+                relief: Raised
             ]
 
             -- Button labels
@@ -370,7 +370,7 @@ FUNCTION text(of) {
                 ]
                 depth: 2
                 transform: [move_further: 0]
-                text_mode: Emboss
+                relief: Raised
             ]
 
             ButtonFilter => [
@@ -380,7 +380,7 @@ FUNCTION text(of) {
                 ]
                 depth: 1.5
                 transform: [move_further: 0]
-                text_mode: Emboss
+                relief: Raised
             ]
 
             ClearButton[hover] => [
@@ -391,7 +391,7 @@ FUNCTION text(of) {
                 ]
                 depth: 1.5
                 transform: [move_further: 0]
-                text_mode: Emboss
+                relief: Raised
             ]
 
             -- Todo title with state
@@ -412,9 +412,9 @@ FUNCTION text(of) {
                     True => [move_further: 4]
                     False => [move_further: 0]
                 }
-                text_mode: completed |> WHEN {
-                    True => Deboss
-                    False => Emboss
+                relief: completed |> WHEN {
+                    True => Carved[wall: 1]
+                    False => Raised
                 }
             ]
 
@@ -436,7 +436,7 @@ FUNCTION text(of) {
                 ]
                 depth: 1.5
                 transform: [move_further: 2]
-                text_mode: Emboss
+                relief: Raised
             ]
 
             Small => make_small_style(Plain)

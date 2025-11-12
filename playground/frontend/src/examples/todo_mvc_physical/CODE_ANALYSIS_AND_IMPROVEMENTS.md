@@ -636,7 +636,7 @@ Theme/text(of: Header) => [
     font: [size: 100, color: ..., weight: Hairline]
     depth: 6              // Geometric thickness of 3D text
     transform: [move_closer: 6]  // Z-position for hierarchy
-    text_mode: Emboss     // Rendering mode (Emboss | Deboss)
+    relief: Raised        // 3D construction (Raised | Carved[wall: N])
 ]
 ```
 
@@ -735,7 +735,7 @@ The unified `Theme/text()` API is designed for **semantic text content** with hi
 - Font properties (size, color, weight)
 - 3D thickness (depth)
 - Z-position (transform)
-- Rendering mode (Emboss/Deboss)
+- 3D construction (relief: Raised | Carved[wall: N])
 
 For **layout-driven text** (icons, decorative elements) or **minimal overrides** (links), direct property specification is more appropriate.
 
@@ -772,6 +772,162 @@ Router added in `Theme/Theme.bn` (lines 29-37).
 2. **Clarity**: Clear separation of geometric depth vs Z-position
 3. **Maintainability**: Single function to update for theme changes
 4. **Type Safety**: Semantic levels (Header, Secondary, etc.) document intent
+
+---
+
+## 3D Text Relief API
+
+**Status**: ✅ Implemented
+**Date**: 2025-11-12
+
+### Overview
+
+The `relief` property controls how 3D text geometry is constructed relative to the surface - whether it's **raised** (solid 3D letters projecting upward) or **carved** (engraved into the surface).
+
+### API
+
+```boon
+relief: Raised                  // Solid 3D raised letters (additive)
+relief: Carved[wall: 2]         // Carved/engraved letters (subtractive, with wall thickness)
+```
+
+### Property Name: `relief`
+
+**Why "relief"?**
+- **Sculptural term**: Established terminology in 3D art/modeling
+- **Accurate**: Describes how elements project from or recede into surface
+- **Concise**: Single word, clear meaning
+
+**Rejected alternatives**:
+- `text_mode` → Too generic (could mean font mode, display mode, etc.)
+- `form` → Less specific
+- `construction` → Too verbose
+- `geometry` → Could conflict with shape properties
+
+### Values
+
+#### `Raised` (Additive Construction)
+
+**What it is**: Solid 3D letters that project upward from the surface.
+
+**Visual characteristics**:
+- Catches light on top surfaces
+- Bright, prominent appearance
+- Suitable for emphasis, headers, active states
+
+**Example**:
+```boon
+Header => [
+    font: [size: 100, color: colors.text_header, weight: Hairline]
+    depth: 6                    // 6 units thick
+    transform: [move_closer: 6] // Rises 6 units above surface
+    relief: Raised              // Solid raised letters
+]
+```
+
+#### `Carved[wall: N]` (Subtractive Construction)
+
+**What it is**: Letters engraved/carved into the surface, creating cavities.
+
+**Visual characteristics**:
+- Recessed into surface
+- In shadow, appears dimmer
+- Suitable for de-emphasis, disabled states, subtle text
+
+**Parameters**:
+- **`wall`**: Thickness of the moat/border around carved letters before surface is cut away
+  - Prevents letters from appearing too deep/hollow
+  - Creates padding around letter shapes
+  - Typical values: 1-2 units
+
+**Example**:
+```boon
+Small => [
+    font: [size: 10, color: colors.text_tertiary]
+    depth: 1                    // 1 unit thick letters
+    transform: [move_further: 4] // Recessed 4 units below surface
+    relief: Carved[wall: 1]     // Carved with 1-unit wall
+]
+
+TodoTitle[completed: True] => [
+    font: [size: 24, line: [strike: True], color: colors.text_disabled]
+    depth: 1
+    transform: [move_further: 4]
+    relief: Carved[wall: 1]     // Completed todos appear carved/dimmed
+]
+```
+
+### Comparison with Previous API
+
+**Old** (deprecated):
+```boon
+text_mode: Emboss  // Technical printing term
+text_mode: Deboss  // No parameter support for wall thickness
+```
+
+**New**:
+```boon
+relief: Raised              // Clear, intuitive
+relief: Carved[wall: 1]     // Supports wall parameter
+```
+
+**Benefits**:
+- ✅ More intuitive terminology (`Raised` vs `Emboss`)
+- ✅ Parameter support for `Carved` (wall thickness)
+- ✅ Clearer field name (`relief` vs `text_mode`)
+- ✅ Consistent with 3D/sculptural terminology
+
+### Usage Patterns
+
+#### Pattern 1: Semantic Hierarchy
+```boon
+Header => [relief: Raised]        // Prominent, emphasized
+Body => [relief: Raised]          // Normal text
+Small => [relief: Carved[wall: 1]] // De-emphasized, subtle
+```
+
+#### Pattern 2: Interactive States
+```boon
+TodoTitle[completed] => [
+    relief: completed |> WHEN {
+        True => Carved[wall: 1]   // Completed: recessed, dimmed
+        False => Raised           // Active: raised, prominent
+    }
+]
+```
+
+#### Pattern 3: Theme-Specific Relief
+
+Different themes use different wall thicknesses based on their depth scales:
+
+| Theme | Small Depth | Wall Thickness |
+|-------|-------------|----------------|
+| Professional | 1 | 1 |
+| Neumorphism | 1 | 1 |
+| Neobrutalism | 2 | 2 |
+| Glassmorphism | 1 | 1 |
+
+### Implementation
+
+All theme files implement `relief` in their `Theme/text()` functions:
+
+- `Theme/Professional.bn` (lines 347, 361, 373, etc.)
+- `Theme/Neumorphism.bn` (lines 227, 236, 243, etc.)
+- `Theme/Neobrutalism.bn` (lines 226, 235, 242, etc.)
+- `Theme/Glassmorphism.bn` (lines 260, 269, 276, etc.)
+
+### Renderer Behavior
+
+**For `Raised`**:
+- Construct solid 3D letter geometry
+- Place on surface with specified `depth` thickness
+- Apply lighting to top/side surfaces
+
+**For `Carved[wall: N]`**:
+- Create cavity in surface using boolean subtraction
+- Leave `wall`-thickness border around letter shapes
+- Place letters inside cavity at recessed Z-position
+- Letters receive less light (appear dimmer)
 
 ---
 
@@ -864,7 +1020,7 @@ FUNCTION make_small_style(font_variant) {
         ]
         depth: 1                    // ← Defined once
         transform: [move_further: 4]  // ← Defined once
-        text_mode: Deboss           // ← Defined once
+        relief: Carved[wall: 1]     // ← Defined once
     ]
 }
 
@@ -874,7 +1030,7 @@ SmallLink[hover] => make_small_style(LinkUnderline[hover])
 ```
 
 **Benefits**:
-- ✅ **DRY**: `depth`, `transform`, `text_mode` only defined once
+- ✅ **DRY**: `depth`, `transform`, `relief` only defined once
 - ✅ **No mutation**: Each call constructs new object (immutable)
 - ✅ **Typed**: `font_variant` parameter is explicit enum
 - ✅ **Maintainable**: Change base properties in one place
@@ -918,7 +1074,7 @@ FUNCTION text(of) {
                 ]
                 depth: 1
                 transform: [move_further: 4]
-                text_mode: Deboss
+                relief: Carved[wall: 1]
             ]
         }
 
