@@ -251,6 +251,16 @@ FUNCTION text(of) {
                 text_mode: completed |> WHEN { True => Deboss, False => Emboss }
             ]
 
+            ButtonIcon[checked] => [
+                font: [
+                    size: 22
+                    color: checked |> WHEN {
+                        True => colors.text
+                        False => colors.text_disabled
+                    }
+                ]
+            ]
+
             Secondary => [
                 font: [size: 14, color: colors.text_secondary]
                 depth: 3

@@ -399,15 +399,16 @@ FUNCTION toggle_all_checkbox() {
             ]
             label: Hidden[text: 'Toggle all']
             checked: checked
-            icon: Element/text(
-                element: []
+            icon: Element/block(
                 style: [
                     height: 34
                     padding: [row: 27, column: 6]
-                    font: Theme/font(of: ButtonIcon[checked: checked])
                     transform: [rotate: 90, move_up: 18]
                 ]
-                text: '>'
+                child: Element/text(
+                    style: Theme/text(of: ButtonIcon[checked: checked])
+                    text: '>'
+                )
             )
         )
     }

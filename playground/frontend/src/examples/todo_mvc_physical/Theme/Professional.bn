@@ -402,6 +402,16 @@ FUNCTION text(of) {
                 }
             ]
 
+            ButtonIcon[checked] => [
+                font: [
+                    size: 22
+                    color: checked |> WHEN {
+                        True => colors.text
+                        False => colors.text_disabled
+                    }
+                ]
+            ]
+
             -- Body text levels
             Secondary => [
                 font: [
