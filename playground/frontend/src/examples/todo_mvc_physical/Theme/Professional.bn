@@ -332,6 +332,22 @@ FUNCTION text(of) {
             ]
         }
 
+        make_small_style: FUNCTION(font_variant) {
+            [
+                font: [
+                    size: 10
+                    color: colors.text_tertiary
+                    line: font_variant |> WHEN {
+                        Plain => Unset
+                        LinkUnderline[hover] => [underline: hover]
+                    }
+                ]
+                depth: 1
+                transform: [move_further: 4]
+                text_mode: Deboss
+            ]
+        }
+
         of |> WHEN {
             -- Hero header text
             Header => [
@@ -423,15 +439,8 @@ FUNCTION text(of) {
                 text_mode: Emboss
             ]
 
-            Small => [
-                font: [
-                    size: 10
-                    color: colors.text_tertiary
-                ]
-                depth: 1
-                transform: [move_further: 4]
-                text_mode: Deboss
-            ]
+            Small => make_small_style(Plain)
+            SmallLink[hover] => make_small_style(LinkUnderline[hover])
         }
     }
 }

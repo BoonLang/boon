@@ -694,7 +694,7 @@ FUNCTION footer() {
 FUNCTION footer_link(label, to) {
     Element/link(
         element: [hovered: LINK]
-        style: [font: [line: [underline: element.hovered]]]
+        style: Theme/text(of: SmallLink[hover: element.hovered])
         label: label
         to: to
         new_tab: []

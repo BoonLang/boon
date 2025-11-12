@@ -775,6 +775,282 @@ Router added in `Theme/Theme.bn` (lines 29-37).
 
 ---
 
+## Text Flow and Inline Elements: Element/paragraph Design
+
+**Status**: ✅ Implemented
+**Date**: 2025-11-12
+
+### Overview
+
+`Element/paragraph` is fundamentally **text-wrapping stripe** - it's `Element/stripe(direction: Row, wrap: True, text_wrap: True)` that wraps content at word boundaries like rich text editors, Markdown renderers, or word processors.
+
+This design handles the "river of text" use case: flowing paragraphs with occasional inline links, emphasis, or embedded objects (images, icons).
+
+---
+
+### The Core Rule: String vs Element Styling
+
+**Fundamental principle**:
+
+1. **String items** in paragraph → automatically receive paragraph's `style:`
+2. **Element items** (any Element/*) → must provide their own complete style
+
+```boon
+Element/paragraph(
+    style: Theme/text(of: Small)    // ← Applied to strings
+    contents: LIST {
+        'Created by '                // ← Gets Small styling
+        footer_link(...)             // ← Element, needs own style
+        ' — '                         // ← Gets Small styling
+        Element/image(...)           // ← Element, needs own style
+    }
+)
+```
+
+**Why this rule?**:
+- **Strings are content** → inherit container's text styling
+- **Elements are structure** → independent components with complete styling
+- **No special inheritance mechanism** → consistent with Boon's "no inheritance" rule
+- **Any element can be inline** → images, blocks, links all work the same way
+
+---
+
+### The `Unset` Pattern for Style Variants
+
+**Problem**: How to create style variants (like links with underlines) without duplicating all properties?
+
+**Solution**: Builder functions with `Unset` for optional properties.
+
+#### What is `Unset`?
+
+`Unset` is a special value that tells the renderer: "don't apply any custom styling for this property, use natural/default rendering."
+
+**Semantics** (inspired by CSS `unset`):
+```boon
+line: Unset              // Don't apply line styling (no underline/strikethrough)
+line: [underline: True]  // Apply underline
+```
+
+When switching from custom to default styling, you're **unsetting** the value:
+```boon
+// Custom
+line: [underline: True]
+
+// Back to natural (unset)
+line: Unset
+```
+
+**Contrast with other values**:
+- `None` → Suggests absence, but confusing for properties with visible defaults
+- `Default` → Sounds like there's a default line style (misleading)
+- `Unset` → Clear verb: "remove custom styling, use natural rendering"
+
+---
+
+### Builder Function Pattern
+
+**Pattern**: Use helper functions to construct style variants without duplication.
+
+```boon
+FUNCTION make_small_style(font_variant) {
+    [
+        font: [
+            size: 10
+            color: colors.text_tertiary
+            line: font_variant |> WHEN {
+                Plain => Unset                      // No line styling
+                LinkUnderline[hover] => [underline: hover]  // Add underline
+            }
+        ]
+        depth: 1                    // ← Defined once
+        transform: [move_further: 4]  // ← Defined once
+        text_mode: Deboss           // ← Defined once
+    ]
+}
+
+// Usage in theme
+Small => make_small_style(Plain)
+SmallLink[hover] => make_small_style(LinkUnderline[hover])
+```
+
+**Benefits**:
+- ✅ **DRY**: `depth`, `transform`, `text_mode` only defined once
+- ✅ **No mutation**: Each call constructs new object (immutable)
+- ✅ **Typed**: `font_variant` parameter is explicit enum
+- ✅ **Maintainable**: Change base properties in one place
+
+**Trade-off**: Font `size` and `color` still repeated per variant, but this is acceptable:
+- Only 2 fields repeated (vs 5+ fields saved)
+- Clear and explicit
+- No language features needed
+
+---
+
+### Complete Example
+
+#### Theme Implementation
+
+```boon
+-- Theme/Professional.bn (lines 335-349, 426-427)
+
+FUNCTION text(of) {
+    BLOCK {
+        colors: PASSED.mode |> WHEN {
+            Light => [
+                text_tertiary: Oklch[lightness: 0.75]
+                // ...
+            ]
+            Dark => [
+                text_tertiary: Oklch[lightness: 0.65]
+                // ...
+            ]
+        }
+
+        make_small_style: FUNCTION(font_variant) {
+            [
+                font: [
+                    size: 10
+                    color: colors.text_tertiary
+                    line: font_variant |> WHEN {
+                        Plain => Unset
+                        LinkUnderline[hover] => [underline: hover]
+                    }
+                ]
+                depth: 1
+                transform: [move_further: 4]
+                text_mode: Deboss
+            ]
+        }
+
+        of |> WHEN {
+            Small => make_small_style(Plain)
+            SmallLink[hover] => make_small_style(LinkUnderline[hover])
+            // ... other cases
+        }
+    }
+}
+```
+
+#### Usage in RUN.bn
+
+```boon
+-- Footer paragraph (lines 665-689)
+Element/paragraph(
+    style: Theme/text(of: Small)    // Base style for string content
+    contents: LIST {
+        'Created by '                // Gets Small styling
+        footer_link(
+            label: 'Martin Kavík'
+            to: 'https://github.com/MartinKavik'
+        )
+        ' and inspired by '          // Gets Small styling
+        footer_link(
+            label: 'TodoMVC'
+            to: 'http://todomvc.com'
+        )
+    }
+)
+
+-- Link helper (lines 694-702)
+FUNCTION footer_link(label, to) {
+    Element/link(
+        element: [hovered: LINK]
+        style: Theme/text(of: SmallLink[hover: element.hovered])  // Complete style
+        label: label
+        to: to
+        new_tab: []
+    )
+}
+```
+
+---
+
+### Extensibility: Any Element Can Be Inline
+
+The design naturally supports any element type inline:
+
+```boon
+Element/paragraph(
+    style: Theme/text(of: Body)
+    contents: LIST {
+        'Check out our new feature '
+        Element/image(              // Inline image (emoji, icon)
+            src: 'sparkle.png'
+            size: 16
+            style: [...]
+        )
+        ' and read the '
+        footer_link(...)            // Inline link
+        ' or download '
+        Element/block(              // Inline badge
+            style: [
+                background: Red
+                padding: [row: 2, column: 4]
+                rounded_corners: 2
+            ]
+            child: 'NEW'
+        )
+    }
+)
+```
+
+**All element types work** because the rule is simple: elements need their own complete style, strings inherit.
+
+---
+
+### Design Rationale
+
+#### Why Not Style Inheritance?
+
+**Considered**: Making elements inherit parent style with overrides.
+
+**Rejected because**:
+- Breaks "no inheritance" principle
+- Complex merge semantics needed
+- Unclear what properties inherit vs override
+- Only beneficial for text flow, not general UI
+
+**Current approach**:
+- Clear rule: strings inherit, elements don't
+- Consistent with rest of Boon
+- Builder functions + `Unset` solve DRY concern
+
+#### Why `Unset` Instead of Optional Fields?
+
+**Considered**: Making fields truly optional (`line` not present if not needed).
+
+**Rejected because**:
+- Complex type system: object type varies by presence of fields
+- Compiler complexity tracking which fields might be `UNPLUGGED`
+- Runtime memory saving is minimal
+
+**Current approach**:
+- Field always present with `Unset` value
+- Simpler types
+- Renderer just ignores `Unset` (like CSS)
+
+---
+
+### Implementation Status
+
+**Files Modified**:
+- `Theme/Professional.bn` (lines 335-349, 426-427)
+- `Theme/Neumorphism.bn` (lines 215-229, 288-289)
+- `Theme/Neobrutalism.bn` (lines 214-228, 287-288)
+- `Theme/Glassmorphism.bn` (lines 248-262, 321-322)
+- `RUN.bn` (lines 694-702)
+
+**Pattern Applied To**:
+- Small + SmallLink (footer links)
+- Can be extended to other levels (Secondary + SecondaryLink, etc.)
+
+**Future Extensions**:
+- Bold, Italic variants using same pattern
+- Code (monospace) variant
+- Emphasis with different colors
+
+---
+
 ## Implementation Strategy
 
 ### Phase 1: Quick Wins (Priority 1)
