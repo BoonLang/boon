@@ -404,7 +404,7 @@ FUNCTION toggle_all_checkbox() {
                 height: Fill
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Touch)
-                pointer_response: Theme/pointer_response(of: Checkbox)
+                spring_range: Theme/spring_range(of: Checkbox)
                 material: Theme/material(of: ToggleCheckbox[checked: element.checked, hover: element.hovered])
             ]
             label: Hidden[text: 'Toggle all']
@@ -470,7 +470,7 @@ FUNCTION todo_checkbox(todo) {
                 size: 40
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Pill)
-                pointer_response: Theme/pointer_response(of: Checkbox)
+                spring_range: Theme/spring_range(of: Checkbox)
                 material: Theme/material(of: TodoCheckbox[checked: todo.completed, hover: element.hovered])
             ]
             label: Reference[element: todo.todo_elements.todo_title_element]
@@ -524,7 +524,7 @@ FUNCTION remove_todo_button() {
             size: 40
             depth: Theme/depth(of: Hero)
             rounded_corners: Theme/corners(of: Pill)
-            pointer_response: Theme/pointer_response(of: ButtonDestructive)
+            spring_range: Theme/spring_range(of: ButtonDestructive)
             material: Theme/material(of: ButtonDelete[hover: element.hovered])
         ]
         label: Element/text(
@@ -617,7 +617,7 @@ FUNCTION filter_button(filter) {
                 padding: [row: 8, column: 4]
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Soft)
-                pointer_response: Theme/pointer_response(of: ButtonFilter)
+                spring_range: Theme/spring_range(of: ButtonFilter)
                 transform: [move_closer: selected_offset]
                 material: Theme/material(of: ButtonFilter[selected: selected, hover: element.hovered])
                 outline: selected |> WHEN {
@@ -652,7 +652,7 @@ FUNCTION remove_completed_button() {
             padding: [row: 4, column: 2]
             depth: Theme/depth(of: Element)
             rounded_corners: Theme/corners(of: Comfort)
-            pointer_response: Theme/pointer_response(of: Button)
+            spring_range: Theme/spring_range(of: Button)
             material: Theme/material(of: ButtonClear[hover: element.hovered])
         ]
         label: Element/text(

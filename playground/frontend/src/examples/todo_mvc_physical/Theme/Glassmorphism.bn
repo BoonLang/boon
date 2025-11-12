@@ -404,6 +404,12 @@ FUNCTION geometry() {
     ]
 }
 
+-- Spring range (elastic pointer response)
+-- Glassmorphism theme uses no spring behavior - ethereal, floating aesthetic
+FUNCTION spring_range(of) {
+    [extend: 0, compress: 0]
+}
+
 FUNCTION theme(mode) {
     [
         -- Lighting: Soft diffuse from upper-left, strong ambient

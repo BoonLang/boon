@@ -230,13 +230,13 @@ FUNCTION text_depth(importance) {
     }
 }
 
--- Pattern 6: Pointer magnetic response
-FUNCTION pointer_response(of) {
+-- Pattern 6: Spring range (elastic pointer response)
+FUNCTION spring_range(of) {
     PASSED.theme_options.name |> WHEN {
-        Professional => of |> Professional/pointer_response()
-        Glassmorphism => of |> Glassmorphism/pointer_response()
-        Neobrutalism => of |> Neobrutalism/pointer_response()
-        Neumorphism => of |> Neumorphism/pointer_response()
+        Professional => of |> Professional/spring_range()
+        Glassmorphism => of |> Glassmorphism/spring_range()
+        Neobrutalism => of |> Neobrutalism/spring_range()
+        Neumorphism => of |> Neumorphism/spring_range()
     }
 }
 

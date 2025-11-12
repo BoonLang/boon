@@ -983,21 +983,21 @@ FUNCTION add_emissive(material, state) {
 -- - Pressed state detection (pole reversal: press = repulsion)
 -- - Elevation offset application
 
--- Pointer response values per element type
--- Returns: [lift: X, press: Y] where X/Y are maximum displacement in pixels
-FUNCTION pointer_response(of) {
+-- Spring range values per element type (elastic pointer response)
+-- Returns: [extend: X, compress: Y] where X/Y are maximum displacement in pixels
+FUNCTION spring_range(of) {
     of |> WHEN {
         -- Interactive elements (magnetic)
-        Button => [lift: 6, press: 4]           -- Standard button feel
-        ButtonDestructive => [lift: 4, press: 6] -- Heavy press for destructive actions
-        ButtonFilter => [lift: 6, press: 4]      -- Same as standard button
-        Checkbox => [lift: 4, press: 8]          -- Deep press for tactile feedback
+        Button => [extend: 6, compress: 4]           -- Standard button feel
+        ButtonDestructive => [extend: 4, compress: 6] -- Heavy press for destructive actions
+        ButtonFilter => [extend: 6, compress: 4]      -- Same as standard button
+        Checkbox => [extend: 4, compress: 8]          -- Deep press for tactile feedback
 
         -- Non-interactive elements (not magnetic)
-        Panel => [lift: 0, press: 0]
-        Container => [lift: 0, press: 0]
-        Background => [lift: 0, press: 0]
-        Input => [lift: 0, press: 0]             -- Inputs don't respond to pointer field
+        Panel => [extend: 0, compress: 0]
+        Container => [extend: 0, compress: 0]
+        Background => [extend: 0, compress: 0]
+        Input => [extend: 0, compress: 0]             -- Inputs don't respond to pointer field
     }
 }
 

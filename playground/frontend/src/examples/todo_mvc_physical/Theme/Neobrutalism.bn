@@ -368,6 +368,12 @@ FUNCTION geometry() {
     ]
 }
 
+-- Spring range (elastic pointer response)
+-- Neobrutalism theme uses no spring behavior - bold, static aesthetic
+FUNCTION spring_range(of) {
+    [extend: 0, compress: 0]
+}
+
 FUNCTION theme(mode) {
     [
         -- Lighting: Hard directional from right, minimal ambient

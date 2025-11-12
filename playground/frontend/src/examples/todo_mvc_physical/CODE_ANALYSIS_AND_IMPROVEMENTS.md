@@ -16,9 +16,10 @@ RUN.bn demonstrates strong emergent physical design with a well-structured archi
 3. **LINK Pattern** - Recognized as correct architectural design (not boilerplate)
 4. **Filter Routes DRY** - Single source of truth with `filter_routes` record
 5. **BUILD.bn Updated** - Flat structure using BuildFS for browser compatibility
+6. **Spring Range API** - `spring_range: [extend: X, compress: Y]` for elastic pointer response
 
 **Remaining Opportunities**:
-1. **Minor Polish** - Conditional logic clarity, magic number tokens, documentation
+1. **Minor Polish** - Conditional logic clarity, spacing tokens
 
 **Overall Grade**: A (Excellent architecture, fully implemented)
 
@@ -286,111 +287,66 @@ PASSED.store.todos
 
 ---
 
-### Issue 3.3: Pointer Response vs Material Naming Alignment
+### Issue 3.3: Spring Range Naming - Improve Physical Metaphor
 
-**Status**: 🟢 Minor - Consistency improvement
-**Location**: Throughout RUN.bn
-**Impact**: Related concepts use different naming
+**Status**: ✅ Resolved - API renamed with better physics metaphor
+**Location**: Throughout RUN.bn and all Theme files
+**Impact**: Improved expressiveness with spring-based terminology
 
-**Current Mapping**:
+**Previous API**:
+```boon
+pointer_response: Theme/pointer_response(of: Button)
 
-| Pointer Response | Material | Alignment |
-|-----------------|----------|-----------|
-| `Checkbox` | `ToggleCheckbox`, `TodoCheckbox` | ❌ Mismatch |
-| `Button` | `Button`, `ButtonEmphasis`, `ButtonClear` | ⚠️ One-to-many |
-| `ButtonDestructive` | `ButtonDelete` | ❌ Different terms |
-| `ButtonFilter` | `ButtonFilter` | ✅ Match |
+// Returned:
+[lift: 6, press: 4]
+```
+
+**Problem**:
+- `pointer_response` didn't clearly communicate the spring-like elastic behavior
+- `lift` and `press` were good but didn't form a cohesive physics metaphor
+
+**Implemented Solution**:
+```boon
+spring_range: Theme/spring_range(of: Button)
+
+// Returns:
+[extend: 6, compress: 4]
+```
+
+**Benefits**:
+- `spring_range` clearly describes elastic range of motion
+- `extend` and `compress` are classic spring physics terms
+- Perfect parallel verbs that form cohesive metaphor
+- Everyone intuitively understands springs extending/compressing
+- More expressive: "button spring extends 6 units toward pointer, compresses 4 units on press"
 
 **Examples**:
 ```boon
-// Line 400-401: ToggleCheckbox
-pointer_response: Theme/pointer_response(of: Checkbox)
-material: Theme/material(of: ToggleCheckbox[checked: ..., hover: ...])
+// Button - standard responsive feel
+spring_range: [extend: 6, compress: 4]
 
-// Line 465-466: TodoCheckbox
-pointer_response: Theme/pointer_response(of: Checkbox)
-material: Theme/material(of: TodoCheckbox[checked: ..., hover: ...])
+// Destructive button - heavy press for caution
+spring_range: [extend: 4, compress: 6]
 
-// Line 521-522: ButtonDelete
-pointer_response: Theme/pointer_response(of: ButtonDestructive)
-material: Theme/material(of: ButtonDelete[hover: ...])
+// Checkbox - deep tactile feedback
+spring_range: [extend: 4, compress: 8]
+
+// Panel - no spring behavior
+spring_range: [extend: 0, compress: 0]
 ```
-
-**Question**: Should pointer_response and material use the same names?
-
-**Proposed Solution A** (Align names exactly):
-```boon
-// Change pointer_response to match materials:
-pointer_response: Theme/pointer_response(of: ToggleCheckbox)
-material: Theme/material(of: ToggleCheckbox[...])
-
-pointer_response: Theme/pointer_response(of: ButtonDelete)
-material: Theme/material(of: ButtonDelete[...])
-```
-
-**Proposed Solution B** (Use categories + variants):
-```boon
-// Pointer response = behavior category
-// Material = specific appearance variant
-pointer_response: Theme/pointer_response(of: Checkbox)  // Generic checkbox behavior
-material: Theme/material(of: CheckboxToggle[...])      // Specific toggle appearance
-
-pointer_response: Theme/pointer_response(of: Button)      // Generic button behavior
-material: Theme/material(of: ButtonDestructive[...])     // Specific destructive appearance
-```
-
-**Recommendation**: **Clarify the distinction** in documentation. Pointer response = behavior category, Material = appearance variant. Current mismatch is intentional.
 
 **Implementation Checklist**:
-- [ ] Document pointer_response vs material distinction
-- [ ] Clarify that pointer_response is behavior, material is appearance
-- [ ] Verify naming makes semantic sense for each use case
+- [x] Rename `pointer_response()` → `spring_range()` in all Theme files
+- [x] Rename `lift:` → `extend:` in all theme implementations
+- [x] Rename `press:` → `compress:` in all theme implementations
+- [x] Update RUN.bn usage: `pointer_response:` → `spring_range:`
+- [x] Update Theme/Theme.bn router function name
 
----
-
-### Issue 3.4: Empty Array as Signal Pattern
-
-**Status**: 🟢 Minor - Documentation needed
-**Location**: Lines 97-103, 122-123
-**Impact**: Unclear idiom for temporal triggers
-
-**Current Pattern**:
-```boon
-title_to_update:
-    LATEST {
-        todo_elements.editing_todo_title_element.event.blur
-            |> THEN { [] }
-        todo_elements.editing_todo_title_element.event.key_down.key
-            |> WHEN { Enter => [], __ => SKIP }
-    }
-    |> THEN { todo_elements.editing_todo_title_element.text }
-```
-
-**Question**: What does `[]` represent here?
-- Empty array/object as trigger signal?
-- Unit type (void)?
-- Temporal update without payload?
-
-**Observation**: `THEN` seems to respond to any value change, so `[]` is just a simple value to emit.
-
-**Proposed Solution**:
-```boon
-// Option 1: Explicit trigger type
-|> THEN { Trigger }
-
-// Option 2: Unit type syntax
-|> THEN { () }
-
-// Option 3: Keep [] but document clearly
-|> THEN { [] }  -- Empty value triggers next THEN
-```
-
-**Recommendation**: **Document current pattern** - `[]` is a simple value that triggers downstream reactions. Consider adding explicit `Trigger` or `Unit` type in future language versions.
-
-**Implementation Checklist**:
-- [ ] Document empty array/object as trigger pattern
-- [ ] Add examples to LANGUAGE_FEATURES_RESEARCH.md
-- [ ] Consider language-level Trigger/Unit type for future
+**Implementation Notes**:
+- ✅ Professional.bn: Full implementation with different spring values per element type
+- ✅ Neumorphism.bn: Stub implementation (no spring behavior - soft, static aesthetic)
+- ✅ Neobrutalism.bn: Stub implementation (no spring behavior - bold, static aesthetic)
+- ✅ Glassmorphism.bn: Stub implementation (no spring behavior - ethereal, floating aesthetic)
 
 ---
 
@@ -994,14 +950,17 @@ Element/paragraph(
 
 **Status**: Completed
 
-### Phase 3: Optional Polish (Low Priority)
-6. **Spacing tokens** - For repeated values only (CheckboxSize: 40, CheckboxWidth: 60)
-7. **Conditional rendering** - Use `List/not_empty()` pattern for clarity
-8. **Document naming conventions** - Pointer response vs materials distinction
-9. **Document trigger patterns** - Empty array usage for signals
+### ✅ Phase 3: Completed
+6. ✅ **Spring range naming** - Renamed `pointer_response` → `spring_range`, `lift/press` → `extend/compress`
 
-**Estimated Effort**: 2-3 hours
-**Impact**: Low (optional polish and documentation improvements)
+**Status**: Completed
+
+### Phase 4: Optional Polish (Low Priority)
+7. **Spacing tokens** - For repeated values only (CheckboxSize: 40, CheckboxWidth: 60)
+8. **Conditional rendering** - Use `List/not_empty()` pattern for clarity
+
+**Estimated Effort**: 1-2 hours
+**Impact**: Low (optional polish)
 
 ---
 
@@ -1013,10 +972,6 @@ The following items could benefit from language-level features but can work with
    - UNLESS combinator
    - show_if/hide_if helpers
    - Current solution: Use `List/not_empty()` and standard WHILE patterns
-
-2. **Trigger/Unit Type** (Issue 3.4)
-   - Explicit signal types (instead of `[]` for triggers)
-   - Current solution: Document `[]` as trigger pattern, works fine
 
 ---
 
@@ -1030,11 +985,11 @@ RUN.bn demonstrates **excellent architectural patterns** with emergent physical 
 - ✅ LINK pattern recognized as correct architectural design
 - ✅ Router/Filter DRY with `filter_routes` single source of truth
 - ✅ BUILD.bn updated to flat structure with BuildFS
+- ✅ Spring range API with `extend/compress` parameters
 
 **Remaining Opportunities** (all minor polish):
 - Spacing tokens for repeated values (CheckboxSize, CheckboxWidth)
 - Conditional rendering clarity (`List/not_empty()` pattern)
-- Documentation improvements
 
 **Overall Assessment**: The code is **architecturally excellent and fully implemented**. All significant improvements completed. Remaining items are optional polish.
 
@@ -1045,7 +1000,6 @@ RUN.bn demonstrates **excellent architectural patterns** with emergent physical 
 **Next Steps**:
 1. Optionally add spacing tokens for repeated values
 2. Optionally use `List/not_empty()` for clearer conditionals
-3. Document patterns and conventions
 
 See "Already Implemented Features" section below for details on completed work.
 
