@@ -304,14 +304,6 @@ FUNCTION font(font) {
     }
 }
 
-FUNCTION edge(edge) {
-    edge |> WHEN {
-        Standard => [width: 3, color: Oklch[lightness: 0.0]]
-        Focus => [width: 3, color: Oklch[lightness: 0.5, chroma: 0.2, hue: 200]]
-        Primary => [width: 3, color: Oklch[lightness: 0.55, chroma: 0.25, hue: 350]]
-    }
-}
-
 FUNCTION depth(of) {
     of |> WHEN {
         Container => 12

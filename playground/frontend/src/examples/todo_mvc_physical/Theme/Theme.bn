@@ -36,15 +36,6 @@ FUNCTION text(of) {
     }
 }
 
-FUNCTION edge(of) {
-    PASSED.theme_options.name |> WHEN {
-        Professional => of |> Professional/edge()
-        Glassmorphism => of |> Glassmorphism/edge()
-        Neobrutalism => of |> Neobrutalism/edge()
-        Neumorphism => of |> Neumorphism/edge()
-    }
-}
-
 FUNCTION depth(of) {
     PASSED.theme_options.name |> WHEN {
         Professional => of |> Professional/depth()

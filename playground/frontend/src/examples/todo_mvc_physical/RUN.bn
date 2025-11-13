@@ -297,7 +297,6 @@ FUNCTION todos_element() {
                 direction: Column
                 gap: Theme/spacing(of: None)
                 style: [
-                    edges: Theme/edge(of: Standard)
                     material: Theme/material(of: SurfaceVariant)
                 ]
                 items: PASSED.store.todos
@@ -423,7 +422,6 @@ FUNCTION editing_todo_title_element(todo) {
             rounded_corners: Theme/corners(of: Touch)
             move: [closer: 24]
             material: Theme/material(of: InputInterior[focus: True])
-            edges: Theme/edge(of: Focus)
         ]
         label: Hidden[text: 'selected todo title']
         text: todo.edited_title
@@ -525,7 +523,6 @@ FUNCTION panel_footer() {
         style: [
             padding: [row: 15, column: 8]
             material: Theme/material(of: PanelFooter)
-            edges: Theme/edge(of: Standard)
         ]
         items: LIST {
             active_items_count_text()

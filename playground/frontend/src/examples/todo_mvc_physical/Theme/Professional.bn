@@ -449,42 +449,6 @@ FUNCTION text(of) {
     }
 }
 
-FUNCTION edge(edge) {
-    edge |> WHEN {
-        Standard => [
-            top: [
-                color: PASSED.mode |> WHEN {
-                    Light => Oklch[lightness: 0.92]
-                    Dark => Oklch[lightness: 0.3]
-                }
-            ]
-        ]
-
-        Focus => [
-            width: 2
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.68, chroma: 0.08, hue: 220]
-                Dark => Oklch[lightness: 0.75, chroma: 0.1, hue: 220]
-            }
-            glow: [
-                color: PASSED.mode |> WHEN {
-                    Light => Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
-                    Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 220]
-                }
-                intensity: 0.2
-            ]
-        ]
-
-        Primary => [
-            width: 1
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.7, chroma: 0.165, hue: 25.36]
-                Dark => Oklch[lightness: 0.75, chroma: 0.165, hue: 25.36]
-            }
-        ]
-    }
-}
-
 FUNCTION depth(of) {
     of |> WHEN {
         Container => 8
