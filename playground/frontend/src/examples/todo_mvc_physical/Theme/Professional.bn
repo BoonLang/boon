@@ -22,42 +22,12 @@ FUNCTION material(material) {
             shine: 0.6
         ]
 
-        Surface => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 1]
-                Dark => Oklch[lightness: 0.15]
-            }
-            gloss: 0.25
-        ]
-
         SurfaceVariant => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.985]
                 Dark => Oklch[lightness: 0.18]
             }
             gloss: 0.25
-        ]
-
-        SurfaceBright => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.99]
-                Dark => Oklch[lightness: 0.22]
-            }
-            gloss: 0.25
-        ]
-
-        Primary => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.7, chroma: 0.165, hue: 25.36]
-                Dark => Oklch[lightness: 0.75, chroma: 0.165, hue: 25.36]
-            }
-        ]
-
-        PrimaryContainer => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.98, chroma: 0.01, hue: 25.36]
-                Dark => Oklch[lightness: 0.25, chroma: 0.08, hue: 25.36]
-            }
         ]
 
         PanelFooter => [
@@ -96,23 +66,6 @@ FUNCTION material(material) {
                 ]
                 False => None
             }
-        ]
-
-        Button[hovered, press] => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.985]
-                Dark => Oklch[lightness: 0.18]
-            }
-            gloss: 0.3
-            metal: 0.03
-        ]
-
-        ButtonEmphasis[hovered, press] => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.7, chroma: 0.165, hue: 25.36]
-                Dark => Oklch[lightness: 0.75, chroma: 0.165, hue: 25.36]
-            }
-            gloss: 0.35
         ]
 
         ButtonDelete[hovered] => [
@@ -190,132 +143,7 @@ FUNCTION material(material) {
     }
 }
 
--- Pattern 4: Text Color from Z-Position
--- Text recessed into surface appears dimmer (in shadow)
--- Text raised from surface appears brighter (catches light)
--- Returns color adjustment based on depth
-FUNCTION text_depth_color(z_position, base_color) {
-    BLOCK {
-        -- Calculate dimming factor based on depth
-        -- Recessed text (negative z) gets darker
-        -- Raised text (positive z) stays at base color or slightly brighter
-        dimming: z_position |> WHEN {
-            z if z >= 0 => 1.0                          -- Surface level or raised: full brightness
-            z if z > -2 => 0.95                         -- Slightly recessed: barely dimmer
-            z if z > -4 => 0.85                         -- Medium recess: secondary text
-            z => 0.7                                     -- Deep recess: tertiary/disabled
-        }
-
-        -- Adjust base color lightness
-        base_color |> Color/adjust(lightness: base_color.lightness * dimming)
-    }
-}
-
--- Pattern 4: Semantic text hierarchy via z-position
--- Returns z-offset for text importance levels
-FUNCTION text_depth(importance) {
-    importance |> WHEN {
-        Primary => 0        -- Surface level: full brightness
-        Secondary => -2     -- Slightly recessed: ~85% brightness
-        Tertiary => -4      -- Medium recess: ~70% brightness
-        Disabled => -6      -- Deep recess: ~60% brightness
-    }
-}
-
 FUNCTION font(font) {
-    BLOCK {
-        colors: PASSED.mode |> WHEN {
-            Light => [
-                text: Oklch[lightness: 0.42]
-                text_secondary: Oklch[lightness: 0.57]
-                text_disabled: Oklch[lightness: 0.75]
-                text_header: Oklch[lightness: 0.54, chroma: 0.156, hue: 21.24]
-                danger: Oklch[lightness: 0.6, chroma: 0.109, hue: 18.87]
-            ]
-            Dark => [
-                text: Oklch[lightness: 0.9]
-                text_secondary: Oklch[lightness: 0.75]
-                text_disabled: Oklch[lightness: 0.5]
-                text_header: Oklch[lightness: 0.75, chroma: 0.165, hue: 25.36]
-                danger: Oklch[lightness: 0.7, chroma: 0.12, hue: 18.87]
-            ]
-        }
-
-        font |> WHEN {
-            -- Simple fonts (no state)
-            Body => [
-                size: 14
-                color: colors.text
-                weight: Light
-                family: LIST { 'Helvetica Neue', 'Helvetica', 'Arial', SansSerif }
-            ]
-
-            Header => [
-                size: 100
-                color: colors.text_header
-                weight: Hairline
-            ]
-
-            Input => [
-                size: 24
-                color: colors.text
-            ]
-
-            Placeholder => [
-                size: 24
-                style: Italic
-                color: colors.text_secondary
-            ]
-
-            Button => [
-                size: 24
-                color: colors.text
-            ]
-
-            ButtonDelete => [
-                size: 30
-                align: Center
-                color: colors.danger
-            ]
-
-            Detail => [
-                color: colors.text_secondary
-            ]
-
-            Caption => [
-                size: 10
-                align: Center
-                color: colors.text_secondary
-            ]
-
-            -- Fonts with state
-            ButtonIcon[checked] => [
-                size: 22
-                color: checked |> WHEN {
-                    True => colors.text
-                    False => colors.text_disabled
-                }
-            ]
-
-            TodoTitle[completed] => [
-                size: 24
-                line: [strike: completed]
-                color: completed |> WHEN {
-                    True => colors.text_disabled
-                    False => colors.text
-                }
-            ]
-
-            ClearButton[hovered] => [
-                color: colors.text_secondary
-                line: [underline: hovered]
-            ]
-        }
-    }
-}
-
--- Unified text styling (font + 3D properties)
-FUNCTION text(of) {
     BLOCK {
         colors: PASSED.mode |> WHEN {
             Light => [
@@ -336,116 +164,152 @@ FUNCTION text(of) {
             ]
         }
 
-        make_small_style: FUNCTION(font_variant) {
-            [
-                font: [
-                    size: 10
-                    color: colors.text_tertiary
-                    line: font_variant |> WHEN {
-                        Plain => Unset
-                        LinkUnderline[hovered] => [underline: hovered]
-                    }
-                ]
-                depth: 1
-                transform: [move_further: 4]
-                relief: Carved[wall: 1]
+        font |> WHEN {
+            Input => [
+                size: 24
+                color: colors.text
             ]
-        }
 
-        of |> WHEN {
-            -- Hero header text
+            Placeholder => [
+                size: 24
+                style: Italic
+                color: colors.text_secondary
+            ]
+
             Header => [
-                font: [
-                    size: 100
-                    color: colors.text_header
-                    weight: Hairline
-                ]
-                depth: 6
-                transform: [move_closer: 6]
-                relief: Raised
+                size: 100
+                color: colors.text_header
+                weight: Hairline
             ]
 
-            -- Button labels
             ButtonDelete => [
-                font: [
-                    size: 30
-                    align: Center
-                    color: colors.danger
-                ]
-                depth: 2
-                transform: [move_further: 0]
-                relief: Raised
+                size: 30
+                align: Center
+                color: colors.danger
             ]
 
             ButtonFilter => [
-                font: [
-                    size: 14
-                    color: colors.text_secondary
-                ]
-                depth: 1.5
-                transform: [move_further: 0]
-                relief: Raised
+                size: 14
+                color: colors.text_secondary
             ]
 
             ClearButton[hovered] => [
-                font: [
-                    size: 14
-                    color: colors.text_secondary
-                    line: [underline: hovered]
-                ]
-                depth: 1.5
-                transform: [move_further: 0]
-                relief: Raised
+                size: 14
+                color: colors.text_secondary
+                line: [underline: hovered]
             ]
 
-            -- Todo title with state
             TodoTitle[completed] => [
-                font: [
-                    size: 24
-                    line: [strike: completed]
-                    color: completed |> WHEN {
-                        True => colors.text_disabled
-                        False => colors.text
-                    }
-                ]
-                depth: completed |> WHEN {
-                    True => 1
-                    False => 2
-                }
-                transform: completed |> WHEN {
-                    True => [move_further: 4]
-                    False => [move_further: 0]
-                }
-                relief: completed |> WHEN {
-                    True => Carved[wall: 1]
-                    False => Raised
+                size: 24
+                line: [strike: completed]
+                color: completed |> WHEN {
+                    True => colors.text_disabled
+                    False => colors.text
                 }
             ]
 
             ButtonIcon[checked] => [
-                font: [
-                    size: 22
-                    color: checked |> WHEN {
-                        True => colors.text
-                        False => colors.text_disabled
-                    }
-                ]
+                size: 22
+                color: checked |> WHEN {
+                    True => colors.text
+                    False => colors.text_disabled
+                }
             ]
 
-            -- Body text levels
             Secondary => [
-                font: [
-                    size: 14
-                    color: colors.text_secondary
-                ]
-                depth: 1.5
-                transform: [move_further: 2]
-                relief: Raised
+                size: 14
+                color: colors.text_secondary
             ]
 
-            Small => make_small_style(Plain)
-            SmallLink[hovered] => make_small_style(LinkUnderline[hovered])
+            Small => [
+                size: 10
+                color: colors.text_tertiary
+            ]
+
+            SmallLink[hovered] => [
+                size: 10
+                color: colors.text_tertiary
+                line: [underline: hovered]
+            ]
         }
+    }
+}
+
+-- Unified text styling (font + 3D properties)
+FUNCTION text(of) {
+    of |> WHEN {
+        -- Hero header text
+        Header => [
+            font: font(of: Header)
+            depth: 6
+            move: [closer: 6]
+            relief: Raised
+        ]
+
+        -- Button labels
+        ButtonDelete => [
+            font: font(of: ButtonDelete)
+            depth: 2
+            move: [further: 0]
+            relief: Raised
+        ]
+
+        ButtonFilter => [
+            font: font(of: ButtonFilter)
+            depth: 1.5
+            move: [further: 0]
+            relief: Raised
+        ]
+
+        ClearButton[hovered] => [
+            font: font(of: ClearButton[hovered])
+            depth: 1.5
+            move: [further: 0]
+            relief: Raised
+        ]
+
+        -- Todo title with state
+        TodoTitle[completed] => [
+            font: font(of: TodoTitle[completed])
+            depth: completed |> WHEN {
+                True => 1
+                False => 2
+            }
+            move: completed |> WHEN {
+                True => [further: 4]
+                False => [further: 0]
+            }
+            relief: completed |> WHEN {
+                True => Carved[wall: 1]
+                False => Raised
+            }
+        ]
+
+        ButtonIcon[checked] => [
+            font: font(of: ButtonIcon[checked])
+        ]
+
+        -- Body text levels
+        Secondary => [
+            font: font(of: Secondary)
+            depth: 1.5
+            move: [further: 2]
+            relief: Raised
+        ]
+
+        Small => [
+            font: font(of: Small)
+            depth: 1
+            move: [further: 4]
+            relief: Carved[wall: 1]
+        ]
+
+        SmallLink[hovered] => [
+            font: font(of: SmallLink[hovered])
+            depth: 1
+            move: [further: 4]
+            relief: Carved[wall: 1]
+        ]
     }
 }
 
@@ -458,51 +322,18 @@ FUNCTION depth(of) {
     }
 }
 
--- Pattern 3: Depth from Element Type + Importance
--- Combines base depth for element type with importance multiplier
--- Usage: Theme/depth_scale(element_type: Button, importance: Destructive)
-FUNCTION depth_scale(element_type, importance) {
-    BLOCK {
-        -- Base depth by element type (physical thickness)
-        base: element_type |> WHEN {
-            Container => 8
-            Button => 4
-            Input => 3
-            Checkbox => 4
-            Label => 1
-            Icon => 2
-        }
-
-        -- Importance multiplier (how critical the action is)
-        multiplier: importance |> WHEN {
-            Destructive => 2.5   -- Delete/remove actions feel heavy
-            Primary => 1.5       -- Main call-to-action
-            Secondary => 1.0     -- Standard interactive elements
-            Tertiary => 0.5      -- Subtle, de-emphasized elements
-        }
-
-        -- Result: base × multiplier (rounded to whole number for clean values)
-        base * multiplier |> Math/round()
-    }
-}
-
 FUNCTION elevation(of) {
     of |> WHEN {
         Card => 50
-        Dialog => 24
         EditingFocus => 24
-        Lift => 8
-        Button => 4
         Selection => 4
         TodoItem => 4
-        Base => 0
         Inset => -4
     }
 }
 
 FUNCTION corners(of) {
     of |> WHEN {
-        Edge => 0
         Touch => 2
         Comfort => 4
         Soft => 6
@@ -510,38 +341,7 @@ FUNCTION corners(of) {
     }
 }
 
--- Pattern 7: Corner Radius from Material Hardness
--- Hard materials (glass, metal) have sharp edges
--- Soft materials (rubber, foam) have rounded edges
--- Usage: Theme/corners_from_material(of: Glass)
-FUNCTION corners_from_material(of) {
-    of |> WHEN {
-        -- Hard materials: sharp edges (difficult to round)
-        Glass => 0
-        Metal => 1
-        Ceramic => 1
-
-        -- Medium materials: slight rounding
-        Plastic => 4
-        Wood => 3
-        Stone => 2
-
-        -- Soft materials: natural rounding
-        Rubber => 8
-        Foam => 12
-        Fabric => 10
-
-        -- UI-optimized: ergonomic for touch
-        Button => 6      -- Touch-friendly
-        Card => 4        -- Comfortable viewing
-        Chip => Fully    -- Pill-shaped tags
-
-        -- Semantic overrides
-        Circular => Fully
-    }
-}
-
-FUNCTION lights(mode) {
+FUNCTION lights() {
     LIST {
         Light/directional(
             azimuth: 30
@@ -552,14 +352,14 @@ FUNCTION lights(mode) {
         )
         Light/ambient(
             intensity: 0.4
-            color: mode |> WHEN {
+            color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.8, chroma: 0.01, hue: 220]
                 Dark => Oklch[lightness: 0.3, chroma: 0.01, hue: 220]
             }
         )
         Light/spot(
             target: FocusedElement,
-            color: mode |> WHEN {
+            color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
                 Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 220]
             },
@@ -570,389 +370,12 @@ FUNCTION lights(mode) {
     }
 }
 
--- Pattern 9: Sweeping Light for Loading States
--- Creates animated light that sweeps across scene
--- Usage: Theme/loading_light(mode: Light, brand_color: Optional)
-FUNCTION loading_light(mode, brand_color) {
-    Light/sweep(
-        direction: LeftToRight
-        speed: 2.5              -- Seconds for full sweep
-        width: 150              -- Width of light beam
-        color: brand_color |> WHEN {
-            Some[color] => color
-            None => mode |> WHEN {
-                Light => Oklch[lightness: 0.95, chroma: 0.02, hue: 220]
-                Dark => Oklch[lightness: 0.6, chroma: 0.05, hue: 220]
-            }
-        }
-        intensity: 0.3
-        falloff: Linear         -- Smooth edges
-        repeat: Infinite        -- Continuous sweep
-    )
-}
-
--- Pattern 9: Shimmer effect for skeleton loading
--- Faster, more subtle sweep
-FUNCTION shimmer_light(mode) {
-    Light/sweep(
-        direction: LeftToRight
-        speed: 1.5              -- Faster sweep
-        width: 80               -- Narrower beam
-        color: mode |> WHEN {
-            Light => Oklch[lightness: 1, chroma: 0, hue: 0]      -- White shimmer
-            Dark => Oklch[lightness: 0.4, chroma: 0.01, hue: 220]
-        }
-        intensity: 0.2
-        falloff: Gaussian       -- Soft, diffuse
-        repeat: Infinite
-    )
-}
-
--- Pattern 6: Cursor Gravity Field (EXPERIMENTAL)
--- Cursor exerts magnetic attraction force on nearby interactive elements
--- Elements lift toward cursor with inverse-square falloff
--- Usage: Theme/cursor_gravity_field()
-FUNCTION cursor_gravity_field() {
-    [
-        enabled: True           -- Can disable for accessibility (reduced motion)
-        strength: 50            -- Force strength constant
-        radius: 120             -- Effective radius in pixels
-        max_lift: 8             -- Maximum lift amount (caps very close elements)
-        min_distance: 20        -- Minimum distance before force applies (deadzone)
-        falloff: InverseSquare  -- Physics-accurate: force = strength / (distance^2)
-
-        -- Tilt toward cursor (element "looks at" cursor)
-        enable_tilt: True
-        max_tilt: 3             -- Maximum tilt angle in degrees
-
-        -- Performance optimization
-        update_rate: 60         -- Hz (60fps)
-        spatial_partition: True -- Use quadtree for large element counts
-    ]
-}
-
--- Pattern 6: Calculate gravity force for element
--- Returns lift amount based on distance to cursor
--- Usage: Theme/cursor_lift(element_center, cursor_position)
-FUNCTION cursor_lift(element_center, cursor_position) {
-    BLOCK {
-        gravity: cursor_gravity_field()
-        distance: Math/distance(element_center, cursor_position)
-
-        distance |> WHEN {
-            d if d < gravity.min_distance => 0  -- Deadzone, no effect
-            d if d > gravity.radius => 0        -- Outside radius, no effect
-            d => BLOCK {
-                -- Inverse square law: force = strength / distance²
-                force: gravity.strength / (d * d)
-                -- Cap maximum lift
-                force |> Math/min(gravity.max_lift)
-            }
-        }
-    }
-}
-
--- Pattern 6: Calculate tilt toward cursor
--- Returns rotation angles for element to "look at" cursor
-FUNCTION cursor_tilt(element_center, cursor_position) {
-    BLOCK {
-        gravity: cursor_gravity_field()
-
-        gravity.enable_tilt |> WHEN {
-            False => [rotate_x: 0, rotate_y: 0]
-            True => BLOCK {
-                delta: [
-                    x: cursor_position.x - element_center.x
-                    y: cursor_position.y - element_center.y
-                ]
-                distance: Math/distance(element_center, cursor_position)
-
-                distance |> WHEN {
-                    d if d > gravity.radius => [rotate_x: 0, rotate_y: 0]
-                    d => BLOCK {
-                        -- Calculate tilt proportional to distance
-                        tilt_factor: 1.0 - (d / gravity.radius)  -- 1.0 at center, 0 at edge
-
-                        [
-                            rotate_x: (delta.y / d) * gravity.max_tilt * tilt_factor
-                            rotate_y: (delta.x / d) * gravity.max_tilt * tilt_factor
-                        ]
-                    }
-                }
-            }
-        }
-    }
-}
-
 FUNCTION geometry() {
     [
         edge_radius: 2
         bevel_angle: 45
-        -- Enhanced beveling for automatic edge definition (Pattern 2)
-        -- Higher values create more pronounced edges that catch light better
-        -- Eliminates need for manual edges on elements with sufficient depth
-        edge_definition: 1.5  -- Multiplier for bevel prominence (1.0 = standard, 2.0 = dramatic)
-        min_depth_for_edges: 4  -- Elements thinner than this need manual edges
     ]
 }
-
--- Interaction physics constants
--- Used in Phase 2 for automatic hovered/press transforms based on material elasticity
-FUNCTION interaction() {
-    [
-        hovered_lift: 2          -- Standard lift on hovered (for Secondary importance)
-        press_depth: 4         -- Standard depression when pressed
-        emphasis_lift: 4       -- Extra lift for Primary importance elements
-        transition_ms: 150     -- Animation duration
-    ]
-}
-
--- Pattern 1: Material Physics Properties
--- Defines how materials physically respond to interaction
--- Usage: Theme/material_physics(of: Plastic)
-FUNCTION material_physics(of) {
-    of |> WHEN {
-        -- Springy materials: bounce/lift noticeably on interaction
-        Rubber => [
-            elasticity: Springy    -- High bounce response
-            weight: Light          -- Lifts easily
-            rest_elevation: 4      -- Resting height
-            hovered_lift: 4          -- Extra lift on hovered
-            press_depression: 6    -- Deep press
-        ]
-
-        Foam => [
-            elasticity: Springy
-            weight: VeryLight
-            rest_elevation: 2
-            hovered_lift: 3
-            press_depression: 4
-        ]
-
-        -- Medium materials: moderate physical response
-        Plastic => [
-            elasticity: Medium     -- Standard response
-            weight: Standard       -- Normal weight
-            rest_elevation: 4
-            hovered_lift: 2
-            press_depression: 4
-        ]
-
-        Wood => [
-            elasticity: Medium
-            weight: Standard
-            rest_elevation: 2
-            hovered_lift: 2
-            press_depression: 2
-        ]
-
-        -- Rigid materials: minimal movement
-        Metal => [
-            elasticity: Rigid      -- Barely moves
-            weight: Heavy          -- Feels substantial
-            rest_elevation: 2
-            hovered_lift: 1
-            press_depression: 1
-        ]
-
-        Stone => [
-            elasticity: Rigid
-            weight: VeryHeavy      -- Almost immovable
-            rest_elevation: 0
-            hovered_lift: 1
-            press_depression: 0
-        ]
-
-        Glass => [
-            elasticity: Rigid
-            weight: Standard
-            rest_elevation: 2
-            hovered_lift: 1
-            press_depression: 1
-        ]
-
-        -- UI-optimized presets
-        Button => [
-            elasticity: Springy
-            weight: Light
-            rest_elevation: 4
-            hovered_lift: 2
-            press_depression: 4
-        ]
-
-        ButtonPrimary => [
-            elasticity: Medium
-            weight: Standard
-            rest_elevation: 6
-            hovered_lift: 4
-            press_depression: 4
-        ]
-
-        ButtonDestructive => [
-            elasticity: Rigid      -- Heavy, deliberate feel
-            weight: Heavy
-            rest_elevation: 8
-            hovered_lift: 4
-            press_depression: 4  -- Solid depression for heavy button
-        ]
-
-        Checkbox => [
-            elasticity: Medium
-            weight: Light
-            rest_elevation: 4
-            hovered_lift: 2
-            press_depression: 8  -- Deep press to surface level (4) then further back (total 8)
-        ]
-
-        Input => [
-            elasticity: Rigid
-            weight: Standard
-            rest_elevation: -4     -- Recessed
-            hovered_lift: 0          -- Inputs don't lift
-            press_depression: 0
-        ]
-
-        ButtonFilter => [
-            elasticity: Medium
-            weight: Light
-            rest_elevation: 0      -- Flush with surface when not selected
-            hovered_lift: 4          -- Lift on hovered
-            press_depression: 0    -- Press back to surface
-        ]
-    }
-}
-
--- Pattern 1: Auto-calculate interaction transforms from material
--- Returns transforms for hovered/press states based on material physics
--- Usage: Theme/interaction_transform(material: Plastic, state: [hovereded: True, pressed: False])
-FUNCTION interaction_transform(material, state) {
-    BLOCK {
-        physics: material |> material_physics()
-
-        state |> WHEN {
-            [hovereded: __, pressed: True] => [
-                -- Pressed: Move back by press_depression
-                move_closer: physics.rest_elevation - physics.press_depression
-            ]
-            [hovereded: True, pressed: False] => [
-                -- Hover: Add hovered_lift to resting position
-                move_closer: physics.rest_elevation + physics.hovered_lift
-            ]
-            [hovereded: False, pressed: False] => [
-                -- Rest: Just resting elevation
-                move_closer: physics.rest_elevation
-            ]
-        }
-    }
-}
-
--- Pattern 8: Disabled State as Ghost Material
--- Disabled elements become ghostly - translucent, recessed, insubstantial
--- Usage: Theme/disabled_style(current_style)
-FUNCTION disabled_style(current_style) {
-    [
-        -- Inherit current style and modify
-        ...current_style
-        -- Ghost properties
-        opacity: 0.3           -- Translucent, barely present
-        depth: 1               -- Paper-thin, insubstantial
-        transform: [move_further: 2]  -- Pushed back into surface, receives less light
-        -- Material becomes non-interactive
-        interaction: Frozen    -- No hovered/press response
-    ]
-}
-
--- Pattern 8: Helper for disabled state on entire element
--- Returns complete disabled modifications
-FUNCTION disabled_transform() {
-    [
-        opacity: 0.3
-        depth: 1
-        move_further: 2
-    ]
-}
-
--- Pattern 10: Emissive Materials for State Indication
--- Elements emit light from within based on state (error, success, warning)
--- Emissive edges glow naturally without separate glow effect
--- Usage: Theme/emissive_state(state: Error)
-FUNCTION emissive_state(state) {
-    state |> WHEN {
-        Error => [
-            emissive_color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.6, chroma: 0.15, hue: 18.87]   -- Red/orange
-                Dark => Oklch[lightness: 0.7, chroma: 0.15, hue: 18.87]
-            }
-            emissive_intensity: 0.25    -- Moderate glow
-            pulse_speed: 0              -- No pulse for errors (static warning)
-        ]
-
-        Success => [
-            emissive_color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.6, chroma: 0.12, hue: 145]     -- Green
-                Dark => Oklch[lightness: 0.7, chroma: 0.12, hue: 145]
-            }
-            emissive_intensity: 0.2     -- Subtle glow
-            pulse_speed: 0              -- No pulse
-        ]
-
-        Warning => [
-            emissive_color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.65, chroma: 0.15, hue: 85]     -- Yellow/amber
-                Dark => Oklch[lightness: 0.75, chroma: 0.15, hue: 85]
-            }
-            emissive_intensity: 0.3     -- Brighter for attention
-            pulse_speed: 2              -- Pulse every 2 seconds
-        ]
-
-        Info => [
-            emissive_color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.65, chroma: 0.1, hue: 220]     -- Blue
-                Dark => Oklch[lightness: 0.75, chroma: 0.12, hue: 220]
-            }
-            emissive_intensity: 0.15    -- Very subtle
-            pulse_speed: 0              -- No pulse
-        ]
-
-        Loading => [
-            emissive_color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.7, chroma: 0.1, hue: 220]      -- Blue
-                Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 220]
-            }
-            emissive_intensity: 0.2
-            pulse_speed: 1.5            -- Pulse faster (activity indicator)
-        ]
-    }
-}
-
--- Pattern 10: Helper to add emissive glow to material
--- Usage: Theme/add_emissive(material: current, state: Error)
-FUNCTION add_emissive(material, state) {
-    BLOCK {
-        emissive: state |> emissive_state()
-
-        [
-            ...material
-            emissive_color: emissive.emissive_color
-            emissive_intensity: emissive.emissive_intensity
-            pulse_speed: emissive.pulse_speed
-        ]
-    }
-}
-
--- Pattern 6: Pointer Magnetic Response (Simplified Spring Model)
--- Elements respond to pointer proximity with lift/press behavior
--- Mental model: Elements on springs, pointer exerts magnetic force
---
--- USER API: pointer_response: Theme/pointer_response(of: Button)
--- Theme returns [lift: X, press: Y], rendering engine applies physics automatically
---
--- Rendering engine handles:
--- - Pointer position tracking (mouse/touch/stylus/gamepad/VR/etc)
--- - Element position calculation
--- - Distance calculation and linear falloff
--- - Pressed state detection (pole reversal: press = repulsion)
--- - Elevation offset application
 
 -- Sizing tokens for interactive elements
 -- Returns: pixel size for consistent touch targets and controls
@@ -978,179 +401,13 @@ FUNCTION spacing(of) {
     }
 }
 
--- Spring range values per element type (elastic pointer response)
--- Returns: [extend: X, compress: Y] where X/Y are maximum displacement in pixels
+-- Spring range values for interactive elements
+-- Returns: [extend: X, compress: Y] defining maximum displacement in pixels for pointer magnetic response
 FUNCTION spring_range(of) {
     of |> WHEN {
-        -- Interactive elements (magnetic)
         Button => [extend: 6, compress: 4]           -- Standard button feel
         ButtonDestructive => [extend: 4, compress: 6] -- Heavy press for destructive actions
         ButtonFilter => [extend: 6, compress: 4]      -- Same as standard button
         Checkbox => [extend: 4, compress: 8]          -- Deep press for tactile feedback
-
-        -- Non-interactive elements (not magnetic)
-        Panel => [extend: 0, compress: 0]
-        Container => [extend: 0, compress: 0]
-        Background => [extend: 0, compress: 0]
-        Input => [extend: 0, compress: 0]             -- Inputs don't respond to pointer field
-    }
-}
-
--- Global pointer magnetic field configuration
-FUNCTION pointer_field() {
-    [
-        radius: 120         -- Effective range in pixels
-        falloff: Linear     -- Linear distance falloff (UX optimized)
-        depth_limit: 10     -- Safety: prevent elements from going too deep (absolute clamp)
-    ]
-}
-
--- NOTE: pointer_elevation is for DOCUMENTATION/REFERENCE only
--- The rendering engine implements this logic internally
--- Users don't call this function - they just set: pointer_response: Theme/pointer_response(of: Button)
---
--- Calculate pointer magnetic elevation
--- Returns: elevation offset to add to element's natural position
--- Positive = lift up (attraction), Negative = push down (repulsion when pressed)
-FUNCTION pointer_elevation(element_type, element_center, pointer_position, pressed) {
-    BLOCK {
-        response: pointer_response(element_type)
-        field: pointer_field()
-
-        -- Early exit if element is not magnetic
-        response.lift = 0 |> WHEN {
-            True => 0
-            False => BLOCK {
-                -- Calculate distance to pointer
-                distance: Math/distance(element_center, pointer_position)
-
-                -- Outside field radius = no effect
-                distance > field.radius |> WHEN {
-                    True => 0
-                    False => BLOCK {
-                        -- Linear falloff: 1.0 at distance=0, 0.0 at distance=radius
-                        distance_factor: 1.0 - (distance / field.radius)
-
-                        -- Calculate displacement based on pressed state
-                        displacement: pressed |> WHEN {
-                            -- Pressed: Magnetic poles reversed (repulsion, push down)
-                            True => -(response.press * distance_factor)
-                            -- Not pressed: Normal attraction (lift up)
-                            False => response.lift * distance_factor
-                        }
-
-                        -- Safety clamp: prevent going too deep
-                        displacement |> Math/max(-field.depth_limit)
-                    }
-                }
-            }
-        }
-    }
-}
-
-FUNCTION theme(mode) {
-    [
-        -- Lighting: Neutral warm from upper-right, soft ambient fill
-        lights: LIST {
-            Light/directional(
-                azimuth: 30
-                altitude: 45
-                spread: 1
-                intensity: 1.2
-                color: Oklch[lightness: 0.98, chroma: 0.015, hue: 65]
-            )
-            Light/ambient(
-                intensity: 0.4
-                color: mode |> WHEN {
-                    Light => Oklch[lightness: 0.8, chroma: 0.01, hue: 220]
-                    Dark => Oklch[lightness: 0.3, chroma: 0.01, hue: 220]
-                }
-            )
-        }
-
-        -- Geometry: Soft rounded edges, standard bevels
-        geometry: [
-            edge_radius: 2
-            bevel_angle: 45
-        ]
-
-        -- Elevation: Moderate floating, subtle raises
-        elevation: [
-            Card: 50
-            Dialog: 24
-            Lift: 8
-            Button: 4
-            Base: 0
-            Inset: -4
-        ]
-
-        -- Depth: Standard thickness scale
-        depth: [
-            Container: 8
-            Element: 6
-            Detail: 2
-            Hero: 10
-        ]
-
-        -- Interaction: Subtle physical movement
-        interaction: [
-            hovered_lift: 2          -- Adds to resting z
-            press_depth: 4         -- Movement when pressed
-            emphasis_lift: 4       -- Extra lift for important elements
-            transition_ms: 150     -- Animation duration
-        ]
-
-        -- Corners: Rounded but not excessive
-        corners: [
-            Edge: 0
-            Detail: 2
-            Comfort: 4
-            Soft: 6
-            Pill: Fully
-        ]
-
-        -- Colors: Text, edges, and glow effects (surfaces are in materials)
-        colors: mode |> WHEN {
-            Light => [
-                primary_glow: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
-                focus: Oklch[lightness: 0.68, chroma: 0.08, hue: 220]
-                focus_glow: Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
-                danger: Oklch[lightness: 0.6, chroma: 0.109, hue: 18.87]
-                danger_glow: Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87]
-                text: Oklch[lightness: 0.42]
-                text_secondary: Oklch[lightness: 0.57]
-                text_disabled: Oklch[lightness: 0.75]
-                text_header: Oklch[lightness: 0.54, chroma: 0.156, hue: 21.24]
-                edge: Oklch[lightness: 0.92]
-            ]
-            Dark => [
-                primary_glow: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
-                focus: Oklch[lightness: 0.75, chroma: 0.1, hue: 220]
-                focus_glow: Oklch[lightness: 0.8, chroma: 0.12, hue: 220]
-                danger: Oklch[lightness: 0.7, chroma: 0.12, hue: 18.87]
-                danger_glow: Oklch[lightness: 0.8, chroma: 0.12, hue: 18.87]
-                text: Oklch[lightness: 0.9]
-                text_secondary: Oklch[lightness: 0.75]
-                text_disabled: Oklch[lightness: 0.5]
-                text_header: Oklch[lightness: 0.75, chroma: 0.165, hue: 25.36]
-                edge: Oklch[lightness: 0.3]
-            ]
-        }
-    ]
-}
-
--- Semantic light types
-FUNCTION light(of) {
-    of |> WHEN {
-        FocusSpotlight => Light/spot(
-            target: FocusedElement,
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
-                Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 220]
-            },
-            intensity: 0.3,
-            radius: 60,
-            softness: 0.85
-        )
     }
 }
