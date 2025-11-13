@@ -335,7 +335,7 @@ FUNCTION todo_element(todo) {
         style: [
             width: Fill
             depth: Theme/depth(of: Detail)
-            move: [closer: 4]
+            move: [closer: Theme/elevation(of: TodoItem)]
             material: Theme/material(of: InputExterior[hovered: element.hovered])
         ]
         items: PASSED.store.selected_todo_id = todo.id |> WHILE {
@@ -386,10 +386,10 @@ FUNCTION toggle_all_checkbox() {
             checked: checked
             icon: Element/block(
                 style: [
-                    height: 34
+                    height: Theme/sizing(of: IconContainer)
                     padding: [row: 27, column: 6]
                     rotate: 90
-                    move: [up: 18]
+                    move: [up: Theme/spacing(of: IconOffset)]
                 ]
                 child: Element/text(
                     style: Theme/text(of: ButtonIcon[checked: checked])
@@ -414,13 +414,13 @@ FUNCTION editing_todo_title_element(todo) {
             ]
         ]
         style: [
-            width: 506
+            width: Theme/sizing(of: EditingInputWidth)
             padding: [row: 17, top: 17, bottom: 16]
             align: Right
             font: Theme/font(of: Input)
             depth: Theme/depth(of: Element)
             rounded_corners: Theme/corners(of: Touch)
-            move: [closer: 24]
+            move: [closer: Theme/elevation(of: EditingFocus)]
             material: Theme/material(of: InputInterior[focus: True])
         ]
         label: Hidden[text: 'selected todo title']

@@ -317,9 +317,11 @@ FUNCTION elevation(of) {
     of |> WHEN {
         Card => 8
         Dialog => 6
+        EditingFocus => 6
         Lift => 4
         Button => 2
         Selection => 2
+        TodoItem => 2
         Base => 0
         Inset => -2
     }
@@ -376,6 +378,8 @@ FUNCTION sizing(of) {
     of |> WHEN {
         TouchTarget => 40
         ToggleControl => 60
+        IconContainer => 34
+        EditingInputWidth => 506
     }
 }
 
@@ -386,6 +390,7 @@ FUNCTION spacing(of) {
         Tight => 5
         Small => 9
         Standard => 10
+        IconOffset => 18
         Section => 65
     }
 }

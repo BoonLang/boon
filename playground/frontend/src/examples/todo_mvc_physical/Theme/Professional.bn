@@ -490,9 +490,11 @@ FUNCTION elevation(of) {
     of |> WHEN {
         Card => 50
         Dialog => 24
+        EditingFocus => 24
         Lift => 8
         Button => 4
         Selection => 4
+        TodoItem => 4
         Base => 0
         Inset => -4
     }
@@ -958,6 +960,8 @@ FUNCTION sizing(of) {
     of |> WHEN {
         TouchTarget => 40      -- Standard checkbox/button size (accessible touch target)
         ToggleControl => 60    -- Wide toggle control size
+        IconContainer => 34    -- Icon wrapper container height
+        EditingInputWidth => 506  -- Fixed width for editing input overlay
     }
 }
 
@@ -969,6 +973,7 @@ FUNCTION spacing(of) {
         Tight => 5        -- Tight spacing (between related items)
         Small => 9        -- Small spacing (footer paragraphs)
         Standard => 10    -- Standard spacing (component separation)
+        IconOffset => 18  -- Vertical offset for rotated icon positioning
         Section => 65     -- Section spacing (major breaks)
     }
 }
