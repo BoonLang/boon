@@ -125,12 +125,8 @@ FUNCTION new_todo(title) {
 }
 
 ------------------------------------------------------------------------
--- THEME - Professional design preset
+-- THEME
 ------------------------------------------------------------------------
--- Theme functions (materials, fonts, borders) in Theme/Professional.bn
--- Structural properties (depth, elevation, corners, lights, geometry) also from theme
--- To switch themes: Change theme_options.name to Neobrutalism, Glassmorphism, or Neumorphism
--- To switch mode: Change theme_options.mode to Dark
 
 theme_options: [
     name: Professional
@@ -138,7 +134,7 @@ theme_options: [
 ]
 
 ------------------------------------------------------------------------
--- SCENE - Physical 3D with theme
+-- SCENE
 ------------------------------------------------------------------------
 
 scene: main_scene(PASS: [store: store, theme_options: theme_options])
@@ -152,7 +148,7 @@ FUNCTION main_scene() {
 }
 
 ------------------------------------------------------------------------
--- ROOT ELEMENT - Background plane
+-- ROOT ELEMENT
 ------------------------------------------------------------------------
 
 FUNCTION root_element() {
@@ -216,7 +212,7 @@ FUNCTION header() {
 }
 
 ------------------------------------------------------------------------
--- MAIN PANEL - Floating card with automatic drop shadow
+-- MAIN PANEL
 ------------------------------------------------------------------------
 
 FUNCTION main_panel() {
@@ -254,7 +250,7 @@ FUNCTION main_panel() {
 }
 
 ------------------------------------------------------------------------
--- NEW TODO INPUT - Recessed into panel (automatic inset shadow)
+-- NEW TODO INPUT
 ------------------------------------------------------------------------
 
 FUNCTION new_todo_title_text_input() {
@@ -327,7 +323,7 @@ FUNCTION todos_element() {
 }
 
 ------------------------------------------------------------------------
--- TODO ITEM - Slightly raised above list
+-- TODO ITEM
 ------------------------------------------------------------------------
 
 FUNCTION todo_element(todo) {
@@ -364,7 +360,7 @@ FUNCTION todo_element(todo) {
 }
 
 ------------------------------------------------------------------------
--- TOGGLE ALL CHECKBOX - Button with physical movement
+-- TOGGLE ALL CHECKBOX
 ------------------------------------------------------------------------
 
 FUNCTION toggle_all_checkbox() {
@@ -382,7 +378,10 @@ FUNCTION toggle_all_checkbox() {
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Touch)
                 spring_range: Theme/spring_range(of: Checkbox)
-                material: Theme/material(of: ToggleCheckbox[checked: element.checked, hover: element.hovered])
+                material: Theme/material(of: ToggleCheckbox[
+                    checked: element.checked
+                    hover: element.hovered
+                ])
             ]
             label: Hidden[text: 'Toggle all']
             checked: checked
@@ -402,7 +401,7 @@ FUNCTION toggle_all_checkbox() {
 }
 
 ------------------------------------------------------------------------
--- EDITING TODO INPUT - Pops up dramatically when focused
+-- EDITING TODO INPUT
 ------------------------------------------------------------------------
 
 FUNCTION editing_todo_title_element(todo) {
@@ -433,7 +432,7 @@ FUNCTION editing_todo_title_element(todo) {
 }
 
 ------------------------------------------------------------------------
--- TODO CHECKBOX - Round button that moves physically
+-- TODO CHECKBOX
 ------------------------------------------------------------------------
 
 FUNCTION todo_checkbox(todo) {
@@ -448,7 +447,10 @@ FUNCTION todo_checkbox(todo) {
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Pill)
                 spring_range: Theme/spring_range(of: Checkbox)
-                material: Theme/material(of: TodoCheckbox[checked: todo.completed, hover: element.hovered])
+                material: Theme/material(of: TodoCheckbox[
+                    checked: todo.completed
+                    hover: element.hovered
+                ])
             ]
             label: Reference[element: todo.todo_elements.todo_title_element]
             checked: todo.completed
@@ -467,7 +469,7 @@ FUNCTION todo_checkbox(todo) {
 }
 
 ------------------------------------------------------------------------
--- TODO TITLE LABEL - Flat on surface
+-- TODO TITLE LABEL
 ------------------------------------------------------------------------
 
 FUNCTION todo_title_element(todo) {
@@ -488,7 +490,7 @@ FUNCTION todo_title_element(todo) {
 }
 
 ------------------------------------------------------------------------
--- REMOVE TODO BUTTON - Row sibling, appears on row hover, floats dramatically
+-- REMOVE TODO BUTTON
 ------------------------------------------------------------------------
 
 FUNCTION remove_todo_button() {
@@ -512,7 +514,7 @@ FUNCTION remove_todo_button() {
 }
 
 ------------------------------------------------------------------------
--- PANEL FOOTER - Flat on panel surface
+-- PANEL FOOTER
 ------------------------------------------------------------------------
 
 FUNCTION panel_footer() {
@@ -560,7 +562,7 @@ FUNCTION active_items_count_text() {
 }
 
 ------------------------------------------------------------------------
--- FILTER BUTTONS - Pills that physically move when selected/hovered
+-- FILTER BUTTONS
 ------------------------------------------------------------------------
 
 FUNCTION filters_element() {
@@ -596,7 +598,10 @@ FUNCTION filter_button(filter) {
                 rounded_corners: Theme/corners(of: Soft)
                 spring_range: Theme/spring_range(of: ButtonFilter)
                 transform: [move_closer: selected_offset]
-                material: Theme/material(of: ButtonFilter[selected: selected, hover: element.hovered])
+                material: Theme/material(of: ButtonFilter[
+                    selected: selected
+                    hover: element.hovered
+                ])
                 outline: selected |> WHEN {
                     True => Theme/border(of: Primary)
                     False => NoOutline
@@ -615,7 +620,7 @@ FUNCTION filter_button(filter) {
 }
 
 ------------------------------------------------------------------------
--- CLEAR COMPLETED BUTTON - Subtle depth on hover
+-- CLEAR COMPLETED BUTTON
 ------------------------------------------------------------------------
 
 FUNCTION remove_completed_button() {
@@ -640,7 +645,7 @@ FUNCTION remove_completed_button() {
 }
 
 ------------------------------------------------------------------------
--- FOOTER - Flat on background
+-- FOOTER
 ------------------------------------------------------------------------
 
 FUNCTION footer() {
