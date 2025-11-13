@@ -592,7 +592,7 @@ FUNCTION filter_button(filter) {
                 padding: [row: 8, column: 4]
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Soft)
-                spring_range: Theme/spring_range(of: ButtonFilter)
+                spring_range: Theme/spring_range(of: Button)
                 move: [closer: selected |> WHEN {
                     True => Theme/elevation(of: Selection)
                     False => 0

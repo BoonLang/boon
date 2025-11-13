@@ -4,7 +4,6 @@
 
 FUNCTION material(material) {
     material |> WHEN {
-        -- Simple materials (no state)
         Background => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.96, chroma: 0.01, hue: 220]
@@ -38,7 +37,6 @@ FUNCTION material(material) {
             gloss: 0.4
         ]
 
-        -- Interactive materials (with state)
         InputExterior[hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.985]
@@ -235,10 +233,8 @@ FUNCTION font(font) {
     }
 }
 
--- Unified text styling (font + 3D properties)
 FUNCTION text(of) {
     of |> WHEN {
-        -- Hero header text
         Header => [
             font: font(of: Header)
             depth: 6
@@ -246,7 +242,6 @@ FUNCTION text(of) {
             relief: Raised
         ]
 
-        -- Button labels
         ButtonDelete => [
             font: font(of: ButtonDelete)
             depth: 2
@@ -268,7 +263,6 @@ FUNCTION text(of) {
             relief: Raised
         ]
 
-        -- Todo title with state
         TodoTitle[completed] => [
             font: font(of: TodoTitle[completed])
             depth: completed |> WHEN {
@@ -289,7 +283,6 @@ FUNCTION text(of) {
             font: font(of: ButtonIcon[checked])
         ]
 
-        -- Body text levels
         Secondary => [
             font: font(of: Secondary)
             depth: 1.5
@@ -377,37 +370,30 @@ FUNCTION geometry() {
     ]
 }
 
--- Sizing tokens for interactive elements
--- Returns: pixel size for consistent touch targets and controls
 FUNCTION sizing(of) {
     of |> WHEN {
-        TouchTarget => 40      -- Standard checkbox/button size (accessible touch target)
-        ToggleControl => 60    -- Wide toggle control size
-        IconContainer => 34    -- Icon wrapper container height
-        EditingInputWidth => 506  -- Fixed width for editing input overlay
+        TouchTarget => 40
+        ToggleControl => 60
+        IconContainer => 34
+        EditingInputWidth => 506
     }
 }
 
--- Spacing scale for gaps and separation
--- Returns: pixel spacing for consistent visual rhythm
 FUNCTION spacing(of) {
     of |> WHEN {
-        None => 0         -- No spacing (flush layouts)
-        Tight => 5        -- Tight spacing (between related items)
-        Small => 9        -- Small spacing (footer paragraphs)
-        Standard => 10    -- Standard spacing (component separation)
-        IconOffset => 18  -- Vertical offset for rotated icon positioning
-        Section => 65     -- Section spacing (major breaks)
+        None => 0
+        Tight => 5
+        Small => 9
+        Standard => 10
+        IconOffset => 18
+        Section => 65
     }
 }
 
--- Spring range values for interactive elements
--- Returns: [extend: X, compress: Y] defining maximum displacement in pixels for pointer magnetic response
 FUNCTION spring_range(of) {
     of |> WHEN {
-        Button => [extend: 6, compress: 4]           -- Standard button feel
-        ButtonDestructive => [extend: 4, compress: 6] -- Heavy press for destructive actions
-        ButtonFilter => [extend: 6, compress: 4]      -- Same as standard button
-        Checkbox => [extend: 4, compress: 8]          -- Deep press for tactile feedback
+        Button => [extend: 6, compress: 4]
+        ButtonDestructive => [extend: 4, compress: 6]
+        Checkbox => [extend: 4, compress: 8]
     }
 }
