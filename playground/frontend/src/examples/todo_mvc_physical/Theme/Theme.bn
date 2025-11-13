@@ -1,108 +1,20 @@
--- Theme System Router
--- Routes theme requests to the appropriate theme implementation
--- based on PASSED.theme_options.name and PASSED.theme_options.mode
---
--- Usage Examples:
---   Materials: Theme/material(of: Surface), Theme/material(of: Interactive[hovered: element.hovered])
---   Fonts: Theme/font(of: Body), Theme/font(of: ButtonIcon[checked: checked])
---   Text: Theme/text(of: Hero), Theme/text(of: BodySecondary)
---   Structural: Theme/depth(of: Container), Theme/elevation(of: Card), Theme/corners(of: Soft)
+FUNCTION material(of) { get(from: Material, of: of) }
+FUNCTION font(of) { get(from: Font, of: of) }
+FUNCTION text(of) { get(from: Text, of: of) }
+FUNCTION depth(of) { get(from: Depth, of: of) }
+FUNCTION elevation(of) { get(from: Elevation, of: of) }
+FUNCTION corners(of) { get(from: Corners, of: of) }
+FUNCTION lights() { get(from: Lights, of: []) }
+FUNCTION geometry() { get(from: Geometry, of: []) }
+FUNCTION sizing(of) { get(from: Sizing, of: of) }
+FUNCTION spacing(of) { get(from: Spacing, of: of) }
+FUNCTION spring_range(of) { get(from: SpringRange, of: of) }
 
-FUNCTION material(of) {
+FUNCTION get(from, of) {
     PASSED.theme_options.name |> WHEN {
-        Professional => of |> Professional/material()
-        Glassmorphism => of |> Glassmorphism/material()
-        Neobrutalism => of |> Neobrutalism/material()
-        Neumorphism => of |> Neumorphism/material()
-    }
-}
-
-FUNCTION font(of) {
-    PASSED.theme_options.name |> WHEN {
-        Professional => of |> Professional/font()
-        Glassmorphism => of |> Glassmorphism/font()
-        Neobrutalism => of |> Neobrutalism/font()
-        Neumorphism => of |> Neumorphism/font()
-    }
-}
-
-FUNCTION text(of) {
-    PASSED.theme_options.name |> WHEN {
-        Professional => of |> Professional/text()
-        Glassmorphism => of |> Glassmorphism/text()
-        Neobrutalism => of |> Neobrutalism/text()
-        Neumorphism => of |> Neumorphism/text()
-    }
-}
-
-FUNCTION depth(of) {
-    PASSED.theme_options.name |> WHEN {
-        Professional => of |> Professional/depth()
-        Glassmorphism => of |> Glassmorphism/depth()
-        Neobrutalism => of |> Neobrutalism/depth()
-        Neumorphism => of |> Neumorphism/depth()
-    }
-}
-
-FUNCTION elevation(of) {
-    PASSED.theme_options.name |> WHEN {
-        Professional => of |> Professional/elevation()
-        Glassmorphism => of |> Glassmorphism/elevation()
-        Neobrutalism => of |> Neobrutalism/elevation()
-        Neumorphism => of |> Neumorphism/elevation()
-    }
-}
-
-FUNCTION corners(of) {
-    PASSED.theme_options.name |> WHEN {
-        Professional => of |> Professional/corners()
-        Glassmorphism => of |> Glassmorphism/corners()
-        Neobrutalism => of |> Neobrutalism/corners()
-        Neumorphism => of |> Neumorphism/corners()
-    }
-}
-
-FUNCTION lights() {
-    PASSED.theme_options.name |> WHEN {
-        Professional => Professional/lights()
-        Glassmorphism => Glassmorphism/lights()
-        Neobrutalism => Neobrutalism/lights()
-        Neumorphism => Neumorphism/lights()
-    }
-}
-
-FUNCTION geometry() {
-    PASSED.theme_options.name |> WHEN {
-        Professional => Professional/geometry()
-        Glassmorphism => Glassmorphism/geometry()
-        Neobrutalism => Neobrutalism/geometry()
-        Neumorphism => Neumorphism/geometry()
-    }
-}
-
-FUNCTION sizing(of) {
-    PASSED.theme_options.name |> WHEN {
-        Professional => of |> Professional/sizing()
-        Glassmorphism => of |> Glassmorphism/sizing()
-        Neobrutalism => of |> Neobrutalism/sizing()
-        Neumorphism => of |> Neumorphism/sizing()
-    }
-}
-
-FUNCTION spacing(of) {
-    PASSED.theme_options.name |> WHEN {
-        Professional => of |> Professional/spacing()
-        Glassmorphism => of |> Glassmorphism/spacing()
-        Neobrutalism => of |> Neobrutalism/spacing()
-        Neumorphism => of |> Neumorphism/spacing()
-    }
-}
-
-FUNCTION spring_range(of) {
-    PASSED.theme_options.name |> WHEN {
-        Professional => of |> Professional/spring_range()
-        Glassmorphism => of |> Glassmorphism/spring_range()
-        Neobrutalism => of |> Neobrutalism/spring_range()
-        Neumorphism => of |> Neumorphism/spring_range()
+        Professional => Professional/get(from: from, of: of)
+        Glassmorphism => Glassmorphism/get(from: from, of: of)
+        Neobrutalism => Neobrutalism/get(from: from, of: of)
+        Neumorphism => Neumorphism/get(from: from, of: of)
     }
 }

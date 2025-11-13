@@ -2,6 +2,22 @@
 -- Soft rounded edges, subtle shadows, low gloss materials
 -- Neutral warm lighting, classic design system aesthetic
 
+FUNCTION get(from, of) {
+    from |> WHEN {
+        Material => of |> material()
+        Font => of |> font()
+        Text => of |> text()
+        Depth => of |> depth()
+        Elevation => of |> elevation()
+        Corners => of |> corners()
+        Lights => lights()
+        Geometry => geometry()
+        Sizing => of |> sizing()
+        Spacing => of |> spacing()
+        SpringRange => of |> spring_range()
+    }
+}
+
 FUNCTION material(material) {
     material |> WHEN {
         Background => [
