@@ -157,12 +157,16 @@ FUNCTION material(material) {
                 True => 0.2
             }
             metal: 0.03
-            glow: selected |> WHEN {
-                True => [
+            glow: LIST { selected, hover } |> WHEN {
+                LIST { True, __ } => [
                     color: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
                     intensity: 0.05
                 ]
-                False => None
+                LIST { False, True } => [
+                    color: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
+                    intensity: 0.025
+                ]
+                LIST { False, False } => None
             }
         ]
 
@@ -524,6 +528,7 @@ FUNCTION elevation(of) {
         Dialog => 24
         Lift => 8
         Button => 4
+        Selection => 4
         Base => 0
         Inset => -4
     }

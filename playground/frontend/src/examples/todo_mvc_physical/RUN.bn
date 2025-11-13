@@ -586,7 +586,6 @@ FUNCTION filters_element() {
 FUNCTION filter_button(filter) {
     BLOCK {
         selected: PASSED.store.selected_filter = filter
-        selected_offset: selected |> WHEN { True => 6, False => 0 }
 
         Element/button(
             element: [
@@ -598,15 +597,14 @@ FUNCTION filter_button(filter) {
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Soft)
                 spring_range: Theme/spring_range(of: ButtonFilter)
-                move: [closer: selected_offset]
+                move: [closer: selected |> WHEN {
+                    True => Theme/elevation(of: Selection)
+                    False => 0
+                }]
                 material: Theme/material(of: ButtonFilter[
                     selected: selected
                     hover: element.hovered
                 ])
-                outline: selected |> WHEN {
-                    True => Theme/border(of: Primary)
-                    False => NoOutline
-                }
             ]
             label: Element/text(
                 style: Theme/text(of: ButtonFilter)
