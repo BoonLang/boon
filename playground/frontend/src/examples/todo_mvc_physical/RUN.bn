@@ -297,7 +297,7 @@ FUNCTION todos_element() {
                 direction: Column
                 gap: Theme/spacing(of: None)
                 style: [
-                    borders: Theme/border(of: Standard)
+                    edges: Theme/edge(of: Standard)
                     material: Theme/material(of: SurfaceVariant)
                 ]
                 items: PASSED.store.todos
@@ -337,7 +337,7 @@ FUNCTION todo_element(todo) {
             width: Fill
             depth: Theme/depth(of: Detail)
             move: [closer: 4]
-            material: Theme/material(of: InputExterior[hover: element.hovered])
+            material: Theme/material(of: InputExterior[hovered: element.hovered])
         ]
         items: PASSED.store.selected_todo_id = todo.id |> WHILE {
             True => LIST {
@@ -380,7 +380,7 @@ FUNCTION toggle_all_checkbox() {
                 spring_range: Theme/spring_range(of: Checkbox)
                 material: Theme/material(of: ToggleCheckbox[
                     checked: element.checked
-                    hover: element.hovered
+                    hovered: element.hovered
                 ])
             ]
             label: Hidden[text: 'Toggle all']
@@ -423,7 +423,7 @@ FUNCTION editing_todo_title_element(todo) {
             rounded_corners: Theme/corners(of: Touch)
             move: [closer: 24]
             material: Theme/material(of: InputInterior[focus: True])
-            borders: Theme/border(of: Focus)
+            edges: Theme/edge(of: Focus)
         ]
         label: Hidden[text: 'selected todo title']
         text: todo.edited_title
@@ -450,7 +450,7 @@ FUNCTION todo_checkbox(todo) {
                 spring_range: Theme/spring_range(of: Checkbox)
                 material: Theme/material(of: TodoCheckbox[
                     checked: todo.completed
-                    hover: element.hovered
+                    hovered: element.hovered
                 ])
             ]
             label: Reference[element: todo.todo_elements.todo_title_element]
@@ -481,7 +481,6 @@ FUNCTION todo_title_element(todo) {
         style: [
             width: Fill
             padding: [column: 15, left: 15, right: 60]
-            clip: Row
         ]
         label: Element/text(
             style: Theme/text(of: TodoTitle[completed: todo.completed])
@@ -505,7 +504,7 @@ FUNCTION remove_todo_button() {
             depth: Theme/depth(of: Hero)
             rounded_corners: Theme/corners(of: Pill)
             spring_range: Theme/spring_range(of: ButtonDestructive)
-            material: Theme/material(of: ButtonDelete[hover: element.hovered])
+            material: Theme/material(of: ButtonDelete[hovered: element.hovered])
         ]
         label: Element/text(
             style: Theme/text(of: ButtonDelete)
@@ -526,7 +525,7 @@ FUNCTION panel_footer() {
         style: [
             padding: [row: 15, column: 8]
             material: Theme/material(of: PanelFooter)
-            borders: Theme/border(of: Standard)
+            edges: Theme/edge(of: Standard)
         ]
         items: LIST {
             active_items_count_text()
@@ -603,7 +602,7 @@ FUNCTION filter_button(filter) {
                 }]
                 material: Theme/material(of: ButtonFilter[
                     selected: selected
-                    hover: element.hovered
+                    hovered: element.hovered
                 ])
             ]
             label: Element/text(
@@ -634,10 +633,10 @@ FUNCTION remove_completed_button() {
             depth: Theme/depth(of: Element)
             rounded_corners: Theme/corners(of: Comfort)
             spring_range: Theme/spring_range(of: Button)
-            material: Theme/material(of: ButtonClear[hover: element.hovered])
+            material: Theme/material(of: ButtonClear[hovered: element.hovered])
         ]
         label: Element/text(
-            style: Theme/text(of: ClearButton[hover: element.hovered])
+            style: Theme/text(of: ClearButton[hovered: element.hovered])
             text: 'Clear completed'
         )
     )
@@ -685,7 +684,7 @@ FUNCTION footer() {
 FUNCTION footer_link(label, to) {
     Element/link(
         element: [hovered: LINK]
-        style: Theme/text(of: SmallLink[hover: element.hovered])
+        style: Theme/text(of: SmallLink[hovered: element.hovered])
         label: label
         to: to
         new_tab: []

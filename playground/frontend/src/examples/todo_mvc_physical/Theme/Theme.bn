@@ -5,7 +5,7 @@
 -- Usage Examples:
 --   Materials: Theme/material(of: ButtonDelete[hover: element.hovered])
 --   Fonts: Theme/font(of: ButtonIcon[checked: checked])
---   Borders: Theme/border(of: BorderFocus)
+--   Borders: Theme/edge(of: BorderFocus)
 --   Structural: Theme/depth(of: Major), Theme/elevation(of: Card), Theme/corners(of: Round)
 
 FUNCTION material(of) {
@@ -36,12 +36,12 @@ FUNCTION text(of) {
     }
 }
 
-FUNCTION border(of) {
+FUNCTION edge(of) {
     PASSED.theme_options.name |> WHEN {
-        Professional => of |> Professional/border()
-        Glassmorphism => of |> Glassmorphism/border()
-        Neobrutalism => of |> Neobrutalism/border()
-        Neumorphism => of |> Neumorphism/border()
+        Professional => of |> Professional/edge()
+        Glassmorphism => of |> Glassmorphism/edge()
+        Neobrutalism => of |> Neobrutalism/edge()
+        Neumorphism => of |> Neumorphism/edge()
     }
 }
 

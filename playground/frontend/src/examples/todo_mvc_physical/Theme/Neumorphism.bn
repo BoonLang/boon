@@ -70,7 +70,7 @@ FUNCTION material(material) {
         ]
 
         -- Interactive materials (with state)
-        InputExterior[hover] => [
+        InputExterior[hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.90, chroma: 0.005, hue: 240]
                 Dark => Oklch[lightness: 0.20, chroma: 0.005, hue: 240]
@@ -99,7 +99,7 @@ FUNCTION material(material) {
             }
         ]
 
-        Button[hover, press] => [
+        Button[hovered, press] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.90, chroma: 0.005, hue: 240]
                 Dark => Oklch[lightness: 0.20, chroma: 0.005, hue: 240]
@@ -108,7 +108,7 @@ FUNCTION material(material) {
             metal: 0.0
         ]
 
-        ButtonEmphasis[hover, press] => [
+        ButtonEmphasis[hovered, press] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.75, chroma: 0.05, hue: 260]
                 Dark => Oklch[lightness: 0.65, chroma: 0.06, hue: 260]
@@ -116,13 +116,13 @@ FUNCTION material(material) {
             gloss: 0.3
         ]
 
-        ButtonDelete[hover] => [
+        ButtonDelete[hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.94, chroma: 0.005, hue: 240]
                 Dark => Oklch[lightness: 0.22, chroma: 0.005, hue: 240]
             }
             gloss: 0.3
-            glow: hover |> WHEN {
+            glow: hovered |> WHEN {
                 True => [
                     color: PASSED.mode |> WHEN {
                         Light => Oklch[lightness: 0.75, chroma: 0.07, hue: 20]
@@ -134,7 +134,7 @@ FUNCTION material(material) {
             }
         ]
 
-        ButtonClear[hover] => [
+        ButtonClear[hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.94, chroma: 0.005, hue: 240]
                 Dark => Oklch[lightness: 0.22, chroma: 0.005, hue: 240]
@@ -142,7 +142,7 @@ FUNCTION material(material) {
             gloss: 0.25
         ]
 
-        ButtonFilter[selected, hover] => [
+        ButtonFilter[selected, hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => selected |> WHEN {
                     False => Oklch[lightness: 0.90, chroma: 0.005, hue: 240]
@@ -158,7 +158,7 @@ FUNCTION material(material) {
                 True => 0.2
             }
             metal: 0.03
-            glow: LIST { selected, hover } |> WHEN {
+            glow: LIST { selected, hovered } |> WHEN {
                 LIST { True, __ } => [
                     color: PASSED.mode |> WHEN {
                         Light => Oklch[lightness: 0.8, chroma: 0.06, hue: 260]
@@ -177,7 +177,7 @@ FUNCTION material(material) {
             }
         ]
 
-        ToggleCheckbox[checked, hover] => [
+        ToggleCheckbox[checked, hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.90, chroma: 0.005, hue: 240]
                 Dark => Oklch[lightness: 0.20, chroma: 0.005, hue: 240]
@@ -186,7 +186,7 @@ FUNCTION material(material) {
             metal: 0.05
         ]
 
-        TodoCheckbox[checked, hover] => [
+        TodoCheckbox[checked, hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.90, chroma: 0.005, hue: 240]
                 Dark => Oklch[lightness: 0.20, chroma: 0.005, hue: 240]
@@ -226,7 +226,7 @@ FUNCTION text(of) {
                     color: colors.text_tertiary
                     line: font_variant |> WHEN {
                         Plain => Unset
-                        LinkUnderline[hover] => [underline: hover]
+                        LinkUnderline[hovered] => [underline: hovered]
                     }
                 ]
                 depth: 1
@@ -257,8 +257,8 @@ FUNCTION text(of) {
                 relief: Raised
             ]
 
-            ClearButton[hover] => [
-                font: [size: 14, color: colors.text_secondary, line: [underline: hover]]
+            ClearButton[hovered] => [
+                font: [size: 14, color: colors.text_secondary, line: [underline: hovered]]
                 depth: 1.5
                 transform: [move_further: 0]
                 relief: Raised
@@ -293,7 +293,7 @@ FUNCTION text(of) {
             ]
 
             Small => make_small_style(Plain)
-            SmallLink[hover] => make_small_style(LinkUnderline[hover])
+            SmallLink[hovered] => make_small_style(LinkUnderline[hovered])
         }
     }
 }
@@ -304,8 +304,8 @@ FUNCTION font(font) {
     }
 }
 
-FUNCTION border(border) {
-    border |> WHEN {
+FUNCTION edge(edge) {
+    edge |> WHEN {
         Standard => [width: 0, color: Oklch[lightness: 0.5]]
         Focus => [width: 0, color: Oklch[lightness: 0.7, chroma: 0.1, hue: 220]]
         Primary => [width: 0, color: Oklch[lightness: 0.7, chroma: 0.165, hue: 25.36]]
@@ -453,7 +453,7 @@ FUNCTION theme(mode) {
 
         -- Interaction: Gentle, smooth movement
         interaction: [
-            hover_lift: 1          -- Very subtle lifts
+            hovered_lift: 1          -- Very subtle lifts
             press_depth: 2         -- Gentle presses
             emphasis_lift: 2
             transition_ms: 200     -- Slow, smooth
@@ -468,7 +468,7 @@ FUNCTION theme(mode) {
             Pill: Fully
         ]
 
-        -- Colors: Text, borders, and glow effects (surfaces are in materials)
+        -- Colors: Text, edges, and glow effects (surfaces are in materials)
         colors: mode |> WHEN {
             Light => [
                 primary_glow: Oklch[lightness: 0.8, chroma: 0.06, hue: 260]
@@ -480,7 +480,7 @@ FUNCTION theme(mode) {
                 text_secondary: Oklch[lightness: 0.6, chroma: 0.01, hue: 240]
                 text_disabled: Oklch[lightness: 0.75, chroma: 0.005, hue: 240]
                 text_header: Oklch[lightness: 0.75, chroma: 0.05, hue: 260]
-                border: Oklch[lightness: 0.85, chroma: 0.005, hue: 240]
+                edge: Oklch[lightness: 0.85, chroma: 0.005, hue: 240]
             ]
             Dark => [
                 primary_glow: Oklch[lightness: 0.7, chroma: 0.07, hue: 260]
@@ -492,7 +492,7 @@ FUNCTION theme(mode) {
                 text_secondary: Oklch[lightness: 0.6, chroma: 0.01, hue: 240]
                 text_disabled: Oklch[lightness: 0.4, chroma: 0.005, hue: 240]
                 text_header: Oklch[lightness: 0.65, chroma: 0.06, hue: 260]
-                border: Oklch[lightness: 0.3, chroma: 0.005, hue: 240]
+                edge: Oklch[lightness: 0.3, chroma: 0.005, hue: 240]
             ]
         }
     ]

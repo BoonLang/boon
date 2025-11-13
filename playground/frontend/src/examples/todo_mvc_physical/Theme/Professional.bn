@@ -69,7 +69,7 @@ FUNCTION material(material) {
         ]
 
         -- Interactive materials (with state)
-        InputExterior[hover] => [
+        InputExterior[hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.985]
                 Dark => Oklch[lightness: 0.18]
@@ -98,7 +98,7 @@ FUNCTION material(material) {
             }
         ]
 
-        Button[hover, press] => [
+        Button[hovered, press] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.985]
                 Dark => Oklch[lightness: 0.18]
@@ -107,7 +107,7 @@ FUNCTION material(material) {
             metal: 0.03
         ]
 
-        ButtonEmphasis[hover, press] => [
+        ButtonEmphasis[hovered, press] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.7, chroma: 0.165, hue: 25.36]
                 Dark => Oklch[lightness: 0.75, chroma: 0.165, hue: 25.36]
@@ -115,13 +115,13 @@ FUNCTION material(material) {
             gloss: 0.35
         ]
 
-        ButtonDelete[hover] => [
+        ButtonDelete[hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.99]
                 Dark => Oklch[lightness: 0.22]
             }
             gloss: 0.35
-            glow: hover |> WHEN {
+            glow: hovered |> WHEN {
                 True => [
                     color: PASSED.mode |> WHEN {
                         Light => Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87]
@@ -133,7 +133,7 @@ FUNCTION material(material) {
             }
         ]
 
-        ButtonClear[hover] => [
+        ButtonClear[hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.99]
                 Dark => Oklch[lightness: 0.22]
@@ -141,7 +141,7 @@ FUNCTION material(material) {
             gloss: 0.4
         ]
 
-        ButtonFilter[selected, hover] => [
+        ButtonFilter[selected, hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => selected |> WHEN {
                     False => Oklch[lightness: 0.985]
@@ -157,7 +157,7 @@ FUNCTION material(material) {
                 True => 0.2
             }
             metal: 0.03
-            glow: LIST { selected, hover } |> WHEN {
+            glow: LIST { selected, hovered } |> WHEN {
                 LIST { True, __ } => [
                     color: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
                     intensity: 0.05
@@ -170,7 +170,7 @@ FUNCTION material(material) {
             }
         ]
 
-        ToggleCheckbox[checked, hover] => [
+        ToggleCheckbox[checked, hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.985]
                 Dark => Oklch[lightness: 0.18]
@@ -179,7 +179,7 @@ FUNCTION material(material) {
             metal: 0.05
         ]
 
-        TodoCheckbox[checked, hover] => [
+        TodoCheckbox[checked, hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.985]
                 Dark => Oklch[lightness: 0.18]
@@ -306,9 +306,9 @@ FUNCTION font(font) {
                 }
             ]
 
-            ClearButton[hover] => [
+            ClearButton[hovered] => [
                 color: colors.text_secondary
-                line: [underline: hover]
+                line: [underline: hovered]
             ]
         }
     }
@@ -343,7 +343,7 @@ FUNCTION text(of) {
                     color: colors.text_tertiary
                     line: font_variant |> WHEN {
                         Plain => Unset
-                        LinkUnderline[hover] => [underline: hover]
+                        LinkUnderline[hovered] => [underline: hovered]
                     }
                 ]
                 depth: 1
@@ -387,11 +387,11 @@ FUNCTION text(of) {
                 relief: Raised
             ]
 
-            ClearButton[hover] => [
+            ClearButton[hovered] => [
                 font: [
                     size: 14
                     color: colors.text_secondary
-                    line: [underline: hover]
+                    line: [underline: hovered]
                 ]
                 depth: 1.5
                 transform: [move_further: 0]
@@ -444,13 +444,13 @@ FUNCTION text(of) {
             ]
 
             Small => make_small_style(Plain)
-            SmallLink[hover] => make_small_style(LinkUnderline[hover])
+            SmallLink[hovered] => make_small_style(LinkUnderline[hovered])
         }
     }
 }
 
-FUNCTION border(border) {
-    border |> WHEN {
+FUNCTION edge(edge) {
+    edge |> WHEN {
         Standard => [
             top: [
                 color: PASSED.mode |> WHEN {
@@ -724,17 +724,17 @@ FUNCTION geometry() {
         bevel_angle: 45
         -- Enhanced beveling for automatic edge definition (Pattern 2)
         -- Higher values create more pronounced edges that catch light better
-        -- Eliminates need for manual borders on elements with sufficient depth
+        -- Eliminates need for manual edges on elements with sufficient depth
         edge_definition: 1.5  -- Multiplier for bevel prominence (1.0 = standard, 2.0 = dramatic)
-        min_depth_for_edges: 4  -- Elements thinner than this need manual borders
+        min_depth_for_edges: 4  -- Elements thinner than this need manual edges
     ]
 }
 
 -- Interaction physics constants
--- Used in Phase 2 for automatic hover/press transforms based on material elasticity
+-- Used in Phase 2 for automatic hovered/press transforms based on material elasticity
 FUNCTION interaction() {
     [
-        hover_lift: 2          -- Standard lift on hover (for Secondary importance)
+        hovered_lift: 2          -- Standard lift on hovered (for Secondary importance)
         press_depth: 4         -- Standard depression when pressed
         emphasis_lift: 4       -- Extra lift for Primary importance elements
         transition_ms: 150     -- Animation duration
@@ -751,7 +751,7 @@ FUNCTION material_physics(of) {
             elasticity: Springy    -- High bounce response
             weight: Light          -- Lifts easily
             rest_elevation: 4      -- Resting height
-            hover_lift: 4          -- Extra lift on hover
+            hovered_lift: 4          -- Extra lift on hovered
             press_depression: 6    -- Deep press
         ]
 
@@ -759,7 +759,7 @@ FUNCTION material_physics(of) {
             elasticity: Springy
             weight: VeryLight
             rest_elevation: 2
-            hover_lift: 3
+            hovered_lift: 3
             press_depression: 4
         ]
 
@@ -768,7 +768,7 @@ FUNCTION material_physics(of) {
             elasticity: Medium     -- Standard response
             weight: Standard       -- Normal weight
             rest_elevation: 4
-            hover_lift: 2
+            hovered_lift: 2
             press_depression: 4
         ]
 
@@ -776,7 +776,7 @@ FUNCTION material_physics(of) {
             elasticity: Medium
             weight: Standard
             rest_elevation: 2
-            hover_lift: 2
+            hovered_lift: 2
             press_depression: 2
         ]
 
@@ -785,7 +785,7 @@ FUNCTION material_physics(of) {
             elasticity: Rigid      -- Barely moves
             weight: Heavy          -- Feels substantial
             rest_elevation: 2
-            hover_lift: 1
+            hovered_lift: 1
             press_depression: 1
         ]
 
@@ -793,7 +793,7 @@ FUNCTION material_physics(of) {
             elasticity: Rigid
             weight: VeryHeavy      -- Almost immovable
             rest_elevation: 0
-            hover_lift: 1
+            hovered_lift: 1
             press_depression: 0
         ]
 
@@ -801,7 +801,7 @@ FUNCTION material_physics(of) {
             elasticity: Rigid
             weight: Standard
             rest_elevation: 2
-            hover_lift: 1
+            hovered_lift: 1
             press_depression: 1
         ]
 
@@ -810,7 +810,7 @@ FUNCTION material_physics(of) {
             elasticity: Springy
             weight: Light
             rest_elevation: 4
-            hover_lift: 2
+            hovered_lift: 2
             press_depression: 4
         ]
 
@@ -818,7 +818,7 @@ FUNCTION material_physics(of) {
             elasticity: Medium
             weight: Standard
             rest_elevation: 6
-            hover_lift: 4
+            hovered_lift: 4
             press_depression: 4
         ]
 
@@ -826,7 +826,7 @@ FUNCTION material_physics(of) {
             elasticity: Rigid      -- Heavy, deliberate feel
             weight: Heavy
             rest_elevation: 8
-            hover_lift: 4
+            hovered_lift: 4
             press_depression: 4  -- Solid depression for heavy button
         ]
 
@@ -834,7 +834,7 @@ FUNCTION material_physics(of) {
             elasticity: Medium
             weight: Light
             rest_elevation: 4
-            hover_lift: 2
+            hovered_lift: 2
             press_depression: 8  -- Deep press to surface level (4) then further back (total 8)
         ]
 
@@ -842,7 +842,7 @@ FUNCTION material_physics(of) {
             elasticity: Rigid
             weight: Standard
             rest_elevation: -4     -- Recessed
-            hover_lift: 0          -- Inputs don't lift
+            hovered_lift: 0          -- Inputs don't lift
             press_depression: 0
         ]
 
@@ -850,29 +850,29 @@ FUNCTION material_physics(of) {
             elasticity: Medium
             weight: Light
             rest_elevation: 0      -- Flush with surface when not selected
-            hover_lift: 4          -- Lift on hover
+            hovered_lift: 4          -- Lift on hovered
             press_depression: 0    -- Press back to surface
         ]
     }
 }
 
 -- Pattern 1: Auto-calculate interaction transforms from material
--- Returns transforms for hover/press states based on material physics
--- Usage: Theme/interaction_transform(material: Plastic, state: [hovered: True, pressed: False])
+-- Returns transforms for hovered/press states based on material physics
+-- Usage: Theme/interaction_transform(material: Plastic, state: [hovereded: True, pressed: False])
 FUNCTION interaction_transform(material, state) {
     BLOCK {
         physics: material |> material_physics()
 
         state |> WHEN {
-            [hovered: __, pressed: True] => [
+            [hovereded: __, pressed: True] => [
                 -- Pressed: Move back by press_depression
                 move_closer: physics.rest_elevation - physics.press_depression
             ]
-            [hovered: True, pressed: False] => [
-                -- Hover: Add hover_lift to resting position
-                move_closer: physics.rest_elevation + physics.hover_lift
+            [hovereded: True, pressed: False] => [
+                -- Hover: Add hovered_lift to resting position
+                move_closer: physics.rest_elevation + physics.hovered_lift
             ]
-            [hovered: False, pressed: False] => [
+            [hovereded: False, pressed: False] => [
                 -- Rest: Just resting elevation
                 move_closer: physics.rest_elevation
             ]
@@ -892,7 +892,7 @@ FUNCTION disabled_style(current_style) {
         depth: 1               -- Paper-thin, insubstantial
         transform: [move_further: 2]  -- Pushed back into surface, receives less light
         -- Material becomes non-interactive
-        interaction: Frozen    -- No hover/press response
+        interaction: Frozen    -- No hovered/press response
     ]
 }
 
@@ -1125,7 +1125,7 @@ FUNCTION theme(mode) {
 
         -- Interaction: Subtle physical movement
         interaction: [
-            hover_lift: 2          -- Adds to resting z
+            hovered_lift: 2          -- Adds to resting z
             press_depth: 4         -- Movement when pressed
             emphasis_lift: 4       -- Extra lift for important elements
             transition_ms: 150     -- Animation duration
@@ -1140,7 +1140,7 @@ FUNCTION theme(mode) {
             Pill: Fully
         ]
 
-        -- Colors: Text, borders, and glow effects (surfaces are in materials)
+        -- Colors: Text, edges, and glow effects (surfaces are in materials)
         colors: mode |> WHEN {
             Light => [
                 primary_glow: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
@@ -1152,7 +1152,7 @@ FUNCTION theme(mode) {
                 text_secondary: Oklch[lightness: 0.57]
                 text_disabled: Oklch[lightness: 0.75]
                 text_header: Oklch[lightness: 0.54, chroma: 0.156, hue: 21.24]
-                border: Oklch[lightness: 0.92]
+                edge: Oklch[lightness: 0.92]
             ]
             Dark => [
                 primary_glow: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
@@ -1164,7 +1164,7 @@ FUNCTION theme(mode) {
                 text_secondary: Oklch[lightness: 0.75]
                 text_disabled: Oklch[lightness: 0.5]
                 text_header: Oklch[lightness: 0.75, chroma: 0.165, hue: 25.36]
-                border: Oklch[lightness: 0.3]
+                edge: Oklch[lightness: 0.3]
             ]
         }
     ]
