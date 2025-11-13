@@ -223,7 +223,7 @@ FUNCTION main_panel() {
         style: [
             width: Fill
             depth: Theme/depth(of: Container)
-            transform: [move_closer: Theme/elevation(of: Card)]
+            move: [closer: Theme/elevation(of: Card)]
             rounded_corners: Theme/corners(of: Comfort)
             material: Theme/material(of: Panel)
         ]
@@ -265,7 +265,7 @@ FUNCTION new_todo_title_text_input() {
             padding: [column: 19, left: 60, right: 16]
             font: Theme/font(of: Input)
             depth: Theme/depth(of: Element)
-            transform: [move_further: Theme/elevation(of: Inset)]
+            move: [further: Theme/elevation(of: Inset)]
             rounded_corners: Theme/corners(of: Touch)
             material: Theme/material(of: InputInterior[focus: element.focused])
         ]
@@ -336,7 +336,7 @@ FUNCTION todo_element(todo) {
         style: [
             width: Fill
             depth: Theme/depth(of: Detail)
-            transform: [move_closer: 4]
+            move: [closer: 4]
             material: Theme/material(of: InputExterior[hover: element.hovered])
         ]
         items: PASSED.store.selected_todo_id = todo.id |> WHILE {
@@ -389,7 +389,8 @@ FUNCTION toggle_all_checkbox() {
                 style: [
                     height: 34
                     padding: [row: 27, column: 6]
-                    transform: [rotate: 90, move_up: 18]
+                    rotate: 90
+                    move: [up: 18]
                 ]
                 child: Element/text(
                     style: Theme/text(of: ButtonIcon[checked: checked])
@@ -420,7 +421,7 @@ FUNCTION editing_todo_title_element(todo) {
             font: Theme/font(of: Input)
             depth: Theme/depth(of: Element)
             rounded_corners: Theme/corners(of: Touch)
-            transform: [move_closer: 24]
+            move: [closer: 24]
             material: Theme/material(of: InputInterior[focus: True])
             borders: Theme/border(of: Focus)
         ]
@@ -597,7 +598,7 @@ FUNCTION filter_button(filter) {
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Soft)
                 spring_range: Theme/spring_range(of: ButtonFilter)
-                transform: [move_closer: selected_offset]
+                move: [closer: selected_offset]
                 material: Theme/material(of: ButtonFilter[
                     selected: selected
                     hover: element.hovered
