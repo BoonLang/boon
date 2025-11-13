@@ -1,27 +1,7 @@
--- TodoMVC with Emergent Physical Geometry + Theme System
---
--- GEOMETRY: Elements positioned in 3D space, bevels/shadows emerge naturally
--- THEME: Professional preset. See Theme/ for Neobrutalism, Glassmorphism, Neumorphism
--- DEMO: Consistent theme API - materials, fonts, borders use tagged functions
---
--- EMERGENT PATTERNS IMPLEMENTED:
---   Pattern 1: Material physics (elasticity) → REPLACED by Pattern 6 magnetic response
---   Pattern 2: Beveled geometry → automatic edge definition (replaces borders)
---   Pattern 3: Semantic depth tokens (Container, Element, Hero, Detail) - simple API
---   Pattern 4: Text hierarchy from z-position (depth-based lighting affects brightness)
---   Pattern 5: Focus spotlight (dynamic lighting for focused elements)
---   Pattern 6: Pointer magnetic response → elements lift/depress based on proximity (spring model)
---   Pattern 7: Semantic corner tokens (Touch, Comfort, Soft, Pill) - simple API
---   Pattern 8: Disabled state as ghost material (translucent, recessed)
---   Pattern 9: Sweep/shimmer lights for loading states (when applicable)
---   Pattern 10: Emissive materials for state indication (error, success, warning)
---
--- Theme provides: materials, fonts, borders, lights, geometry, depth, elevation, corners
--- Switch theme: Change theme_options.name (Professional, Neobrutalism, Glassmorphism, Neumorphism)
--- Switch mode: Change theme_options.mode (Light, Dark)
+-- TodoMVC - Physical 3D UI Example
 
 ------------------------------------------------------------------------
--- FILTER ROUTES - Single source of truth
+-- FILTER ROUTES
 ------------------------------------------------------------------------
 
 filter_routes: [
@@ -161,9 +141,9 @@ theme_options: [
 -- SCENE - Physical 3D with theme
 ------------------------------------------------------------------------
 
-scene: create_scene(PASS: [store: store, theme_options: theme_options])
+scene: main_scene(PASS: [store: store, theme_options: theme_options])
 
-FUNCTION create_scene() {
+FUNCTION main_scene() {
     Scene/new(
         root: root_element()
         lights: Theme/lights()
@@ -312,12 +292,10 @@ FUNCTION new_todo_title_text_input() {
 ------------------------------------------------------------------------
 
 FUNCTION todos_element() {
-    -- Use Stack to layer checkbox over the todo list
     Element/stack(
         element: []
         style: [width: Fill]
         layers: LIST {
-            -- Base layer: The actual todos list
             Element/stripe(
                 element: []
                 direction: Column
@@ -334,7 +312,6 @@ FUNCTION todos_element() {
                     })
                     |> List/map(old, new: old |> todo_element())
             )
-            -- Overlay layer: Toggle-all checkbox positioned at top-left
             Element/block(
                 element: []
                 style: [
