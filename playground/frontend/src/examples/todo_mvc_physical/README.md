@@ -10,21 +10,21 @@ This directory contains the TodoMVC implementation with physically-based 3D rend
 
 ### Documentation
 
-- **`PHYSICALLY_BASED_RENDERING.md`** - **START HERE** - Complete guide to Boon's 3D UI system
+- **`docs/PHYSICALLY_BASED_RENDERING.md`** - **START HERE** - Complete guide to Boon's 3D UI system
   - User API (semantic elements)
   - Automatic cavity generation
   - Material properties
   - Scene lighting (`Lights/basic()` helper or custom light lists)
   - Internal implementation details
 
-- **`3D_API_DESIGN.md`** - Detailed API reference for 3D properties
+- **`docs/3D_API_DESIGN.md`** - Detailed API reference for 3D properties
   - `transform: [move_closer/move_further]` positioning
   - `depth` property for 3D thickness
   - `gloss`, `metal`, `shine` material properties
   - `edges`, `rim` properties
   - Complete TodoMVC examples
 
-- **`EMERGENT_GEOMETRY_CONCEPT.md`** - Philosophy document
+- **`docs/EMERGENT_GEOMETRY_CONCEPT.md`** - Philosophy document
   - How geometry emerges from spatial relationships
   - Design system switching (Professional, Neobrutalism, etc.)
   - Paradigm shift from explicit to emergent
@@ -101,7 +101,7 @@ Each theme bundles **8 properties** that cascade through the entire scene:
 7. **Corners** - Radius scale (sharp, subtle, standard, round)
 8. **Colors** - Semantic palette with automatic light/dark mode
 
-**See `Theme/` directory for complete theme definitions and documentation.**
+**See `Theme/` directory for theme code and `docs/theme/` for complete documentation.**
 
 ## Design Philosophy
 

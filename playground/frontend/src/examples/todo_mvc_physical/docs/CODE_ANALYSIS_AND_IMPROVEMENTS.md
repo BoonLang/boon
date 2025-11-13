@@ -106,7 +106,7 @@ new_todo_title_text_input()
 4. **Visual Tooling**: Generate reactive graph diagrams from LINK structure
 5. **Documentation**: Establish LINK as standard architectural pattern
 
-**See Full Analysis**: `../../.code/LINK_PATTERN.md` for comprehensive deep-dive into why LINK is architectural clarity, not boilerplate.
+**See Full Analysis**: `/docs/patterns/LINK_PATTERN.md` for comprehensive deep-dive into why LINK is architectural clarity, not boilerplate.
 
 **Conclusion**: **No changes needed** - LINK pattern is correct design. Document as best practice, add compiler verification, provide tooling support.
 
@@ -915,7 +915,7 @@ Element/paragraph(
 ### ✅ Phase 1: Quick Wins (Priority 1) - COMPLETED
 1. ✅ **Theme API Unified** - Implemented `Theme/text()` consolidating all text properties
 2. ✅ **3D Relief System** - Implemented `relief: Raised` and `relief: Carved[wall: N]`
-3. ✅ **LINK Pattern** - Documented as correct architectural design (see `.code/LINK_PATTERN.md`)
+3. ✅ **LINK Pattern** - Documented as correct architectural design (see `/docs/patterns/LINK_PATTERN.md`)
 
 **Status**: Completed
 
@@ -1105,7 +1105,7 @@ toggle_all_checkbox() |> LINK { PASSED.store.elements.toggle_all_checkbox }
 
 **The pattern is not boilerplate - it's architectural clarity.**
 
-**See comprehensive analysis**: `.code/LINK_PATTERN.md` for full deep-dive into why LINK is correct design.
+**See comprehensive analysis**: `/docs/patterns/LINK_PATTERN.md` for full deep-dive into why LINK is correct design.
 
 ---
 

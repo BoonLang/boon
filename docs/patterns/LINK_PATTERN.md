@@ -1036,7 +1036,7 @@ Don't try to eliminate the pattern - **embrace it** as a core architectural prin
 ---
 
 **Related Documentation:**
-- `.code/BOON_SYNTAX.md` - Core Boon syntax rules
-- `CODE_ANALYSIS_AND_IMPROVEMENTS.md` - TodoMVC code analysis
+- `../language/BOON_SYNTAX.md` - Core Boon syntax rules
+- `playground/frontend/src/examples/todo_mvc_physical/docs/CODE_ANALYSIS_AND_IMPROVEMENTS.md` - TodoMVC code analysis
 
 **Last Updated:** 2025-11-12

@@ -861,8 +861,8 @@ BUILD.bn provides powerful code generation capabilities for Boon projects.
 ---
 
 **Related Documents:**
-- `.code/BOON_SYNTAX.md` - Core Boon syntax
-- `.code/LINK_PATTERN.md` - Reactive architecture patterns
+- `../language/BOON_SYNTAX.md` - Core Boon syntax
+- `../patterns/LINK_PATTERN.md` - Reactive architecture patterns
 - `playground/frontend/src/examples/todo_mvc_physical/BUILD.bn` - Example build script
 
 **Last Updated:** 2025-11-12
