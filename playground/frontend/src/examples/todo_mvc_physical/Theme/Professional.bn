@@ -11,14 +11,12 @@ FUNCTION material(material) {
             }
         ]
 
-        Panel => [
+        Surface => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 1]
                 Dark => Oklch[lightness: 0.15]
             }
-            gloss: 0.12
-            metal: 0.02
-            shine: 0.6
+            gloss: 0.25
         ]
 
         SurfaceVariant => [
@@ -29,7 +27,7 @@ FUNCTION material(material) {
             gloss: 0.25
         ]
 
-        PanelFooter => [
+        SurfaceElevated => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.99]
                 Dark => Oklch[lightness: 0.22]
@@ -37,15 +35,19 @@ FUNCTION material(material) {
             gloss: 0.4
         ]
 
-        InputExterior[hovered] => [
+        Interactive[hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.985]
                 Dark => Oklch[lightness: 0.18]
             }
-            gloss: 0.18
+            gloss: hovered |> WHEN {
+                True => 0.3
+                False => 0.25
+            }
+            metal: 0.03
         ]
 
-        InputInterior[focus] => [
+        InteractiveRecessed[focus] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 1]
                 Dark => Oklch[lightness: 0.15]
@@ -66,77 +68,25 @@ FUNCTION material(material) {
             }
         ]
 
-        ButtonDelete[hovered] => [
+        Primary => [
             color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.99]
-                Dark => Oklch[lightness: 0.22]
-            }
-            gloss: 0.35
-            glow: hovered |> WHEN {
-                True => [
-                    color: PASSED.mode |> WHEN {
-                        Light => Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87]
-                        Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 18.87]
-                    }
-                    intensity: 0.08
-                ]
-                False => None
+                Light => Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
+                Dark => Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
             }
         ]
 
-        ButtonClear[hovered] => [
+        PrimarySubtle => [
             color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.99]
-                Dark => Oklch[lightness: 0.22]
-            }
-            gloss: 0.4
-        ]
-
-        ButtonFilter[selected, hovered] => [
-            color: PASSED.mode |> WHEN {
-                Light => selected |> WHEN {
-                    False => Oklch[lightness: 0.985]
-                    True => Oklch[lightness: 0.98, chroma: 0.01, hue: 25.36]
-                }
-                Dark => selected |> WHEN {
-                    False => Oklch[lightness: 0.18]
-                    True => Oklch[lightness: 0.25, chroma: 0.08, hue: 25.36]
-                }
-            }
-            gloss: selected |> WHEN {
-                False => 0.35
-                True => 0.2
-            }
-            metal: 0.03
-            glow: LIST { selected, hovered } |> WHEN {
-                LIST { True, __ } => [
-                    color: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
-                    intensity: 0.05
-                ]
-                LIST { False, True } => [
-                    color: Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
-                    intensity: 0.025
-                ]
-                LIST { False, False } => None
+                Light => Oklch[lightness: 0.98, chroma: 0.01, hue: 25.36]
+                Dark => Oklch[lightness: 0.25, chroma: 0.08, hue: 25.36]
             }
         ]
 
-        ToggleCheckbox[checked, hovered] => [
+        Danger => [
             color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.985]
-                Dark => Oklch[lightness: 0.18]
+                Light => Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87]
+                Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 18.87]
             }
-            gloss: 0.3
-            metal: 0.05
-        ]
-
-        TodoCheckbox[checked, hovered] => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.985]
-                Dark => Oklch[lightness: 0.18]
-            }
-            gloss: 0.25
-            metal: 0.03
         ]
     }
 }
@@ -163,6 +113,33 @@ FUNCTION font(font) {
         }
 
         font |> WHEN {
+            Hero => [
+                size: 100
+                color: colors.text_header
+                weight: Hairline
+            ]
+
+            Body => [
+                size: 24
+                color: colors.text
+            ]
+
+            BodySecondary => [
+                size: 14
+                color: colors.text_secondary
+            ]
+
+            BodyDisabled => [
+                size: 24
+                color: colors.text_disabled
+            ]
+
+            BodyDanger => [
+                size: 30
+                align: Center
+                color: colors.danger
+            ]
+
             Input => [
                 size: 24
                 color: colors.text
@@ -174,49 +151,12 @@ FUNCTION font(font) {
                 color: colors.text_secondary
             ]
 
-            Header => [
-                size: 100
-                color: colors.text_header
-                weight: Hairline
-            ]
-
-            ButtonDelete => [
-                size: 30
-                align: Center
-                color: colors.danger
-            ]
-
-            ButtonFilter => [
-                size: 14
-                color: colors.text_secondary
-            ]
-
-            ClearButton[hovered] => [
-                size: 14
-                color: colors.text_secondary
-                line: [underline: hovered]
-            ]
-
-            TodoTitle[completed] => [
-                size: 24
-                line: [strike: completed]
-                color: completed |> WHEN {
-                    True => colors.text_disabled
-                    False => colors.text
-                }
-            ]
-
             ButtonIcon[checked] => [
                 size: 22
                 color: checked |> WHEN {
                     True => colors.text
                     False => colors.text_disabled
                 }
-            ]
-
-            Secondary => [
-                size: 14
-                color: colors.text_secondary
             ]
 
             Small => [
@@ -235,59 +175,22 @@ FUNCTION font(font) {
 
 FUNCTION text(of) {
     of |> WHEN {
-        Header => [
-            font: font(of: Header)
+        Hero => [
+            font: font(of: Hero)
             depth: 6
             move: [closer: 6]
             relief: Raised
         ]
 
-        ButtonDelete => [
-            font: font(of: ButtonDelete)
-            depth: 2
-            move: [further: 0]
-            relief: Raised
-        ]
-
-        ButtonFilter => [
-            font: font(of: ButtonFilter)
+        BodySecondary => [
+            font: font(of: BodySecondary)
             depth: 1.5
-            move: [further: 0]
+            move: [further: 2]
             relief: Raised
-        ]
-
-        ClearButton[hovered] => [
-            font: font(of: ClearButton[hovered])
-            depth: 1.5
-            move: [further: 0]
-            relief: Raised
-        ]
-
-        TodoTitle[completed] => [
-            font: font(of: TodoTitle[completed])
-            depth: completed |> WHEN {
-                True => 1
-                False => 2
-            }
-            move: completed |> WHEN {
-                True => [further: 4]
-                False => [further: 0]
-            }
-            relief: completed |> WHEN {
-                True => Carved[wall: 1]
-                False => Raised
-            }
         ]
 
         ButtonIcon[checked] => [
             font: font(of: ButtonIcon[checked])
-        ]
-
-        Secondary => [
-            font: font(of: Secondary)
-            depth: 1.5
-            move: [further: 2]
-            relief: Raised
         ]
 
         Small => [

@@ -134,6 +134,124 @@ theme_options: [
 ]
 
 ------------------------------------------------------------------------
+-- COMPONENT STYLES
+------------------------------------------------------------------------
+
+FUNCTION delete_button_material(hovered) {
+    Theme/material(of: SurfaceElevated) |> MERGE [
+        glow: hovered |> WHEN {
+            True => [
+                color: Theme/material(of: Danger).color
+                intensity: 0.08
+            ]
+            False => None
+        }
+    ]
+}
+
+FUNCTION filter_button_material(selected, hovered) {
+    BLOCK {
+        base: selected |> WHEN {
+            True => Theme/material(of: PrimarySubtle)
+            False => Theme/material(of: SurfaceVariant)
+        }
+
+        base |> MERGE [
+            gloss: selected |> WHEN {
+                False => 0.35
+                True => 0.2
+            }
+            metal: 0.03
+            glow: LIST { selected, hovered } |> WHEN {
+                LIST { True, __ } => [
+                    color: Theme/material(of: Primary).color
+                    intensity: 0.05
+                ]
+                LIST { False, True } => [
+                    color: Theme/material(of: Primary).color
+                    intensity: 0.025
+                ]
+                LIST { False, False } => None
+            }
+        ]
+    }
+}
+
+FUNCTION clear_button_font(hovered) {
+    [
+        size: 14
+        color: PASSED.theme_options.mode |> WHEN {
+            Light => Oklch[lightness: 0.57]
+            Dark => Oklch[lightness: 0.75]
+        }
+        line: [underline: hovered]
+    ]
+}
+
+FUNCTION clear_button_text(hovered) {
+    [
+        font: clear_button_font(hovered: hovered)
+        depth: 1.5
+        move: [further: 0]
+        relief: Raised
+    ]
+}
+
+FUNCTION todo_title_font(completed) {
+    BLOCK {
+        colors: PASSED.theme_options.mode |> WHEN {
+            Light => [text: Oklch[lightness: 0.42], text_disabled: Oklch[lightness: 0.75]]
+            Dark => [text: Oklch[lightness: 0.9], text_disabled: Oklch[lightness: 0.5]]
+        }
+
+        [
+            size: 24
+            line: [strike: completed]
+            color: completed |> WHEN {
+                True => colors.text_disabled
+                False => colors.text
+            }
+        ]
+    }
+}
+
+FUNCTION todo_title_text(completed) {
+    [
+        font: todo_title_font(completed: completed)
+        depth: completed |> WHEN {
+            True => 1
+            False => 2
+        }
+        move: completed |> WHEN {
+            True => [further: 4]
+            False => [further: 0]
+        }
+        relief: completed |> WHEN {
+            True => Carved[wall: 1]
+            False => Raised
+        }
+    ]
+}
+
+FUNCTION delete_button_text() {
+    [
+        font: Theme/font(of: BodyDanger)
+        depth: 2
+        move: [further: 0]
+        relief: Raised
+    ]
+}
+
+FUNCTION filter_button_text() {
+    [
+        font: Theme/font(of: BodySecondary)
+        depth: 1.5
+        move: [further: 0]
+        relief: Raised
+    ]
+}
+
+------------------------------------------------------------------------
 -- SCENE
 ------------------------------------------------------------------------
 
@@ -205,7 +323,7 @@ FUNCTION header() {
         ]
         child: Element/text(
             element: [tag: H1]
-            style: Theme/text(of: Header)
+            style: Theme/text(of: Hero)
             text: 'todos'
         )
     )
@@ -225,7 +343,7 @@ FUNCTION main_panel() {
             depth: Theme/depth(of: Container)
             move: [closer: Theme/elevation(of: Card)]
             rounded_corners: Theme/corners(of: Comfort)
-            material: Theme/material(of: Panel)
+            material: Theme/material(of: Surface)
         ]
         items: LIST {
             new_todo_title_text_input()
@@ -267,7 +385,7 @@ FUNCTION new_todo_title_text_input() {
             depth: Theme/depth(of: Element)
             move: [further: Theme/elevation(of: Inset)]
             rounded_corners: Theme/corners(of: Touch)
-            material: Theme/material(of: InputInterior[focus: element.focused])
+            material: Theme/material(of: InteractiveRecessed[focus: element.focused])
         ]
         label: Hidden[text: 'What needs to be done?']
         text: LATEST {
@@ -336,7 +454,7 @@ FUNCTION todo_element(todo) {
             width: Fill
             depth: Theme/depth(of: Detail)
             move: [closer: Theme/elevation(of: TodoItem)]
-            material: Theme/material(of: InputExterior[hovered: element.hovered])
+            material: Theme/material(of: Interactive[hovered: element.hovered])
         ]
         items: PASSED.store.selected_todo_id = todo.id |> WHILE {
             True => LIST {
@@ -377,10 +495,7 @@ FUNCTION toggle_all_checkbox() {
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Touch)
                 spring_range: Theme/spring_range(of: Checkbox)
-                material: Theme/material(of: ToggleCheckbox[
-                    checked: element.checked
-                    hovered: element.hovered
-                ])
+                material: Theme/material(of: Interactive[hovered: element.hovered])
             ]
             label: Hidden[text: 'Toggle all']
             checked: checked
@@ -421,7 +536,7 @@ FUNCTION editing_todo_title_element(todo) {
             depth: Theme/depth(of: Element)
             rounded_corners: Theme/corners(of: Touch)
             move: [closer: Theme/elevation(of: EditingFocus)]
-            material: Theme/material(of: InputInterior[focus: True])
+            material: Theme/material(of: InteractiveRecessed[focus: True])
         ]
         label: Hidden[text: 'selected todo title']
         text: todo.edited_title
@@ -446,10 +561,7 @@ FUNCTION todo_checkbox(todo) {
                 depth: Theme/depth(of: Element)
                 rounded_corners: Theme/corners(of: Pill)
                 spring_range: Theme/spring_range(of: Checkbox)
-                material: Theme/material(of: TodoCheckbox[
-                    checked: todo.completed
-                    hovered: element.hovered
-                ])
+                material: Theme/material(of: Interactive[hovered: element.hovered])
             ]
             label: Reference[element: todo.todo_elements.todo_title_element]
             checked: todo.completed
@@ -481,7 +593,7 @@ FUNCTION todo_title_element(todo) {
             padding: [column: 15, left: 15, right: 60]
         ]
         label: Element/text(
-            style: Theme/text(of: TodoTitle[completed: todo.completed])
+            style: todo_title_text(completed: todo.completed)
             text: todo.title
         )
     )
@@ -502,10 +614,10 @@ FUNCTION remove_todo_button() {
             depth: Theme/depth(of: Hero)
             rounded_corners: Theme/corners(of: Pill)
             spring_range: Theme/spring_range(of: ButtonDestructive)
-            material: Theme/material(of: ButtonDelete[hovered: element.hovered])
+            material: delete_button_material(hovered: element.hovered)
         ]
         label: Element/text(
-            style: Theme/text(of: ButtonDelete)
+            style: delete_button_text()
             text: '×'
         )
     )
@@ -522,7 +634,7 @@ FUNCTION panel_footer() {
         gap: Theme/spacing(of: None)
         style: [
             padding: [row: 15, column: 8]
-            material: Theme/material(of: PanelFooter)
+            material: Theme/material(of: SurfaceElevated)
         ]
         items: LIST {
             active_items_count_text()
@@ -547,7 +659,7 @@ FUNCTION panel_footer() {
 FUNCTION active_items_count_text() {
     Element/text(
         element: []
-        style: Theme/text(of: Secondary)
+        style: Theme/text(of: BodySecondary)
         text: PASSED.store.todos
             |> List/retain(item, if: item.completed |> Bool/not())
             |> List/count
@@ -597,13 +709,10 @@ FUNCTION filter_button(filter) {
                     True => Theme/elevation(of: Selection)
                     False => 0
                 }]
-                material: Theme/material(of: ButtonFilter[
-                    selected: selected
-                    hovered: element.hovered
-                ])
+                material: filter_button_material(selected: selected, hovered: element.hovered)
             ]
             label: Element/text(
-                style: Theme/text(of: ButtonFilter)
+                style: filter_button_text()
                 text: filter |> WHEN {
                     All => 'All'
                     Active => 'Active'
@@ -630,10 +739,10 @@ FUNCTION remove_completed_button() {
             depth: Theme/depth(of: Element)
             rounded_corners: Theme/corners(of: Comfort)
             spring_range: Theme/spring_range(of: Button)
-            material: Theme/material(of: ButtonClear[hovered: element.hovered])
+            material: Theme/material(of: SurfaceElevated)
         ]
         label: Element/text(
-            style: Theme/text(of: ClearButton[hovered: element.hovered])
+            style: clear_button_text(hovered: element.hovered)
             text: 'Clear completed'
         )
     )

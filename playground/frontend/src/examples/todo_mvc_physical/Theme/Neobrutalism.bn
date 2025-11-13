@@ -4,7 +4,6 @@
 
 FUNCTION material(material) {
     material |> WHEN {
-        -- Simple materials (no state)
         Background => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.95, chroma: 0.05, hue: 90]
@@ -12,22 +11,12 @@ FUNCTION material(material) {
             }
         ]
 
-        Panel => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 1.0]
-                Dark => Oklch[lightness: 0.0]
-            }
-            gloss: 0.05
-            metal: 0.0
-            shine: 0.0
-        ]
-
         Surface => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 1.0]
                 Dark => Oklch[lightness: 0.0]
             }
-            gloss: 0.08
+            gloss: 0.05
         ]
 
         SurfaceVariant => [
@@ -38,29 +27,7 @@ FUNCTION material(material) {
             gloss: 0.08
         ]
 
-        SurfaceBright => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 1.0]
-                Dark => Oklch[lightness: 0.12]
-            }
-            gloss: 0.08
-        ]
-
-        Primary => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.55, chroma: 0.25, hue: 350]
-                Dark => Oklch[lightness: 0.7, chroma: 0.28, hue: 350]
-            }
-        ]
-
-        PrimaryContainer => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 1.0]
-                Dark => Oklch[lightness: 0.0]
-            }
-        ]
-
-        PanelFooter => [
+        SurfaceElevated => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 1.0]
                 Dark => Oklch[lightness: 0.12]
@@ -68,16 +35,16 @@ FUNCTION material(material) {
             gloss: 0.12
         ]
 
-        -- Interactive materials (with state)
-        InputExterior[hovered] => [
+        Interactive[hovered] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.98]
                 Dark => Oklch[lightness: 0.08]
             }
-            gloss: 0.1
+            gloss: 0.12
+            metal: 0.03
         ]
 
-        InputInterior[focus] => [
+        InteractiveRecessed[focus] => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 1.0]
                 Dark => Oklch[lightness: 0.0]
@@ -98,106 +65,30 @@ FUNCTION material(material) {
             }
         ]
 
-        Button[hovered, press] => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.98]
-                Dark => Oklch[lightness: 0.08]
-            }
-            gloss: 0.12
-            metal: 0.0
-        ]
-
-        ButtonEmphasis[hovered, press] => [
+        Primary => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.55, chroma: 0.25, hue: 350]
                 Dark => Oklch[lightness: 0.7, chroma: 0.28, hue: 350]
             }
-            gloss: 0.15
         ]
 
-        ButtonDelete[hovered] => [
+        PrimarySubtle => [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 1.0]
-                Dark => Oklch[lightness: 0.12]
-            }
-            gloss: 0.15
-            glow: hovered |> WHEN {
-                True => [
-                    color: PASSED.mode |> WHEN {
-                        Light => Oklch[lightness: 0.7, chroma: 0.25, hue: 330]
-                        Dark => Oklch[lightness: 0.85, chroma: 0.3, hue: 330]
-                    }
-                    intensity: 0.08
-                ]
-                False => None
+                Dark => Oklch[lightness: 0.0]
             }
         ]
 
-        ButtonClear[hovered] => [
+        Danger => [
             color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 1.0]
-                Dark => Oklch[lightness: 0.12]
+                Light => Oklch[lightness: 0.7, chroma: 0.25, hue: 330]
+                Dark => Oklch[lightness: 0.85, chroma: 0.3, hue: 330]
             }
-            gloss: 0.12
-        ]
-
-        ButtonFilter[selected, hovered] => [
-            color: PASSED.mode |> WHEN {
-                Light => selected |> WHEN {
-                    False => Oklch[lightness: 0.98]
-                    True => Oklch[lightness: 1.0]
-                }
-                Dark => selected |> WHEN {
-                    False => Oklch[lightness: 0.08]
-                    True => Oklch[lightness: 0.0]
-                }
-            }
-            gloss: selected |> WHEN {
-                False => 0.15
-                True => 0.1
-            }
-            metal: 0.03
-            glow: LIST { selected, hovered } |> WHEN {
-                LIST { True, __ } => [
-                    color: PASSED.mode |> WHEN {
-                        Light => Oklch[lightness: 0.7, chroma: 0.25, hue: 350]
-                        Dark => Oklch[lightness: 0.8, chroma: 0.3, hue: 350]
-                    }
-                    intensity: 0.05
-                ]
-                LIST { False, True } => [
-                    color: PASSED.mode |> WHEN {
-                        Light => Oklch[lightness: 0.7, chroma: 0.25, hue: 350]
-                        Dark => Oklch[lightness: 0.8, chroma: 0.3, hue: 350]
-                    }
-                    intensity: 0.025
-                ]
-                LIST { False, False } => None
-            }
-        ]
-
-        ToggleCheckbox[checked, hovered] => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.98]
-                Dark => Oklch[lightness: 0.08]
-            }
-            gloss: 0.15
-            metal: 0.05
-        ]
-
-        TodoCheckbox[checked, hovered] => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.98]
-                Dark => Oklch[lightness: 0.08]
-            }
-            gloss: 0.12
-            metal: 0.03
         ]
     }
 }
 
--- Unified text styling (font + 3D properties)
-FUNCTION text(of) {
+FUNCTION font(font) {
     BLOCK {
         colors: PASSED.mode |> WHEN {
             Light => [
@@ -218,89 +109,100 @@ FUNCTION text(of) {
             ]
         }
 
-        make_small_style: FUNCTION(font_variant) {
-            [
-                font: [
-                    size: 10
-                    color: colors.text_tertiary
-                    line: font_variant |> WHEN {
-                        Plain => Unset
-                        LinkUnderline[hovered] => [underline: hovered]
-                    }
-                ]
-                depth: 2
-                transform: [move_further: 4]
-                relief: Carved[wall: 2]
-            ]
-        }
-
-        of |> WHEN {
-            Header => [
-                font: [size: 100, color: colors.text_header, weight: Hairline]
-                depth: 8
-                transform: [move_closer: 8]
-                relief: Raised
+        font |> WHEN {
+            Hero => [
+                size: 100
+                color: colors.text_header
+                weight: Hairline
             ]
 
-            ButtonDelete => [
-                font: [size: 30, align: Center, color: colors.danger]
-                depth: 4
-                transform: [move_further: 0]
-                relief: Raised
+            Body => [
+                size: 24
+                color: colors.text
             ]
 
-            ButtonFilter => [
-                font: [size: 14, color: colors.text_secondary]
-                depth: 3
-                transform: [move_further: 0]
-                relief: Raised
+            BodySecondary => [
+                size: 14
+                color: colors.text_secondary
             ]
 
-            ClearButton[hovered] => [
-                font: [size: 14, color: colors.text_secondary, line: [underline: hovered]]
-                depth: 3
-                transform: [move_further: 0]
-                relief: Raised
+            BodyDisabled => [
+                size: 24
+                color: colors.text_disabled
             ]
 
-            TodoTitle[completed] => [
-                font: [
-                    size: 24
-                    line: [strike: completed]
-                    color: completed |> WHEN { True => colors.text_disabled, False => colors.text }
-                ]
-                depth: completed |> WHEN { True => 2, False => 4 }
-                transform: completed |> WHEN { True => [move_further: 6], False => [move_further: 0] }
-                relief: completed |> WHEN { True => Carved[wall: 2], False => Raised }
+            BodyDanger => [
+                size: 30
+                align: Center
+                color: colors.danger
+            ]
+
+            Input => [
+                size: 24
+                color: colors.text
+            ]
+
+            Placeholder => [
+                size: 24
+                style: Italic
+                color: colors.text_secondary
             ]
 
             ButtonIcon[checked] => [
-                font: [
-                    size: 22
-                    color: checked |> WHEN {
-                        True => colors.text
-                        False => colors.text_disabled
-                    }
-                ]
+                size: 22
+                color: checked |> WHEN {
+                    True => colors.text
+                    False => colors.text_disabled
+                }
             ]
 
-            Secondary => [
-                font: [size: 14, color: colors.text_secondary]
-                depth: 3
-                transform: [move_further: 2]
-                relief: Raised
+            Small => [
+                size: 10
+                color: colors.text_tertiary
             ]
 
-            Small => make_small_style(Plain)
-            SmallLink[hovered] => make_small_style(LinkUnderline[hovered])
+            SmallLink[hovered] => [
+                size: 10
+                color: colors.text_tertiary
+                line: [underline: hovered]
+            ]
         }
     }
 }
 
-FUNCTION font(font) {
-    font |> WHEN {
-        -- Implement font variants if needed
-        _ => [size: 16]
+FUNCTION text(of) {
+    of |> WHEN {
+        Hero => [
+            font: font(of: Hero)
+            depth: 8
+            move: [closer: 8]
+            relief: Raised
+        ]
+
+        BodySecondary => [
+            font: font(of: BodySecondary)
+            depth: 3
+            move: [further: 2]
+            relief: Raised
+        ]
+
+        ButtonIcon[checked] => [
+            font: font(of: ButtonIcon[checked])
+        ]
+
+        Small => [
+            font: font(of: Small)
+            depth: 2
+            move: [further: 4]
+            relief: Carved[wall: 2]
+        ]
+
+        SmallLink[hovered] => [
+            font: font(of: SmallLink[hovered])
+            depth: 2
+            move: [further: 4]
+            relief: Carved[wall: 2]
+        ]
     }
 }
 
@@ -337,7 +239,7 @@ FUNCTION corners(of) {
     }
 }
 
-FUNCTION lights(mode) {
+FUNCTION lights() {
     LIST {
         Light/directional(
             azimuth: 90
@@ -352,13 +254,13 @@ FUNCTION lights(mode) {
         )
         Light/spot(
             target: FocusedElement,
-            color: mode |> WHEN {
+            color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.9, chroma: 0.25, hue: 200]
                 Dark => Oklch[lightness: 0.85, chroma: 0.25, hue: 200]
             },
             intensity: 0.5,
             radius: 40,
-            softness: 0.1  -- Very sharp, dramatic
+            softness: 0.1
         )
     }
 }
@@ -395,93 +297,9 @@ FUNCTION spacing(of) {
 -- Spring range (elastic pointer response)
 -- Neobrutalism theme uses no spring behavior - bold, static aesthetic
 FUNCTION spring_range(of) {
-    [extend: 0, compress: 0]
-}
-
-FUNCTION theme(mode) {
-    [
-        -- Lighting: Hard directional from right, minimal ambient
-        lights: LIST {
-            Light/directional(
-                azimuth: 90
-                altitude: 60
-                spread: 0              -- Sharp hard shadows
-                intensity: 1.5         -- Strong contrast
-                color: Oklch[lightness: 1.0, chroma: 0.0, hue: 0]  -- Pure white
-            )
-            Light/ambient(
-                intensity: 0.3         -- Less fill = harder shadows
-                color: Oklch[lightness: 0.7, chroma: 0.0, hue: 0]  -- Pure gray
-            )
-        }
-
-        -- Geometry: Sharp chamfered edges, aggressive bevels
-        geometry: [
-            edge_radius: 0         -- CHAMFERED (no rounding)
-            bevel_angle: 30        -- Aggressive sharp bevels
-        ]
-
-        -- Elevation: Dramatic height differences
-        elevation: [
-            card: 60               -- Float higher for drama
-            popup: 32              -- Very prominent
-            floating: 12           -- More dramatic
-            raised: 6              -- Bolder raises
-            Base: 0
-            recessed: -6           -- Deeper recesses
-        ]
-
-        -- Depth: Chunky thick elements
-        depth: [
-            major: 12              -- Thicker structures
-            standard: 8            -- Thicker standard
-            subtle: 4              -- Even "subtle" is chunky
-            emphasis: 16           -- Very bold
-        ]
-
-        -- Interaction: Snappy, dramatic movement
-        interaction: [
-            hovered_lift: 4          -- Bigger lifts
-            press_depth: 6         -- Deeper presses
-            emphasis_lift: 8       -- Much more dramatic
-            transition_ms: 100     -- Faster, snappier
-        ]
-
-        -- Corners: Sharp or very round, no in-between
-        corners: [
-            Edge: 0               -- Always sharp
-            subtle: 0              -- No subtle rounding
-            standard: 0            -- Default sharp
-            round: 12              -- When rounded, go big
-            Pill: Fully
-        ]
-
-        -- Colors: Text, edges, and glow effects (surfaces are in materials)
-        colors: mode |> WHEN {
-            Light => [
-                primary_glow: Oklch[lightness: 0.7, chroma: 0.25, hue: 350]
-                focus: Oklch[lightness: 0.5, chroma: 0.2, hue: 200]
-                focus_glow: Oklch[lightness: 0.7, chroma: 0.2, hue: 200]
-                danger: Oklch[lightness: 0.5, chroma: 0.25, hue: 330]
-                danger_glow: Oklch[lightness: 0.7, chroma: 0.25, hue: 330]
-                text: Oklch[lightness: 0.0]
-                text_secondary: Oklch[lightness: 0.25]
-                text_disabled: Oklch[lightness: 0.6]
-                text_header: Oklch[lightness: 0.55, chroma: 0.25, hue: 350]
-                edge: Oklch[lightness: 0.0]
-            ]
-            Dark => [
-                primary_glow: Oklch[lightness: 0.8, chroma: 0.3, hue: 350]
-                focus: Oklch[lightness: 0.75, chroma: 0.25, hue: 200]
-                focus_glow: Oklch[lightness: 0.85, chroma: 0.25, hue: 200]
-                danger: Oklch[lightness: 0.75, chroma: 0.28, hue: 330]
-                danger_glow: Oklch[lightness: 0.85, chroma: 0.3, hue: 330]
-                text: Oklch[lightness: 1.0]
-                text_secondary: Oklch[lightness: 0.8]
-                text_disabled: Oklch[lightness: 0.4]
-                text_header: Oklch[lightness: 0.7, chroma: 0.28, hue: 350]
-                edge: Oklch[lightness: 1.0]
-            ]
-        }
-    ]
+    of |> WHEN {
+        Button => [extend: 0, compress: 0]
+        ButtonDestructive => [extend: 0, compress: 0]
+        Checkbox => [extend: 0, compress: 0]
+    }
 }
