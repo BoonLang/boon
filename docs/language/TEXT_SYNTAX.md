@@ -347,6 +347,9 @@ No `\u{...}` escape sequences needed!
 Defined in the Text module using TEXT syntax:
 
 ```boon
+-- Empty string (recommended over TEXT {}):
+empty: TEXT {}
+
 -- Newline character (multiline TEXT with empty content):
 newline: TEXT {
 
@@ -407,6 +410,10 @@ Text/repeat(TEXT { - }, 10)           -- Creates "----------"
 Text/repeat(Text/space, 4)            -- Creates 4 spaces
 Text/repeat(TEXT { Hello }, 3)        -- Creates "HelloHelloHello"
 
+-- Empty string constant (recommended):
+initial_value: Text/empty             -- Clearer than TEXT {}
+text |> THEN { Text/empty }           -- Reset to empty
+
 -- Empty check:
 text |> Text/is_empty() |> WHEN { True => ..., False => ... }
 
@@ -437,8 +444,8 @@ escape: Text/character(27)
 ### Empty and Spaces
 
 ```boon
-empty: TEXT {}
-one_space: Text/space        -- TEXT { } is compiler error
+empty: Text/empty            -- Recommended (TEXT {} also valid)
+one_space: Text/space        -- TEXT { } with 1 char is compiler error
 two_spaces: TEXT {   }       -- 3 chars total = 1 space content
 single_char: TEXT { - }      -- Single char must have padding
 ```
@@ -610,7 +617,7 @@ text: TEXT {
     Line 3
 }
 code: TEXT #{ function() { return #{x}; } }
-empty: TEXT {}
+empty: Text/empty
 check: text |> Text/trim() |> Text/is_not_empty()
 ```
 
@@ -619,9 +626,9 @@ check: text |> Text/trim() |> Text/is_not_empty()
 - Apostrophes work without escaping
 - Multiline instead of `\n`
 - Hash escaping for literal braces
-- `TEXT {}` for empty string
-- `Text/is_empty()` and `Text/is_not_empty()` predicates
-- `Text/newline`, `Text/space`, `Text/tab` constants
+- `Text/empty` constant (recommended over `TEXT {}`)
+- `Text/is_empty()` and `Text/is_not_empty()` predicates (replaces old `Text/empty()` function)
+- `Text/empty`, `Text/newline`, `Text/space`, `Text/tab` constants
 
 ---
 
@@ -630,7 +637,7 @@ check: text |> Text/trim() |> Text/is_not_empty()
 | Feature | Syntax | Example |
 |---------|--------|---------|
 | **Mode Detection** | Next char after `{` | `}`, space, or newline |
-| Empty | `TEXT {}` | `TEXT {}` |
+| Empty | `TEXT {}` or constant | `TEXT {}` or `Text/empty` (recommended) |
 | Single space | Use constant | `Text/space` |
 | Inline | `TEXT { content }` | `TEXT { Hello }` (padding required) |
 | Single char | `TEXT { x }` | `TEXT { + }` (padding required) |
@@ -641,7 +648,7 @@ check: text |> Text/trim() |> Text/is_not_empty()
 | Hash modes | All three modes | Empty, inline, multiline with hashes |
 | Asymmetric close | Always `}` | `TEXT #{ ... }` not `TEXT #{ ... }#` |
 | No escapes | Natural solutions | Multiline, hash, Unicode |
-| Constants | `Text/newline/space/tab` | Defined with TEXT syntax |
+| Constants | `Text/empty/newline/space/tab` | Defined with TEXT syntax |
 | Character code | `Text/character(code)` | For control chars |
 | Repeat text | `Text/repeat(text, n)` | `Text/repeat(TEXT { - }, 10)` |
 | Predicates | `is_` prefix | `is_empty`, `is_not_empty` |
@@ -785,6 +792,28 @@ newline: Text/newline
 ```
 
 Use the provided constants for readability.
+
+### **❌ Don't use `TEXT {}` for empty strings in code**
+
+```boon
+-- Bad (visually unclear):
+initial_value: TEXT {}
+text: LATEST {
+    TEXT {}
+    element.event.change.text
+    title_to_save |> THEN { TEXT {} }
+}
+
+-- Good (clear intent):
+initial_value: Text/empty
+text: LATEST {
+    Text/empty
+    element.event.change.text
+    title_to_save |> THEN { Text/empty }
+}
+```
+
+Use `Text/empty` constant for better readability and searchability.
 
 ### **❌ Don't chain `is_empty() |> Bool/not()`**
 
