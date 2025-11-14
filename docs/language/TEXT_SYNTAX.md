@@ -446,7 +446,7 @@ escape: Text/character(27)
 ```boon
 empty: Text/empty            -- Recommended (TEXT {} also valid)
 one_space: Text/space        -- TEXT { } with 1 char is compiler error
-two_spaces: TEXT {   }       -- 3 chars total = 1 space content
+two_spaces: TEXT {    }      -- 4 chars total = 2 spaces content
 single_char: TEXT { - }      -- Single char must have padding
 ```
 
