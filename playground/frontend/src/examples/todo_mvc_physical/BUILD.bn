@@ -1,15 +1,15 @@
--- TODO: multine string, escape strings, file_stem function, file vs path, 
+-- TODO: file_stem function, file vs path,
 -- WHEN with single arm to block refactor maybe, what is file?, item.extension -> function,
--- File/read_text() handle errors, Path/file_stem() Option handling, .., 
--- string syntax highlight and parser todos, update Assets.bn accordingly, binary type?
+-- File/read_text() handle errors, Path/file_stem() Option handling, ..,
+-- binary type?
 
 -- Generates Assets.bn from SVG icon files
 
-icons_directory: './assets/icons'
-output_file: './Generated/Assets.bn'
+icons_directory: TEXT { ./assets/icons }
+output_file: TEXT { ./Generated/Assets.bn }
 
 svg_files: Directory/entries(icons_directory)
-    |> List/retain(item, if: item.extension = 'svg')
+    |> List/retain(item, if: item.extension = TEXT { svg })
     |> List/sort_by(item, key: item.path)
 
 generation: svg_files
@@ -18,7 +18,7 @@ generation: svg_files
     |> WHEN {
         Ok => BLOCK {
             svg_files_count: svg_files |> List/count()
-            'Included {svg_files_count} icons' |> Log/info()
+            TEXT { Included {svg_files_count} icons } |> Log/info()
         }
         Error[message] => message |> Log/error()
     }
@@ -26,9 +26,15 @@ generation: svg_files
 FUNCTION module_code(svg_files) {
     svg_files
         |> List/map(old, new: icon_code(file: old))
-        |> Text/join('\n')
-        |> Text/indent(spaces: 4)
-        |> WHEN { code => '-- Generated from {icons_directory}\n\nicon: [\n{code}\n]\n' }
+        |> Text/join_lines()
+        |> WHEN { code => TEXT {
+            -- Generated from {icons_directory}
+
+            icon: [
+                {code}
+            ]
+
+        } }
 }
 
 FUNCTION icon_code(file) {
@@ -37,6 +43,6 @@ FUNCTION icon_code(file) {
             file.path
                 |> File/read_text()
                 |> Url/encode()
-                |> WHEN { encoded => '{name}: \'data:image/svg+xml;utf8,{encoded}\'' }
+                |> WHEN { encoded => TEXT { {name}: 'data:image/svg+xml;utf8,{encoded}' } }
         }
 }
