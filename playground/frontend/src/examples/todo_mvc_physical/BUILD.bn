@@ -27,13 +27,9 @@ generation_result: svg_files
 
     } }
     |> File/write_text(path: output_file)
-    |> WHEN {
-        Ok => []
-        error => FLUSH { error }
-    }
 
 generation_error_handling: generation_result |> WHEN {
-    [] => BLOCK {
+    Ok => BLOCK {
         count: svg_files |> List/count()
         logged: TEXT { Included {count} icons } |> Log/info()
         Build/succeed()
