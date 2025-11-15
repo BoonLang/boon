@@ -11,18 +11,12 @@ svg_files: Directory/entries(icons_directory)
     |> List/sort_by(item, key: item.path)
 
 generation: svg_files
-    |> List/map(old, new: icon_code(old))
-    |> List/retain(result, if: result |> WHEN {
-        ReadError[message] => BLOCK {
-            logged: TEXT { Cannot read icon: {message} } |> Log/error()
-            FALSE
+    |> List/try_map(old, new:
+        old |> icon_code() |> WHEN {
+            Ok[text] => text
+            error => THROW { error }
         }
-        EncodeError[message] => BLOCK {
-            logged: TEXT { Cannot encode icon: {message} } |> Log/error()
-            FALSE
-        }
-        __ => TRUE
-    })
+    )
     |> Text/join_lines()
     |> WHEN { code => TEXT {
         -- Generated from {icons_directory}
@@ -43,14 +37,20 @@ generation: svg_files
         Build/succeed()
     } }
     |> CATCH {
+        ReadError[message] => BLOCK {
+            logged: TEXT { Cannot read icon: {message} } |> Log/error()
+            Build/fail()
+        }
+        EncodeError[message] => BLOCK {
+            logged: TEXT { Cannot encode icon: {message} } |> Log/error()
+            Build/fail()
+        }
         WriteError[message] => BLOCK {
-            logged: TEXT { FATAL: Cannot write {output_file}: {message} } |> Log/error()
+            logged: TEXT { Cannot write {output_file}: {message} } |> Log/error()
             Build/fail()
         }
     }
 
--- Process single icon
--- No CATCH - errors propagate as TEXT | ReadError | EncodeError
 FUNCTION icon_code(item) {
     item.path
         |> File/read_text()
@@ -64,6 +64,6 @@ FUNCTION icon_code(item) {
             error => THROW { error }
         }
         |> WHEN { encoded =>
-            TEXT { {item.file_stem}: data:image/svg+xml;utf8,{encoded} }
+            Ok[text: TEXT { {item.file_stem}: data:image/svg+xml;utf8,{encoded} }]
         }
 }
