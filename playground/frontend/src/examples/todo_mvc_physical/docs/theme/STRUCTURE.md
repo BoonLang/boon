@@ -172,7 +172,7 @@ FUNCTION my_button() {
             material: PASSED.theme.materials.button
             backgSoft: [color: PASSED.theme.colors.surface_variant]
         ]
-        label: 'Click me'
+        label: TEXT { Click me }
     )
 }
 ```

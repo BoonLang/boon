@@ -101,14 +101,6 @@ edited_title: LATEST {
 **Pattern:** Single chars like `'+'`, `'-'`, `'s'`, `'>'`, `'×'`
 
 ```boon
--- BEFORE:
-label: '+'
-label: '-'
-maybe_s: count > 1 |> WHEN { True => 's', False => '' }
-child: '>'
-label: '×'
-
--- AFTER:
 label: TEXT { + }
 label: TEXT { - }
 maybe_s: count > 1 |> WHEN {
@@ -133,16 +125,6 @@ label: TEXT { × }
 **Pattern:** Short text without special characters
 
 ```boon
--- BEFORE:
-root: 'Hello world!'
-child: 'todos'
-label: 'All'
-label: 'Active'
-label: 'Completed'
-label: 'Clear completed'
-label: 'Toggle all'
-
--- AFTER:
 root: TEXT { Hello world! }
 child: TEXT { todos }
 label: TEXT { All }

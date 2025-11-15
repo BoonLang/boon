@@ -25,7 +25,7 @@ This document describes Boon's physically-based 3D rendering system for UI eleme
 ```boon
 Element/text_input(
     style: [depth: 6, material: [gloss: 0.65]]
-    text: 'Hello'
+    text: TEXT { Hello }
 )
 ```
 
@@ -59,8 +59,8 @@ Element/text_input(
         material: [gloss: 0.65]  -- Shiny interior
         background: [color: Oklch[lightness: 0.99]]
     ]
-    text: 'Type here...'
-    placeholder: 'Enter text'
+    text: TEXT { Type here... }
+    placeholder: TEXT { Enter text }
 )
 ```
 
@@ -103,7 +103,7 @@ Element/button(
         rounded_corners: 4
         material: [gloss: 0.3]
     ]
-    label: 'Click me'
+    label: TEXT { Click me }
 )
 ```
 
@@ -124,7 +124,7 @@ Element/block(
         rounded_corners: 4
         material: [gloss: 0.12]
     ]
-    child: Element/text(text: 'Card content')
+    child: Element/text(text: TEXT { Card content })
 )
 ```
 
@@ -541,8 +541,8 @@ Element/text_input(
         background: [color: Oklch[lightness: 0.99]]
         material: [gloss: 0.65]     -- Shiny interior
     ]
-    text: 'What needs to be done?'
-    placeholder: [text: 'What needs to be done?']
+    text: TEXT { What needs to be done? }
+    placeholder: [text: TEXT { What needs to be done? }]
 )
 ```
 

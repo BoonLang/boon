@@ -151,7 +151,7 @@ Element/button(
     style: [
         spring_range: Theme/spring_range(of: Button)
     ]
-    label: 'Click me'
+    label: TEXT { Click me }
 )
 ```
 
@@ -163,7 +163,7 @@ Element/button(
         spring_range: Theme/spring_range(of: ButtonDestructive)
         transform: [move_left: 50, move_down: 14]  -- Custom X/Y position
     ]
-    label: '×'
+    label: TEXT { × }
 )
 ```
 

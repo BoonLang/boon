@@ -186,7 +186,7 @@ You already know what `variable: LINK` means and now you'll find out how to set 
 Notice these lines: 
 
 1. `decrement_button: LINK`
-2. `counter_button(label: '-') |> LINK { PASSED.elements.decrement_button }`
+2. `counter_button(label: TEXT { - }) |> LINK { PASSED.elements.decrement_button }`
 
 The element data returned from the `counter_button(..)` function call are _linked_ to `decrement_button` and returned from `LINK {}` without any changes. 
 

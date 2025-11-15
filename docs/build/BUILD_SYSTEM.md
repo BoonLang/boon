@@ -92,18 +92,18 @@ BUILD.bn uses a flat, declarative structure - no `main()` function needed.
 -- CONFIGURATION (at top)
 ------------------------------------------------------------------------
 
-input_dir: './assets/icons'
-output_file: './Generated/Assets.bn'
+input_dir: TEXT { ./assets/icons }
+output_file: TEXT { ./Generated/Assets.bn }
 
 ------------------------------------------------------------------------
 -- HELPER FUNCTIONS (if needed)
 ------------------------------------------------------------------------
 
 FUNCTION generate_icon_entry(file) {
-    icon_name: file.name |> Text/trim_suffix('.svg')
+    icon_name: file.name |> Text/trim_suffix(TEXT { .svg })
     svg_content: BuildFS/read_string(file.path)
-    data_url: 'data:image/svg+xml;utf8,' ++ URL/encode(svg_content)
-    Result: '{icon_name}: \'{data_url}\''
+    data_url: TEXT { data:image/svg+xml;utf8, } ++ URL/encode(svg_content)
+    Result: TEXT { {icon_name}: '{data_url}' }
 }
 
 ------------------------------------------------------------------------
@@ -112,26 +112,26 @@ FUNCTION generate_icon_entry(file) {
 
 -- Read inputs
 svg_files: BuildFS/read_dir(input_dir)
-    |> List/retain(item, if: item.name |> Text/ends_with('.svg'))
+    |> List/retain(item, if: item.name |> Text/ends_with(TEXT { .svg }))
 
 -- Generate code
 generated_code: [
-    '-- GENERATED CODE'
-    ''
-    'icon: ['
+    TEXT { -- GENERATED CODE }
+    Text/empty
+    TEXT { icon: [ }
     svg_files
         |> List/map(file => generate_icon_entry(file))
-        |> Text/join('\n')
+        |> Text/join(Text/newline)
         |> Text/indent(spaces: 4)
-    ']'
-] |> Text/join('\n')
+    TEXT { ] }
+] |> Text/join(Text/newline)
 
 -- Write output
-BuildFS/create_dir_all('./Generated')
+BuildFS/create_dir_all(TEXT { ./Generated })
 BuildFS/write_string(output_file, generated_code)
 
 -- Register rebuild triggers
-Build/rerun_if_changed('BUILD.bn')
+Build/rerun_if_changed(TEXT { BUILD.bn })
 Build/rerun_if_dir_changed(input_dir)
 ```
 
@@ -155,7 +155,7 @@ Controls build system behavior and provides build-time utilities.
 Log informational message to build output.
 
 ```boon
-Build/info('Generated 42 icons to Generated/Assets.bn')
+Build/info(TEXT { Generated 42 icons to Generated/Assets.bn })
 ```
 
 #### `Build/warning(message: String)`
@@ -163,7 +163,7 @@ Build/info('Generated 42 icons to Generated/Assets.bn')
 Log warning message (non-fatal).
 
 ```boon
-Build/warning('Icon directory is empty')
+Build/warning(TEXT { Icon directory is empty })
 ```
 
 #### `Build/error(message: String)`
@@ -171,7 +171,7 @@ Build/warning('Icon directory is empty')
 Log error and fail the build.
 
 ```boon
-Build/error('Required file not found: config.toml')
+Build/error(TEXT { Required file not found: config.toml })
 ```
 
 #### `Build/rerun_if_changed(path: String)`
@@ -179,8 +179,8 @@ Build/error('Required file not found: config.toml')
 Register file dependency - rebuild if file changes.
 
 ```boon
-Build/rerun_if_changed('BUILD.bn')
-Build/rerun_if_changed('routes.config.bn')
+Build/rerun_if_changed(TEXT { BUILD.bn })
+Build/rerun_if_changed(TEXT { routes.config.bn })
 ```
 
 #### `Build/rerun_if_dir_changed(path: String)`
@@ -188,8 +188,8 @@ Build/rerun_if_changed('routes.config.bn')
 Register directory dependency - rebuild if any file in directory changes.
 
 ```boon
-Build/rerun_if_dir_changed('./assets/icons')
-Build/rerun_if_dir_changed('./theme')
+Build/rerun_if_dir_changed(TEXT { ./assets/icons })
+Build/rerun_if_dir_changed(TEXT { ./theme })
 ```
 
 #### `Build/env(name: String) -> String | UNPLUGGED`
@@ -197,8 +197,8 @@ Build/rerun_if_dir_changed('./theme')
 Access build-time environment variables.
 
 ```boon
-api_endpoint: Build/env('API_ENDPOINT')? |> WHEN {
-    UNPLUGGED => 'http://localhost:3000'
+api_endpoint: Build/env(TEXT { API_ENDPOINT })? |> WHEN {
+    UNPLUGGED => TEXT { http://localhost:3000 }
     value => value
 }
 ```
@@ -214,7 +214,7 @@ api_endpoint: Build/env('API_ENDPOINT')? |> WHEN {
 Read file as UTF-8 string.
 
 ```boon
-svg_content: File/read_string('./assets/icon.svg')
+svg_content: File/read_string(TEXT { ./assets/icon.svg })
 ```
 
 #### `File/write_string(path: String, content: String)`
@@ -222,7 +222,7 @@ svg_content: File/read_string('./assets/icon.svg')
 Write string to file (UTF-8).
 
 ```boon
-File/write_string('./Generated/Assets.bn', generated_code)
+File/write_string(TEXT { ./Generated/Assets.bn }, generated_code)
 ```
 
 #### `File/read_dir(path: String) -> List[FileEntry]`
@@ -230,17 +230,17 @@ File/write_string('./Generated/Assets.bn', generated_code)
 Read directory entries.
 
 ```boon
-files: File/read_dir('./assets')
-    |> List/retain(item, if: item.name |> Text/ends_with('.svg'))
+files: File/read_dir(TEXT { ./assets })
+    |> List/retain(item, if: item.name |> Text/ends_with(TEXT { .svg }))
 ```
 
 **FileEntry**:
 ```boon
 [
-    name: String       -- Filename (e.g., "icon.svg")
-    path: String       -- Full path (e.g., "./assets/icon.svg")
-    is_file: Bool      -- True if file, False if directory
-    is_dir: Bool       -- True if directory, False if file
+    name: Text       -- Filename (e.g., TEXT { icon.svg })
+    path: Text       -- Full path (e.g., TEXT { ./assets/icon.svg })
+    is_file: Bool    -- True if file, False if directory
+    is_dir: Bool     -- True if directory, False if file
 ]
 ```
 
@@ -249,7 +249,7 @@ files: File/read_dir('./assets')
 Check if file or directory exists.
 
 ```boon
-File/exists('./config.toml') |> WHEN {
+File/exists(TEXT { ./config.toml }) |> WHEN {
     True => read_config()
     False => default_config()
 }
@@ -260,7 +260,7 @@ File/exists('./config.toml') |> WHEN {
 Create directory and all parent directories (like `mkdir -p`).
 
 ```boon
-File/create_dir_all('./Generated/Routes')
+File/create_dir_all(TEXT { ./Generated/Routes })
 ```
 
 ---
@@ -283,7 +283,7 @@ Format timestamp as ISO 8601 string.
 
 ```boon
 generated_at: Time/now() |> Time/format_iso()
--- Result: "2025-11-12T14:30:00Z"
+-- Result: TEXT { 2025-11-12T14:30:00Z }
 ```
 
 ---
@@ -297,7 +297,7 @@ URL encoding utilities.
 URL-encode string (percent-encoding).
 
 ```boon
-data_url: 'data:image/svg+xml;utf8,' ++ URL/encode(svg_content)
+data_url: TEXT { data:image/svg+xml;utf8, } ++ URL/encode(svg_content)
 ```
 
 ---
@@ -314,10 +314,10 @@ Indent each line by N spaces.
 body: function_body |> Text/indent(spaces: 4)
 
 Result: [
-    'FUNCTION foo() {'
+    TEXT { FUNCTION foo() { }
     body
-    '}'
-] |> Text/join('\n')
+    TEXT { } }
+] |> Text/join(Text/newline)
 ```
 
 #### `Text/trim_suffix(text: String, suffix: String) -> String`
@@ -325,8 +325,8 @@ Result: [
 Remove suffix if present.
 
 ```boon
-'checkbox_completed.svg' |> Text/trim_suffix('.svg')
--- Result: "checkbox_completed"
+TEXT { checkbox_completed.svg } |> Text/trim_suffix(TEXT { .svg })
+-- Result: TEXT { checkbox_completed }
 ```
 
 #### `Text/trim_prefix(text: String, prefix: String) -> String`
@@ -334,8 +334,8 @@ Remove suffix if present.
 Remove prefix if present.
 
 ```boon
-'./assets/icon.svg' |> Text/trim_prefix('./')
--- Result: "assets/icon.svg"
+TEXT { ./assets/icon.svg } |> Text/trim_prefix(TEXT { ./ })
+-- Result: TEXT { assets/icon.svg }
 ```
 
 ---
@@ -408,7 +408,7 @@ Read file as string.
 **Browser**: Reads from virtual filesystem (loaded project files)
 
 ```boon
-content: BuildFS/read_string('./assets/icon.svg')
+content: BuildFS/read_string(TEXT { ./assets/icon.svg })
 ```
 
 #### `BuildFS/write_string(path: String, content: String)`
@@ -419,7 +419,7 @@ Write file as string.
 **Browser**: Writes to virtual filesystem (available to compiler)
 
 ```boon
-BuildFS/write_string('./Generated/Router.bn', router_code)
+BuildFS/write_string(TEXT { ./Generated/Router.bn }, router_code)
 ```
 
 #### `BuildFS/read_dir(path: String) -> List[FileEntry]`
@@ -430,8 +430,8 @@ List directory contents.
 **Browser**: Reads from virtual filesystem directory structure
 
 ```boon
-icons: BuildFS/read_dir('./assets/icons')
-    |> List/retain(item, if: item.name |> Text/ends_with('.svg'))
+icons: BuildFS/read_dir(TEXT { ./assets/icons })
+    |> List/retain(item, if: item.name |> Text/ends_with(TEXT { .svg }))
 ```
 
 #### `BuildFS/exists(path: String) -> Bool`
@@ -439,7 +439,7 @@ icons: BuildFS/read_dir('./assets/icons')
 Check if file exists.
 
 ```boon
-BuildFS/exists('./config.bn') |> WHEN {
+BuildFS/exists(TEXT { ./config.bn }) |> WHEN {
     True => load_config()
     False => default_config()
 }
@@ -453,7 +453,7 @@ Create directory (and parents).
 **Browser**: Creates virtual directory entries
 
 ```boon
-BuildFS/create_dir_all('./Generated/Routes')
+BuildFS/create_dir_all(TEXT { ./Generated/Routes })
 ```
 
 ---
@@ -469,8 +469,8 @@ BuildFS/read_string(path)  -- New (Node.js + Browser)
 
 **Phase 2**: Migrate existing BUILD.bn files
 ```diff
-- File/read_dir('./assets/icons')
-+ BuildFS/read_dir('./assets/icons')
+- File/read_dir(TEXT { ./assets/icons })
++ BuildFS/read_dir(TEXT { ./assets/icons })
 
 - File/write_string(output_file, code)
 + BuildFS/write_string(output_file, code)
@@ -502,9 +502,9 @@ Use a flat record at the top of your file as the single source of truth:
 ------------------------------------------------------------------------
 
 filter_routes: [
-    all: '/'
-    active: '/active'
-    completed: '/completed'
+    all: TEXT { / }
+    active: TEXT { /active }
+    completed: TEXT { /completed }
 ]
 
 ------------------------------------------------------------------------
@@ -553,9 +553,9 @@ FUNCTION filter_button(filter) {
                 style: Theme/text(of: ButtonFilter)
                 -- Labels can stay as simple WHEN - they're just UI strings
                 text: filter |> WHEN {
-                    All => 'All'
-                    Active => 'Active'
-                    Completed => 'Completed'
+                    All => TEXT { All }
+                    Active => TEXT { Active }
+                    Completed => TEXT { Completed }
                 }
             )
         )
@@ -569,16 +569,16 @@ FUNCTION filter_button(filter) {
 ```boon
 -- Parsing
 selected_filter: Router/route() |> WHEN {
-    '/active' => Active          -- String appears here
-    '/completed' => Completed    -- String appears here
+    TEXT { /active } => Active          -- String appears here
+    TEXT { /completed } => Completed    -- String appears here
     __ => All
 }
 
 -- Generation
 go_to_result: LATEST {
-    filter_buttons.all.event.press |> THEN { '/' }              -- String appears here
-    filter_buttons.active.event.press |> THEN { '/active' }     -- String appears here
-    filter_buttons.completed.event.press |> THEN { '/completed' } -- String appears here
+    filter_buttons.all.event.press |> THEN { TEXT { / } }              -- String appears here
+    filter_buttons.active.event.press |> THEN { TEXT { /active } }     -- String appears here
+    filter_buttons.completed.event.press |> THEN { TEXT { /completed } } -- String appears here
 }
 ```
 
@@ -586,9 +586,9 @@ go_to_result: LATEST {
 ```boon
 -- Routes defined once
 filter_routes: [
-    all: '/'
-    active: '/active'
-    completed: '/completed'
+    all: TEXT { / }
+    active: TEXT { /active }
+    completed: TEXT { /completed }
 ]
 
 -- Parsing uses filter_routes
@@ -635,14 +635,14 @@ For TodoMVC and similar apps, the simple data structure pattern is perfect.
 
 ✅ **Do**:
 ```boon
-content: BuildFS/read_string('./config.bn')
-BuildFS/write_string('./Generated/Output.bn', code)
+content: BuildFS/read_string(TEXT { ./config.bn })
+BuildFS/write_string(TEXT { ./Generated/Output.bn }, code)
 ```
 
 ❌ **Don't**:
 ```boon
-content: File/read_string('./config.bn')  -- Won't work in browser
-File/write_string('./Generated/Output.bn', code)
+content: File/read_string(TEXT { ./config.bn })  -- Won't work in browser
+File/write_string(TEXT { ./Generated/Output.bn }, code)
 ```
 
 **Why**: BuildFS works in both Node.js and browser (Playground).
@@ -653,13 +653,13 @@ File/write_string('./Generated/Output.bn', code)
 
 ✅ **Do**:
 ```boon
-BuildFS/create_dir_all('./Generated')
-BuildFS/write_string('./Generated/Assets.bn', code)
+BuildFS/create_dir_all(TEXT { ./Generated })
+BuildFS/write_string(TEXT { ./Generated/Assets.bn }, code)
 ```
 
 ❌ **Don't**:
 ```boon
-BuildFS/write_string('./src/assets.bn', code)  -- Mixes generated with source
+BuildFS/write_string(TEXT { ./src/assets.bn }, code)  -- Mixes generated with source
 ```
 
 **Why**:
@@ -674,12 +674,12 @@ BuildFS/write_string('./src/assets.bn', code)  -- Mixes generated with source
 ✅ **Do**:
 ```boon
 code: [
-    '-- GENERATED CODE - DO NOT EDIT'
-    '-- Generated by BUILD.bn'
-    '-- Generated at: {Time/now() |> Time/format_iso()}'
-    ''
+    TEXT { -- GENERATED CODE - DO NOT EDIT }
+    TEXT { -- Generated by BUILD.bn }
+    TEXT { -- Generated at: {Time/now() |> Time/format_iso()} }
+    Text/empty
     actual_code
-] |> Text/join('\n')
+] |> Text/join(Text/newline)
 ```
 
 **Why**:
@@ -696,8 +696,8 @@ code: [
 FUNCTION main() {
     -- ... generation logic ...
 
-    Build/rerun_if_changed('BUILD.bn')
-    Build/rerun_if_dir_changed('./assets')
+    Build/rerun_if_changed(TEXT { BUILD.bn })
+    Build/rerun_if_dir_changed(TEXT { ./assets })
 }
 ```
 
@@ -715,9 +715,9 @@ FUNCTION main() {
 -- CONFIGURATION
 ------------------------------------------------------------------------
 
-icons_dir: './assets/icons'
-output_dir: './Generated'
-output_file: output_dir ++ '/Assets.bn'
+icons_dir: TEXT { ./assets/icons }
+output_dir: TEXT { ./Generated }
+output_file: output_dir ++ TEXT { /Assets.bn }
 
 ------------------------------------------------------------------------
 -- BUILD LOGIC
@@ -728,7 +728,7 @@ BuildFS/create_dir_all(output_dir)
 
 -- Read all SVG files
 svg_files: BuildFS/read_dir(icons_dir)
-    |> List/retain(item, if: item.name |> Text/ends_with('.svg'))
+    |> List/retain(item, if: item.name |> Text/ends_with(TEXT { .svg }))
 
 -- Generate code
 generated_code: generate_assets_module(svg_files)
@@ -750,7 +750,7 @@ BuildFS/write_string(output_file, generated_code)
 ```boon
 -- Check for empty directories
 svg_files |> List/count() = 0 |> WHEN {
-    True => Build/warning('No SVG files found in {icons_dir}')
+    True => Build/warning(TEXT { No SVG files found in {icons_dir} })
     False => SKIP
 }
 
@@ -760,7 +760,7 @@ duplicates: svg_files
     |> List/retain(group, if: group |> List/count() > 1)
 
 duplicates |> List/count() > 0 |> WHEN {
-    True => Build/error('Duplicate filenames: {duplicates}')
+    True => Build/error(TEXT { Duplicate filenames: {duplicates} })
     False => SKIP
 }
 ```
@@ -783,9 +783,9 @@ Apply the single source of truth pattern to eliminate route string duplication.
 ------------------------------------------------------------------------
 
 filter_routes: [
-    all: '/'
-    active: '/active'
-    completed: '/completed'
+    all: TEXT { / }
+    active: TEXT { /active }
+    completed: TEXT { /completed }
 ]
 ```
 
@@ -795,8 +795,8 @@ filter_routes: [
   store: [
       elements: [ ... ]
 -     selected_filter: Router/route() |> WHEN {
--         '/active' => Active
--         '/completed' => Completed
+-         TEXT { /active } => Active
+-         TEXT { /completed } => Completed
 -         __ => All
 -     }
 +     selected_filter: Router/route() |> WHEN {
@@ -811,9 +811,9 @@ filter_routes: [
 ```diff
       go_to_result:
           LATEST {
--             filter_buttons.all.event.press |> THEN { '/' }
--             filter_buttons.active.event.press |> THEN { '/active' }
--             filter_buttons.completed.event.press |> THEN { '/completed' }
+-             filter_buttons.all.event.press |> THEN { TEXT { / } }
+-             filter_buttons.active.event.press |> THEN { TEXT { /active } }
+-             filter_buttons.completed.event.press |> THEN { TEXT { /completed } }
 +             filter_buttons.all.event.press |> THEN { filter_routes.all }
 +             filter_buttons.active.event.press |> THEN { filter_routes.active }
 +             filter_buttons.completed.event.press |> THEN { filter_routes.completed }

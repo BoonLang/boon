@@ -42,7 +42,7 @@ Element/text_input(
         material: [gloss: 0.65]    -- Shiny interior
         padding: [all: 10]         -- Controls wall thickness
     ]
-    text: 'Hello'
+    text: TEXT { Hello }
 )
 ```
 

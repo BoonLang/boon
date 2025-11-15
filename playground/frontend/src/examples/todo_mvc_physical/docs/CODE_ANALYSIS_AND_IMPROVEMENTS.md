@@ -127,9 +127,9 @@ Simple data structure at top of RUN.bn:
 ------------------------------------------------------------------------
 
 filter_routes: [
-    all: '/'
-    active: '/active'
-    completed: '/completed'
+    all: TEXT { / }
+    active: TEXT { /active }
+    completed: TEXT { /completed }
 ]
 ```
 
@@ -385,7 +385,7 @@ icon: Element/text(
         font: Theme/font(of: ButtonIcon[checked: checked])  // Text property
         transform: [rotate: 90, move_up: 18]  // Layout transforms
     ]
-    text: '>'
+    text: TEXT { > }
 )
 ```
 
@@ -658,7 +658,7 @@ This design handles the "river of text" use case: flowing paragraphs with occasi
 Element/paragraph(
     style: Theme/text(of: Small)    // ← Applied to strings
     contents: LIST {
-        'Created by '                // ← Gets Small styling
+        TEXT { Created by  }                // ← Gets Small styling
         footer_link(...)             // ← Element, needs own style
         ' — '                         // ← Gets Small styling
         Element/image(...)           // ← Element, needs own style
@@ -797,15 +797,15 @@ FUNCTION text(of) {
 Element/paragraph(
     style: Theme/text(of: Small)    // Base style for string content
     contents: LIST {
-        'Created by '                // Gets Small styling
+        TEXT { Created by  }                // Gets Small styling
         footer_link(
-            label: 'Martin Kavík'
-            to: 'https://github.com/MartinKavik'
+            label: TEXT { Martin Kavík }
+            to: TEXT { https://github.com/MartinKavik }
         )
-        ' and inspired by '          // Gets Small styling
+        TEXT {  and inspired by  }          // Gets Small styling
         footer_link(
-            label: 'TodoMVC'
-            to: 'http://todomvc.com'
+            label: TEXT { TodoMVC }
+            to: TEXT { http://todomvc.com }
         )
     }
 )
@@ -832,22 +832,22 @@ The design naturally supports any element type inline:
 Element/paragraph(
     style: Theme/text(of: Body)
     contents: LIST {
-        'Check out our new feature '
+        TEXT { Check out our new feature  }
         Element/image(              // Inline image (emoji, icon)
-            src: 'sparkle.png'
+            src: TEXT { sparkle.png }
             size: 16
             style: [...]
         )
-        ' and read the '
+        TEXT {  and read the  }
         footer_link(...)            // Inline link
-        ' or download '
+        TEXT {  or download  }
         Element/block(              // Inline badge
             style: [
                 background: Red
                 padding: [row: 2, column: 4]
                 rounded_corners: 2
             ]
-            child: 'NEW'
+            child: TEXT { NEW }
         )
     }
 )
@@ -1154,9 +1154,9 @@ SmallLink[hover] => make_small_style(LinkUnderline[hover])
 Element/paragraph(
     style: Theme/text(of: Small)    // Base style for strings
     contents: LIST {
-        'Created by '                // Gets Small styling
+        TEXT { Created by  }                // Gets Small styling
         footer_link(...)             // Element with own complete style
-        ' — '                        // Gets Small styling
+        TEXT {  —  }                        // Gets Small styling
     }
 )
 

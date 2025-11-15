@@ -209,7 +209,7 @@ Element/text_input(
             gloss: 0.65       -- Shiny interior
         ]
     ]
-    text: 'Hello'
+    text: TEXT { Hello }
 )
 ```
 
@@ -233,7 +233,7 @@ Element/button(
             gloss: 0.3
         ]
     ]
-    label: 'Click'
+    label: TEXT { Click }
 )
 ```
 
@@ -289,7 +289,7 @@ Element/button(
             gloss: 0.3
         ]
     ]
-    label: 'Press me'
+    label: TEXT { Press me }
 )
 ```
 
@@ -310,7 +310,7 @@ Element/text_input(
         transform: [move_further: 4]
         padding: [all: 10]
     ]
-    text: 'Type here...'
+    text: TEXT { Type here... }
 )
 ```
 
@@ -335,7 +335,7 @@ Element/stripe(
     ]
     items: LIST {
         -- Header (flush with card surface)
-        Element/text(content: 'Header')
+        Element/text(content: TEXT { Header })
 
         -- Input (recessed into card)
         Element/text_input(
@@ -346,7 +346,7 @@ Element/stripe(
                     gloss: 0.65
                 ]
             ]
-            text: 'Username'
+            text: TEXT { Username }
         )
 
         -- Button (raised from card)
@@ -358,7 +358,7 @@ Element/stripe(
                     gloss: 0.3
                 ]
             ]
-            label: 'Submit'
+            label: TEXT { Submit }
         )
     }
 )
@@ -389,7 +389,7 @@ Element/text_input(
             False => []
         }
     ]
-    text: '...'
+    text: TEXT { ... }
 )
 ```
 
@@ -674,7 +674,7 @@ FUNCTION new_todo_input() {
             ]
             -- Cavity geometry automatic!
         ]
-        text: 'What needs to be done?'
+        text: TEXT { What needs to be done? }
     )
 }
 
@@ -694,7 +694,7 @@ FUNCTION todo_button() {
             ]
             -- Raised geometry automatic!
         ]
-        label: 'Remove'
+        label: TEXT { Remove }
     )
 }
 ```

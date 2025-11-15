@@ -91,7 +91,7 @@ Element/text_input(
     ]
     style: [...]
     text: LATEST {
-        ''
+        Text/empty
         element.event.change.text  -- Local access to own event
     }
 )
@@ -170,9 +170,9 @@ FUNCTION new_todo_title_text_input() {
             event: [change: LINK, key_down: LINK]
         ]
         text: LATEST {
-            ''
+            Text/empty
             element.event.change.text  -- Element uses its own event locally
-            PASSED.store.title_to_save |> THEN { '' }
+            PASSED.store.title_to_save |> THEN { Text/empty }
         }
     )
 }
@@ -437,11 +437,11 @@ text: input.text |> Text/trim()
 ```boon
 // PROPOSED (BAD):
 Element/text_input(
-    element: [id: 'new-todo-input']
+    element: [id: TEXT { new-todo-input }]
 )
 
 // Access by ID anywhere
-store.element('new-todo-input').event.change
+store.element(TEXT { new-todo-input }).event.change
 ```
 
 **Problems:**
@@ -807,7 +807,7 @@ FUNCTION new_todo_title_text_input() {
             ]
         ]
         text: LATEST {
-            ''
+            Text/empty
             element.event.change.text  -- Local access
         }
     )
@@ -852,9 +852,9 @@ filter_button(Completed) |> LINK { PASSED.store.elements.filter_buttons.complete
 
 -- Step 4: Use button events for navigation
 go_to_result: LATEST {
-    filter_buttons.all.event.press |> THEN { '/' }
-    filter_buttons.active.event.press |> THEN { '/active' }
-    filter_buttons.completed.event.press |> THEN { '/completed' }
+    filter_buttons.all.event.press |> THEN { TEXT { / } }
+    filter_buttons.active.event.press |> THEN { TEXT { /active } }
+    filter_buttons.completed.event.press |> THEN { TEXT { /completed } }
 } |> Router/go_to()
 ```
 

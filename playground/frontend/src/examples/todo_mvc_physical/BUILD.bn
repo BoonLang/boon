@@ -43,6 +43,6 @@ FUNCTION icon_code(file) {
             file.path
                 |> File/read_text()
                 |> Url/encode()
-                |> WHEN { encoded => TEXT { {name}: 'data:image/svg+xml;utf8,{encoded}' } }
+                |> WHEN { encoded => TEXT { {name}: TEXT #{ data:image/svg+xml;utf8,{encoded} } } }
         }
 }

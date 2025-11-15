@@ -542,7 +542,7 @@ FUNCTION icon_code(file) {
             file.path
                 |> File/read_text()
                 |> Url/encode()
-                |> WHEN { encoded => TEXT { {name}: 'data:image/svg+xml;utf8,{encoded}' } }
+                |> WHEN { encoded => TEXT { {name}: TEXT #{ data:image/svg+xml;utf8,{encoded} } } }
         }
 }
 ```
@@ -593,20 +593,7 @@ This would hide escape sequences and provide semantic terminal control. Can be a
 
 ---
 
-## Migration from Old Syntax
-
-### Before (with quotes and escapes)
-
-```boon
-text: 'Hello {name}!'
-text: 'I don\'t like it'
-text: 'Line 1\nLine 2\nLine 3'
-code: 'function() { return {x}; }'
-empty: ''
-check: text |> Text/trim() |> Text/empty() |> Bool/not()
-```
-
-### After (with TEXT)
+## TEXT Syntax Examples
 
 ```boon
 text: TEXT { Hello {name}! }

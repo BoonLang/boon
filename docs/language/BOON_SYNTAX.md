@@ -19,7 +19,7 @@ FUNCTION root_element() { ... }
 store: [...]
 selected_filter: Active
 go_to_result: Router/go_to()
-title_to_save: "Hello"
+title_to_save: TEXT { Hello }
 ```
 
 ❌ **INCORRECT - These will NOT work:**
@@ -59,7 +59,7 @@ TodoId
 Element/text(
     element: [tag: H1]
     style: [font: Theme/font(of: Header)]
-    text: 'todos'
+    text: TEXT { todos }
 )
 
 Scene/new(
@@ -85,7 +85,7 @@ route |> Router/go_to()
 ```boon
 Theme/material(InputInterior[focus: True])  -- INVALID: argument must be named
 Text/trim(user_input)                        -- INVALID: must pipe or use text: parameter
-Element/text('Hello')                        -- INVALID: must use text: parameter
+Element/text(TEXT { Hello })                 -- INVALID: must use text: parameter
 ```
 
 **Correct versions:**
@@ -93,12 +93,12 @@ Element/text('Hello')                        -- INVALID: must use text: paramete
 -- Option 1: Use named parameter
 Theme/material(of: InputInterior[focus: True])
 Text/trim(text: user_input)
-Element/text(text: 'Hello')
+Element/text(text: TEXT { Hello })
 
 -- Option 2: Use pipe for first argument
 Theme/material(of: InputInterior[focus: True])
 user_input |> Text/trim()
-'Hello' |> Element/text()  -- Though named is more readable here
+TEXT { Hello } |> Element/text()  -- Though named is more readable here
 ```
 
 ---
@@ -426,9 +426,9 @@ FUNCTION get_value(overrides) {
 ✅ **Correct - LATEST with events:**
 ```boon
 value: LATEST {
-    ''                                    -- Initial value
-    input_element.event.change.text      -- Updates on change event
-    save_button.event.press |> THEN { '' }  -- Resets on save
+    Text/empty                               -- Initial value
+    input_element.event.change.text          -- Updates on change event
+    save_button.event.press |> THEN { Text/empty }  -- Resets on save
 }
 ```
 

@@ -32,7 +32,7 @@ Element/text(
         font: Theme/font(of: Header)
         transform: [move_closer: 6]  -- Hero text: raised above surface
     ]
-    text: 'todos'
+    text: TEXT { todos }
 )
 ```
 
@@ -47,7 +47,7 @@ Element/text(
         font: Theme/font(of: Secondary)
         transform: [move_further: Theme/text_hierarchy_depth(Secondary)]
     ]
-    text: '{count} item{maybe_s} left'
+    text: TEXT { {count} item{maybe_s} left }
 )
 ```
 
@@ -80,7 +80,7 @@ Element/paragraph(
         font: Theme/font(of: Small)
         transform: [move_further: Theme/text_hierarchy_depth(Tertiary)]
     ]
-    contents: LIST { 'Double-click to edit a todo' }
+    contents: LIST { TEXT { Double-click to edit a todo } }
 )
 ```
 
