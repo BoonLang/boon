@@ -1,7 +1,6 @@
 -- Generates Assets.bn from SVG icon files
--- THROW/CATCH error handling (similar to PASS/PASSED)
--- THROW skips pipeline until CATCH (mandatory)
--- CATCH returns values, not errors
+-- FLUSH pattern: errors exit pipeline and flow as return values
+-- Two-binding pattern: generation_result → generation_error_handling
 
 icons_directory: TEXT { ./assets/icons }
 output_file: TEXT { ./Generated/Assets.bn }
@@ -10,11 +9,11 @@ svg_files: Directory/entries(icons_directory)
     |> List/retain(item, if: item.extension = TEXT { svg })
     |> List/sort_by(item, key: item.path)
 
-generation: svg_files
+generation_result: svg_files
     |> List/try_map(old, new:
         old |> icon_code() |> WHEN {
             Ok[text] => text
-            error => THROW { error }
+            error => FLUSH { error }
         }
     )
     |> Text/join_lines()
@@ -29,39 +28,38 @@ generation: svg_files
     |> File/write_text(path: output_file)
     |> WHEN {
         Ok => []
-        error => THROW { error }
+        error => FLUSH { error }
     }
-    |> THEN { BLOCK {
+
+generation_error_handling: generation_result |> WHEN {
+    [] => BLOCK {
         count: svg_files |> List/count()
         logged: TEXT { Included {count} icons } |> Log/info()
         Build/succeed()
-    } }
-    |> CATCH {
-        ReadError[message] => BLOCK {
-            logged: TEXT { Cannot read icon: {message} } |> Log/error()
-            Build/fail()
-        }
-        EncodeError[message] => BLOCK {
-            logged: TEXT { Cannot encode icon: {message} } |> Log/error()
-            Build/fail()
-        }
-        WriteError[message] => BLOCK {
-            logged: TEXT { Cannot write {output_file}: {message} } |> Log/error()
-            Build/fail()
-        }
     }
+    error => BLOCK {
+        error_message: error |> WHEN {
+            ReadError[message] => TEXT { Cannot read icon: {message} }
+            EncodeError[message] => TEXT { Cannot encode icon: {message} }
+            WriteError[message] => TEXT { Cannot write {output_file}: {message} }
+        }
+        logged: error_message |> Log/error()
+        Build/fail()
+    }
+}
+
 
 FUNCTION icon_code(item) {
     item.path
         |> File/read_text()
         |> WHEN {
             Ok[text] => text
-            error => THROW { error }
+            error => FLUSH { error }
         }
         |> Url/encode()
         |> WHEN {
             Ok[encoded] => encoded
-            error => THROW { error }
+            error => FLUSH { error }
         }
         |> WHEN { encoded =>
             Ok[text: TEXT { {item.file_stem}: data:image/svg+xml;utf8,{encoded} }]
