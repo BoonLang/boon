@@ -28,10 +28,11 @@ BUILD.bn is Boon's build-time code generation system. It allows projects to gene
 
 1. [BUILD.bn Fundamentals](#buildbn-fundamentals)
 2. [API Reference](#api-reference)
-3. [Browser Compatibility (BuildFS)](#browser-compatibility)
-4. [Simple Routing Pattern](#simple-routing-pattern)
-5. [Best Practices](#best-practices)
-6. [Migration Guide](#migration-guide)
+3. [Error Handling in BUILD.bn](#error-handling-in-buildbn)
+4. [Browser Compatibility (BuildFS)](#browser-compatibility)
+5. [Simple Routing Pattern](#simple-routing-pattern)
+6. [Best Practices](#best-practices)
+7. [Migration Guide](#migration-guide)
 
 ---
 
@@ -337,6 +338,200 @@ Remove prefix if present.
 TEXT { ./assets/icon.svg } |> Text/trim_prefix(TEXT { ./ })
 -- Result: TEXT { assets/icon.svg }
 ```
+
+---
+
+## Error Handling in BUILD.bn
+
+### THROW/CATCH Pattern
+
+BUILD.bn supports explicit error handling using the **THROW/CATCH** pattern, similar to PASS/PASSED.
+
+#### Core Semantics
+
+- **THROW** exits the pipeline immediately, jumping to the nearest CATCH
+- **CATCH is mandatory** - compilation error if THROW is not caught
+- Errors flow through a separate channel (like PASS/PASSED)
+- THEN and CATCH are mutually exclusive - only one executes
+
+#### Basic Example
+
+```boon
+FUNCTION icon_code(item) {
+    item.path
+        |> File/read_text()
+        |> WHEN {
+            Ok[text] => text
+            error => THROW { error }  -- Jumps to CATCH
+        }
+        |> Url/encode()  -- SKIPPED if error was thrown
+        |> WHEN {
+            Ok[encoded] => encoded
+            error => THROW { error }
+        }
+        |> WHEN { encoded =>
+            Ok[text: TEXT { {item.file_stem}: data:image/svg+xml;utf8,{encoded} }]
+        }
+}
+```
+
+**Note:** `icon_code` has no CATCH, so thrown errors become the return value: `Ok[text: TEXT] | ReadError | EncodeError`
+
+#### Fail-Fast Pattern with List/try_map
+
+Process list items, stopping on first error:
+
+```boon
+generation: svg_files
+    |> List/try_map(old, new:
+        old |> icon_code() |> WHEN {
+            Ok[text] => text        -- Extract success value
+            error => THROW { error } -- Stop on first error
+        }
+    )
+    -- Returns: List[TEXT] if all succeed, or first error
+    |> Text/join_lines()
+    |> WHEN { code => TEXT {
+        -- Generated from {icons_directory}
+        icon: [
+            {code}
+        ]
+    } }
+    |> File/write_text(path: output_file)
+    |> WHEN {
+        Ok => []
+        error => THROW { error }
+    }
+    |> THEN { BLOCK {
+        count: svg_files |> List/count()
+        logged: TEXT { Included {count} icons } |> Log/info()
+        Build/succeed()
+    } }
+    |> CATCH {
+        ReadError[message] => BLOCK {
+            logged: TEXT { Cannot read icon: {message} } |> Log/error()
+            Build/fail()
+        }
+        EncodeError[message] => BLOCK {
+            logged: TEXT { Cannot encode icon: {message} } |> Log/error()
+            Build/fail()
+        }
+        WriteError[message] => BLOCK {
+            logged: TEXT { Cannot write {output_file}: {message} } |> Log/error()
+            Build/fail()
+        }
+    }
+```
+
+**Key Points:**
+- `List/try_map` provides fail-fast behavior
+- Mapper explicitly handles `Ok[value] => value, error => THROW { error }`
+- THEN runs only on success (no THROW occurred)
+- CATCH runs only on error (THROW occurred)
+- Both return build status via `Build/succeed()` or `Build/fail()`
+
+#### Accumulate Errors Pattern with List/collect_map
+
+Process all items, collecting all errors:
+
+```boon
+generation: svg_files
+    |> List/collect_map(old, new:
+        old |> icon_code() |> WHEN {
+            Ok[text] => Ok[item: text]  -- Keep wrapped
+            error => error               -- Accumulate
+        }
+    )
+    -- Returns: Ok[icons: List[TEXT]] | Errors[errors: List[Error]]
+    |> WHEN {
+        Ok[icons] => icons
+        Errors[errors] => THROW { IconErrors[errors: errors] }
+    }
+    |> Text/join_lines()
+    |> File/write_text(path: output_file)
+    |> WHEN {
+        Ok => []
+        error => THROW { error }
+    }
+    |> THEN { BLOCK {
+        logged: TEXT { Build succeeded } |> Log/info()
+        Build/succeed()
+    } }
+    |> CATCH {
+        IconErrors[errors] => BLOCK {
+            count: errors |> List/count()
+            logged_all: errors |> List/each(e => e |> WHEN {
+                ReadError[message] => TEXT { Cannot read: {message} } |> Log/error()
+                EncodeError[message] => TEXT { Cannot encode: {message} } |> Log/error()
+            })
+            logged_summary: TEXT { Build failed: {count} icon errors } |> Log/error()
+            Build/fail()
+        }
+        WriteError[message] => BLOCK {
+            logged: TEXT { Cannot write {output_file}: {message} } |> Log/error()
+            Build/fail()
+        }
+    }
+```
+
+**Key Points:**
+- `List/collect_map` processes all items (doesn't stop on first error)
+- Success values stay wrapped: `Ok[item: text]`
+- Returns all errors together for comprehensive reporting
+- Logs each individual error plus summary
+
+#### Ok Tagging for Type Safety
+
+Wrap success values in `Ok` tag to distinguish from errors:
+
+```boon
+-- Without Ok wrapper (unsafe):
+WHEN {
+    text => text        -- Matches EVERYTHING (including errors!)
+    error => ...        -- Never reached
+}
+
+-- With Ok wrapper (safe):
+WHEN {
+    Ok[text] => text    -- Only matches Ok
+    error => THROW { error }  -- Matches all errors
+}
+```
+
+**Why Ok tagging:**
+- Prevents accidental matching of error types
+- Makes success case explicit
+- Enables safe pattern matching
+- Works with both try_map (fail-fast) and collect_map (accumulate)
+
+#### Build Status Functions
+
+Use `Build/succeed()` and `Build/fail()` to communicate build results:
+
+```boon
+Build/succeed()  -- Build completed successfully
+Build/fail()     -- Build failed (logs errors)
+```
+
+These functions:
+- Communicate with the build system
+- Can be used in watch mode for continuous builds
+- Return appropriate exit codes in CI/CD
+
+### Error Handling Best Practices
+
+✅ **Do:**
+- Use `List/try_map` for fail-fast (stop on first error)
+- Use `List/collect_map` for comprehensive reporting (all errors)
+- Wrap success values in `Ok[item: value]` for type safety
+- Log errors in CATCH blocks before calling `Build/fail()`
+- Use BLOCK with variable bindings for side effects
+
+❌ **Don't:**
+- Swallow errors by logging and discarding them
+- Use bare pattern matching (`text =>`) that matches everything
+- Mix THROW/CATCH with silent error propagation
+- Forget CATCH - compilation error!
 
 ---
 

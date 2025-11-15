@@ -1,8 +1,9 @@
 # Boon BUILD Patterns & Learnings
 
 **Date:** 2025-01-15
+**Updated:** 2025-11-15
 **Context:** Lessons from refactoring BUILD.bn with error handling patterns
-**Status:** Reference Guide
+**Status:** Reference Guide - Finalized with THROW/CATCH pattern
 
 ---
 
@@ -302,15 +303,19 @@ state |> WHEN {
 
 ---
 
-### Pattern 0: THROW/CATCH (Recommended for Simplicity)
+### Pattern 0: THROW/CATCH (Finalized - Used in BUILD.bn)
 
-**Lightweight exception-style error handling without complex type system:**
+**Lightweight exception-style error handling with Ok tagging for type safety.**
 
 **Key Semantics:**
 - **THROW** exits the pipeline immediately (like exceptions)
 - Execution **jumps** to nearest CATCH (skipping intermediate steps)
 - **CATCH is mandatory** - compilation error if missing
 - Similar to PASS/PASSED (separate channel for errors)
+- Functions return Ok-tagged values to distinguish from errors
+- THEN and CATCH are mutually exclusive paths
+
+#### Basic Function Pattern
 
 ```boon
 FUNCTION icon_code(item) {
@@ -326,99 +331,196 @@ FUNCTION icon_code(item) {
             error => THROW { error }
         }
         |> WHEN { encoded =>
-            TEXT { {item.file_stem}: data:image/svg+xml;utf8,{encoded} }
-        }
-        |> CATCH {  -- MANDATORY: Must catch all thrown errors
-            ReadError[message] => TEXT { -- ERROR: Read failed: {message} }
-            EncodeError[message] => TEXT { -- ERROR: Encode failed: {message} }
+            Ok[text: TEXT { {item.file_stem}: data:image/svg+xml;utf8,{encoded} }]
         }
 }
+-- Returns: Ok[text: TEXT] | ReadError | EncodeError
+-- No CATCH - errors propagate to caller
 ```
 
-**Pattern:** `Ok[value] => value, error => THROW { error }`
-- Unwraps success (`Ok[value]`)
-- Throws everything else (any error tag)
-- Cleaner than matching each error type
+**Key Point:** Return `Ok[text: ...]` to wrap success value, making it distinguishable from error types.
 
-**Execution flow when ReadError occurs:**
-1. `File/read_text()` returns `ReadError[message]`
-2. WHEN matches `error => THROW { error }`
-3. **Execution jumps to CATCH** (Url/encode is **skipped**)
-4. CATCH matches `ReadError[message]` → returns TEXT error comment
-5. Pipeline continues with TEXT value (not an Error tag)
-
-**With variable binding for side effects:**
+#### Fail-Fast with List/try_map
 
 ```boon
-|> CATCH {
-    WriteError[msg] => BLOCK {
-        logged: TEXT { FATAL: Cannot write: {msg} } |> Log/error()
-        THROW { WriteError[msg] }  -- Re-throw fatal errors
-    }
-}
-```
-
-**Gradual error handling:**
-
-```boon
--- Level 0: No CATCH (compilation error if function can THROW)
-item.path
-    |> File/read_text()
+generation: svg_files
+    |> List/try_map(old, new:
+        old |> icon_code() |> WHEN {
+            Ok[text] => text        -- Extract success value
+            error => THROW { error } -- Stop on first error
+        }
+    )
+    -- Returns: List[TEXT] if all succeed, or first error
+    |> Text/join_lines()
+    |> WHEN { code => TEXT {
+        -- Generated from {icons_directory}
+        icon: [
+            {code}
+        ]
+    } }
+    |> File/write_text(path: output_file)
     |> WHEN {
-        Ok[text] => text
+        Ok => []
         error => THROW { error }
     }
-    -- ❌ ERROR: Uncaught THROW - must add CATCH
-
--- Level 1: Minimal CATCH (catch all errors)
-item.path
-    |> File/read_text()
-    |> WHEN {
-        Ok[text] => text
-        error => THROW { error }
-    }
-    |> Url/encode()
-    |> WHEN {
-        Ok[encoded] => encoded
-        error => THROW { error }
-    }
+    |> THEN { BLOCK {
+        count: svg_files |> List/count()
+        logged: TEXT { Included {count} icons } |> Log/info()
+        Build/succeed()
+    } }
     |> CATCH {
-        ReadError[message] => TEXT { -- ERROR: {message} }
-        EncodeError[message] => TEXT { -- ERROR: {message} }
-    }
-
--- Level 2: Handle some errors without THROW (continue pipeline)
-item.path
-    |> File/read_text()
-    |> WHEN {
-        Ok[text] => text
         ReadError[message] => BLOCK {
-            logged: TEXT { Warning: {message} } |> Log/warn()
-            TEXT { default content }  -- Fallback, no THROW
+            logged: TEXT { Cannot read icon: {message} } |> Log/error()
+            Build/fail()
         }
-    }
-    |> Url/encode()  -- Runs even if ReadError (fallback was used)
-    |> WHEN {
-        Ok[encoded] => encoded
-        error => THROW { error }  -- This one still throws
-    }
-    |> CATCH {
-        EncodeError[message] => TEXT { -- ERROR: {message} }
+        EncodeError[message] => BLOCK {
+            logged: TEXT { Cannot encode icon: {message} } |> Log/error()
+            Build/fail()
+        }
+        WriteError[message] => BLOCK {
+            logged: TEXT { Cannot write {output_file}: {message} } |> Log/error()
+            Build/fail()
+        }
     }
 ```
 
-**Benefits:**
-- ✅ Lightweight - no union types
-- ✅ Explicit - THROW makes error paths visible
-- ✅ Familiar - like try/catch
-- ✅ Gradual - add CATCH incrementally
-- ✅ Composable - CATCH at any level
+**Execution Flow:**
+1. **Success Path**: try_map → join_lines → write → THEN → Build/succeed()
+2. **Error Path**: THROW at any point → skip to CATCH → Build/fail()
+3. **Mutual Exclusion**: Only THEN or CATCH runs, not both
 
-**When to use:**
-- Build scripts (like BUILD.bn)
-- Simple error recovery
-- When type system simplicity matters
-- When team familiarity is important
+#### Accumulate Errors with List/collect_map
+
+```boon
+generation: svg_files
+    |> List/collect_map(old, new:
+        old |> icon_code() |> WHEN {
+            Ok[text] => Ok[item: text]  -- Keep Ok wrapper
+            error => error               -- Pass through errors
+        }
+    )
+    -- Returns: Ok[icons: List[TEXT]] | Errors[errors: List[Error]]
+    |> WHEN {
+        Ok[icons] => icons
+        Errors[errors] => THROW { IconErrors[errors: errors] }
+    }
+    |> Text/join_lines()
+    |> File/write_text(path: output_file)
+    |> WHEN {
+        Ok => []
+        error => THROW { error }
+    }
+    |> THEN { BLOCK {
+        logged: TEXT { Build succeeded } |> Log/info()
+        Build/succeed()
+    } }
+    |> CATCH {
+        IconErrors[errors] => BLOCK {
+            count: errors |> List/count()
+            logged_all: errors |> List/each(e => e |> WHEN {
+                ReadError[message] => TEXT { Cannot read: {message} } |> Log/error()
+                EncodeError[message] => TEXT { Cannot encode: {message} } |> Log/error()
+            })
+            logged_summary: TEXT { Build failed: {count} icon errors } |> Log/error()
+            Build/fail()
+        }
+        WriteError[message] => BLOCK {
+            logged: TEXT { Cannot write {output_file}: {message} } |> Log/error()
+            Build/fail()
+        }
+    }
+```
+
+**Difference from try_map:**
+- `try_map`: Stops on first error (fail-fast)
+- `collect_map`: Processes all items, collects all errors (comprehensive reporting)
+
+#### Ok Tagging for Type Safety
+
+**Problem - Bare pattern matching:**
+```boon
+|> WHEN {
+    text => text        -- ❌ Matches EVERYTHING (including errors!)
+    error => ...        -- Never reached
+}
+```
+
+**Solution - Ok tagging:**
+```boon
+|> WHEN {
+    Ok[text] => text    -- ✅ Only matches Ok
+    error => THROW { error }  -- ✅ Matches all errors
+}
+```
+
+**Why Ok tagging is essential:**
+- Prevents accidental matching of error types
+- Makes success case explicit in function return type
+- Enables safe pattern matching in List/try_map and List/collect_map
+- Type signature: `Ok[text: TEXT] | ReadError | EncodeError`
+
+#### THEN/CATCH Mutual Exclusion
+
+```boon
+|> THEN { BLOCK {
+    logged: TEXT { Success } |> Log/info()
+    Build/succeed()
+} }
+|> CATCH {
+    error => BLOCK {
+        logged: error |> Log/error()
+        Build/fail()
+    }
+}
+```
+
+**Semantics:**
+- **THEN** runs only if no THROW occurred (success path)
+- **CATCH** runs only if THROW occurred (error path)
+- Never both - they're mutually exclusive alternatives
+- Both return values that merge back into the pipeline
+- Use `Build/succeed()` and `Build/fail()` to communicate build status
+
+#### BLOCK Usage with Side Effects
+
+**Correct - variable bindings:**
+```boon
+CATCH {
+    WriteError[message] => BLOCK {
+        logged: TEXT { Cannot write: {message} } |> Log/error()
+        Build/fail()  -- Final expression (return value)
+    }
+}
+```
+
+**Incorrect - sequential statements:**
+```boon
+BLOCK {
+    Log/error(message)  -- ❌ Not a variable binding
+    Build/fail()
+}
+```
+
+**Rule:** BLOCK contains only variable bindings plus final expression.
+
+#### Benefits
+
+- ✅ Type-safe with Ok tagging
+- ✅ Fail-fast or accumulate errors (try_map vs collect_map)
+- ✅ Explicit error paths (THROW makes flow visible)
+- ✅ Familiar to mainstream developers (like try/catch)
+- ✅ Clean separation (THEN for success, CATCH for errors)
+- ✅ Composable (functions can throw, caller catches)
+- ✅ No abbreviations (message not msg)
+- ✅ Proper logging with side effects in BLOCK
+
+#### When to Use
+
+- ✅ Build scripts (like BUILD.bn)
+- ✅ When you want fail-fast behavior
+- ✅ When comprehensive error reporting is needed
+- ✅ When type safety matters (Ok tagging prevents mistakes)
+- ✅ When team familiarity is important
 
 ---
 
@@ -748,22 +850,64 @@ List/map(old, new: process(old))
 
 **Key Learnings:**
 
-1. **BLOCK forms dependency graph** - variables wait for dependencies, but can't be redefined
-2. **Pipeline style** - start with value, pipe through transformations
-3. **WHEN vs THEN** - WHEN binds value, THEN ignores it
-4. **Tagged objects** - use adhoc tags with named properties for state progression
-5. **Error handling** - state accumulator or helper functions for flat structure
-6. **Function parameters** - fixed by definition, can't rename at call site
-7. **TEXT syntax** - no nesting, interpolation with `{var}`, named properties in tags
+1. **THROW/CATCH is finalized** - Use for BUILD.bn error handling with Ok tagging
+2. **Ok tagging essential** - Wrap success values in `Ok[item: value]` for type safety
+3. **Fail-fast vs accumulate** - `List/try_map` (stop on first) vs `List/collect_map` (all errors)
+4. **THEN/CATCH mutual exclusion** - Only one executes, never both
+5. **BLOCK forms dependency graph** - Variables wait for dependencies, can't be redefined
+6. **Pipeline style** - Start with value, pipe through transformations
+7. **WHEN vs THEN** - WHEN binds value, THEN ignores it
+8. **Tagged objects** - Use adhoc tags with named properties
+9. **Function parameters** - Fixed by definition, can't rename at call site
+10. **TEXT syntax** - No nesting, interpolation with `{var}`, named properties in tags
+11. **No abbreviations** - Use `message` not `msg` for clarity
+12. **Build status** - Use `Build/succeed()` and `Build/fail()` to communicate results
 
-**Next Steps:**
+**Finalized Error Handling Pattern (from BUILD.bn):**
 
-When adding error handling to BUILD.bn, consider:
-- State accumulator pattern (flat, transparent)
-- Helper functions pattern (testable, clear)
-- Error accumulation pattern (collect all errors)
+```boon
+-- Function returns Ok[value] or errors
+FUNCTION process(item) {
+    item
+        |> operation()
+        |> WHEN {
+            Ok[result] => result
+            error => THROW { error }
+        }
+        |> WHEN { result =>
+            Ok[value: process(result)]
+        }
+}
+
+-- Caller uses try_map for fail-fast
+items
+    |> List/try_map(old, new:
+        old |> process() |> WHEN {
+            Ok[value] => value
+            error => THROW { error }
+        }
+    )
+    |> THEN { BLOCK {
+        logged: TEXT { Success } |> Log/info()
+        Build/succeed()
+    } }
+    |> CATCH {
+        error => BLOCK {
+            logged: error |> Log/error()
+            Build/fail()
+        }
+    }
+```
+
+**Implementation Status:**
+
+✅ **BUILD.bn** - Finalized with THROW/CATCH, List/try_map, Ok tagging
+✅ **BUILD_SIMPLE_ERRORS.bn** - Same as BUILD.bn (fail-fast pattern)
+✅ **BUILD_WITH_ERRORS.bn** - Error accumulation with List/collect_map
+✅ **ERROR_HANDLING_LEVELS.md** - Progressive complexity levels documented
+✅ **BUILD_SYSTEM.md** - Comprehensive error handling guide added
 
 ---
 
-**Last Updated:** 2025-01-15
-**Related Files:** BUILD.bn, BOON_SYNTAX.md, TEXT_SYNTAX.md
+**Last Updated:** 2025-11-15
+**Related Files:** BUILD.bn, BUILD_SIMPLE_ERRORS.bn, BUILD_WITH_ERRORS.bn, ERROR_HANDLING_LEVELS.md, BUILD_SYSTEM.md
