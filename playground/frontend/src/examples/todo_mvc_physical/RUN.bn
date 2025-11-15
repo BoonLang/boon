@@ -137,7 +137,8 @@ theme_options: [
 ------------------------------------------------------------------------
 
 FUNCTION delete_button_material(hovered) {
-    Theme/material(of: SurfaceElevated) |> MERGE [
+    [
+        ...Theme/material(of: SurfaceElevated)
         glow: hovered |> WHEN {
             True => [
                 color: Theme/material(of: Danger).color
@@ -149,40 +150,33 @@ FUNCTION delete_button_material(hovered) {
 }
 
 FUNCTION filter_button_material(selected, hovered) {
-    BLOCK {
-        base: selected |> WHEN {
+    [
+        ...selected |> WHEN {
             True => Theme/material(of: PrimarySubtle)
             False => Theme/material(of: SurfaceVariant)
         }
-
-        base |> MERGE [
-            gloss: selected |> WHEN {
-                False => 0.35
-                True => 0.2
-            }
-            metal: 0.03
-            glow: LIST { selected, hovered } |> WHEN {
-                LIST { True, __ } => [
-                    color: Theme/material(of: Primary).color
-                    intensity: 0.05
-                ]
-                LIST { False, True } => [
-                    color: Theme/material(of: Primary).color
-                    intensity: 0.025
-                ]
-                LIST { False, False } => None
-            }
-        ]
-    }
+        gloss: selected |> WHEN {
+            False => 0.35
+            True => 0.2
+        }
+        metal: 0.03
+        glow: LIST { selected, hovered } |> WHEN {
+            LIST { True, __ } => [
+                color: Theme/material(of: Primary).color
+                intensity: 0.05
+            ]
+            LIST { False, True } => [
+                color: Theme/material(of: Primary).color
+                intensity: 0.025
+            ]
+            LIST { False, False } => None
+        }
+    ]
 }
 
 FUNCTION clear_button_font(hovered) {
     [
-        size: 14
-        color: PASSED.theme_options.mode |> WHEN {
-            Light => Oklch[lightness: 0.57]
-            Dark => Oklch[lightness: 0.75]
-        }
+        ...Theme/font(of: BodySecondary)
         line: [underline: hovered]
     ]
 }
@@ -197,21 +191,14 @@ FUNCTION clear_button_text(hovered) {
 }
 
 FUNCTION todo_title_font(completed) {
-    BLOCK {
-        colors: PASSED.theme_options.mode |> WHEN {
-            Light => [text: Oklch[lightness: 0.42], text_disabled: Oklch[lightness: 0.75]]
-            Dark => [text: Oklch[lightness: 0.9], text_disabled: Oklch[lightness: 0.5]]
+    [
+        ...Theme/font(of: Body)
+        line: [strike: completed]
+        ...completed |> WHEN {
+            True => [color: Theme/font(of: BodyDisabled).color]
+            False => []
         }
-
-        [
-            size: 24
-            line: [strike: completed]
-            color: completed |> WHEN {
-                True => colors.text_disabled
-                False => colors.text
-            }
-        ]
-    }
+    ]
 }
 
 FUNCTION todo_title_text(completed) {

@@ -19,15 +19,8 @@ FUNCTION get(from, of) {
 }
 
 FUNCTION material(material) {
-    material |> WHEN {
-        Background => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.96, chroma: 0.01, hue: 220]
-                Dark => Oklch[lightness: 0.08, chroma: 0.005, hue: 220]
-            }
-        ]
-
-        Surface => [
+    BLOCK {
+        surface_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 1]
                 Dark => Oklch[lightness: 0.15]
@@ -35,7 +28,7 @@ FUNCTION material(material) {
             gloss: 0.25
         ]
 
-        SurfaceVariant => [
+        surface_variant_base: [
             color: PASSED.mode |> WHEN {
                 Light => Oklch[lightness: 0.985]
                 Dark => Oklch[lightness: 0.18]
@@ -43,67 +36,74 @@ FUNCTION material(material) {
             gloss: 0.25
         ]
 
-        SurfaceElevated => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.99]
-                Dark => Oklch[lightness: 0.22]
-            }
-            gloss: 0.4
-        ]
+        material |> WHEN {
+            Background => [
+                color: PASSED.mode |> WHEN {
+                    Light => Oklch[lightness: 0.96, chroma: 0.01, hue: 220]
+                    Dark => Oklch[lightness: 0.08, chroma: 0.005, hue: 220]
+                }
+            ]
 
-        Interactive[hovered] => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.985]
-                Dark => Oklch[lightness: 0.18]
-            }
-            gloss: hovered |> WHEN {
-                True => 0.3
-                False => 0.25
-            }
-            metal: 0.03
-        ]
+            Surface => surface_base
 
-        InteractiveRecessed[focus] => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 1]
-                Dark => Oklch[lightness: 0.15]
-            }
-            gloss: focus |> WHEN {
-                False => 0.65
-                True => 0.15
-            }
-            glow: focus |> WHEN {
-                True => [
-                    color: PASSED.mode |> WHEN {
-                        Light => Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
-                        Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 220]
-                    }
-                    intensity: 0.15
-                ]
-                False => None
-            }
-        ]
+            SurfaceVariant => surface_variant_base
 
-        Primary => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
-                Dark => Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
-            }
-        ]
+            SurfaceElevated => [
+                color: PASSED.mode |> WHEN {
+                    Light => Oklch[lightness: 0.99]
+                    Dark => Oklch[lightness: 0.22]
+                }
+                gloss: 0.4
+            ]
 
-        PrimarySubtle => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.98, chroma: 0.01, hue: 25.36]
-                Dark => Oklch[lightness: 0.25, chroma: 0.08, hue: 25.36]
-            }
-        ]
+            Interactive[hovered] => [
+                ...surface_variant_base
+                gloss: hovered |> WHEN {
+                    True => 0.3
+                    False => 0.25
+                }
+                metal: 0.03
+            ]
 
-        Danger => [
-            color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87]
-                Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 18.87]
-            }
-        ]
+            InteractiveRecessed[focus] => [
+                ...surface_base
+                gloss: focus |> WHEN {
+                    False => 0.65
+                    True => 0.15
+                }
+                glow: focus |> WHEN {
+                    True => [
+                        color: PASSED.mode |> WHEN {
+                            Light => Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
+                            Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 220]
+                        }
+                        intensity: 0.15
+                    ]
+                    False => None
+                }
+            ]
+
+            Primary => [
+                color: PASSED.mode |> WHEN {
+                    Light => Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
+                    Dark => Oklch[lightness: 0.8, chroma: 0.165, hue: 25.36]
+                }
+            ]
+
+            PrimarySubtle => [
+                color: PASSED.mode |> WHEN {
+                    Light => Oklch[lightness: 0.98, chroma: 0.01, hue: 25.36]
+                    Dark => Oklch[lightness: 0.25, chroma: 0.08, hue: 25.36]
+                }
+            ]
+
+            Danger => [
+                color: PASSED.mode |> WHEN {
+                    Light => Oklch[lightness: 0.8, chroma: 0.109, hue: 18.87]
+                    Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 18.87]
+                }
+            ]
+        }
     }
 }
 
@@ -128,6 +128,16 @@ FUNCTION font(font) {
             ]
         }
 
+        body_base: [
+            size: 24
+            color: colors.text
+        ]
+
+        small_base: [
+            size: 10
+            color: colors.text_tertiary
+        ]
+
         font |> WHEN {
             Hero => [
                 size: 100
@@ -135,10 +145,7 @@ FUNCTION font(font) {
                 weight: Hairline
             ]
 
-            Body => [
-                size: 24
-                color: colors.text
-            ]
+            Body => body_base
 
             BodySecondary => [
                 size: 14
@@ -146,7 +153,7 @@ FUNCTION font(font) {
             ]
 
             BodyDisabled => [
-                size: 24
+                ...body_base
                 color: colors.text_disabled
             ]
 
@@ -156,13 +163,10 @@ FUNCTION font(font) {
                 color: colors.danger
             ]
 
-            Input => [
-                size: 24
-                color: colors.text
-            ]
+            Input => [...body_base]
 
             Placeholder => [
-                size: 24
+                ...body_base
                 style: Italic
                 color: colors.text_secondary
             ]
@@ -175,14 +179,10 @@ FUNCTION font(font) {
                 }
             ]
 
-            Small => [
-                size: 10
-                color: colors.text_tertiary
-            ]
+            Small => small_base
 
             SmallLink[hovered] => [
-                size: 10
-                color: colors.text_tertiary
+                ...small_base
                 line: [underline: hovered]
             ]
         }
@@ -190,38 +190,40 @@ FUNCTION font(font) {
 }
 
 FUNCTION text(of) {
-    of |> WHEN {
-        Hero => [
-            font: font(of: Hero)
-            depth: 6
-            move: [closer: 6]
-            relief: Raised
-        ]
-
-        BodySecondary => [
-            font: font(of: BodySecondary)
-            depth: 1.5
-            move: [further: 2]
-            relief: Raised
-        ]
-
-        ButtonIcon[checked] => [
-            font: font(of: ButtonIcon[checked])
-        ]
-
-        Small => [
+    BLOCK {
+        small_base: [
             font: font(of: Small)
             depth: 1
             move: [further: 4]
             relief: Carved[wall: 1]
         ]
 
-        SmallLink[hovered] => [
-            font: font(of: SmallLink[hovered])
-            depth: 1
-            move: [further: 4]
-            relief: Carved[wall: 1]
-        ]
+        of |> WHEN {
+            Hero => [
+                font: font(of: Hero)
+                depth: 6
+                move: [closer: 6]
+                relief: Raised
+            ]
+
+            BodySecondary => [
+                font: font(of: BodySecondary)
+                depth: 1.5
+                move: [further: 2]
+                relief: Raised
+            ]
+
+            ButtonIcon[checked] => [
+                font: font(of: ButtonIcon[checked])
+            ]
+
+            Small => small_base
+
+            SmallLink[hovered] => [
+                ...small_base
+                font: font(of: SmallLink[hovered])
+            ]
+        }
     }
 }
 

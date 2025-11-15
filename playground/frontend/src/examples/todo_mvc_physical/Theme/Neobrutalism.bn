@@ -125,6 +125,16 @@ FUNCTION font(font) {
             ]
         }
 
+        body_base: [
+            size: 24
+            color: colors.text
+        ]
+
+        small_base: [
+            size: 10
+            color: colors.text_tertiary
+        ]
+
         font |> WHEN {
             Hero => [
                 size: 100
@@ -132,10 +142,7 @@ FUNCTION font(font) {
                 weight: Hairline
             ]
 
-            Body => [
-                size: 24
-                color: colors.text
-            ]
+            Body => body_base
 
             BodySecondary => [
                 size: 14
@@ -143,7 +150,7 @@ FUNCTION font(font) {
             ]
 
             BodyDisabled => [
-                size: 24
+                ...body_base
                 color: colors.text_disabled
             ]
 
@@ -153,13 +160,10 @@ FUNCTION font(font) {
                 color: colors.danger
             ]
 
-            Input => [
-                size: 24
-                color: colors.text
-            ]
+            Input => [...body_base]
 
             Placeholder => [
-                size: 24
+                ...body_base
                 style: Italic
                 color: colors.text_secondary
             ]
@@ -172,14 +176,10 @@ FUNCTION font(font) {
                 }
             ]
 
-            Small => [
-                size: 10
-                color: colors.text_tertiary
-            ]
+            Small => small_base
 
             SmallLink[hovered] => [
-                size: 10
-                color: colors.text_tertiary
+                ...small_base
                 line: [underline: hovered]
             ]
         }
@@ -187,38 +187,40 @@ FUNCTION font(font) {
 }
 
 FUNCTION text(of) {
-    of |> WHEN {
-        Hero => [
-            font: font(of: Hero)
-            depth: 8
-            move: [closer: 8]
-            relief: Raised
-        ]
-
-        BodySecondary => [
-            font: font(of: BodySecondary)
-            depth: 3
-            move: [further: 2]
-            relief: Raised
-        ]
-
-        ButtonIcon[checked] => [
-            font: font(of: ButtonIcon[checked])
-        ]
-
-        Small => [
+    BLOCK {
+        small_base: [
             font: font(of: Small)
             depth: 2
             move: [further: 4]
             relief: Carved[wall: 2]
         ]
 
-        SmallLink[hovered] => [
-            font: font(of: SmallLink[hovered])
-            depth: 2
-            move: [further: 4]
-            relief: Carved[wall: 2]
-        ]
+        of |> WHEN {
+            Hero => [
+                font: font(of: Hero)
+                depth: 8
+                move: [closer: 8]
+                relief: Raised
+            ]
+
+            BodySecondary => [
+                font: font(of: BodySecondary)
+                depth: 3
+                move: [further: 2]
+                relief: Raised
+            ]
+
+            ButtonIcon[checked] => [
+                font: font(of: ButtonIcon[checked])
+            ]
+
+            Small => small_base
+
+            SmallLink[hovered] => [
+                ...small_base
+                font: font(of: SmallLink[hovered])
+            ]
+        }
     }
 }
 
