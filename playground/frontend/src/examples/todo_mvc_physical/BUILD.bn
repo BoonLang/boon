@@ -1,5 +1,6 @@
 -- Generates Assets.bn from SVG icon files
--- FLUSH pattern: errors exit pipeline and flow as return values
+-- FLUSH: exits expression, creates hidden FLUSHED[value] wrapper
+-- FLUSHED[value] propagates transparently, unwraps at boundaries
 -- Two-binding pattern: generation_result → generation_error_handling
 
 icons_directory: TEXT { ./assets/icons }
@@ -10,7 +11,7 @@ svg_files: Directory/entries(icons_directory)
     |> List/sort_by(item, key: item.path)
 
 generation_result: svg_files
-    |> List/try_map(old, new:
+    |> List/map(old, new:
         old |> icon_code() |> WHEN {
             Ok[text] => text
             error => FLUSH { error }
