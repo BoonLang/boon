@@ -75,29 +75,13 @@ FUNCTION new_todo(title) {
             title
             title_to_update
         }
-        completed: BLOCK {
-            completed: LATEST {
-                False
-                store.elements.toggle_all_checkbox.event.click |> THEN { 
-                    store.todos 
-                        |> List/every(item, if: item.completed) 
-                        |> Bool/not() 
-                }
-            }
-            LATEST {
-                completed
-                todo_elements.todo_checkbox.event.click |> THEN { 
-                    completed |> Bool/not()
-                } 
-            }
-        }
         completed:
             LATEST {
                 False
-                store.elements.toggle_all_checkbox.event.click |> THEN { 
-                    store.todos 
-                        |> List/every(item, if: item.completed) 
-                        |> Bool/not() 
+                store.elements.toggle_all_checkbox.event.click |> THEN {
+                    store.todos
+                        |> List/every(item, if: item.completed)
+                        |> Bool/not()
                 }
             }
             |> Bool/toggle(when: todo_elements.todo_checkbox.event.click)
