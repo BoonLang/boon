@@ -368,20 +368,22 @@ FUNCTION create_material(overrides) {
 
 ### Inlining and Further Optimization
 
-When spread expression is inline or from inlined function:
+When spread expression comes from inlined function call:
 
 ```boon
+FUNCTION get_base() {
+    [
+        color: expensive_color()
+        gloss: 0.4
+    ]
+}
+
 [
-    ...BLOCK {
-        [
-            color: expensive_color()
-            gloss: 0.4
-        ]
-    }
+    ...get_base()
     color: red
 ]
 
-// Compiler inlines BLOCK, sees:
+// Compiler inlines get_base(), sees:
 [
     color: expensive_color()  // Will be overridden
     gloss: 0.4
@@ -492,7 +494,7 @@ parse_field_definition():
 
 ## Common Patterns
 
-### Pattern 1: Defaults with Overrides
+### Pattern 1: Defaults with Overrides (Preferred)
 
 **Use case:** Provide defaults, allow user overrides
 
@@ -506,6 +508,12 @@ parse_field_definition():
 ```
 
 **Reads:** "Here are my defaults, override with user values"
+
+**This is the PREFERRED pattern** because:
+- ✅ Reads naturally top-to-bottom (defaults → overrides)
+- ✅ Clear mental model: "set defaults, then apply overrides"
+- ✅ Most common use case in practice
+- ✅ Matches common configuration patterns
 
 ---
 
@@ -522,6 +530,8 @@ parse_field_definition():
 ```
 
 **Reads:** "Use user config, fall back to these defaults"
+
+**Note:** Pattern 1 (defaults-first) is preferred over this pattern for most cases. Use this pattern only when you specifically need fallback behavior for missing fields.
 
 ---
 
@@ -606,138 +616,204 @@ parse_field_definition():
 
 ## Examples
 
-### Theme Material with Overrides
+### Theme Material Base Extraction
 
 ```boon
-FUNCTION material(of) {
-    of |> WHEN {
-        SurfaceElevated => [
+FUNCTION material(material) {
+    BLOCK {
+        surface_base: [
             color: PASSED.mode |> WHEN {
-                Light => Oklch[lightness: 0.99]
-                Dark => Oklch[lightness: 0.22]
-            }
-            gloss: 0.4
-            metal: 0.02
-            ...of.with  // User overrides
-        ]
-
-        Interactive[hovered] => [
-            color: hovered |> WHEN {
-                True => Oklch[lightness: 0.95]
-                False => Oklch[lightness: 0.98]
+                Light => Oklch[lightness: 1]
+                Dark => Oklch[lightness: 0.15]
             }
             gloss: 0.25
-            glow: hovered |> WHEN {
-                True => [color: primary_color, intensity: 0.05]
-                False => None
-            }
-            ...of.with
         ]
+
+        surface_variant_base: [
+            color: PASSED.mode |> WHEN {
+                Light => Oklch[lightness: 0.985]
+                Dark => Oklch[lightness: 0.18]
+            }
+            gloss: 0.25
+        ]
+
+        material |> WHEN {
+            Surface => surface_base
+
+            SurfaceVariant => surface_variant_base
+
+            Interactive[hovered] => [
+                ...surface_variant_base
+                gloss: hovered |> WHEN {
+                    True => 0.3
+                    False => 0.25
+                }
+                metal: 0.03
+            ]
+
+            InteractiveRecessed[focus] => [
+                ...surface_base
+                gloss: focus |> WHEN {
+                    False => 0.65
+                    True => 0.15
+                }
+                glow: focus |> WHEN {
+                    True => [
+                        color: PASSED.mode |> WHEN {
+                            Light => Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
+                            Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 220]
+                        }
+                        intensity: 0.15
+                    ]
+                    False => None
+                }
+            ]
+        }
     }
 }
-
-// Usage:
-Theme/material(of: SurfaceElevated)
-// → [color: Oklch[...], gloss: 0.4, metal: 0.02]
-
-Theme/material(of: SurfaceElevated[with: [color: red, glow: x]])
-// → [color: red, gloss: 0.4, metal: 0.02, glow: x]
-// (color computation skipped via optimization)
-
-Theme/material(of: Interactive[hovered: True, with: [metal: 0.05]])
-// → [color: Oklch[0.95], gloss: 0.25, glow: [...], metal: 0.05]
 ```
 
-### Style Cascade
+### Font Variants with Spread
 
 ```boon
-FUNCTION Button(props) {
+FUNCTION font(font) {
+    BLOCK {
+        colors: PASSED.mode |> WHEN {
+            Light => [
+                text: Oklch[lightness: 0.42]
+                text_secondary: Oklch[lightness: 0.57]
+                text_disabled: Oklch[lightness: 0.75]
+            ]
+            Dark => [
+                text: Oklch[lightness: 0.9]
+                text_secondary: Oklch[lightness: 0.75]
+                text_disabled: Oklch[lightness: 0.5]
+            ]
+        }
+
+        body_base: [
+            size: 24
+            color: colors.text
+        ]
+
+        small_base: [
+            size: 10
+            color: colors.text_tertiary
+        ]
+
+        font |> WHEN {
+            Body => body_base
+
+            BodyDisabled => [
+                ...body_base
+                color: colors.text_disabled
+            ]
+
+            Input => [...body_base]
+
+            Placeholder => [
+                ...body_base
+                style: Italic
+                color: colors.text_secondary
+            ]
+
+            Small => small_base
+
+            SmallLink[hovered] => [
+                ...small_base
+                line: [underline: hovered]
+            ]
+        }
+    }
+}
+```
+
+### Conditional Material Overrides
+
+```boon
+FUNCTION delete_button_material(hovered) {
     [
-        style: [
-            // Component defaults
-            padding: 10
-            border_radius: 5
-            background: default_bg
+        ...Theme/material(of: SurfaceElevated)
+        glow: hovered |> WHEN {
+            True => [
+                color: Theme/material(of: Danger).color
+                intensity: 0.08
+            ]
+            False => None
+        }
+    ]
+}
 
-            // Theme styles
-            ...Theme/get(from: Button)
-
-            // State-based modifications
-            ...props.hovered |> WHEN {
-                True => [background: lighter_bg]
-                False => []
-            }
-
-            // User overrides (highest priority)
-            ...props.style
-        ]
+FUNCTION filter_button_material(selected, hovered) {
+    [
+        ...selected |> WHEN {
+            True => Theme/material(of: PrimarySubtle)
+            False => Theme/material(of: SurfaceVariant)
+        }
+        gloss: selected |> WHEN {
+            False => 0.35
+            True => 0.2
+        }
+        metal: 0.03
+        glow: LIST { selected, hovered } |> WHEN {
+            LIST { True, __ } => [
+                color: Theme/material(of: Primary).color
+                intensity: 0.05
+            ]
+            LIST { False, True } => [
+                color: Theme/material(of: Primary).color
+                intensity: 0.025
+            ]
+            LIST { False, False } => None
+        }
     ]
 }
 ```
 
-### Configuration Merging
+### Font with Conditional Styling
 
 ```boon
-app_config: [
-    // Environment defaults
-    ...environment |> WHEN {
-        Production => production_defaults
-        Development => dev_defaults
-        Test => test_defaults
-    }
-
-    // User config (overrides environment)
-    ...user_config
-
-    // Required fallbacks
-    timeout: 3000
-    retries: 3
-    log_level: "info"
-]
-```
-
-### Inline Record Spreading
-
-```boon
-material: [
-    // Spread inline record
-    ...[
-        color: base_color
-        gloss: 0.4
+FUNCTION clear_button_font(hovered) {
+    [
+        ...Theme/font(of: BodySecondary)
+        line: [underline: hovered]
     ]
+}
 
-    // Add/override fields
-    metal: 0.02
-    glow: None
-]
+FUNCTION todo_title_font(completed) {
+    [
+        ...Theme/font(of: Body)
+        line: [strike: completed]
+        ...completed |> WHEN {
+            True => [color: Theme/font(of: BodyDisabled).color]
+            False => []
+        }
+    ]
+}
 ```
 
-### Multiple Conditional Spreads
+### Text Styling with Base Spread
 
 ```boon
-element_style: [
-    // Base styles
-    padding: 10
-    margin: 5
+FUNCTION text(of) {
+    BLOCK {
+        small_base: [
+            font: font(of: Small)
+            depth: 1
+            move: [further: 4]
+            relief: Carved[wall: 1]
+        ]
 
-    // Hover state
-    ...hovered |> WHEN {
-        True => [background: hover_bg, cursor: "pointer"]
-        False => []
-    }
+        of |> WHEN {
+            Small => small_base
 
-    // Focus state (can override hover)
-    ...focused |> WHEN {
-        True => [background: focus_bg, outline: focus_outline]
-        False => []
+            SmallLink[hovered] => [
+                ...small_base
+                font: font(of: SmallLink[hovered])
+            ]
+        }
     }
-
-    // Disabled state (overrides all)
-    ...disabled |> WHEN {
-        True => [background: disabled_bg, cursor: "not-allowed"]
-        False => []
-    }
-]
+}
 ```
 
 ---
@@ -765,7 +841,7 @@ result: [
 ```
 
 **Differences:**
-- Boon uses `:` instead of `:` for consistency
+- Boon uses `[...]` instead of `{...}` for record literals
 - Boon optimizes away dead fields (JavaScript creates then overwrites)
 - Boon has UNPLUGGED handling (JavaScript has undefined/null issues)
 - Boon has compile-time type checking
@@ -1107,9 +1183,7 @@ result: base |> MERGE [
 ]
 ```
 
-### New Pattern (Valid)
-
-**Option A: Caller-side spread**
+### New Pattern: Caller-Side Spread (Recommended)
 
 ```boon
 result: [
@@ -1119,7 +1193,14 @@ result: [
 ]
 ```
 
-**Option B: Callee-side spread (recommended)**
+**Why caller-side spread is preferred:**
+- ✅ **Consistency:** Single pattern throughout codebase
+- ✅ **No forced API:** Functions don't need to support ad-hoc override parameters
+- ✅ **Flexibility:** Caller has full control over what to override
+- ✅ **Simplicity:** Functions remain simple, focused on their core responsibility
+- ✅ **Future-proof:** Caller-side spread will always be available, even when callee-side isn't feasible
+
+### Alternative: Callee-Side Spread (Use Sparingly)
 
 ```boon
 // In Theme/material implementation:
@@ -1140,11 +1221,20 @@ result: Theme/material(of: Surface[with: [
 ]])
 ```
 
-**Benefits of Option B:**
-- ✅ Better optimization (knows overrides at theme level)
-- ✅ Consistent theme API
-- ✅ Single function call
-- ✅ Theme controls what can be overridden
+**Use callee-side spread only when:**
+- Function explicitly designed for configuration/theming with well-defined override points
+- You want to provide a convenient override API as part of the function's interface
+
+**Note:** Callee-side spread does NOT restrict what can be overridden - callers can always use caller-side spread on the result:
+```boon
+// Even with callee-side spread support:
+result: [
+    ...Theme/material(of: Surface[with: [color: red]])
+    gloss: 0.9  // Can still override anything!
+]
+```
+
+**Avoid mixing patterns:** If you start with caller-side spread, stick with it. Mixing patterns creates inconsistency and confusion.
 
 ---
 
