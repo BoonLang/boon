@@ -150,6 +150,47 @@ BLOCK {
 
 ---
 
+### BLOCK Contains Only Variable Bindings + Final Expression
+
+**BLOCK syntax is for defining variables, NOT executing statements:**
+
+```boon
+-- ✅ CORRECT: Variables + final expression
+BLOCK {
+    x: 1
+    y: x + 1
+    z: y * 2
+    z  -- Final expression (return value)
+}
+
+-- ✅ CORRECT: Variables with side effects, final return
+BLOCK {
+    logged: message |> Log/error()
+    count: items |> List/count()
+    count  -- Return count
+}
+
+-- ❌ WRONG: Sequential statements
+BLOCK {
+    Log/error(message)
+    THROW { Error[msg] }
+}
+
+-- ✅ CORRECT: Use variable bindings
+BLOCK {
+    logged: message |> Log/error()
+    THROW { Error[msg] }  -- Final expression
+}
+
+-- ✅ CORRECT: Or use THEN for sequencing
+message |> Log/error()
+    |> THEN { THROW { Error[msg] } }
+```
+
+**Key rule:** BLOCK is for **dependency graphs**, not **sequential execution**.
+
+---
+
 ## Pipeline Patterns
 
 ### Pure Pipeline Style
@@ -244,6 +285,142 @@ state |> WHEN {
 ---
 
 ## Error Handling Patterns
+
+### Overview: Two Main Approaches
+
+**Approach 1: THROW/CATCH** (Lightweight, familiar)
+- Explicit error throwing with THROW
+- Error boundaries with CATCH
+- No union types needed
+- Familiar to mainstream developers
+
+**Approach 2: State Accumulator** (Type-safe, compositional)
+- Track state through pipeline with different variable names
+- Transparent error propagation via pattern matching
+- Errors carry full context
+- More functional style
+
+---
+
+### Pattern 0: THROW/CATCH (Recommended for Simplicity)
+
+**Lightweight exception-style error handling without complex type system:**
+
+**Key Semantics:**
+- **THROW** exits the pipeline immediately (like exceptions)
+- Execution **jumps** to nearest CATCH (skipping intermediate steps)
+- **CATCH is mandatory** - compilation error if missing
+- Similar to PASS/PASSED (separate channel for errors)
+
+```boon
+FUNCTION icon_code(item) {
+    item.path
+        |> File/read_text()
+        |> WHEN {
+            Ok[text] => text
+            error => THROW { error }
+        }
+        |> Url/encode()  -- SKIPPED if error was thrown
+        |> WHEN {
+            Ok[encoded] => encoded
+            error => THROW { error }
+        }
+        |> WHEN { encoded =>
+            TEXT { {item.file_stem}: data:image/svg+xml;utf8,{encoded} }
+        }
+        |> CATCH {  -- MANDATORY: Must catch all thrown errors
+            ReadError[message] => TEXT { -- ERROR: Read failed: {message} }
+            EncodeError[message] => TEXT { -- ERROR: Encode failed: {message} }
+        }
+}
+```
+
+**Pattern:** `Ok[value] => value, error => THROW { error }`
+- Unwraps success (`Ok[value]`)
+- Throws everything else (any error tag)
+- Cleaner than matching each error type
+
+**Execution flow when ReadError occurs:**
+1. `File/read_text()` returns `ReadError[message]`
+2. WHEN matches `error => THROW { error }`
+3. **Execution jumps to CATCH** (Url/encode is **skipped**)
+4. CATCH matches `ReadError[message]` → returns TEXT error comment
+5. Pipeline continues with TEXT value (not an Error tag)
+
+**With variable binding for side effects:**
+
+```boon
+|> CATCH {
+    WriteError[msg] => BLOCK {
+        logged: TEXT { FATAL: Cannot write: {msg} } |> Log/error()
+        THROW { WriteError[msg] }  -- Re-throw fatal errors
+    }
+}
+```
+
+**Gradual error handling:**
+
+```boon
+-- Level 0: No CATCH (compilation error if function can THROW)
+item.path
+    |> File/read_text()
+    |> WHEN {
+        Ok[text] => text
+        error => THROW { error }
+    }
+    -- ❌ ERROR: Uncaught THROW - must add CATCH
+
+-- Level 1: Minimal CATCH (catch all errors)
+item.path
+    |> File/read_text()
+    |> WHEN {
+        Ok[text] => text
+        error => THROW { error }
+    }
+    |> Url/encode()
+    |> WHEN {
+        Ok[encoded] => encoded
+        error => THROW { error }
+    }
+    |> CATCH {
+        ReadError[message] => TEXT { -- ERROR: {message} }
+        EncodeError[message] => TEXT { -- ERROR: {message} }
+    }
+
+-- Level 2: Handle some errors without THROW (continue pipeline)
+item.path
+    |> File/read_text()
+    |> WHEN {
+        Ok[text] => text
+        ReadError[message] => BLOCK {
+            logged: TEXT { Warning: {message} } |> Log/warn()
+            TEXT { default content }  -- Fallback, no THROW
+        }
+    }
+    |> Url/encode()  -- Runs even if ReadError (fallback was used)
+    |> WHEN {
+        Ok[encoded] => encoded
+        error => THROW { error }  -- This one still throws
+    }
+    |> CATCH {
+        EncodeError[message] => TEXT { -- ERROR: {message} }
+    }
+```
+
+**Benefits:**
+- ✅ Lightweight - no union types
+- ✅ Explicit - THROW makes error paths visible
+- ✅ Familiar - like try/catch
+- ✅ Gradual - add CATCH incrementally
+- ✅ Composable - CATCH at any level
+
+**When to use:**
+- Build scripts (like BUILD.bn)
+- Simple error recovery
+- When type system simplicity matters
+- When team familiarity is important
+
+---
 
 ### Pattern 1: State Accumulator (Flat, Transparent)
 
@@ -491,6 +668,28 @@ BLOCK {
     x: 1
     y: x + 1
 }
+```
+
+---
+
+### ❌ Using BLOCK for Sequential Statements
+
+```boon
+-- WRONG: BLOCK is not for statements
+BLOCK {
+    Log/error(message)
+    THROW { Error[msg] }
+}
+
+-- CORRECT: Use variable bindings
+BLOCK {
+    logged: message |> Log/error()
+    THROW { Error[msg] }  -- Final expression
+}
+
+-- CORRECT: Or use THEN
+message |> Log/error()
+    |> THEN { THROW { Error[msg] } }
 ```
 
 ---

@@ -21,7 +21,8 @@ generation: svg_files
     |> File/write_text(path: output_file)
     |> THEN {
         count: svg_files |> List/count()
-        TEXT { Included {count} icons } |> Log/info()
+        logged: TEXT { Included {count} icons } |> Log/info()
+        Build/success()
     }
 
 FUNCTION icon_code(item) {
