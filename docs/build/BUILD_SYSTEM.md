@@ -343,16 +343,19 @@ TEXT { ./assets/icon.svg } |> Text/trim_prefix(TEXT { ./ })
 
 ## Error Handling in BUILD.bn
 
-### THROW/CATCH Pattern
+> **See Also:** [`../language/ERROR_HANDLING.md`](../language/ERROR_HANDLING.md) for comprehensive coverage of THROW/CATCH semantics, BLOCK behavior, and general error handling patterns.
 
-BUILD.bn supports explicit error handling using the **THROW/CATCH** pattern, similar to PASS/PASSED.
+This section focuses on error handling **specific to BUILD.bn** - build scripts, file operations, and fail-fast vs accumulate patterns.
 
-#### Core Semantics
+### THROW/CATCH in BUILD.bn
 
-- **THROW** exits the pipeline immediately, jumping to the nearest CATCH
-- **CATCH is mandatory** - compilation error if THROW is not caught
-- Errors flow through a separate channel (like PASS/PASSED)
-- THEN and CATCH are mutually exclusive - only one executes
+BUILD.bn uses the **THROW/CATCH** pattern for build-time error handling.
+
+**Quick Reference (see ERROR_HANDLING.md for details):**
+- **THROW** jumps to nearest CATCH, skipping intermediate steps
+- **CATCH is mandatory** - compilation error if missing
+- **THEN and CATCH** are mutually exclusive - only one executes
+- **Ok tagging** required for type-safe pattern matching
 
 #### Basic Example
 
@@ -482,27 +485,18 @@ generation: svg_files
 
 #### Ok Tagging for Type Safety
 
+> **See ERROR_HANDLING.md** for complete Ok tagging guide.
+
 Wrap success values in `Ok` tag to distinguish from errors:
 
 ```boon
--- Without Ok wrapper (unsafe):
 WHEN {
-    text => text        -- Matches EVERYTHING (including errors!)
-    error => ...        -- Never reached
-}
-
--- With Ok wrapper (safe):
-WHEN {
-    Ok[text] => text    -- Only matches Ok
-    error => THROW { error }  -- Matches all errors
+    Ok[text] => text              -- ✅ Only matches Ok
+    error => THROW { error }       -- ✅ Matches all errors
 }
 ```
 
-**Why Ok tagging:**
-- Prevents accidental matching of error types
-- Makes success case explicit
-- Enables safe pattern matching
-- Works with both try_map (fail-fast) and collect_map (accumulate)
+This prevents bare patterns (`text => text`) from accidentally matching error types.
 
 #### Build Status Functions
 
@@ -1056,8 +1050,9 @@ BUILD.bn provides powerful code generation capabilities for Boon projects.
 ---
 
 **Related Documents:**
+- `../language/ERROR_HANDLING.md` - Complete error handling guide (THROW/CATCH, BLOCK, patterns)
 - `../language/BOON_SYNTAX.md` - Core Boon syntax
 - `../patterns/LINK_PATTERN.md` - Reactive architecture patterns
-- `playground/frontend/src/examples/todo_mvc_physical/BUILD.bn` - Example build script
+- `playground/frontend/src/examples/todo_mvc_physical/BUILD.bn` - Reference build script with error handling
 
-**Last Updated:** 2025-11-12
+**Last Updated:** 2025-11-15
