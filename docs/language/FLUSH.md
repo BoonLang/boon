@@ -868,6 +868,8 @@ FUNCTION icon_code(item) {
 
 ### Alternative 1: THROW/CATCH (Exception-like)
 
+> **Note:** THROW/CATCH was considered during design but not implemented. FLUSH was chosen instead for the reasons outlined below. This comparison is included for historical context and design rationale.
+
 **Code example:**
 ```boon
 result: items

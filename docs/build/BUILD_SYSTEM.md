@@ -343,18 +343,21 @@ TEXT { ./assets/icon.svg } |> Text/trim_prefix(TEXT { ./ })
 
 ## Error Handling in BUILD.bn
 
-> **See Also:** [`../language/ERROR_HANDLING.md`](../language/ERROR_HANDLING.md) for comprehensive coverage of THROW/CATCH semantics, BLOCK behavior, and general error handling patterns.
+> **See Also:**
+> - [`../language/FLUSH.md`](../language/FLUSH.md) for comprehensive FLUSH pattern specification
+> - [`../language/ERROR_HANDLING.md`](../language/ERROR_HANDLING.md) for BLOCK behavior and general error handling patterns
 
 This section focuses on error handling **specific to BUILD.bn** - build scripts, file operations, and fail-fast vs accumulate patterns.
 
-### THROW/CATCH in BUILD.bn
+### FLUSH in BUILD.bn
 
-BUILD.bn uses the **THROW/CATCH** pattern for build-time error handling.
+BUILD.bn uses the **FLUSH** pattern for build-time error handling.
 
-**Quick Reference (see ERROR_HANDLING.md for details):**
-- **THROW** jumps to nearest CATCH, skipping intermediate steps
-- **CATCH is mandatory** - compilation error if missing
-- **THEN and CATCH** are mutually exclusive - only one executes
+**Quick Reference (see FLUSH.md for details):**
+- **FLUSH** exits expression and creates hidden `FLUSHED[value]` wrapper
+- **FLUSHED[value]** propagates transparently through pipeline (bypasses functions)
+- **Unwraps at boundaries** - variable bindings, function returns
+- **No CATCH needed** - errors handled at variable level
 - **Ok tagging** required for type-safe pattern matching
 
 #### Basic Example
@@ -365,12 +368,12 @@ FUNCTION icon_code(item) {
         |> File/read_text()
         |> WHEN {
             Ok[text] => text
-            error => THROW { error }  -- Jumps to CATCH
+            error => FLUSH { error }  -- Exits expression, creates FLUSHED[error]
         }
-        |> Url/encode()  -- SKIPPED if error was thrown
+        |> Url/encode()  -- SKIPPED if error was FLUSHed (bypassed)
         |> WHEN {
             Ok[encoded] => encoded
-            error => THROW { error }
+            error => FLUSH { error }
         }
         |> WHEN { encoded =>
             Ok[text: TEXT { {item.file_stem}: data:image/svg+xml;utf8,{encoded} }]
@@ -378,109 +381,95 @@ FUNCTION icon_code(item) {
 }
 ```
 
-**Note:** `icon_code` has no CATCH, so thrown errors become the return value: `Ok[text: TEXT] | ReadError | EncodeError`
+**Note:** FLUSHed errors unwrap at function boundary, so return type is: `Ok[text: TEXT] | ReadError | EncodeError`
 
-#### Fail-Fast Pattern with List/try_map
+#### Fail-Fast Pattern with List/map
 
-Process list items, stopping on first error:
+Process list items, stopping on first error using **two-binding pattern**:
 
 ```boon
-generation: svg_files
-    |> List/try_map(old, new:
+generation_result: svg_files
+    |> List/map(old, new:
         old |> icon_code() |> WHEN {
-            Ok[text] => text        -- Extract success value
-            error => THROW { error } -- Stop on first error
+            Ok[text] => text             -- Extract success value
+            error => FLUSH { error }      -- Stop on first error (fail-fast)
         }
     )
-    -- Returns: List[TEXT] if all succeed, or first error
-    |> Text/join_lines()
+    -- List/map sees FLUSHED[error], stops processing, returns FLUSHED[error]
+    |> Text/join_lines()  -- Bypassed if FLUSHED[error]
     |> WHEN { code => TEXT {
         -- Generated from {icons_directory}
-        icon: [
-            {code}
-        ]
+        icon: [ {code} ]
     } }
-    |> File/write_text(path: output_file)
-    |> WHEN {
-        Ok => []
-        error => THROW { error }
-    }
-    |> THEN { BLOCK {
+    |> File/write_text(path: output_file)  -- Bypassed if FLUSHED[error]
+    -- Boundary: generation_result = Ok | ReadError | EncodeError | WriteError
+
+-- Error handling at variable level (no CATCH needed)
+generation_error_handling: generation_result |> WHEN {
+    Ok => BLOCK {
         count: svg_files |> List/count()
         logged: TEXT { Included {count} icons } |> Log/info()
         Build/succeed()
-    } }
-    |> CATCH {
-        ReadError[message] => BLOCK {
-            logged: TEXT { Cannot read icon: {message} } |> Log/error()
-            Build/fail()
-        }
-        EncodeError[message] => BLOCK {
-            logged: TEXT { Cannot encode icon: {message} } |> Log/error()
-            Build/fail()
-        }
-        WriteError[message] => BLOCK {
-            logged: TEXT { Cannot write {output_file}: {message} } |> Log/error()
-            Build/fail()
-        }
     }
+    error => BLOCK {
+        error_message: error |> WHEN {
+            ReadError[message] => TEXT { Cannot read icon: {message} }
+            EncodeError[message] => TEXT { Cannot encode icon: {message} }
+            WriteError[message] => TEXT { Cannot write {output_file}: {message} }
+        }
+        logged: error_message |> Log/error()
+        Build/fail()
+    }
+}
 ```
 
 **Key Points:**
-- `List/try_map` provides fail-fast behavior
-- Mapper explicitly handles `Ok[value] => value, error => THROW { error }`
-- THEN runs only on success (no THROW occurred)
-- CATCH runs only on error (THROW occurred)
-- Both return build status via `Build/succeed()` or `Build/fail()`
+- `List/map` with FLUSH provides fail-fast (no special `try_map` needed)
+- FLUSH creates `FLUSHED[error]` that stops `List/map` processing
+- `FLUSHED[error]` bypasses remaining pipeline steps transparently
+- Error handling happens at variable level (`generation_error_handling`)
+- Two-binding pattern: `generation_result` → `generation_error_handling`
 
-#### Accumulate Errors Pattern with List/collect_map
+#### Accumulate Errors Pattern with List/map
 
-Process all items, collecting all errors:
+Process all items, collecting all errors (no FLUSH = accumulate):
 
 ```boon
-generation: svg_files
-    |> List/collect_map(old, new:
-        old |> icon_code() |> WHEN {
-            Ok[text] => Ok[item: text]  -- Keep wrapped
-            error => error               -- Accumulate
-        }
+generation_result: svg_files
+    |> List/map(old, new:
+        old |> icon_code()  -- Returns: Ok[text: TEXT] | ReadError | EncodeError
+        -- No FLUSH = accumulates all results (success and errors)
     )
-    -- Returns: Ok[icons: List[TEXT]] | Errors[errors: List[Error]]
+    -- Returns: [Ok[text: TEXT] | ReadError | EncodeError, ...]
+    |> separate_errors()  -- Helper: splits successes from errors
     |> WHEN {
-        Ok[icons] => icons
-        Errors[errors] => THROW { IconErrors[errors: errors] }
+        Ok[icons] => icons |> process_successfully()
+        Errors[errors] => errors  -- All errors collected
     }
-    |> Text/join_lines()
-    |> File/write_text(path: output_file)
-    |> WHEN {
-        Ok => []
-        error => THROW { error }
-    }
-    |> THEN { BLOCK {
+
+-- Error handling
+generation_error_handling: generation_result |> WHEN {
+    Ok => BLOCK {
         logged: TEXT { Build succeeded } |> Log/info()
         Build/succeed()
-    } }
-    |> CATCH {
-        IconErrors[errors] => BLOCK {
-            count: errors |> List/count()
-            logged_all: errors |> List/each(e => e |> WHEN {
-                ReadError[message] => TEXT { Cannot read: {message} } |> Log/error()
-                EncodeError[message] => TEXT { Cannot encode: {message} } |> Log/error()
-            })
-            logged_summary: TEXT { Build failed: {count} icon errors } |> Log/error()
-            Build/fail()
-        }
-        WriteError[message] => BLOCK {
-            logged: TEXT { Cannot write {output_file}: {message} } |> Log/error()
-            Build/fail()
-        }
     }
+    Errors[errors] => BLOCK {
+        count: errors |> List/count()
+        logged_all: errors |> List/each(error => error |> WHEN {
+            ReadError[message] => TEXT { Cannot read: {message} } |> Log/error()
+            EncodeError[message] => TEXT { Cannot encode: {message} } |> Log/error()
+        })
+        logged_summary: TEXT { Build failed: {count} icon errors } |> Log/error()
+        Build/fail()
+    }
+}
 ```
 
 **Key Points:**
-- `List/collect_map` processes all items (doesn't stop on first error)
-- Success values stay wrapped: `Ok[item: text]`
-- Returns all errors together for comprehensive reporting
+- `List/map` without FLUSH accumulates all results (both success and errors)
+- Returns mixed list: `[Ok[T] | Error, Ok[T] | Error, ...]`
+- Use helper function to separate successes from errors
+- All errors available for comprehensive reporting
 - Logs each individual error plus summary
 
 #### Ok Tagging for Type Safety
@@ -491,8 +480,8 @@ Wrap success values in `Ok` tag to distinguish from errors:
 
 ```boon
 WHEN {
-    Ok[text] => text              -- ✅ Only matches Ok
-    error => THROW { error }       -- ✅ Matches all errors
+    Ok[text] => text           -- ✅ Only matches Ok
+    error => FLUSH { error }   -- ✅ Matches all errors
 }
 ```
 
@@ -515,17 +504,17 @@ These functions:
 ### Error Handling Best Practices
 
 ✅ **Do:**
-- Use `List/try_map` for fail-fast (stop on first error)
-- Use `List/collect_map` for comprehensive reporting (all errors)
+- Use `List/map` with FLUSH for fail-fast (stop on first error)
+- Use `List/map` without FLUSH for comprehensive reporting (accumulate errors)
 - Wrap success values in `Ok[item: value]` for type safety
-- Log errors in CATCH blocks before calling `Build/fail()`
+- Handle errors at variable level (two-binding pattern)
 - Use BLOCK with variable bindings for side effects
+- Log errors before calling `Build/fail()`
 
 ❌ **Don't:**
 - Swallow errors by logging and discarding them
 - Use bare pattern matching (`text =>`) that matches everything
-- Mix THROW/CATCH with silent error propagation
-- Forget CATCH - compilation error!
+- Forget to handle errors in the second binding
 
 ---
 
@@ -1050,7 +1039,8 @@ BUILD.bn provides powerful code generation capabilities for Boon projects.
 ---
 
 **Related Documents:**
-- `../language/ERROR_HANDLING.md` - Complete error handling guide (THROW/CATCH, BLOCK, patterns)
+- `../language/FLUSH.md` - FLUSH pattern specification (fail-fast error handling)
+- `../language/ERROR_HANDLING.md` - General error handling guide (BLOCK, WHEN, patterns)
 - `../language/BOON_SYNTAX.md` - Core Boon syntax
 - `../patterns/LINK_PATTERN.md` - Reactive architecture patterns
 - `playground/frontend/src/examples/todo_mvc_physical/BUILD.bn` - Reference build script with error handling

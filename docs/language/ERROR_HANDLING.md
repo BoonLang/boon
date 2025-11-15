@@ -9,7 +9,7 @@
 ## Table of Contents
 
 1. [Introduction](#introduction)
-2. [THROW/CATCH Pattern](#throwcatch-pattern)
+2. [FLUSH Pattern](#flush-pattern)
 3. [BLOCK Fundamentals](#block-fundamentals)
 4. [Pipeline Patterns](#pipeline-patterns)
 5. [WHEN vs THEN](#when-vs-then)
@@ -23,22 +23,24 @@
 
 ## Introduction
 
-Boon provides multiple approaches to error handling, from explicit THROW/CATCH to transparent error propagation through tagged unions. This guide covers the patterns, semantics, and best practices.
+Boon provides multiple approaches to error handling, from FLUSH pattern for fail-fast to transparent error propagation through tagged unions. This guide covers the patterns, semantics, and best practices.
 
-**Key Principle:** Errors are values, not exceptions (though THROW/CATCH provides exception-like ergonomics).
+**Key Principle:** Errors are values, not exceptions. FLUSH provides fail-fast ergonomics while maintaining transparent value propagation.
+
+> **See Also:** [`FLUSH.md`](FLUSH.md) for comprehensive FLUSH specification including hardware implementation, parallel processing, and streaming semantics.
 
 ---
 
-## THROW/CATCH Pattern
+## FLUSH Pattern
 
 ### Core Semantics
 
-**THROW/CATCH** provides exception-style error handling similar to PASS/PASSED:
+**FLUSH** provides fail-fast error handling with transparent propagation:
 
-- **THROW** exits the pipeline immediately, jumping to the nearest CATCH
-- Execution **skips intermediate steps** until CATCH is reached
-- **CATCH is mandatory** - compilation error if THROW is not caught
-- Errors flow through a separate channel (like PASS/PASSED)
+- **FLUSH** exits the current expression and creates hidden `FLUSHED[value]` wrapper
+- **FLUSHED[value]** propagates transparently (bypasses functions automatically)
+- **Unwraps at boundaries** - variable bindings, function returns
+- **No CATCH needed** - errors handled where variable is used
 
 ### Basic Example
 
@@ -48,70 +50,79 @@ FUNCTION process(item) {
         |> operation()
         |> WHEN {
             Ok[result] => result
-            error => THROW { error }
+            error => FLUSH { error }  -- Exits expression
         }
-        |> next_operation()  -- SKIPPED if error was thrown
+        |> next_operation()  -- SKIPPED (bypassed) if error was FLUSHed
         |> WHEN {
             Ok[value] => value
-            error => THROW { error }
+            error => FLUSH { error }
         }
         |> WHEN { value =>
             Ok[processed: transform(value)]
         }
 }
 -- Returns: Ok[processed: T] | Error
--- No CATCH - errors propagate to caller
+-- FLUSHED[error] unwraps at function boundary
 ```
 
-**Key Point:** Functions without CATCH return union types where thrown errors become part of the return type.
+**Key Point:** FLUSHed errors unwrap at boundaries, becoming part of the return type.
 
-### THROW Without CATCH
+### FLUSH for Early Exit
 
 ```boon
 FUNCTION risky_operation(x) {
     x |> validate() |> WHEN {
-        Invalid[reason] => THROW { ValidationError[reason: reason] }
+        Invalid[reason] => FLUSH { ValidationError[reason: reason] }
         Valid[value] => process(value)
     }
 }
--- Returns: T | ValidationError
--- Caller must handle the error
+-- Returns: T | ValidationError (after unwrapping)
+-- Caller handles the error
 ```
 
-### CATCH Handling
+### Error Handling at Variable Level
+
+Instead of CATCH blocks, handle errors where the variable is used:
 
 ```boon
-value
-    |> risky_operation()
-    |> CATCH {
-        ValidationError[reason] => BLOCK {
-            logged: TEXT { Validation failed: {reason} } |> Log/error()
-            default_value()
+result: items
+    |> process()  -- May return FLUSHED[error] internally
+
+-- Handle at variable level
+result |> WHEN {
+    Ok[value] => use_value(value)
+    ValidationError[reason] => BLOCK {
+        logged: TEXT { Validation failed: {reason} } |> Log/error()
+        default_value()
+    }
+}
+```
+
+### Two-Binding Pattern
+
+**Separate pipeline from error handling:**
+
+```boon
+generation_result: svg_files
+    |> List/map(item =>
+        item |> process() |> WHEN {
+            Ok[value] => value
+            error => FLUSH { error }  -- Stops List/map
         }
-    }
--- Returns: T (error handled, returns default)
+    )
+    |> transform()  -- Bypassed if FLUSHed
+
+-- Error handling in second binding
+generation_error_handling: generation_result |> WHEN {
+    Ok => handle_success()
+    error => handle_error(error)
+}
 ```
 
-### THEN/CATCH Mutual Exclusion
-
-**THEN and CATCH are mutually exclusive** - only one executes:
-
-```boon
-pipeline
-    |> operation()
-    |> THEN {
-        -- Only runs if no THROW occurred
-        success_handling()
-    }
-    |> CATCH {
-        -- Only runs if THROW occurred
-        error => error_handling(error)
-    }
-```
-
-**Execution paths:**
-- **Success**: operation → THEN → return value from THEN
-- **Error**: operation → THROW → CATCH → return value from CATCH
+**Benefits:**
+- Clear separation: pipeline vs error handling
+- No CATCH blocks needed
+- Error handling happens at natural boundary
 
 ### Ok Tagging Requirement
 
@@ -121,13 +132,13 @@ To distinguish success from errors in pattern matching, wrap success values in `
 -- ❌ WRONG: Bare pattern matches everything
 |> WHEN {
     value => value        -- Matches BOTH success AND errors!
-    error => THROW { ... } -- Never reached
+    error => FLUSH { ... } -- Never reached
 }
 
 -- ✅ CORRECT: Ok tagging
 |> WHEN {
-    Ok[value] => value    -- Only matches Ok
-    error => THROW { error }  -- Matches all error types
+    Ok[value] => value      -- Only matches Ok
+    error => FLUSH { error }  -- Matches all error types
 }
 ```
 
@@ -189,13 +200,13 @@ BLOCK {
 -- ❌ WRONG: Sequential statements
 BLOCK {
     Log/error(message)  -- ERROR: Not a variable binding
-    THROW { error }
+    FLUSH { error }
 }
 
 -- ✅ CORRECT: Bind side effects to variables
 BLOCK {
     logged: message |> Log/error()
-    THROW { error }  -- Final expression
+    FLUSH { error }  -- Final expression
 }
 ```
 
@@ -239,24 +250,23 @@ item
     |> operation3()  -- V -> W
 ```
 
-**With THROW/CATCH:**
+**With FLUSH:**
 
 ```boon
-item
+result: item
     |> operation1()
     |> WHEN {
         Ok[result] => result
-        error => THROW { error }
+        error => FLUSH { error }
     }
-    |> operation2()  -- SKIPPED if thrown
-    |> WHEN {
-        Ok[result] => result
-        error => THROW { error }
-    }
-    |> CATCH {
-        Error1[msg] => handle_error1(msg)
-        Error2[msg] => handle_error2(msg)
-    }
+    |> operation2()  -- SKIPPED (bypassed) if FLUSHed
+
+-- Handle at variable level
+result |> WHEN {
+    Ok[value] => use_value(value)
+    Error1[msg] => handle_error1(msg)
+    Error2[msg] => handle_error2(msg)
+}
 ```
 
 ---
@@ -327,7 +337,7 @@ FUNCTION process(item) {
         |> operation()
         |> WHEN {
             Ok[text] => text  -- ✅ Only matches Ok
-            error => THROW { error }  -- ✅ Matches all errors
+            error => FLUSH { error }  -- ✅ Matches all errors
         }
         |> WHEN { text =>
             Ok[result: transform(text)]  -- ✅ Wrap success
@@ -348,7 +358,7 @@ FUNCTION process(item) {
 
 ## Alternative Error Patterns
 
-Beyond THROW/CATCH, Boon supports several error handling approaches.
+Beyond FLUSH, Boon supports several error handling approaches.
 
 ### Pattern 1: State Accumulator
 
@@ -529,13 +539,13 @@ BLOCK {
 -- WRONG:
 BLOCK {
     Log/error(message)
-    THROW { error }
+    FLUSH { error }
 }
 
 -- CORRECT:
 BLOCK {
     logged: message |> Log/error()
-    THROW { error }
+    FLUSH { error }
 }
 ```
 
@@ -551,7 +561,7 @@ WHEN {
 -- CORRECT:
 WHEN {
     Ok[value] => value
-    error => THROW { error }
+    error => FLUSH { error }
 }
 ```
 
@@ -565,28 +575,30 @@ WHEN {
 |> THEN { log(TEXT { done }) }
 ```
 
-### ❌ Forgetting CATCH
+### ❌ Not Handling Errors at Boundary
 
 ```boon
--- WRONG (compilation error):
-item
+-- INCOMPLETE: Error not handled
+result: item
     |> operation()
     |> WHEN {
         Ok[x] => x
-        error => THROW { error }
+        error => FLUSH { error }
     }
--- ERROR: Uncaught THROW
+-- result = T | Error, but never handled!
 
--- CORRECT:
-item
+-- CORRECT: Handle at variable level
+result: item
     |> operation()
     |> WHEN {
         Ok[x] => x
-        error => THROW { error }
+        error => FLUSH { error }
     }
-    |> CATCH {
-        error => handle(error)
-    }
+
+result |> WHEN {
+    Ok[value] => use_value(value)
+    error => handle_error(error)
+}
 ```
 
 ---
@@ -611,15 +623,17 @@ FUNCTION process(x) {
 
 ### 2. Choose the Right Pattern
 
-**Use THROW/CATCH when:**
-- You want familiar exception-like semantics
+**Use FLUSH when:**
 - Fail-fast behavior is desired
-- Team familiarity matters
+- Working with collections (List/map stops on first error)
+- Want to skip remaining pipeline steps on error
+- Hardware/FPGA implementation matters
 
 **Use State Accumulator when:**
 - You need transparent error propagation
 - Rich error context is important
 - Multiple error types per stage
+- Want to accumulate all errors (no FLUSH)
 
 **Use Helper Functions when:**
 - Pipeline has many stages
@@ -685,12 +699,12 @@ Error[msg: TEXT { ... }]
 
 **Key Principles:**
 
-1. **THROW/CATCH** - Exception-like error handling, CATCH mandatory
+1. **FLUSH** - Fail-fast error handling with transparent propagation
 2. **Ok Tagging** - Essential for type-safe pattern matching
 3. **BLOCK** - Dependency graph, not sequential statements
 4. **THEN vs WHEN** - THEN ignores value, WHEN binds it
 5. **Tagged Objects** - Use adhoc tags with named properties
-6. **Multiple Patterns** - Choose based on needs (THROW/CATCH, State Accumulator, Helper Functions)
+6. **Multiple Patterns** - Choose based on needs (FLUSH, State Accumulator, Helper Functions)
 
 **Common Pattern:**
 
@@ -700,18 +714,20 @@ FUNCTION process(item) {
         |> operation()
         |> WHEN {
             Ok[result] => result
-            error => THROW { error }
+            error => FLUSH { error }
         }
         |> WHEN { result =>
             Ok[value: transform(result)]
         }
 }
 
--- Caller:
-items
-    |> List/map(item => process(item))
-    |> THEN { results => handle_success(results) }
-    |> CATCH { error => handle_error(error) }
+-- Caller with two-binding pattern:
+result: items |> List/map(item => process(item))
+
+result |> WHEN {
+    Ok[values] => handle_success(values)
+    error => handle_error(error)
+}
 ```
 
 ---
