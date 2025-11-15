@@ -253,6 +253,45 @@ Element/button(
 )
 ```
 
+### 5. Per-Component Overrides
+
+Elements can override theme values using the spread operator:
+
+```boon
+Element/button(
+    style: [
+        -- Use theme material as base
+        ...PASSED.theme.materials.button
+
+        -- Override specific property
+        gloss: 0.5
+    ]
+)
+```
+
+This pattern is used throughout `RUN.bn` to create specialized button materials:
+
+```boon
+FUNCTION delete_button_material(hovered) {
+    [
+        ...Theme/material(of: SurfaceElevated)
+        glow: hovered |> WHEN {
+            True => [
+                color: Theme/material(of: Danger).color
+                intensity: 0.08
+            ]
+            False => None
+        }
+    ]
+}
+```
+
+**Benefits:**
+- ✅ Maintains theme consistency (inherits base properties)
+- ✅ Allows contextual customization
+- ✅ Type-safe field overrides
+- ✅ Optimized by compiler (monomorphization)
+
 ## Benefits
 
 ### Developer Experience
@@ -312,31 +351,17 @@ active_theme: LATEST {
 
 ### 2. Theme Composition
 ```boon
--- Merge multiple themes
+-- Compose multiple themes using spread operator
 FUNCTION CustomTheme(mode) {
-    base: Professional(mode: mode)
-
-    base |> merge([
-        colors: CustomColors(mode: mode)
-        interaction: SmoothInteraction
-    ])
+    [
+        ...Professional(mode: mode)
+        colors: CustomColors(mode: mode)   -- Override colors
+        interaction: SmoothInteraction      -- Override interaction
+    ]
 }
 ```
 
-### 3. Per-Component Overrides
-```boon
-Element/button(
-    style: [
-        -- Use theme defaults
-        ...PASSED.theme.materials.button
-
-        -- Override specific property
-        gloss: 0.5
-    ]
-)
-```
-
-### 4. Responsive Themes
+### 3. Responsive Themes
 ```boon
 -- Different themes for different screen sizes
 theme: viewport.width |> WHEN {
@@ -346,7 +371,7 @@ theme: viewport.width |> WHEN {
 }
 ```
 
-### 5. Animation Curves
+### 4. Animation Curves
 ```boon
 animation: [
     spring_stiffness: 200
@@ -355,7 +380,7 @@ animation: [
 ]
 ```
 
-### 6. Typography Scale
+### 5. Typography Scale
 ```boon
 typography: [
     heading: [size: 24, weight: Bold, line_height: 1.2]

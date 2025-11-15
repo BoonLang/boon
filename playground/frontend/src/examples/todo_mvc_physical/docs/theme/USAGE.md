@@ -302,9 +302,121 @@ backgSoft: [color: THEME.colors.success]
 6. **📏 Guaranteed consistency** - Impossible to have mismatched values
 7. **🚀 Composable** - Mix theme values with custom overrides
 
+## Overriding Theme Values with Spread Operator
+
+You can extend or modify theme materials using the spread operator (`...`):
+
+### Basic Override Pattern
+
+```boon
+FUNCTION delete_button_material(hovered) {
+    [
+        ...Theme/material(of: SurfaceElevated)  -- Get base material
+        glow: hovered |> WHEN {                  -- Add conditional glow
+            True => [
+                color: Theme/material(of: Danger).color
+                intensity: 0.08
+            ]
+            False => None
+        }
+    ]
+}
+```
+
+This pattern allows you to:
+- ✅ **Build on existing theme materials** - Inherit base properties automatically
+- ✅ **Override specific properties** - Change only what you need
+- ✅ **Add new properties** - Extend with additional fields
+- ✅ **Maintain theme consistency** - Base values stay synchronized
+
+### Multiple Conditional Overrides
+
+```boon
+FUNCTION filter_button_material(selected, hovered) {
+    [
+        ...selected |> WHEN {
+            True => Theme/material(of: PrimarySubtle)
+            False => Theme/material(of: SurfaceVariant)
+        }
+        gloss: selected |> WHEN {
+            False => 0.35
+            True => 0.2
+        }
+        metal: 0.03
+        glow: LIST { selected, hovered } |> WHEN {
+            LIST { True, __ } => [
+                color: Theme/material(of: Primary).color
+                intensity: 0.05
+            ]
+            LIST { False, True } => [
+                color: Theme/material(of: Primary).color
+                intensity: 0.025
+            ]
+            LIST { False, False } => None
+        }
+    ]
+}
+```
+
+### Font Overrides
+
+```boon
+FUNCTION clear_button_font(hovered) {
+    [
+        ...Theme/font(of: BodySecondary)
+        line: [underline: hovered]
+    ]
+}
+
+FUNCTION todo_title_font(completed) {
+    [
+        ...Theme/font(of: Body)
+        line: [strike: completed]
+        ...completed |> WHEN {
+            True => [color: Theme/font(of: BodyDisabled).color]
+            False => []
+        }
+    ]
+}
+```
+
+### Why Use Spread Operator?
+
+**Without spread (manual duplication):**
+```boon
+-- ❌ Must manually copy all fields
+FUNCTION custom_material() {
+    [
+        color: Oklch[lightness: 0.99]  -- Copied from SurfaceElevated
+        gloss: 0.4                      -- Copied from SurfaceElevated
+        metal: 0.02                     -- Copied from SurfaceElevated
+        glow: custom_glow               -- Only this is different!
+    ]
+}
+```
+
+**With spread (DRY and maintainable):**
+```boon
+-- ✅ Inherit base, override only what changes
+FUNCTION custom_material() {
+    [
+        ...Theme/material(of: SurfaceElevated)
+        glow: custom_glow
+    ]
+}
+```
+
+**Benefits:**
+1. **DRY** - Don't repeat yourself
+2. **Maintainable** - Theme updates propagate automatically
+3. **Type-safe** - Compiler checks field compatibility
+4. **Optimized** - Monomorphization eliminates overhead
+
+See actual usage in `RUN.bn` for complete examples.
+
 ## Advanced: Custom Theme Properties
 
-Themes can include custom properties beyond the Element set:
+Themes can include custom properties beyond the standard set:
 
 ```boon
 FUNCTION MyCustomTheme(mode) {

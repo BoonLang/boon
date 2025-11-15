@@ -705,6 +705,130 @@ Text.bn            → Text/trim(), Text/empty()
 
 ---
 
+## 11. Record Composition with Spread Operator
+
+**The spread operator (`...`) allows merging record fields within record literals.**
+
+This enables composing records by spreading one record into another, following a "defaults first, overrides last" pattern.
+
+### Basic Usage
+
+✅ **Correct - Spreading a record:**
+```boon
+base: [
+    color: red
+    gloss: 0.4
+]
+
+result: [
+    ...base        -- Spreads all fields from base
+    metal: 0.03    -- Add new field
+]
+-- Result: [color: red, gloss: 0.4, metal: 0.03]
+```
+
+### Override Pattern (Defaults First, Overrides Last)
+
+✅ **Correct - Defaults with overrides:**
+```boon
+FUNCTION create_material(user_overrides) {
+    [
+        color: default_color
+        gloss: 0.25
+        metal: 0.02
+        ...user_overrides  -- Overrides any matching fields
+    ]
+}
+```
+
+This is the **preferred pattern** - define defaults first, then spread overrides.
+
+### Extracting Base Records in BLOCK
+
+When you need to share common fields between variants, extract them in BLOCK scope:
+
+✅ **Correct - Using BLOCK to avoid recursion:**
+```boon
+FUNCTION font(of) {
+    BLOCK {
+        body_base: [
+            size: 24
+            color: colors.text
+        ]
+
+        small_base: [
+            size: 10
+            color: colors.text_tertiary
+        ]
+
+        of |> WHEN {
+            Body => body_base
+
+            BodyDisabled => [
+                ...body_base
+                color: colors.text_disabled
+            ]
+
+            Input => [...body_base]
+
+            Small => small_base
+
+            SmallLink[hovered] => [
+                ...small_base
+                line: [underline: hovered]
+            ]
+        }
+    }
+}
+```
+
+**Why BLOCK?** Direct recursion is not allowed in Boon. You cannot call `font(of: Body)` from within the `font()` function body. Instead, extract shared records as BLOCK-scoped variables.
+
+### Caller-Side Spread (Recommended)
+
+✅ **Correct - Caller composes records:**
+```boon
+delete_button_material: [
+    ...Theme/material(of: SurfaceElevated)
+    glow: hovered |> WHEN {
+        True => [color: danger_color, intensity: 0.08]
+        False => None
+    }
+]
+```
+
+This pattern gives the caller full control over composition without forcing functions to support override parameters.
+
+### Key Rules
+
+1. **Spread only in record literals** - `...expr` only works inside `[...]`
+2. **Last wins** - Later field definitions override earlier ones (left-to-right)
+3. **UNPLUGGED handling** - Spreading UNPLUGGED is treated as empty record `[]`
+4. **No duplicate explicit fields** - Cannot define the same field twice explicitly
+5. **Spread anywhere** - Can place `...` before, after, or between field definitions
+
+❌ **INCORRECT - Duplicate field definition:**
+```boon
+[
+    color: red
+    color: blue  -- Error: Field 'color' defined multiple times
+]
+```
+
+✅ **Correct - Spread can override:**
+```boon
+[
+    color: red
+    ...overrides  -- OK even if overrides.color exists
+]
+```
+
+### Complete Specification
+
+For the complete spread operator specification including type system, optimization guarantees, and advanced patterns, see `/docs/language/SPREAD_OPERATOR.md`.
+
+---
+
 ## 7. Correct Examples Based on These Rules
 
 ### Example 1: Unified Theme Router
