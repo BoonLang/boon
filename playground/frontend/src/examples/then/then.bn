@@ -17,7 +17,7 @@ FUNCTION sum_of_steps(step, seconds) {
 addition_button: Element/button(
     element: [event: [press: LINK]]
     style: []
-    label: 'A + B'
+    label: TEXT { A + B }
 )
 
 document: Document/new(root: Element/stripe(
@@ -25,8 +25,8 @@ document: Document/new(root: Element/stripe(
     direction: Column
     style: []
     items: LIST {
-        input_a |> input_row(name: 'A')
-        input_b |> input_row(name: 'B')
+        input_a |> input_row(name: TEXT { A })
+        input_b |> input_row(name: TEXT { B })
         addition_button
         Element/container(
             element: []
@@ -40,6 +40,6 @@ FUNCTION input_row(input, name) {
     Element/container(
         element: []
         style: [align: [row: Center]]
-        child: '{name}: {input}'
+        child: TEXT { {name}: {input} }
     )
 }

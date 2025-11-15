@@ -18,5 +18,5 @@ counter:
 increment_button: Element/button(
     element: [event: [press: LINK]]
     style: []
-    label: '+'
+    label: TEXT { + }
 )

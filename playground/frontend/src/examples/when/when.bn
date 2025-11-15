@@ -20,16 +20,16 @@ FUNCTION sum_of_steps(step, seconds) {
     |> Math/sum()
 }
 
-subtraction_button: 'A - B' |> operation_button()
-addition_button: 'A + B' |> operation_button()
+subtraction_button: TEXT { A - B } |> operation_button()
+addition_button: TEXT { A + B } |> operation_button()
 
 document: Document/new(root: Element/stripe(
     element: []
     direction: Column
     style: []
     items: LIST {
-        input_a |> input_row(name: 'A')
-        input_b |> input_row(name: 'B')
+        input_a |> input_row(name: TEXT { A })
+        input_b |> input_row(name: TEXT { B })
         addition_button
         subtraction_button
         Element/container(
@@ -44,7 +44,7 @@ FUNCTION input_row(input, name) {
     Element/container(
         element: []
         style: [align: [row: Center]]
-        child: '{name}: {input}'
+        child: TEXT { {name}: {input} }
     )
 }
 

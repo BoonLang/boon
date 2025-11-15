@@ -5,9 +5,9 @@
 ------------------------------------------------------------------------
 
 filter_routes: [
-    all: '/'
-    active: '/active'
-    completed: '/completed'
+    all: TEXT { / }
+    active: TEXT { /active }
+    completed: TEXT { /completed }
 ]
 
 ------------------------------------------------------------------------
@@ -41,8 +41,7 @@ store: [
         Enter => BLOCK {
             new_todo_title: elements.new_todo_title_text_input.text |> Text/trim()
             new_todo_title
-                |> Text/empty()
-                |> Bool/not()
+                |> Text/is_not_empty()
                 |> WHEN { True => new_todo_title, False => SKIP }
         }
         __ => SKIP
@@ -108,15 +107,15 @@ FUNCTION new_todo(title) {
             |> Bool/toggle(when: todo_elements.todo_checkbox.event.click)
         edited_title: BLOCK {
             edited_title: LATEST {
-                ''
+                Text/empty
                 todo_elements.editing_todo_title_element.event.change.text
-                title_to_update |> THEN { '' }
+                title_to_update |> THEN { Text/empty }
             }
             LATEST {
                 edited_title
                 todo_elements.todo_title_element.event.double_click |> THEN {
                     edited_title
-                        |> Text/empty()
+                        |> Text/is_empty()
                         |> WHEN { True => title, False => SKIP }
                 }
             }
@@ -324,7 +323,7 @@ FUNCTION header() {
         child: Element/text(
             element: [tag: H1]
             style: Theme/text(of: Hero)
-            text: 'todos'
+            text: TEXT { todos }
         )
     )
 }
@@ -387,15 +386,15 @@ FUNCTION new_todo_title_text_input() {
             rounded_corners: Theme/corners(of: Touch)
             material: Theme/material(of: InteractiveRecessed[focus: element.focused])
         ]
-        label: Hidden[text: 'What needs to be done?']
+        label: Hidden[text: TEXT { What needs to be done? }]
         text: LATEST {
-            ''
+            Text/empty
             element.event.change.text
-            PASSED.store.title_to_save |> THEN { '' }
+            PASSED.store.title_to_save |> THEN { Text/empty }
         }
         placeholder: [
             style: [font: Theme/font(of: Placeholder)]
-            text: 'What needs to be done?'
+            text: TEXT { What needs to be done? }
         ]
         focus: True
     )
@@ -497,7 +496,7 @@ FUNCTION toggle_all_checkbox() {
                 spring_range: Theme/spring_range(of: Checkbox)
                 material: Theme/material(of: Interactive[hovered: element.hovered])
             ]
-            label: Hidden[text: 'Toggle all']
+            label: Hidden[text: TEXT { Toggle all }]
             checked: checked
             icon: Element/block(
                 style: [
@@ -508,7 +507,7 @@ FUNCTION toggle_all_checkbox() {
                 ]
                 child: Element/text(
                     style: Theme/text(of: ButtonIcon[checked: checked])
-                    text: '>'
+                    text: TEXT { > }
                 )
             )
         )
@@ -538,7 +537,7 @@ FUNCTION editing_todo_title_element(todo) {
             move: [closer: Theme/elevation(of: EditingFocus)]
             material: Theme/material(of: InteractiveRecessed[focus: True])
         ]
-        label: Hidden[text: 'selected todo title']
+        label: Hidden[text: TEXT { selected todo title }]
         text: todo.edited_title
         placeholder: []
         focus: True
@@ -618,7 +617,7 @@ FUNCTION remove_todo_button() {
         ]
         label: Element/text(
             style: delete_button_text()
-            text: '×'
+            text: TEXT { × }
         )
     )
 }
@@ -664,8 +663,8 @@ FUNCTION active_items_count_text() {
             |> List/retain(item, if: item.completed |> Bool/not())
             |> List/count
             |> WHEN { count => BLOCK {
-                maybe_s: count > 1 |> WHEN { True => 's', False => '' }
-                '{count} item{maybe_s} left'
+                maybe_s: count > 1 |> WHEN { True => TEXT { s }, False => Text/empty }
+                TEXT { {count} item{maybe_s} left }
             }}
     )
 }
@@ -714,9 +713,9 @@ FUNCTION filter_button(filter) {
             label: Element/text(
                 style: filter_button_text()
                 text: filter |> WHEN {
-                    All => 'All'
-                    Active => 'Active'
-                    Completed => 'Completed'
+                    All => TEXT { All }
+                    Active => TEXT { Active }
+                    Completed => TEXT { Completed }
                 }
             )
         )
@@ -743,7 +742,7 @@ FUNCTION remove_completed_button() {
         ]
         label: Element/text(
             style: clear_button_text(hovered: element.hovered)
-            text: 'Clear completed'
+            text: TEXT { Clear completed }
         )
     )
 }
@@ -762,16 +761,16 @@ FUNCTION footer() {
             Element/paragraph(
                 element: []
                 style: Theme/text(of: Small)
-                contents: LIST { 'Double-click to edit a todo' }
+                contents: LIST { TEXT { Double-click to edit a todo } }
             )
             Element/paragraph(
                 element: []
                 style: Theme/text(of: Small)
                 contents: LIST {
-                    'Created by '
+                    TEXT { Created by }
                     footer_link(
-                        label: 'Martin Kavík'
-                        to: 'https://github.com/MartinKavik'
+                        label: TEXT { Martin Kavík }
+                        to: TEXT { https://github.com/MartinKavik }
                     )
                 }
             )
@@ -779,8 +778,8 @@ FUNCTION footer() {
                 element: []
                 style: Theme/text(of: Small)
                 contents: LIST {
-                    'Part of '
-                    footer_link(label: 'TodoMVC', to: 'http://todomvc.com')
+                    TEXT { Part of }
+                    footer_link(label: TEXT { TodoMVC }, to: TEXT { http://todomvc.com })
                 }
             )
         }

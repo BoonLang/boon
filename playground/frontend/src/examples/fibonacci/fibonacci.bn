@@ -9,4 +9,4 @@ FUNCTION fibonacci(position) {
 
 position: 5
 result: position |> fibonacci()
-'{position}. Fibonacci number is {result}' |> Console/log()
+TEXT { {position}. Fibonacci number is {result} } |> Console/log()

@@ -21,9 +21,9 @@ FUNCTION root_element() {
         gap: 15
         style: [align: Center]
         items: LIST {
-            counter_button(label: '-') |> LINK { PASSED.elements.decrement_button }
+            counter_button(label: TEXT { - }) |> LINK { PASSED.elements.decrement_button }
             PASSED.counter
-            counter_button(label: '+') |> LINK { PASSED.elements.increment_button }
+            counter_button(label: TEXT { + }) |> LINK { PASSED.elements.increment_button }
         }
     )
 }

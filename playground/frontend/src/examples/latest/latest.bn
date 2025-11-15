@@ -9,8 +9,8 @@ sum: value |> Math/sum()
 
 ------------------------------------------------
 
-send_1_button: send_button(label: 'Send 1')
-send_2_button: send_button(label: 'Send 2')
+send_1_button: send_button(label: TEXT { Send 1 })
+send_2_button: send_button(label: TEXT { Send 2 })
 
 document: Document/new(root: Element/stripe(
     element: []
@@ -20,7 +20,7 @@ document: Document/new(root: Element/stripe(
         send_1_button
         send_2_button
         value |> value_container
-        'Sum: {sum}' |> value_container
+        TEXT { Sum: {sum} } |> value_container
     }
 ))
 
