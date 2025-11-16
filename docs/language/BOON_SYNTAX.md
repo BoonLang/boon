@@ -623,7 +623,488 @@ Theme/light(of: FocusSpotlight, with: [softness: 0.95])  -- Override softness
 
 ---
 
-## 9. Module System
+## 9. BLOCK - Dependency Graphs
+
+**BLOCK creates a dependency graph, not sequential statements.**
+
+BLOCK is Boon's fundamental scoping construct for managing multiple variable bindings with dependencies.
+
+### Core Concept: Reactive Dataflow
+
+**BLOCK variables execute in parallel, respecting dependencies:**
+
+```boon
+BLOCK {
+    a: 1
+    b: a + 1  -- Waits for 'a' to resolve
+    c: b + 1  -- Waits for 'b' to resolve
+    c         -- Return final value
+}
+-- Result: 3
+```
+
+**Think of BLOCK as a reactive dataflow graph, not sequential statements.**
+
+### Syntax: Variables + Final Expression
+
+```boon
+BLOCK {
+    variable1: expression1
+    variable2: expression2  -- Can reference variable1
+    variable3: expression3  -- Can reference variable1, variable2
+    variable3              -- Final expression (returned)
+}
+```
+
+✅ **Correct - Variables with dependencies:**
+```boon
+BLOCK {
+    validated: input |> validate()
+    processed: validated |> process()
+    saved: processed |> save()
+    saved  -- Return saved result
+}
+```
+
+✅ **Correct - Side effects bound to variables:**
+```boon
+BLOCK {
+    logged: message |> Log/error()
+    count: items |> List/count()
+    count  -- Return value
+}
+```
+
+❌ **WRONG - Sequential statements:**
+```boon
+BLOCK {
+    Log/error(message)  -- ERROR: Not a variable binding
+    FLUSH { error }
+}
+```
+
+✅ **CORRECT - Bind side effects:**
+```boon
+BLOCK {
+    logged: message |> Log/error()
+    FLUSH { error }  -- Final expression (OK)
+}
+```
+
+### Cannot Redefine Variables
+
+**Each variable name can only be defined once:**
+
+❌ **WRONG - Redefining 'state':**
+```boon
+BLOCK {
+    state: Ready[...]
+    state: state |> WHEN { ... }  -- ERROR: Cannot redefine
+}
+```
+
+✅ **CORRECT - Different names:**
+```boon
+BLOCK {
+    state1: Ready[...]
+    state2: state1 |> WHEN { ... }
+    state3: state2 |> WHEN { ... }
+    state3  -- Return final
+}
+```
+
+### Variables Can Reference Each Other
+
+```boon
+BLOCK {
+    base: [color: red, gloss: 0.4]
+    enhanced: [...base, metal: 0.03]
+    final: enhanced.color
+    final  -- Returns: red
+}
+```
+
+Runtime builds dependency graph and evaluates in correct order.
+
+### BLOCK for Shared Records
+
+**Extract common records to avoid duplication:**
+
+```boon
+FUNCTION font(of) {
+    BLOCK {
+        body_base: [
+            size: 24
+            color: colors.text
+        ]
+
+        small_base: [
+            size: 10
+            color: colors.text_tertiary
+        ]
+
+        of |> WHEN {
+            Body => body_base
+
+            BodyDisabled => [
+                ...body_base
+                color: colors.text_disabled
+            ]
+
+            Small => small_base
+
+            SmallLink[hovered] => [
+                ...small_base
+                line: [underline: hovered]
+            ]
+        }
+    }
+}
+```
+
+**Why BLOCK?** Direct recursion is not allowed. You cannot call `font(of: Body)` from within `font()`. Instead, extract shared records as BLOCK-scoped variables.
+
+### Key Rules
+
+1. **Dependency graph, not sequential** - Variables can execute in parallel
+2. **Cannot redefine variables** - Each name defined once
+3. **Must bind expressions to variables** - No bare expressions except final
+4. **Final expression is returned** - Last line without variable binding
+5. **Used for scoping and sharing** - Extract common values
+
+### See Also
+
+For comprehensive BLOCK documentation including error handling patterns, see `/docs/language/ERROR_HANDLING.md` Section 3: BLOCK Fundamentals.
+
+---
+
+## 10. Reactive Patterns: WHILE, THEN, and SKIP
+
+**Boon provides reactive patterns for conditional evaluation, event handling, and filtering.**
+
+### WHILE - Conditional Evaluation
+
+**WHILE evaluates a condition and returns different values based on pattern matching.**
+
+Similar to WHEN, but semantically used for reactive conditional branching.
+
+✅ **Correct - Conditional rendering:**
+```boon
+PASSED.store.todos
+    |> List/not_empty()
+    |> WHILE {
+        True => Element/stripe(
+            element: []
+            items: todos_list()
+        )
+        False => NoElement
+    }
+```
+
+✅ **Correct - Conditional values:**
+```boon
+PASSED.store.selected_filter |> WHILE {
+    All => True
+    Active => item.completed |> Bool/not()
+    Completed => item.completed
+}
+```
+
+✅ **Correct - Conditional element visibility:**
+```boon
+element.hovered |> WHILE {
+    True => remove_button()
+        |> LINK { todo.elements.remove_button }
+    False => NoElement
+}
+```
+
+**Pattern:**
+```boon
+condition |> WHILE {
+    pattern1 => value1
+    pattern2 => value2
+    __ => default_value
+}
+```
+
+**Common use cases:**
+- Conditional UI rendering (with `NoElement`)
+- Filter conditions in List operations
+- Reactive value selection
+
+### THEN - Ignore Input Value
+
+**THEN evaluates an expression while ignoring the piped input value.**
+
+Use THEN when you need to trigger an action from an event but don't need the event's value.
+
+✅ **Correct - Event to constant value:**
+```boon
+LATEST {
+    filter_buttons.all.event.press |> THEN { filter_routes.all }
+    filter_buttons.active.event.press |> THEN { filter_routes.active }
+    filter_buttons.completed.event.press |> THEN { filter_routes.completed }
+}
+```
+
+✅ **Correct - Reset on event:**
+```boon
+text: LATEST {
+    Text/empty
+    input_element.event.change.text
+    save_button.event.press |> THEN { Text/empty }  -- Reset to empty
+}
+```
+
+✅ **Correct - Side effect without using value:**
+```boon
+logged: items
+    |> process()
+    |> THEN {
+        count: items |> List/count()
+        TEXT { Processed {count} items } |> Log/info()
+    }
+```
+
+**Comparison with WHEN:**
+
+```boon
+-- ❌ WRONG: Value not used
+event.press |> WHEN {
+    __ => perform_action()  -- Ignoring the value with __
+}
+
+-- ✅ CORRECT: Use THEN
+event.press |> THEN {
+    perform_action()
+}
+```
+
+**Rule:** If you're not using the piped value, use THEN instead of WHEN.
+
+### SKIP - Filter and Early Return
+
+**SKIP signals that a value should be filtered out or skipped in reactive pipelines.**
+
+Used in pattern matching to indicate "no value" or "filter this out".
+
+✅ **Correct - Conditional value with filter:**
+```boon
+title_to_save: elements.text_input.event.key_down.key |> WHEN {
+    Enter => BLOCK {
+        new_title: elements.text_input.text |> Text/trim()
+        new_title
+            |> Text/is_not_empty()
+            |> WHEN { True => new_title, False => SKIP }
+    }
+    __ => SKIP
+}
+```
+
+✅ **Correct - Event filtering:**
+```boon
+selected_id: LATEST {
+    None
+    todos
+        |> List/map(old, new: LATEST {
+            old.event.key_down.key
+                |> WHEN { Escape => None, __ => SKIP }
+            old.title_updated
+                |> THEN { None }
+            old.event.double_click
+                |> THEN { old.id }
+        })
+        |> List/latest()
+}
+```
+
+**How SKIP works:**
+- In WHEN: Signals "no match, skip this value"
+- With LATEST: Filtered out, doesn't become the latest value
+- With List operations: Item is filtered from the result
+- In reactive pipelines: Value doesn't propagate
+
+**Common patterns:**
+- Event filtering (only process specific keys/events)
+- Conditional value generation (skip if validation fails)
+- Filtering in reactive LATEST chains
+
+### NoElement - Absence of UI Element
+
+**NoElement represents the absence of a UI element in conditional rendering.**
+
+Used with WHILE for conditional element visibility.
+
+✅ **Correct - Conditional button:**
+```boon
+element.hovered |> WHILE {
+    True => remove_button()
+    False => NoElement
+}
+```
+
+✅ **Correct - Conditional section:**
+```boon
+todos |> List/any(item, if: item.completed) |> WHILE {
+    True => clear_completed_button()
+    False => NoElement
+}
+```
+
+**Pattern:**
+```boon
+condition |> WHILE {
+    True => some_element()
+    False => NoElement
+}
+```
+
+**NoElement vs empty LIST:**
+- `NoElement`: No element rendered at all
+- `LIST {}`: Empty list of elements (still takes up space in layout)
+
+### LINK - Reactive Architecture (See Dedicated Doc)
+
+**LINK creates bidirectional reactive channels in Boon's dataflow graph.**
+
+LINK is a core reactive pattern used extensively (38+ uses in todo_mvc) for:
+- Multiple consumers of event streams
+- Cross-element coordination
+- Dynamic element collections with reactive channels
+- Compile-time verification of reactive topology
+
+✅ **Common usage - Wiring reactive elements:**
+```boon
+new_todo_input()
+    |> LINK { PASSED.store.elements.new_todo_input }
+
+remove_button()
+    |> LINK { todo.elements.remove_button }
+```
+
+**LINK Pattern (Three Steps):**
+1. **Declare Architecture** - Reserve reactive slots in store
+2. **Declare Capabilities** - Advertise reactive streams in elements
+3. **Wire Connections** - Connect streams to architectural slots
+
+**For comprehensive LINK documentation**, see `/docs/language/LINK_PATTERN.md`. The LINK pattern is explained in detail with architecture, examples, and best practices (30KB comprehensive guide).
+
+---
+
+## 11. Lists and Pattern Matching Wildcards
+
+**Boon provides list literals and wildcard patterns for flexible pattern matching.**
+
+### LIST Literals
+
+**Create lists using `LIST { }` syntax:**
+
+✅ **Correct - Empty list:**
+```boon
+todos: LIST {}
+```
+
+✅ **Correct - List with items:**
+```boon
+items: LIST {
+    header()
+    main_content()
+    footer()
+}
+```
+
+✅ **Correct - Inline list:**
+```boon
+items: LIST { item1, item2, item3 }
+```
+
+**Lists in UI:**
+```boon
+Element/stripe(
+    element: []
+    direction: Column
+    items: LIST {
+        todo_checkbox(todo: todo)
+        todo_title_element(todo: todo)
+        remove_button()
+    }
+)
+```
+
+### Wildcard Pattern `__`
+
+**The wildcard `__` matches any value in pattern matching.**
+
+Use `__` as a catch-all pattern in WHEN/WHILE for values you don't care about.
+
+✅ **Correct - Default case:**
+```boon
+Router/route() |> WHEN {
+    filter_routes.active => Active
+    filter_routes.completed => Completed
+    __ => All  -- Matches everything else
+}
+```
+
+✅ **Correct - Ignoring specific values:**
+```boon
+event.key |> WHEN {
+    Enter => save()
+    Escape => cancel()
+    __ => SKIP  -- Ignore all other keys
+}
+```
+
+✅ **Correct - Event filtering:**
+```boon
+old.event.key_down.key |> WHEN {
+    Escape => None
+    __ => SKIP  -- Skip all other keys
+}
+```
+
+**Pattern:**
+```boon
+value |> WHEN {
+    specific_pattern1 => result1
+    specific_pattern2 => result2
+    __ => default_result  -- Catch-all
+}
+```
+
+### LIST Pattern Matching
+
+**Match on list structures with patterns:**
+
+✅ **Correct - Pattern matching on list values:**
+```boon
+LIST { selected, hovered } |> WHEN {
+    LIST { True, __ } => [
+        color: primary_color
+        intensity: 0.05
+    ]
+    LIST { False, True } => [
+        color: primary_color
+        intensity: 0.025
+    ]
+    LIST { False, False } => None
+}
+```
+
+**In this pattern:**
+- `LIST { True, __ }` - First element is True, second can be anything
+- `LIST { False, True }` - First is False, second is True
+- `LIST { False, False }` - Both are False
+
+**Use cases:**
+- Matching multiple boolean states
+- Coordinating multiple conditions
+- Conditional styling based on element states
+
+---
+
+## 12. Module System
 
 **Modules are files.** Each `.bn` file is a module, and functions are called using the file name:
 
@@ -637,7 +1118,7 @@ Text.bn            → Text/trim(), Text/empty()
 
 ---
 
-## 10. Record Composition with Spread Operator
+## 13. Record Composition with Spread Operator
 
 **The spread operator (`...`) allows merging record fields within record literals.**
 
@@ -761,7 +1242,7 @@ For the complete spread operator specification including type system, optimizati
 
 ---
 
-## 11. FLUSH and Error Handling
+## 14. FLUSH and Error Handling
 
 **Boon uses FLUSH for fail-fast error handling with transparent propagation.**
 
@@ -997,7 +1478,7 @@ FUNCTION icon_code(item) {
 
 ---
 
-## 12. Correct Examples Based on These Rules
+## 15. Correct Examples Based on These Rules
 
 ### Example 1: Unified Theme Router
 
@@ -1083,6 +1564,15 @@ style: [
 | **Type tracking** | Full inference with UNPLUGGED | Compiler tracks all UNPLUGGED through flow |
 | **Modules** | One file = one module | `Themes.bn` → `Theme/material()` |
 | **Record composition** | Use spread operator | `[...base, ...overrides]` |
+| **BLOCK** | Dependency graph, not sequential | Variables execute in parallel, cannot redefine |
+| **WHILE** | Conditional evaluation (reactive) | `condition \|> WHILE { True => value, False => alternative }` |
+| **THEN** | Ignore piped value | Use when you don't need the input value |
+| **SKIP** | Filter/early return in pipelines | Signals "skip this value" in WHEN/LATEST |
+| **LIST literals** | `LIST { }` syntax | `LIST { item1, item2, item3 }` |
+| **Wildcard `__`** | Matches anything in patterns | `\|> WHEN { specific => x, __ => default }` |
+| **LIST pattern matching** | Match list structures | `LIST { True, __ } => ...` |
+| **NoElement** | Absence of UI element | Use with WHILE for conditional rendering |
+| **LINK** | Reactive architecture pattern | See `/docs/language/LINK_PATTERN.md` |
 
 ---
 
@@ -1131,6 +1621,28 @@ When proposing new Boon APIs, remember:
    - Two-binding pattern: separate pipeline from error handling
    - No CATCH blocks needed
 
+11. ✅ **Use BLOCK for dependency graphs, not sequential code**
+   - Variables execute in parallel, respecting dependencies
+   - Cannot redefine variables (use different names)
+   - Must bind expressions to variables (except final expression)
+   - Use for scoping and extracting shared records
+
+12. ✅ **Use reactive patterns appropriately**
+   - **WHILE**: Conditional evaluation, especially for UI rendering
+   - **THEN**: When ignoring piped value (event handling without value)
+   - **SKIP**: Filtering in WHEN/LATEST chains
+   - **NoElement**: Conditional UI rendering with WHILE
+
+13. ✅ **Use LIST and wildcard patterns**
+   - `LIST { }` for list literals
+   - `__` for catch-all in pattern matching
+   - LIST pattern matching for coordinated state: `LIST { True, __ } => ...`
+
+14. ✅ **Use LINK for reactive architecture**
+   - Declare → Advertise → Wire pattern
+   - See `/docs/language/LINK_PATTERN.md` for comprehensive guide
+   - Essential for element event coordination
+
 ---
 
 ## Verified Against Codebase
@@ -1144,10 +1656,14 @@ These rules have been verified against:
 **Last updated:** 2025-11-16
 
 **Recent additions:**
-- FLUSH and error handling (Section 11)
+- **Section 9: BLOCK** - Comprehensive dependency graph semantics, cannot redefine variables, parallel execution
+- **Section 10: Reactive Patterns** - WHILE (conditional evaluation), THEN (ignore value), SKIP (filtering), NoElement (UI absence), LINK (reactive architecture reference)
+- **Section 11: Lists and Wildcards** - LIST literals, `__` wildcard pattern, LIST pattern matching
+- FLUSH and error handling (Section 14)
 - Ok tagging requirement for FLUSH pattern
 - Two-binding pattern for error handling
 - Spread operator for structural defaults (replaced LATEST misuse)
-- Updated Summary table with FLUSH/error handling rows
+- Updated Summary table with all reactive patterns and core features
 - Clear distinction between spread operator (structural), LATEST (temporal), and WHEN+UNPLUGGED (optional fields)
 - Removed partial pattern matching section (prefer explicit field extraction and spread operator)
+- All previously undocumented but heavily-used features now documented
