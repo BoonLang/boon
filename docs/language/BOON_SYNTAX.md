@@ -1242,23 +1242,12 @@ For the complete spread operator specification including type system, optimizati
 
 ---
 
-## 14. FLUSH and Error Handling
+## 14. FLUSH and Error Handling - Quick Reference
 
-**Boon uses FLUSH for fail-fast error handling with transparent propagation.**
+**Boon uses FLUSH for fail-fast error handling. Errors are values, not exceptions.**
 
-Unlike exceptions, errors are values. FLUSH provides ergonomic early exit while maintaining transparent value propagation through pipelines.
+### Essential Pattern
 
-### Core Semantics
-
-**FLUSH** exits the current expression and creates a hidden `FLUSHED[value]` wrapper:
-- **FLUSH** exits immediately from current expression
-- Creates hidden `FLUSHED[value]` wrapper (not user-accessible)
-- **FLUSHED[value]** propagates transparently (bypasses functions)
-- **Unwraps at boundaries** - variable bindings, function returns
-
-### Basic FLUSH Pattern
-
-✅ **Correct - FLUSH for early exit:**
 ```boon
 FUNCTION process(item) {
     item
@@ -1268,213 +1257,69 @@ FUNCTION process(item) {
             error => FLUSH { error }  -- Exit expression
         }
         |> next_operation()  -- SKIPPED if error was FLUSHed
-        |> WHEN {
-            Ok[value] => value
-            error => FLUSH { error }
-        }
-        |> WHEN { value =>
-            Ok[result: transform(value)]
+        |> WHEN { result =>
+            Ok[value: transform(result)]
         }
 }
--- Returns: Ok[result: T] | ErrorType1 | ErrorType2
--- FLUSHED[error] unwraps at function boundary
+-- Returns: Ok[value: T] | ErrorType
 ```
 
-### Ok Tagging Requirement
+### Key Concepts
 
-**To distinguish success from errors, wrap success values in `Ok`:**
+**FLUSH Semantics:**
+- FLUSH exits expression, creates hidden `FLUSHED[value]` wrapper
+- FLUSHED propagates transparently (bypasses functions)
+- Unwraps at boundaries (variable bindings, function returns)
 
-❌ **WRONG - Bare pattern matches everything:**
+**Ok Tagging (Required):**
 ```boon
-|> WHEN {
-    value => value        -- Matches BOTH success AND errors!
-    error => FLUSH { ... } -- Never reached
-}
-```
-
-✅ **CORRECT - Ok tagging:**
-```boon
+-- ✅ CORRECT: Ok tagging
 |> WHEN {
     Ok[value] => value      -- Only matches Ok
     error => FLUSH { error }  -- Matches all error types
 }
+
+-- ❌ WRONG: Bare pattern matches everything!
+|> WHEN {
+    value => value        -- Matches BOTH success AND errors
+    error => FLUSH { ... } -- Never reached
+}
 ```
 
-**Function signature with Ok tagging:**
-```boon
-FUNCTION process(x) -> Ok[result: T] | ErrorType1 | ErrorType2
-```
-
-### Two-Binding Pattern
-
-**Separate pipeline from error handling for clarity:**
-
-✅ **Correct - Two-binding pattern:**
+**Two-Binding Pattern:**
 ```boon
 -- First binding: pipeline with FLUSH
 generation_result: svg_files
-    |> List/map(item =>
-        item |> process() |> WHEN {
-            Ok[value] => value
-            error => FLUSH { error }  -- Stops List/map
-        }
-    )
-    |> transform()  -- Bypassed if FLUSHed
+    |> List/map(item => process(item) |> WHEN {
+        Ok[value] => value
+        error => FLUSH { error }
+    })
 
 -- Second binding: error handling
 generation_error_handling: generation_result |> WHEN {
     Ok[values] => handle_success(values)
-    ReadError[message] => handle_read_error(message)
-    EncodeError[message] => handle_encode_error(message)
-}
-```
-
-**Benefits:**
-- Clear separation: pipeline vs error handling
-- No CATCH blocks needed
-- Error handling at natural boundary
-
-### FLUSH with List/map (Fail-Fast)
-
-**Regular `List/map` (not `try_map`) handles FLUSH automatically:**
-
-```boon
-items: [1, 2, 3, 4, 5]
-
-result: items
-    |> List/map(item =>
-        item |> risky_operation() |> WHEN {
-            Ok[value] => value
-            error => FLUSH { error }  -- Stop on first error
-        }
-    )
--- List/map sees FLUSHED[error], stops processing, returns FLUSHED[error]
-
--- Handle error at variable level
-result |> WHEN {
-    Ok[values] => use_values(values)
     error => handle_error(error)
 }
 ```
 
-### Error Handling at Variable Level
+**List/map Fail-Fast:**
+- Regular `List/map` stops on first FLUSH (no `try_map` needed)
+- Returns FLUSHED[error] which unwraps at variable boundary
 
-**Instead of CATCH blocks, handle errors where the variable is used:**
+### Comprehensive Documentation
 
-✅ **Correct - Handle at variable level:**
-```boon
-result: items
-    |> process()  -- May return FLUSHED[error] internally
+📖 **`/docs/language/ERROR_HANDLING.md`** - Practical patterns and best practices (15KB)
+- FLUSH vs State Accumulator vs Helper Functions patterns
+- BLOCK fundamentals for error handling
+- WHEN vs THEN in error contexts
+- Common pitfalls and best practices
 
--- Handle at variable level
-result |> WHEN {
-    Ok[value] => use_value(value)
-    ValidationError[reason] => BLOCK {
-        logged: TEXT { Validation failed: {reason} } |> Log/error()
-        default_value()
-    }
-    NetworkError[message] => BLOCK {
-        logged: TEXT { Network error: {message} } |> Log/error()
-        retry()
-    }
-}
-```
-
-### Tagged Error Types
-
-**Use descriptive tagged objects for errors:**
-
-✅ **Correct - Rich error context:**
-```boon
--- Good error types
-ReadError[message: TEXT]
-EncodeError[message: TEXT]
-ValidationError[field: TEXT, reason: TEXT]
-NetworkError[url: TEXT, status: 404]
-
--- Pattern matching
-error |> WHEN {
-    ReadError[message] => TEXT { Cannot read: {message} }
-    EncodeError[message] => TEXT { Cannot encode: {message} }
-    ValidationError[field, reason] => TEXT { {field} validation failed: {reason} }
-}
-```
-
-### Complete BUILD.bn Example
-
-```boon
--- Generates Assets.bn from SVG icon files
-icons_directory: TEXT { ./assets/icons }
-output_file: TEXT { ./Generated/Assets.bn }
-
-svg_files: Directory/entries(icons_directory)
-    |> List/retain(item, if: item.extension = TEXT { svg })
-    |> List/sort_by(item, key: item.path)
-
-generation_result: svg_files
-    |> List/map(item =>
-        item |> icon_code() |> WHEN {
-            Ok[text] => text
-            error => FLUSH { error }
-        }
-    )
-    |> Text/join_lines()
-    |> WHEN { code => TEXT {
-        -- Generated from {icons_directory}
-        icon: [
-            {code}
-        ]
-    } }
-    |> File/write_text(path: output_file)
-
-generation_error_handling: generation_result |> WHEN {
-    Ok => BLOCK {
-        count: svg_files |> List/count()
-        logged: TEXT { Included {count} icons } |> Log/info()
-        Build/succeed()
-    }
-    error => BLOCK {
-        error_message: error |> WHEN {
-            ReadError[message] => TEXT { Cannot read icon: {message} }
-            EncodeError[message] => TEXT { Cannot encode icon: {message} }
-            WriteError[message] => TEXT { Cannot write {output_file}: {message} }
-        }
-        logged: error_message |> Log/error()
-        Build/fail()
-    }
-}
-
-FUNCTION icon_code(item) {
-    item.path
-        |> File/read_text()
-        |> WHEN {
-            Ok[text] => text
-            error => FLUSH { error }
-        }
-        |> Url/encode()
-        |> WHEN {
-            Ok[encoded] => encoded
-            error => FLUSH { error }
-        }
-        |> WHEN { encoded =>
-            Ok[text: TEXT { {item.file_stem}: data:image/svg+xml;utf8,{encoded} }]
-        }
-}
-```
-
-### Key Rules
-
-1. **Always use Ok tagging** - Wrap success values in `Ok[...]` to distinguish from errors
-2. **FLUSH exits expression** - Creates hidden FLUSHED[value] wrapper
-3. **No CATCH needed** - Handle errors at variable level with WHEN
-4. **Two-binding pattern** - Separate pipeline from error handling
-5. **List/map fail-fast** - Regular List/map stops on first FLUSH
-6. **Rich error context** - Use tagged objects with descriptive fields
-
-### See Also
-
-- `/docs/language/FLUSH.md` - Comprehensive FLUSH specification
-- `/docs/language/ERROR_HANDLING.md` - Error handling patterns and best practices
+📖 **`/docs/language/FLUSH.md`** - Technical specification (27KB)
+- Hardware implementation details
+- Parallel processing semantics
+- Streaming behavior
+- Grammar specification
+- Complete type system integration
 
 ---
 
