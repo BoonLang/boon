@@ -355,28 +355,19 @@ Light/spotlight(target: FocusedElement, softness: Soft)
 Light/spotlight(target: FocusedElement, softness: 0.95)
 ```
 
-#### Pattern B: Record with Optional Properties (for multiple optional values)
+#### Pattern B: Record with Spread Operator (for multiple optional values)
 
-✅ **Correct - Use an empty record or record with overrides:**
+✅ **Correct - Use spread operator with defaults:**
 ```boon
 FUNCTION spotlight(of, overrides) {
-    target: LATEST {
-        FocusedElement  -- Default for FocusSpotlight
-        overrides.target
-    }
-    color: LATEST {
-        Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
-        overrides.color
-    }
-    softness: LATEST {
-        0.85
-        overrides.softness
-    }
-    intensity: LATEST {
-        0.3
-        overrides.intensity
-    }
-    -- Use target, color, softness, intensity...
+    config: [
+        target: FocusedElement
+        color: Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
+        softness: 0.85
+        intensity: 0.3
+        ...overrides  -- Override any matching fields
+    ]
+    -- Use config.target, config.color, config.softness, config.intensity...
 }
 
 -- Usage:
@@ -399,27 +390,26 @@ FUNCTION spotlight(target, softness) {
 
 ---
 
-## 7. No `??` Operator - Use `LATEST` Combinator
+## 7. No `??` Operator - Use Spread Operator or `LATEST`
 
 **Boon does NOT have a null-coalescing operator (`??`).**
 
-To provide fallback values, use the `LATEST` combinator.
+To provide fallback values:
+- **For structural defaults (missing fields):** Use spread operator or `WHEN + UNPLUGGED`
+- **For temporal reactive values (events):** Use `LATEST` combinator
 
-✅ **Correct - Use LATEST for fallback:**
+✅ **Correct - Use spread operator for structural defaults:**
 ```boon
 FUNCTION get_value(overrides) {
-    color: LATEST {
-        Oklch[lightness: 0.7, chroma: 0.1, hue: 220]  -- Default
-        overrides.color                                  -- Override if provided
-    }
-    softness: LATEST {
-        0.85
-        overrides.softness
-    }
+    [
+        color: Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
+        softness: 0.85
+        ...overrides  -- Override any matching fields
+    ]
 }
 
--- LATEST takes the most recent value from its reactive expressions
--- If overrides.color is present, it becomes the "latest" value
+-- Spread operator merges records (defaults first, overrides last)
+-- If overrides.color exists, it overrides the default
 -- Otherwise, the default value is used
 ```
 
@@ -447,6 +437,11 @@ value: overrides.value || default_value
 - Returns the most recent value that has been produced
 - Reactive - updates when any expression produces a new value
 - First value in the list is typically the default/initial value
+
+**When to use each:**
+- **Spread operator:** For structural defaults (function parameters with overrides)
+- **WHEN + UNPLUGGED:** For optional field access with defaults
+- **LATEST:** For temporal reactive values (events, changing data over time)
 
 ---
 
@@ -628,70 +623,7 @@ Theme/light(of: FocusSpotlight, with: [softness: 0.95])  -- Override softness
 
 ---
 
-## 9. Partial Pattern Matching for Tagged Objects
-
-**A bare tag pattern matches the tag regardless of what fields it has.**
-
-### Basic Behavior
-
-```boon
-light |> WHEN {
-    FocusSpotlight => handle_focus(light)
-    -- Matches: FocusSpotlight, FocusSpotlight[], FocusSpotlight[softness: 0.95], etc.
-}
-```
-
-Without partial matching, you'd need to match every field combination:
-```boon
-light |> WHEN {
-    FocusSpotlight => ...
-    FocusSpotlight[softness] => ...
-    FocusSpotlight[target] => ...
-    FocusSpotlight[softness, target] => ...
-    -- Combinatorial explosion!
-}
-```
-
-### Accessing Fields with `?`
-
-Inside a partial match, use `?` to access potentially missing fields:
-
-```boon
-FUNCTION process(config) {
-    config |> WHEN {
-        AppConfig => BLOCK {
-            -- config matches AppConfig with any fields
-            theme: config.theme? |> WHEN {
-                UNPLUGGED => Professional
-                t => t
-            }
-
-            mode: config.mode? |> WHEN {
-                UNPLUGGED => Light
-                m => m
-            }
-        }
-    }
-}
-
--- Works with any field combination:
-process(config: AppConfig)
-process(config: AppConfig[theme: Dark])
-process(config: AppConfig[theme: Dark, mode: Dark])
-```
-
-### Why This Works
-
-Combining partial matching + UNPLUGGED + `?` operator eliminates need for:
-- Spread syntax (`Tag[...fields]`)
-- Combinatorial pattern matching
-- Magic field extraction
-
-Each field is accessed explicitly with clear defaults.
-
----
-
-## 10. Module System
+## 9. Module System
 
 **Modules are files.** Each `.bn` file is a module, and functions are called using the file name:
 
@@ -705,7 +637,7 @@ Text.bn            → Text/trim(), Text/empty()
 
 ---
 
-## 11. Record Composition with Spread Operator
+## 10. Record Composition with Spread Operator
 
 **The spread operator (`...`) allows merging record fields within record literals.**
 
@@ -829,7 +761,243 @@ For the complete spread operator specification including type system, optimizati
 
 ---
 
-## 7. Correct Examples Based on These Rules
+## 11. FLUSH and Error Handling
+
+**Boon uses FLUSH for fail-fast error handling with transparent propagation.**
+
+Unlike exceptions, errors are values. FLUSH provides ergonomic early exit while maintaining transparent value propagation through pipelines.
+
+### Core Semantics
+
+**FLUSH** exits the current expression and creates a hidden `FLUSHED[value]` wrapper:
+- **FLUSH** exits immediately from current expression
+- Creates hidden `FLUSHED[value]` wrapper (not user-accessible)
+- **FLUSHED[value]** propagates transparently (bypasses functions)
+- **Unwraps at boundaries** - variable bindings, function returns
+
+### Basic FLUSH Pattern
+
+✅ **Correct - FLUSH for early exit:**
+```boon
+FUNCTION process(item) {
+    item
+        |> operation()
+        |> WHEN {
+            Ok[result] => result
+            error => FLUSH { error }  -- Exit expression
+        }
+        |> next_operation()  -- SKIPPED if error was FLUSHed
+        |> WHEN {
+            Ok[value] => value
+            error => FLUSH { error }
+        }
+        |> WHEN { value =>
+            Ok[result: transform(value)]
+        }
+}
+-- Returns: Ok[result: T] | ErrorType1 | ErrorType2
+-- FLUSHED[error] unwraps at function boundary
+```
+
+### Ok Tagging Requirement
+
+**To distinguish success from errors, wrap success values in `Ok`:**
+
+❌ **WRONG - Bare pattern matches everything:**
+```boon
+|> WHEN {
+    value => value        -- Matches BOTH success AND errors!
+    error => FLUSH { ... } -- Never reached
+}
+```
+
+✅ **CORRECT - Ok tagging:**
+```boon
+|> WHEN {
+    Ok[value] => value      -- Only matches Ok
+    error => FLUSH { error }  -- Matches all error types
+}
+```
+
+**Function signature with Ok tagging:**
+```boon
+FUNCTION process(x) -> Ok[result: T] | ErrorType1 | ErrorType2
+```
+
+### Two-Binding Pattern
+
+**Separate pipeline from error handling for clarity:**
+
+✅ **Correct - Two-binding pattern:**
+```boon
+-- First binding: pipeline with FLUSH
+generation_result: svg_files
+    |> List/map(item =>
+        item |> process() |> WHEN {
+            Ok[value] => value
+            error => FLUSH { error }  -- Stops List/map
+        }
+    )
+    |> transform()  -- Bypassed if FLUSHed
+
+-- Second binding: error handling
+generation_error_handling: generation_result |> WHEN {
+    Ok[values] => handle_success(values)
+    ReadError[message] => handle_read_error(message)
+    EncodeError[message] => handle_encode_error(message)
+}
+```
+
+**Benefits:**
+- Clear separation: pipeline vs error handling
+- No CATCH blocks needed
+- Error handling at natural boundary
+
+### FLUSH with List/map (Fail-Fast)
+
+**Regular `List/map` (not `try_map`) handles FLUSH automatically:**
+
+```boon
+items: [1, 2, 3, 4, 5]
+
+result: items
+    |> List/map(item =>
+        item |> risky_operation() |> WHEN {
+            Ok[value] => value
+            error => FLUSH { error }  -- Stop on first error
+        }
+    )
+-- List/map sees FLUSHED[error], stops processing, returns FLUSHED[error]
+
+-- Handle error at variable level
+result |> WHEN {
+    Ok[values] => use_values(values)
+    error => handle_error(error)
+}
+```
+
+### Error Handling at Variable Level
+
+**Instead of CATCH blocks, handle errors where the variable is used:**
+
+✅ **Correct - Handle at variable level:**
+```boon
+result: items
+    |> process()  -- May return FLUSHED[error] internally
+
+-- Handle at variable level
+result |> WHEN {
+    Ok[value] => use_value(value)
+    ValidationError[reason] => BLOCK {
+        logged: TEXT { Validation failed: {reason} } |> Log/error()
+        default_value()
+    }
+    NetworkError[message] => BLOCK {
+        logged: TEXT { Network error: {message} } |> Log/error()
+        retry()
+    }
+}
+```
+
+### Tagged Error Types
+
+**Use descriptive tagged objects for errors:**
+
+✅ **Correct - Rich error context:**
+```boon
+-- Good error types
+ReadError[message: TEXT]
+EncodeError[message: TEXT]
+ValidationError[field: TEXT, reason: TEXT]
+NetworkError[url: TEXT, status: 404]
+
+-- Pattern matching
+error |> WHEN {
+    ReadError[message] => TEXT { Cannot read: {message} }
+    EncodeError[message] => TEXT { Cannot encode: {message} }
+    ValidationError[field, reason] => TEXT { {field} validation failed: {reason} }
+}
+```
+
+### Complete BUILD.bn Example
+
+```boon
+-- Generates Assets.bn from SVG icon files
+icons_directory: TEXT { ./assets/icons }
+output_file: TEXT { ./Generated/Assets.bn }
+
+svg_files: Directory/entries(icons_directory)
+    |> List/retain(item, if: item.extension = TEXT { svg })
+    |> List/sort_by(item, key: item.path)
+
+generation_result: svg_files
+    |> List/map(item =>
+        item |> icon_code() |> WHEN {
+            Ok[text] => text
+            error => FLUSH { error }
+        }
+    )
+    |> Text/join_lines()
+    |> WHEN { code => TEXT {
+        -- Generated from {icons_directory}
+        icon: [
+            {code}
+        ]
+    } }
+    |> File/write_text(path: output_file)
+
+generation_error_handling: generation_result |> WHEN {
+    Ok => BLOCK {
+        count: svg_files |> List/count()
+        logged: TEXT { Included {count} icons } |> Log/info()
+        Build/succeed()
+    }
+    error => BLOCK {
+        error_message: error |> WHEN {
+            ReadError[message] => TEXT { Cannot read icon: {message} }
+            EncodeError[message] => TEXT { Cannot encode icon: {message} }
+            WriteError[message] => TEXT { Cannot write {output_file}: {message} }
+        }
+        logged: error_message |> Log/error()
+        Build/fail()
+    }
+}
+
+FUNCTION icon_code(item) {
+    item.path
+        |> File/read_text()
+        |> WHEN {
+            Ok[text] => text
+            error => FLUSH { error }
+        }
+        |> Url/encode()
+        |> WHEN {
+            Ok[encoded] => encoded
+            error => FLUSH { error }
+        }
+        |> WHEN { encoded =>
+            Ok[text: TEXT { {item.file_stem}: data:image/svg+xml;utf8,{encoded} }]
+        }
+}
+```
+
+### Key Rules
+
+1. **Always use Ok tagging** - Wrap success values in `Ok[...]` to distinguish from errors
+2. **FLUSH exits expression** - Creates hidden FLUSHED[value] wrapper
+3. **No CATCH needed** - Handle errors at variable level with WHEN
+4. **Two-binding pattern** - Separate pipeline from error handling
+5. **List/map fail-fast** - Regular List/map stops on first FLUSH
+6. **Rich error context** - Use tagged objects with descriptive fields
+
+### See Also
+
+- `/docs/language/FLUSH.md` - Comprehensive FLUSH specification
+- `/docs/language/ERROR_HANDLING.md` - Error handling patterns and best practices
+
+---
+
+## 12. Correct Examples Based on These Rules
 
 ### Example 1: Unified Theme Router
 
@@ -904,14 +1072,17 @@ style: [
 | **Function parameters** | All required, no defaults | Use `Default` tag or `with: []` record |
 | **Optional fields** | Use `obj.field?` postfix | Returns `T \| UNPLUGGED`, must handle with WHEN |
 | **Fallback values (temporal)** | Use `LATEST` | `LATEST { default, event_value }` ✅ |
-| **Fallback values (structural)** | Use `WHEN + UNPLUGGED` | `obj.field? \|> WHEN { UNPLUGGED => default, x => x }` |
-| **Partial pattern matching** | Bare tag matches any fields | `FocusSpotlight =>` matches all variants |
+| **Fallback values (structural)** | Use spread operator or `WHEN + UNPLUGGED` | `[defaults... ...overrides]` or `obj.field? \|> WHEN { UNPLUGGED => default, x => x }` |
+| **Error handling** | Use `FLUSH` for fail-fast | `error => FLUSH { error }` |
+| **Ok tagging** | Wrap success values in `Ok` | `Ok[value: result]` to distinguish from errors |
+| **Error handling pattern** | Two-binding pattern | Separate pipeline from error handling |
 | **Function calls** | Module/function() syntax | `Theme/material()`, `Text/trim()` |
 | **Function definitions** | Root level only, not first-class | `FUNCTION material(m) { ... }` |
 | **Records** | Data only, no functions | `[corners: [round: 6]]` ✅, `[fn: FUNCTION...]` ❌ |
 | **Type declarations** | Don't exist - tags are inferred | Just use `All`, `InputInterior[focus: True]` |
 | **Type tracking** | Full inference with UNPLUGGED | Compiler tracks all UNPLUGGED through flow |
 | **Modules** | One file = one module | `Themes.bn` → `Theme/material()` |
+| **Record composition** | Use spread operator | `[...base, ...overrides]` |
 
 ---
 
@@ -943,20 +1114,22 @@ When proposing new Boon APIs, remember:
    - No optional parameters or default values
    - Use polymorphic tags (`Default`, `None`) or records (`overrides: []`) for optional-like behavior
 
-8. ✅ **Use LATEST for fallback values**
+8. ✅ **Use spread operator for structural defaults, LATEST for temporal values**
    - No `??` or `||` operators exist
-   - `LATEST { default_value, override_value }` pattern for defaults
+   - Spread operator: `[defaults... ...overrides]` for function parameters with overrides
+   - LATEST: `LATEST { default_value, event_value }` for temporal reactive values only
+   - Do NOT use LATEST for structural defaults (causes blink/performance issues)
 
 9. ✅ **Use `obj.field?` for optional fields**
    - Postfix `?` operator accesses potentially missing fields
    - Returns `T | UNPLUGGED` which must be handled with WHEN
-   - Do NOT use LATEST for structural defaults (causes blink/performance issues)
+   - Pattern: `obj.field? |> WHEN { UNPLUGGED => default, x => x }`
 
-10. ✅ **Use partial pattern matching + UNPLUGGED for flexible APIs**
-   - Bare tag matches any field combination
-   - Access fields individually with `?` operator
-   - Explicit defaults for each field
-   - No need for spread syntax or combinatorial patterns
+10. ✅ **Use FLUSH for error handling**
+   - Always use Ok tagging: `Ok[value: result]`
+   - FLUSH exits expression: `error => FLUSH { error }`
+   - Two-binding pattern: separate pipeline from error handling
+   - No CATCH blocks needed
 
 ---
 
@@ -968,10 +1141,13 @@ These rules have been verified against:
 - `/playground/frontend/src/examples/todo_mvc/*.bn` (multiple example files)
 - All example projects in `/playground/frontend/src/examples/`
 
-**Last updated:** 2025-11-12
+**Last updated:** 2025-11-16
 
 **Recent additions:**
-- UNPLUGGED state and postfix `?` operator
-- Partial pattern matching for tagged objects
-- Type inference and compile-time UNPLUGGED tracking
-- Clear distinction between LATEST (temporal) and WHEN+UNPLUGGED (structural)
+- FLUSH and error handling (Section 11)
+- Ok tagging requirement for FLUSH pattern
+- Two-binding pattern for error handling
+- Spread operator for structural defaults (replaced LATEST misuse)
+- Updated Summary table with FLUSH/error handling rows
+- Clear distinction between spread operator (structural), LATEST (temporal), and WHEN+UNPLUGGED (optional fields)
+- Removed partial pattern matching section (prefer explicit field extraction and spread operator)
