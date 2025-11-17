@@ -70,9 +70,10 @@ signed_hex: BITS { 8, 16sFF }           -- 8-bit, signed, pattern = -1
 -- Octal patterns (base 8)
 octal_val: BITS { 12, 8u7777 }          -- 12-bit, unsigned, octal
 
--- Underscore separators for readability (planned)
-long_mask: BITS { 32, 2u1111_0000_1111_0000_1111_0000_1111_0000 }
-hex_color: BITS { 32, 16uFF_80_40_FF }
+-- Long patterns (readability tip: use hex for long bit patterns)
+long_mask: BITS { 32, 2u11110000111100001111000011110000 }  -- Binary
+long_mask_hex: BITS { 32, 16uF0F0F0F0 }                      -- Same, more readable
+hex_color: BITS { 32, 16uFF8040FF }                          -- RGBA color
 
 -- Dynamic width (parameterized modules)
 reg: BITS { width, 10u0 }               -- Width from variable
@@ -214,11 +215,22 @@ instruction: BITS { __, {
 **Alternative using `Bits/concat` function**:
 
 ```boon
--- Functional style (equivalent to above)
-packet: Bits/concat(LIST { header, payload })
+-- Functional style (equivalent to syntactic form)
+header: BITS { 8, 10u5 }
+payload: BITS { 24, 16uDEADBEEF }
+packet: Bits/concat(LIST { header, payload })  -- OK: both unsigned
 
--- Same signedness rules apply
-Bits/concat(LIST { s_field, u_field })  -- ERROR: mixed signedness
+-- ❌ Same signedness rules apply strictly
+s_field: BITS { 8, 10s-5 }
+u_field: BITS { 8, 10u10 }
+bad: Bits/concat(LIST { s_field, u_field })
+-- ERROR: "Cannot concatenate BITS with different signedness. Field 1 is signed, field 2 is unsigned. Use Bits/as_unsigned() or Bits/as_signed() to convert."
+
+-- ✅ Correct: explicit conversion
+ok: Bits/concat(LIST {
+    s_field |> Bits/as_unsigned()   -- Reinterpret as unsigned
+    u_field
+})  -- OK: both unsigned now
 ```
 
 **Design rationale**:
@@ -302,12 +314,16 @@ Bits/is_power_of_two(bits)
 -- Operations preserve width of first operand
 a: BITS { 8, 10u200 }
 b: BITS { 8, 10u100 }
-sum: a |> Bits/add(b)  -- Width preserved
+sum: a |> Bits/add(b)  -- Width preserved: BITS { 8, ... }
 
--- Mismatched widths: Error or auto-extend (TBD)
+-- ❌ Mismatched widths: COMPILE ERROR (explicit conversions required)
 a: BITS { 8, 16uFF }
 b: BITS { 4, 16u3 }
-result: a |> Bits/and(b)  -- Error: width mismatch? Or zero-extend b?
+result: a |> Bits/and(b)  -- ERROR: "Width mismatch: 8 bits vs 4 bits"
+
+-- ✅ CORRECT: Explicit width conversion required
+result: a |> Bits/and(b |> Bits/zero_extend(to: 8))  -- OK
+result: a |> Bits/truncate(to: 4) |> Bits/and(b)     -- OK (truncates a)
 
 -- Explicit width change
 extended: BITS { 4, 16uF } |> Bits/zero_extend(to: 8)  -- 16u0F (zero-extended)
@@ -386,7 +402,7 @@ u |> Bits/add(s |> Bits/as_unsigned())   -- OK
 Bytes can be decimal or hex (using 16# for consistency with BITS).
 
 ```boon
--- Hex bytes (most common, using 16# for consistency)
+-- Hex bytes (most common)
 data: BYTES { 16#FF, 16#00, 16#AB, 16#CD }  -- 4 bytes
 
 -- Decimal bytes
@@ -411,7 +427,11 @@ buffer: BYTES { length: 1024 }              -- 1KB of zeros
 parsed: BYTES { hex: TEXT { FF00ABCD } }
 ```
 
-**Note:** BYTES uses 16# for hex to be consistent with BITS syntax. No 0x prefix.
+**Note on syntax difference:**
+- **BITS** uses `16uFF` / `16sFF` (base + signedness + value) - signedness is required for interpretation
+- **BYTES** uses `16#FF` (base + `#` + value) - no signedness concept (bytes are just 0-255 values)
+- Both use base prefix (2, 8, 10, 16) and avoid `0x` prefix for consistency
+- The `#` separator in BYTES indicates "literal byte value" vs `u`/`s` signedness markers in BITS
 
 ### Core Operations
 
@@ -550,6 +570,8 @@ BITS { 8, 10u255 } |> Bits/to_text(format: Decimal) -- "255"
 
 -- Parse text to BITS (must specify signedness)
 Bits/u_from_binary_text(TEXT { 11111111 })          -- 8-bit unsigned from binary string
+Bits/s_from_binary_text(TEXT { 11111111 }, width: 8) -- 8-bit signed from binary string
+Bits/u_from_hex_text(TEXT { FF }, width: 8)         -- 8-bit unsigned from hex string
 Bits/s_from_hex_text(TEXT { FF }, width: 8)         -- 8-bit signed from hex string
 
 -- BYTES to text
@@ -999,13 +1021,38 @@ FUNCTION counter(clk_event, rst_event) {
     [count: count]
 }
 
--- Priority encoder
+-- Priority encoder (4-bit input)
 FUNCTION priority_encoder(input) {
+    -- input is BITS { 4, ... }, match highest priority bit
     input |> WHEN {
-        BITS { 1, __, __, __ } => [y: BITS { 2, 2u11 }, valid: True]
-        BITS { 0, 1, __, __ } => [y: BITS { 2, 2u10 }, valid: True]
-        BITS { 0, 0, 1, __ } => [y: BITS { 2, 2u01 }, valid: True]
-        BITS { 0, 0, 0, 1 } => [y: BITS { 2, 2u00 }, valid: True]
+        BITS { 4, {
+            BITS { 1, 2u1 }    -- Bit 3 set (highest priority)
+            BITS { 1, __ }
+            BITS { 1, __ }
+            BITS { 1, __ }
+        }} => [y: BITS { 2, 2u11 }, valid: True]
+
+        BITS { 4, {
+            BITS { 1, 2u0 }    -- Bit 3 clear
+            BITS { 1, 2u1 }    -- Bit 2 set
+            BITS { 1, __ }
+            BITS { 1, __ }
+        }} => [y: BITS { 2, 2u10 }, valid: True]
+
+        BITS { 4, {
+            BITS { 1, 2u0 }
+            BITS { 1, 2u0 }
+            BITS { 1, 2u1 }    -- Bit 1 set
+            BITS { 1, __ }
+        }} => [y: BITS { 2, 2u01 }, valid: True]
+
+        BITS { 4, {
+            BITS { 1, 2u0 }
+            BITS { 1, 2u0 }
+            BITS { 1, 2u0 }
+            BITS { 1, 2u1 }    -- Bit 0 set (lowest priority)
+        }} => [y: BITS { 2, 2u00 }, valid: True]
+
         __ => [y: BITS { 2, 2u00 }, valid: False]
     }
 }
@@ -1214,8 +1261,9 @@ FUNCTION pack_normal(nx, ny, nz) {
     nx_bits: Bits/s_from_number(value: (nx * scale) |> Number/round(), width: 10)
     ny_bits: Bits/s_from_number(value: (ny * scale) |> Number/round(), width: 10)
     nz_bits: Bits/s_from_number(value: (nz * scale) |> Number/round(), width: 10)
-    w_bits: BITS { 2, 2u00 }  -- Padding (unsigned)
+    w_bits: BITS { 2, 2s00 }  -- Padding (signed to match other fields)
 
+    -- All fields signed - signedness matching rule satisfied
     Bits/concat(LIST { nx_bits, ny_bits, nz_bits, w_bits })
 }
 
@@ -1278,6 +1326,8 @@ buffer_usage: [
 - `Bits/u_from_number(value: V, width: N)` - Unsigned from number
 - `Bits/s_from_number(value: V, width: N)` - Signed from number
 - `Bits/u_from_binary_text(text: T)` - Unsigned from binary string
+- `Bits/s_from_binary_text(text: T, width: N)` - Signed from binary string
+- `Bits/u_from_hex_text(text: T, width: N)` - Unsigned from hex string
 - `Bits/s_from_hex_text(text: T, width: N)` - Signed from hex string
 
 #### Properties
