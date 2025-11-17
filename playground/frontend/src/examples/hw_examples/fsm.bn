@@ -44,37 +44,39 @@ FUNCTION fsm(clk_event, rst_event, a) {
 }
 
 -- Alternative: Explicit state encoding
-FUNCTION fsm_encoded(clk_event, rst_event, a) {
-    BLOCK {
-        state: LATEST {
-            LIST { False, True }  -- B = 2'b01
-
-            rst_event |> WHEN {
-                Rising => LIST { False, True }
-                __ => SKIP
-            }
-
-            clk_event |> WHEN {
-                Rising => state |> WHEN {
-                    LIST { False, False } => LIST { True, False }   -- A -> C
-                    LIST { False, True } => LIST { True, True }     -- B -> D
-                    LIST { True, False } => a |> WHEN {
-                        True => LIST { True, True }                 -- C -> D
-                        False => LIST { False, True }               -- C -> B
-                    }
-                    LIST { True, True } => LIST { False, False }    -- D -> A
-                }
-                __ => SKIP
-            }
-        }
-
-        b: state |> WHEN {
-            LIST { False, False } => False  -- A
-            LIST { False, True } => True    -- B
-            LIST { True, False } => a       -- C: output depends on input
-            LIST { True, True } => False    -- D
-        }
-
-        [b: b]
-    }
-}
+-- Commented out: No corresponding .sv file (for transpiler development)
+--
+-- FUNCTION fsm_encoded(clk_event, rst_event, a) {
+--     BLOCK {
+--         state: LATEST {
+--             LIST { False, True }  -- B = 2'b01
+--
+--             rst_event |> WHEN {
+--                 Rising => LIST { False, True }
+--                 __ => SKIP
+--             }
+--
+--             clk_event |> WHEN {
+--                 Rising => state |> WHEN {
+--                     LIST { False, False } => LIST { True, False }   -- A -> C
+--                     LIST { False, True } => LIST { True, True }     -- B -> D
+--                     LIST { True, False } => a |> WHEN {
+--                         True => LIST { True, True }                 -- C -> D
+--                         False => LIST { False, True }               -- C -> B
+--                     }
+--                     LIST { True, True } => LIST { False, False }    -- D -> A
+--                 }
+--                 __ => SKIP
+--             }
+--         }
+--
+--         b: state |> WHEN {
+--             LIST { False, False } => False  -- A
+--             LIST { False, True } => True    -- B
+--             LIST { True, False } => a       -- C: output depends on input
+--             LIST { True, True } => False    -- D
+--         }
+--
+--         [b: b]
+--     }
+-- }

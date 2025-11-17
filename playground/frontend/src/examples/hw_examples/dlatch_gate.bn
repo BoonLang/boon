@@ -21,20 +21,24 @@ FUNCTION d_latch(d, e) {
 }
 
 -- Behavioral model using Boon's WHEN
-FUNCTION d_latch_behavioral(d, e) {
-    e |> WHEN {
-        True => [q: d, nq: d |> Bool/not()]  -- Transparent
-        False => [q: Hold, nq: Hold]          -- Hold previous state
-    }
-}
+-- Commented out: No corresponding .sv file (for transpiler development)
+--
+-- FUNCTION d_latch_behavioral(d, e) {
+--     e |> WHEN {
+--         True => [q: d, nq: d |> Bool/not()]  -- Transparent
+--         False => [q: Hold, nq: Hold]          -- Hold previous state
+--     }
+-- }
 
 -- With explicit state tracking using LATEST
-FUNCTION d_latch_stateful(d, e_event) {
-    LATEST {
-        [q: False, nq: True]  -- Initial state
-        e_event |> WHEN {
-            High => [q: d, nq: d |> Bool/not()]
-            __ => SKIP
-        }
-    }
-}
+-- Commented out: No corresponding .sv file (for transpiler development)
+--
+-- FUNCTION d_latch_stateful(d, e_event) {
+--     LATEST {
+--         [q: False, nq: True]  -- Initial state
+--         e_event |> WHEN {
+--             High => [q: d, nq: d |> Bool/not()]
+--             __ => SKIP
+--         }
+--     }
+-- }

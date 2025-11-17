@@ -30,21 +30,25 @@ FUNCTION dff_master_slave(clk, d) {
 }
 
 -- Behavioral model using Boon's reactive events
-FUNCTION dff_behavioral(clk_event, d) {
-    LATEST {
-        False  -- Initial output
-        clk_event |> WHEN {
-            Rising => d      -- Sample D on rising edge
-            __ => SKIP
-        }
-    }
-}
+-- Commented out: No corresponding .sv file (for transpiler development)
+--
+-- FUNCTION dff_behavioral(clk_event, d) {
+--     LATEST {
+--         False  -- Initial output
+--         clk_event |> WHEN {
+--             Rising => d      -- Sample D on rising edge
+--             __ => SKIP
+--         }
+--     }
+-- }
 
 -- Alternative: Toggle pattern similar to TodoMVC
-FUNCTION dff_toggle(clk_rise_event, d) {
-    output: LATEST {
-        False
-        clk_rise_event |> THEN { d }
-    }
-    [o: output]
-}
+-- Commented out: No corresponding .sv file (for transpiler development)
+--
+-- FUNCTION dff_toggle(clk_rise_event, d) {
+--     output: LATEST {
+--         False
+--         clk_rise_event |> THEN { d }
+--     }
+--     [o: output]
+-- }

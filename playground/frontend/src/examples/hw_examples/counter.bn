@@ -1,0 +1,100 @@
+-- Loadable up/down counter
+-- Demonstrates BITS arithmetic operations
+-- Why BITS: increment/decrement are single operations (vs manual arithmetic with LIST)
+
+FUNCTION counter(clk_event, rst_event, load, load_value, up, en) {
+    -- Sequential counter using LATEST
+    -- Maps to always_ff in SystemVerilog
+    -- All values are BITS { 8, ... } (unsigned 8-bit)
+
+    count: LATEST {
+        BITS { 8, 10u0 }  -- Initial: unsigned zero
+
+        -- Asynchronous reset (highest priority)
+        rst_event |> WHEN {
+            Rising => BITS { 8, 10u0 }
+            __ => SKIP
+        }
+
+        -- Clock-triggered operations
+        clk_event |> WHEN {
+            Rising => en |> WHEN {
+                True => load |> WHEN {
+                    -- Load has priority over counting
+                    True => load_value
+
+                    -- Count up or down
+                    False => up |> WHEN {
+                        True => count |> Bits/increment()   -- count + 1
+                        False => count |> Bits/decrement()  -- count - 1
+                    }
+                }
+                False => SKIP  -- Hold when disabled
+            }
+            __ => SKIP
+        }
+    }
+
+    [count: count]
+}
+
+-- Alternative: Counter with overflow/underflow flags
+-- Commented out: No corresponding .sv file (for transpiler development)
+--
+-- FUNCTION counter_with_flags(clk_event, rst_event, en, up) {
+--     count: LATEST {
+--         BITS { 8, 10u0 }
+--
+--         rst_event |> WHEN {
+--             Rising => BITS { 8, 10u0 }
+--             __ => SKIP
+--         }
+--
+--         clk_event |> WHEN {
+--             Rising => en |> WHEN {
+--                 True => up |> WHEN {
+--                     True => count |> Bits/increment()
+--                     False => count |> Bits/decrement()
+--                 }
+--                 False => SKIP
+--             }
+--             __ => SKIP
+--         }
+--     }
+--
+--     -- Detect overflow (count = 255 and counting up)
+--     overflow: count |> Bits/equal(BITS { 8, 10u255 }) |> Bool/and(up)
+--
+--     -- Detect underflow (count = 0 and counting down)
+--     underflow: count |> Bits/equal(BITS { 8, 10u0 }) |> Bool/and(up |> Bool/not())
+--
+--     [
+--         count: count
+--         overflow: overflow
+--         underflow: underflow
+--     ]
+-- }
+
+-- Alternative: Parameterized counter (variable width)
+-- Commented out: No corresponding .sv file (for transpiler development)
+--
+-- FUNCTION counter_param(width, clk_event, rst_event, en) {
+--     count: LATEST {
+--         BITS { width, 10u0 }
+--
+--         rst_event |> WHEN {
+--             Rising => BITS { width, 10u0 }
+--             __ => SKIP
+--         }
+--
+--         clk_event |> WHEN {
+--             Rising => en |> WHEN {
+--                 True => count |> Bits/increment()
+--                 False => SKIP
+--             }
+--             __ => SKIP
+--         }
+--     }
+--
+--     [count: count]
+-- }

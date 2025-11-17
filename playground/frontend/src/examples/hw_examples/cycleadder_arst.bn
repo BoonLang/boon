@@ -8,11 +8,11 @@ FUNCTION cycleadder(width, clk_event, rst_event, en, a) {
     -- 'a' is BITS { width, ... }, 'output' is also BITS { width, ... }
 
     output: LATEST {
-        BITS { width, 0 }  -- Initial value (reset state)
+        BITS { width, 10u0 }  -- Initial value: unsigned zero (reset state)
 
         -- Asynchronous reset has priority (posedge rst)
         rst_event |> WHEN {
-            Rising => BITS { width, 0 }
+            Rising => BITS { width, 10u0 }
             __ => SKIP
         }
 

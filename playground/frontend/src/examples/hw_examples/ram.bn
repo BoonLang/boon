@@ -48,38 +48,42 @@ FUNCTION ram_param(awidth, dwidth, clk_event, addr, wraddr, wrdata) {
 }
 
 -- Alternative: RAM with write enable
-FUNCTION ram_with_we(clk_event, addr, wraddr, wrdata, write_enable) {
-    BLOCK {
-        mem: LATEST {
-            List/range(start: 0, end: 16)
-
-            clk_event |> WHEN {
-                Rising => write_enable |> WHEN {
-                    True => mem |> List/set(index: wraddr, value: wrdata)
-                    False => SKIP
-                }
-                __ => SKIP
-            }
-        }
-
-        data: mem |> List/get(index: addr)
-
-        [data: data]
-    }
-}
+-- Commented out: No corresponding .sv file (for transpiler development)
+--
+-- FUNCTION ram_with_we(clk_event, addr, wraddr, wrdata, write_enable) {
+--     BLOCK {
+--         mem: LATEST {
+--             List/range(start: 0, end: 16)
+--
+--             clk_event |> WHEN {
+--                 Rising => write_enable |> WHEN {
+--                     True => mem |> List/set(index: wraddr, value: wrdata)
+--                     False => SKIP
+--                 }
+--                 __ => SKIP
+--             }
+--         }
+--
+--         data: mem |> List/get(index: addr)
+--
+--         [data: data]
+--     }
+-- }
 
 -- Example usage
-FUNCTION example_ram_operations() {
-    BLOCK {
-        -- Create RAM instance
-        my_ram: ram(
-            clk_event: Rising
-            addr: 5           -- Read from address 5
-            wraddr: 3         -- Write to address 3
-            wrdata: 42        -- Write value 42
-        )
-
-        -- Returns data at address 5, after writing 42 to address 3
-        my_ram.data
-    }
-}
+-- Commented out: No corresponding .sv file (for transpiler development)
+--
+-- FUNCTION example_ram_operations() {
+--     BLOCK {
+--         -- Create RAM instance
+--         my_ram: ram(
+--             clk_event: Rising
+--             addr: 5           -- Read from address 5
+--             wraddr: 3         -- Write to address 3
+--             wrdata: 42        -- Write value 42
+--         )
+--
+--         -- Returns data at address 5, after writing 42 to address 3
+--         my_ram.data
+--     }
+-- }

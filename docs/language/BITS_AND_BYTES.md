@@ -25,6 +25,131 @@ Both use consistent literal syntax (like TEXT {} and LIST {}) and provide domain
 
 ---
 
+## When to Use: BITS vs LIST { Bool } vs Bool
+
+Boon provides three ways to represent bit-level data in hardware designs. Choose based on your primary operations:
+
+### Quick Decision Tree
+
+```
+Representing hardware signal?
+│
+├─ Single bit signal?
+│  └─ Use Bool
+│     Examples: enable, valid, ready, clock
+│     Operations: Bool/and(), Bool/or(), Bool/not()
+│
+├─ Multiple bits for arithmetic or bit manipulation?
+│  └─ Use BITS
+│     Examples: counter, accumulator, ALU, shifter, CRC
+│     Operations: Bits/add(), Bits/increment(), Bits/shift_left()
+│     Benefit: Concise, type-safe, width-tracked
+│
+├─ Multiple bits for pattern matching on bit patterns?
+│  └─ Use LIST { Bool }
+│     Examples: priority encoder, instruction decoder
+│     Operations: WHEN { LIST { True, __, __ } => ... }
+│     Benefit: Elegant wildcard patterns
+│
+└─ State machine states?
+   └─ Use Tags (or LIST { Bool } for explicit encoding)
+      Examples: Idle, Running, Done
+      Operations: WHEN { Idle => Running, Running => Done }
+```
+
+### Comparison Table
+
+| Task | Best Choice | Why | Example |
+|------|-------------|-----|---------|
+| **Counter (up/down)** | BITS | `Bits/increment()` | `count |> Bits/increment()` |
+| **Accumulator** | BITS | `Bits/add()` concise | `sum |> Bits/add(value)` |
+| **Shift register (LFSR)** | BITS | `Bits/shift_right()` 1 line vs 8 | `state |> Bits/shift_right(by: 1)` |
+| **Barrel shifter** | BITS | `Bits/shift_left(by: n)` | `data |> Bits/shift_left(by: amount)` |
+| **ALU operations** | BITS | All arithmetic operators | `a |> Bits/add(b)` |
+| **Priority encoder** | LIST { Bool } | Wildcard patterns elegant | `WHEN { LIST { True, __, __ } => 3 }` |
+| **Bit pattern decoder** | LIST { Bool } | Pattern matching clear | `WHEN { LIST { False, True, __, __ } => ... }` |
+| **FSM states** | Tags | Most readable | `WHEN { Idle => Running }` |
+| **Enable signal** | Bool | Single bit | `enable |> WHEN { True => ..., False => ... }` |
+| **Valid/Ready flags** | Bool | Individual signals | `valid |> Bool/and(ready)` |
+
+### Code Comparison: LFSR Example
+
+**BITS (Recommended for shift operations):**
+```boon
+-- 3 lines: clear and concise
+out
+    |> Bits/shift_right(by: 1)
+    |> Bits/set(index: 7, value: feedback)
+```
+
+**LIST { Bool } (Verbose for shift operations):**
+```boon
+-- 11 lines: manual reconstruction
+LIST {
+    out |> List/get(index: 6)
+    out |> List/get(index: 5)
+    out |> List/get(index: 4)
+    out |> List/get(index: 3)
+    out |> List/get(index: 2)
+    out |> List/get(index: 1)
+    out |> List/get(index: 0)
+    feedback
+}
+```
+
+**Verdict:** BITS is 73% shorter for bit manipulation.
+
+### Code Comparison: Priority Encoder
+
+**LIST { Bool } (Recommended for pattern matching):**
+```boon
+-- Elegant: wildcards make intent clear
+input |> WHEN {
+    LIST { True, __, __, __ } => 3      -- Bit 3 set
+    LIST { False, True, __, __ } => 2    -- Bit 2 set
+    LIST { False, False, True, __ } => 1 -- Bit 1 set
+}
+```
+
+**BITS (Verbose for pattern matching):**
+```boon
+-- Verbose: nested BITS patterns
+input |> WHEN {
+    BITS { 4, {
+        BITS { 1, 2u1 }    -- Bit 3 set
+        BITS { 1, __ }
+        BITS { 1, __ }
+        BITS { 1, __ }
+    }} => 3
+    -- ... much more verbose
+}
+```
+
+**Verdict:** LIST { Bool } is clearer for wildcard patterns.
+
+### Hardware Examples by Category
+
+**Arithmetic (use BITS):**
+- `cycleadder_arst.bn` - Accumulator with `Bits/add()`
+- `counter.bn` - Up/down counter with `Bits/increment()`
+- `alu.bn` - ALU with arithmetic operators
+
+**Bit Manipulation (use BITS):**
+- `lfsr.bn` - Shift register with `Bits/shift_right()`
+- `serialadder.bn` - Bit-serial operations
+
+**Pattern Matching (use LIST { Bool }):**
+- `prio_encoder.bn` - Wildcard bit patterns
+- `fsm.bn` - State pattern matching (or use Tags)
+
+**Single-Bit Logic (use Bool):**
+- `sr_gate.bn` - SR latch with Bool operations
+- `fulladder.bn` - Boolean logic gates
+
+See [Hardware Examples](../playground/frontend/src/examples/hw_examples/) for complete implementations.
+
+---
+
 ## Table of Contents
 
 1. [BITS - Bit-Level Data](#bits---bit-level-data)
@@ -558,6 +683,46 @@ bit: bool |> Bool/to_s_bit()   -- BITS { 1, 2s1 }
 
 -- Get bit as Bool
 flag: register |> Bits/get(index: 7)  -- Returns Bool
+```
+
+### BITS ↔ LIST { Bool }
+
+Convert between BITS (packed bit vector) and LIST { Bool } (individual bit signals):
+
+```boon
+-- BITS to LIST { Bool } (MSB-first order)
+bits: BITS { 8, 2u10110010 }
+bool_list: bits |> Bits/to_bool_list()
+-- Result: LIST { True, False, True, True, False, False, True, False }
+--         [bit 7, bit 6, bit 5, bit 4, bit 3, bit 2, bit 1, bit 0]
+
+-- LIST { Bool } to unsigned BITS
+bool_list: LIST { True, False, True, False }  -- 4 bits
+bits: bool_list |> List/to_u_bits()
+-- Result: BITS { 4, 2u1010 } (unsigned)
+
+-- LIST { Bool } to signed BITS
+bool_list: LIST { True, True, True, True }  -- 4 bits, all ones
+bits: bool_list |> List/to_s_bits()
+-- Result: BITS { 4, 2s1111 } (signed, -1 in two's complement)
+
+-- Use case: Pattern match with LIST, then do arithmetic with BITS
+input: LIST { True, False, True, False }
+input |> WHEN {
+    LIST { True, __, __, __ } => {
+        -- Convert to BITS for arithmetic
+        bits: input |> List/to_u_bits()
+        result: bits |> Bits/add(BITS { 4, 10u5 })
+        [result: result]
+    }
+}
+
+-- Use case: BITS arithmetic, then pattern match result
+sum: a |> Bits/add(b)  -- BITS arithmetic
+sum |> Bits/to_bool_list() |> WHEN {
+    LIST { True, True, __, __ } => overflow_case()
+    __ => normal_case()
+}
 ```
 
 ### BITS/BYTES ↔ Text
@@ -1399,6 +1564,13 @@ buffer_usage: [
 #### Conversion
 - `Bits/to_bytes(bits)` - Convert to BYTES
 - `Bits/to_text(bits, format: Binary|Hex|Decimal)` - To string representation
+- `Bits/to_bool_list(bits)` - Convert to LIST { Bool } (MSB-first)
+
+### LIST Module (BITS conversions)
+
+#### Conversion to BITS
+- `List/to_u_bits(list: LIST { Bool })` - Convert to unsigned BITS
+- `List/to_s_bits(list: LIST { Bool })` - Convert to signed BITS
 
 ### BYTES Module
 

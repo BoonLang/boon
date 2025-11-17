@@ -20,11 +20,13 @@ FUNCTION sr_latch(s, r) {
 }
 
 -- Alternative: Express as truth table using pattern matching
-FUNCTION sr_latch_truth(s, r) {
-    LIST { s, r } |> WHEN {
-        LIST { False, False } => [q: Hold, nq: Hold]  -- Hold state
-        LIST { True, False } => [q: True, nq: False]   -- Set
-        LIST { False, True } => [q: False, nq: True]   -- Reset
-        LIST { True, True } => [q: Invalid, nq: Invalid]  -- Invalid condition
-    }
-}
+-- Commented out: No corresponding .sv file (for transpiler development)
+--
+-- FUNCTION sr_latch_truth(s, r) {
+--     LIST { s, r } |> WHEN {
+--         LIST { False, False } => [q: Hold, nq: Hold]  -- Hold state
+--         LIST { True, False } => [q: True, nq: False]   -- Set
+--         LIST { False, True } => [q: False, nq: True]   -- Reset
+--         LIST { True, True } => [q: Invalid, nq: Invalid]  -- Invalid condition
+--     }
+-- }

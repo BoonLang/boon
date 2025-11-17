@@ -1,0 +1,101 @@
+-- Arithmetic Logic Unit (ALU)
+-- Demonstrates multiple BITS operations (arithmetic, logic, shifts)
+-- Why BITS: All arithmetic and bit manipulation operations in one place
+
+-- ALU operation codes
+AluOp: [Add, Sub, And, Or, Xor, ShiftLeft, ShiftRight, Equal]
+
+FUNCTION alu(a, b, op) {
+    -- 8-bit ALU operations
+    -- a and b are BITS { 8, ... } (unsigned)
+    -- Returns BITS { 8, ... } result
+
+    op |> WHEN {
+        -- Arithmetic operations
+        Add => a |> Bits/add(b)              -- a + b (wrapping)
+        Sub => a |> Bits/subtract(b)          -- a - b (wrapping)
+
+        -- Bitwise logic
+        And => a |> Bits/and(b)               -- a & b
+        Or => a |> Bits/or(b)                 -- a | b
+        Xor => a |> Bits/xor(b)               -- a ^ b
+
+        -- Shift operations (shift amount from low bits of b)
+        ShiftLeft => a |> Bits/shift_left(by: b |> Bits/slice(high: 2, low: 0) |> Bits/to_number())
+        ShiftRight => a |> Bits/shift_right(by: b |> Bits/slice(high: 2, low: 0) |> Bits/to_number())
+
+        -- Comparison (return all 1s if equal, all 0s if not)
+        Equal => a |> Bits/equal(b) |> WHEN {
+            True => BITS { 8, 16uFF }    -- All ones
+            False => BITS { 8, 10u0 }    -- All zeros
+        }
+    }
+}
+
+-- ALU with flags (Zero, Negative, Carry, Overflow)
+-- Commented out: No corresponding .sv file (for transpiler development)
+--
+-- FUNCTION alu_with_flags(a, b, op) {
+--     BLOCK {
+--         result: alu(a: a, b: b, op: op)
+--
+--         -- Flag generation
+--         zero: result |> Bits/is_zero()
+--         negative: result |> Bits/get(index: 7)  -- MSB is sign bit
+--
+--         [
+--             result: result
+--             zero: zero
+--             negative: negative
+--         ]
+--     }
+-- }
+
+-- Extended ALU with more operations
+-- Commented out: No corresponding .sv file (for transpiler development)
+--
+-- FUNCTION alu_extended(a, b, op) {
+--     AluExtOp: [
+--         Add, Sub, And, Or, Xor, Not, Nand, Nor,
+--         ShiftLeft, ShiftRight, RotateLeft, RotateRight,
+--         Increment, Decrement, Negate,
+--         Equal, LessThan, GreaterThan
+--     ]
+--
+--     op |> WHEN {
+--         -- Arithmetic
+--         Add => a |> Bits/add(b)
+--         Sub => a |> Bits/subtract(b)
+--         Increment => a |> Bits/increment()
+--         Decrement => a |> Bits/decrement()
+--         Negate => a |> Bits/negate()           -- Two's complement
+--
+--         -- Bitwise logic
+--         And => a |> Bits/and(b)
+--         Or => a |> Bits/or(b)
+--         Xor => a |> Bits/xor(b)
+--         Not => a |> Bits/not()
+--         Nand => a |> Bits/nand(b)
+--         Nor => a |> Bits/nor(b)
+--
+--         -- Shifts
+--         ShiftLeft => a |> Bits/shift_left(by: b |> Bits/slice(high: 2, low: 0) |> Bits/to_number())
+--         ShiftRight => a |> Bits/shift_right(by: b |> Bits/slice(high: 2, low: 0) |> Bits/to_number())
+--         RotateLeft => a |> Bits/rotate_left(by: b |> Bits/slice(high: 2, low: 0) |> Bits/to_number())
+--         RotateRight => a |> Bits/rotate_right(by: b |> Bits/slice(high: 2, low: 0) |> Bits/to_number())
+--
+--         -- Comparisons (return 1 if true, 0 if false in result[0])
+--         Equal => a |> Bits/equal(b) |> WHEN {
+--             True => BITS { 8, 10u1 }
+--             False => BITS { 8, 10u0 }
+--         }
+--         LessThan => a |> Bits/less_than(b) |> WHEN {
+--             True => BITS { 8, 10u1 }
+--             False => BITS { 8, 10u0 }
+--         }
+--         GreaterThan => a |> Bits/greater_than(b) |> WHEN {
+--             True => BITS { 8, 10u1 }
+--             False => BITS { 8, 10u0 }
+--         }
+--     }
+-- }

@@ -46,9 +46,11 @@ FUNCTION serialadder(a_bits, b_bits) {
 
 -- Example usage:
 -- 4-bit addition: [0,1,1,0] + [0,1,0,1] = [0,0,0,0,1] (6 + 5 = 11)
-FUNCTION example_4bit_add() {
-    serialadder(
-        a_bits: LIST { False, True, True, False }  -- 6 in binary LSB first
-        b_bits: LIST { True, False, True, False }  -- 5 in binary LSB first
-    )
-}
+-- Commented out: No corresponding .sv file (for transpiler development)
+--
+-- FUNCTION example_4bit_add() {
+--     serialadder(
+--         a_bits: LIST { False, True, True, False }  -- 6 in binary LSB first
+--         b_bits: LIST { True, False, True, False }  -- 5 in binary LSB first
+--     )
+-- }
