@@ -125,6 +125,108 @@ Bits/s_from_number(value: -42, width: 8) -- Signed from number
 -- These match the literal syntax: u_ for unsigned, s_ for signed
 ```
 
+### Construction via Concatenation
+
+Build composite BITS values from multiple fields using the same syntax as pattern matching (but in reverse):
+
+```boon
+-- Construction syntax: BITS { __, { field_values }}
+-- Width is inferred from sum of field widths
+
+-- ✅ VALID: All unsigned fields
+header: BITS { 8, 10u5 }
+payload: BITS { 24, 16uDEADBEEF }
+
+packet: BITS { __, {
+    header
+    payload
+}}
+-- Result: BITS { 32, ... } unsigned (8 + 24 = 32)
+
+-- ✅ VALID: All signed fields
+temp1: BITS { 16, 10s-5 }
+temp2: BITS { 16, 10s-3 }
+
+temps: BITS { __, {
+    temp1
+    temp2
+}}
+-- Result: BITS { 32, ... } signed
+
+-- ❌ COMPILE ERROR: Mixed signedness not allowed
+s_field: BITS { 8, 10s-5 }      -- signed
+u_field: BITS { 8, 10u10 }      -- unsigned
+
+bad: BITS { __, {
+    s_field
+    u_field
+}}
+-- Error: "Cannot concatenate BITS with different signedness. All fields must be signed or all unsigned. Use Bits/as_unsigned() or Bits/as_signed() to convert."
+```
+
+**Signedness matching rule**: All fields must have the same signedness (all signed or all unsigned). This prevents accidental mixing and makes intent explicit.
+
+**Converting signedness** (reinterpret bit pattern, zero-cost):
+
+```boon
+-- Explicit conversion for mixed-signedness concatenation
+s_field: BITS { 8, 10s-5 }      -- signed (-5 = 0xFB)
+u_field: BITS { 8, 10u10 }      -- unsigned
+
+-- ✅ Convert to all unsigned
+packet: BITS { __, {
+    s_field |> Bits/as_unsigned()    -- Reinterpret as BITS { 8, 10u251 }
+    u_field
+}}
+-- Result: BITS { 16, ... } unsigned
+
+-- ✅ Convert to all signed
+packet: BITS { __, {
+    s_field
+    u_field |> Bits/as_signed()      -- Reinterpret as BITS { 8, 10s10 }
+}}
+-- Result: BITS { 16, ... } signed
+```
+
+**Real-world example - RISC-V instruction encoding**:
+
+```boon
+-- I-type instruction: opcode + rd + funct3 + rs1 + imm
+-- Most fields unsigned, but immediate is signed
+
+opcode: BITS { 7, 10u19 }       -- ADDI opcode
+rd: BITS { 5, 10u10 }           -- Destination register
+funct3: BITS { 3, 10u0 }        -- Function code
+rs1: BITS { 5, 10u5 }           -- Source register
+imm: BITS { 12, 10s-100 }       -- Signed immediate
+
+-- Build instruction (all fields as unsigned bit patterns)
+instruction: BITS { __, {
+    opcode
+    rd
+    funct3
+    rs1
+    imm |> Bits/as_unsigned()   -- Treat signed immediate as bit pattern
+}}
+-- Result: BITS { 32, ... } unsigned - ready to emit to assembler
+```
+
+**Alternative using `Bits/concat` function**:
+
+```boon
+-- Functional style (equivalent to above)
+packet: Bits/concat(LIST { header, payload })
+
+-- Same signedness rules apply
+Bits/concat(LIST { s_field, u_field })  -- ERROR: mixed signedness
+```
+
+**Design rationale**:
+- **Symmetric syntax**: Construction mirrors pattern matching for consistency
+- **Type safety**: Catching mixed signedness prevents bugs (following VHDL/Rust)
+- **Explicit conversions**: `Bits/as_unsigned()` / `Bits/as_signed()` make intent clear
+- **Hardware reality**: Concatenation joins bit patterns; signedness is interpretation
+
 ### Core Operations
 
 ```boon
@@ -133,6 +235,11 @@ Bits/width(bits)                        -- Number of bits
 Bits/to_number(bits)                    -- Convert to number (respects signedness)
 Bits/u_from_number(value: 42, width: 8) -- Number to unsigned bits
 Bits/s_from_number(value: -42, width: 8) -- Number to signed bits
+
+-- Signedness conversion (reinterpret bit pattern, zero-cost)
+Bits/as_unsigned(bits)                  -- Force unsigned interpretation
+Bits/as_signed(bits)                    -- Force signed interpretation
+Bits/is_signed(bits)                    -- Check if signed (returns Bool)
 
 -- Bit access
 Bits/get(bits, index: 3)                -- Get single bit (Bool)
@@ -156,7 +263,7 @@ Bits/rotate_left(bits, by: 3)           -- Rotate left
 Bits/rotate_right(bits, by: 3)          -- Rotate right
 
 -- Concatenation and replication
-Bits/concat(LIST { a, b, c })           -- Join bit vectors
+Bits/concat(LIST { a, b, c })           -- Join bit vectors (all must have matching signedness)
 Bits/replicate(bits, times: 4)          -- Repeat pattern
 Bits/reverse(bits)                      -- Reverse bit order
 
@@ -550,10 +657,13 @@ FUNCTION parse_message(raw_bits) {
 
 ## Pattern Matching
 
-### Matching on BITS Values
+BITS supports two types of pattern matching: **exact value matching** and **field decomposition**.
+
+### Exact Value Matching
+
+Match a BITS value against specific literals:
 
 ```boon
--- Exact match
 opcode |> WHEN {
     BITS { 8, 16u00 } => Nop
     BITS { 8, 16u01 } => Load
@@ -561,25 +671,279 @@ opcode |> WHEN {
     BITS { 8, 16uFF } => Halt
     __ => Unknown
 }
+```
 
--- Match with don't-care bits (using __ placeholder)
-instruction |> WHEN {
-    BITS { 0, 0, 0, 0, __, __, __, __ } => TypeA  -- High nibble = 0
-    BITS { 0, 0, 0, 1, __, __, __, __ } => TypeB  -- High nibble = 1
-    BITS { 1, __, __, __, __, __, __, __ } => TypeC  -- MSB = 1
-    __ => Unknown
-}
+### Field Decomposition Pattern
 
--- Extract fields during match
-instruction |> WHEN {
-    BITS { 0, 0, op1, op0, rd3, rd2, rd1, rd0 } => BLOCK {
-        opcode: BITS { bits: LIST { op0, op1 } }
-        rd: BITS { bits: LIST { rd0, rd1, rd2, rd3 } }
-        Execute[op: opcode, dest: rd]
-    }
-    __ => Invalid
+**Syntax:** `BITS { total_width, { field_patterns }}`
+
+Decompose a BITS value into consecutive fields from MSB to LSB:
+
+```boon
+-- 8-bit value split into two 4-bit nibbles
+byte |> WHEN {
+    BITS { 8, {
+        BITS { 4, high }
+        BITS { 4, low }
+    }} => process(high, low)
 }
 ```
+
+**Key properties:**
+- Fields are extracted **MSB-first** (left to right = high to low bits)
+- Field widths must sum to total width (compiler validates)
+- Each extracted field is a BITS value with its specified width
+- Newlines separate field patterns (no commas needed)
+
+### Hardware Instruction Decoding
+
+**ARM Thumb instruction (16-bit):**
+```boon
+-- Format: [2-bit op1][3-bit op2][11-bit data]
+thumb_inst |> WHEN {
+    BITS { 16, {
+        BITS { 2, op1 }      -- Extract bits [15:14]
+        BITS { 3, op2 }      -- Extract bits [13:11]
+        BITS { 11, data }    -- Extract bits [10:0]
+    }} => handle_thumb(op1, op2, data)
+}
+```
+
+**RISC-V R-type instruction (32-bit):**
+```boon
+-- Format: [7-bit funct7][5-bit rs2][5-bit rs1][3-bit funct3][5-bit rd][7-bit opcode]
+instruction |> WHEN {
+    BITS { 32, {
+        BITS { 7, funct7 }
+        BITS { 5, rs2 }
+        BITS { 5, rs1 }
+        BITS { 3, funct3 }
+        BITS { 5, rd }
+        BITS { 7, 2u0110011 }    -- Match exact opcode
+    }} => R_Type { funct7, rs2, rs1, funct3, rd }
+}
+```
+
+### Mixing Literal Matches and Extraction
+
+```boon
+-- IPv4 header first word: [4-bit version][4-bit IHL][8-bit ToS][16-bit length]
+first_word |> WHEN {
+    BITS { 32, {
+        BITS { 4, 10u4 }     -- Match IPv4 version (literal 4)
+        BITS { 4, ihl }      -- Extract IHL
+        BITS { 8, tos }      -- Extract ToS
+        BITS { 16, length }  -- Extract length
+    }} => IPv4Header { ihl, tos, length }
+
+    BITS { 32, {
+        BITS { 4, 10u6 }     -- Match IPv6 version
+        BITS { 28, __ }      -- Ignore rest
+    }} => IPv6Header
+}
+```
+
+### Nested Field Decomposition
+
+Hierarchically decompose fields:
+
+```boon
+-- 16-bit: [8-bit high][8-bit low], where low = [4-bit][4-bit]
+value |> WHEN {
+    BITS { 16, {
+        BITS { 8, high_byte }
+        BITS { 8, {
+            BITS { 4, low_nibble }
+            BITS { 4, high_nibble }
+        }}
+    }} => nested(high_byte, low_nibble, high_nibble)
+}
+```
+
+### Two-Stage Matching
+
+Extract fields first, then match on extracted values:
+
+```boon
+-- Extract opcode, then match it
+instruction |> WHEN {
+    BITS { 16, {
+        BITS { 4, opcode }
+        BITS { 4, dest }
+        BITS { 8, imm }
+    }} => opcode |> WHEN {
+        BITS { 4, 16u0 } => Load { dest, imm }
+        BITS { 4, 16u1 } => Store { dest, imm }
+        BITS { 4, 16u2 } => Add { dest, imm }
+        __ => Unknown
+    }
+}
+```
+
+This approach separates extraction from matching, keeping each WHEN block focused.
+
+### UTF-8 Byte Classification
+
+```boon
+first_byte |> WHEN {
+    BITS { 8, {
+        BITS { 1, 2u0 }      -- 0xxxxxxx
+        BITS { 7, payload }
+    }} => OneByte(payload)
+
+    BITS { 8, {
+        BITS { 3, 2u110 }    -- 110xxxxx
+        BITS { 5, payload }
+    }} => TwoByteStart(payload)
+
+    BITS { 8, {
+        BITS { 4, 2u1110 }   -- 1110xxxx
+        BITS { 4, payload }
+    }} => ThreeByteStart(payload)
+
+    BITS { 8, {
+        BITS { 5, 2u11110 }  -- 11110xxx
+        BITS { 3, payload }
+    }} => FourByteStart(payload)
+}
+```
+
+### Wildcards and Don't-Care Fields
+
+Use `__` to ignore fields you don't need:
+
+```boon
+instruction |> WHEN {
+    BITS { 32, {
+        BITS { 4, 16uF }     -- Match high nibble = F
+        BITS { 28, __ }      -- Ignore remaining 28 bits
+    }} => SpecialInstruction
+
+    BITS { 32, {
+        BITS { 8, opcode }
+        BITS { 24, __ }      -- Extract opcode, ignore rest
+    }} => process_opcode(opcode)
+}
+```
+
+### Variable Width Fields (Wildcard Width)
+
+For header + variable-length payload patterns, you can use `__` as the **width** of the **last field only**:
+
+```boon
+-- ✅ VALID: Wildcard width in last position
+packet |> WHEN {
+    BITS { __, {
+        BITS { 8, msg_type }
+        BITS { 16, length }
+        BITS { __, payload }     -- Extract remaining bits as payload
+    }} => process_packet(msg_type, length, payload)
+}
+
+-- ✅ VALID: Parse header, capture rest
+message |> WHEN {
+    BITS { __, {
+        BITS { 4, version }
+        BITS { 4, flags }
+        BITS { __, data }        -- Everything after 8-bit header
+    }} => Message { version, flags, data }
+}
+```
+
+**Wildcard width is ONLY allowed in the last field position.** This keeps the rules simple and explicit:
+
+```boon
+-- ❌ INVALID: Wildcard width in middle position
+BITS { 32, {
+    BITS { 8, header }
+    BITS { __, middle }      -- ERROR: wildcard not last
+    BITS { 8, footer }
+}}
+-- Error: "Wildcard width (__) only allowed in last field position"
+
+-- ❌ INVALID: Multiple wildcard widths
+BITS { 32, {
+    BITS { __, field1 }      -- ERROR: multiple wildcards
+    BITS { __, field2 }
+}}
+-- Error: "Multiple wildcard widths not allowed"
+```
+
+**Design rationale:**
+- **Explicit is better**: If you know the total width (32) and field sizes (8, 8), just write `BITS { 16, middle }` explicitly
+- **Simpler rules**: "Last position only" is unambiguous, no complex resolution algorithms needed
+- **Main use case covered**: Header + variable payload is the primary pattern needing variable width
+- **Consistent with Boon philosophy**: No surprises, explicit over implicit
+
+### Width Validation
+
+The compiler validates that field widths sum to the total width:
+
+```boon
+-- ✅ VALID: 4 + 4 + 8 = 16
+BITS { 16, {
+    BITS { 4, a }
+    BITS { 4, b }
+    BITS { 8, c }
+}}
+
+-- ❌ COMPILE ERROR: 4 + 4 + 4 = 12 ≠ 16
+BITS { 16, {
+    BITS { 4, a }
+    BITS { 4, b }
+    BITS { 4, c }
+}}
+-- Error: "Field widths (12) don't match total width (16)"
+
+-- ❌ COMPILE ERROR: 4 + 4 + 10 = 18 > 16
+BITS { 16, {
+    BITS { 4, a }
+    BITS { 4, b }
+    BITS { 10, c }
+}}
+-- Error: "Field widths (18) exceed total width (16)"
+```
+
+### Pattern Syntax Summary
+
+**Construction (create BITS value):**
+```boon
+-- Literal syntax
+BITS { width, base[s|u]value }
+-- Examples:
+BITS { 8, 10u42 }                  -- Unsigned decimal
+BITS { 8, 2s11111111 }             -- Signed binary
+BITS { 16, 16uABCD }               -- Unsigned hex
+
+-- Concatenation syntax (symmetric with pattern matching)
+BITS { __, { field_values }}
+-- Examples:
+BITS { __, {                       -- Build from two fields
+    BITS { 8, 10u5 }               -- Width inferred: 8 + 24 = 32
+    BITS { 24, 16uDEADBEEF }
+}}
+-- All fields must have matching signedness (all signed or all unsigned)
+```
+
+**Pattern matching (destructure BITS value):**
+```boon
+BITS { width, value }              -- Match exact value
+BITS { width, { fields } }         -- Decompose into fields
+-- Examples:
+BITS { 8, 16uFF }                  -- Match 0xFF exactly
+BITS { 8, {                        -- Extract two 4-bit fields
+    BITS { 4, high }
+    BITS { 4, low }
+}}
+```
+
+**Key differences:**
+- **Literal construction**: Uses `base[s|u]value` (e.g., `10u42`, `2s1010`)
+- **Concatenation construction**: Uses `{ field_values }` with inferred width (`__`)
+- **Pattern matching**: Uses field decomposition or exact value matching
+- **Symmetric syntax**: Construction via concatenation mirrors pattern matching
+
+---
 
 ### Matching on BYTES Values
 
