@@ -1,0 +1,51 @@
+-- Four-bit priority encoder
+-- Outputs position of highest priority (leftmost) set bit
+-- Boon's WHEN with wildcards matches casez behavior
+
+FUNCTION prio_encoder(a) {
+    -- Priority encoding using pattern matching
+    -- Maps to always_comb with casez in SystemVerilog
+
+    a |> WHEN {
+        -- 4'b1??? : highest priority bit 3
+        LIST { True, __, __, __ } => [
+            y: LIST { True, True }  -- Binary 3
+            valid: True
+        ]
+
+        -- 4'b01?? : bit 2
+        LIST { False, True, __, __ } => [
+            y: LIST { False, True }  -- Binary 2
+            valid: True
+        ]
+
+        -- 4'b001? : bit 1
+        LIST { False, False, True, __ } => [
+            y: LIST { True, False }  -- Binary 1
+            valid: True
+        ]
+
+        -- 4'b0001 : bit 0
+        LIST { False, False, False, True } => [
+            y: LIST { False, False }  -- Binary 0
+            valid: True
+        ]
+
+        -- default: no valid input
+        __ => [
+            y: LIST { False, False }  -- Binary 0
+            valid: False
+        ]
+    }
+}
+
+-- Alternative: numeric representation
+FUNCTION prio_encoder_numeric(a3, a2, a1, a0) {
+    LIST { a3, a2, a1, a0 } |> WHEN {
+        LIST { True, __, __, __ } => [y: 3, valid: True]
+        LIST { False, True, __, __ } => [y: 2, valid: True]
+        LIST { False, False, True, __ } => [y: 1, valid: True]
+        LIST { False, False, False, True } => [y: 0, valid: True]
+        __ => [y: 0, valid: False]
+    }
+}

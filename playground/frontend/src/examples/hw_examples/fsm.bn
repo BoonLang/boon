@@ -1,0 +1,80 @@
+-- Finite State Machine
+-- 4-state FSM with input-dependent transitions
+-- Boon's WHEN models state transitions naturally
+
+-- State encoding using tags
+-- A = 2'b00, B = 2'b01, C = 2'b10, D = 2'b11
+
+FUNCTION fsm(clk_event, rst_event, a) {
+    BLOCK {
+        -- Sequential state register using LATEST
+        -- Maps to always_ff in SystemVerilog
+        state: LATEST {
+            B  -- Initial state (reset goes to B)
+
+            -- Asynchronous reset
+            rst_event |> WHEN {
+                Rising => B
+                __ => SKIP
+            }
+
+            -- Clock-triggered state transitions
+            clk_event |> WHEN {
+                Rising => state |> WHEN {
+                    A => C                              -- A -> C
+                    B => D                              -- B -> D
+                    C => a |> WHEN { True => D, False => B }  -- C -> D or B
+                    D => A                              -- D -> A
+                }
+                __ => SKIP
+            }
+        }
+
+        -- Combinational output logic
+        -- Maps to always_comb in SystemVerilog
+        b: state |> WHEN {
+            A => False
+            B => True
+            C => a |> WHEN { True => True, False => False }
+            D => False
+        }
+
+        [b: b]
+    }
+}
+
+-- Alternative: Explicit state encoding
+FUNCTION fsm_encoded(clk_event, rst_event, a) {
+    BLOCK {
+        state: LATEST {
+            LIST { False, True }  -- B = 2'b01
+
+            rst_event |> WHEN {
+                Rising => LIST { False, True }
+                __ => SKIP
+            }
+
+            clk_event |> WHEN {
+                Rising => state |> WHEN {
+                    LIST { False, False } => LIST { True, False }   -- A -> C
+                    LIST { False, True } => LIST { True, True }     -- B -> D
+                    LIST { True, False } => a |> WHEN {
+                        True => LIST { True, True }                 -- C -> D
+                        False => LIST { False, True }               -- C -> B
+                    }
+                    LIST { True, True } => LIST { False, False }    -- D -> A
+                }
+                __ => SKIP
+            }
+        }
+
+        b: state |> WHEN {
+            LIST { False, False } => False  -- A
+            LIST { False, True } => True    -- B
+            LIST { True, False } => a       -- C: output depends on input
+            LIST { True, True } => False    -- D
+        }
+
+        [b: b]
+    }
+}

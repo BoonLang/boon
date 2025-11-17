@@ -1,0 +1,30 @@
+-- SR latch (gate model)
+-- Cross-coupled NOR gates create bistable element
+-- Boon's reactive dataflow naturally models signal propagation
+
+FUNCTION sr_latch(s, r) {
+    BLOCK {
+        -- Cross-coupled NOR gates
+        -- q = NOR(r, nq)
+        -- nq = NOR(s, q)
+        -- In reactive Boon, we express the stable state relationship
+
+        q: r |> Bool/not() |> Bool/and(nq |> Bool/not())
+        nq: s |> Bool/not() |> Bool/and(q |> Bool/not())
+
+        [
+            q: q
+            nq: nq
+        ]
+    }
+}
+
+-- Alternative: Express as truth table using pattern matching
+FUNCTION sr_latch_truth(s, r) {
+    LIST { s, r } |> WHEN {
+        LIST { False, False } => [q: Hold, nq: Hold]  -- Hold state
+        LIST { True, False } => [q: True, nq: False]   -- Set
+        LIST { False, True } => [q: False, nq: True]   -- Reset
+        LIST { True, True } => [q: Invalid, nq: Invalid]  -- Invalid condition
+    }
+}

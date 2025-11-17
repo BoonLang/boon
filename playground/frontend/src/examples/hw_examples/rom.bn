@@ -1,0 +1,53 @@
+-- Simple asynchronous ROM
+-- Parameterized address and data width
+-- Memory initialized with address as data
+
+FUNCTION rom(addr) {
+    BLOCK {
+        -- ROM content: each address contains its own value
+        -- This models: initial for (i = 0; i < 2**AWIDTH; i = i+1) mem[i] = i;
+
+        -- In transpiler, this would generate memory initialization
+        mem: List/range(start: 0, end: 16)  -- 2^4 = 16 entries
+
+        -- Asynchronous read: assign data = mem[addr]
+        data: mem |> List/get(index: addr)
+
+        [data: data]
+    }
+}
+
+-- Parameterized version with explicit widths
+FUNCTION rom_param(awidth, dwidth, addr) {
+    BLOCK {
+        -- Memory size: 2^awidth entries
+        mem_size: 2 |> Number/pow(awidth)
+
+        -- Initialize: mem[i] = i (truncated to dwidth if needed)
+        mem: List/range(start: 0, end: mem_size)
+
+        -- Asynchronous read
+        data: mem |> List/get(index: addr)
+
+        [
+            data: data
+            awidth: awidth  -- Metadata for transpiler
+            dwidth: dwidth
+        ]
+    }
+}
+
+-- Alternative: Explicit content definition
+FUNCTION rom_with_content(addr, content) {
+    -- content is a list representing ROM contents
+    data: content |> List/get(index: addr)
+    [data: data]
+}
+
+-- Example: 4-address ROM with custom values
+FUNCTION example_rom() {
+    rom_with_content(
+        addr: 2
+        content: LIST { 10, 20, 30, 40 }  -- Returns 30
+    )
+}

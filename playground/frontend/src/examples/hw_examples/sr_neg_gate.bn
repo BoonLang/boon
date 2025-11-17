@@ -1,0 +1,29 @@
+-- SR latch with negated inputs (gate model)
+-- Cross-coupled NAND gates with active-low inputs
+-- Boon's reactive dataflow models signal propagation
+
+FUNCTION sr_neg_latch(ns, nr) {
+    BLOCK {
+        -- Cross-coupled NAND gates
+        -- q = NAND(ns, nq)
+        -- nq = NAND(nr, q)
+
+        q: ns |> Bool/and(nq) |> Bool/not()
+        nq: nr |> Bool/and(q) |> Bool/not()
+
+        [
+            q: q
+            nq: nq
+        ]
+    }
+}
+
+-- Alternative: Express as truth table with negated inputs
+FUNCTION sr_neg_latch_truth(ns, nr) {
+    LIST { ns, nr } |> WHEN {
+        LIST { True, True } => [q: Hold, nq: Hold]     -- Hold state (both inactive)
+        LIST { False, True } => [q: True, nq: False]   -- Set (ns active low)
+        LIST { True, False } => [q: False, nq: True]   -- Reset (nr active low)
+        LIST { False, False } => [q: Invalid, nq: Invalid]  -- Invalid condition
+    }
+}

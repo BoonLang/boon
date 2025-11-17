@@ -1,0 +1,85 @@
+-- Simple synchronous RAM
+-- Parameterized address and data width
+-- Asynchronous read, synchronous write
+
+FUNCTION ram(clk_event, addr, wraddr, wrdata) {
+    BLOCK {
+        -- Memory state using LATEST
+        -- Initial: mem[i] = i
+        mem: LATEST {
+            List/range(start: 0, end: 16)  -- 2^4 = 16 entries
+
+            -- Synchronous write: always_ff @(posedge clk) mem[wraddr] <= wrdata
+            clk_event |> WHEN {
+                Rising => mem |> List/set(index: wraddr, value: wrdata)
+                __ => SKIP
+            }
+        }
+
+        -- Asynchronous read: assign data = mem[addr]
+        data: mem |> List/get(index: addr)
+
+        [data: data]
+    }
+}
+
+-- Parameterized version
+FUNCTION ram_param(awidth, dwidth, clk_event, addr, wraddr, wrdata) {
+    BLOCK {
+        mem_size: 2 |> Number/pow(awidth)
+
+        mem: LATEST {
+            List/range(start: 0, end: mem_size)
+
+            clk_event |> WHEN {
+                Rising => mem |> List/set(index: wraddr, value: wrdata)
+                __ => SKIP
+            }
+        }
+
+        data: mem |> List/get(index: addr)
+
+        [
+            data: data
+            awidth: awidth  -- Metadata for transpiler
+            dwidth: dwidth
+        ]
+    }
+}
+
+-- Alternative: RAM with write enable
+FUNCTION ram_with_we(clk_event, addr, wraddr, wrdata, write_enable) {
+    BLOCK {
+        mem: LATEST {
+            List/range(start: 0, end: 16)
+
+            clk_event |> WHEN {
+                Rising => write_enable |> WHEN {
+                    True => mem |> List/set(index: wraddr, value: wrdata)
+                    False => SKIP
+                }
+                __ => SKIP
+            }
+        }
+
+        data: mem |> List/get(index: addr)
+
+        [data: data]
+    }
+}
+
+-- Example usage
+FUNCTION example_ram_operations() {
+    BLOCK {
+        -- Create RAM instance
+        my_ram: ram(
+            clk_event: Rising
+            addr: 5           -- Read from address 5
+            wraddr: 3         -- Write to address 3
+            wrdata: 42        -- Write value 42
+        )
+
+        -- Returns data at address 5, after writing 42 to address 3
+        my_ram.data
+    }
+}

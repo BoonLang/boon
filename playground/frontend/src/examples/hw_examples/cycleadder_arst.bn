@@ -1,0 +1,50 @@
+-- Accumulator with asynchronous reset
+-- Adds input to accumulator on clock cycles
+-- Boon's LATEST models sequential register behavior
+
+FUNCTION cycleadder(clk_event, rst_event, en, a) {
+    -- Sequential accumulator using LATEST for register state
+    -- Maps to always_ff in SystemVerilog
+
+    output: LATEST {
+        0  -- Initial value (corresponds to reset state)
+
+        -- Asynchronous reset has priority (posedge rst)
+        rst_event |> WHEN {
+            Rising => 0
+            __ => SKIP
+        }
+
+        -- Clock-triggered accumulation (posedge clk)
+        clk_event |> WHEN {
+            Rising => en |> WHEN {
+                True => output + a  -- O <= O + A when enabled
+                False => SKIP       -- Hold when disabled
+            }
+            __ => SKIP
+        }
+    }
+
+    [o: output]
+}
+
+-- Parameterized version (width as conceptual constraint)
+FUNCTION cycleadder_param(width, clk_event, rst_event, en, a) {
+    -- Width parameter would constrain bit operations in transpiler
+    output: LATEST {
+        0
+        rst_event |> WHEN { Rising => 0, __ => SKIP }
+        clk_event |> WHEN {
+            Rising => en |> WHEN {
+                True => output + a
+                False => SKIP
+            }
+            __ => SKIP
+        }
+    }
+
+    [
+        o: output
+        width: width  -- Metadata for transpiler
+    ]
+}

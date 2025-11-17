@@ -1,0 +1,50 @@
+-- Master-slave D flip-flop
+-- Edge-triggered storage element using two D latches
+-- Boon's LATEST captures sequential state changes
+
+FUNCTION d_latch(d, e) {
+    BLOCK {
+        nd: d |> Bool/not()
+        s: e |> Bool/and(d)
+        r: e |> Bool/and(nd)
+
+        q: r |> Bool/not() |> Bool/and(nq |> Bool/not())
+        nq: s |> Bool/not() |> Bool/and(q |> Bool/not())
+
+        [q: q, nq: nq]
+    }
+}
+
+FUNCTION dff_master_slave(clk, d) {
+    BLOCK {
+        nclk: clk |> Bool/not()
+
+        -- Master latch (transparent when clk high)
+        master: d_latch(d: d, e: clk)
+
+        -- Slave latch (transparent when clk low / nclk high)
+        slave: d_latch(d: master.q, e: nclk)
+
+        [o: slave.q]
+    }
+}
+
+-- Behavioral model using Boon's reactive events
+FUNCTION dff_behavioral(clk_event, d) {
+    LATEST {
+        False  -- Initial output
+        clk_event |> WHEN {
+            Rising => d      -- Sample D on rising edge
+            __ => SKIP
+        }
+    }
+}
+
+-- Alternative: Toggle pattern similar to TodoMVC
+FUNCTION dff_toggle(clk_rise_event, d) {
+    output: LATEST {
+        False
+        clk_rise_event |> THEN { d }
+    }
+    [o: output]
+}

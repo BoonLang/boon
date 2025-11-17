@@ -1,0 +1,54 @@
+-- Multibit serial adder
+-- Parameterized width using List operations
+-- Boon's List/map replicates hardware generate construct
+
+FUNCTION halfadder(a, b) {
+    [
+        o: a |> Bool/xor(b)
+        c: a |> Bool/and(b)
+    ]
+}
+
+FUNCTION fulladder(a, b, d) {
+    BLOCK {
+        ha1: halfadder(a: a, b: b)
+        ha2: halfadder(a: ha1.o, b: d)
+        [
+            o: ha2.o
+            c: ha1.c |> Bool/or(ha2.c)
+        ]
+    }
+}
+
+FUNCTION serialadder(a_bits, b_bits) {
+    BLOCK {
+        -- Generate adder chain using List/fold (like generate in Verilog)
+        -- Carries propagate through the chain
+        result: LIST { a_bits, b_bits }
+            |> List/zip()
+            |> List/fold(
+                init: [sums: LIST {}, carry: False]
+                item, acc: BLOCK {
+                    fa: fulladder(a: item.first, b: item.second, d: acc.carry)
+                    [
+                        sums: acc.sums |> List/append(item: fa.o)
+                        carry: fa.c
+                    ]
+                }
+            )
+
+        -- Output includes final carry (overflow bit)
+        [
+            o: result.sums |> List/append(item: result.carry)
+        ]
+    }
+}
+
+-- Example usage:
+-- 4-bit addition: [0,1,1,0] + [0,1,0,1] = [0,0,0,0,1] (6 + 5 = 11)
+FUNCTION example_4bit_add() {
+    serialadder(
+        a_bits: LIST { False, True, True, False }  -- 6 in binary LSB first
+        b_bits: LIST { True, False, True, False }  -- 5 in binary LSB first
+    )
+}

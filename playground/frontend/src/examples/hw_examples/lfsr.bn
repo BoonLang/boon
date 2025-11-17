@@ -1,0 +1,68 @@
+-- Linear feedback shift register
+-- 8-bit LFSR with feedback taps at positions 7 and 3
+-- Generates pseudo-random sequences
+
+FUNCTION lfsr(clk_event, reset_event) {
+    -- Sequential register with feedback using LATEST
+    -- Maps to always_ff in SystemVerilog
+
+    out: LATEST {
+        LIST { False, False, False, False, False, False, False, False }  -- Initial: 8'b0
+
+        -- Asynchronous reset
+        reset_event |> WHEN {
+            Rising => LIST { False, False, False, False, False, False, False, False }
+            __ => SKIP
+        }
+
+        -- Clock-triggered shift with feedback
+        clk_event |> WHEN {
+            Rising => BLOCK {
+                -- Linear feedback: NOT(out[7] XOR out[3])
+                feedback: out |> List/get(index: 7) |> Bool/xor(
+                    out |> List/get(index: 3)
+                ) |> Bool/not()
+
+                -- Shift right, feedback enters at LSB
+                LIST {
+                    out |> List/get(index: 6)
+                    out |> List/get(index: 5)
+                    out |> List/get(index: 4)
+                    out |> List/get(index: 3)
+                    out |> List/get(index: 2)
+                    out |> List/get(index: 1)
+                    out |> List/get(index: 0)
+                    feedback
+                }
+            }
+            __ => SKIP
+        }
+    }
+
+    [out: out]
+}
+
+-- Alternative: Using List operations for shift
+FUNCTION lfsr_list_ops(clk_event, reset_event) {
+    out: LATEST {
+        List/repeat(item: False, count: 8)
+
+        reset_event |> WHEN { Rising => List/repeat(item: False, count: 8), __ => SKIP }
+
+        clk_event |> WHEN {
+            Rising => BLOCK {
+                feedback: out |> List/get(index: 7) |> Bool/xor(
+                    out |> List/get(index: 3)
+                ) |> Bool/not()
+
+                -- Shift: drop MSB, prepend feedback at LSB
+                out
+                    |> List/drop_last()
+                    |> List/prepend(item: feedback)
+            }
+            __ => SKIP
+        }
+    }
+
+    [out: out]
+}
