@@ -1,7 +1,7 @@
 # BITS and BYTES: Binary Data in Boon
 
 **Date**: 2025-11-17
-**Status**: Design Specification
+**Status**: Design Specification (Updated)
 **Scope**: Binary data literals and operations across all Boon domains
 
 ---
@@ -16,10 +16,12 @@ Boon provides two complementary abstractions for binary data:
 Both use consistent literal syntax (like TEXT {} and LIST {}) and provide domain-appropriate operations that work universally across FPGA, Web/Wasm, Server, Embedded, and 3D contexts.
 
 **Key design principles:**
-- **Explicit over implicit** - Widths and sizes are always known
+- **Explicit over implicit** - Width and signedness always required, no guessing
+- **No surprises** - Errors on overflow, pattern mismatch (Rust/Elm philosophy)
 - **Semantic clarity** - BITS for bit-level work, BYTES for byte-level work
 - **Universal applicability** - Same abstractions work everywhere
 - **Clean conversions** - Bridge between Bool, Tags, Numbers, Text
+- **Unified literal syntax** - `base[s|u]value` format (e.g., `10u100`, `2s1010`, `16uFF`)
 
 ---
 
@@ -40,28 +42,87 @@ Both use consistent literal syntax (like TEXT {} and LIST {}) and provide domain
 
 ### Literal Syntax
 
+**Core format: `BITS { width, base[s|u]value }`**
+
+Width is always required. Value uses unified format: `base[s|u]digits` where base is 2, 8, 10, or 16, and `s`/`u` indicates signed/unsigned.
+
 ```boon
--- Binary literal (width inferred from digit count)
-flags: BITS { 1011 }                    -- 4-bit: 0b1011
+-- Decimal values (base 10)
+counter: BITS { 8, 10u42 }              -- 8-bit, unsigned, value 42
+threshold: BITS { 16, 10u1000 }         -- 16-bit, unsigned, value 1000
+zero_reg: BITS { 32, 10u0 }             -- 32-bit, unsigned, all zeros
 
--- Explicit width with decimal value
-counter: BITS { width: 8, value: 42 }  -- 8-bit: 0b00101010
+-- Signed decimal values
+temperature: BITS { 12, 10s0 }          -- 12-bit, signed, value 0
+offset: BITS { 16, 10s-500 }            -- 16-bit, signed, negative 500
+positive_signed: BITS { 8, 10s100 }     -- 8-bit, signed, positive 100
 
--- Hexadecimal (width = 4 * hex digits)
-color: BITS { 0xFF80 }                  -- 16-bit: 0xFF80
-mask: BITS { 0x0F }                     -- 8-bit: 0x0F
+-- Binary patterns (base 2)
+flags: BITS { 8, 2u10110010 }           -- 8-bit, unsigned, binary pattern
+mask: BITS { 4, 2u1111 }                -- 4-bit, unsigned, all ones
+signed_pattern: BITS { 8, 2s11111111 }  -- 8-bit, signed, pattern = -1
 
--- Verilog-style literals (familiar for hardware)
-register: BITS { 32'd12345 }            -- 32-bit decimal
-opcode: BITS { 8'hFF }                  -- 8-bit hex
-state: BITS { 4'b1010 }                 -- 4-bit binary
+-- Hexadecimal patterns (base 16)
+color: BITS { 32, 16uFF8040FF }         -- 32-bit, unsigned, RGBA
+address: BITS { 16, 16uABCD }           -- 16-bit, unsigned, hex
+signed_hex: BITS { 8, 16sFF }           -- 8-bit, signed, pattern = -1
 
--- Zero/one filled
-zero_reg: BITS { width: 16, zero }      -- All zeros
-one_reg: BITS { width: 16, ones }       -- All ones
+-- Octal patterns (base 8)
+octal_val: BITS { 12, 8u7777 }          -- 12-bit, unsigned, octal
 
--- From list of bools (LSB first)
-manual: BITS { bits: LIST { True, True, False, True } }  -- 4'b1011
+-- Underscore separators for readability (planned)
+long_mask: BITS { 32, 2u1111_0000_1111_0000_1111_0000_1111_0000 }
+hex_color: BITS { 32, 16uFF_80_40_FF }
+
+-- Dynamic width (parameterized modules)
+reg: BITS { width, 10u0 }               -- Width from variable
+reg: BITS { width * 2, 16uFF }          -- Width from expression
+```
+
+### Width and Value Rules
+
+**Pattern has more digits than width → ERROR**
+```boon
+BITS { 4, 2u10110010 }  -- ERROR: 8-bit pattern doesn't fit in 4-bit width
+-- Compile-time error if width is literal
+-- Runtime error if width is dynamic
+```
+
+**Pattern has fewer digits than width → Zero-extend from left**
+```boon
+BITS { 16, 2u1010 }     -- OK: becomes 0000_0000_0000_1010
+BITS { 8, 16uF }        -- OK: becomes 0000_1111
+```
+
+**Decimal value exceeds width → ERROR**
+```boon
+BITS { 8, 10u256 }      -- ERROR: 256 requires 9 bits, max for 8-bit unsigned is 255
+BITS { 4, 10u20 }       -- ERROR: 20 requires 5 bits
+BITS { 8, 10s128 }      -- ERROR: 128 exceeds 8-bit signed max (127)
+```
+
+**Negative values only with signed (s) → Unsigned cannot be negative**
+```boon
+BITS { 8, 10s-100 }     -- OK: signed negative decimal
+BITS { 8, 10u-100 }     -- ERROR: unsigned cannot be negative
+BITS { 8, 2s11111111 }  -- OK: signed pattern (two's complement = -1)
+BITS { 8, 2u11111111 }  -- OK: unsigned pattern (= 255)
+```
+
+### Helper Functions
+
+```boon
+-- Unsigned helpers (u_ prefix)
+Bits/u_zeros(width: 32)                 -- 32-bit unsigned all zeros
+Bits/u_ones(width: 16)                  -- 16-bit unsigned all ones (65535)
+Bits/u_from_number(value: 42, width: 8) -- Unsigned from number
+
+-- Signed helpers (s_ prefix)
+Bits/s_zeros(width: 32)                 -- 32-bit signed all zeros
+Bits/s_ones(width: 16)                  -- 16-bit signed all ones (-1)
+Bits/s_from_number(value: -42, width: 8) -- Signed from number
+
+-- These match the literal syntax: u_ for unsigned, s_ for signed
 ```
 
 ### Core Operations
@@ -69,8 +130,9 @@ manual: BITS { bits: LIST { True, True, False, True } }  -- 4'b1011
 ```boon
 -- Width and value
 Bits/width(bits)                        -- Number of bits
-Bits/to_number(bits)                    -- Convert to number
-Bits/from_number(value: 42, width: 8)   -- Number to bits
+Bits/to_number(bits)                    -- Convert to number (respects signedness)
+Bits/u_from_number(value: 42, width: 8) -- Number to unsigned bits
+Bits/s_from_number(value: -42, width: 8) -- Number to signed bits
 
 -- Bit access
 Bits/get(bits, index: 3)                -- Get single bit (Bool)
@@ -131,19 +193,79 @@ Bits/is_power_of_two(bits)
 
 ```boon
 -- Operations preserve width of first operand
-a: BITS { width: 8, value: 200 }
-b: BITS { width: 8, value: 100 }
-sum: Bits/add(a, b)  -- Returns BITS { width: 8, value: 44 } (wraps)
+a: BITS { 8, 10u200 }
+b: BITS { 8, 10u100 }
+sum: a |> Bits/add(b)  -- Width preserved
 
--- Mismatched widths: shorter operand is zero-extended
-a: BITS { width: 8, value: 0xFF }
-b: BITS { width: 4, value: 0x3 }
-result: Bits/and(a, b)  -- b becomes 0x03, result is 0x03
+-- Mismatched widths: Error or auto-extend (TBD)
+a: BITS { 8, 16uFF }
+b: BITS { 4, 16u3 }
+result: a |> Bits/and(b)  -- Error: width mismatch? Or zero-extend b?
 
 -- Explicit width change
-extended: BITS { width: 4, value: 0xF } |> Bits/zero_extend(to: 8)  -- 0x0F
-extended: BITS { width: 4, value: 0xF } |> Bits/sign_extend(to: 8)  -- 0xFF
-truncated: BITS { width: 8, value: 0xFF } |> Bits/truncate(to: 4)   -- 0xF
+extended: BITS { 4, 16uF } |> Bits/zero_extend(to: 8)  -- 16u0F (zero-extended)
+extended: BITS { 4, 16sF } |> Bits/sign_extend(to: 8)  -- 16sFF (sign bit extends)
+truncated: BITS { 8, 16uFF } |> Bits/truncate(to: 4)   -- 16uF (lower 4 bits)
+```
+
+### Overflow Behavior (Arithmetic)
+
+**Debug mode:** Panic on overflow (catches bugs early)
+**Release/FPGA mode:** Wrap silently (hardware behavior, performance)
+
+```boon
+a: BITS { 8, 10u200 }
+b: BITS { 8, 10u100 }
+sum: a |> Bits/add(b)  -- 300 overflows 8 bits!
+-- Debug: PANIC: overflow, 200 + 100 = 300 exceeds 8-bit unsigned max (255)
+-- Release: Returns BITS { 8, 10u44 } (300 mod 256)
+```
+
+**Explicit variants (always available):**
+```boon
+-- Wrapping (always wraps, no panic)
+sum: a |> Bits/add_wrapping(b)           -- BITS { 8, 10u44 }
+
+-- Checked (returns Result)
+sum: a |> Bits/add_checked(b)            -- Error[Overflow] or Ok[BITS { 8, ... }]
+
+-- Saturating (clamps to max/min)
+sum: a |> Bits/add_saturating(b)         -- BITS { 8, 10u255 } (clamped)
+
+-- Widening (result has more bits)
+sum: a |> Bits/add_widening(b)           -- BITS { 9, 10u300 } (wider result)
+```
+
+### Signedness
+
+BITS tracks signedness internally (like it tracks width). Signedness is determined by the `s` or `u` in the literal.
+
+```boon
+-- Unsigned (u in literal)
+u: BITS { 8, 16uFF }                     -- Unsigned: 255
+u |> Bits/is_signed()                    -- False
+u |> Bits/to_number()                    -- 255
+
+-- Signed (s in literal)
+s: BITS { 8, 16sFF }                     -- Signed: -1
+s |> Bits/is_signed()                    -- True
+s |> Bits/to_number()                    -- -1
+
+-- Signed negative decimal
+s: BITS { 8, 10s-100 }                   -- Signed negative
+s |> Bits/to_number()                    -- -100
+
+-- Operations respect signedness
+u |> Bits/shift_right(by: 2)             -- Logical shift (zero-fill)
+s |> Bits/shift_right(by: 2)             -- Arithmetic shift (sign-extend)
+
+u |> Bits/less_than(other_u)             -- Unsigned comparison
+s |> Bits/less_than(other_s)             -- Signed comparison
+
+-- Mixing signed/unsigned = Error
+u |> Bits/add(s)                         -- ERROR: signed/unsigned mismatch
+-- Must convert explicitly:
+u |> Bits/add(s |> Bits/as_unsigned())   -- OK
 ```
 
 ---
@@ -152,29 +274,37 @@ truncated: BITS { width: 8, value: 0xFF } |> Bits/truncate(to: 4)   -- 0xF
 
 ### Literal Syntax
 
+**Core format: `BYTES { byte, byte, ... }`**
+
+Bytes can be decimal or hex (using 16# for consistency with BITS).
+
 ```boon
--- Hex bytes (most common)
-data: BYTES { 0xFF, 0x00, 0xAB, 0xCD }  -- 4 bytes
+-- Hex bytes (most common, using 16# for consistency)
+data: BYTES { 16#FF, 16#00, 16#AB, 16#CD }  -- 4 bytes
 
 -- Decimal bytes
-data: BYTES { 255, 0, 171, 205 }        -- Same as above
+data: BYTES { 255, 0, 171, 205 }            -- Same as above
+
+-- Mixed
+header: BYTES { 16#89, 16#50, 78, 71 }      -- PNG magic bytes
+
+-- Single byte
+single: BYTES { 16#FF }                      -- 1 byte
 
 -- From text with encoding
 utf8_data: BYTES { text: TEXT { Hello }, encoding: UTF8 }
-ascii_data: BYTES { text: TEXT { OK }, encoding: ASCII }
 
 -- From Base64
 decoded: BYTES { base64: TEXT { SGVsbG8gV29ybGQ= } }
 
 -- Zero-filled buffer
-buffer: BYTES { length: 1024 }          -- 1KB of zeros
+buffer: BYTES { length: 1024 }              -- 1KB of zeros
 
 -- From hex string
 parsed: BYTES { hex: TEXT { FF00ABCD } }
-
--- Single byte
-single: BYTES { 0xFF }                   -- 1 byte
 ```
+
+**Note:** BYTES uses 16# for hex to be consistent with BITS syntax. No 0x prefix.
 
 ### Core Operations
 
@@ -184,15 +314,15 @@ Bytes/length(bytes)                      -- Number of bytes
 
 -- Byte access
 Bytes/get(bytes, index: 0)              -- Single byte (0-255)
-Bytes/set(bytes, index: 0, value: 0xFF) -- Set byte
+Bytes/set(bytes, index: 0, value: 16#FF)-- Set byte
 Bytes/slice(bytes, start: 0, end: 4)    -- Sub-range [start, end)
 Bytes/drop(bytes, count: 2)             -- Remove first N bytes
 Bytes/take(bytes, count: 4)             -- Keep first N bytes
 
 -- Concatenation
 Bytes/concat(LIST { a, b, c })          -- Join buffers
-Bytes/append(bytes, byte: 0xFF)         -- Add byte at end
-Bytes/prepend(bytes, byte: 0x00)        -- Add byte at start
+Bytes/append(bytes, byte: 16#FF)        -- Add byte at end
+Bytes/prepend(bytes, byte: 16#00)       -- Add byte at start
 
 -- Typed views (read as specific type)
 Bytes/read_u8(bytes, offset: 0)
@@ -219,15 +349,15 @@ Bytes/from_hex(hex_text)
 Bytes/from_base64(base64_text)
 
 -- Search and comparison
-Bytes/find(bytes, pattern: BYTES { 0xFF, 0x00 })  -- Find pattern
-Bytes/starts_with(bytes, prefix: BYTES { 0x89, 0x50 })  -- PNG header?
+Bytes/find(bytes, pattern: BYTES { 16#FF, 16#00 })  -- Find pattern
+Bytes/starts_with(bytes, prefix: BYTES { 16#89, 16#50 })  -- PNG header?
 Bytes/ends_with(bytes, suffix: ...)
 Bytes/equal(a, b)                       -- Byte-wise equality
 
 -- Transformation
 Bytes/reverse(bytes)                    -- Reverse byte order
-Bytes/map(bytes, byte => byte |> Bits/xor(0xFF))  -- Transform each byte
-Bytes/fill(bytes, start: 0, end: 10, value: 0x00)  -- Fill range
+Bytes/map(bytes, byte => byte |> Bits/xor(16#FF))  -- Transform each byte
+Bytes/fill(bytes, start: 0, end: 10, value: 16#00)  -- Fill range
 ```
 
 ### Endianness
@@ -251,38 +381,37 @@ swapped: Bytes/swap_endian_64(value)
 
 ```boon
 -- BITS to BYTES (pads to byte boundary if needed)
-bits: BITS { 12'hABC }                  -- 12 bits
-bytes: bits |> Bits/to_bytes()          -- BYTES { 0x0A, 0xBC } (2 bytes, padded)
+bits: BITS { 12, 16uABC }                  -- 12 bits
+bytes: bits |> Bits/to_bytes()             -- BYTES { 16#0A, 16#BC } (2 bytes, padded)
 
--- BYTES to BITS
-bytes: BYTES { 0xFF, 0x00 }
-bits: bytes |> Bytes/to_bits()          -- BITS { width: 16, 0xFF00 }
+-- BYTES to BITS (unsigned by default)
+bytes: BYTES { 16#FF, 16#00 }
+bits: bytes |> Bytes/to_u_bits()           -- BITS { 16, 16uFF00 } (unsigned)
+bits: bytes |> Bytes/to_s_bits()           -- BITS { 16, 16sFF00 } (signed)
 
 -- Explicit padding control
-bits: BITS { 5'b11011 }                 -- 5 bits
-bytes: bits |> Bits/to_bytes(pad: Left)  -- BYTES { 0b00011011 }
-bytes: bits |> Bits/to_bytes(pad: Right) -- BYTES { 0b11011000 }
+bits: BITS { 5, 2u11011 }                  -- 5 bits
+bytes: bits |> Bits/to_bytes(pad: Left)   -- BYTES { 16#1B } (00011011)
+bytes: bits |> Bits/to_bytes(pad: Right)  -- BYTES { 16#D8 } (11011000)
 ```
 
 ### BITS ↔ Number
 
 ```boon
--- To number (unsigned)
-num: BITS { 8'hFF } |> Bits/to_number()  -- 255
+-- To number (respects internal signedness)
+num: BITS { 8, 16uFF } |> Bits/to_number()       -- 255 (unsigned)
+num: BITS { 8, 16sFF } |> Bits/to_number()       -- -1 (signed)
 
--- To number (signed, two's complement)
-num: BITS { 8'hFF } |> Bits/to_number_signed()  -- -1
-
--- From number
-bits: Bits/from_number(value: 42, width: 8)  -- BITS { 8'd42 }
-bits: Bits/from_number(value: -1, width: 8)  -- BITS { 8'hFF }
+-- From number (u_ or s_ prefix)
+bits: Bits/u_from_number(value: 42, width: 8)    -- BITS { 8, 10u42 }
+bits: Bits/s_from_number(value: -1, width: 8)    -- BITS { 8, 10s-1 }
 ```
 
 ### BYTES ↔ Number
 
 ```boon
 -- Single byte to number
-num: BYTES { 0xFF } |> Bytes/get(index: 0)  -- 255
+num: BYTES { 16#FF } |> Bytes/get(index: 0)  -- 255
 
 -- Multi-byte to number (via typed read)
 num: Bytes/read_u32(bytes, offset: 0, endian: Little)
@@ -292,12 +421,13 @@ num: Bytes/read_u32(bytes, offset: 0, endian: Little)
 
 ```boon
 -- Single bit to Bool
-bit: BITS { 1'b1 }
+bit: BITS { 1, 2u1 }
 bool: bit |> Bits/to_bool()  -- True
 
--- Bool to single bit
+-- Bool to single bit (unsigned by default)
 bool: True
-bit: bool |> Bool/to_bit()  -- BITS { 1'b1 }
+bit: bool |> Bool/to_u_bit()   -- BITS { 1, 2u1 }
+bit: bool |> Bool/to_s_bit()   -- BITS { 1, 2s1 }
 
 -- Get bit as Bool
 flag: register |> Bits/get(index: 7)  -- Returns Bool
@@ -307,17 +437,17 @@ flag: register |> Bits/get(index: 7)  -- Returns Bool
 
 ```boon
 -- BITS to text representations
-BITS { 8'hFF } |> Bits/to_text(format: Binary)  -- "11111111"
-BITS { 8'hFF } |> Bits/to_text(format: Hex)     -- "FF"
-BITS { 8'd255 } |> Bits/to_text(format: Decimal) -- "255"
+BITS { 8, 16uFF } |> Bits/to_text(format: Binary)   -- "11111111"
+BITS { 8, 16uFF } |> Bits/to_text(format: Hex)      -- "FF"
+BITS { 8, 10u255 } |> Bits/to_text(format: Decimal) -- "255"
 
--- Parse text to BITS
-BITS { binary: TEXT { 11111111 } }              -- 8-bit from binary string
-BITS { hex: TEXT { FF }, width: 8 }             -- 8-bit from hex string
+-- Parse text to BITS (must specify signedness)
+Bits/u_from_binary_text(TEXT { 11111111 })          -- 8-bit unsigned from binary string
+Bits/s_from_hex_text(TEXT { FF }, width: 8)         -- 8-bit signed from hex string
 
 -- BYTES to text
-BYTES { 0xFF, 0x00 } |> Bytes/to_hex()          -- "FF00"
-BYTES { 0xFF, 0x00 } |> Bytes/to_base64()       -- "/wA="
+BYTES { 16#FF, 16#00 } |> Bytes/to_hex()             -- "FF00"
+BYTES { 16#FF, 16#00 } |> Bytes/to_base64()          -- "/wA="
 BYTES { text: TEXT { Hi }, encoding: UTF8 } |> Bytes/to_text(encoding: UTF8)  -- "Hi"
 ```
 
@@ -344,8 +474,8 @@ flag_schema: [
     alpha_blend: 3
 ]
 
-packed: render_state |> Flags/pack(schema: flag_schema)
--- Result: BITS { 4'b0110 }
+packed: render_state |> Flags/u_pack(schema: flag_schema)
+-- Result: BITS { 4, 2u0110 }
 
 -- Unpack back to record
 unpacked: packed |> Flags/unpack(schema: flag_schema)
@@ -372,12 +502,12 @@ message_encoding: [
     Error: 15
 ]
 
--- Encode tag to bits
-type_bits: Data |> Tag/to_bits(encoding: message_encoding, width: 4)
--- Result: BITS { 4'd1 }
+-- Encode tag to bits (u_ for unsigned)
+type_bits: Data |> Tag/to_u_bits(encoding: message_encoding, width: 4)
+-- Result: BITS { 4, 10u1 }
 
 -- Decode bits to tag
-type_tag: BITS { 4'd2 } |> Tag/from_bits(encoding: message_encoding)
+type_tag: BITS { 4, 10u2 } |> Tag/from_bits(encoding: message_encoding)
 -- Result: Ack
 
 -- Pattern matching helper
@@ -425,10 +555,10 @@ FUNCTION parse_message(raw_bits) {
 ```boon
 -- Exact match
 opcode |> WHEN {
-    BITS { 8'h00 } => Nop
-    BITS { 8'h01 } => Load
-    BITS { 8'h02 } => Store
-    BITS { 8'hFF } => Halt
+    BITS { 8, 16u00 } => Nop
+    BITS { 8, 16u01 } => Load
+    BITS { 8, 16u02 } => Store
+    BITS { 8, 16uFF } => Halt
     __ => Unknown
 }
 
@@ -456,10 +586,10 @@ instruction |> WHEN {
 ```boon
 -- File type detection by magic bytes
 file_bytes |> Bytes/take(count: 4) |> WHEN {
-    BYTES { 0x89, 0x50, 0x4E, 0x47 } => PngFile
-    BYTES { 0xFF, 0xD8, 0xFF, 0xE0 } => JpegFile
-    BYTES { 0x47, 0x49, 0x46, 0x38 } => GifFile
-    BYTES { 0x25, 0x50, 0x44, 0x46 } => PdfFile
+    BYTES { 16#89, 16#50, 16#4E, 16#47 } => PngFile
+    BYTES { 16#FF, 16#D8, 16#FF, 16#E0 } => JpegFile
+    BYTES { 16#47, 16#49, 16#46, 16#38 } => GifFile
+    BYTES { 16#25, 16#50, 16#44, 16#46 } => PdfFile
     __ => UnknownFile
 }
 
@@ -489,10 +619,10 @@ FUNCTION sr_latch(s, r) {
 -- 4-bit counter with async reset
 FUNCTION counter(clk_event, rst_event) {
     count: LATEST {
-        BITS { width: 4, zero }
+        BITS { 4, 10u0 }
 
         rst_event |> WHEN {
-            Rising => BITS { width: 4, zero }
+            Rising => BITS { 4, 10u0 }
             __ => SKIP
         }
 
@@ -508,17 +638,17 @@ FUNCTION counter(clk_event, rst_event) {
 -- Priority encoder
 FUNCTION priority_encoder(input) {
     input |> WHEN {
-        BITS { 1, __, __, __ } => [y: BITS { 2'b11 }, valid: True]
-        BITS { 0, 1, __, __ } => [y: BITS { 2'b10 }, valid: True]
-        BITS { 0, 0, 1, __ } => [y: BITS { 2'b01 }, valid: True]
-        BITS { 0, 0, 0, 1 } => [y: BITS { 2'b00 }, valid: True]
-        __ => [y: BITS { 2'b00 }, valid: False]
+        BITS { 1, __, __, __ } => [y: BITS { 2, 2u11 }, valid: True]
+        BITS { 0, 1, __, __ } => [y: BITS { 2, 2u10 }, valid: True]
+        BITS { 0, 0, 1, __ } => [y: BITS { 2, 2u01 }, valid: True]
+        BITS { 0, 0, 0, 1 } => [y: BITS { 2, 2u00 }, valid: True]
+        __ => [y: BITS { 2, 2u00 }, valid: False]
     }
 }
 
 -- Linear Feedback Shift Register
 FUNCTION lfsr_step(state) {
-    -- state is BITS { width: 8 }
+    -- state is BITS { 8, ... }
     feedback: state |> Bits/get(index: 7)
         |> Bool/xor(state |> Bits/get(index: 3))
         |> Bool/not()
@@ -538,8 +668,8 @@ FUNCTION parse_ws_frame(bytes) {
         first_byte: bytes |> Bytes/get(index: 0)
         second_byte: bytes |> Bytes/get(index: 1)
 
-        first_bits: BITS { width: 8, value: first_byte }
-        second_bits: BITS { width: 8, value: second_byte }
+        first_bits: Bits/u_from_number(value: first_byte, width: 8)
+        second_bits: Bits/u_from_number(value: second_byte, width: 8)
 
         [
             fin: first_bits |> Bits/get(index: 7)
@@ -556,7 +686,7 @@ FUNCTION parse_ws_frame(bytes) {
 -- Canvas pixel manipulation (RGBA packed)
 FUNCTION adjust_brightness(pixel_bytes, factor) {
     pixel: Bytes/read_u32(pixel_bytes, offset: 0, endian: Little)
-    pixel_bits: BITS { width: 32, value: pixel }
+    pixel_bits: Bits/u_from_number(value: pixel, width: 32)
 
     r: pixel_bits |> Bits/slice(high: 7, low: 0) |> Bits/to_number()
     g: pixel_bits |> Bits/slice(high: 15, low: 8) |> Bits/to_number()
@@ -567,11 +697,11 @@ FUNCTION adjust_brightness(pixel_bytes, factor) {
     new_g: (g * factor) |> Number/min(255) |> Number/floor()
     new_b: (b * factor) |> Number/min(255) |> Number/floor()
 
-    BITS { width: 32, zero }
-        |> Bits/set_slice(high: 7, low: 0, value: Bits/from_number(value: new_r, width: 8))
-        |> Bits/set_slice(high: 15, low: 8, value: Bits/from_number(value: new_g, width: 8))
-        |> Bits/set_slice(high: 23, low: 16, value: Bits/from_number(value: new_b, width: 8))
-        |> Bits/set_slice(high: 31, low: 24, value: Bits/from_number(value: new_a, width: 8))
+    BITS { 32, 10u0 }
+        |> Bits/set_slice(high: 7, low: 0, value: Bits/u_from_number(value: new_r, width: 8))
+        |> Bits/set_slice(high: 15, low: 8, value: Bits/u_from_number(value: new_g, width: 8))
+        |> Bits/set_slice(high: 23, low: 16, value: Bits/u_from_number(value: new_b, width: 8))
+        |> Bits/set_slice(high: 31, low: 24, value: Bits/u_from_number(value: new_a, width: 8))
 }
 
 -- Feature flags for WebGL
@@ -580,13 +710,13 @@ render_flags: [
     enable_reflections: False
     enable_antialiasing: True
     enable_bloom: False
-] |> Flags/pack(schema: [
+] |> Flags/u_pack(schema: [
     enable_shadows: 0
     enable_reflections: 1
     enable_antialiasing: 2
     enable_bloom: 3
 ])
--- Result: BITS { 4'b0101 }
+-- Result: BITS { 4, 2u0101 }
 ```
 
 ### Server / Networking
@@ -601,7 +731,7 @@ FUNCTION parse_tcp_header(bytes) {
         ack_num: Bytes/read_u32(bytes, offset: 8, endian: Big)
 
         flags_byte: bytes |> Bytes/get(index: 13)
-        flags: BITS { width: 8, value: flags_byte }
+        flags: Bits/u_from_number(value: flags_byte, width: 8)
 
         [
             source_port: src_port
@@ -624,9 +754,9 @@ FUNCTION parse_tcp_header(bytes) {
 FUNCTION build_message(type_tag, sequence, payload) {
     BLOCK {
         header: Bits/concat(LIST {
-            type_tag |> Tag/to_bits(encoding: message_encoding, width: 4)
-            Bits/from_number(value: sequence, width: 12)
-            Bits/from_number(value: Bytes/length(payload), width: 16)
+            type_tag |> Tag/to_u_bits(encoding: message_encoding, width: 4)
+            Bits/u_from_number(value: sequence, width: 12)
+            Bits/u_from_number(value: Bytes/length(payload), width: 16)
         })
 
         header_bytes: header |> Bits/to_bytes()
@@ -637,7 +767,7 @@ FUNCTION build_message(type_tag, sequence, payload) {
 -- Hash computation (XOR-based simple hash)
 FUNCTION simple_hash(data) {
     data
-        |> Bytes/to_bits()
+        |> Bytes/to_u_bits()
         |> Bits/reduce_xor()
 }
 ```
@@ -649,16 +779,16 @@ FUNCTION simple_hash(data) {
 FUNCTION configure_gpio(pin, mode) {
     BLOCK {
         -- Read current config
-        config_reg: Memory/read(address: 0x4000_0000)
-        config_bits: BITS { width: 32, value: config_reg }
+        config_reg: Memory/read(address: 16u40000000)
+        config_bits: Bits/u_from_number(value: config_reg, width: 32)
 
         -- Set mode bits for pin (2 bits per pin)
         pin_offset: pin * 2
         mode_bits: mode |> WHEN {
-            Input => BITS { 2'b00 }
-            Output => BITS { 2'b01 }
-            Alternate => BITS { 2'b10 }
-            Analog => BITS { 2'b11 }
+            Input => BITS { 2, 2u00 }
+            Output => BITS { 2, 2u01 }
+            Alternate => BITS { 2, 2u10 }
+            Analog => BITS { 2, 2u11 }
         }
 
         new_config: config_bits
@@ -669,17 +799,17 @@ FUNCTION configure_gpio(pin, mode) {
             )
 
         -- Write back
-        Memory/write(address: 0x4000_0000, value: new_config |> Bits/to_number())
+        Memory/write(address: 16u40000000, value: new_config |> Bits/to_number())
     }
 }
 
 -- SPI data transfer
 FUNCTION spi_transfer(tx_byte) {
-    tx_bits: BITS { width: 8, value: tx_byte }
+    tx_bits: Bits/u_from_number(value: tx_byte, width: 8)
 
     -- Shift out MSB first, shift in response
     List/range(start: 7, end: -1) |> List/fold(
-        init: [tx: tx_bits, rx: BITS { width: 8, zero }]
+        init: [tx: tx_bits, rx: BITS { 8, 10u0 }]
         bit_idx, acc: BLOCK {
             -- Set MOSI
             mosi: acc.tx |> Bits/get(index: bit_idx)
@@ -704,8 +834,8 @@ FUNCTION spi_transfer(tx_byte) {
 }
 
 -- I2C address with R/W bit
-i2c_address: BITS { width: 8, zero }
-    |> Bits/set_slice(high: 7, low: 1, value: Bits/from_number(value: device_addr, width: 7))
+i2c_address: BITS { 8, 10u0 }
+    |> Bits/set_slice(high: 7, low: 1, value: Bits/u_from_number(value: device_addr, width: 7))
     |> Bits/set(index: 0, value: read_mode)
 ```
 
@@ -717,29 +847,29 @@ FUNCTION pack_normal(nx, ny, nz) {
     -- Convert -1..1 floats to 10-bit signed integers
     scale: 511  -- (2^9 - 1)
 
-    nx_bits: Bits/from_number(value: (nx * scale) |> Number/round(), width: 10)
-    ny_bits: Bits/from_number(value: (ny * scale) |> Number/round(), width: 10)
-    nz_bits: Bits/from_number(value: (nz * scale) |> Number/round(), width: 10)
-    w_bits: BITS { 2'b00 }  -- Padding
+    nx_bits: Bits/s_from_number(value: (nx * scale) |> Number/round(), width: 10)
+    ny_bits: Bits/s_from_number(value: (ny * scale) |> Number/round(), width: 10)
+    nz_bits: Bits/s_from_number(value: (nz * scale) |> Number/round(), width: 10)
+    w_bits: BITS { 2, 2u00 }  -- Padding (unsigned)
 
     Bits/concat(LIST { nx_bits, ny_bits, nz_bits, w_bits })
 }
 
 -- Color conversion (float RGBA to packed u32)
 FUNCTION pack_color(r, g, b, a) {
-    BITS { width: 32, zero }
-        |> Bits/set_slice(high: 7, low: 0, value: Bits/from_number(value: (r * 255) |> Number/floor(), width: 8))
-        |> Bits/set_slice(high: 15, low: 8, value: Bits/from_number(value: (g * 255) |> Number/floor(), width: 8))
-        |> Bits/set_slice(high: 23, low: 16, value: Bits/from_number(value: (b * 255) |> Number/floor(), width: 8))
-        |> Bits/set_slice(high: 31, low: 24, value: Bits/from_number(value: (a * 255) |> Number/floor(), width: 8))
+    BITS { 32, 10u0 }
+        |> Bits/set_slice(high: 7, low: 0, value: Bits/u_from_number(value: (r * 255) |> Number/floor(), width: 8))
+        |> Bits/set_slice(high: 15, low: 8, value: Bits/u_from_number(value: (g * 255) |> Number/floor(), width: 8))
+        |> Bits/set_slice(high: 23, low: 16, value: Bits/u_from_number(value: (b * 255) |> Number/floor(), width: 8))
+        |> Bits/set_slice(high: 31, low: 24, value: Bits/u_from_number(value: (a * 255) |> Number/floor(), width: 8))
 }
 
 -- Texture format detection
 FUNCTION detect_texture_format(header_bytes) {
     header_bytes |> Bytes/take(count: 4) |> WHEN {
-        BYTES { 0x44, 0x44, 0x53, 0x20 } => DDS
-        BYTES { 0xAB, 0x4B, 0x54, 0x58 } => KTX
-        BYTES { 0x89, 0x50, 0x4E, 0x47 } => PNG
+        BYTES { 16#44, 16#44, 16#53, 16#20 } => DDS
+        BYTES { 16#AB, 16#4B, 16#54, 16#58 } => KTX
+        BYTES { 16#89, 16#50, 16#4E, 16#47 } => PNG
         __ => Unknown
     }
 }
@@ -752,7 +882,7 @@ buffer_usage: [
     storage: False
     copy_src: False
     copy_dst: True
-] |> Flags/pack(schema: [
+] |> Flags/u_pack(schema: [
     vertex: 0
     index: 1
     uniform: 2
@@ -769,21 +899,27 @@ buffer_usage: [
 ### BITS Module
 
 #### Constructors
-- `BITS { binary_digits }` - From binary literal
-- `BITS { width: N, value: V }` - Explicit width and value
-- `BITS { hex_value }` - From hex (0x prefix)
-- `BITS { N'bXXX }` - Verilog-style binary
-- `BITS { N'dXXX }` - Verilog-style decimal
-- `BITS { N'hXXX }` - Verilog-style hex
+- `BITS { width, base[s|u]value }` - Core format: width and value with explicit base/signedness
+  - `BITS { 8, 10u42 }` - 8-bit unsigned decimal 42
+  - `BITS { 8, 10s-100 }` - 8-bit signed decimal -100
+  - `BITS { 8, 2u10110010 }` - 8-bit unsigned binary pattern
+  - `BITS { 16, 16sFFFF }` - 16-bit signed hex pattern
 - `BITS { bits: LIST { bools } }` - From list of bools
-- `BITS { width: N, zero }` - All zeros
-- `BITS { width: N, ones }` - All ones
-- `Bits/from_number(value: V, width: N)` - From number
+
+#### Helper Functions (u_ for unsigned, s_ for signed)
+- `Bits/u_zeros(width: N)` - Unsigned all zeros
+- `Bits/s_zeros(width: N)` - Signed all zeros
+- `Bits/u_ones(width: N)` - Unsigned all ones
+- `Bits/s_ones(width: N)` - Signed all ones (-1)
+- `Bits/u_from_number(value: V, width: N)` - Unsigned from number
+- `Bits/s_from_number(value: V, width: N)` - Signed from number
+- `Bits/u_from_binary_text(text: T)` - Unsigned from binary string
+- `Bits/s_from_hex_text(text: T, width: N)` - Signed from hex string
 
 #### Properties
 - `Bits/width(bits)` - Get width
-- `Bits/to_number(bits)` - To unsigned number
-- `Bits/to_number_signed(bits)` - To signed number (two's complement)
+- `Bits/is_signed(bits)` - Check if signed
+- `Bits/to_number(bits)` - To number (respects signedness)
 - `Bits/to_bool(bits)` - Single bit to Bool
 - `Bits/is_zero(bits)` - Check if all zeros
 
@@ -961,12 +1097,14 @@ buffer_usage: [
 3. **No surprises** - Endianness bugs are hard to find
 4. **Explicit is better** - Never assume byte order
 
-### Why Verilog-Style Literals?
+### Why base[s|u]value Syntax?
 
-1. **Familiar to hardware engineers** - `8'hFF` is standard
-2. **Explicit width** - No ambiguity
-3. **Multiple bases** - Binary, decimal, hex in one syntax
-4. **Transpiler friendly** - Direct mapping to SystemVerilog
+1. **Unified format** - `base[s|u]value` encodes base AND signedness in one notation
+2. **Always explicit** - `10u42` is unambiguous: base 10, unsigned, value 42
+3. **Consistent everywhere** - Same pattern for decimal, binary, hex: `10u`, `2s`, `16u`
+4. **Self-documenting** - `16sFF` immediately shows: hex, signed, pattern FF
+5. **Function naming matches** - `Bits/u_zeros()` mirrors `10u0` literal syntax
+6. **No abbreviations** - Full `s` for signed, `u` for unsigned, not cryptic symbols
 
 ### Why Separate Flags Module?
 
@@ -983,13 +1121,13 @@ buffer_usage: [
 
 ```boon
 -- ❌ WRONG: Result truncated to 8 bits
-a: BITS { width: 8, value: 200 }
-b: BITS { width: 8, value: 100 }
-sum: Bits/add(a, b)  -- Result: 44 (300 mod 256)
+a: BITS { 8, 10u200 }
+b: BITS { 8, 10u100 }
+sum: Bits/add(a, b)  -- Result: 44 (300 mod 256) in release mode
 
 -- ✅ CORRECT: Use wider result
-a: BITS { width: 8, value: 200 }
-b: BITS { width: 8, value: 100 }
+a: BITS { 8, 10u200 }
+b: BITS { 8, 10u100 }
 sum: Bits/add(
     a |> Bits/zero_extend(to: 9)
     b |> Bits/zero_extend(to: 9)
@@ -1010,9 +1148,9 @@ value: Bytes/read_u32(data, offset: 0, endian: Big)
 
 ```boon
 -- BITS uses MSB-to-LSB indexing (index 0 is LSB)
-bits: BITS { 8'b10110010 }
---          ^      ^
---        bit 7   bit 0
+bits: BITS { 8, 2u10110010 }
+--              ^      ^
+--            bit 7   bit 0
 
 bit_7: bits |> Bits/get(index: 7)  -- True (MSB)
 bit_0: bits |> Bits/get(index: 0)  -- False (LSB)
@@ -1027,7 +1165,19 @@ result: bits + 1
 -- ✅ CORRECT: Use Bits/increment or convert
 result: bits |> Bits/increment()
 -- or
-result: Bits/add(bits, Bits/from_number(value: 1, width: Bits/width(bits)))
+result: Bits/add(bits, Bits/u_from_number(value: 1, width: Bits/width(bits)))
+```
+
+### 5. Mixing Signed and Unsigned
+
+```boon
+-- ❌ WRONG: Signed/unsigned mismatch
+u_val: BITS { 8, 10u100 }
+s_val: BITS { 8, 10s50 }
+sum: u_val |> Bits/add(s_val)  -- ERROR: type mismatch
+
+-- ✅ CORRECT: Convert explicitly
+sum: u_val |> Bits/add(s_val |> Bits/as_unsigned())
 ```
 
 ---
@@ -1074,7 +1224,7 @@ Bits/simd_add(vectors: LIST { a, b, c, d }, width: 32)
 
 ```boon
 -- Direct hardware register access
-GPIO_CONTROL: BITS/REGISTER { address: 0x4000_0000, width: 32 }
+GPIO_CONTROL: BITS/REGISTER { address: 16u40000000, width: 32 }
 GPIO_CONTROL |> Bits/set(index: 0, value: True)  -- Writes to hardware
 ```
 
