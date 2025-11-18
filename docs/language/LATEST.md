@@ -18,6 +18,81 @@ LATEST provides reactive state management in Boon, working seamlessly across sof
 
 ---
 
+## Supported Types in LATEST
+
+LATEST manages state for specific types. Understanding what LATEST supports is crucial for writing correct reactive code.
+
+### ✅ Supported Types
+
+**1. Scalars** - Simple primitive values
+- `Number`, `Text`
+- Example: `counter: 0 |> LATEST count { count + 1 }`
+
+**2. Tags/Enums** - Enumeration values
+- Built-in tags like `True`, `False`
+- User-defined state types for state machines
+- Example: `state: Idle |> LATEST state { state |> next_state() }`
+- Example: `flag: True |> LATEST flag { toggle |> THEN { flag |> Bool/not() } }`
+
+**3. BITS** - Hardware bit vectors
+- Fixed-width bit patterns for hardware
+- Example: `reg: BITS { 8, 10u0 } |> LATEST reg { reg + 1 }`
+
+**4. Objects** - Structured data with named fields
+- Composite values like `[x: 0, y: 0]`, `[counter: 5, enabled: True]`
+- Example: `pos: [x: 0, y: 0] |> LATEST pos { [x: pos.x + 1, y: pos.y] }`
+
+### ❌ NOT Supported - Use Alternatives Instead
+
+**LIST** - Don't use LIST in LATEST! Use reactive LIST operations:
+
+```boon
+// ❌ DON'T: LIST in LATEST (anti-pattern)
+items: LIST {} |> LATEST list {
+    event |> THEN { list |> List/push(item) }
+}
+
+// ✅ DO: Reactive LIST operations (no LATEST needed)
+items: LIST {}
+    |> List/push(item: new_event)
+    |> List/take_last(count: 100)
+```
+
+**Fixed-size collections** - Use MEMORY primitive instead:
+
+```boon
+// ❌ DON'T: Collections for indexed storage
+mem: List/range(0, 16) |> LATEST mem {
+    mem |> List/set(index: addr, value: data)
+}
+
+// ✅ DO: Use MEMORY for fixed-size indexed storage
+mem: MEMORY { 16, 0 }
+    |> Memory/write(address: addr, data: data)
+```
+
+**Why no LIST in LATEST?**
+1. **Different reactivity models:**
+   - LIST is reactive at collection level (sends VecDiff operations)
+   - LATEST is for value-level state tracking
+   - Mixing these creates confusion
+
+2. **Performance:**
+   - LIST operations with structural sharing have overhead
+   - Per-update copies can be expensive
+
+3. **Better alternatives exist:**
+   - **Dynamic collections:** Use reactive LIST operations directly
+   - **Fixed-size storage:** Use MEMORY primitive
+   - **Bounded logs:** Use Queue/bounded
+
+4. **Simpler mental model:**
+   - LATEST for simple stateful values
+   - LIST/MEMORY for collections
+   - Clear separation of concerns
+
+---
+
 ## Quick Examples
 
 ### Software
@@ -684,34 +759,34 @@ Warning: LATEST has no external trigger
 
 **Problem:**
 ```boon
-// ❌ ERROR: List/push returns new list, but it's not used
-items: LIST {} |> LATEST list {
-    add_event |> THEN {
-        List/push(list, new_item)  // Returns new list
-        list                        // Returns old list! BUG!
+// ❌ ERROR: Pure function call, but result not used
+value: 0 |> LATEST v {
+    event |> THEN {
+        some_pure_function(v)  // Returns new value
+        v                       // Returns old value! BUG!
     }
 }
 ```
 
 **Why it happens:**
-- Boon has persistent data structures (immutable)
-- `List/push` returns a NEW list, doesn't modify in-place
-- Last expression `list` returns the OLD list (unchanged)
+- Boon has immutable values
+- Pure functions return NEW values, don't modify in-place
+- Last expression `v` returns the OLD value (unchanged)
 
 **Solution:**
 ```boon
 // ✅ Use the returned value
-items: LIST {} |> LATEST list {
-    add_event |> THEN {
-        list |> List/push(new_item)  // Pipe to use result
+value: 0 |> LATEST v {
+    event |> THEN {
+        v |> some_pure_function()  // Pipe to use result
     }
 }
 
-// OR
-items: LIST {} |> LATEST list {
-    add_event |> THEN {
-        new_list: list |> List/push(new_item)
-        new_list
+// OR bind it
+value: 0 |> LATEST v {
+    event |> THEN {
+        new_value: some_pure_function(v)
+        new_value
     }
 }
 ```
@@ -721,58 +796,16 @@ items: LIST {} |> LATEST list {
 Error: Pure function return value unused
   --> example.bn:3:9
    |
- 3 |         List/push(list, new_item)
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+ 3 |         some_pure_function(v)
+   |         ^^^^^^^^^^^^^^^^^^^^^
    |
-   = Note: List/push returns a new list, but the result is discarded
-   = Help: Use the return value: `list |> List/push(new_item)`
+   = Note: Function returns a new value, but the result is discarded
+   = Help: Use the return value: `v |> some_pure_function()`
 ```
 
-### Pitfall 3: Unbounded Collection Growth
+**Note:** This pitfall applies to any pure function. A previous version showed LIST in LATEST, but LIST is no longer supported in LATEST - see "Supported Types" section above.
 
-**Problem:**
-```boon
-// ⚠️ WARNING: Unbounded growth (memory leak)
-log: LIST {} |> LATEST entries {
-    event |> THEN {
-        entries |> List/push(event_data)
-    }
-}
-// Grows forever!
-```
-
-**Why it happens:**
-- No limit on collection size
-- Can cause memory issues in long-running applications
-
-**Solution:**
-```boon
-// ✅ Add bounded growth
-log: LIST {} |> LATEST entries {
-    event |> THEN {
-        entries
-            |> List/push(event_data)
-            |> List/take_last(count: 100)  // Keep only last 100
-    }
-}
-
-// OR use circular buffer
-log: Queue/bounded(size: 100, on_full: DropOldest)
-```
-
-**Compiler warning:**
-```
-Warning: Potential unbounded collection growth
-  --> example.bn:1:6
-   |
- 1 | log: LIST {} |> LATEST entries {
-   |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = Note: Collection grows without bound
-   = Help: Consider using `List/take_last(count: N)` or `Queue/bounded`
-```
-
-### Pitfall 4: Circular Dependencies
+### Pitfall 3: Circular Dependencies
 
 **Problem:**
 ```boon
@@ -819,7 +852,7 @@ Warning: Circular dependency detected
    = Help: Consider restructuring to eliminate cycle
 ```
 
-### Pitfall 5: Same Name Confusion (Not a Real Issue!)
+### Pitfall 4: Same Name Confusion (Not a Real Issue!)
 
 **Common concern:**
 ```boon
@@ -852,19 +885,18 @@ counter: 0 |> LATEST current { event |> THEN { current + 1 } }  // Verbose
 The Boon compiler implements static analysis at three strictness levels:
 
 **Level 1: Permissive (default)**
+- ❌ Rule 1: LIST in LATEST (ERROR - not supported type)
 - ❌ Rule 2: Unused pure return value (ERROR)
-- ⚠️ Rule 1: No external trigger (WARNING)
+- ⚠️ Rule 3: No external trigger (WARNING)
 
 **Level 2: Strict (`--strict` flag)**
 - All Permissive rules, plus:
-- ⚠️ Rule 3: Unbounded growth (WARNING)
 - ⚠️ Rule 4: Circular dependencies (WARNING)
-- ⚠️ Rule 6: List/Record in LATEST (WARNING)
 
 **Level 3: Pedantic (`--pedantic` flag)**
 - All Strict rules, plus:
-- ℹ️ Rule 7: Parameter name matches variable (INFO)
-- ℹ️ Rule 8: Pure functions only (INFO)
+- ℹ️ Rule 5: Parameter name matches variable (INFO)
+- ℹ️ Rule 6: Pure functions only (INFO)
 
 **Suppressing warnings:**
 ```boon
@@ -873,7 +905,7 @@ The Boon compiler implements static analysis at three strictness levels:
 counter: 0 |> LATEST counter { counter + 1 }
 
 // Suppress at module level
-#![allow(unbounded_growth)]
+#![allow(circular_dependencies)]
 ```
 
 See `LATEST_COMPILER_RULES.md` for complete rule specification.
@@ -883,13 +915,13 @@ See `LATEST_COMPILER_RULES.md` for complete rule specification.
 **DO:**
 - ✅ Use same name for parameter and variable (clear shadowing)
 - ✅ Add explicit triggers (events, reactive inputs)
-- ✅ Use persistent data structures correctly (pipe results)
-- ✅ Bound collection growth (take_last, bounded queues)
+- ✅ Use supported types only (scalars, enums, BITS, objects)
+- ✅ Use pure functions correctly (pipe results)
 - ✅ Keep dependencies one-way (no cycles)
 
 **DON'T:**
+- ❌ Use LIST in LATEST (use reactive LIST operations instead)
 - ❌ Forget to use return values from pure functions
-- ❌ Let collections grow unbounded
 - ❌ Create circular dependencies
 - ❌ Use generic names like `x`, `current`, `value` (unless appropriate)
 

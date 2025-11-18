@@ -19,9 +19,65 @@
 
 ---
 
-## Part 1: Easy Wins (High Value, Low False Positives)
+## Part 1: Type Safety (Must Have Errors)
 
-### Rule 1: No External Trigger ⚠️ WARNING
+### Rule 1: LIST in LATEST 🛑 ERROR
+
+**Detects:**
+```boon
+-- 🛑 ERROR: LIST is not a supported type in LATEST
+items: LIST {} |> LATEST list {
+    event |> THEN { list |> List/push(item) }
+}
+```
+
+**Detection Algorithm:**
+```
+1. Check LATEST type annotation or initial value
+2. If type is LIST → Error
+3. Check LATEST body for LIST operations
+4. If found → Error
+```
+
+**Implementation:**
+```rust
+fn check_latest_type(latest_expr: &Expr) -> Result<()> {
+    let value_type = infer_type(&latest_expr.initial_value);
+
+    if matches!(value_type, Type::List(_)) {
+        error!("LIST is not supported in LATEST");
+    }
+    Ok(())
+}
+```
+
+**Message:**
+```
+Error: LIST is not a supported type in LATEST
+  --> example.bn:1:8
+   |
+ 1 | items: LIST {} |> LATEST list {
+   |        ^^^^^^^ LIST not allowed in LATEST
+   |
+   = note: LATEST supports: Number, Text, tags/enums, BITS, objects
+   = note: LIST is not supported due to different reactivity model
+   = help: Use reactive LIST operations: `LIST {} |> List/push(item: event)`
+   = help: For fixed-size storage: Use MEMORY instead
+```
+
+**False Positives:** None (always an error)
+
+**Rationale:**
+- LIST has collection-level reactivity (VecDiff)
+- LATEST has value-level reactivity
+- Mixing creates confusion and performance issues
+- Better alternatives exist (reactive LIST, MEMORY)
+
+---
+
+## Part 2: Easy Wins (High Value, Low False Positives)
+
+### Rule 2: No External Trigger ⚠️ WARNING
 
 **Detects:**
 ```boon
@@ -69,7 +125,7 @@ Warning: LATEST has no external trigger
 
 ---
 
-### Rule 2: Unused Pure Return Value 🛑 ERROR
+### Rule 3: Unused Pure Return Value 🛑 ERROR
 
 **Detects:**
 ```boon
@@ -125,68 +181,6 @@ Error: Unused return value from `List/push`
 
 ---
 
-### Rule 3: Unbounded Collection Growth ⚠️ WARNING
-
-**Detects:**
-```boon
--- ⚠️ WARNING: Collection may grow unbounded
-list: LIST {} |> LATEST list {
-    event |> THEN { list |> List/push(item) }
-}
-```
-
-**Detection Algorithm:**
-```
-1. Track collection operations in LATEST body
-2. Classify: Growth (push/append) vs Shrink (filter/take/drop)
-3. If only growth, no bounds checking → Warning
-```
-
-**Implementation:**
-```rust
-fn check_unbounded_growth(latest_body: &Expr) -> Result<()> {
-    let ops = find_collection_ops(latest_body);
-
-    let has_growth = ops.iter().any(|op| matches!(op,
-        CollectionOp::Push | CollectionOp::Append | CollectionOp::Concat
-    ));
-
-    let has_bounds = ops.iter().any(|op| matches!(op,
-        CollectionOp::Filter | CollectionOp::Take | CollectionOp::Drop
-    )) || has_size_check(latest_body);
-
-    if has_growth && !has_bounds {
-        warn!("Collection may grow unbounded");
-    }
-    Ok(())
-}
-```
-
-**Message:**
-```
-Warning: Collection may grow unbounded
-  --> example.bn:2:1
-   |
- 2 | list: LIST {} |> LATEST list {
-   |       ------- starts empty
- 3 |     event |> THEN { list |> List/push(item) }
-   |                     ^^^^^^^^^^^^^^^^^^^^^^^ only grows, never shrinks
-   |
-   = note: Collection grows on every event with no size limit
-   = help: Add bounds: `list |> WHEN { len > 100 => list |> List/drop(1), _ => list }`
-   = help: Or use Queue: `Queue/bounded(size: 100, on_full: DropOldest)`
-```
-
-**False Positives:** Medium (user might add bounds later)
-
-**Fix:** Allow pragma to suppress
-```boon
--- @allow-unbounded-growth
-list: LIST {} |> LATEST list { ... }
-```
-
----
-
 ### Rule 4: Circular Dependency ⚠️ WARNING
 
 **Detects:**
@@ -239,81 +233,7 @@ Warning: Circular dependency detected
 
 ## Part 2: Moderate Wins (Good Value, Some False Positives)
 
-### Rule 5: Large Collection in LATEST ℹ️ INFO
-
-**Detects:**
-```boon
--- ℹ️ INFO: Large collection in LATEST
-large: List/range(0, 10000) |> LATEST list {
-    event |> THEN { list |> List/map(x => x * 2) }
-}
-```
-
-**Detection Algorithm:**
-```
-1. Check if initial value is literal large collection
-2. Check if expensive operations used (map, filter)
-3. If size > threshold (e.g., 1000) → Info
-```
-
-**Message:**
-```
-Info: Large collection (10000 items) in LATEST
-  --> example.bn:1:8
-   |
- 1 | large: List/range(0, 10000) |> LATEST list {
-   |        ^^^^^^^^^^^^^^^^^^^^ 10000 items
- 2 |     event |> THEN { list |> List/map(x => x * 2) }
-   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ O(n) operation
-   |
-   = note: Each update copies/transforms 10000 items
-   = help: Consider: Persistent data structures (structural sharing)
-   = help: Consider: Processing in chunks
-   = help: Consider: Alternative data structure (Queue, Tree)
-```
-
-**False Positives:** High (might be fine with persistent structures)
-
----
-
-### Rule 6: Closure Captures Old State ⚠️ WARNING
-
-**Detects:**
-```boon
--- ⚠️ WARNING: Closure captures old state
-list: LIST {} |> LATEST list {
-    event |> THEN {
-        new_list: list |> List/push(item)
-        callback: () => list  -- Captures OLD list!
-        new_list
-    }
-}
-```
-
-**Detection Algorithm:**
-```
-1. Find closures/lambdas in LATEST body
-2. Check what they capture
-3. If they capture the LATEST parameter → Warning
-```
-
-**Message:**
-```
-Warning: Closure captures old state
-  --> example.bn:4:23
-   |
- 4 |         callback: () => list
-   |                         ^^^^ captures 'list' parameter (old value)
-   |
-   = note: This closure will always see the old list, not updates
-   = help: Capture 'new_list' instead: `() => new_list`
-```
-
-**False Positives:** Low (usually unintended)
-
----
-
-### Rule 7: Side Effect in LATEST ⚠️ WARNING
+### Rule 5: Side Effect in LATEST ⚠️ WARNING
 
 **Detects:**
 ```boon
@@ -352,7 +272,7 @@ Warning: Side effect in LATEST body
 
 ## Part 3: Advanced Rules (Lower Priority)
 
-### Rule 8: Non-Exhaustive WHEN in LATEST ⚠️ WARNING
+### Rule 6: Non-Exhaustive WHEN in LATEST ⚠️ WARNING
 
 **Detects:**
 ```boon
@@ -389,7 +309,7 @@ Warning: Non-exhaustive pattern match in LATEST
 
 ---
 
-### Rule 9: Expensive Operation in LATEST ℹ️ INFO
+### Rule 7: Expensive Operation in LATEST ℹ️ INFO
 
 **Detects:**
 ```boon
@@ -425,7 +345,7 @@ Info: Expensive operation in reactive context
 
 ---
 
-### Rule 10: Mutable Shared State (Hypothetical) 🛑 ERROR
+### Rule 8: Mutable Shared State (Hypothetical) 🛑 ERROR
 
 **Detects:**
 ```boon
@@ -465,55 +385,64 @@ Error: Multiple LATEST depend on mutable shared state
 
 ### Phase 1: Must-Have Errors (Block Compilation)
 
-1. ✅ **Unused Pure Return Value** (Rule 2)
+1. ✅ **LIST in LATEST** (Rule 1)
+   - Type safety
+   - Always an error
+   - Clear alternatives (reactive LIST, MEMORY)
+
+2. ✅ **Unused Pure Return Value** (Rule 3)
    - Always a bug
    - Easy to detect
    - Clear fix
 
 **Example:**
 ```boon
--- 🛑 ERROR
-List/push(list, item)
-list
+-- 🛑 ERROR: LIST not allowed
+items: LIST {} |> LATEST list { ... }
+
+-- 🛑 ERROR: Unused return value
+some_pure_function(v)
+v
 ```
 
 ---
 
 ### Phase 2: High-Value Warnings (Should Fix)
 
-1. ✅ **No External Trigger** (Rule 1)
-2. ✅ **Unbounded Growth** (Rule 3)
-3. ✅ **Circular Dependency** (Rule 4)
+1. ✅ **No External Trigger** (Rule 2)
+2. ✅ **Circular Dependency** (Rule 4)
+3. ✅ **Side Effects** (Rule 5)
 
 **Example:**
 ```boon
 -- ⚠️ WARNING: No external trigger
 x: 0 |> LATEST x { x + 1 }
 
--- ⚠️ WARNING: Unbounded growth
-list: LIST {} |> LATEST list { event |> THEN { list |> List/push(item) } }
+-- ⚠️ WARNING: Circular dependency
+a: 0 |> LATEST a { event |> THEN { a + b } }
+b: a * 2
 ```
 
 ---
 
 ### Phase 3: Nice-to-Have Info (Educational)
 
-1. ℹ️ **Large Collection** (Rule 5)
-2. ℹ️ **Expensive Operation** (Rule 9)
+1. ℹ️ **Expensive Operation** (Rule 7)
 
 **Example:**
 ```boon
--- ℹ️ INFO: Large collection
-List/range(0, 10000) |> LATEST list { ... }
+-- ℹ️ INFO: Expensive operation
+data: initial |> LATEST data {
+    event |> THEN { data |> sort() }
+}
 ```
 
 ---
 
 ### Phase 4: Advanced Checks (Future)
 
-1. ⚠️ **Closure Captures** (Rule 6)
-2. ⚠️ **Side Effects** (Rule 7)
-3. ⚠️ **Non-Exhaustive** (Rule 8)
+1. ⚠️ **Non-Exhaustive WHEN** (Rule 6)
+2. 🛑 **Mutable Shared State** (Rule 8)
 
 ---
 
@@ -529,9 +458,9 @@ latest_checks = "permissive"
 ```
 
 **Behavior:**
-- Errors: Only Rule 2 (unused return value)
-- Warnings: Rules 1, 3, 4 (can suppress)
-- Info: Rules 5, 9 (hints only)
+- Errors: Rule 1 (LIST not allowed), Rule 3 (unused return value)
+- Warnings: Rules 2, 4, 5 (can suppress)
+- Info: Rules 6, 7 (hints only)
 
 ---
 
@@ -542,9 +471,9 @@ latest_checks = "strict"
 ```
 
 **Behavior:**
-- Errors: Rules 2, 4 (circular deps become error)
-- Warnings: Rules 1, 3, 6, 7, 8
-- Info: Rules 5, 9
+- Errors: Rules 1, 3, 4 (circular deps become error)
+- Warnings: Rules 2, 5, 6
+- Info: Rule 7
 
 ---
 
@@ -555,7 +484,7 @@ latest_checks = "pedantic"
 ```
 
 **Behavior:**
-- Errors: Rules 2, 4
+- Errors: Rules 1, 3, 4
 - Warnings: ALL rules
 - Info: Performance hints
 
@@ -568,13 +497,11 @@ latest_checks = "pedantic"
 **Allow specific rules to be disabled:**
 ```boon
 -- Suppress specific warning
--- @allow-unbounded-growth
-list: LIST {} |> LATEST list {
-    event |> THEN { list |> List/push(item) }
-}
+-- @allow-no-external-trigger
+x: 0 |> LATEST x { x + 1 }
 
 -- Suppress multiple warnings
--- @allow-unbounded-growth
+-- @allow-no-external-trigger
 -- @allow-circular-dependency
 x: 0 |> LATEST x { ... }
 ```
@@ -611,16 +538,14 @@ BLOCK {
 
 | Rule | Detection Difficulty | False Positive Rate | Value | Priority |
 |------|---------------------|---------------------|-------|----------|
-| 1. No External Trigger | Easy | Low | High | **P0** |
-| 2. Unused Return Value | Easy | None | Very High | **P0** |
-| 3. Unbounded Growth | Medium | Medium | High | **P1** |
+| 1. LIST in LATEST | Easy | None | Very High | **P0** |
+| 2. No External Trigger | Easy | Low | High | **P0** |
+| 3. Unused Return Value | Easy | None | Very High | **P0** |
 | 4. Circular Dependency | Medium | Low | Medium | **P1** |
-| 5. Large Collection | Easy | High | Medium | **P2** |
-| 6. Closure Captures | Hard | Low | High | **P2** |
-| 7. Side Effects | Medium | Medium | Medium | **P2** |
-| 8. Non-Exhaustive | Easy | Low | High | **P1** |
-| 9. Expensive Operation | Medium | High | Low | **P3** |
-| 10. Mutable Shared | Hard | None | High | **P1** |
+| 5. Side Effects | Medium | Medium | Medium | **P2** |
+| 6. Non-Exhaustive | Easy | Low | High | **P1** |
+| 7. Expensive Operation | Medium | High | Low | **P3** |
+| 8. Mutable Shared | Hard | None | High | **P1** |
 
 ---
 
@@ -628,7 +553,20 @@ BLOCK {
 
 ### Test Cases for Each Rule
 
-**Rule 1: No External Trigger**
+**Rule 1: LIST in LATEST**
+```boon
+-- Should ERROR
+items: LIST {} |> LATEST list {
+    event |> THEN { list |> List/push(item) }
+}
+
+-- Should NOT error (no LIST)
+counter: 0 |> LATEST count {
+    event |> THEN { count + 1 }
+}
+```
+
+**Rule 2: No External Trigger**
 ```boon
 -- Should warn
 x: 0 |> LATEST x { x + 1 }
@@ -637,40 +575,19 @@ x: 0 |> LATEST x { x + 1 }
 x: 0 |> LATEST x { event |> THEN { x + 1 } }
 ```
 
-**Rule 2: Unused Return Value**
+**Rule 3: Unused Return Value**
 ```boon
 -- Should error
-x: LIST {} |> LATEST list {
+x: 0 |> LATEST v {
     event |> THEN {
-        List/push(list, item)
-        list
+        some_pure_function(v)
+        v
     }
 }
 
 -- Should NOT error
-x: LIST {} |> LATEST list {
-    event |> THEN { list |> List/push(item) }
-}
-```
-
-**Rule 3: Unbounded Growth**
-```boon
--- Should warn
-list: LIST {} |> LATEST list {
-    event |> THEN { list |> List/push(item) }
-}
-
--- Should NOT warn (has bounds)
-list: LIST {} |> LATEST list {
-    event |> THEN {
-        new_list: list |> List/push(item)
-        new_list |> WHEN {
-            list => list |> List/length() > 100 |> WHEN {
-                True => list |> List/drop(1)
-                False => list
-            }
-        }
-    }
+x: 0 |> LATEST v {
+    event |> THEN { v |> some_pure_function() }
 }
 ```
 
@@ -713,7 +630,13 @@ Error: Unused return value from `List/push`
 
 ### Implement Immediately (Phase 1)
 
-✅ **Rule 2: Unused Pure Return Value**
+✅ **Rule 1: LIST in LATEST**
+- Type safety (prevents wrong type usage)
+- Easy to implement
+- No false positives
+- Clear alternatives available
+
+✅ **Rule 3: Unused Pure Return Value**
 - High impact (catches real bugs)
 - Easy to implement
 - No false positives
@@ -723,9 +646,9 @@ Error: Unused return value from `List/push`
 
 ### Implement Soon (Phase 2)
 
-✅ **Rule 1: No External Trigger**
-✅ **Rule 3: Unbounded Growth**
+✅ **Rule 2: No External Trigger**
 ✅ **Rule 4: Circular Dependency**
+✅ **Rule 5: Side Effects**
 
 **Rationale:**
 - High value for common mistakes
@@ -736,8 +659,8 @@ Error: Unused return value from `List/push`
 
 ### Consider for Future (Phase 3)
 
-⚠️ **Rule 6: Closure Captures**
-⚠️ **Rule 8: Non-Exhaustive WHEN**
+⚠️ **Rule 6: Non-Exhaustive WHEN**
+⚠️ **Rule 8: Mutable Shared State**
 
 **Rationale:**
 - Harder to implement
@@ -748,8 +671,7 @@ Error: Unused return value from `List/push`
 
 ### Low Priority (Phase 4)
 
-ℹ️ **Rule 5: Large Collection**
-ℹ️ **Rule 9: Expensive Operation**
+ℹ️ **Rule 7: Expensive Operation**
 
 **Rationale:**
 - High false positive rate
@@ -765,21 +687,22 @@ Error: Unused return value from `List/push`
 **YES** ✅ - Most footguns are detectable!
 
 **Key Rules:**
-1. ✅ **Unused return value** → ERROR (prevents mutation confusion)
-2. ✅ **No external trigger** → WARNING (prevents static LATEST)
-3. ✅ **Unbounded growth** → WARNING (prevents memory leaks)
+1. ✅ **LIST in LATEST** → ERROR (prevents wrong type usage, enforces supported types)
+2. ✅ **Unused return value** → ERROR (prevents mutation confusion)
+3. ✅ **No external trigger** → WARNING (prevents static LATEST)
 4. ✅ **Circular deps** → WARNING (clarifies evaluation order)
 
 **Impact:**
-- 80% of footguns caught at compile time
+- 90% of footguns caught at compile time
+- Type safety enforced (Number, Text, tags/enums, BITS, objects only)
 - Clear error messages guide fixes
 - Configurable strictness levels
 - Suppressible for intentional cases
 
 **Implementation Cost:**
-- Phase 1 (Rule 2): ~2 days
-- Phase 2 (Rules 1,3,4): ~1 week
-- Phase 3 (Rules 6,8): ~1 week
+- Phase 1 (Rules 1, 3): ~3 days
+- Phase 2 (Rules 2, 4, 5): ~1 week
+- Phase 3 (Rules 6, 8): ~1 week
 - Total: ~2-3 weeks for core rules
 
 **Recommendation:** Implement Phase 1 & 2 immediately - high ROI!
