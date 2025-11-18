@@ -3,14 +3,17 @@
 -- Why BITS: Signed arithmetic (10s1, 10s-1) handles increment/decrement elegantly
 
 -- Transpiler model (SpinalHDL-style implicit clock domain):
---   - clk, rst implicitly passed from hardware module context (not in parameter list)
---   - Transpiler infers registers from stateful operations (Bits/set, Bits/sum)
+--   - clk implicitly passed from hardware module context (not in parameter list)
+--   - Bits/sum is stateful → this function is actually a register
+--   - Pipeline describes next-state logic for the register
 --   - Transpiler generates: module counter(input clk, input rst, input load, ...)
 --
--- Key pattern: Delta accumulation with mutual exclusivity
+-- Key pattern: State-based pattern matching with delta accumulation
+--   - All logic matches on single `control_signals` record (truth table style)
 --   - Bits/set: absolute value updates (reset, load)
 --   - Bits/sum: relative delta updates (increment/decrement)
---   - Guards ensure only ONE operation active per cycle (no conflicts)
+--   - Wildcards (__) show which signals are don't-care for each operation
+--   - Flat patterns (no nested WHENs) - each pattern is one truth table row
 
 -- Parameters:
 --   rst, load, en, up: Bool - control signals
@@ -22,54 +25,28 @@
 
 FUNCTION counter(rst, load, load_value, up, en) {
     BLOCK {
-        default: BITS { 8, 10s0 }  -- Reset value (signed for consistency)
+        count_width: 8
+        default: BITS { count_width, 10s0 }
 
-        -- Guard: prevent operations during reset
-        not_resetting: rst |> Bool/not()
+        -- Bundle all control signals for pattern matching
+        control_signals: [reset: rst, load: load, up: up, enabled: en]
 
-        -- Control signal: load when enabled and not resetting
-        -- Mutual exclusivity: can't load AND increment in same cycle
-        en_and_load: Bool/and(
-            this: Bool/and(this: en, that: not_resetting)
-            that: load
-        )
-
-        -- Control signal: count when enabled, not loading, not resetting
-        en_and_not_load: Bool/and(
-            this: Bool/and(this: en, that: not_resetting)
-            that: load |> Bool/not()
-        )
-
-        -- Delta value: +1 (increment), -1 (decrement), or SKIP (no change)
-        -- Signed BITS allows negative deltas (10s-1 = -1 in two's complement)
-        -- Only active when en_and_not_load=True (mutually exclusive with load)
-        delta: en_and_not_load |> WHEN {
-            True => up |> WHEN {
-                True => BITS { 8, 10s1 }    -- Increment: +1
-                False => BITS { 8, 10s-1 }  -- Decrement: -1
-            }
-            False => SKIP  -- Hold: no delta
-        }
-
-        -- Register update pipeline (sequential transformations):
-        -- Priority through guards (only one fires per cycle):
-        --   1. rst=True → reset to default (highest priority via not_resetting guard)
-        --   2. load=True, rst=False → set to load_value (via en_and_load guard)
-        --   3. Otherwise → add delta (+1, -1, or 0)
-        --
-        -- Pipeline semantics:
-        --   Bits/set(SKIP) → pass through unchanged
-        --   Bits/set(value) → replace with value
-        --   Bits/sum(SKIP) → pass through unchanged
-        --   Bits/sum(delta) → add delta to current value
-        --
-        -- Bits/sum initialization:
-        --   First parameter (default): initial value for the register
-        --   Second parameter (delta): change to apply each cycle
         count: default
-            |> Bits/set(rst |> WHEN { True => default, False => SKIP })
-            |> Bits/set(en_and_load |> WHEN { True => load_value, False => SKIP })
-            |> Bits/sum(delta: delta)
+            |> Bits/set(control_signals |> WHEN {
+                [reset: True, load: __, up: __, enabled: __] => default
+                __ => SKIP
+            })
+            |> Bits/set(control_signals |> WHEN {
+                [reset: False, load: True, up: __, enabled: True] => load_value
+                __ => SKIP
+            })
+            |> Bits/sum(delta: control_signals |> WHEN {
+                [reset: False, load: False, up: True, enabled: True] =>
+                    BITS { count_width, 10s1 }
+                [reset: False, load: False, up: False, enabled: True] =>
+                    BITS { count_width, 10s-1 }
+                __ => SKIP
+            })
 
         [count: count]
     }
