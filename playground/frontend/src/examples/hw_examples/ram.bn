@@ -2,18 +2,19 @@
 -- Parameterized address and data width
 -- Asynchronous read, synchronous write
 
--- Transpiler mapping:
---   LATEST { ... } → synchronous write register
---   mem |> List/get(index: addr) → asynchronous read (combinational)
+-- Transpiler model:
+--   - clk implicitly passed from hardware module context
+--   - LATEST allows access to current memory array for element update
+--   - Asynchronous read is combinational (outside LATEST)
 
-FUNCTION ram(clk, addr, wraddr, wrdata) {
+FUNCTION ram(addr, wraddr, wrdata) {
     BLOCK {
-        -- clk: Bool - clock for synchronous writes
         -- addr: Number (0-15) - read address
         -- wraddr: Number (0-15) - write address
         -- wrdata: Number - data to write
 
         -- Memory state: synchronous write on every clock cycle
+        -- LATEST needed to update specific memory element
         -- Initial: mem[i] = i
         mem: LATEST {
             List/range(start: 0, end: 16)  -- 2^4 = 16 entries
@@ -28,17 +29,13 @@ FUNCTION ram(clk, addr, wraddr, wrdata) {
 }
 
 -- Parameterized version
-FUNCTION ram_param(awidth, dwidth, clk_event, addr, wraddr, wrdata) {
+FUNCTION ram_param(awidth, dwidth, addr, wraddr, wrdata) {
     BLOCK {
         mem_size: 2 |> Number/pow(awidth)
 
         mem: LATEST {
             List/range(start: 0, end: mem_size)
-
-            clk_event |> WHEN {
-                Rising => mem |> List/set(index: wraddr, value: wrdata)
-                __ => SKIP
-            }
+            mem |> List/set(index: wraddr, value: wrdata)
         }
 
         data: mem |> List/get(index: addr)

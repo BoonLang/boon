@@ -1,28 +1,30 @@
 -- Accumulator with asynchronous reset
 -- Adds input to accumulator on clock cycles
+-- Demonstrates Bits/sum for accumulation pattern
 
--- Transpiler mapping:
---   width parameter → module parameter: #(parameter WIDTH = 4)
---   BITS { width, ... } → logic [WIDTH-1:0]
---   LATEST { ... } → register with implicit clock domain
+-- Transpiler model:
+--   - clk implicitly passed from hardware module context
+--   - Bits/sum is stateful → this function is actually a register
+--   - width parameter → module parameter: #(parameter WIDTH = 4)
 
-FUNCTION cycleadder(width, clk, rst, en, a) {
-    -- width: Number - bit width parameter
-    -- clk, rst: Bool - clock domain
-    -- en: Bool - enable signal
-    -- a: BITS { width, ... } - input value to accumulate
+FUNCTION cycleadder(width, rst, en, a) {
+    BLOCK {
+        default: BITS { width, 10u0 }
 
-    output: LATEST {
-        BITS { width, 10u0 }  -- Reset value
+        -- Bundle control signals for pattern matching
+        control_signals: [reset: rst, enabled: en]
 
-        rst |> WHEN {
-            True => BITS { width, 10u0 }
-            False => en |> WHEN {
-                True => output |> Bits/add(a)
-                False => output  -- Hold when disabled
-            }
-        }
+        -- Pipeline = next-state logic (accumulator register)
+        output: default
+            |> Bits/set(control_signals |> WHEN {
+                [reset: True, enabled: __] => default
+                __ => SKIP
+            })
+            |> Bits/sum(delta: control_signals |> WHEN {
+                [reset: False, enabled: True] => a
+                __ => SKIP
+            })
+
+        [o: output]
     }
-
-    [o: output]
 }

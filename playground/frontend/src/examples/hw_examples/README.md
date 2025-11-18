@@ -4,79 +4,116 @@ Boon hardware examples demonstrating FPGA/ASIC design patterns. Each example sho
 
 ---
 
-## Transpiler Model: SpinalHDL-Style Implicit Clocking
+## Transpiler Model: Two Register Patterns
 
-Boon hardware uses an **implicit clock domain model** inspired by SpinalHDL:
+Boon hardware uses **implicit clock domain** (SpinalHDL-style) with two complementary patterns for registers:
 
 ### Core Principles
 
-1. **Parameters match SystemVerilog ports exactly**
-   - `clk, rst` not `clk_event, rst_event`
+1. **Implicit clock signal**
+   - `clk` is NOT in function parameters
+   - Transpiler adds `input clk` to generated module
    - All signals are `Bool` or `BITS` types
 
-2. **LATEST = Register**
-   - `LATEST { ... }` creates a clocked register
-   - Clock domain is **implicit** from function's `clk` parameter
-   - No explicit edge detection needed
+2. **Two register patterns**
+   - **Bits/sum pattern** - For counters/accumulators (delta accumulation)
+   - **LATEST pattern** - For FSMs/transformations (needs current value)
 
-3. **Pattern matching = Conditional logic**
-   - `rst |> WHEN { True => ... }` → async reset
-   - Other `WHEN` patterns → if/else logic
+3. **Pattern matching = Declarative logic**
+   - Control signals bundled into records
+   - Patterns read like truth tables
+   - Wildcards (`__`) show don't-care signals
 
-### Transpiler Mapping Rules
+### Pattern 1: Bits/sum (Delta Accumulation)
 
-| Boon Pattern | SystemVerilog Output | Example |
-|--------------|---------------------|---------|
-| `FUNCTION name(clk, rst, ...)` | `module name(input clk, input rst, ...)` | Function → Module |
-| `LATEST { init_value ... }` | `always_ff @(posedge clk ...)` | Register with implicit clock |
-| `rst \|> WHEN { True => val }` | `if (rst) ... <= val;` | Async reset condition |
-| `en \|> WHEN { True => ... }` | `if (en) ...` | Conditional logic |
-| `count \|> Bits/increment()` | `count + 1` | Arithmetic operation |
-| `state \|> WHEN { A => ... }` | `case (state) A: ...` | Pattern matching |
+**Use for:** Counters, accumulators, arithmetic registers
 
-### Example: Counter
-
-**Boon:**
 ```boon
-FUNCTION counter(clk, rst, en) {
-    count: LATEST {
-        BITS { 8, 10u0 }
-        rst |> WHEN {
-            True => BITS { 8, 10u0 }
-            False => en |> WHEN {
-                True => count |> Bits/increment()
-                False => count
-            }
-        }
+FUNCTION counter(rst, load, load_value, up, en) {
+    BLOCK {
+        count_width: 8
+        default: BITS { count_width, 10s0 }
+        control_signals: [reset: rst, load: load, up: up, enabled: en]
+
+        -- Pipeline = next-state logic (this function IS a register)
+        count: default
+            |> Bits/set(control_signals |> WHEN {
+                [reset: True, load: __, up: __, enabled: __] => default
+                __ => SKIP
+            })
+            |> Bits/set(control_signals |> WHEN {
+                [reset: False, load: True, up: __, enabled: True] => load_value
+                __ => SKIP
+            })
+            |> Bits/sum(delta: control_signals |> WHEN {
+                [reset: False, load: False, up: True, enabled: True] =>
+                    BITS { count_width, 10s1 }
+                [reset: False, load: False, up: False, enabled: True] =>
+                    BITS { count_width, 10s-1 }
+                __ => SKIP
+            })
+
+        [count: count]
     }
-    [count: count]
 }
 ```
 
-**Generated SystemVerilog:**
-```systemverilog
-module counter(
-    input clk,
-    input rst,
-    input en,
-    output logic [7:0] count
-);
-    always_ff @(posedge clk or posedge rst)
-        if (rst)
-            count <= 8'd0;
-        else if (en)
-            count <= count + 1;
-endmodule
+**Key:** `Bits/sum` is stateful. Patterns show exact conditions (truth table rows).
+
+### Pattern 2: LATEST (Value Transformation)
+
+**Use for:** FSMs, LFSRs, RAMs (when next value depends on current value)
+
+```boon
+FUNCTION fsm(rst, a) {
+    BLOCK {
+        state: LATEST {
+            B  -- Reset state
+            rst |> WHEN {
+                True => B
+                False => state |> WHEN {
+                    A => C
+                    B => D
+                    C => a |> WHEN { True => D, False => B }
+                    D => A
+                }
+            }
+        }
+        -- Output logic...
+    }
+}
 ```
+
+**Key:** LATEST allows self-reference (`state |> WHEN`) for transformations.
+
+### When to Use Which Pattern?
+
+| Pattern | Use Case | Example | Why |
+|---------|----------|---------|-----|
+| **Bits/sum** | Counter | next = current + delta | Delta depends only on control signals |
+| **Bits/sum** | Accumulator | next = current + value | Adding values to accumulator |
+| **LATEST** | FSM | next = f(current, input) | Next state depends on current state |
+| **LATEST** | LFSR | next = shift(current) + feedback(current) | Transformation needs current bits |
+| **LATEST** | RAM | mem[addr] = value | Update specific array element |
+
+### Transpiler Mapping
+
+| Boon Pattern | SystemVerilog Output |
+|--------------|---------------------|
+| `FUNCTION name(rst, ...)` | `module name(input clk, input rst, ...)` |
+| `Bits/sum(delta: ...)` | `always_ff @(posedge clk ...) ... <= ... + delta` |
+| `LATEST { ... }` | `always_ff @(posedge clk ...)` |
+| `[reset: True, ...]` | Truth table row → if/else condition |
+| `control_signals |> WHEN` | Pattern matching → case/if statements |
 
 ### Why This Model?
 
-- **Simple transpiler**: Pattern-based translation, no complex edge detection
-- **Clear semantics**: LATEST = register, clock is contextual
-- **Matches intent**: Boon code reads like hardware behavior
-- **Consistent with UI**: Reactive model works same way everywhere
+- **Declarative**: Patterns read like truth tables
+- **Type-safe**: Width tracking, pattern exhaustiveness
+- **Two tools for two jobs**: Bits/sum for deltas, LATEST for transforms
+- **Simple transpiler**: Direct mapping to SystemVerilog
 
-See individual `.bn` files for detailed transpiler mapping comments.
+See individual `.bn` files for detailed examples.
 
 ---
 

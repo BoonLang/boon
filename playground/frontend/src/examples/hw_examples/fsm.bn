@@ -1,20 +1,19 @@
 -- Finite State Machine
 -- 4-state FSM with input-dependent transitions
--- Boon's WHEN models state transitions naturally
+-- Demonstrates state transitions with pattern matching
 
 -- State encoding using tags
 -- A = 2'b00, B = 2'b01, C = 2'b10, D = 2'b11
 
--- Transpiler mapping:
---   LATEST { ... } → sequential state register
---   Pattern matching outside LATEST → combinational logic
+-- Transpiler model:
+--   - clk implicitly passed from hardware module context
+--   - LATEST allows controlled self-reference for state transitions
+--   - Pattern matching models state transitions (case statement)
 
-FUNCTION fsm(clk, rst, a) {
+FUNCTION fsm(rst, a) {
     BLOCK {
-        -- clk, rst: Bool - clock domain
-        -- a: Bool - input signal
-
         -- Sequential state register
+        -- FSMs use LATEST because next state depends on current state
         state: LATEST {
             B  -- Reset state
 

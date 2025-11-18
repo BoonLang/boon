@@ -1159,32 +1159,84 @@ request_line |> Bytes/take(count: 7) |> WHEN {
 
 ### FPGA / Hardware
 
+#### Hardware Register Pattern
+
+Boon hardware uses **stateful operations** to define registers:
+
+- **`Bits/sum`** is stateful - maintains register value across clock cycles
+- **Pipeline describes next-state logic** - transformations define how register updates
+- **Pattern matching on control signals** - declarative truth table style
+- **Implicit clock domain** - `clk` added by transpiler (SpinalHDL-style)
+
+**Key semantics:**
+- `Bits/set(SKIP)` → pass through unchanged (identity)
+- `Bits/set(value)` → replace with value (absolute update)
+- `Bits/sum(SKIP)` → add 0 (hold)
+- `Bits/sum(delta)` → add delta to current value (relative update)
+
+**Transpilation:** A function with `Bits/sum` becomes a register in hardware. The pipeline describes the synchronous logic for updating that register.
+
 ```boon
--- SR Latch using BITS
+-- SR Latch using BITS (combinational)
 FUNCTION sr_latch(s, r) {
     q: s |> Bits/or(q) |> Bits/and(r |> Bits/not())
     nq: q |> Bits/not()
     [q: q, nq: nq]
 }
 
--- 4-bit counter with async reset
-FUNCTION counter(clk_event, rst_event) {
-    count: LATEST {
-        BITS { 4, 10u0 }
+-- Loadable up/down counter (register with pattern matching)
+FUNCTION counter(rst, load, load_value, up, en) {
+    BLOCK {
+        count_width: 8
+        default: BITS { count_width, 10s0 }
 
-        rst_event |> WHEN {
-            Rising => BITS { 4, 10u0 }
-            __ => SKIP
-        }
+        -- Bundle control signals for pattern matching
+        control_signals: [reset: rst, load: load, up: up, enabled: en]
 
-        clk_event |> WHEN {
-            Rising => count |> Bits/increment()
-            __ => SKIP
-        }
+        -- Pipeline = next-state logic (this function IS a register)
+        count: default
+            |> Bits/set(control_signals |> WHEN {
+                [reset: True, load: __, up: __, enabled: __] => default
+                __ => SKIP
+            })
+            |> Bits/set(control_signals |> WHEN {
+                [reset: False, load: True, up: __, enabled: True] => load_value
+                __ => SKIP
+            })
+            |> Bits/sum(delta: control_signals |> WHEN {
+                [reset: False, load: False, up: True, enabled: True] =>
+                    BITS { count_width, 10s1 }
+                [reset: False, load: False, up: False, enabled: True] =>
+                    BITS { count_width, 10s-1 }
+                __ => SKIP
+            })
+
+        [count: count]
     }
-
-    [count: count]
 }
+
+-- Transpiles to SystemVerilog:
+-- module counter(
+--     input clk,                    // implicit in Boon
+--     input rst,
+--     input load,
+--     input [7:0] load_value,
+--     input up,
+--     input en,
+--     output logic [7:0] count
+-- );
+--     always_ff @(posedge clk or posedge rst)
+--         if (rst)
+--             count <= 8'd0;
+--         else if (en)
+--             if (load)
+--                 count <= load_value;
+--             else
+--                 if (up)
+--                     count <= count + 1;
+--                 else
+--                     count <= count - 1;
+-- endmodule
 
 -- Priority encoder (4-bit input)
 FUNCTION priority_encoder(input) {

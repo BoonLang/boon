@@ -3,12 +3,13 @@
 -- Generates pseudo-random sequences
 -- Why BITS: Shift operations are concise (1 line vs 8 lines with LIST)
 
--- Transpiler mapping:
---   LATEST { ... } → register with implicit clock domain
---   reset |> WHEN { True => ... } → async reset condition
+-- Transpiler model:
+--   - clk implicitly passed from hardware module context
+--   - LATEST allows access to current register value for feedback computation
+--   - Next value is transformation of current value (shift + feedback)
 
-FUNCTION lfsr(clk, reset) {
-    -- clk, reset: Bool - define clock domain
+FUNCTION lfsr(reset) {
+    -- reset: Bool - asynchronous reset
     -- Returns: BITS { 8, ... } - current LFSR state
 
     out: LATEST {
