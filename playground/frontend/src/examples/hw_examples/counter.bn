@@ -1,100 +1,76 @@
 -- Loadable up/down counter
--- Demonstrates BITS arithmetic operations
--- Why BITS: increment/decrement are single operations (vs manual arithmetic with LIST)
+-- Demonstrates BITS arithmetic with delta/sum pattern for hardware
+-- Why BITS: Signed arithmetic (10s1, 10s-1) handles increment/decrement elegantly
 
-FUNCTION counter(clk_event, rst_event, load, load_value, up, en) {
-    -- Sequential counter using LATEST
-    -- Maps to always_ff in SystemVerilog
-    -- All values are BITS { 8, ... } (unsigned 8-bit)
+-- Transpiler model (SpinalHDL-style implicit clock domain):
+--   - clk, rst implicitly passed from hardware module context (not in parameter list)
+--   - Transpiler infers registers from stateful operations (Bits/set, Bits/sum)
+--   - Transpiler generates: module counter(input clk, input rst, input load, ...)
+--
+-- Key pattern: Delta accumulation with mutual exclusivity
+--   - Bits/set: absolute value updates (reset, load)
+--   - Bits/sum: relative delta updates (increment/decrement)
+--   - Guards ensure only ONE operation active per cycle (no conflicts)
 
-    count: LATEST {
-        BITS { 8, 10u0 }  -- Initial: unsigned zero
+-- Parameters:
+--   rst, load, en, up: Bool - control signals
+--   load_value: BITS { 8, ... } - value to load
+-- Returns:
+--   count: BITS { 8, ... } - current counter value
+-- Implicit:
+--   clk - clock signal (added by transpiler)
 
-        -- Asynchronous reset (highest priority)
-        rst_event |> WHEN {
-            Rising => BITS { 8, 10u0 }
-            __ => SKIP
-        }
+FUNCTION counter(rst, load, load_value, up, en) {
+    BLOCK {
+        default: BITS { 8, 10s0 }  -- Reset value (signed for consistency)
 
-        -- Clock-triggered operations
-        clk_event |> WHEN {
-            Rising => en |> WHEN {
-                True => load |> WHEN {
-                    -- Load has priority over counting
-                    True => load_value
+        -- Guard: prevent operations during reset
+        not_resetting: rst |> Bool/not()
 
-                    -- Count up or down
-                    False => up |> WHEN {
-                        True => count |> Bits/increment()   -- count + 1
-                        False => count |> Bits/decrement()  -- count - 1
-                    }
-                }
-                False => SKIP  -- Hold when disabled
+        -- Control signal: load when enabled and not resetting
+        -- Mutual exclusivity: can't load AND increment in same cycle
+        en_and_load: Bool/and(
+            this: Bool/and(this: en, that: not_resetting)
+            that: load
+        )
+
+        -- Control signal: count when enabled, not loading, not resetting
+        en_and_not_load: Bool/and(
+            this: Bool/and(this: en, that: not_resetting)
+            that: load |> Bool/not()
+        )
+
+        -- Delta value: +1 (increment), -1 (decrement), or SKIP (no change)
+        -- Signed BITS allows negative deltas (10s-1 = -1 in two's complement)
+        -- Only active when en_and_not_load=True (mutually exclusive with load)
+        delta: en_and_not_load |> WHEN {
+            True => up |> WHEN {
+                True => BITS { 8, 10s1 }    -- Increment: +1
+                False => BITS { 8, 10s-1 }  -- Decrement: -1
             }
-            __ => SKIP
+            False => SKIP  -- Hold: no delta
         }
+
+        -- Register update pipeline (sequential transformations):
+        -- Priority through guards (only one fires per cycle):
+        --   1. rst=True → reset to default (highest priority via not_resetting guard)
+        --   2. load=True, rst=False → set to load_value (via en_and_load guard)
+        --   3. Otherwise → add delta (+1, -1, or 0)
+        --
+        -- Pipeline semantics:
+        --   Bits/set(SKIP) → pass through unchanged
+        --   Bits/set(value) → replace with value
+        --   Bits/sum(SKIP) → pass through unchanged
+        --   Bits/sum(delta) → add delta to current value
+        --
+        -- Bits/sum initialization:
+        --   First parameter (default): initial value for the register
+        --   Second parameter (delta): change to apply each cycle
+        count: default
+            |> Bits/set(rst |> WHEN { True => default, False => SKIP })
+            |> Bits/set(en_and_load |> WHEN { True => load_value, False => SKIP })
+            |> Bits/sum(delta: delta)
+
+        [count: count]
     }
-
-    [count: count]
 }
-
--- Alternative: Counter with overflow/underflow flags
--- Commented out: No corresponding .sv file (for transpiler development)
---
--- FUNCTION counter_with_flags(clk_event, rst_event, en, up) {
---     count: LATEST {
---         BITS { 8, 10u0 }
---
---         rst_event |> WHEN {
---             Rising => BITS { 8, 10u0 }
---             __ => SKIP
---         }
---
---         clk_event |> WHEN {
---             Rising => en |> WHEN {
---                 True => up |> WHEN {
---                     True => count |> Bits/increment()
---                     False => count |> Bits/decrement()
---                 }
---                 False => SKIP
---             }
---             __ => SKIP
---         }
---     }
---
---     -- Detect overflow (count = 255 and counting up)
---     overflow: count |> Bits/equal(BITS { 8, 10u255 }) |> Bool/and(up)
---
---     -- Detect underflow (count = 0 and counting down)
---     underflow: count |> Bits/equal(BITS { 8, 10u0 }) |> Bool/and(up |> Bool/not())
---
---     [
---         count: count
---         overflow: overflow
---         underflow: underflow
---     ]
--- }
-
--- Alternative: Parameterized counter (variable width)
--- Commented out: No corresponding .sv file (for transpiler development)
---
--- FUNCTION counter_param(width, clk_event, rst_event, en) {
---     count: LATEST {
---         BITS { width, 10u0 }
---
---         rst_event |> WHEN {
---             Rising => BITS { width, 10u0 }
---             __ => SKIP
---         }
---
---         clk_event |> WHEN {
---             Rising => en |> WHEN {
---                 True => count |> Bits/increment()
---                 False => SKIP
---             }
---             __ => SKIP
---         }
---     }
---
---     [count: count]
--- }

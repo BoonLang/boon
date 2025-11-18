@@ -1,28 +1,26 @@
 -- Accumulator with asynchronous reset
 -- Adds input to accumulator on clock cycles
--- Boon's LATEST models sequential register behavior
 
-FUNCTION cycleadder(width, clk_event, rst_event, en, a) {
-    -- Sequential accumulator using LATEST for register state
-    -- Maps to always_ff in SystemVerilog
-    -- 'a' is BITS { width, ... }, 'output' is also BITS { width, ... }
+-- Transpiler mapping:
+--   width parameter → module parameter: #(parameter WIDTH = 4)
+--   BITS { width, ... } → logic [WIDTH-1:0]
+--   LATEST { ... } → register with implicit clock domain
+
+FUNCTION cycleadder(width, clk, rst, en, a) {
+    -- width: Number - bit width parameter
+    -- clk, rst: Bool - clock domain
+    -- en: Bool - enable signal
+    -- a: BITS { width, ... } - input value to accumulate
 
     output: LATEST {
-        BITS { width, 10u0 }  -- Initial value: unsigned zero (reset state)
+        BITS { width, 10u0 }  -- Reset value
 
-        -- Asynchronous reset has priority (posedge rst)
-        rst_event |> WHEN {
-            Rising => BITS { width, 10u0 }
-            __ => SKIP
-        }
-
-        -- Clock-triggered accumulation (posedge clk)
-        clk_event |> WHEN {
-            Rising => en |> WHEN {
-                True => output |> Bits/add(a)  -- O <= O + A when enabled
-                False => SKIP                   -- Hold when disabled
+        rst |> WHEN {
+            True => BITS { width, 10u0 }
+            False => en |> WHEN {
+                True => output |> Bits/add(a)
+                False => output  -- Hold when disabled
             }
-            __ => SKIP
         }
     }
 

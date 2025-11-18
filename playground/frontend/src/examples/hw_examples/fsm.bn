@@ -5,37 +5,35 @@
 -- State encoding using tags
 -- A = 2'b00, B = 2'b01, C = 2'b10, D = 2'b11
 
-FUNCTION fsm(clk_event, rst_event, a) {
+-- Transpiler mapping:
+--   LATEST { ... } → sequential state register
+--   Pattern matching outside LATEST → combinational logic
+
+FUNCTION fsm(clk, rst, a) {
     BLOCK {
-        -- Sequential state register using LATEST
-        -- Maps to always_ff in SystemVerilog
+        -- clk, rst: Bool - clock domain
+        -- a: Bool - input signal
+
+        -- Sequential state register
         state: LATEST {
-            B  -- Initial state (reset goes to B)
+            B  -- Reset state
 
-            -- Asynchronous reset
-            rst_event |> WHEN {
-                Rising => B
-                __ => SKIP
-            }
-
-            -- Clock-triggered state transitions
-            clk_event |> WHEN {
-                Rising => state |> WHEN {
+            rst |> WHEN {
+                True => B
+                False => state |> WHEN {
                     A => C                              -- A -> C
                     B => D                              -- B -> D
                     C => a |> WHEN { True => D, False => B }  -- C -> D or B
                     D => A                              -- D -> A
                 }
-                __ => SKIP
             }
         }
 
         -- Combinational output logic
-        -- Maps to always_comb in SystemVerilog
         b: state |> WHEN {
             A => False
             B => True
-            C => a |> WHEN { True => True, False => False }
+            C => a  -- Output depends on input in state C
             D => False
         }
 

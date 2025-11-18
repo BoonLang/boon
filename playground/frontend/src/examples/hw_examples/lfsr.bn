@@ -3,22 +3,20 @@
 -- Generates pseudo-random sequences
 -- Why BITS: Shift operations are concise (1 line vs 8 lines with LIST)
 
-FUNCTION lfsr(clk_event, reset_event) {
-    -- Sequential register with feedback using LATEST
-    -- Maps to always_ff in SystemVerilog
+-- Transpiler mapping:
+--   LATEST { ... } → register with implicit clock domain
+--   reset |> WHEN { True => ... } → async reset condition
+
+FUNCTION lfsr(clk, reset) {
+    -- clk, reset: Bool - define clock domain
+    -- Returns: BITS { 8, ... } - current LFSR state
 
     out: LATEST {
-        BITS { 8, 10u0 }  -- Initial: 8-bit unsigned zero
+        BITS { 8, 10u0 }  -- Reset value
 
-        -- Asynchronous reset
-        reset_event |> WHEN {
-            Rising => BITS { 8, 10u0 }
-            __ => SKIP
-        }
-
-        -- Clock-triggered shift with feedback
-        clk_event |> WHEN {
-            Rising => BLOCK {
+        reset |> WHEN {
+            True => BITS { 8, 10u0 }
+            False => BLOCK {
                 -- Linear feedback: NOT(out[7] XOR out[3])
                 feedback: out |> Bits/get(index: 7) |> Bool/xor(
                     out |> Bits/get(index: 3)
@@ -29,7 +27,6 @@ FUNCTION lfsr(clk_event, reset_event) {
                     |> Bits/shift_right(by: 1)
                     |> Bits/set(index: 7, value: feedback)
             }
-            __ => SKIP
         }
     }
 

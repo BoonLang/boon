@@ -4,6 +4,82 @@ Boon hardware examples demonstrating FPGA/ASIC design patterns. Each example sho
 
 ---
 
+## Transpiler Model: SpinalHDL-Style Implicit Clocking
+
+Boon hardware uses an **implicit clock domain model** inspired by SpinalHDL:
+
+### Core Principles
+
+1. **Parameters match SystemVerilog ports exactly**
+   - `clk, rst` not `clk_event, rst_event`
+   - All signals are `Bool` or `BITS` types
+
+2. **LATEST = Register**
+   - `LATEST { ... }` creates a clocked register
+   - Clock domain is **implicit** from function's `clk` parameter
+   - No explicit edge detection needed
+
+3. **Pattern matching = Conditional logic**
+   - `rst |> WHEN { True => ... }` → async reset
+   - Other `WHEN` patterns → if/else logic
+
+### Transpiler Mapping Rules
+
+| Boon Pattern | SystemVerilog Output | Example |
+|--------------|---------------------|---------|
+| `FUNCTION name(clk, rst, ...)` | `module name(input clk, input rst, ...)` | Function → Module |
+| `LATEST { init_value ... }` | `always_ff @(posedge clk ...)` | Register with implicit clock |
+| `rst \|> WHEN { True => val }` | `if (rst) ... <= val;` | Async reset condition |
+| `en \|> WHEN { True => ... }` | `if (en) ...` | Conditional logic |
+| `count \|> Bits/increment()` | `count + 1` | Arithmetic operation |
+| `state \|> WHEN { A => ... }` | `case (state) A: ...` | Pattern matching |
+
+### Example: Counter
+
+**Boon:**
+```boon
+FUNCTION counter(clk, rst, en) {
+    count: LATEST {
+        BITS { 8, 10u0 }
+        rst |> WHEN {
+            True => BITS { 8, 10u0 }
+            False => en |> WHEN {
+                True => count |> Bits/increment()
+                False => count
+            }
+        }
+    }
+    [count: count]
+}
+```
+
+**Generated SystemVerilog:**
+```systemverilog
+module counter(
+    input clk,
+    input rst,
+    input en,
+    output logic [7:0] count
+);
+    always_ff @(posedge clk or posedge rst)
+        if (rst)
+            count <= 8'd0;
+        else if (en)
+            count <= count + 1;
+endmodule
+```
+
+### Why This Model?
+
+- **Simple transpiler**: Pattern-based translation, no complex edge detection
+- **Clear semantics**: LATEST = register, clock is contextual
+- **Matches intent**: Boon code reads like hardware behavior
+- **Consistent with UI**: Reactive model works same way everywhere
+
+See individual `.bn` files for detailed transpiler mapping comments.
+
+---
+
 ## Quick Reference: When to Use What
 
 ### Use BITS for:
