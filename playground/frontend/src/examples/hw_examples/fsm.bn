@@ -14,9 +14,7 @@ FUNCTION fsm(rst, a) {
     BLOCK {
         -- Sequential state register
         -- FSMs use LATEST because next state depends on current state
-        state: LATEST {
-            B  -- Reset state
-
+        state: B |> LATEST state {
             rst |> WHEN {
                 True => B
                 False => state |> WHEN {

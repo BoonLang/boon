@@ -51,3 +51,29 @@ FUNCTION counter(rst, load, load_value, up, en) {
         [count: count]
     }
 }
+
+-- Alternative: Using LATEST with self-reference (equivalent to Bits/sum pattern above)
+-- This version is more imperative: "next state from current state"
+-- The Bits/sum version above is more declarative: "truth table with deltas"
+-- Both are valid hardware patterns; Bits/sum is preferred for its clarity
+-- Commented out: For educational comparison only
+--
+-- FUNCTION counter_latest(rst, load, load_value, up, en) {
+--     BLOCK {
+--         count_width: 8
+--         default: BITS { count_width, 10s0 }
+--         control_signals: [reset: rst, load: load, up: up, enabled: en]
+--
+--         count: default |> LATEST count {
+--             control_signals |> WHEN {
+--                 [reset: True, load: __, up: __, enabled: __] => default
+--                 [reset: False, load: True, up: __, enabled: True] => load_value
+--                 [reset: False, load: False, up: True, enabled: True] => count |> Bits/increment()
+--                 [reset: False, load: False, up: False, enabled: True] => count |> Bits/decrement()
+--                 __ => count  -- Hold current value
+--             }
+--         }
+--
+--         [count: count]
+--     }
+-- }

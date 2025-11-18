@@ -3,13 +3,10 @@ store: [
         decrement_button: LINK
         increment_button: LINK
     ]
-    counter: 
-        LATEST {
-            0
-            elements.decrement_button.event.press |> THEN { -1 }
-            elements.increment_button.event.press |> THEN { 1 }
-        } 
-        |> Math/sum()
+    counter: 0 |> LATEST count {
+        elements.decrement_button.event.press |> THEN { count - 1 }
+        elements.increment_button.event.press |> THEN { count + 1 }
+    }
 ]
 
 document: Document/new(root: root_element(PASS: store))

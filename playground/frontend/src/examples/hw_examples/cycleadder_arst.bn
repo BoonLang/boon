@@ -28,3 +28,23 @@ FUNCTION cycleadder(width, rst, en, a) {
         [o: output]
     }
 }
+
+-- Alternative: Using LATEST with self-reference (equivalent to Bits/sum pattern above)
+-- Commented out: For educational comparison only
+--
+-- FUNCTION cycleadder_latest(width, rst, en, a) {
+--     BLOCK {
+--         default: BITS { width, 10u0 }
+--         control_signals: [reset: rst, enabled: en]
+--
+--         output: default |> LATEST output {
+--             control_signals |> WHEN {
+--                 [reset: True, enabled: __] => default
+--                 [reset: False, enabled: True] => output |> Bits/add(a)
+--                 __ => output  -- Hold
+--             }
+--         }
+--
+--         [o: output]
+--     }
+-- }

@@ -642,6 +642,259 @@ FUNCTION fsm(rst, a) {
 
 ---
 
+## Common Pitfalls and Compiler Warnings
+
+While LATEST is designed with safety in mind (non-self-reactive semantics prevent infinite loops), there are still patterns that can cause confusion or bugs. The Boon compiler includes static analysis rules to catch these at compile-time.
+
+### Pitfall 1: No External Trigger (Evaluates Once)
+
+**Problem:**
+```boon
+// ⚠️ WARNING: No external trigger - evaluates once then stays
+x: 0 |> LATEST x { x + 1 }
+// Result: x = 1 (evaluates once on init, no re-trigger)
+```
+
+**Why it happens:**
+- Piped LATEST evaluates once on initialization
+- With no event or reactive input, it never re-evaluates
+- Non-self-reactive: doesn't react to its own state change
+
+**Solution:**
+```boon
+// ✅ Add explicit trigger
+x: 0 |> LATEST x {
+    timer_event |> THEN { x + 1 }
+}
+```
+
+**Compiler warning:**
+```
+Warning: LATEST has no external trigger
+  --> example.bn:1:4
+   |
+ 1 | x: 0 |> LATEST x { x + 1 }
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = Note: This will evaluate once on initialization and never update
+   = Help: Add an event trigger (e.g., `event |> THEN { x + 1 }`)
+```
+
+### Pitfall 2: Unused Pure Function Return Value
+
+**Problem:**
+```boon
+// ❌ ERROR: List/push returns new list, but it's not used
+items: LIST {} |> LATEST list {
+    add_event |> THEN {
+        List/push(list, new_item)  // Returns new list
+        list                        // Returns old list! BUG!
+    }
+}
+```
+
+**Why it happens:**
+- Boon has persistent data structures (immutable)
+- `List/push` returns a NEW list, doesn't modify in-place
+- Last expression `list` returns the OLD list (unchanged)
+
+**Solution:**
+```boon
+// ✅ Use the returned value
+items: LIST {} |> LATEST list {
+    add_event |> THEN {
+        list |> List/push(new_item)  // Pipe to use result
+    }
+}
+
+// OR
+items: LIST {} |> LATEST list {
+    add_event |> THEN {
+        new_list: list |> List/push(new_item)
+        new_list
+    }
+}
+```
+
+**Compiler error:**
+```
+Error: Pure function return value unused
+  --> example.bn:3:9
+   |
+ 3 |         List/push(list, new_item)
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = Note: List/push returns a new list, but the result is discarded
+   = Help: Use the return value: `list |> List/push(new_item)`
+```
+
+### Pitfall 3: Unbounded Collection Growth
+
+**Problem:**
+```boon
+// ⚠️ WARNING: Unbounded growth (memory leak)
+log: LIST {} |> LATEST entries {
+    event |> THEN {
+        entries |> List/push(event_data)
+    }
+}
+// Grows forever!
+```
+
+**Why it happens:**
+- No limit on collection size
+- Can cause memory issues in long-running applications
+
+**Solution:**
+```boon
+// ✅ Add bounded growth
+log: LIST {} |> LATEST entries {
+    event |> THEN {
+        entries
+            |> List/push(event_data)
+            |> List/take_last(count: 100)  // Keep only last 100
+    }
+}
+
+// OR use circular buffer
+log: Queue/bounded(size: 100, on_full: DropOldest)
+```
+
+**Compiler warning:**
+```
+Warning: Potential unbounded collection growth
+  --> example.bn:1:6
+   |
+ 1 | log: LIST {} |> LATEST entries {
+   |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = Note: Collection grows without bound
+   = Help: Consider using `List/take_last(count: N)` or `Queue/bounded`
+```
+
+### Pitfall 4: Circular Dependencies
+
+**Problem:**
+```boon
+// ⚠️ WARNING: Confusing evaluation order
+a: 0 |> LATEST a {
+    event |> THEN { a + b }
+}
+b: a * 2  // Depends on 'a'
+```
+
+**Why it happens:**
+- `b` depends on `a`, `a` depends on `b` (via event)
+- Evaluation order unclear
+- Can cause confusion about what values are used
+
+**Solution:**
+```boon
+// ✅ Make dependencies explicit and one-way
+counter: 0 |> LATEST count {
+    event |> THEN { count + 1 }
+}
+double: counter * 2  // Clear one-way dependency
+
+// OR use shared state
+[
+    counter: 0 |> LATEST count {
+        event |> THEN { count + 1 }
+    }
+    double: counter * 2
+]
+```
+
+**Compiler warning:**
+```
+Warning: Circular dependency detected
+  --> example.bn:1:4
+   |
+ 1 | a: 0 |> LATEST a { event |> THEN { a + b } }
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ 2 | b: a * 2
+   |    -----
+   |
+   = Note: 'a' depends on 'b', 'b' depends on 'a'
+   = Help: Consider restructuring to eliminate cycle
+```
+
+### Pitfall 5: Same Name Confusion (Not a Real Issue!)
+
+**Common concern:**
+```boon
+counter: 0 |> LATEST counter { counter + 1 }
+//       ^            ^         ^
+//       |            |         |
+//       Variable   Parameter  Parameter reference
+```
+
+**This is actually FINE!**
+- Standard shadowing rules apply
+- Parameter `counter` shadows variable `counter` inside the block
+- Outside the block, `counter` refers to the variable
+- Clear and unambiguous
+
+**Recommended pattern:**
+```boon
+// ✅ Same name is idiomatic - no need for generic names
+counter: 0 |> LATEST counter { event |> THEN { counter + 1 } }
+sum: 0 |> LATEST sum { value |> THEN { sum + value } }
+state: Idle |> LATEST state { event |> THEN { next_state(state) } }
+
+// ❌ Avoid generic/confusing names
+counter: 0 |> LATEST x { event |> THEN { x + 1 } }        // What is 'x'?
+counter: 0 |> LATEST current { event |> THEN { current + 1 } }  // Verbose
+```
+
+### Compiler Rules Summary
+
+The Boon compiler implements static analysis at three strictness levels:
+
+**Level 1: Permissive (default)**
+- ❌ Rule 2: Unused pure return value (ERROR)
+- ⚠️ Rule 1: No external trigger (WARNING)
+
+**Level 2: Strict (`--strict` flag)**
+- All Permissive rules, plus:
+- ⚠️ Rule 3: Unbounded growth (WARNING)
+- ⚠️ Rule 4: Circular dependencies (WARNING)
+- ⚠️ Rule 6: List/Record in LATEST (WARNING)
+
+**Level 3: Pedantic (`--pedantic` flag)**
+- All Strict rules, plus:
+- ℹ️ Rule 7: Parameter name matches variable (INFO)
+- ℹ️ Rule 8: Pure functions only (INFO)
+
+**Suppressing warnings:**
+```boon
+// Suppress specific warning
+#[allow(no_external_trigger)]
+counter: 0 |> LATEST counter { counter + 1 }
+
+// Suppress at module level
+#![allow(unbounded_growth)]
+```
+
+See `LATEST_COMPILER_RULES.md` for complete rule specification.
+
+### Best Practices
+
+**DO:**
+- ✅ Use same name for parameter and variable (clear shadowing)
+- ✅ Add explicit triggers (events, reactive inputs)
+- ✅ Use persistent data structures correctly (pipe results)
+- ✅ Bound collection growth (take_last, bounded queues)
+- ✅ Keep dependencies one-way (no cycles)
+
+**DON'T:**
+- ❌ Forget to use return values from pure functions
+- ❌ Let collections grow unbounded
+- ❌ Create circular dependencies
+- ❌ Use generic names like `x`, `current`, `value` (unless appropriate)
+
+---
+
 ## Design Rationale
 
 ### Why Two Forms?
@@ -719,11 +972,12 @@ flag: LATEST {
 
 ## Next Steps
 
-1. Finalize syntax details
-2. Update hw_examples to use LATEST
-3. Document transpilation to SystemVerilog
+1. ✅ ~~Finalize syntax details~~ - DONE (piped LATEST syntax finalized)
+2. ✅ ~~Update hw_examples to use LATEST~~ - DONE (all examples updated)
+3. Document transpilation to SystemVerilog (hardware backend)
 4. Add LATEST to standard library documentation
 5. Write tutorial showing progression from simple to piped LATEST
+6. Implement compiler rules (see LATEST_COMPILER_RULES.md for specification)
 
 ---
 

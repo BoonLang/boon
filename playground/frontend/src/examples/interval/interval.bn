@@ -1,6 +1,19 @@
-document: 
+-- Simple LATEST: Timer event stream with delta accumulation
+document:
     Duration[seconds: 1]
-    |> Timer/interval() 
-    |> THEN { 1 } 
+    |> Timer/interval()
+    |> THEN { 1 }
     |> Math/sum()
     |> Document/new()
+
+-- Alternative: LATEST with self-reference (explicit counter)
+-- Separates state from view for clarity
+-- Commented out: For educational comparison
+--
+-- counter: 0 |> LATEST count {
+--     Duration[seconds: 1]
+--     |> Timer/interval()
+--     |> THEN { count + 1 }
+-- }
+--
+-- document: counter |> Document/new()

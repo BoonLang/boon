@@ -4,8 +4,8 @@
 
 -- Transpiler model:
 --   - clk implicitly passed from hardware module context
---   - LATEST allows access to current memory array for element update
---   - Asynchronous read is combinational (outside LATEST)
+--   - MEMORY primitive handles stateful storage (no LATEST needed)
+--   - Asynchronous read is combinational
 
 FUNCTION ram(addr, wraddr, wrdata) {
     BLOCK {
@@ -14,31 +14,51 @@ FUNCTION ram(addr, wraddr, wrdata) {
         -- wrdata: Number - data to write
 
         -- Memory state: synchronous write on every clock cycle
-        -- LATEST needed to update specific memory element
+        -- MEMORY is stateful by design (no LATEST wrapper needed)
         -- Initial: mem[i] = i
-        mem: LATEST {
-            List/range(start: 0, end: 16)  -- 2^4 = 16 entries
-            mem |> List/set(index: wraddr, value: wrdata)
-        }
+        mem: MEMORY { 16, 0 }
+            |> Memory/initialize(i, data: i)
+            |> Memory/write(address: wraddr, data: wrdata)
 
         -- Asynchronous read (combinational)
-        data: mem |> List/get(index: addr)
+        data: mem |> Memory/read(address: addr)
 
         [data: data]
     }
 }
+
+
+
+
+
+-- Example: RAM with Write Enable
+FUNCTION ram_with_we(addr, wraddr, wrdata, write_enable) {
+    BLOCK {
+        memory: MEMORY { 16, BITS { 8, 2u0 } }
+            |> Memory/write_entry(entry: write_enable |> WHEN {
+                True => [address: wraddr, data: wrdata]
+                False => SKIP
+            })
+
+        data: memory |> Memory/read(address: addr)
+
+        [data: data]
+    }
+}
+
+
+
 
 -- Parameterized version
 FUNCTION ram_param(awidth, dwidth, addr, wraddr, wrdata) {
     BLOCK {
         mem_size: 2 |> Number/pow(awidth)
 
-        mem: LATEST {
-            List/range(start: 0, end: mem_size)
-            mem |> List/set(index: wraddr, value: wrdata)
-        }
+        mem: MEMORY { mem_size, 0 }
+            |> Memory/initialize(i, data: i)
+            |> Memory/write(address: wraddr, data: wrdata)
 
-        data: mem |> List/get(index: addr)
+        data: mem |> Memory/read(address: addr)
 
         [
             data: data
@@ -48,29 +68,6 @@ FUNCTION ram_param(awidth, dwidth, addr, wraddr, wrdata) {
     }
 }
 
--- Alternative: RAM with write enable
--- Commented out: No corresponding .sv file (for transpiler development)
---
--- FUNCTION ram_with_we(clk_event, addr, wraddr, wrdata, write_enable) {
---     BLOCK {
---         mem: LATEST {
---             List/range(start: 0, end: 16)
---
---             clk_event |> WHEN {
---                 Rising => write_enable |> WHEN {
---                     True => mem |> List/set(index: wraddr, value: wrdata)
---                     False => SKIP
---                 }
---                 __ => SKIP
---             }
---         }
---
---         data: mem |> List/get(index: addr)
---
---         [data: data]
---     }
--- }
-
 -- Example usage
 -- Commented out: No corresponding .sv file (for transpiler development)
 --
@@ -78,7 +75,6 @@ FUNCTION ram_param(awidth, dwidth, addr, wraddr, wrdata) {
 --     BLOCK {
 --         -- Create RAM instance
 --         my_ram: ram(
---             clk_event: Rising
 --             addr: 5           -- Read from address 5
 --             wraddr: 3         -- Write to address 3
 --             wrdata: 42        -- Write value 42
@@ -86,5 +82,19 @@ FUNCTION ram_param(awidth, dwidth, addr, wraddr, wrdata) {
 --
 --         -- Returns data at address 5, after writing 42 to address 3
 --         my_ram.data
+--     }
+-- }
+--
+-- FUNCTION example_dual_port_ram() {
+--     BLOCK {
+--         -- Dual-port RAM: independent read and write ports
+--         memory: MEMORY { 256, 0 }
+--             |> Memory/write(address: wr_addr_a, data: wr_data_a)
+--             |> Memory/write(address: wr_addr_b, data: wr_data_b)
+--
+--         data_a: memory |> Memory/read(address: rd_addr_a)
+--         data_b: memory |> Memory/read(address: rd_addr_b)
+--
+--         [data_a: data_a, data_b: data_b]
 --     }
 -- }

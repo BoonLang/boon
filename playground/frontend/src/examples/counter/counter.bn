@@ -8,12 +8,22 @@ document: Document/new(root: Element/stripe(
     }
 ))
 
-counter: 
+-- Simple LATEST: Event merging with stateful operation (Math/sum)
+-- This pattern uses delta accumulation (events produce +1, Math/sum maintains total)
+counter:
     LATEST {
         0
-        increment_button.event.press |> THEN { 1 } 
-    } 
+        increment_button.event.press |> THEN { 1 }
+    }
     |> Math/sum()
+
+-- Alternative: LATEST with self-reference (explicit current value)
+-- This pattern directly computes next value from current value
+-- Commented out: For educational comparison
+--
+-- counter: 0 |> LATEST count {
+--     increment_button.event.press |> THEN { count + 1 }
+-- }
 
 increment_button: Element/button(
     element: [event: [press: LINK]]

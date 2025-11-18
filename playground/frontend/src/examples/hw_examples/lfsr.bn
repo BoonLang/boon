@@ -12,9 +12,7 @@ FUNCTION lfsr(reset) {
     -- reset: Bool - asynchronous reset
     -- Returns: BITS { 8, ... } - current LFSR state
 
-    out: LATEST {
-        BITS { 8, 10u0 }  -- Reset value
-
+    out: BITS { 8, 10u0 } |> LATEST out {
         reset |> WHEN {
             True => BITS { 8, 10u0 }
             False => BLOCK {

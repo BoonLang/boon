@@ -14,10 +14,11 @@ input_a: sum_of_steps(step: 1, seconds: 0.5)
 input_b: sum_of_steps(step: 10, seconds: 1)
 
 FUNCTION sum_of_steps(step, seconds) {
-    Duration[seconds: seconds]
-    |> Timer/interval() 
-    |> THEN { step } 
-    |> Math/sum()
+    0 |> LATEST sum {
+        Duration[seconds: seconds]
+        |> Timer/interval()
+        |> THEN { sum + step }
+    }
 }
 
 subtraction_button: TEXT { A - B } |> operation_button()
