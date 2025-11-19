@@ -758,7 +758,7 @@ FUNCTION process_with_cleanup(resource) {
 
 ```boon
 generation_result: svg_files
-    |> List/retain(item, if: item.extension = TEXT { svg })
+    |> List/retain(item, if: item.extension == TEXT { svg })
     |> List/sort_by(item, key: item.path)
     |> List/map(old, new:
         old |> icon_code() |> WHEN {

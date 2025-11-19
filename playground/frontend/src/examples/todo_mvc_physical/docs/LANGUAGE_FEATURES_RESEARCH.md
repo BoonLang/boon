@@ -855,7 +855,7 @@ processed: items |> List/map(item, result: item.name?)
 -- Type: List<T | UNPLUGGED>
 
 -- Problem: Can we have UNPLUGGED in lists?
-filtered: processed |> List/retain(item, if: item != UNPLUGGED)  -- ???
+filtered: processed |> List/retain(item, if: item =/= UNPLUGGED)  -- ???
 ```
 
 **Challenge:** How do collections interact with UNPLUGGED?

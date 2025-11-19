@@ -722,7 +722,7 @@ store: [
 
 FUNCTION filter_button(filter) {
     BLOCK {
-        selected: PASSED.store.selected_filter = filter
+        selected: PASSED.store.selected_filter == filter
 
         Element/button(
             element: [event: [press: LINK], hovered: LINK]
@@ -927,7 +927,7 @@ BuildFS/write_string(output_file, generated_code)
 ✅ **Do**:
 ```boon
 -- Check for empty directories
-svg_files |> List/count() = 0 |> WHEN {
+svg_files |> List/count() == 0 |> WHEN {
     True => Build/warning(TEXT { No SVG files found in {icons_dir} })
     False => SKIP
 }

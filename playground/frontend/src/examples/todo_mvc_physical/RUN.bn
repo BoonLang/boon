@@ -442,7 +442,7 @@ FUNCTION todo_element(todo) {
             move: [closer: Theme/elevation(of: TodoItem)]
             material: Theme/material(of: Interactive[hovered: element.hovered])
         ]
-        items: PASSED.store.selected_todo_id = todo.id |> WHILE {
+        items: PASSED.store.selected_todo_id == todo.id |> WHILE {
             True => LIST {
                 editing_todo_title_element(todo: todo)
                     |> LINK { todo.todo_elements.editing_todo_title_element }
@@ -679,7 +679,7 @@ FUNCTION filters_element() {
 
 FUNCTION filter_button(filter) {
     BLOCK {
-        selected: PASSED.store.selected_filter = filter
+        selected: PASSED.store.selected_filter == filter
 
         Element/button(
             element: [

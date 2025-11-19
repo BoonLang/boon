@@ -270,7 +270,7 @@ FUNCTION todo_element(todo) {
             background: [color: Oklch[lightness: 1]]
             font: [size: 24]
         ]
-        items: PASSED.store.selected_todo_id = todo.id |> WHILE {
+        items: PASSED.store.selected_todo_id == todo.id |> WHILE {
             True => LIST { 
                 editing_todo_title_element(todo: todo) 
                     |> LINK { todo.todo_elements.editing_todo_title_element }
@@ -481,7 +481,7 @@ FUNCTION filter_button(filter) {
             padding: [row: 8, column: 4]
             rounded_corners: 3
             outline: BLOCK {
-                selected: PASSED.store.selected_filter = filter
+                selected: PASSED.store.selected_filter == filter
                 alpha: LIST { selected, element.hovered } |> WHEN {
                     LIST { True, __ } => 0.2
                     LIST { False, True } => 0.1

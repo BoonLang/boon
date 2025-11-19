@@ -91,9 +91,11 @@ FUNCTION fibonacci(position) {
 
 **Pattern:** The inner scope shadows the outer, making code clearer when the same conceptual value is being transformed.
 
-### Comparison Uses Single `=`
+### Comparison Uses Double `==`
 
-**Equality comparison in Boon uses a single `=` operator, not `==`.**
+**Equality comparison in Boon uses double equals `==`, following universal programming conventions.**
+
+**Inequality uses `=/=` for visual consistency with `==` and `__` (double-character operators).**
 
 However, **pattern matching is often more idiomatic than explicit comparison:**
 
@@ -115,29 +117,37 @@ count |> WHEN {
 }
 ```
 
-✅ **CORRECT - Explicit comparison with `=`:**
+✅ **CORRECT - Explicit comparison with `==`:**
 ```boon
-state.iteration = position |> WHEN {
+state.iteration == position |> WHEN {
     True => result
     False => SKIP
 }
 
-count = 0 |> WHEN {
+count == 0 |> WHEN {
     True => empty_message()
     False => items_list()
 }
+
+count =/= 0 |> WHEN {
+    True => items_list()
+    False => empty_message()
+}
 ```
 
-❌ **INCORRECT - `==` does not exist:**
+❌ **INCORRECT - Single `=` is for mathematical notation only:**
 ```boon
-state.iteration == position  // SYNTAX ERROR
-count == 0                   // SYNTAX ERROR
+state.iteration = position  // SYNTAX ERROR (use ==)
+count = 0                   // SYNTAX ERROR (use ==)
+count != 0                  // SYNTAX ERROR (use =/=)
 ```
 
 **Note:**
 - Pattern matching is preferred when possible (more functional, cleaner)
-- Use single `=` for explicit comparison when needed
+- Use `==` for equality, `=/=` for inequality when explicit comparison needed
 - Assignment uses `:` in bindings (`name: value`)
+- Visual consistency: `==`, `=/=`, and `__` are all double-character operators
+- In programming fonts with ligatures, `==` and `=/=` render distinctly from `=>` (arrow)
 
 ---
 
@@ -1628,7 +1638,7 @@ style: [
 | **Function/variable naming** | snake_case ONLY | `new_todo`, `selected_filter`, `title_to_save` |
 | **Tag naming** | PascalCase | `Active`, `Light`, `InputInterior`, `TodoId` |
 | **Shadowing** | Allowed | `state: init \|> LATEST state { ... }` ✅ |
-| **Comparison operator** | Single `=` (not `==`) | `count = 0 \|> WHEN { True => ..., False => ... }` ✅ |
+| **Comparison operator** | Double `==` for equality, `=/=` for inequality | `count == 0 \|> WHEN { True => ..., False => ... }` ✅ |
 | **Function arguments** | Must be named (except first when piped) | `f(x: 1)` ✅, `f(1)` ❌, `1 \|> f()` ✅ |
 | **Function parameters** | All required, no defaults | Use `Default` tag or `with: []` record |
 | **Optional fields** | Use `obj.field?` postfix | Returns `T \| UNPLUGGED`, must handle with WHEN |
@@ -1670,9 +1680,10 @@ When proposing new Boon APIs, remember:
    - `state: init |> LATEST state { ... }` is preferred over abbreviated parameter names
    - Makes code more readable when transforming the same conceptual value
 
-4. ✅ **Use single `=` for comparison, not `==`**
-   - `count = 0 |> WHEN { True => ..., False => ... }`
+4. ✅ **Use `==` for equality comparison, `=/=` for inequality**
+   - `count == 0 |> WHEN { True => ..., False => ... }`
    - Assignment uses `:` in bindings (`name: value`)
+   - Visual consistency with `__` wildcard (double-character operators)
 
 5. ✅ **Functions must be called with Module/ prefix**
    - `Theme/material()` not `material()`
