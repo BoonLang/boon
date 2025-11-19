@@ -2,11 +2,12 @@
 -- Demonstrates BITS arithmetic with delta/sum pattern for hardware
 -- Why BITS: Signed arithmetic (10s1, 10s-1) handles increment/decrement elegantly
 
--- Transpiler model (SpinalHDL-style implicit clock domain):
---   - clk implicitly passed from hardware module context (not in parameter list)
---   - Bits/sum is stateful → this function is actually a register
+-- Transpiler model:
+--   - Clock accessed via PASSED.clk (ambient context from hardware module)
+--   - PASSED.clk: [] = impulse, SKIP = no impulse
+--   - THEN triggers when PASSED.clk = [] (clock tick/impulse occurs)
+--   - LATEST creates register that holds count value
 --   - Pipeline describes next-state logic for the register
---   - Transpiler generates: module counter(input clk, input rst, input load, ...)
 --
 -- Key pattern: State-based pattern matching with delta accumulation
 --   - All logic matches on single `control_signals` record (truth table style)
@@ -21,8 +22,6 @@
 --   load_value: BITS { 8, ... } - value to load
 -- Returns:
 --   count: BITS { 8, ... } - current counter value
--- Implicit:
---   clk - clock signal (added by transpiler)
 
 FUNCTION counter(rst, load, load_value, up, en) {
     BLOCK {
@@ -32,22 +31,27 @@ FUNCTION counter(rst, load, load_value, up, en) {
         -- Bundle all control signals for pattern matching
         control_signals: [reset: rst, load: load, up: up, enabled: en]
 
-        count: default
-            |> Bits/set(control_signals |> WHILE {
-                [reset: True, load: __, up: __, enabled: __] => default
-                __ => SKIP
-            })
-            |> Bits/set(control_signals |> WHILE {
-                [reset: False, load: True, up: __, enabled: True] => load_value
-                __ => SKIP
-            })
-            |> Bits/sum(delta: control_signals |> WHILE {
-                [reset: False, load: False, up: True, enabled: True] =>
-                    BITS { count_width, 10s1 }
-                [reset: False, load: False, up: False, enabled: True] =>
-                    BITS { count_width, 10s-1 }
-                __ => SKIP
-            })
+        -- Sequential register with clock-triggered updates
+        count: default |> LATEST count {
+            PASSED.clk |> THEN {
+                count
+                    |> Bits/set(control_signals |> WHILE {
+                        [reset: True, load: __, up: __, enabled: __] => default
+                        __ => SKIP
+                    })
+                    |> Bits/set(control_signals |> WHILE {
+                        [reset: False, load: True, up: __, enabled: True] => load_value
+                        __ => SKIP
+                    })
+                    |> Bits/sum(delta: control_signals |> WHILE {
+                        [reset: False, load: False, up: True, enabled: True] =>
+                            BITS { count_width, 10s1 }
+                        [reset: False, load: False, up: False, enabled: True] =>
+                            BITS { count_width, 10s-1 }
+                        __ => SKIP
+                    })
+            }
+        }
 
         [count: count]
     }

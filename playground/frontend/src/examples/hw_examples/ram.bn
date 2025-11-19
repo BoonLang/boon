@@ -3,9 +3,11 @@
 -- Asynchronous read, synchronous write
 
 -- Transpiler model:
---   - clk implicitly passed from hardware module context
---   - MEMORY primitive handles stateful storage (no LATEST needed)
---   - Asynchronous read is combinational
+--   - Clock accessed via PASSED.clk (ambient context from hardware module)
+--   - PASSED.clk: [] = impulse, SKIP = no impulse
+--   - MEMORY primitive handles stateful storage internally
+--   - Memory/write accesses PASSED.clk for synchronous writes
+--   - Memory/read is asynchronous (combinational)
 
 FUNCTION ram(addr, wraddr, wrdata) {
     BLOCK {
@@ -13,11 +15,11 @@ FUNCTION ram(addr, wraddr, wrdata) {
         -- wraddr: Number (0-15) - write address
         -- wrdata: Number - data to write
 
-        -- Memory state: synchronous write on every clock cycle
-        -- MEMORY is stateful by design (no LATEST wrapper needed)
-        -- Initial: mem[i] = i
+        -- Memory state: synchronous write on clock edges
+        -- MEMORY primitive handles state internally, accesses PASSED.clk
+        -- Initial: mem[address] = address
         mem: MEMORY { 16, 0 }
-            |> Memory/initialize(i, data: i)
+            |> Memory/initialize(address, data: address)
             |> Memory/write(address: wraddr, data: wrdata)
 
         -- Asynchronous read (combinational)

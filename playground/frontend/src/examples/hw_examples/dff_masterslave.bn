@@ -1,6 +1,6 @@
 -- Master-slave D flip-flop
 -- Edge-triggered storage element using two D latches
--- Boon's LATEST captures sequential state changes
+-- Structural (gate-level) implementation - clk is a data input signal
 
 FUNCTION d_latch(d, e) {
     BLOCK {

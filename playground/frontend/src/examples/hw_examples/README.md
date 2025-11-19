@@ -4,16 +4,17 @@ Boon hardware examples demonstrating FPGA/ASIC design patterns. Each example sho
 
 ---
 
-## Transpiler Model: Two Register Patterns
+## Transpiler Model: PASSED Context & Register Patterns
 
-Boon hardware uses **implicit clock domain** (SpinalHDL-style) with two complementary patterns for registers:
+Boon hardware uses **ambient context** (`PASSED`) for clock signals, with two complementary patterns for registers:
 
 ### Core Principles
 
-1. **Implicit clock signal**
-   - `clk` is NOT in function parameters
-   - Transpiler adds `input clk` to generated module
-   - All signals are `Bool` or `BITS` types
+1. **Clock via PASSED context**
+   - Hardware modules establish `PASSED: [clk: clk_input, ...]`
+   - Functions access `PASSED.clk` (not in parameters)
+   - Keeps function signatures clean
+   - See [CLOCK_SEMANTICS.md](CLOCK_SEMANTICS.md) for detailed clock documentation
 
 2. **Two register patterns**
    - **Bits/sum pattern** - For counters/accumulators (delta accumulation)
@@ -62,20 +63,21 @@ FUNCTION counter(rst, load, load_value, up, en) {
 
 ### Pattern 2: LATEST (Value Transformation)
 
-**Use for:** FSMs, LFSRs, RAMs (when next value depends on current value)
+**Use for:** FSMs, LFSRs (when next value depends on current value)
 
 ```boon
 FUNCTION fsm(rst, a) {
     BLOCK {
-        state: LATEST {
-            B  -- Reset state
-            rst |> WHEN {
-                True => B
-                False => state |> WHEN {
-                    A => C
-                    B => D
-                    C => a |> WHEN { True => D, False => B }
-                    D => A
+        state: B |> LATEST state {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => B
+                    False => state |> WHEN {
+                        A => C
+                        B => D
+                        C => a |> WHILE { True => D, False => B }
+                        D => A
+                    }
                 }
             }
         }
@@ -84,7 +86,7 @@ FUNCTION fsm(rst, a) {
 }
 ```
 
-**Key:** LATEST allows self-reference (`state |> WHEN`) for transformations.
+**Key:** `LATEST` allows self-reference, `PASSED.clk |> THEN` triggers on clock impulse.
 
 ### When to Use Which Pattern?
 
@@ -100,20 +102,22 @@ FUNCTION fsm(rst, a) {
 
 | Boon Pattern | SystemVerilog Output |
 |--------------|---------------------|
-| `FUNCTION name(rst, ...)` | `module name(input clk, input rst, ...)` |
-| `Bits/sum(delta: ...)` | `always_ff @(posedge clk ...) ... <= ... + delta` |
-| `LATEST { ... }` | `always_ff @(posedge clk ...)` |
+| `PASSED: [clk: clk_input]` | Hardware module establishes clock domain |
+| `PASSED.clk \|> THEN { ... }` | `always_ff @(posedge clk)` |
+| `LATEST state { ... }` | Register with self-reference |
+| `Bits/sum(delta: ...)` | Accumulator logic `... <= ... + delta` |
 | `[reset: True, ...]` | Truth table row → if/else condition |
-| `control_signals |> WHEN` | Pattern matching → case/if statements |
+| `control_signals \|> WHILE` | Pattern matching → case/if statements |
 
 ### Why This Model?
 
+- **Clean signatures**: Clock via `PASSED` context, not parameters
+- **Explicit usage**: See `PASSED.clk |> THEN` where clock is used
 - **Declarative**: Patterns read like truth tables
 - **Type-safe**: Width tracking, pattern exhaustiveness
 - **Two tools for two jobs**: Bits/sum for deltas, LATEST for transforms
-- **Simple transpiler**: Direct mapping to SystemVerilog
 
-See individual `.bn` files for detailed examples.
+See [CLOCK_SEMANTICS.md](CLOCK_SEMANTICS.md) for clock details, and individual `.bn` files for examples.
 
 ---
 
@@ -257,14 +261,16 @@ state |> WHEN {
 ### Example: FSM with Both
 ```boon
 state: B |> LATEST state {
-    rst |> WHILE {                    -- ✅ WHILE: Bool signal
-        True => B
-        False => state |> WHEN {      -- ✅ WHEN: State matching
-            A => C
-            B => D
-            C => input |> WHILE {     -- ✅ WHILE: Bool signal
-                True => D
-                False => B
+    PASSED.clk |> THEN {              -- Clock trigger
+        rst |> WHILE {                -- ✅ WHILE: Bool signal
+            True => B
+            False => state |> WHEN {  -- ✅ WHEN: State matching
+                A => C
+                B => D
+                C => input |> WHILE { -- ✅ WHILE: Bool signal
+                    True => D
+                    False => B
+                }
             }
         }
     }
