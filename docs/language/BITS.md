@@ -123,6 +123,60 @@ reg: BITS { width, 10u0 }               -- width must be compile-time constant
 reg: BITS { width * 2, 16uFF }          -- Expressions of compile-time constants
 ```
 
+### Nested BITS (Concatenation)
+
+BITS values can be nested for concatenation (useful for construction and pattern matching):
+
+```boon
+-- Define reusable bit fields
+opcode: BITS { 4, 16uA }        -- 4-bit opcode
+register: BITS { 3, 10u5 }      -- 3-bit register number
+immediate: BITS { 8, 10u42 }    -- 8-bit immediate value
+
+-- Concatenate fields (nested BITS are concatenated)
+instruction: BITS { __, { opcode, register, immediate } }
+-- Width inferred: 4 + 3 + 8 = 15 bits
+-- Result: BITS { 15, ... } with fields concatenated MSB-first
+
+-- Explicit width (must match sum of nested widths)
+instruction: BITS { 15, { opcode, register, immediate } }  -- OK: 15 = 4+3+8
+
+-- ❌ Width mismatch - COMPILE ERROR
+bad: BITS { 16, { opcode, register, immediate } }  -- ERROR: Width 16 but content is 15 bits
+
+-- Mix literals and nested BITS (literals must specify width)
+packet: BITS { __, { BITS { 2, 2u11 }, opcode, register, BITS { 2, 2u00 } } }
+-- Width: 2 + 4 + 3 + 2 = 11 bits
+
+-- Pattern matching with nested BITS (destructuring)
+-- ALL fields must specify width (literals AND variables)
+instruction |> WHEN {
+    BITS { 15, {
+        BITS { 4, 16uA }    -- Match opcode = 0xA
+        BITS { 3, reg }     -- Extract 3-bit register
+        BITS { 8, imm }     -- Extract 8-bit immediate
+    }} => execute_load(register: reg, value: imm)
+
+    BITS { 15, {
+        BITS { 4, 16uB }    -- Match opcode = 0xB
+        BITS { 3, __ }      -- Ignore register
+        BITS { 8, __ }      -- Ignore immediate
+    }} => execute_store()
+
+    __ => invalid_instruction()
+}
+```
+
+**Concatenation order:** MSB (most significant) first, LSB (least significant) last
+
+```boon
+high: BITS { 4, 16uA }   -- 1010
+low: BITS { 4, 16u5 }    -- 0101
+combined: BITS { __, { high, low } }
+-- Result: BITS { 8, 2u10100101 }
+--         high ^^^^    low ^^^^
+```
+
 ### Width and Value Rules
 
 **Pattern has more digits than width → ERROR**
@@ -146,6 +200,157 @@ BITS { 8, 10s128 }      -- ERROR: 128 exceeds 8-bit signed max (127)
 ```boon
 BITS { 8, 10s-100 }     -- OK: signed negative decimal
 BITS { 8, 10u-100 }     -- ERROR: unsigned cannot be negative
+```
+
+---
+
+## Semantics and Rules
+
+### Width Matching (Nested BITS)
+
+**Rule: Explicit width MUST match sum of nested widths (compile error if mismatch)**
+
+```boon
+-- ✅ Width matches nested content
+field1: BITS { 4, 16uA }
+field2: BITS { 4, 16uB }
+combined: BITS { 8, { field1, field2 } }  -- OK: 8 = 4 + 4
+
+-- ❌ Width mismatch - COMPILE ERROR
+bad: BITS { 10, { field1, field2 } }  -- ERROR: Width 10 but content is 8 bits
+bad: BITS { 6, { field1, field2 } }   -- ERROR: Width 6 but content is 8 bits
+
+-- ✅ Use __ to infer width from nested content
+combined: BITS { __, { field1, field2 } }  -- OK: Infers width = 8
+
+-- ✅ Mix literals and nested BITS (literals must have width)
+packet: BITS { __, { BITS { 2, 2u11 }, field1, BITS { 2, 2u00 } } }  -- Infers: 2 + 4 + 2 = 8 bits
+```
+
+### Concatenation Order
+
+**Rule: MSB (most significant) first, LSB (least significant) last**
+
+```boon
+high: BITS { 4, 16uA }  -- 1010
+mid: BITS { 4, 16u5 }   -- 0101
+low: BITS { 4, 16u3 }   -- 0011
+
+result: BITS { __, { high, mid, low } }
+-- Width: 12 bits
+-- Value: 1010_0101_0011 (MSB first)
+--        high mid  low
+```
+
+### Pattern Matching with Nested BITS
+
+**Rule: ALL fields must specify width explicitly (both literals and variables)**
+
+```boon
+-- Construction
+opcode: BITS { 4, 16uA }
+register: BITS { 3, 10u5 }
+immediate: BITS { 8, 10u42 }
+instruction: BITS { __, { opcode, register, immediate } }
+
+-- Pattern matching (destructuring)
+-- Total width must be explicit, ALL fields need width
+instruction |> WHEN {
+    -- Match specific opcode (literal), extract variables
+    BITS { 15, {
+        BITS { 4, 16uA }    -- Match: opcode must be 0xA
+        BITS { 3, reg }     -- Extract: 3-bit register
+        BITS { 8, imm }     -- Extract: 8-bit immediate
+    }} => load_instruction(reg, imm)
+
+    -- Match specific opcode, ignore rest
+    BITS { 15, {
+        BITS { 4, 16uB }    -- Match: opcode must be 0xB
+        BITS { 3, __ }      -- Ignore: don't extract register
+        BITS { 8, __ }      -- Ignore: don't extract immediate
+    }} => store_instruction()
+
+    -- Extract all fields (no literal matching)
+    BITS { 15, {
+        BITS { 4, op }      -- Extract: 4-bit opcode
+        BITS { 3, reg }     -- Extract: 3-bit register
+        BITS { 8, imm }     -- Extract: 8-bit immediate
+    }} => generic_handler(op, reg, imm)
+
+    -- Default
+    __ => invalid_instruction()
+}
+```
+
+### Mixing Literals and Variables
+
+**Rule: In pattern matching, ALL fields need explicit width (literals and variables)**
+
+```boon
+opcode: BITS { 4, 16uA }
+register: BITS { 3, 10u5 }
+
+-- Construction: Mix literal BITS and variables
+instruction: BITS { __, { opcode, register, BITS { 8, 10u42 }, BITS { 2, 2u11 } } }
+-- Width: 4 + 3 + 8 + 2 = 17 bits
+
+-- Pattern matching: ALL fields need width
+data |> WHEN {
+    BITS { 17, {
+        BITS { 4, 16uA }    -- Match literal
+        BITS { 3, reg }     -- Extract variable
+        BITS { 8, imm }     -- Extract variable
+        BITS { 2, 2u11 }    -- Match literal
+    }} => process(reg, imm)
+    __ => error()
+}
+```
+
+### Common Errors
+
+```boon
+-- ❌ Standalone literal without width
+opcode: BITS { 4, 16uA }
+bad: BITS { __, { 16uA, opcode } }
+-- ERROR: Literal 16uA must specify width (use BITS { width, 16uA })
+
+-- ✅ CORRECT: Wrap literals with width
+good: BITS { __, { BITS { 4, 16uA }, opcode } }
+
+-- ❌ Variables without width in pattern matching
+instruction |> WHEN {
+    BITS { 15, { BITS { 4, 16uA }, reg, imm } } => ...
+    -- ERROR: Variables 'reg' and 'imm' need width specification
+}
+
+-- ✅ CORRECT: All fields have explicit width
+instruction |> WHEN {
+    BITS { 15, {
+        BITS { 4, 16uA }    -- Literal with width
+        BITS { 3, reg }     -- Variable with width
+        BITS { 8, imm }     -- Variable with width
+    }} => ...
+}
+
+-- ❌ Width mismatch in nested BITS
+field1: BITS { 4, 16uA }
+field2: BITS { 5, 16uB }
+bad: BITS { 8, { field1, field2 } }
+-- ERROR: Width 8 but content is 9 bits (4 + 5)
+
+-- ❌ Signedness mismatch in concatenation
+signed_field: BITS { 4, 10s-1 }
+unsigned_field: BITS { 4, 10u5 }
+bad: BITS { __, { signed_field, unsigned_field } }
+-- ERROR: Cannot mix signed and unsigned BITS in concatenation
+
+-- ❌ Pattern exceeds width
+BITS { 4, 2u10110010 }
+-- ERROR: 8-bit pattern doesn't fit in 4-bit width
+
+-- ❌ Using BITS<N> syntax (IDE display only)
+bad: BITS<16>
+-- ERROR: Not valid Boon syntax (use BITS { 16, ... })
 ```
 
 ---
