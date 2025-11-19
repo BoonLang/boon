@@ -117,6 +117,105 @@ See individual `.bn` files for detailed examples.
 
 ---
 
+## Elaboration-Time Transpilation
+
+**Key concept:** Boon distinguishes between **runtime operations** (software) and **elaboration-time operations** (hardware generation).
+
+### Fixed-Size LIST Operations
+
+**Rule:** Operations on `LIST { size, element_type }` where `size` is compile-time constant are **elaboration-time** (unrolled by transpiler).
+
+```boon
+-- ✅ Elaboration-time (size known)
+a: BITS { 8, 10u42 }
+a_bits: a |> Bits/to_bool_list()     -- LIST { 8, Bool }
+inverted: a_bits |> List/map(bit: bit |> Bool/not())
+-- Transpiler unrolls to 8 NOT gates
+
+-- ❌ Error in hardware (size unknown)
+dynamic: get_items()                  -- LIST { TodoItem }
+result: dynamic |> List/map(...)      -- ERROR: "Cannot use dynamic LIST in hardware"
+```
+
+### How Transpiler Unrolls LIST Operations
+
+**List/map → Parallel instances:**
+```boon
+-- Boon
+bits: LIST { 3, { a, b, c }}
+inverted: bits |> List/map(bit: bit |> Bool/not())
+
+-- Transpiles to SystemVerilog
+inverted[0] = ~a;
+inverted[1] = ~b;
+inverted[2] = ~c;
+```
+
+**List/fold → Sequential chain:**
+```boon
+-- Boon
+pairs: LIST { WIDTH, { a_bits, b_bits } }
+    |> List/zip(with: b_bits)
+    |> List/fold(
+        init: [sums: LIST { WIDTH, {} }, carry: False]
+        pair, acc: fulladder(a: pair.first, b: pair.second, d: acc.carry)
+    )
+
+-- Transpiles to (Verilog generate loop)
+genvar i;
+generate
+    for (i=0; i<WIDTH; i=i+1) begin
+        fulladder fa(a[i], b[i], c[i], s[i], c[i+1]);
+    end
+endgenerate
+```
+
+**List/scan → Chain with outputs:**
+```boon
+-- Boon: Carry chain with intermediate sums
+carry_chain: bits |> List/scan(
+    init: False
+    bit, carry: [sum: bit ^ carry, carry_out: bit & carry]
+)
+
+-- Transpiles to: N half-adders in chain
+ha0_sum = a[0] ^ 1'b0;
+ha0_carry = a[0] & 1'b0;
+ha1_sum = a[1] ^ ha0_carry;
+ha1_carry = a[1] & ha0_carry;
+...
+```
+
+### Transpiler Rules
+
+1. **Size must be compile-time constant:**
+   - From BITS width: `BITS { 8, ... } |> Bits/to_bool_list()` → `LIST { 8, Bool }`
+   - From literal: `LIST { 4, { a, b, c, d }}`
+   - From generic parameter: `LIST { WIDTH, Bool }` where WIDTH is constant
+
+2. **Operations are unrolled:**
+   - `List/map` → Parallel instances (combinational)
+   - `List/fold` → Sequential chain (pipelined)
+   - `List/scan` → Chain with intermediate outputs
+   - `List/zip` → Structural pairing
+
+3. **Size mismatch errors:**
+   ```boon
+   a: LIST { 8, Bool }
+   b: LIST { 4, Bool }
+   a |> List/zip(with: b)  -- ERROR: "Size mismatch: 8 vs 4"
+   ```
+
+4. **Dynamic operations forbidden:**
+   ```boon
+   fixed: LIST { 8, Bool }
+   fixed |> List/append(...)  -- ERROR: "Cannot append to fixed-size LIST in hardware"
+   ```
+
+**See:** [LIST.md](../../../docs/language/LIST.md) for complete LIST documentation
+
+---
+
 ## Quick Reference: WHEN vs WHILE
 
 Boon provides two pattern matching constructs with distinct **evaluation semantics**:
@@ -223,16 +322,16 @@ See [BITS_AND_BYTES.md](../../../docs/language/BITS_AND_BYTES.md#when-to-use-bit
 - **Maps to**: Concatenation `{out[6:0], feedback}`
 
 **serialadder.bn** - Bit-serial adder
-- **Operations**: Bit-level full adder
-- **Why BITS/LIST**: Either works, example uses LIST
-- **Maps to**: Sequential bit processing
+- **Operations**: Fixed-size LIST with `List/zip`, `List/scan`
+- **Why LIST**: Demonstrates elaboration-time unrolling (BITS → LIST → fold → BITS)
+- **Maps to**: Verilog `generate for` loop creating WIDTH full adders
 
 ### Pattern Matching (use LIST { Bool })
 
 **prio_encoder.bn** - Priority encoder (4→2)
-- **Operations**: Wildcard pattern matching
-- **Why LIST**: `LIST { True, __, __ }` is elegant
-- **Compare**: BITS version would be verbose
+- **Operations**: Wildcard pattern matching with fixed-size LIST
+- **Why LIST**: `LIST { __, { True, __, __ }}` wildcard patterns elegant
+- **Compare**: BITS version would need nested patterns
 - **Maps to**: `casez` with wildcards
 
 **fsm.bn** - Finite State Machine
