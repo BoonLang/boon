@@ -121,6 +121,11 @@ octal_val: BITS { 12, 8u7777 }          -- 12-bit, unsigned, octal
 -- Compile-time parametric width (hardware generics/parameters)
 reg: BITS { width, 10u0 }               -- width must be compile-time constant
 reg: BITS { width * 2, 16uFF }          -- Expressions of compile-time constants
+
+-- Underscore separators for readability (planned feature)
+long_mask: BITS { 32, 2u1111_0000_1111_0000_1111_0000_1111_0000 }
+hex_color: BITS { 32, 16uFF_80_40_FF }  -- RGBA color
+ipv4_mask: BITS { 32, 16uFF_FF_FF_00 }  -- 255.255.255.0
 ```
 
 ### Nested BITS (Concatenation)
@@ -652,6 +657,49 @@ packet: BITS { __, {
     u_field
 }}
 ```
+
+### Real-World Example: RISC-V Instruction Encoding
+
+Many instruction sets mix signed and unsigned fields. Here's how to handle it:
+
+```boon
+-- I-type instruction: opcode + rd + funct3 + rs1 + imm
+-- Most fields unsigned, but immediate is signed (two's complement)
+
+opcode: BITS { 7, 10u19 }       -- ADDI opcode (unsigned)
+rd: BITS { 5, 10u10 }           -- Destination register x10 (unsigned)
+funct3: BITS { 3, 10u0 }        -- Function code 0 (unsigned)
+rs1: BITS { 5, 10u5 }           -- Source register x5 (unsigned)
+imm: BITS { 12, 10s-100 }       -- Signed immediate -100
+
+-- ❌ Cannot concatenate directly due to mixed signedness
+bad: BITS { __, {
+    imm      -- signed
+    rs1      -- unsigned (ERROR: mixed signedness)
+    funct3
+    rd
+    opcode
+}}
+
+-- ✅ CORRECT: Treat immediate as bit pattern (reinterpret as unsigned)
+instruction: BITS { __, {
+    imm |> Bits/as_unsigned()   -- Reinterpret two's complement as bit pattern
+    rs1
+    funct3
+    rd
+    opcode
+}}
+-- Result: BITS { 32, ... } unsigned - ready to emit to assembler
+
+-- The immediate's two's complement encoding (-100) is preserved
+-- When decoded by CPU, it will interpret those bits as signed
+```
+
+**Why reinterpret to unsigned?**
+- Instruction encoding is a **bit pattern** (unsigned concept)
+- Individual fields have **semantic signedness** (immediate is signed value)
+- Concatenation builds bit pattern → use unsigned
+- CPU hardware decodes and interprets signedness later
 
 ---
 
