@@ -1,12 +1,22 @@
 FUNCTION fibonacci(position) {
-    LIST { 0, 1 } 
-        |> Queue/iterate(previous, next: previous |> WHEN { 
-            LIST { first, second } => LIST { second, first + second }
-        })
-        |> Queue/take_nth(position: position)
-        |> List/first()
+    BLOCK {
+        state: [previous: 0, current: 1, iteration: 0] |> LATEST state {
+            PULSES { position } |> THEN {
+                [
+                    previous: state.current,
+                    current: state.previous + state.current,
+                    iteration: state.iteration + 1
+                ]
+            }
+        }
+        // Only return when iteration reaches target position
+        state.iteration = position |> WHEN {
+            True => state.current
+            False => SKIP
+        }
+    }
 }
 
 position: 5
 result: position |> fibonacci()
-TEXT { {position}. Fibonacci number is {result} } |> Console/log()
+TEXT { "{position}. Fibonacci number is {result}" } |> Console/log()

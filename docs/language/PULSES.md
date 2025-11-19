@@ -31,6 +31,7 @@ result: initial |> LATEST state {
 - **Works with LATEST** - Drives state updates through iteration
 - **Same syntax, different execution** - Loop in SW, counter in HW
 - **Simple and safe** - Bounded by default, no infinite loops
+- **Filter intermediate values** - Track iteration in state, use WHEN to filter
 
 **Replaces:**
 - Queue/iterate (for sequences like Fibonacci)
@@ -59,14 +60,22 @@ result: initial |> LATEST state {
 
 ### **Fibonacci**
 ```boon
-FUNCTION fibonacci(n) {
+FUNCTION fibonacci(position) {
     BLOCK {
-        final: [prev: 0, current: 1] |> LATEST state {
-            PULSES { n } |> THEN {
-                [prev: state.current, current: state.prev + state.current]
+        state: [previous: 0, current: 1, iteration: 0] |> LATEST state {
+            PULSES { position } |> THEN {
+                [
+                    previous: state.current,
+                    current: state.previous + state.current,
+                    iteration: state.iteration + 1
+                ]
             }
         }
-        final.current
+        // Only emit when iteration reaches target position
+        state.iteration = position |> WHEN {
+            True => state.current
+            False => SKIP
+        }
     }
 }
 
@@ -259,22 +268,30 @@ PULSES can coexist with other events!
 
 ## Examples
 
-### **1. Fibonacci (basic)**
+### **1. Fibonacci (with iteration tracking)**
 ```boon
-FUNCTION fibonacci(n) {
+FUNCTION fibonacci(position) {
     BLOCK {
-        final: [prev: 0, current: 1] |> LATEST state {
-            PULSES { n } |> THEN {
-                [prev: state.current, current: state.prev + state.current]
+        state: [previous: 0, current: 1, iteration: 0] |> LATEST state {
+            PULSES { position } |> THEN {
+                [
+                    previous: state.current,
+                    current: state.previous + state.current,
+                    iteration: state.iteration + 1
+                ]
             }
         }
-        final.current
+        // Filter: only emit when complete
+        state.iteration = position |> WHEN {
+            True => state.current
+            False => SKIP
+        }
     }
 }
 
 // Usage
-fib_10: fibonacci(10)  // 55
-fib_20: fibonacci(20)  // 6765
+fib_10: fibonacci(10)  // 55 (emits once when iteration = 10)
+fib_20: fibonacci(20)  // 6765 (emits once when iteration = 20)
 ```
 
 ### **2. Factorial**
@@ -532,22 +549,28 @@ FUNCTION lfsr_n_cycles(initial, cycles) {
 
 **3. Fibonacci in Hardware:**
 ```boon
-FUNCTION fibonacci_hw(n) {
+FUNCTION fibonacci_hw(position) {
     BLOCK {
-        final: [
-            prev: BITS{16, 0},
-            current: BITS{16, 1}
+        state: [
+            previous: BITS{16, 0},
+            current: BITS{16, 1},
+            iteration: BITS{16, 0}
         ] |> LATEST state {
             clk |> THEN {
-                PULSES { n } |> THEN {
+                PULSES { position } |> THEN {
                     [
-                        prev: state.current,
-                        current: state.prev + state.current
+                        previous: state.current,
+                        current: state.previous + state.current,
+                        iteration: state.iteration + 1
                     ]
                 }
             }
         }
-        final.current
+        // Filter: only output when complete
+        state.iteration = position |> WHEN {
+            True => state.current
+            False => SKIP
+        }
     }
 }
 ```
@@ -571,23 +594,55 @@ counter: BITS{8, 0} |> LATEST count {
 
 ## Software Context
 
-### **PULSES in Software is Synchronous**
+### **PULSES in Software: Asynchronous Iteration**
+
+**PULSES fires asynchronously to maintain Boon's actor model:**
 
 ```boon
 result: 0 |> LATEST count {
     PULSES { 10 } |> THEN { count + 1 }
 }
-// Runs synchronously, blocks until done
 ```
 
-**Compiles to:**
-```javascript
-let count = 0;
-for (let i = 0; i < 10; i++) {
-    count = count + 1;
+**Execution:**
+- PULSES fires N async events (doesn't block actor queues)
+- Each pulse updates LATEST
+- LATEST emits on each update (normal reactive behavior)
+- All intermediate values propagate downstream
+
+**To filter intermediate values, track iteration in state:**
+
+```boon
+FUNCTION fibonacci(position) {
+    BLOCK {
+        state: [previous: 0, current: 1, iteration: 0] |> LATEST state {
+            PULSES { position } |> THEN {
+                [
+                    previous: state.current,
+                    current: state.previous + state.current,
+                    iteration: state.iteration + 1
+                ]
+            }
+        }
+        // Filter: only emit when complete
+        state.iteration = position |> WHEN {
+            True => state.current
+            False => SKIP
+        }
+    }
 }
-const result = count;
+
+position: 5
+result: fibonacci(position)
+TEXT { "{position}. Fibonacci number is {result}" } |> Console/log()
+// ✅ Logs ONCE: "5. Fibonacci number is 5"
+// The WHEN filter prevents intermediate values from propagating
 ```
+
+**Key insight:**
+- LATEST emits all updates (normal behavior)
+- Use WHEN + SKIP to filter unwanted intermediate emissions
+- Track iteration count in state for filtering logic
 
 ### **Software Examples**
 
@@ -759,12 +814,20 @@ LIST { 0, 1 }
 **PULSES:**
 ```boon
 BLOCK {
-    final: [prev: 0, current: 1] |> LATEST state {
+    state: [previous: 0, current: 1, iteration: 0] |> LATEST state {
         PULSES { 10 } |> THEN {
-            [prev: state.current, current: state.prev + state.current]
+            [
+                previous: state.current,
+                current: state.previous + state.current,
+                iteration: state.iteration + 1
+            ]
         }
     }
-    final.current
+    // Filter to return only when complete
+    state.iteration = 10 |> WHEN {
+        True => state.current
+        False => SKIP
+    }
 }
 ```
 
@@ -945,14 +1008,23 @@ PULSES {
 PULSES { n } |> THEN { transform(state) }
 ```
 
-✅ **Use BLOCK to extract fields:**
+✅ **Track iteration and filter:**
 ```boon
-FUNCTION fibonacci(n) {
+FUNCTION fibonacci(position) {
     BLOCK {
-        final: [prev: 0, current: 1] |> LATEST state {
-            PULSES { n } |> THEN { ... }
+        state: [previous: 0, current: 1, iteration: 0] |> LATEST state {
+            PULSES { position } |> THEN {
+                [
+                    previous: state.current,
+                    current: state.previous + state.current,
+                    iteration: state.iteration + 1
+                ]
+            }
         }
-        final.current
+        state.iteration = position |> WHEN {
+            True => state.current
+            False => SKIP
+        }
     }
 }
 ```
@@ -1013,6 +1085,8 @@ result: initial |> LATEST state {
 **Key Points:**
 - ✅ Counted iteration (finite, bounded)
 - ✅ Works with LATEST (event-driven)
+- ✅ Async execution (doesn't block actor queues)
+- ✅ Filter intermediate values with WHEN + iteration tracking
 - ✅ Same syntax for HW and SW (different execution)
 - ✅ Unique to Boon (not overloaded)
 - ✅ Simple and safe (explicit bounds)

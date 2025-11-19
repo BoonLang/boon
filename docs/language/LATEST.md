@@ -84,7 +84,7 @@ mem: MEMORY { 16, 0 }
 3. **Better alternatives exist:**
    - **Dynamic collections:** Use reactive LIST operations directly
    - **Fixed-size storage:** Use MEMORY primitive
-   - **Bounded logs:** Use Queue/bounded
+   - **Iteration:** Use PULSES (see PULSES.md)
 
 4. **Simpler mental model:**
    - LATEST for simple stateful values
@@ -594,44 +594,41 @@ counter: 0 |> LATEST count {
 
 ---
 
-## LATEST vs Queue/iterate
+## LATEST vs PULSES
 
 **Two complementary abstractions:**
 
-| Feature | LATEST | Queue/iterate |
-|---------|--------|---------------|
-| **Purpose** | Reactive state | Lazy sequences |
-| **Evaluation** | Push (events drive) | Pull (consumer drives) |
-| **Finiteness** | N/A (reactive) | Can be infinite |
-| **Self-reference** | Via parameter | Via parameter |
-| **Use cases** | Counters, FSMs, accumulators | Fibonacci, generators |
+| Feature | LATEST | PULSES |
+|---------|--------|--------|
+| **Purpose** | Reactive state | Counted iteration |
+| **Trigger** | External events | Internal counter |
+| **Evaluation** | Event-driven | Iteration-driven |
+| **Use cases** | Counters, FSMs, accumulators | Fibonacci, sequences, loops |
 
-**When to use LATEST:**
+**When to use LATEST alone:**
 - ✅ Reactive state (software events, hardware registers)
 - ✅ Event-driven updates
-- ✅ Known inputs (events, signals)
+- ✅ External triggers (button clicks, signals)
 
-**When to use Queue/iterate:**
-- ✅ Lazy evaluation needed
-- ✅ Infinite sequences
-- ✅ Pull-based iteration
+**When to use LATEST + PULSES:**
+- ✅ Counted iteration (N times)
+- ✅ Sequence generation (Fibonacci, factorial)
+- ✅ Iterative algorithms
 
 **Example comparison:**
 
 ```boon
-// LATEST - reactive counter
+// LATEST - reactive counter (event-driven)
 counter: 0 |> LATEST count {
     increment |> THEN { count + 1 }
 }
 // Updates when increment event fires
 
-// Queue/iterate - lazy fibonacci
-LIST { 0, 1 } |> Queue/iterate(prev, next:
-    prev |> WHEN {
-        LIST { first, second } => LIST { second, first + second }
-    }
-)
-// Generates values on demand when pulled
+// LATEST + PULSES - counted iteration
+counter: 0 |> LATEST count {
+    PULSES { 10 } |> THEN { count + 1 }
+}
+// Counts to 10 automatically
 ```
 
 ---

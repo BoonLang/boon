@@ -48,6 +48,79 @@ ButtonDelete
 TodoId
 ```
 
+### Shadowing Is Allowed
+
+**Variable shadowing is permitted in Boon.**
+
+You can reuse the same name in nested scopes, including LATEST parameter names:
+
+✅ **Correct - Shadowing in LATEST:**
+```boon
+state: initial_state |> LATEST state {
+    event |> THEN {
+        transform(state)  // 'state' refers to LATEST parameter, shadows outer binding
+    }
+}
+```
+
+✅ **Correct - Shadowing in WHEN:**
+```boon
+value: config.value? |> WHEN {
+    UNPLUGGED => default_value
+    value => value  // Inner 'value' shadows outer 'value'
+}
+```
+
+✅ **Correct - Common pattern with state:**
+```boon
+FUNCTION fibonacci(position) {
+    BLOCK {
+        state: [previous: 0, current: 1, iteration: 0] |> LATEST state {
+            PULSES { position } |> THEN {
+                [
+                    previous: state.current,    // Refers to LATEST parameter
+                    current: state.previous + state.current,
+                    iteration: state.iteration + 1
+                ]
+            }
+        }
+        state.current  // Refers to outer binding
+    }
+}
+```
+
+**Pattern:** The inner scope shadows the outer, making code clearer when the same conceptual value is being transformed.
+
+### Comparison Uses Single `=`
+
+**Equality comparison in Boon uses a single `=` operator, not `==`.**
+
+✅ **Correct - Single `=` for comparison:**
+```boon
+state.iteration = position |> WHEN {
+    True => result
+    False => SKIP
+}
+
+selected_filter = Active |> WHEN {
+    True => show_active_todos()
+    False => show_all_todos()
+}
+
+count = 0 |> WHEN {
+    True => empty_message()
+    False => items_list()
+}
+```
+
+❌ **INCORRECT - `==` does not exist:**
+```boon
+state.iteration == position  // SYNTAX ERROR
+count == 0                   // SYNTAX ERROR
+```
+
+**Note:** The single `=` is for comparison in expressions. Assignment uses `:` in bindings (`name: value`).
+
 ---
 
 ## 2. Function Arguments Must Be Named (Except When Piped)
@@ -992,7 +1065,149 @@ remove_button()
 
 ---
 
-## 11. Lists and Pattern Matching Wildcards
+## 11. PULSES - Counted Iteration
+
+**PULSES generates counted events to drive iteration with LATEST.**
+
+PULSES is Boon's primitive for iterating N times, replacing traditional loops with reactive event-driven iteration.
+
+### Core Concept
+
+**PULSES fires N times, each producing a unit value `[]`:**
+
+```boon
+PULSES { 10 }  // Generates 10 pulses: [], [], [], ...
+```
+
+**Used with LATEST for stateful iteration:**
+
+```boon
+result: initial_value |> LATEST state {
+    PULSES { 10 } |> THEN {
+        transform(state)
+    }
+}
+// Transforms state 10 times
+```
+
+### Basic Examples
+
+✅ **Correct - Fibonacci:**
+```boon
+FUNCTION fibonacci(n) {
+    BLOCK {
+        final: [prev: 0, current: 1] |> LATEST state {
+            PULSES { n } |> THEN {
+                [prev: state.current, current: state.prev + state.current]
+            }
+        }
+        final.current
+    }
+}
+```
+
+✅ **Correct - Factorial:**
+```boon
+FUNCTION factorial(n) {
+    BLOCK {
+        final: [count: 1, product: 1] |> LATEST state {
+            PULSES { n } |> THEN {
+                [count: state.count + 1, product: state.product * state.count]
+            }
+        }
+        final.product
+    }
+}
+```
+
+✅ **Correct - Count to N:**
+```boon
+counter: 0 |> LATEST count {
+    PULSES { 10 } |> THEN { count + 1 }
+}
+// Result: 10
+```
+
+### Hardware Context (Requires clk)
+
+In hardware, LATEST must be driven by clock:
+
+```boon
+counter: BITS{8, 0} |> LATEST count {
+    clk |> THEN {
+        PULSES { 10 } |> THEN { count + 1 }
+    }
+}
+```
+
+**Execution:**
+- Every clock edge: `clk` fires
+- PULSES checks internal counter
+- If under limit: pulse fires, count increments
+- After N pulses: stops updating
+
+### Early Termination with SKIP
+
+Use SKIP to stop iterating early:
+
+```boon
+result: initial |> LATEST state {
+    PULSES { max_iterations } |> THEN {
+        converged(state) |> WHEN {
+            True => SKIP              // Stop processing
+            False => iterate(state)   // Continue
+        }
+    }
+}
+```
+
+### Mixing PULSES with Other Events
+
+PULSES composes naturally with other event sources:
+
+```boon
+state: initial |> LATEST state {
+    // Automatic iteration
+    PULSES { 100 } |> THEN {
+        auto_update(state)
+    }
+
+    // Manual control
+    reset_button.click |> THEN {
+        initial
+    }
+}
+```
+
+### Key Rules
+
+1. **Syntax:** `PULSES { N }` where N is iteration count
+2. **Type:** Generates unit values `[]` (not indices)
+3. **Use with LATEST:** PULSES is an event source
+4. **Hardware:** Requires `clk |> THEN` wrapper
+5. **Software:** Compiles to synchronous loop
+6. **Bounded:** Always finite (no infinite loops)
+
+### When to Use PULSES
+
+✅ **Use PULSES for:**
+- Counted iteration (N times)
+- Sequence generation (Fibonacci, factorial)
+- Iterative algorithms
+- Hardware counter circuits
+
+❌ **Don't use PULSES for:**
+- Single-time computation (just use expressions)
+- Event-driven updates (use LATEST with events)
+- Infinite sequences (not supported)
+
+### Complete Documentation
+
+📖 **`/docs/language/PULSES.md`** - Comprehensive guide with 10+ examples, hardware synthesis, and design rationale
+
+---
+
+## 12. Lists and Pattern Matching Wildcards
 
 **Boon provides list literals and wildcard patterns for flexible pattern matching.**
 
@@ -1394,6 +1609,8 @@ style: [
 |------|-------------|---------|
 | **Function/variable naming** | snake_case ONLY | `new_todo`, `selected_filter`, `title_to_save` |
 | **Tag naming** | PascalCase | `Active`, `Light`, `InputInterior`, `TodoId` |
+| **Shadowing** | Allowed | `state: init \|> LATEST state { ... }` ✅ |
+| **Comparison operator** | Single `=` (not `==`) | `count = 0 \|> WHEN { True => ..., False => ... }` ✅ |
 | **Function arguments** | Must be named (except first when piped) | `f(x: 1)` ✅, `f(1)` ❌, `1 \|> f()` ✅ |
 | **Function parameters** | All required, no defaults | Use `Default` tag or `with: []` record |
 | **Optional fields** | Use `obj.field?` postfix | Returns `T \| UNPLUGGED`, must handle with WHEN |
@@ -1431,59 +1648,67 @@ When proposing new Boon APIs, remember:
 2. ✅ **Use PascalCase for tags only**
    - `InputInterior`, `Round`, `Header`
 
-3. ✅ **Functions must be called with Module/ prefix**
+3. ✅ **Shadowing is allowed - use clear names**
+   - `state: init |> LATEST state { ... }` is preferred over abbreviated parameter names
+   - Makes code more readable when transforming the same conceptual value
+
+4. ✅ **Use single `=` for comparison, not `==`**
+   - `count = 0 |> WHEN { True => ..., False => ... }`
+   - Assignment uses `:` in bindings (`name: value`)
+
+5. ✅ **Functions must be called with Module/ prefix**
    - `Theme/material()` not `material()`
 
-4. ❌ **Cannot store functions in records or variables**
+6. ❌ **Cannot store functions in records or variables**
    - Functions are not first-class - they cannot be assigned, passed, or stored
    - Records can only contain data (values, nested records, lists, tags)
 
-5. ❌ **Cannot create callable values from records**
+7. ❌ **Cannot create callable values from records**
    - `material: record.function(arg)` doesn't work unless `record.function` is data, not a function
    - For stateful values, you MUST use function calls: `Theme/material(InputInterior[focus: True])`
 
-6. ❌ **Cannot define types or modules inline**
+8. ❌ **Cannot define types or modules inline**
    - No `TYPE`, `MODULE`, `CLASS`, `CONST` declarations
 
-7. ✅ **All function parameters are required**
+9. ✅ **All function parameters are required**
    - No optional parameters or default values
    - Use polymorphic tags (`Default`, `None`) or records (`overrides: []`) for optional-like behavior
 
-8. ✅ **Use spread operator for structural defaults, LATEST for temporal values**
+10. ✅ **Use spread operator for structural defaults, LATEST for temporal values**
    - No `??` or `||` operators exist
    - Spread operator: `[defaults... ...overrides]` for function parameters with overrides
    - LATEST: `LATEST { default_value, event_value }` for temporal reactive values only
    - Do NOT use LATEST for structural defaults (causes blink/performance issues)
 
-9. ✅ **Use `obj.field?` for optional fields**
+11. ✅ **Use `obj.field?` for optional fields**
    - Postfix `?` operator accesses potentially missing fields
    - Returns `T | UNPLUGGED` which must be handled with WHEN
    - Pattern: `obj.field? |> WHEN { UNPLUGGED => default, x => x }`
 
-10. ✅ **Use FLUSH for error handling**
+12. ✅ **Use FLUSH for error handling**
    - Always use Ok tagging: `Ok[value: result]`
    - FLUSH exits expression: `error => FLUSH { error }`
    - Two-binding pattern: separate pipeline from error handling
    - No CATCH blocks needed
 
-11. ✅ **Use BLOCK for dependency graphs, not sequential code**
+13. ✅ **Use BLOCK for dependency graphs, not sequential code**
    - Variables execute in parallel, respecting dependencies
    - Cannot redefine variables (use different names)
    - Must bind expressions to variables (except final expression)
    - Use for scoping and extracting shared records
 
-12. ✅ **Use reactive patterns appropriately**
+14. ✅ **Use reactive patterns appropriately**
    - **WHILE**: Conditional evaluation, especially for UI rendering
    - **THEN**: When ignoring piped value (event handling without value)
    - **SKIP**: Filtering in WHEN/LATEST chains
    - **NoElement**: Conditional UI rendering with WHILE
 
-13. ✅ **Use LIST and wildcard patterns**
+15. ✅ **Use LIST and wildcard patterns**
    - `LIST { }` for list literals
    - `__` for catch-all in pattern matching
    - LIST pattern matching for coordinated state: `LIST { True, __ } => ...`
 
-14. ✅ **Use LINK for reactive architecture**
+16. ✅ **Use LINK for reactive architecture**
    - Declare → Advertise → Wire pattern
    - See `/docs/language/LINK_PATTERN.md` for comprehensive guide
    - Essential for element event coordination
