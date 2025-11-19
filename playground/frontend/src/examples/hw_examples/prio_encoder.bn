@@ -38,16 +38,3 @@ FUNCTION prio_encoder(a) {
         ]
     }
 }
-
--- Alternative: numeric representation
--- Commented out: No corresponding .sv file (for transpiler development)
---
--- FUNCTION prio_encoder_numeric(a3, a2, a1, a0) {
---     LIST { a3, a2, a1, a0 } |> WHEN {
---         LIST { True, __, __, __ } => [y: 3, valid: True]
---         LIST { False, True, __, __ } => [y: 2, valid: True]
---         LIST { False, False, True, __ } => [y: 1, valid: True]
---         LIST { False, False, False, True } => [y: 0, valid: True]
---         __ => [y: 0, valid: False]
---     }
--- }

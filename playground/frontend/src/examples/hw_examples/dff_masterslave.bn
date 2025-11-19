@@ -5,11 +5,11 @@
 FUNCTION d_latch(d, e) {
     BLOCK {
         nd: d |> Bool/not()
-        s: e |> Bool/and(d)
-        r: e |> Bool/and(nd)
+        s: e |> Bool/and(that: d)
+        r: e |> Bool/and(that: nd)
 
-        q: r |> Bool/not() |> Bool/and(nq |> Bool/not())
-        nq: s |> Bool/not() |> Bool/and(q |> Bool/not())
+        q: r |> Bool/not() |> Bool/and(that: nq |> Bool/not())
+        nq: s |> Bool/not() |> Bool/and(that: q |> Bool/not())
 
         [q: q, nq: nq]
     }
@@ -28,27 +28,3 @@ FUNCTION dff_master_slave(clk, d) {
         [o: slave.q]
     }
 }
-
--- Behavioral model using Boon's reactive events
--- Commented out: No corresponding .sv file (for transpiler development)
---
--- FUNCTION dff_behavioral(clk_event, d) {
---     LATEST {
---         False  -- Initial output
---         clk_event |> WHEN {
---             Rising => d      -- Sample D on rising edge
---             __ => SKIP
---         }
---     }
--- }
-
--- Alternative: Toggle pattern similar to TodoMVC
--- Commented out: No corresponding .sv file (for transpiler development)
---
--- FUNCTION dff_toggle(clk_rise_event, d) {
---     output: LATEST {
---         False
---         clk_rise_event |> THEN { d }
---     }
---     [o: output]
--- }

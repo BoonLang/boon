@@ -13,11 +13,11 @@ FUNCTION lfsr(reset) {
     -- Returns: BITS { 8, ... } - current LFSR state
 
     out: BITS { 8, 10u0 } |> LATEST out {
-        reset |> WHEN {
+        reset |> WHILE {
             True => BITS { 8, 10u0 }
             False => BLOCK {
                 -- Linear feedback: NOT(out[7] XOR out[3])
-                feedback: out |> Bits/get(index: 7) |> Bool/xor(
+                feedback: out |> Bits/get(index: 7) |> Bool/xor(that:
                     out |> Bits/get(index: 3)
                 ) |> Bool/not()
 
@@ -31,41 +31,3 @@ FUNCTION lfsr(reset) {
 
     [out: out]
 }
-
--- Alternative: Using LIST { Bool } (verbose, not recommended for shift operations)
--- Commented out: No corresponding .sv file (for transpiler development)
--- This demonstrates why BITS is preferred for bit manipulation
---
--- FUNCTION lfsr_list_verbose(clk_event, reset_event) {
---     out: LATEST {
---         LIST { False, False, False, False, False, False, False, False }
---
---         reset_event |> WHEN {
---             Rising => LIST { False, False, False, False, False, False, False, False }
---             __ => SKIP
---         }
---
---         clk_event |> WHEN {
---             Rising => BLOCK {
---                 feedback: out |> List/get(index: 7) |> Bool/xor(
---                     out |> List/get(index: 3)
---                 ) |> Bool/not()
---
---                 -- Manual shift reconstruction (verbose - 8 lines!)
---                 LIST {
---                     out |> List/get(index: 6)
---                     out |> List/get(index: 5)
---                     out |> List/get(index: 4)
---                     out |> List/get(index: 3)
---                     out |> List/get(index: 2)
---                     out |> List/get(index: 1)
---                     out |> List/get(index: 0)
---                     feedback
---                 }
---             }
---             __ => SKIP
---         }
---     }
---
---     [out: out]
--- }

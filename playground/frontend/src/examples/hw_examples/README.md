@@ -117,6 +117,65 @@ See individual `.bn` files for detailed examples.
 
 ---
 
+## Quick Reference: WHEN vs WHILE
+
+Boon provides two pattern matching constructs with distinct **evaluation semantics**:
+
+### WHILE - Flowing Dependencies (Reactive Evaluation)
+**Use for:** Record patterns, Bool signals, tag matching with dependencies
+
+```boon
+-- ✅ Record pattern matching (fields flow reactively)
+control_signals: [reset: rst, enable: en]
+control_signals |> WHILE {
+    [reset: True, enable: __] => reset_state  -- Reacts to rst/en changes
+    [reset: False, enable: True] => active
+}
+
+-- ✅ Bool signal checking
+rst |> WHILE {
+    True => reset_state    -- While reset is asserted
+    False => normal_state  -- While reset is not asserted
+}
+```
+
+**Semantics:** Pattern matching **re-evaluated** as dependencies change (flowing)
+
+### WHEN - Frozen Evaluation (Pure Pattern Matching)
+**Use for:** State machine states (pure transitions), constant mappings
+
+```boon
+state |> WHEN {
+    Idle => Running      -- Pure state transition
+    Running => Stopped   -- No external dependencies
+}
+```
+
+**Semantics:** Pattern matching **evaluated once** when input value changes (frozen)
+
+**Critical Rule:** Always use **WHILE for record pattern matching** - fields are dependencies that need to flow!
+
+### Example: FSM with Both
+```boon
+state: B |> LATEST state {
+    rst |> WHILE {                    -- ✅ WHILE: Bool signal
+        True => B
+        False => state |> WHEN {      -- ✅ WHEN: State matching
+            A => C
+            B => D
+            C => input |> WHILE {     -- ✅ WHILE: Bool signal
+                True => D
+                False => B
+            }
+        }
+    }
+}
+```
+
+**See:** [WHEN_VS_WHILE.md](../../../docs/language/WHEN_VS_WHILE.md) for complete guide
+
+---
+
 ## Quick Reference: When to Use What
 
 ### Use BITS for:
@@ -161,7 +220,6 @@ See [BITS_AND_BYTES.md](../../../docs/language/BITS_AND_BYTES.md#when-to-use-bit
 **lfsr.bn** - Linear Feedback Shift Register
 - **Operations**: `Bits/shift_right()`, `Bits/set()`
 - **Why BITS**: Shift is 1 line (vs 8 lines with LIST)
-- **Compare**: Includes LIST alternative showing verbosity
 - **Maps to**: Concatenation `{out[6:0], feedback}`
 
 **serialadder.bn** - Bit-serial adder
@@ -210,16 +268,16 @@ See [BITS_AND_BYTES.md](../../../docs/language/BITS_AND_BYTES.md#when-to-use-bit
 - **Why Bool**: 1-bit arithmetic, Boolean logic
 - **Maps to**: Combinational arithmetic gates
 
-### Memory (use Numbers/Lists)
+### Memory (use MEMORY)
 
 **ram.bn** - Synchronous RAM
-- **Operations**: `List/set()`, `List/get()`
-- **Why Numbers**: Memory content is numeric values
+- **Operations**: `Memory/initialize()`, `Memory/write()`, `Memory/read()`
+- **Why MEMORY**: Fixed-size stateful storage with per-address reactivity
 - **Maps to**: Memory array with sync write
 
 **rom.bn** - Asynchronous ROM
-- **Operations**: `List/get()`, `List/range()`
-- **Why Numbers**: Initialized memory content
+- **Operations**: `Memory/initialize()`, `Memory/read()`
+- **Why MEMORY**: Consistent with RAM pattern for memory content
 - **Maps to**: ROM with initial values
 
 ---

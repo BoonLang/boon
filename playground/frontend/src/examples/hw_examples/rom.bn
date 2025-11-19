@@ -7,53 +7,12 @@ FUNCTION rom(addr) {
         -- ROM content: each address contains its own value
         -- This models: initial for (i = 0; i < 2**AWIDTH; i = i+1) mem[i] = i;
 
-        -- In transpiler, this would generate memory initialization
-        mem: List/range(start: 0, end: 16)  -- 2^4 = 16 entries
+        mem: MEMORY { 16, 0 }
+            |> Memory/initialize(i, data: i)
 
-        -- Asynchronous read: assign data = mem[addr]
-        data: mem |> List/get(index: addr)
+        -- Asynchronous read
+        data: mem |> Memory/read(address: addr)
 
         [data: data]
     }
 }
-
--- Parameterized version with explicit widths
--- Commented out: No corresponding .sv file (for transpiler development)
---
--- FUNCTION rom_param(awidth, dwidth, addr) {
---     BLOCK {
---         -- Memory size: 2^awidth entries
---         mem_size: 2 |> Number/pow(awidth)
---
---         -- Initialize: mem[i] = i (truncated to dwidth if needed)
---         mem: List/range(start: 0, end: mem_size)
---
---         -- Asynchronous read
---         data: mem |> List/get(index: addr)
---
---         [
---             data: data
---             awidth: awidth  -- Metadata for transpiler
---             dwidth: dwidth
---         ]
---     }
--- }
-
--- Alternative: Explicit content definition
--- Commented out: No corresponding .sv file (for transpiler development)
---
--- FUNCTION rom_with_content(addr, content) {
---     -- content is a list representing ROM contents
---     data: content |> List/get(index: addr)
---     [data: data]
--- }
-
--- Example: 4-address ROM with custom values
--- Commented out: No corresponding .sv file (for transpiler development)
---
--- FUNCTION example_rom() {
---     rom_with_content(
---         addr: 2
---         content: LIST { 10, 20, 30, 40 }  -- Returns 30
---     )
--- }

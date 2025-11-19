@@ -4,8 +4,8 @@
 
 FUNCTION halfadder(a, b) {
     [
-        o: a |> Bool/xor(b)  -- Sum = A XOR B
-        c: a |> Bool/and(b)  -- Carry = A AND B
+        o: a |> Bool/xor(that: b)  -- Sum = A XOR B
+        c: a |> Bool/and(that: b)  -- Carry = A AND B
     ]
 }
 
@@ -20,17 +20,7 @@ FUNCTION fulladder(a, b, d) {
         -- Final carry = c1 OR c2
         [
             o: ha2.o
-            c: ha1.c |> Bool/or(ha2.c)
+            c: ha1.c |> Bool/or(that: ha2.c)
         ]
     }
 }
-
--- Alternative: Direct Boolean expressions
--- FUNCTION fulladder_direct(a, b, cin) {
---     [
---         sum: a |> Bool/xor(b) |> Bool/xor(cin)
---         cout: a |> Bool/and(b) |> Bool/or(
---             cin |> Bool/and(a |> Bool/xor(b))
---         )
---     ]
--- }
