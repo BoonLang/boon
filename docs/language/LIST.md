@@ -53,7 +53,7 @@ LIST { size, element_type }
 
 -- Examples
 bits: LIST { 8, Bool }           -- 8 booleans
-signals: LIST { WIDTH, Bool }    -- WIDTH booleans (WIDTH is compile-time constant)
+signals: LIST { width, Bool }    -- width booleans (width is compile-time constant)
 ```
 
 **Default values:**
@@ -133,7 +133,7 @@ subset: list |> List/slice(from: 2, to: 5)  -- Elements 2, 3, 4
 
 ```boon
 -- Map: transform each element
-doubled: numbers |> List/map(n: n * 2)
+doubled: numbers |> List/map(old, new: old * 2)
 -- LIST { 3, Number } → LIST { 3, Number }
 
 -- Reverse
@@ -255,7 +255,7 @@ bits: LIST { 8, Bool }
 -- ✅ Elaboration-time (size known)
 a: BITS { 8, 10u42 }
 a_bits: a |> Bits/to_bool_list()     -- LIST { 8, Bool }
-result: a_bits |> List/map(b: b)     -- Transpiler unrolls to 8 operations
+result: a_bits |> List/map(old, new: old)     -- Transpiler unrolls to 8 operations
 
 -- ❌ Runtime (size unknown) - ERROR in hardware context
 dynamic: get_items()                  -- LIST { TodoItem }
@@ -376,7 +376,7 @@ LIST { size, element_type }
 -- Examples
 LIST { TodoItem }           -- Dynamic list of TodoItem
 LIST { 8, Bool }            -- Fixed list of 8 booleans
-LIST { WIDTH, Bool }        -- Fixed list of WIDTH booleans (WIDTH is constant)
+LIST { width, Bool }        -- Fixed list of width booleans (width is constant)
 LIST { __, Bool }           -- Size inferred from construction
 ```
 
@@ -398,23 +398,135 @@ bool_list: bits |> Bits/to_bool_list()
 -- Type: LIST { 8, Bool }
 ```
 
-### Compile-Time Size Requirements (Hardware)
+### Compile-Time Size Requirements
+
+**Critical principle:** If LIST size is specified, it MUST be compile-time known, never runtime.
+
+This matches the design philosophy of BITS width and MEMORY size - **explicit sizes are always compile-time constants.**
+
+#### Why Compile-Time Size?
+
+1. **Hardware Reality** - Fixed-size arrays map to hardware registers and are unrollable at elaboration time
+2. **Type Safety** - Size is part of the type, enabling compile-time verification
+3. **Performance** - Zero runtime overhead for size checking, enables optimizations
+4. **Clarity** - Function signatures explicitly declare collection sizes
+
+#### Size as Part of Type
+
+When specified, size becomes part of the LIST type:
 
 ```boon
--- ✅ Valid: Size is compile-time constant
-FUNCTION process(width: 8) {
-    bits: LIST { width, Bool }  -- OK: width = 8 (constant)
+-- These are DIFFERENT types
+list3: LIST { 3, Number } = LIST { 3, { 1, 2, 3 }}
+list5: LIST { 5, Number } = LIST { 5, { 1, 2, 3, 4, 5 }}
+
+-- ❌ Type mismatch
+list3: LIST { 3, Number } = LIST { 5, { 1, 2, 3, 4, 5 }}  -- ERROR
+
+-- ✅ Functions specify size in type signature
+process_triple: FUNCTION(data: LIST { 3, Number }) -> Result {
+    -- Compiler knows data has exactly 3 elements
 }
 
--- ✅ Valid: Size from generic parameter (constant in context)
-FUNCTION process(WIDTH) {
-    bits: LIST { WIDTH, Bool }  -- OK: WIDTH constant for each instantiation
+-- ❌ Can't pass wrong size
+list5: LIST { 5, Number }
+process_triple(list5)  -- ERROR: Expected LIST(3), got LIST(5)
+```
+
+#### What's Allowed: Compile-Time Constants
+
+```boon
+-- ✅ Literal size (most common)
+LIST { 8, Bool }                     -- Size: 8 (compile-time known)
+
+-- ✅ Compile-time constant parameter
+width: 8  -- Compile-time constant
+LIST { width, Bool }                 -- Size: 8 (compile-time known)
+
+-- ✅ Compile-time expression
+LIST { width * 2, Number }           -- Size: 16 (compile-time known)
+
+-- ✅ Type parameter in generic functions
+FUNCTION create_array<size>() -> LIST { size, Bool } {
+    LIST { size, {} }                -- size is compile-time parameter
 }
 
--- ❌ Invalid: Size depends on hardware signal
+-- ✅ Size inferred from construction
+coords: LIST { __, { x, y, z }}      -- Size: 3 (inferred at compile-time)
+```
+
+#### What's NOT Allowed: Runtime Size
+
+```boon
+-- ❌ Runtime variable size
+user_count: get_count_from_user()
+LIST { user_count, Number }          -- ERROR: Size must be compile-time constant
+
+-- ❌ Conditional size
+size: if condition { 8 } else { 16 }
+LIST { size, Bool }                  -- ERROR: Size unknown at compile-time
+
+-- ❌ Signal-dependent size (hardware)
 FUNCTION process(size_signal) {
-    bits: LIST { size_signal, Bool }  -- ERROR: size must be compile-time constant
+    LIST { size_signal, Bool }       -- ERROR: size must be compile-time constant
 }
+
+-- ✅ Use dynamic LIST instead
+FUNCTION process() {
+    LIST { Number }                  -- Dynamic (no size specified)
+}
+```
+
+#### Compile-Time Size Across Domains
+
+Size is compile-time known in ALL contexts where specified:
+
+**Hardware (Fixed-size required):**
+```boon
+-- Register file (8 registers, hardware-defined)
+registers: LIST { 8, BITS { 32, 10u0 } }
+
+-- Elaboration-time unrolling
+result: registers |> List/map(old, new: process(old))  -- Unrolls to 8 operations
+```
+
+**Software (Fixed-size optional):**
+```boon
+-- Fixed-size buffer (stack-allocated)
+buffer: LIST { 256, Number }
+
+-- Dynamic collection (heap-allocated)
+todos: LIST { TodoItem }  -- No size = dynamic
+```
+
+#### Benefits of Compile-Time Size
+
+1. **Early error detection** - Size mismatches caught at compile-time
+2. **Optimized operations** - Unrolling, vectorization, stack allocation
+3. **Self-documenting** - Function signatures show exact element counts
+4. **No runtime overhead** - No dynamic size tracking needed
+5. **Pattern matching safety** - Size constraints enforced
+
+```boon
+-- Compile-time size checking in pattern matching
+parse_triple: FUNCTION(data: LIST { 3, Number }) {
+    data |> WHEN {
+        LIST { 3, { a, b, c } } => process(a, b, c)  -- ✅ Size matches
+        LIST { 2, { a, b } } => invalid              -- ❌ ERROR: Size mismatch
+    }
+}
+```
+
+#### Dynamic vs Fixed: Clear Distinction
+
+```boon
+-- Dynamic LIST (no size) - can grow/shrink
+todos: LIST { TodoItem }
+todos: todos |> List/append(item: new_todo)  -- ✅ OK: dynamic
+
+-- Fixed-size LIST (size specified) - cannot grow/shrink
+buffer: LIST { 16, Number }
+buffer: buffer |> List/append(item: 42)      -- ❌ ERROR: Fixed size, cannot grow
 ```
 
 ---
@@ -438,7 +550,7 @@ FUNCTION invert_byte(input) {
 ```boon
 -- Ripple-carry adder chain
 FUNCTION adder_chain(a, b) {
-    a_bits: a |> Bits/to_bool_list()  -- LIST { WIDTH, Bool }
+    a_bits: a |> Bits/to_bool_list()  -- LIST { width, Bool }
     b_bits: b |> Bits/to_bool_list()
 
     result: a_bits |> List/zip(with: b_bits)
@@ -454,7 +566,7 @@ FUNCTION adder_chain(a, b) {
         )
 
     [
-        sum: result.values |> List/map(r: r.sum) |> List/to_u_bits()
+        sum: result.values |> List/map(old, new: old.sum) |> List/to_u_bits()
         carry: result.final_carry
     ]
 }
@@ -520,9 +632,10 @@ FUNCTION process_bits(input) {
 ### Pattern 2: Parameterized Hardware Generation
 
 ```boon
-FUNCTION generate_adders(WIDTH) {
-    inputs: LIST { WIDTH, {} }  -- WIDTH adder inputs
-        |> List/map(i: create_adder(index: i))
+FUNCTION generate_adders(width) {
+    inputs: LIST { width, {} }  -- width adder inputs
+        |> List/enumerate()
+        |> List/map(old, new: create_adder(index: old.index))
 }
 ```
 

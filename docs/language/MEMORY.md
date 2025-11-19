@@ -66,6 +66,144 @@ cache: MEMORY { 256, [valid: False, data: 0] }
 
 ---
 
+## Size Must Be Compile-Time Known
+
+**Critical design principle:** MEMORY size is ALWAYS known at compile-time, never at runtime.
+
+This matches the design philosophy of BITS width and LIST size - **explicit sizes are always compile-time constants.**
+
+### Why Compile-Time Size?
+
+1. **Hardware Reality** - Block RAM has fixed size determined at synthesis time
+2. **Type Safety** - Size is part of the memory specification, enabling verification
+3. **Performance** - Zero runtime overhead for size tracking or dynamic allocation
+4. **Clarity** - Memory specifications explicitly declare capacity
+5. **Safety** - Prevents out-of-bounds access at compile-time when possible
+
+### What's Allowed: Compile-Time Constants
+
+```boon
+-- ✅ Literal size (most common)
+MEMORY { 16, BITS { 8, 2u0 } }       -- Size: 16 (compile-time known)
+
+-- ✅ Compile-time constant parameter
+size: 256  -- Compile-time constant
+MEMORY { size, Entry }               -- Size: 256 (compile-time known)
+
+-- ✅ Compile-time expression
+width: 1920
+height: 1080
+MEMORY { width * height, Pixel }     -- Size: 2073600 (compile-time known)
+
+-- ✅ Type parameter in generic functions
+FUNCTION create_buffer<size>() -> MEMORY<size, Byte> {
+    MEMORY { size, BITS { 8, 2u0 } }    -- size is compile-time parameter
+}
+```
+
+### What's NOT Allowed: Runtime Size
+
+```boon
+-- ❌ Runtime variable size
+buffer_size: get_size_from_config()
+MEMORY { buffer_size, Data }         -- ERROR: Size must be compile-time constant
+
+-- ❌ Conditional size
+size: if use_large_buffer { 1024 } else { 256 }
+MEMORY { size, Byte }                -- ERROR: Size unknown at compile-time
+
+-- ❌ Signal-dependent size (hardware)
+FUNCTION create_mem(size_signal) {
+    MEMORY { size_signal, Data }     -- ERROR: size must be compile-time constant
+}
+```
+
+### Compile-Time Size Across Domains
+
+Size is compile-time known in ALL contexts:
+
+**Hardware (Block RAM):**
+```boon
+-- Block RAM (size fixed at synthesis)
+ram: MEMORY { 256, BITS { 32, 2u0 } }
+-- Synthesizer knows exact size, allocates BRAM blocks
+```
+
+**Software (Buffers):**
+```boon
+-- Fixed-size buffer (can be stack-allocated)
+buffer: MEMORY { 4096, Sample { value: 0.0 } }
+-- Compiler knows size, can optimize allocation
+
+-- Screen buffer (large, heap-allocated but fixed size)
+screen: MEMORY { 1920 * 1080, Pixel { r: 0, g: 0, b: 0 } }
+-- Size known at compile-time, never changes
+```
+
+### Benefits of Compile-Time Size
+
+1. **Hardware synthesis** - FPGA tools know exact BRAM requirements
+2. **Memory safety** - Static bounds checking when address is constant
+3. **Optimized allocation** - Fixed size enables stack allocation or efficient heap layout
+4. **Clear capacity** - Size is visible in type, self-documenting
+5. **No runtime tracking** - No need to store size at runtime
+
+```boon
+-- Compile-time bounds checking (when address is constant)
+mem: MEMORY { 16, BITS { 8, 2u0 } }
+
+data: mem |> Memory/read(address: 5)   -- ✅ OK: 5 < 16
+data: mem |> Memory/read(address: 20)  -- ❌ ERROR: 20 >= 16 (if constant)
+
+-- Runtime bounds checking (when address is variable)
+data: mem |> Memory/read(address: user_input)  -- Runtime check needed
+```
+
+### MEMORY vs Dynamic Collections
+
+Unlike LIST which can be dynamic, MEMORY is ALWAYS fixed-size:
+
+```boon
+-- ❌ MEMORY cannot be dynamic
+dynamic_mem: MEMORY { ... }  -- ERROR: Size required, no dynamic MEMORY
+
+-- ✅ Use LIST for dynamic collections
+dynamic_list: LIST { Data }  -- OK: Dynamic list (no size specified)
+
+-- ✅ Use MEMORY for fixed-size random access
+fixed_mem: MEMORY { 256, Data }  -- OK: Fixed-size memory
+```
+
+**Why MEMORY is always fixed-size:**
+- Maps directly to hardware Block RAM (fixed size)
+- Random access requires allocated space
+- Per-address reactivity needs pre-allocated cells
+- Growing/shrinking would require reallocation (expensive)
+
+### Function Signatures with MEMORY
+
+```boon
+-- Size in function parameter type
+process_buffer: FUNCTION(buf: MEMORY<256, Byte>) -> Result {
+    -- Compiler knows buffer has exactly 256 locations
+}
+
+-- Generic over size
+process_any_buffer: FUNCTION<size>(buf: MEMORY<size, Byte>) -> Result {
+    -- size is compile-time parameter
+    -- Each instantiation has specific size
+}
+
+-- ❌ Can't pass wrong size
+buf16: MEMORY { 16, Byte }
+buf256: MEMORY { 256, Byte }
+
+process_buffer(buf256)  -- ✅ OK: size matches
+process_buffer(buf16)   -- ❌ ERROR: Expected MEMORY<256>, got MEMORY<16>
+```
+
+---
+
 ## Operations
 
 ### Memory/write - Direct Write

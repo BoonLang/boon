@@ -10,6 +10,8 @@ This document describes the core syntax rules and conventions of the Boon progra
 
 **All function names and variable names MUST use snake_case.**
 
+**This includes compile-time constants.** Boon has no explicit constant keyword - variables set only at declaration are identified as compile-time constants by the compiler through dataflow analysis. These constant variables still use snake_case, not PascalCase or SCREAMING_SNAKE_CASE.
+
 ✅ **Correct:**
 ```boon
 FUNCTION new_todo(title) { ... }
@@ -20,6 +22,12 @@ store: [...]
 selected_filter: Active
 go_to_result: Router/go_to()
 title_to_save: TEXT { Hello }
+
+-- Compile-time constants (still snake_case!)
+width: 8
+packet_size: 64
+buffer_length: 1024
+max_retry_count: 10
 ```
 
 ❌ **INCORRECT - These will NOT work:**
@@ -30,6 +38,12 @@ FUNCTION CreateScene() { ... }       -- PascalCase not allowed
 
 Store: [...]                         -- PascalCase not allowed
 selectedFilter: Active               -- camelCase not allowed
+
+-- Compile-time constants also CANNOT use other conventions:
+WIDTH: 8                             -- PascalCase not allowed
+PACKET_SIZE: 64                      -- SCREAMING_SNAKE_CASE not allowed
+BufferLength: 1024                   -- PascalCase not allowed
+maxRetryCount: 10                    -- camelCase not allowed
 ```
 
 ### Tags and Tagged Objects: PascalCase

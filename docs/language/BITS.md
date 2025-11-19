@@ -118,9 +118,9 @@ signed_hex: BITS { 8, 16sFF }           -- 8-bit, signed, pattern = -1
 -- Octal patterns (base 8)
 octal_val: BITS { 12, 8u7777 }          -- 12-bit, unsigned, octal
 
--- Dynamic width (parameterized modules)
-reg: BITS { width, 10u0 }               -- Width from variable
-reg: BITS { width * 2, 16uFF }          -- Width from expression
+-- Compile-time parametric width (hardware generics/parameters)
+reg: BITS { width, 10u0 }               -- width must be compile-time constant
+reg: BITS { width * 2, 16uFF }          -- Expressions of compile-time constants
 ```
 
 ### Width and Value Rules
@@ -146,6 +146,136 @@ BITS { 8, 10s128 }      -- ERROR: 128 exceeds 8-bit signed max (127)
 ```boon
 BITS { 8, 10s-100 }     -- OK: signed negative decimal
 BITS { 8, 10u-100 }     -- ERROR: unsigned cannot be negative
+```
+
+---
+
+## Width Must Be Compile-Time Known
+
+**Critical design principle:** BITS width is ALWAYS known at compile-time, never at runtime.
+
+### Why Compile-Time Width?
+
+1. **Hardware Reality** - Hardware registers, signals, and buses have fixed sizes known at synthesis/compile time
+2. **Type Safety** - Width is part of the type, enabling compile-time verification
+3. **Performance** - Zero runtime overhead for width checking or dynamic allocation
+4. **Clarity** - Function signatures explicitly declare bit widths
+
+### Width as Part of Type
+
+Width is part of the BITS type, similar to array sizes in systems languages:
+
+```boon
+-- These are DIFFERENT types
+flags8: BITS(8) = BITS { 8, 16uFF }      -- Type: BITS(8)
+flags16: BITS(16) = BITS { 16, 16uFFFF } -- Type: BITS(16)
+
+-- ❌ Type mismatch
+flags8: BITS(8) = BITS { 16, 16uFFFF }   -- ERROR: Expected BITS(8), got BITS(16)
+
+-- ✅ Functions specify width in type signature
+process_byte: FUNCTION(data: BITS(8)) -> Result {
+    -- Compiler knows data is exactly 8 bits
+}
+
+-- ❌ Can't pass wrong width
+word: BITS(16) = BITS { 16, 16uABCD }
+process_byte(word)  -- ERROR: Expected BITS(8), got BITS(16)
+```
+
+### What's Allowed: Compile-Time Constants
+
+```boon
+-- ✅ Literal width (most common)
+BITS { 8, 16uFF }                        -- Width: 8 (compile-time known)
+
+-- ✅ Compile-time constant (parameter/generic)
+width: 8  -- Compile-time constant
+BITS { width, 16uFF }                    -- Width: 8 (compile-time known)
+
+-- ✅ Compile-time expression
+BITS { width * 2, 16uABCD }              -- Width: 16 (compile-time known)
+
+-- ✅ Type parameter in generic functions
+FUNCTION create_register<width>() -> BITS(width) {
+    Bits/u_zeros(width: width)           -- width is compile-time parameter
+}
+```
+
+### What's NOT Allowed: Runtime Width
+
+```boon
+-- ❌ Runtime variable width
+user_input: get_width_from_user()
+BITS { user_input, 16uFF }               -- ERROR: Width must be compile-time constant
+
+-- ❌ Conditional width
+width: if condition { 8 } else { 16 }
+BITS { width, 16uFF }                    -- ERROR: Width unknown at compile-time
+
+-- ❌ Function returning dynamic width
+get_dynamic_bits: FUNCTION() -> BITS {   -- ERROR: Width required in type
+    BITS { 8, 16uFF }
+}
+
+-- ✅ Function with explicit width
+get_bits: FUNCTION() -> BITS(8) {        -- Width in return type
+    BITS { 8, 16uFF }
+}
+
+-- ✅ Generic function with width parameter
+create_register: FUNCTION<width>() -> BITS(width) {
+    Bits/u_zeros(width: width)
+}
+```
+
+### Compile-Time Width Across Domains
+
+Width is compile-time known in ALL domains, not just hardware:
+
+**Embedded/Hardware:**
+```boon
+-- GPIO register (32-bit, hardware-defined)
+gpio_reg: BITS(32)
+```
+
+**Server/Network:**
+```boon
+-- TCP flags (9 bits, RFC-defined)
+tcp_flags: BITS(9)
+```
+
+**Web/Wasm:**
+```boon
+-- WebSocket opcode (4 bits, spec-defined)
+opcode: BITS(4)
+```
+
+**3D Graphics:**
+```boon
+-- Color channel (8 bits, format-defined)
+red: BITS(8)
+```
+
+In all cases, the width is defined by specifications, standards, or design decisions made at compile-time.
+
+### Benefits of Compile-Time Width
+
+1. **Early error detection** - Width mismatches caught at compile-time
+2. **Optimized code generation** - Compiler can generate exact-width operations
+3. **Self-documenting** - Function signatures show exact bit counts
+4. **No runtime overhead** - No dynamic width tracking needed
+5. **Pattern matching safety** - All patterns must have matching widths
+
+```boon
+-- Compile-time width checking in pattern matching
+parse_opcode: FUNCTION(code: BITS(4)) {
+    code |> WHEN {
+        BITS { 4, 2u0000 } => Continuation  -- ✅ 4 bits
+        BITS { 4, 2u0001 } => TextFrame     -- ✅ 4 bits
+        BITS { 8, 16u00 } => Invalid        -- ❌ ERROR: 8 bits doesn't match BITS(4)
+    }
+}
 ```
 
 ### Helper Functions
