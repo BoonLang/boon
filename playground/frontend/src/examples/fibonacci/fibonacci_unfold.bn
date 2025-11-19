@@ -1,0 +1,26 @@
+// Fibonacci using UNFOLD - beautiful, push-based, functional
+
+FUNCTION fibonacci(n) {
+    [prev: 0, current: 1]
+        |> UNFOLD times: n { state =>
+            [prev: state.current, current: state.prev + state.current]
+        }
+        |> .current
+}
+
+position: 10
+result: position |> fibonacci()
+TEXT { {position}. Fibonacci number is {result} } |> Console/log()
+
+// Alternative: Generate sequence of Fibonacci numbers
+FUNCTION fibonacci_sequence(n) {
+    [prev: 0, current: 1]
+        |> UNFOLD times: n, collect: True { state =>
+            [prev: state.current, current: state.prev + state.current]
+        }
+        |> List/map(fn: FUNCTION(state) { state.current })
+}
+
+// Returns: [1, 1, 2, 3, 5, 8, 13, 21, 34, 55]
+sequence: fibonacci_sequence(10)
+TEXT { "First 10 Fibonacci numbers: {sequence}" } |> Console/log()
