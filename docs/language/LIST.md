@@ -18,20 +18,31 @@ LIST is Boon's universal collection type, working seamlessly across domains:
 
 ## Construction Syntax
 
+**LIST uses different syntax for dynamic vs fixed-size:**
+
+- **Dynamic (no size parameter):** `LIST {}` or `LIST { item1, item2, ... }`
+- **Fixed-size (size parameter):** `LIST { size, content }`
+
 ### Dynamic Lists (Software)
 
 ```boon
--- Empty dynamic list (type inferred from usage)
+-- Empty dynamic list
 todos: LIST {}
-todos: LIST { item1, item2, item3 }  -- Sugar for LIST { __, { item1, item2, item3 }}
 
--- Type notation
-LIST { element_type }
+-- Dynamic list with initial items (no size parameter)
+todos: LIST { item1, item2, item3 }  -- Can grow/shrink later
 
--- Examples
-tasks: LIST { TodoItem }
-numbers: LIST { Number }
+-- ⚠️ NOT the same as fixed-size with inferred size:
+fixed: LIST { __, { item1, item2, item3 }}  -- Fixed at 3 elements, cannot grow
 ```
+
+**Important distinction:**
+- `LIST { item1, item2, item3 }` → **Dynamic** (no size parameter, can grow/shrink)
+- `LIST { __, { item1, item2, item3 }}` → **Fixed-size** (size inferred from content, cannot grow)
+
+**Note:** This is consistent across all collection types:
+- Dynamic: `LIST { items }`, `BYTES { bytes }` (no size parameter)
+- Fixed-size: `LIST { size, items }`, `BYTES { size, bytes }` (with size parameter)
 
 ### Fixed-Size Lists (Hardware Compatible)
 
@@ -48,12 +59,9 @@ data: LIST { 3, { 10, 20, 30 }}
 -- Size inference
 coords: LIST { __, { x, y, z }}  -- Size = 3
 
--- Type notation
-LIST { size, element_type }
-
 -- Examples
-bits: LIST { 8, Bool }           -- 8 booleans
-signals: LIST { width, Bool }    -- width booleans (width is compile-time constant)
+bits: LIST { 8, {} }             -- 8 elements (default values)
+signals: LIST { width, {} }      -- width elements (width is compile-time constant)
 ```
 
 **Default values:**
@@ -211,7 +219,7 @@ flat: nested_lists |> List/flatten()
 todos: LIST {}
     |> List/append(item: new_todo)           -- Runtime operation
     |> List/filter(item, if: item.active)    -- Runtime operation
-    |> List/map(item: render_todo(item))     -- Runtime operation
+    |> List/map(old, new: render_todo(old))  -- Runtime operation
 ```
 
 **Reactive behavior:**
@@ -231,10 +239,10 @@ filtered_todos: PASSED.todos
 
 ```boon
 -- Fixed-size list
-bits: LIST { 8, Bool }
-    |> List/map(bit: bit |> Bool/not())     -- Transpiler unrolls to 8 NOT gates
+bits: LIST { 8, {} }
+    |> List/map(old, new: old |> Bool/not())  -- Transpiler unrolls to 8 NOT gates
     |> List/fold(init: False, item, acc: item |> Bool/or(that: acc))
-                                             -- Transpiler creates OR tree
+                                              -- Transpiler creates OR tree
 ```
 
 **Elaboration-time semantics:**
@@ -268,7 +276,7 @@ result: dynamic |> List/map(...)      -- Software: OK, Hardware: ERROR
 ```boon
 -- Boon
 bits: LIST { 3, { a, b, c }}
-inverted: bits |> List/map(bit: bit |> Bool/not())
+inverted: bits |> List/map(old, new: old |> Bool/not())
 
 -- Transpiles to SystemVerilog
 inverted[0] = ~a;
@@ -540,7 +548,7 @@ buffer: buffer |> List/append(item: 42)      -- ❌ ERROR: Fixed size, cannot gr
 FUNCTION invert_byte(input) {
     -- input: BITS { 8, ... }
     bits: input |> Bits/to_bool_list()  -- LIST { 8, Bool }
-    inverted: bits |> List/map(bit: bit |> Bool/not())
+    inverted: bits |> List/map(old, new: old |> Bool/not())
     [output: inverted |> List/to_u_bits()]
 }
 ```
@@ -583,7 +591,7 @@ FUNCTION adder_chain(a, b) {
 todos: LIST {}
     |> List/append(item: new_todo_event)
     |> List/filter(item, if: item.completed |> Bool/not())
-    |> List/map(item: render_todo(item))
+    |> List/map(old, new: render_todo(old))
 ```
 
 ### Event Streams
@@ -624,7 +632,7 @@ events: LATEST {
 FUNCTION process_bits(input) {
     input
         |> Bits/to_bool_list()           -- BITS → LIST { N, Bool }
-        |> List/map(bit: bit |> Bool/not())  -- Process as LIST
+        |> List/map(old, new: old |> Bool/not())  -- Process as LIST
         |> List/to_u_bits()              -- LIST → BITS
 }
 ```
@@ -645,7 +653,7 @@ FUNCTION generate_adders(width) {
 items: LIST {}
     |> List/append(item: new_item_event)
     |> List/filter(item, if: filter_predicate)
-    |> List/map(item: transform(item))
+    |> List/map(old, new: transform(old))
 ```
 
 ---
