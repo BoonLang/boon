@@ -176,13 +176,13 @@ magic: BYTES { __, { 16u89, 16u50, 16u4E, 16u47 } }  -- Exactly 4 bytes
 -- ❌ Cannot change size of fixed BYTES
 header: header |> Bytes/append(byte: 16uFF)  -- ERROR: Fixed size
 
--- ✅ Dynamic BYTES (no size parameter at all)
-buffer: BYTES  -- Starts empty, can grow/shrink
+-- ✅ Dynamic BYTES (empty, no size specified)
+buffer: BYTES {}  -- Starts empty, can grow/shrink
 buffer: buffer |> Bytes/append(byte: 16uFF)  -- OK: Dynamic
 
 -- ❌ No literal syntax for dynamic BYTES with initial content
 -- Must start empty and build up, or use functions
-buffer: BYTES
+buffer: BYTES {}
 buffer: buffer |> Bytes/concat(BYTES { __, { 16uFF, 16u00 } })
 ```
 
@@ -266,7 +266,7 @@ This matches the design philosophy of LIST - size can be specified or omitted.
 
 ```boon
 -- Dynamic byte buffer
-buffer: BYTES  -- Type: BYTES (size unknown at compile-time)
+buffer: BYTES {}  -- Type: BYTES (size unknown at compile-time)
 
 -- Can grow
 buffer: buffer |> Bytes/append(byte: 16uFF)
@@ -337,7 +337,7 @@ user_size: get_size_from_input()
 buffer: BYTES { user_size, {} }  -- ERROR: Size must be compile-time constant
 
 -- ✅ Use dynamic BYTES instead
-dynamic_buffer: BYTES  -- OK: no size specified
+dynamic_buffer: BYTES {}  -- OK: no size specified
 ```
 
 ### Hardware Requires Fixed Size
@@ -415,7 +415,7 @@ result: parse_ethernet_header(header: small_header)  -- ERROR: Only 10 bytes, ne
 
 ```boon
 -- ✅ Dynamic BYTES (software) - can grow/shrink
-buffer: BYTES
+buffer: BYTES {}
 buffer: buffer |> Bytes/append(byte: 16uFF)  -- OK: dynamic
 
 -- ✅ Fixed-size BYTES (hardware) - cannot grow
