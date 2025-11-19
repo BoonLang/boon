@@ -6,22 +6,29 @@
 -- A = 2'b00, B = 2'b01, C = 2'b10, D = 2'b11
 
 -- Transpiler model:
---   - clk implicitly passed from hardware module context
+--   - clk explicitly passed as input parameter ([] = impulse, SKIP = no impulse)
+--   - THEN triggers when clk = [] (clock tick/impulse occurs)
+--   - When clk = SKIP, no update occurs (state holds previous value)
 --   - LATEST allows controlled self-reference for state transitions
 --   - Pattern matching models state transitions (case statement)
 
-FUNCTION fsm(rst, a) {
+FUNCTION fsm(clk, rst, a) {
     BLOCK {
         -- Sequential state register
+        -- clk receives [] (impulse) or SKIP (no impulse)
+        -- THEN triggers on each [] impulse, providing edge-triggered behavior
+        -- LATEST holds state between clock ticks
         -- FSMs use LATEST because next state depends on current state
         state: B |> LATEST state {
-            rst |> WHILE {
-                True => B
-                False => state |> WHEN {
-                    A => C                              -- A -> C
-                    B => D                              -- B -> D
-                    C => a |> WHILE { True => D, False => B }  -- C -> D or B
-                    D => A                              -- D -> A
+            clk |> THEN {
+                rst |> WHILE {
+                    True => B
+                    False => state |> WHEN {
+                        A => C                              -- A -> C
+                        B => D                              -- B -> D
+                        C => a |> WHILE { True => D, False => B }  -- C -> D or B
+                        D => A                              -- D -> A
+                    }
                 }
             }
         }
