@@ -10,9 +10,9 @@ FUNCTION fibonacci(position) {
             }
         }
         // Only return when iteration reaches target position
-        state.iteration = position |> WHEN {
-            True => state.current
-            False => SKIP
+        state.iteration |> WHEN {
+            position => state.current
+            __ => SKIP
         }
     }
 }

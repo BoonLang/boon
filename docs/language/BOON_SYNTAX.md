@@ -95,16 +95,31 @@ FUNCTION fibonacci(position) {
 
 **Equality comparison in Boon uses a single `=` operator, not `==`.**
 
-✅ **Correct - Single `=` for comparison:**
+However, **pattern matching is often more idiomatic than explicit comparison:**
+
+✅ **BEST - Pattern matching (most idiomatic):**
+```boon
+state.iteration |> WHEN {
+    position => result
+    __ => SKIP
+}
+
+selected_filter |> WHEN {
+    Active => show_active_todos()
+    __ => show_all_todos()
+}
+
+count |> WHEN {
+    0 => empty_message()
+    __ => items_list()
+}
+```
+
+✅ **CORRECT - Explicit comparison with `=`:**
 ```boon
 state.iteration = position |> WHEN {
     True => result
     False => SKIP
-}
-
-selected_filter = Active |> WHEN {
-    True => show_active_todos()
-    False => show_all_todos()
 }
 
 count = 0 |> WHEN {
@@ -119,7 +134,10 @@ state.iteration == position  // SYNTAX ERROR
 count == 0                   // SYNTAX ERROR
 ```
 
-**Note:** The single `=` is for comparison in expressions. Assignment uses `:` in bindings (`name: value`).
+**Note:**
+- Pattern matching is preferred when possible (more functional, cleaner)
+- Use single `=` for explicit comparison when needed
+- Assignment uses `:` in bindings (`name: value`)
 
 ---
 
@@ -1094,28 +1112,28 @@ result: initial_value |> LATEST state {
 
 ✅ **Correct - Fibonacci:**
 ```boon
-FUNCTION fibonacci(n) {
+FUNCTION fibonacci(position) {
     BLOCK {
-        final: [prev: 0, current: 1] |> LATEST state {
-            PULSES { n } |> THEN {
-                [prev: state.current, current: state.prev + state.current]
+        state: [previous: 0, current: 1] |> LATEST state {
+            PULSES { position } |> THEN {
+                [previous: state.current, current: state.previous + state.current]
             }
         }
-        final.current
+        state.current
     }
 }
 ```
 
 ✅ **Correct - Factorial:**
 ```boon
-FUNCTION factorial(n) {
+FUNCTION factorial(count) {
     BLOCK {
-        final: [count: 1, product: 1] |> LATEST state {
-            PULSES { n } |> THEN {
-                [count: state.count + 1, product: state.product * state.count]
+        state: [index: 1, product: 1] |> LATEST state {
+            PULSES { count } |> THEN {
+                [index: state.index + 1, product: state.product * state.index]
             }
         }
-        final.product
+        state.product
     }
 }
 ```

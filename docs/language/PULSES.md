@@ -72,9 +72,9 @@ FUNCTION fibonacci(position) {
             }
         }
         // Only emit when iteration reaches target position
-        state.iteration = position |> WHEN {
-            True => state.current
-            False => SKIP
+        state.iteration |> WHEN {
+            position => state.current
+            __ => SKIP
         }
     }
 }
@@ -282,16 +282,16 @@ FUNCTION fibonacci(position) {
             }
         }
         // Filter: only emit when complete
-        state.iteration = position |> WHEN {
-            True => state.current
-            False => SKIP
+        state.iteration |> WHEN {
+            position => state.current
+            __ => SKIP
         }
     }
 }
 
 // Usage
-fib_10: fibonacci(10)  // 55 (emits once when iteration = 10)
-fib_20: fibonacci(20)  // 6765 (emits once when iteration = 20)
+fib_10: fibonacci(10)  // 55 (emits once when iteration matches 10)
+fib_20: fibonacci(20)  // 6765 (emits once when iteration matches 20)
 ```
 
 ### **2. Factorial**
@@ -429,12 +429,12 @@ FUNCTION collatz_steps(n, max_steps) {
     BLOCK {
         final: [value: n, steps: 0] |> LATEST state {
             PULSES { max_steps } |> THEN {
-                state.value == 1 |> WHEN {
-                    True => SKIP  // Already at 1
-                    False => [
-                        value: state.value % 2 == 0 |> WHEN {
-                            True => state.value / 2
-                            False => state.value * 3 + 1
+                state.value |> WHEN {
+                    1 => SKIP  // Already at 1
+                    __ => [
+                        value: state.value % 2 |> WHEN {
+                            0 => state.value / 2
+                            __ => state.value * 3 + 1
                         },
                         steps: state.steps + 1
                     ]
@@ -567,9 +567,9 @@ FUNCTION fibonacci_hw(position) {
             }
         }
         // Filter: only output when complete
-        state.iteration = position |> WHEN {
-            True => state.current
-            False => SKIP
+        state.iteration |> WHEN {
+            position => state.current
+            __ => SKIP
         }
     }
 }
@@ -625,9 +625,9 @@ FUNCTION fibonacci(position) {
             }
         }
         // Filter: only emit when complete
-        state.iteration = position |> WHEN {
-            True => state.current
-            False => SKIP
+        state.iteration |> WHEN {
+            position => state.current
+            __ => SKIP
         }
     }
 }
@@ -824,9 +824,9 @@ BLOCK {
         }
     }
     // Filter to return only when complete
-    state.iteration = 10 |> WHEN {
-        True => state.current
-        False => SKIP
+    state.iteration |> WHEN {
+        10 => state.current
+        __ => SKIP
     }
 }
 ```
@@ -1021,9 +1021,9 @@ FUNCTION fibonacci(position) {
                 ]
             }
         }
-        state.iteration = position |> WHEN {
-            True => state.current
-            False => SKIP
+        state.iteration |> WHEN {
+            position => state.current
+            __ => SKIP
         }
     }
 }
