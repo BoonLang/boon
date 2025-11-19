@@ -119,8 +119,8 @@ For conversions and dynamic construction, use functions:
 
 ```boon
 -- From text (encoding conversion)
-utf8_bytes: Bytes/from_text(TEXT { Hello }, encoding: UTF8)
-ascii_bytes: Bytes/from_text(TEXT { GET }, encoding: ASCII)
+utf8_bytes: Bytes/from_text(TEXT { Hello }, encoding: Utf8)
+ascii_bytes: Bytes/from_text(TEXT { GET }, encoding: Ascii)
 
 -- From Base64 (decoding)
 decoded: Bytes/from_base64(TEXT { SGVsbG8gV29ybGQ= })
@@ -162,33 +162,36 @@ buffer: BYTES { 1024, {} }  -- OK: 1024 zero bytes
 empty: BYTES { 0, {} }      -- OK: 0 bytes
 ```
 
-### Fixed vs Dynamic BYTES
+### Concatenation Rules
 
-**Rule: `BYTES { size, content }` is ALWAYS fixed-size (cannot grow/shrink)**
+**Rule: Fixed-size containers can only contain fixed-size BYTES. Dynamic containers can contain any BYTES.**
 
 ```boon
--- ✅ Fixed-size with explicit size (zero-filled)
-header: BYTES { 14, {} }  -- Exactly 14 bytes, cannot change size
+-- ✅ Fixed-size BYTES can concatenate other FIXED-SIZE BYTES
+header: BYTES { __, { 16uFF, 16u00 } }      -- Fixed (2 bytes)
+footer: BYTES { __, { 16u00, 16uFF } }      -- Fixed (2 bytes)
+frame: BYTES { __, { header, 16uAB, footer } }  -- Fixed (5 bytes = 2+1+2)
 
--- ✅ Fixed-size with inferred size (from literals)
-magic: BYTES { __, { 16u89, 16u50, 16u4E, 16u47 } }  -- Exactly 4 bytes
+-- ✅ Dynamic BYTES can concatenate any BYTES (fixed or dynamic)
+dynamic1: BYTES {}                          -- Dynamic
+dynamic2: BYTES {}                          -- Dynamic
+fixed: BYTES { __, { 16uFF, 16u00 } }       -- Fixed (2 bytes)
 
--- ❌ Cannot change size of fixed BYTES
-header: header |> Bytes/append(byte: 16uFF)  -- ERROR: Fixed size
+combined_dynamic: BYTES { dynamic1, dynamic2 }     -- Dynamic result
+mixed: BYTES { fixed, dynamic1, 16uAB }            -- Dynamic result
 
--- ✅ Dynamic BYTES (empty, no size specified)
-buffer: BYTES {}  -- Starts empty, can grow/shrink
-buffer: buffer |> Bytes/append(byte: 16uFF)  -- OK: Dynamic
-
--- ❌ No literal syntax for dynamic BYTES with initial content
--- Must start empty and build up, or use functions
-buffer: BYTES {}
-buffer: buffer |> Bytes/concat(BYTES { __, { 16uFF, 16u00 } })
+-- ❌ Fixed-size BYTES CANNOT contain dynamic BYTES
+bad: BYTES { __, { dynamic1, dynamic2 } }
+-- ERROR: Cannot infer compile-time size from runtime-sized content
 ```
+
+**See "Size Semantics: Dynamic vs Fixed-Size" section below for complete details.**
 
 ### Content Composition and Flattening
 
 **Rule: Content `{ }` can contain byte literals, BITS values, and nested BYTES - all flattened in order**
+
+**Important:** Fixed-size containers can only contain fixed-size BYTES (compile-time known size). Dynamic containers can contain both fixed and dynamic BYTES.
 
 ```boon
 -- Byte literals (1 byte each)
@@ -250,6 +253,14 @@ header: header |> Bytes/append(byte: 16uAB)
 -- ❌ Cannot use BYTES<N> syntax (IDE display only)
 bad: BYTES<14>
 -- ERROR: Not valid Boon syntax (use BYTES { 14, {} })
+
+-- ❌ Cannot put dynamic BYTES in fixed-size container
+dynamic_data: BYTES {}
+bad: BYTES { __, { dynamic_data, 16uFF } }
+-- ERROR: Cannot infer compile-time size from runtime-sized content
+
+-- ✅ CORRECT: Use dynamic container for dynamic BYTES
+good: BYTES { dynamic_data, 16uFF }  -- Dynamic result
 ```
 
 ---
@@ -463,25 +474,25 @@ Bytes/concat(LIST { a, b, c })          -- Join buffers
 Bytes/append(bytes, byte: 16uFF)        -- Add byte at end
 Bytes/prepend(bytes, byte: 16u00)       -- Add byte at start
 
--- Typed views (read as specific type)
-Bytes/read_u8(bytes, offset: 0)
-Bytes/read_u16(bytes, offset: 0, endian: Little)
-Bytes/read_u32(bytes, offset: 0, endian: Big)
-Bytes/read_u64(bytes, offset: 0, endian: Little)
-Bytes/read_i8(bytes, offset: 0)         -- Signed integers
-Bytes/read_i16(bytes, offset: 0, endian: Little)
-Bytes/read_i32(bytes, offset: 0, endian: Big)
-Bytes/read_i64(bytes, offset: 0, endian: Little)
-Bytes/read_f32(bytes, offset: 0, endian: Little)
-Bytes/read_f64(bytes, offset: 0, endian: Little)
+-- Typed views (read multi-byte numbers)
+Bytes/read_unsigned(bytes, offset: 0, byte_count: 1)  -- Single byte (no endian needed)
+Bytes/read_unsigned(bytes, offset: 0, byte_count: 2, endian: Little)
+Bytes/read_unsigned(bytes, offset: 0, byte_count: 4, endian: Big)
+Bytes/read_unsigned(bytes, offset: 0, byte_count: 8, endian: Little)
+Bytes/read_signed(bytes, offset: 0, byte_count: 1)    -- Single byte (no endian needed)
+Bytes/read_signed(bytes, offset: 0, byte_count: 2, endian: Little)
+Bytes/read_signed(bytes, offset: 0, byte_count: 4, endian: Big)
+Bytes/read_signed(bytes, offset: 0, byte_count: 8, endian: Little)
+Bytes/read_float(bytes, offset: 0, byte_count: 4, endian: Little)  -- 32-bit float
+Bytes/read_float(bytes, offset: 0, byte_count: 8, endian: Little)  -- 64-bit float
 
 -- Typed writes
-Bytes/write_u16(bytes, offset: 0, value: 1000, endian: Little)
-Bytes/write_u32(bytes, offset: 4, value: 12345, endian: Big)
-Bytes/write_f32(bytes, offset: 8, value: 3.14, endian: Little)
+Bytes/write_unsigned(bytes, offset: 0, value: 1000, byte_count: 2, endian: Little)
+Bytes/write_unsigned(bytes, offset: 4, value: 12345, byte_count: 4, endian: Big)
+Bytes/write_float(bytes, offset: 8, value: 3.14, byte_count: 4, endian: Little)
 
 -- Text conversions
-Bytes/to_text(bytes, encoding: UTF8)    -- Decode to text
+Bytes/to_text(bytes, encoding: Utf8)    -- Decode to text
 Bytes/to_hex(bytes)                     -- "FF00ABCD"
 Bytes/to_base64(bytes)                  -- Base64 encode
 Bytes/from_hex(hex_text)
@@ -495,8 +506,7 @@ Bytes/equal(a, b)                       -- Byte-wise equality
 
 -- Transformation
 Bytes/reverse(bytes)                    -- Reverse byte order
-Bytes/map(bytes, byte => byte |> Bits/xor(16uFF))  -- Transform each
-Bytes/fill(bytes, start: 0, end: 10, value: 16u00)  -- Fill range
+Bytes/fill(bytes, start: 0, end: 10, value: 16u00)  -- Fill range with value
 ```
 
 ---
@@ -507,13 +517,12 @@ Endianness is always explicit for multi-byte reads/writes:
 
 ```boon
 -- Explicit for all multi-byte operations
-value: Bytes/read_u32(data, offset: 0, endian: Little)  -- x86 style
-value: Bytes/read_u32(data, offset: 0, endian: Big)     -- Network byte order
+value: Bytes/read_unsigned(data, offset: 0, byte_count: 4, endian: Little)  -- x86 style
+value: Bytes/read_unsigned(data, offset: 0, byte_count: 4, endian: Big)     -- Network byte order
 
--- Swap endianness
-swapped: Bytes/swap_endian_16(value)
-swapped: Bytes/swap_endian_32(value)
-swapped: Bytes/swap_endian_64(value)
+-- Swap endianness by re-reading with different endian
+little_endian: Bytes/read_unsigned(data, offset: 0, byte_count: 4, endian: Little)
+big_endian: Bytes/read_unsigned(data, offset: 0, byte_count: 4, endian: Big)
 ```
 
 **Why explicit?**
@@ -543,7 +552,7 @@ file_bytes |> Bytes/take(count: 4) |> WHEN {
 
 ```boon
 -- Option 1: Convert to TEXT first (recommended for text protocols)
-request_line |> Bytes/to_text(encoding: ASCII) |> Text/take(count: 4) |> WHEN {
+request_line |> Bytes/to_text(encoding: Ascii) |> Text/take(count: 4) |> WHEN {
     TEXT { GET } => GetMethod
     TEXT { POST } => PostMethod
     TEXT { PUT } => PutMethod
@@ -571,7 +580,7 @@ request_line |> Bytes/take(count: 3) |> WHEN {
 num: BYTES { __, { 16uFF } } |> Bytes/get(index: 0)  -- 255
 
 -- Multi-byte to number (via typed read)
-num: Bytes/read_u32(bytes, offset: 0, endian: Little)
+num: Bytes/read_unsigned(bytes, offset: 0, byte_count: 4, endian: Little)
 ```
 
 ### BYTES ↔ BITS
@@ -593,12 +602,12 @@ bytes: bits |> Bits/to_bytes()             -- 2 bytes (padded)
 -- BYTES to text
 BYTES { __, { 16uFF, 16u00 } } |> Bytes/to_hex()             -- "FF00"
 BYTES { __, { 16uFF, 16u00 } } |> Bytes/to_base64()          -- "/wA="
-utf8_bytes |> Bytes/to_text(encoding: UTF8)          -- "Hi"
+utf8_bytes |> Bytes/to_text(encoding: Utf8)          -- "Hi"
 
 -- Text to BYTES (use functions, not literals)
 Bytes/from_hex(TEXT { FF00ABCD })
 Bytes/from_base64(TEXT { SGVsbG8= })
-Bytes/from_text(TEXT { Hello }, encoding: UTF8)
+Bytes/from_text(TEXT { Hello }, encoding: Utf8)
 ```
 
 ---
@@ -631,10 +640,10 @@ FUNCTION parse_ws_frame(bytes) {
 ```boon
 FUNCTION parse_tcp_header(bytes) {
     BLOCK {
-        src_port: Bytes/read_u16(bytes, offset: 0, endian: Big)
-        dst_port: Bytes/read_u16(bytes, offset: 2, endian: Big)
-        seq_num: Bytes/read_u32(bytes, offset: 4, endian: Big)
-        ack_num: Bytes/read_u32(bytes, offset: 8, endian: Big)
+        src_port: Bytes/read_unsigned(bytes, offset: 0, byte_count: 2, endian: Big)
+        dst_port: Bytes/read_unsigned(bytes, offset: 2, byte_count: 2, endian: Big)
+        seq_num: Bytes/read_unsigned(bytes, offset: 4, byte_count: 4, endian: Big)
+        ack_num: Bytes/read_unsigned(bytes, offset: 8, byte_count: 4, endian: Big)
 
         flags_byte: bytes |> Bytes/get(index: 13)
         flags: Bits/u_from_number(value: flags_byte, width: 8)
@@ -688,13 +697,19 @@ FUNCTION detect_texture_format(header_bytes) {
 
 ## API Reference
 
-### Constructors
+### Literal Syntax
 
-- `BYTES { byte, byte, ... }` - From byte literals
-- `BYTES { length: N }` - Zero-filled buffer
-- `BYTES { text: T, encoding: E }` - From text
-- `BYTES { base64: T }` - From Base64
-- `BYTES { hex: T }` - From hex string
+- `BYTES { size, { byte, byte, ... } }` - From byte literals with explicit size
+- `BYTES { __, { byte, byte, ... } }` - From byte literals with inferred size
+- `BYTES { size, {} }` - Zero-filled buffer with explicit size
+- `BYTES {}` - Dynamic empty BYTES
+
+### Construction Functions
+
+- `Bytes/zeros(length: N)` - Zero-filled buffer
+- `Bytes/from_text(text, encoding: E)` - From text
+- `Bytes/from_base64(text)` - From Base64
+- `Bytes/from_hex(text)` - From hex string
 - `Bytes/from_bits(bits)` - From BITS
 
 ### Properties
@@ -712,29 +727,19 @@ FUNCTION detect_texture_format(header_bytes) {
 
 ### Typed Views (Read)
 
-- `Bytes/read_u8(bytes, offset: O)`
-- `Bytes/read_u16(bytes, offset: O, endian: E)`
-- `Bytes/read_u32(bytes, offset: O, endian: E)`
-- `Bytes/read_u64(bytes, offset: O, endian: E)`
-- `Bytes/read_i8(bytes, offset: O)`
-- `Bytes/read_i16(bytes, offset: O, endian: E)`
-- `Bytes/read_i32(bytes, offset: O, endian: E)`
-- `Bytes/read_i64(bytes, offset: O, endian: E)`
-- `Bytes/read_f32(bytes, offset: O, endian: E)`
-- `Bytes/read_f64(bytes, offset: O, endian: E)`
+- `Bytes/read_unsigned(bytes, offset: O, byte_count: N)` - Single byte (no endian)
+- `Bytes/read_unsigned(bytes, offset: O, byte_count: N, endian: E)` - Multi-byte unsigned
+- `Bytes/read_signed(bytes, offset: O, byte_count: N)` - Single byte (no endian)
+- `Bytes/read_signed(bytes, offset: O, byte_count: N, endian: E)` - Multi-byte signed
+- `Bytes/read_float(bytes, offset: O, byte_count: N, endian: E)` - Float (4 or 8 bytes)
 
 ### Typed Views (Write)
 
-- `Bytes/write_u8(bytes, offset: O, value: V)`
-- `Bytes/write_u16(bytes, offset: O, value: V, endian: E)`
-- `Bytes/write_u32(bytes, offset: O, value: V, endian: E)`
-- `Bytes/write_u64(bytes, offset: O, value: V, endian: E)`
-- `Bytes/write_i8(bytes, offset: O, value: V)`
-- `Bytes/write_i16(bytes, offset: O, value: V, endian: E)`
-- `Bytes/write_i32(bytes, offset: O, value: V, endian: E)`
-- `Bytes/write_i64(bytes, offset: O, value: V, endian: E)`
-- `Bytes/write_f32(bytes, offset: O, value: V, endian: E)`
-- `Bytes/write_f64(bytes, offset: O, value: V, endian: E)`
+- `Bytes/write_unsigned(bytes, offset: O, value: V, byte_count: N)` - Single byte (no endian)
+- `Bytes/write_unsigned(bytes, offset: O, value: V, byte_count: N, endian: E)` - Multi-byte unsigned
+- `Bytes/write_signed(bytes, offset: O, value: V, byte_count: N)` - Single byte (no endian)
+- `Bytes/write_signed(bytes, offset: O, value: V, byte_count: N, endian: E)` - Multi-byte signed
+- `Bytes/write_float(bytes, offset: O, value: V, byte_count: N, endian: E)` - Float (4 or 8 bytes)
 
 ### Manipulation
 
@@ -759,12 +764,35 @@ FUNCTION detect_texture_format(header_bytes) {
 - `Bytes/to_text(bytes, encoding: E)` - Decode to text
 - `Bytes/to_hex(bytes)` - To hex string
 - `Bytes/to_base64(bytes)` - To Base64
+- `Bytes/from_text(text, encoding: E)` - Encode from text
 - `Bytes/from_hex(text)` - Parse hex
 - `Bytes/from_base64(text)` - Parse Base64
+- `Bytes/zeros(length: N)` - Create zero-filled buffer
 
 ---
 
 ## Design Rationale
+
+### Why Width Parameters Instead of Type-Specific Functions?
+
+**Boon uses `byte_count` parameters instead of type-specific functions (like Rust's `read_u8`, `read_u16`, etc.):**
+
+```boon
+-- ✅ Boon style: Width as parameter
+Bytes/read_unsigned(bytes, offset: 0, byte_count: 2, endian: Big)
+Bytes/read_unsigned(bytes, offset: 0, byte_count: 4, endian: Big)
+
+-- ❌ Rust style: Type in function name
+Bytes/read_u16(bytes, offset: 0, endian: Big)
+Bytes/read_u32(bytes, offset: 0, endian: Big)
+```
+
+**Benefits:**
+1. **Consistent with BITS** - `BITS { width, value }` uses width parameter
+2. **Less API surface** - 3 functions instead of 10+ type-specific ones
+3. **More flexible** - Can read any byte width (not limited to 1,2,4,8)
+4. **No type system assumptions** - Boon doesn't have explicit u8/u16/u32/u64 types
+5. **Explicit is better** - `byte_count: 2` is clearer than `u16`
 
 ### Why Byte-Level Abstraction?
 
@@ -792,11 +820,11 @@ BYTES serves different purposes from BITS:
 ### 1. Ignoring Endianness
 
 ```boon
--- ❌ WRONG: Platform-dependent behavior
-value: Bytes/read_u32(data, offset: 0)  -- Which endianness?
+-- ❌ WRONG: Endianness required for multi-byte reads
+value: Bytes/read_unsigned(data, offset: 0, byte_count: 4)  -- ERROR: Missing endian parameter
 
 -- ✅ CORRECT: Explicit endianness
-value: Bytes/read_u32(data, offset: 0, endian: Big)
+value: Bytes/read_unsigned(data, offset: 0, byte_count: 4, endian: Big)
 ```
 
 ### 2. Byte vs Bit Confusion

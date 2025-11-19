@@ -60,6 +60,26 @@ Neobrutalism
 InputInterior
 ButtonDelete
 TodoId
+Utf8
+Ascii
+Little
+Big
+```
+
+**Important:** SCREAM_CASE is reserved for Boon keywords only (FUNCTION, BLOCK, LATEST, etc.). User-defined tags MUST use PascalCase.
+
+✅ **Correct - Tags use PascalCase:**
+```boon
+encoding: Utf8          -- Correct
+endian: Little          -- Correct
+endian: Big             -- Correct
+```
+
+❌ **INCORRECT - SCREAM_CASE not allowed for tags:**
+```boon
+encoding: UTF8          -- WRONG: Reserved for keywords
+endian: LITTLE          -- WRONG: Reserved for keywords
+endian: BIG             -- WRONG: Reserved for keywords
 ```
 
 ### Shadowing Is Allowed
