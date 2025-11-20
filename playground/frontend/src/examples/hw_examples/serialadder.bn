@@ -30,22 +30,27 @@ FUNCTION serialadder(a, b) {
         -- Zip creates LIST { WIDTH, [Bool, Bool] } (pairs of bits)
         pairs: a_bits |> List/zip(with: b_bits)
 
-        -- List/scan: thread carry through chain, keep all sums
+        -- List/chain: thread carry through chain, collect all sums
         -- Transpiler unrolls to WIDTH full adders in chain
-        result: pairs |> List/scan(
-            init: False  -- Initial carry = False
-            pair, carry_in: BLOCK {
-                fa: fulladder(a: pair.first, b: pair.second, d: carry_in)
-                [sum: fa.o, carry_out: fa.c]
+        result: pairs |> List/chain(
+            item
+            initial_state: False  -- Initial carry = False
+            state
+            iteration: BLOCK {
+                fa: fulladder(a: item.first, b: item.second, d: state)
+                [
+                    output_value: fa.o
+                    next_state: fa.c
+                ]
             }
         )
-        -- result: [sums: LIST { WIDTH, Bool }, final_carry: Bool]
+        -- result: [values: LIST { WIDTH, Bool }, final_state: Bool]
 
         -- Build output BITS: concatenate sums + final carry
         [
             o: BITS { __, {
-                result.sums |> List/to_u_bits()       -- LIST { WIDTH, Bool } → BITS { WIDTH, ... }
-                result.final_carry |> Bool/to_u_bit() -- Bool → BITS { 1, ... }
+                result.values |> List/to_u_bits()       -- LIST { WIDTH, Bool } → BITS { WIDTH, ... }
+                result.final_state |> Bool/to_u_bit()   -- Bool → BITS { 1, ... }
             }}
             -- Result: BITS { WIDTH+1, ... }
         ]

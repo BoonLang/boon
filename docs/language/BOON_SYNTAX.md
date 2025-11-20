@@ -299,6 +299,36 @@ user_input |> Text/trim()
 TEXT { Hello } |> Element/text()  -- Though named is more readable here
 ```
 
+### Function Argument Separation
+
+**Function arguments are separated by NEWLINES, not commas.**
+
+✅ **Correct - Newline separation:**
+```boon
+Element/text(
+    element: [tag: H1]
+    style: [font: Theme/font(of: Header)]
+    text: TEXT { todos }
+)
+
+Scene/new(
+    root: root_element(PASS: [store: store])
+    lights: Theme/lights()
+    geometry: Theme/geometry()
+)
+```
+
+❌ **INCORRECT - Commas between arguments:**
+```boon
+Element/text(
+    element: [tag: H1],           -- WRONG: No comma!
+    style: [font: ...],           -- WRONG: No comma!
+    text: TEXT { todos }
+)
+```
+
+**Rule:** Arguments are separated by newlines, not commas
+
 ---
 
 ## 3. Functions Are Not First-Class

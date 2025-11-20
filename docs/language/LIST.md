@@ -167,12 +167,17 @@ sum: numbers |> List/fold(
 )
 -- LIST { N, Number } → Number
 
--- Scan: fold but keep intermediate results
-running_sum: numbers |> List/scan(
-    init: 0
-    item, acc: acc + item
+-- Chain: thread state through list, collect outputs
+result: numbers |> List/chain(
+    item
+    initial_state: 0
+    state
+    iteration: [
+        output_value: state + item
+        next_state: state + item
+    ]
 )
--- LIST { N, Number } → LIST { N, Number }
+-- Returns: [values: LIST { N, Number }, final_state: Number]
 
 -- Count
 length: list |> List/count()
@@ -248,7 +253,7 @@ bits: LIST { 8, {} }
 **Elaboration-time semantics:**
 - `List/map` → Parallel instances (N copies of logic)
 - `List/fold` → Sequential chain (N-stage pipeline)
-- `List/scan` → Chain with outputs (N stages, N outputs)
+- `List/chain` → Chain with outputs (N stages, N outputs)
 - `List/zip` → Structural pairing (N pairs)
 
 ---
@@ -298,13 +303,18 @@ temp3 = temp2 + c;
 sum = temp3 + d;
 ```
 
-**List/scan (chain with outputs):**
+**List/chain (chain with outputs):**
 ```boon
 -- Boon
 bits: LIST { 3, { a, b, c }}
-carry_chain: bits |> List/scan(
-    init: False
-    bit, carry: [sum: bit |> Bool/xor(that: carry), carry: bit |> Bool/and(that: carry)]
+result: bits |> List/chain(
+    item
+    initial_state: False
+    state
+    iteration: [
+        output_value: item |> Bool/xor(that: state)
+        next_state: item |> Bool/and(that: state)
+    ]
 )
 
 -- Transpiles to (3 half-adders in chain)
@@ -317,8 +327,9 @@ ha1_carry = b & ha0_carry;
 ha2_sum = c ^ ha1_carry;
 ha2_carry = c & ha1_carry;
 
-carry_chain = {ha0_sum, ha1_sum, ha2_sum};
-final_carry = ha2_carry;
+-- Result structure:
+result.values = {ha0_sum, ha1_sum, ha2_sum};
+result.final_state = ha2_carry;
 ```
 
 **List/zip (structural pairing):**
@@ -562,20 +573,25 @@ FUNCTION adder_chain(a, b) {
     b_bits: b |> Bits/to_bool_list()
 
     result: a_bits |> List/zip(with: b_bits)
-        |> List/scan(
-            init: False  -- Initial carry
-            pair, carry: BLOCK {
-                sum: pair.first |> Bool/xor(that: pair.second) |> Bool/xor(that: carry)
-                carry_out: (pair.first |> Bool/and(that: pair.second))
-                    |> Bool/or(that: pair.first |> Bool/and(that: carry))
-                    |> Bool/or(that: pair.second |> Bool/and(that: carry))
-                [sum: sum, carry: carry_out]
+        |> List/chain(
+            item
+            initial_state: False  -- Initial carry
+            state
+            iteration: BLOCK {
+                sum: item.first |> Bool/xor(that: item.second) |> Bool/xor(that: state)
+                carry_out: (item.first |> Bool/and(that: item.second))
+                    |> Bool/or(that: item.first |> Bool/and(that: state))
+                    |> Bool/or(that: item.second |> Bool/and(that: state))
+                [
+                    output_value: sum
+                    next_state: carry_out
+                ]
             }
         )
 
     [
-        sum: result.values |> List/map(old, new: old.sum) |> List/to_u_bits()
-        carry: result.final_carry
+        sum: result.values |> List/to_u_bits()
+        carry: result.final_state
     ]
 }
 ```
