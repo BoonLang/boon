@@ -216,6 +216,43 @@ partial: BITS { 12, 16uABC }  -- 12 bits (not byte-aligned)
 bad: BYTES { __, { partial } }  -- ERROR: BITS width must be multiple of 8
 ```
 
+### TEXT in BYTES Constructor
+
+TEXT can be included directly in BYTES (auto-converts to UTF-8):
+
+```boon
+-- Simple TEXT to BYTES (UTF-8 encoding)
+bytes: BYTES { TEXT { Hello } }
+// Result: BYTES { 5, { 16u48, 16u65, 16u6C, 16u6C, 16u6F } }
+
+-- Mixed content (TEXT + bytes + BITS)
+packet: BYTES { __, {
+    16uFF,                         -- Header byte
+    TEXT { GET },                   -- HTTP method (UTF-8)
+    16u20,                         -- Space
+    TEXT { /path },                 -- Path (UTF-8)
+    16u00                          -- Null terminator
+} }
+
+-- Non-ASCII works (UTF-8 encoding)
+greeting: BYTES { TEXT { Dobrý den } }
+// "Dobr" = 4 bytes (ASCII subset)
+// "ý" = 2 bytes (C3 BD in UTF-8)
+// " den" = 4 bytes (ASCII subset)
+// Total: 10 bytes
+```
+
+**UTF-8 encoding is automatic** - no encoding parameter needed. For ASCII validation, use explicit conversion:
+
+```boon
+-- ASCII validation (explicit)
+command: TEXT { AT+RESET }
+ascii_bytes: command |> Text/to_bytes(encoding: Ascii)  -- Validates
+
+-- Then use in BYTES
+packet: BYTES { __, { 16uFF, ascii_bytes, 16u00 } }
+```
+
 ### Empty Content Semantics
 
 **Rule: `{}` means zero-filled (all bytes are 0)**
@@ -676,6 +713,63 @@ FUNCTION build_message(type_tag, sequence, payload) {
 
         header_bytes: header |> Bits/to_bytes()
         Bytes/concat(LIST { header_bytes, payload })
+    }
+}
+```
+
+### Hardware/Embedded: UART Communication
+
+```boon
+-- Simple UART hello (auto-converts TEXT to UTF-8 BYTES)
+FUNCTION uart_hello() {
+    BLOCK {
+        msg: TEXT { INIT OK }  -- Compile-time constant
+
+        -- Auto-converts to BYTES at this boundary
+        msg |> Bytes/for_each(byte: byte => uart_tx(byte))
+        // Sends: 49 4E 49 54 20 4F 4B (7 bytes)
+    }
+}
+
+-- International text in hardware (UTF-8)
+FUNCTION uart_status() {
+    BLOCK {
+        status: TEXT { Stav: připraven }  -- Czech text, compile-time
+
+        -- Auto-converts to UTF-8 BYTES
+        status |> Bytes/for_each(byte: byte => uart_tx(byte))
+        // "Stav: p" = 7 bytes (ASCII)
+        // "ř" = 2 bytes (C5 99 in UTF-8)
+        // "ipraven" = 7 bytes (ASCII)
+        // Total: 16 bytes
+    }
+}
+
+-- Protocol with TEXT (mixed construction)
+FUNCTION uart_command(cmd_id) {
+    BLOCK {
+        packet: BYTES { __, {
+            16u02,                    -- STX (start of text)
+            TEXT { CMD: },            -- Prefix (UTF-8)
+            cmd_id,                   -- Command ID byte
+            16u03                     -- ETX (end of text)
+        } }
+
+        packet |> Bytes/for_each(byte: byte => uart_tx(byte))
+    }
+}
+
+-- ASCII validation when needed (explicit)
+FUNCTION uart_at_command(command) {
+    BLOCK {
+        validated: command
+            |> Text/is_ascii()
+            |> WHEN {
+                True => command |> Text/to_bytes(encoding: Ascii)
+                False => BYTES { TEXT { ERROR } }  -- Fallback
+            }
+
+        validated |> Bytes/for_each(byte: byte => uart_tx(byte))
     }
 }
 ```

@@ -583,6 +583,277 @@ This would hide escape sequences and provide semantic terminal control. Can be a
 
 ---
 
+## Text Encoding
+
+### TEXT Represents Unicode
+
+**TEXT in Boon represents Unicode text** - an abstract sequence of Unicode characters (code points).
+
+TEXT literals can contain any Unicode characters:
+
+```boon
+-- Any language works
+english: TEXT { Hello World }
+czech: TEXT { Dobrý den }
+chinese: TEXT { 你好世界 }
+arabic: TEXT { مرحبا }
+emoji: TEXT { Status: ✓ }
+mixed: TEXT { Price: €50, Temp: -5°C }
+```
+
+### Internal Representation
+
+TEXT values are stored internally as UTF-8 bytes (implementation detail). This representation is **opaque** - you work with TEXT as characters, not bytes.
+
+```boon
+text: TEXT { Hello }
+
+-- ✅ Character-level operations
+text |> Text/length()           -- 5 characters
+text |> Text/concat(TEXT { ! }) -- Character concatenation
+
+-- ❌ Cannot access bytes directly
+text[2]  -- Not allowed (characters may be multi-byte)
+```
+
+### Encoding at Boundaries
+
+Encoding becomes **explicit** when TEXT converts to BYTES (at I/O boundaries):
+
+```boon
+-- File I/O
+TEXT { Hello } |> File/write(path: file, encoding: Utf8)
+
+-- Network I/O
+TEXT { Response } |> Socket/send(socket, encoding: Utf8)
+
+-- TEXT → BYTES conversion
+text: TEXT { Hello }
+bytes: text |> Text/to_bytes(encoding: Utf8)
+```
+
+### UTF-8 vs ASCII
+
+**UTF-8 (default for most cases):**
+- **Variable-width**: 1-4 bytes per character
+- **Universal**: Supports all Unicode characters
+- **Modern standard**: Web, APIs, files, protocols
+- **ASCII-compatible**: ASCII text encodes identically
+
+**ASCII (explicit when needed):**
+- **Fixed-width**: Exactly 1 byte per character
+- **Limited**: Characters 0-127 only (English + basic symbols)
+- **Legacy protocols**: Some old systems require ASCII
+- **Validation**: Ensures text contains only ASCII
+
+```boon
+-- UTF-8 (default) - supports everything
+message: TEXT { User: {name} ✓ }
+bytes: message |> Text/to_bytes(encoding: Utf8)
+
+-- ASCII (explicit) - validation + conversion
+command: TEXT { AT+RESET }
+bytes: command |> Text/to_bytes(encoding: Ascii)
+// ERROR if non-ASCII characters present
+```
+
+### TEXT in Software vs Hardware
+
+**Software (Web/Server/Build):**
+
+TEXT is a **runtime type** with full UTF-8 support:
+
+```boon
+-- Software: Dynamic text operations
+FUNCTION render_greeting(user_name) {
+    greeting: TEXT { Hello {user_name}! }  -- Runtime interpolation
+    greeting |> Text/to_bytes(encoding: Utf8)
+}
+```
+
+**Hardware (FPGA/Embedded):**
+
+TEXT must be **compile-time constant** and auto-converts to BYTES (UTF-8):
+
+```boon
+-- Hardware: Compile-time constant
+FUNCTION uart_hello() {
+    BLOCK {
+        msg: TEXT { Hello World }  -- Compile-time constant
+
+        -- Auto-converts to UTF-8 BYTES at this boundary
+        msg |> Bytes/for_each(byte: byte => uart_tx(byte))
+
+        -- Compiler generates: BYTES { 11, { ... } } at compile-time
+    }
+}
+
+-- Non-ASCII in hardware (UTF-8 encoding)
+FUNCTION uart_czech() {
+    BLOCK {
+        msg: TEXT { Dobrý den }  -- Compile-time constant
+
+        -- Auto-converts to UTF-8 (some chars are multi-byte)
+        msg |> Bytes/for_each(byte: byte => uart_tx(byte))
+
+        -- "Dobr" = 4 bytes (ASCII)
+        -- "ý" = 2 bytes (C3 BD in UTF-8)
+        -- " den" = 4 bytes (ASCII)
+        -- Total: 10 bytes (known at compile-time)
+    }
+}
+```
+
+**Hardware rules:**
+1. ✅ Compile-time TEXT constants allowed
+2. ✅ Compile-time interpolation with constant values
+3. ✅ Auto-converts to UTF-8 BYTES at boundaries
+4. ❌ Runtime text operations not allowed (compile error)
+
+```boon
+-- ✅ Hardware: Compile-time constant
+msg: TEXT { INIT }
+msg |> Bytes/for_each(...)  -- Auto-converts to BYTES
+
+-- ✅ Hardware: Compile-time interpolation
+version: 1  -- Compile-time constant
+msg: TEXT { FW v{version} }  -- Resolved at compile-time
+
+-- ❌ Hardware: Runtime operations
+FUNCTION echo(input_byte) {
+    msg: TEXT { Got: {input_byte} }
+    // ERROR: Cannot interpolate runtime value in hardware TEXT
+}
+```
+
+### When to Use UTF-8
+
+**Use UTF-8 encoding when:**
+- Building web applications (HTTP, JSON, HTML)
+- Working with modern APIs
+- User-facing text (internationalization)
+- File formats (config files, data files)
+- **Default choice for most cases**
+
+```boon
+-- Web response
+response: TEXT { {"status": "success"} }
+bytes: response |> Text/to_bytes(encoding: Utf8)
+
+-- International content
+message: TEXT { Dobrý den! }
+bytes: message |> Text/to_bytes(encoding: Utf8)
+```
+
+### When to Use ASCII
+
+**Use ASCII encoding when:**
+- Legacy protocols require ASCII-only
+- Need 1-byte-per-character guarantee
+- Validation (ensure no non-ASCII sneaked in)
+- Old embedded systems/terminals
+
+```boon
+-- AT modem commands (ASCII-only protocol)
+command: TEXT { AT+CGDCONT=1,"IP","internet" }
+bytes: command |> Text/to_bytes(encoding: Ascii)
+
+-- Validate ASCII before sending
+user_command
+    |> Text/is_ascii()
+    |> WHEN {
+        True => user_command |> Text/to_bytes(encoding: Ascii)
+        False => Error("Protocol requires ASCII-only")
+    }
+```
+
+### Encoding Performance
+
+**UTF-8 → UTF-8 conversion:**
+- Zero transcoding (TEXT is UTF-8 internally)
+- Just copy or reference internal buffer
+- **Cost: Negligible**
+
+**UTF-8 → ASCII conversion:**
+- Validation scan (check all bytes < 128)
+- ~1 nanosecond per byte on modern CPUs
+- **Cost: <0.01% vs I/O latency**
+
+Example: 100-byte HTTP header
+- Validation: ~100 nanoseconds
+- Network I/O: ~1-10 milliseconds
+- **Overhead: Completely negligible**
+
+### Text Module API Extensions
+
+```boon
+-- ASCII validation and utilities
+Text/is_ascii(text: Text) -> Bool
+Text/to_ascii_lossy(text: Text) -> BYTES  -- Replace non-ASCII with '?'
+
+-- Examples
+TEXT { Hello } |> Text/is_ascii()         -- True
+TEXT { Hello 世界 } |> Text/is_ascii()    -- False
+
+TEXT { Café™ } |> Text/to_ascii_lossy()   -- "Caf??" (é, ™ → ?)
+```
+
+### Common Patterns
+
+**Validate before protocol:**
+```boon
+FUNCTION send_at_command(command) {
+    command
+        |> Text/is_ascii()
+        |> WHEN {
+            True => command
+                |> Text/to_bytes(encoding: Ascii)
+                |> serial_write()
+            False => Error("AT commands must be ASCII")
+        }
+}
+```
+
+**Length-prefixed protocol:**
+```boon
+-- ✅ Correct: Use byte length
+message: TEXT { Hello }
+bytes: message |> Text/to_bytes(encoding: Utf8)
+length: bytes |> Bytes/length()  -- Byte count, not character count
+
+send_byte(length)
+send_bytes(bytes)
+```
+
+**Legacy terminal fallback:**
+```boon
+msg: terminal_supports_utf8 |> WHEN {
+    True => TEXT { Status: ✓ }
+    False => TEXT { Status: OK }
+}
+```
+
+### Hardware Size Impact
+
+**ASCII text (common case):**
+```boon
+TEXT { INIT }    -- UTF-8: 4 bytes, ASCII: 4 bytes (0% overhead)
+TEXT { ERROR }   -- UTF-8: 5 bytes, ASCII: 5 bytes (0% overhead)
+```
+
+**Non-ASCII text:**
+```boon
+TEXT { Dobrý den }  -- UTF-8: 10 bytes
+// ASCII: Impossible (ý not in ASCII)
+
+TEXT { Status: ✓ }  -- UTF-8: 10 bytes (✓ = 3 bytes)
+// ASCII: Impossible (✓ not in ASCII)
+```
+
+**Conclusion:** For ASCII text (common in hardware debug), zero overhead. For non-ASCII, ASCII encoding isn't possible anyway.
+
+---
+
 ## Design Principles
 
 1. **Explicit over implicit** - Content is literal, spacing is visible

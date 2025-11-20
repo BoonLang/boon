@@ -4,6 +4,69 @@ This document describes the core syntax rules and conventions of the Boon progra
 
 ---
 
+## Source File Encoding and Character Sets
+
+### Source File Encoding: UTF-8 Required
+
+**All Boon source files MUST be UTF-8 encoded without BOM (Byte Order Mark).**
+
+This matches modern language standards (Rust, Go, Python 3) and enables:
+- Comments in any language
+- String literals with Unicode characters
+- International development teams
+
+✅ **Examples:**
+```boon
+-- Comments work in any language
+-- English: This is a comment
+-- Czech: Toto je komentář
+-- Chinese: 这是注释
+-- Arabic: هذا تعليق
+
+-- TEXT literals support Unicode
+greeting: TEXT { Hello 世界 🌍 }
+message: TEXT { Dobrý den! }
+price: TEXT { Price: €50 }
+```
+
+❌ **Not supported:**
+- Other encodings (Latin-1, UTF-16, etc.)
+- BOM (Byte Order Mark) - save as UTF-8 without BOM
+
+**Editor setup:** Configure your editor to save files as UTF-8 without BOM.
+
+### Identifier Encoding: ASCII-Only
+
+**Identifiers (variable names, function names, module names) MUST use ASCII characters only.**
+
+Allowed characters:
+- Lowercase letters: `a-z`
+- Uppercase letters: `A-Z` (for PascalCase tags)
+- Digits: `0-9` (not at start)
+- Underscore: `_`
+
+✅ **Correct:**
+```boon
+user_name: TEXT { 张三 }        -- ASCII identifier, Unicode content
+temperature_celsius: -15        -- ASCII identifier (no accents)
+message: TEXT { Привет мир }    -- ASCII identifier, Cyrillic content
+```
+
+❌ **INCORRECT:**
+```boon
+用户名: TEXT { ... }            -- ERROR: Non-ASCII identifier
+température: -15                -- ERROR: é is not ASCII
+сообщение: TEXT { ... }         -- ERROR: Cyrillic identifier
+```
+
+**Why ASCII-only identifiers?**
+1. **Tool compatibility** - Works with all editors, terminals, compilers
+2. **No visual confusion** - Avoids lookalike characters (Cyrillic 'а' vs Latin 'a')
+3. **Simplicity** - No Unicode normalization or case-folding complexity
+4. **Industry standard** - Most systems languages restrict identifiers to ASCII
+
+---
+
 ## 1. Naming Conventions
 
 ### Functions and Variables: snake_case ONLY

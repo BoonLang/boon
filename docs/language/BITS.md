@@ -827,6 +827,50 @@ bits: bool_list |> List/to_s_bits()
 -- Result: BITS { 4, 2s1010 } (signed)
 ```
 
+### BITS ← TEXT
+
+TEXT can be converted to BITS (must be byte-aligned, auto-converts to UTF-8):
+
+```boon
+-- Simple TEXT to BITS (UTF-8 encoding)
+signature: BITS { TEXT { BN } }
+// 'B' = 16u42, 'N' = 16u4E
+// Result: BITS { 16, 16u424E }  (2 chars × 8 bits = 16 bits)
+
+-- Protocol header with TEXT
+header: BITS { __, {
+    BITS { 4, 16uA },              -- Version nibble
+    TEXT { OK },                   -- Status (16 bits, UTF-8)
+    BITS { 4, 16u0 }               -- Reserved
+} }
+// Result: BITS { 24, ... }  (4 + 16 + 4 = 24 bits)
+
+-- Non-ASCII TEXT (UTF-8 multi-byte)
+status: BITS { TEXT { ✓ } }
+// ✓ = 3 bytes UTF-8 = 24 bits
+// Result: BITS { 24, ... }
+```
+
+**Requirements:**
+- TEXT must result in byte-aligned bits (width multiple of 8)
+- UTF-8 encoding is automatic
+
+**Hardware examples:**
+
+```boon
+-- Protocol signature
+magic: BITS { TEXT { BOON } }
+// Result: BITS { 32, 16u424F4F4E }
+
+-- Instruction encoding with mnemonic
+instruction: BITS { __, {
+    TEXT { LD },                   -- Mnemonic (16 bits)
+    BITS { 8, reg_addr },          -- Register
+    BITS { 8, immediate }          -- Immediate value
+} }
+// Total: 32 bits (16 + 8 + 8)
+```
+
 ### BITS ↔ BYTES
 
 ```boon
