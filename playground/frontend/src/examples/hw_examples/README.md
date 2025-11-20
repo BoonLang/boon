@@ -479,6 +479,26 @@ Examples are synthesizable Boon code. To use:
 
 ---
 
+## HDL Gap Analysis & Research
+
+**[hdl_analysis/](./hdl_analysis/)** - Comprehensive research on Boon's HDL capabilities
+
+This folder contains a detailed analysis comparing Boon to modern HDLs (SpinalHDL, Spade, Chisel, Amaranth, VHDL-2019) and discovering how missing features naturally emerge from Boon's reactive core.
+
+**Key findings:**
+- 🎯 Boon is already ~85% complete HDL
+- 🔄 Pipelines emerge from LATEST + PASSED (~70% exists)
+- 🌊 Streaming emerges from LINK + FLUSH (~80% exists)
+- ✅ 7 out of 11 critical features are 75%+ naturally emergent
+
+**Documents:**
+- [Gap Analysis Report](./hdl_analysis/QUICK_REPORT.md) - Comparison to modern HDLs
+- [Pipelines & Streaming](./hdl_analysis/NATURAL_EMERGENCE_ANALYSIS.md) - How they emerge naturally
+- [Remaining Features](./hdl_analysis/REMAINING_FEATURES_EMERGENCE.md) - CDC, interfaces, formal verification, etc.
+- [Overview README](./hdl_analysis/README.md) - Complete analysis summary
+
+---
+
 ## Additional Resources
 
 - [BITS and BYTES Documentation](../../../docs/language/BITS_AND_BYTES.md)

@@ -1120,8 +1120,8 @@ The language is already there. We just need to see it.
 ---
 
 **Related Documents:**
-- `QUICK_REPORT.md` - Gap analysis
-- `NATURAL_EMERGENCE_ANALYSIS.md` - Pipelines and streaming
-- `LATEST.md` - Reactive state semantics
-- `LINK_PATTERN.md` - Reactive channel architecture
-- `FLUSH.md` - Bypass and early exit
+- [QUICK_REPORT.md](./QUICK_REPORT.md) - Gap analysis
+- [NATURAL_EMERGENCE_ANALYSIS.md](./NATURAL_EMERGENCE_ANALYSIS.md) - Pipelines and streaming
+- [../../../../../docs/language/LATEST.md](../../../../../docs/language/LATEST.md) - Reactive state semantics
+- [../../../../../docs/language/LINK_PATTERN.md](../../../../../docs/language/LINK_PATTERN.md) - Reactive channel architecture
+- [../../../../../docs/language/FLUSH.md](../../../../../docs/language/FLUSH.md) - Bypass and early exit
