@@ -24,10 +24,10 @@ From `LATEST.md` and `CLOCK_SEMANTICS.md`:
 
 ```boon
 // Boon register pattern
-count: BITS{8, 10u0} |> LATEST count {
+count: BITS[8] { 10u0 } |> LATEST count {
     PASSED.clk |> THEN {
         rst |> WHILE {
-            True => BITS{8, 10u0}
+            True => BITS[8] { 10u0 }
             False => count |> Bits/increment()
         }
     }
@@ -214,7 +214,7 @@ result: data_stream |> THEN { value =>
 StreamInterface: [
     valid: Bool   // Producer has data
     ready: Bool   // Consumer can accept
-    data: BITS { width, ... }
+    data: BITS[width] { ...  }
 ]
 
 // Producer declares streaming capability
@@ -584,16 +584,16 @@ FUNCTION risc_cpu(instruction) {
 FUNCTION streaming_fifo(depth) {
     BLOCK {
         // Input stream interface
-        input: LINK  // [valid: Bool, ready: Bool, data: BITS{8, ...}]
+        input: LINK  // [valid: Bool, ready: Bool, data: BITS[8] { ... }]
 
         // Output stream interface
-        output: LINK  // [valid: Bool, ready: Bool, data: BITS{8, ...}]
+        output: LINK  // [valid: Bool, ready: Bool, data: BITS[8] { ... }]
 
         // FIFO storage
-        buffer: MEMORY { depth, BITS{8, 10u0} }
+        buffer: MEMORY[depth] { BITS[8] { 10u0  } }
 
         // Pointers
-        write_ptr: BITS{8, 10u0} |> LATEST wr {
+        write_ptr: BITS[8] { 10u0 } |> LATEST wr {
             PASSED.clk |> THEN {
                 // Write when input valid AND ready
                 input.valid |> Bool/and(ready_to_accept) |> WHEN {
@@ -603,7 +603,7 @@ FUNCTION streaming_fifo(depth) {
             }
         }
 
-        read_ptr: BITS{8, 10u0} |> LATEST rd {
+        read_ptr: BITS[8] { 10u0 } |> LATEST rd {
             PASSED.clk |> THEN {
                 // Read when output ready AND valid
                 output.ready |> Bool/and(data_available) |> WHEN {

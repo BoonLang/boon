@@ -21,7 +21,7 @@ FUNCTION fulladder(a, b, d) {
 }
 
 FUNCTION serialadder(a, b) {
-    -- a, b are BITS { WIDTH, ... } (matches SystemVerilog input [WIDTH-1:0])
+    -- a, b are BITS[WIDTH] { ...  } (matches SystemVerilog input [WIDTH-1:0])
     BLOCK {
         -- Convert BITS to fixed-size LIST { WIDTH, Bool }
         a_bits: a |> Bits/to_bool_list()  -- LIST { WIDTH, Bool }
@@ -48,9 +48,9 @@ FUNCTION serialadder(a, b) {
 
         -- Build output BITS: concatenate sums + final carry
         [
-            o: BITS { __, {
-                result.values |> List/to_u_bits()       -- LIST { WIDTH, Bool } → BITS { WIDTH, ... }
-                result.final_state |> Bool/to_u_bit()   -- Bool → BITS { 1, ... }
+            o: BITS[__] {
+                result.values |> List/to_u_bits()       -- LIST { WIDTH, Bool } → BITS[WIDTH] { ...  }
+                result.final_state |> Bool/to_u_bit()   -- Bool → BITS[1] { ...  }
             }}
             -- Result: BITS { WIDTH+1, ... }
         ]

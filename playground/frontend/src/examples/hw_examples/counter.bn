@@ -19,14 +19,14 @@
 
 -- Parameters:
 --   rst, load, en, up: Bool - control signals
---   load_value: BITS { 8, ... } - value to load
+--   load_value: BITS[8] { ...  } - value to load
 -- Returns:
---   count: BITS { 8, ... } - current counter value
+--   count: BITS[8] { ...  } - current counter value
 
 FUNCTION counter(rst, load, load_value, up, en) {
     BLOCK {
         count_width: 8
-        default: BITS { count_width, 10s0 }
+        default: BITS[count_width] { 10s0  }
 
         -- Bundle all control signals for pattern matching
         control_signals: [reset: rst, load: load, up: up, enabled: en]
@@ -45,9 +45,9 @@ FUNCTION counter(rst, load, load_value, up, en) {
                     })
                     |> Bits/sum(delta: control_signals |> WHILE {
                         [reset: False, load: False, up: True, enabled: True] =>
-                            BITS { count_width, 10s1 }
+                            BITS[count_width] { 10s1  }
                         [reset: False, load: False, up: False, enabled: True] =>
-                            BITS { count_width, 10s-1 }
+                            BITS[count_width] { 10s-1  }
                         __ => SKIP
                     })
             }

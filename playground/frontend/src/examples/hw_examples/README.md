@@ -33,7 +33,7 @@ Boon hardware uses **ambient context** (`PASSED`) for clock signals, with two co
 FUNCTION counter(rst, load, load_value, up, en) {
     BLOCK {
         count_width: 8
-        default: BITS { count_width, 10s0 }
+        default: BITS[count_width] { 10s0  }
         control_signals: [reset: rst, load: load, up: up, enabled: en]
 
         -- Pipeline = next-state logic (this function IS a register)
@@ -48,9 +48,9 @@ FUNCTION counter(rst, load, load_value, up, en) {
             })
             |> Bits/sum(delta: control_signals |> WHEN {
                 [reset: False, load: False, up: True, enabled: True] =>
-                    BITS { count_width, 10s1 }
+                    BITS[count_width] { 10s1  }
                 [reset: False, load: False, up: False, enabled: True] =>
-                    BITS { count_width, 10s-1 }
+                    BITS[count_width] { 10s-1  }
                 __ => SKIP
             })
 
@@ -127,12 +127,12 @@ See [CLOCK_SEMANTICS.md](CLOCK_SEMANTICS.md) for clock details, and individual `
 
 ### Fixed-Size LIST Operations
 
-**Rule:** Operations on `LIST { size, element_type }` where `size` is compile-time constant are **elaboration-time** (unrolled by transpiler).
+**Rule:** Operations on `LIST[size, element_type]` where `size` is compile-time constant are **elaboration-time** (unrolled by transpiler).
 
 ```boon
 -- ✅ Elaboration-time (size known)
-a: BITS { 8, 10u42 }
-a_bits: a |> Bits/to_bool_list()     -- LIST { 8, Bool }
+a: BITS[8] { 10u42  }
+a_bits: a |> Bits/to_bool_list()     -- LIST[8, Bool]
 inverted: a_bits |> List/map(bit: bit |> Bool/not())
 -- Transpiler unrolls to 8 NOT gates
 
@@ -146,7 +146,7 @@ result: dynamic |> List/map(...)      -- ERROR: "Cannot use dynamic LIST in hard
 **List/map → Parallel instances:**
 ```boon
 -- Boon
-bits: LIST { 3, { a, b, c }}
+bits: LIST[3] {  a, b, c  }
 inverted: bits |> List/map(bit: bit |> Bool/not())
 
 -- Transpiles to SystemVerilog
@@ -158,10 +158,10 @@ inverted[2] = ~c;
 **List/fold → Sequential chain:**
 ```boon
 -- Boon
-pairs: LIST { WIDTH, { a_bits, b_bits } }
+pairs: LIST[WIDTH] {  a_bits, b_bits  }
     |> List/zip(with: b_bits)
     |> List/fold(
-        init: [sums: LIST { WIDTH, {} }, carry: False]
+        init: [sums: LIST[WIDTH] {  }, carry: False]
         pair, acc: fulladder(a: pair.first, b: pair.second, d: acc.carry)
     )
 
@@ -193,9 +193,9 @@ ha1_carry = a[1] & ha0_carry;
 ### Transpiler Rules
 
 1. **Size must be compile-time constant:**
-   - From BITS width: `BITS { 8, ... } |> Bits/to_bool_list()` → `LIST { 8, Bool }`
-   - From literal: `LIST { 4, { a, b, c, d }}`
-   - From generic parameter: `LIST { WIDTH, Bool }` where WIDTH is constant
+   - From BITS width: `BITS[8] { ...  } |> Bits/to_bool_list()` → `LIST[8, Bool]`
+   - From literal: `LIST[4] {  a, b, c, d  }`
+   - From generic parameter: `LIST[WIDTH, Bool]` where WIDTH is constant
 
 2. **Operations are unrolled:**
    - `List/map` → Parallel instances (combinational)
@@ -205,14 +205,14 @@ ha1_carry = a[1] & ha0_carry;
 
 3. **Size mismatch errors:**
    ```boon
-   a: LIST { 8, Bool }
-   b: LIST { 4, Bool }
+   a: LIST[8, Bool]
+   b: LIST[4, Bool]
    a |> List/zip(with: b)  -- ERROR: "Size mismatch: 8 vs 4"
    ```
 
 4. **Dynamic operations forbidden:**
    ```boon
-   fixed: LIST { 8, Bool }
+   fixed: LIST[8, Bool]
    fixed |> List/append(...)  -- ERROR: "Cannot append to fixed-size LIST in hardware"
    ```
 
@@ -336,7 +336,7 @@ See [BITS_AND_BYTES.md](../../../docs/language/BITS_AND_BYTES.md#when-to-use-bit
 
 **prio_encoder.bn** - Priority encoder (4→2)
 - **Operations**: Wildcard pattern matching with fixed-size LIST
-- **Why LIST**: `LIST { __, { True, __, __ }}` wildcard patterns elegant
+- **Why LIST**: `LIST[__] {  True, __, __  }` wildcard patterns elegant
 - **Compare**: BITS version would need nested patterns
 - **Maps to**: `casez` with wildcards
 
@@ -428,11 +428,11 @@ input |> WHEN {
 **BITS (Verbose) - Nested patterns:**
 ```boon
 input |> WHEN {
-    BITS { 4, {
-        BITS { 1, 2u1 }
-        BITS { 1, __ }
-        BITS { 1, __ }
-        BITS { 1, __ }
+    BITS[4] {
+        BITS[1] { 2u1  }
+        BITS[1] { __  }
+        BITS[1] { __  }
+        BITS[1] { __  }
     }} => 3
 }
 ```

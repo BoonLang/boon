@@ -380,9 +380,9 @@ FUNCTION interaction_transform(material, state) {
 
 // Before (5 lines manual):
 transform: LIST { element.hovered, element.pressed } |> WHEN {
-    LIST { __, True } => []
-    LIST { True, False } => [move_closer: 4]
-    LIST { False, False } => []
+    LIST[__, True] => []
+    LIST[True, False] => [move_closer: 4]
+    LIST[False, False] => []
 }
 
 // After (1 line automatic):

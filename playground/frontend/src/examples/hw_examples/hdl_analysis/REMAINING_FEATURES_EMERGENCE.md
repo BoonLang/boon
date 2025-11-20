@@ -36,14 +36,14 @@ From the hardware examples and `CLOCK_SEMANTICS.md`:
 FUNCTION dual_clock_fifo(write_clk, read_clk, data_in) {
     BLOCK {
         // Write domain (write_clk)
-        write_ptr: BITS{4, 10u0} |> LATEST wr {
+        write_ptr: BITS[4] { 10u0 } |> LATEST wr {
             PASSED.clk[write_clk] |> THEN {
                 wr |> Bits/increment()
             }
         }
 
         // Read domain (read_clk)
-        read_ptr: BITS{4, 10u0} |> LATEST rd {
+        read_ptr: BITS[4] { 10u0 } |> LATEST rd {
             PASSED.clk[read_clk] |> THEN {
                 rd |> Bits/increment()
             }
@@ -65,14 +65,14 @@ FUNCTION dual_clock_fifo(write_clk, read_clk, data_in) {
 FUNCTION safe_dual_clock_fifo(write_clk, read_clk, data_in) {
     BLOCK {
         // Write domain
-        write_ptr: BITS{4, 10u0} |> LATEST wr {
+        write_ptr: BITS[4] { 10u0 } |> LATEST wr {
             PASSED.clk[write_clk] |> THEN {
                 wr |> Bits/increment()
             }
         }
 
         // Read domain
-        read_ptr: BITS{4, 10u0} |> LATEST rd {
+        read_ptr: BITS[4] { 10u0 } |> LATEST rd {
             PASSED.clk[read_clk] |> THEN {
                 rd |> Bits/increment()
             }
@@ -122,7 +122,7 @@ FUNCTION CDC/synchronize(signal, from: from_clk, to: to_clk, stages: 2) {
 FUNCTION CDC/async_fifo(depth, write_clk, read_clk) {
     BLOCK {
         // Write domain
-        write_ptr: BITS{4, 10u0} |> LATEST wr {
+        write_ptr: BITS[4] { 10u0 } |> LATEST wr {
             PASSED.clk[write_clk] |> THEN {
                 wr |> Bits/increment()
             }
@@ -136,7 +136,7 @@ FUNCTION CDC/async_fifo(depth, write_clk, read_clk) {
             |> CDC/synchronize(from: write_clk, to: read_clk)
 
         // Read domain
-        read_ptr: BITS{4, 10u0} |> LATEST rd {
+        read_ptr: BITS[4] { 10u0 } |> LATEST rd {
             PASSED.clk[read_clk] |> THEN {
                 rd |> Bits/increment()
             }
@@ -184,8 +184,8 @@ FUNCTION CDC/async_fifo(depth, write_clk, read_clk) {
 axi_write_address: [
     awvalid: True
     awready: False
-    awaddr: BITS{32, 10u1000}
-    awprot: BITS{3, 10u0}
+    awaddr: BITS[32] { 10u1000 }
+    awprot: BITS[3] { 10u0 }
 ]
 
 // Access fields
@@ -220,15 +220,15 @@ store.elements.input.event.key_down.key
 AXI4_LITE_WRITE_ADDRESS: INTERFACE {
     awvalid: Bool
     awready: Bool
-    awaddr: BITS { 32, ... }
-    awprot: BITS { 3, ... }
+    awaddr: BITS[32] { ...  }
+    awprot: BITS[3] { ...  }
 }
 
 AXI4_LITE_WRITE_DATA: INTERFACE {
     wvalid: Bool
     wready: Bool
-    wdata: BITS { 32, ... }
-    wstrb: BITS { 4, ... }
+    wdata: BITS[32] { ...  }
+    wstrb: BITS[4] { ...  }
 }
 
 AXI4_LITE: INTERFACE {
@@ -257,12 +257,12 @@ axi_master: [
     write_address: [
         awvalid: True
         awready: False
-        awaddr: BITS{32, 10u0}
+        awaddr: BITS[32] { 10u0 }
     ]
     write_data: [
         wvalid: True
         wready: False
-        wdata: BITS{32, 10u0}
+        wdata: BITS[32] { 10u0 }
     ]
 ]
 
@@ -313,19 +313,19 @@ state: input |> WHEN {
 ```boon
 FUNCTION counter(rst, en) {
     BLOCK {
-        count: BITS{8, 10u0} |> LATEST count {
+        count: BITS[8] { 10u0 } |> LATEST count {
             PASSED.clk |> THEN {
                 rst |> WHEN {
-                    True => BITS{8, 10u0}
+                    True => BITS[8] { 10u0 }
                     False => en |> WHEN {
                         True => BLOCK {
                             next: count |> Bits/increment()
 
                             // Formal verification assertions
                             next |> FORMAL {
-                                assert: next < BITS{8, 10u256}  // Never overflow
-                                assume: en |> Bool/not() |> Bool/or(count < BITS{8, 10u255})
-                                cover: next == BITS{8, 10u100}  // Coverage goal
+                                assert: next < BITS[8] { 10u256 }  // Never overflow
+                                assume: en |> Bool/not() |> Bool/or(count < BITS[8] { 10u255 })
+                                cover: next == BITS[8] { 10u100 }  // Coverage goal
                             }
 
                             next
@@ -345,10 +345,10 @@ FUNCTION counter(rst, en) {
 
 ```boon
 FUNCTION counter(rst, en) {
-    count: BITS{8, 10u0} |> LATEST count {
+    count: BITS[8] { 10u0 } |> LATEST count {
         PASSED.clk |> THEN {
             next: rst |> WHEN {
-                True => BITS{8, 10u0}
+                True => BITS[8] { 10u0 }
                 False => en |> WHEN {
                     True => count |> Bits/increment()
                     False => count
@@ -356,9 +356,9 @@ FUNCTION counter(rst, en) {
             }
 
             // Assertions as attributes
-            #[assert(next < BITS{8, 10u256})]
-            #[assume(en |> Bool/implies(count < BITS{8, 10u255}))]
-            #[cover(next == BITS{8, 10u100})]
+            #[assert(next < BITS[8] { 10u256 })]
+            #[assume(en |> Bool/implies(count < BITS[8] { 10u255 }))]
+            #[cover(next == BITS[8] { 10u100 })]
 
             next
         }
@@ -453,12 +453,12 @@ TEST counter_basic {
     // Assertions (checked each cycle)
     assertions: PULSES { 20 } |> List/map(cycle, assertion:
         cycle |> WHEN {
-            0 => dut.count == BITS{8, 10u0}     // After reset
-            3 => dut.count == BITS{8, 10u0}     // Still 0
-            4 => dut.count == BITS{8, 10u1}     // First increment
-            12 => dut.count == BITS{8, 10u9}    // After 9 increments
-            13 => dut.count == BITS{8, 10u9}    // Held
-            19 => dut.count == BITS{8, 10u13}   // After 4 more
+            0 => dut.count == BITS[8] { 10u0 }     // After reset
+            3 => dut.count == BITS[8] { 10u0 }     // Still 0
+            4 => dut.count == BITS[8] { 10u1 }     // First increment
+            12 => dut.count == BITS[8] { 10u9 }    // After 9 increments
+            13 => dut.count == BITS[8] { 10u9 }    // Held
+            19 => dut.count == BITS[8] { 10u13 }   // After 4 more
             __ => True  // Don't check other cycles
         }
     )
@@ -478,23 +478,23 @@ TEST counter_basic {
     test_rst <- True
     test_en <- False
     WAIT_CYCLES 3
-    ASSERT dut.count == BITS{8, 10u0}
+    ASSERT dut.count == BITS[8] { 10u0 }
 
     // Cycle 3-12: Enable counting
     test_rst <- False
     test_en <- True
     WAIT_CYCLES 10
-    ASSERT dut.count == BITS{8, 10u9}
+    ASSERT dut.count == BITS[8] { 10u9 }
 
     // Cycle 13-15: Disable
     test_en <- False
     WAIT_CYCLES 3
-    ASSERT dut.count == BITS{8, 10u9}  // Should hold
+    ASSERT dut.count == BITS[8] { 10u9 }  // Should hold
 
     // Cycle 16-19: Enable again
     test_en <- True
     WAIT_CYCLES 4
-    ASSERT dut.count == BITS{8, 10u13}
+    ASSERT dut.count == BITS[8] { 10u13 }
 }
 ```
 
@@ -542,7 +542,7 @@ FUNCTION configurable_alu(width, include_multiply) {
         // Conditionally include multiplier
         mult_result: include_multiply |> WHEN {
             True => a |> Bits/multiply(b)
-            False => BITS { width, 10u0 }  // Tie to zero
+            False => BITS[width] { 10u0  }  // Tie to zero
         }
 
         // Select result
@@ -564,7 +564,7 @@ large_alu: configurable_alu(width: 32, include_multiply: True)
 **Generic parameters already work:**
 ```boon
 FUNCTION parameterized_memory(depth, width) {
-    mem: MEMORY { depth, BITS{width, 10u0} }
+    mem: MEMORY[depth] { BITS[width] { 10u0  } }
     // depth and width are compile-time constants!
 }
 
@@ -606,14 +606,14 @@ FUNCTION parallel_adder_tree(inputs) {
 
 // Usage
 inputs: LIST {
-    BITS{8, 10u1}
-    BITS{8, 10u2}
-    BITS{8, 10u3}
-    BITS{8, 10u4}
-    BITS{8, 10u5}
-    BITS{8, 10u6}
-    BITS{8, 10u7}
-    BITS{8, 10u8}
+    BITS[8] { 10u1 }
+    BITS[8] { 10u2 }
+    BITS[8] { 10u3 }
+    BITS[8] { 10u4 }
+    BITS[8] { 10u5 }
+    BITS[8] { 10u6 }
+    BITS[8] { 10u7 }
+    BITS[8] { 10u8 }
 }
 
 // Generates balanced tree of adders at compile time!
@@ -653,39 +653,39 @@ FUNCTION AXI4_Lite/master(addr_width, data_width) {
         write_address: [
             awvalid: LINK
             awready: LINK
-            awaddr: BITS { addr_width, ... }
-            awprot: BITS { 3, ... }
+            awaddr: BITS[addr_width] { ...  }
+            awprot: BITS[3] { ...  }
         ]
 
         // Write data channel
         write_data: [
             wvalid: LINK
             wready: LINK
-            wdata: BITS { data_width, ... }
-            wstrb: BITS { data_width / 8, ... }
+            wdata: BITS[data_width] { ...  }
+            wstrb: BITS[data_width / 8] { ...  }
         ]
 
         // Write response channel
         write_response: [
             bvalid: LINK
             bready: LINK
-            bresp: BITS { 2, ... }
+            bresp: BITS[2] { ...  }
         ]
 
         // Read address channel
         read_address: [
             arvalid: LINK
             arready: LINK
-            araddr: BITS { addr_width, ... }
-            arprot: BITS { 3, ... }
+            araddr: BITS[addr_width] { ...  }
+            arprot: BITS[3] { ...  }
         ]
 
         // Read data channel
         read_data: [
             rvalid: LINK
             rready: LINK
-            rdata: BITS { data_width, ... }
-            rresp: BITS { 2, ... }
+            rdata: BITS[data_width] { ...  }
+            rresp: BITS[2] { ...  }
         ]
     ]
 }
@@ -705,9 +705,9 @@ FUNCTION AXI4_Stream/source(data_width, user_width, dest_width) {
         stream: LINK  // StreamInterface with AXI4-Stream fields
         valid: Bool
         ready: Bool
-        data: BITS { data_width, ... }
-        user: BITS { user_width, ... }
-        dest: BITS { dest_width, ... }
+        data: BITS[data_width] { ...  }
+        user: BITS[user_width] { ...  }
+        dest: BITS[dest_width] { ...  }
         last: Bool
     ]
 }
@@ -746,11 +746,11 @@ FUNCTION Wishbone/master(addr_width, data_width, granularity) {
         cyc: LINK
         stb: LINK
         we: LINK
-        adr: BITS { addr_width, ... }
-        dat_o: BITS { data_width, ... }
-        sel: BITS { data_width / granularity, ... }
+        adr: BITS[addr_width] { ...  }
+        dat_o: BITS[data_width] { ...  }
+        sel: BITS[data_width / granularity] { ...  }
         ack: LINK
-        dat_i: BITS { data_width, ... }
+        dat_i: BITS[data_width] { ...  }
     ]
 }
 ```
@@ -812,11 +812,11 @@ FUNCTION top_module() {
 
 FUNCTION cpu_core() {
     // Access parent's clock
-    registers: BITS{32, 10u0} |> LATEST reg {
+    registers: BITS[32] { 10u0 } |> LATEST reg {
         PASSED.clk |> THEN {
             // Access parent's reset
             PASSED.rst |> WHEN {
-                True => BITS{32, 10u0}
+                True => BITS[32] { 10u0 }
                 False => compute(reg)
             }
         }
@@ -864,8 +864,8 @@ FUNCTION adder(a, b) {
 
 **Width tracking:**
 ```boon
-a: BITS { 8, 10u0 }
-b: BITS { 16, 10u0 }
+a: BITS[8] { 10u0  }
+b: BITS[16] { 10u0  }
 // Compiler knows widths!
 ```
 
@@ -891,8 +891,8 @@ FUNCTION generic_adder<T: Numeric>(a: T, b: T) -> T {
 
 **Dependent types (width relationships):**
 ```boon
-FUNCTION concatenate(a: BITS{N, ...}, b: BITS{M, ...})
-    -> BITS{N + M, ...} {
+FUNCTION concatenate(a: BITS[N] { ... }, b: BITS[M] { ... })
+    -> BITS[N + M] { ... } {
     // Return type width depends on input widths
 }
 ```
@@ -901,7 +901,7 @@ FUNCTION concatenate(a: BITS{N, ...}, b: BITS{M, ...})
 ```boon
 NonZero<T> = T where T != 0
 
-FUNCTION safe_divide(a: BITS{8, ...}, b: NonZero<BITS{8, ...}>) {
+FUNCTION safe_divide(a: BITS[8] { ... }, b: NonZero<BITS[8] { ... }>) {
     // b is guaranteed non-zero at compile time!
     a / b  // No division by zero possible
 }
@@ -951,7 +951,7 @@ store.elements.button.event.press |> THEN { action }
 **Annotate values for waveform viewers:**
 ```boon
 #[debug(name: "Program Counter", radix: hex)]
-pc: BITS{32, 10u0} |> LATEST pc {
+pc: BITS[32] { 10u0 } |> LATEST pc {
     PASSED.clk |> THEN { pc + 4 }
 }
 

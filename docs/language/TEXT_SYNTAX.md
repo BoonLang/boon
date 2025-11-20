@@ -684,7 +684,7 @@ FUNCTION uart_hello() {
         -- Auto-converts to UTF-8 BYTES at this boundary
         msg |> Bytes/for_each(byte: byte => uart_tx(byte))
 
-        -- Compiler generates: BYTES { 11, { ... } } at compile-time
+        -- Compiler generates: BYTES[11] {  ...  } at compile-time
     }
 }
 

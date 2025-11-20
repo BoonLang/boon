@@ -20,7 +20,7 @@ MEMORY provides stateful, random-access storage in Boon, working seamlessly acro
 
 ```boon
 // Simple RAM
-mem: MEMORY { 16, BITS { 8, 2u0 } }
+mem: MEMORY[16] { BITS[8] { 2u0   } }
     |> Memory/write(address: wraddr, data: wrdata)
 
 data: mem |> Memory/read(address: addr)
@@ -30,7 +30,7 @@ data: mem |> Memory/read(address: addr)
 
 ```boon
 // Frame buffer
-screen: MEMORY { 1920 * 1080, Pixel { r: 0, g: 0, b: 0 } }
+screen: MEMORY[1920 * 1080] { Pixel { r: 0, g: 0, b: 0  } }
     |> Memory/write_entry(entry: draw_event |> THEN {
         [address: x + y * 1920, data: color]
     })
@@ -45,7 +45,7 @@ pixel: screen |> Memory/read(address: x + y * 1920)
 ### Construction
 
 ```boon
-MEMORY { size, default_value }
+MEMORY[size] { default_value  }
 ```
 
 **Parameters:**
@@ -55,13 +55,13 @@ MEMORY { size, default_value }
 **Examples:**
 ```boon
 // 8-bit RAM, 16 locations, initialized to 0
-mem: MEMORY { 16, BITS { 8, 2u0 } }
+mem: MEMORY[16] { BITS[8] { 2u0   } }
 
 // Pixel buffer, 1920x1080, initialized to black
-screen: MEMORY { 1920 * 1080, Pixel { r: 0, g: 0, b: 0 } }
+screen: MEMORY[1920 * 1080] { Pixel { r: 0, g: 0, b: 0  } }
 
 // Cache entries, 256 slots, initialized to invalid
-cache: MEMORY { 256, [valid: False, data: 0] }
+cache: MEMORY[256] { [valid: False, data: 0]  }
 ```
 
 ---
@@ -84,20 +84,20 @@ This matches the design philosophy of BITS width and LIST size - **explicit size
 
 ```boon
 -- ✅ Literal size (most common)
-MEMORY { 16, BITS { 8, 2u0 } }       -- Size: 16 (compile-time known)
+MEMORY[16] { BITS[8] { 2u0   } }       -- Size: 16 (compile-time known)
 
 -- ✅ Compile-time constant parameter
 size: 256  -- Compile-time constant
-MEMORY { size, Entry }               -- Size: 256 (compile-time known)
+MEMORY[size] { Entry  }               -- Size: 256 (compile-time known)
 
 -- ✅ Compile-time expression
 width: 1920
 height: 1080
-MEMORY { width * height, Pixel }     -- Size: 2073600 (compile-time known)
+MEMORY[width * height] { Pixel  }     -- Size: 2073600 (compile-time known)
 
 -- ✅ Type parameter in generic functions
 FUNCTION create_buffer<size>() -> MEMORY<size, Byte> {
-    MEMORY { size, BITS { 8, 2u0 } }    -- size is compile-time parameter
+    MEMORY[size] { BITS[8] { 2u0   } }    -- size is compile-time parameter
 }
 ```
 
@@ -106,15 +106,15 @@ FUNCTION create_buffer<size>() -> MEMORY<size, Byte> {
 ```boon
 -- ❌ Runtime variable size
 buffer_size: get_size_from_config()
-MEMORY { buffer_size, Data }         -- ERROR: Size must be compile-time constant
+MEMORY[buffer_size] { Data  }         -- ERROR: Size must be compile-time constant
 
 -- ❌ Conditional size
 size: if use_large_buffer { 1024 } else { 256 }
-MEMORY { size, Byte }                -- ERROR: Size unknown at compile-time
+MEMORY[size] { Byte  }                -- ERROR: Size unknown at compile-time
 
 -- ❌ Signal-dependent size (hardware)
 FUNCTION create_mem(size_signal) {
-    MEMORY { size_signal, Data }     -- ERROR: size must be compile-time constant
+    MEMORY[size_signal] { Data  }     -- ERROR: size must be compile-time constant
 }
 ```
 
@@ -125,18 +125,18 @@ Size is compile-time known in ALL contexts:
 **Hardware (Block RAM):**
 ```boon
 -- Block RAM (size fixed at synthesis)
-ram: MEMORY { 256, BITS { 32, 2u0 } }
+ram: MEMORY[256] { BITS[32] { 2u0   } }
 -- Synthesizer knows exact size, allocates BRAM blocks
 ```
 
 **Software (Buffers):**
 ```boon
 -- Fixed-size buffer (can be stack-allocated)
-buffer: MEMORY { 4096, Sample { value: 0.0 } }
+buffer: MEMORY[4096] { Sample { value: 0.0  } }
 -- Compiler knows size, can optimize allocation
 
 -- Screen buffer (large, heap-allocated but fixed size)
-screen: MEMORY { 1920 * 1080, Pixel { r: 0, g: 0, b: 0 } }
+screen: MEMORY[1920 * 1080] { Pixel { r: 0, g: 0, b: 0  } }
 -- Size known at compile-time, never changes
 ```
 
@@ -150,7 +150,7 @@ screen: MEMORY { 1920 * 1080, Pixel { r: 0, g: 0, b: 0 } }
 
 ```boon
 -- Compile-time bounds checking (when address is constant)
-mem: MEMORY { 16, BITS { 8, 2u0 } }
+mem: MEMORY[16] { BITS[8] { 2u0   } }
 
 data: mem |> Memory/read(address: 5)   -- ✅ OK: 5 < 16
 data: mem |> Memory/read(address: 20)  -- ❌ ERROR: 20 >= 16 (if constant)
@@ -171,7 +171,7 @@ dynamic_mem: MEMORY { ... }  -- ERROR: Size required, no dynamic MEMORY
 dynamic_list: LIST { Data }  -- OK: Dynamic list (no size specified)
 
 -- ✅ Use MEMORY for fixed-size random access
-fixed_mem: MEMORY { 256, Data }  -- OK: Fixed-size memory
+fixed_mem: MEMORY[256] { Data  }  -- OK: Fixed-size memory
 ```
 
 **Why MEMORY is always fixed-size:**
@@ -195,8 +195,8 @@ process_any_buffer: FUNCTION<size>(buf: MEMORY<size, Byte>) -> Result {
 }
 
 -- ❌ Can't pass wrong size
-buf16: MEMORY { 16, Byte }
-buf256: MEMORY { 256, Byte }
+buf16: MEMORY[16] { Byte  }
+buf256: MEMORY[256] { Byte  }
 
 process_buffer(buf256)  -- ✅ OK: size matches
 process_buffer(buf16)   -- ❌ ERROR: Expected MEMORY<256>, got MEMORY<16>
@@ -216,7 +216,7 @@ Writes `data` to `address` on every clock cycle (hardware) or when inputs change
 
 **Example:**
 ```boon
-mem: MEMORY { 16, BITS { 8, 2u0 } }
+mem: MEMORY[16] { BITS[8] { 2u0   } }
     |> Memory/write(address: wraddr, data: wrdata)
 ```
 
@@ -230,7 +230,7 @@ Writes entry if provided, skips if SKIP. Useful for conditional writes.
 
 **Example:**
 ```boon
-mem: MEMORY { 16, BITS { 8, 2u0 } }
+mem: MEMORY[16] { BITS[8] { 2u0   } }
     |> Memory/write_entry(entry: write_enable |> WHEN {
         True => [address: wraddr, data: wrdata]
         False => SKIP
@@ -262,11 +262,11 @@ Initializes each location with custom value based on index.
 **Example:**
 ```boon
 // Initialize mem[i] = i
-mem: MEMORY { 16, BITS { 8, 2u0 } }
+mem: MEMORY[16] { BITS[8] { 2u0   } }
     |> Memory/initialize(i, data: i |> Int/to_bits(width: 8))
 
 // Initialize with lookup table
-rom: MEMORY { 256, BITS { 16, 2u0 } }
+rom: MEMORY[256] { BITS[16] { 2u0   } }
     |> Memory/initialize(angle, data: SineLUT/get(angle))
 ```
 
@@ -279,7 +279,7 @@ rom: MEMORY { 256, BITS { 16, 2u0 } }
 Each memory location is independently reactive:
 
 ```boon
-mem: MEMORY { 16, Int }
+mem: MEMORY[16] { Int  }
     |> Memory/write(address: 5, data: 42)
 
 value_at_5: mem |> Memory/read(address: 5)
@@ -306,7 +306,7 @@ todos: LIST {}
 // Subscribers get: VecDiff::Push { value: new_todo }
 
 // MEMORY: Per-address reactivity
-pixels: MEMORY { 1920 * 1080, Pixel { ... } }
+pixels: MEMORY[1920 * 1080] { Pixel { ...  } }
     |> Memory/write(address: 100, data: red_pixel)
 // Subscribers at address 100 get: new Pixel value
 // Other addresses not notified
@@ -321,7 +321,7 @@ pixels: MEMORY { 1920 * 1080, Pixel { ... } }
 ```boon
 FUNCTION ram(addr, wraddr, wrdata) {
     BLOCK {
-        mem: MEMORY { 16, BITS { 8, 2u0 } }
+        mem: MEMORY[16] { BITS[8] { 2u0   } }
             |> Memory/write(address: wraddr, data: wrdata)
 
         data: mem |> Memory/read(address: addr)
@@ -362,7 +362,7 @@ endmodule
 ### Write Enable
 
 ```boon
-mem: MEMORY { 16, BITS { 8, 2u0 } }
+mem: MEMORY[16] { BITS[8] { 2u0   } }
     |> Memory/write_entry(entry: write_enable |> WHEN {
         True => [address: wraddr, data: wrdata]
         False => SKIP
@@ -382,7 +382,7 @@ end
 
 ```boon
 // Initialize with sequential values
-mem: MEMORY { 16, BITS { 8, 2u0 } }
+mem: MEMORY[16] { BITS[8] { 2u0   } }
     |> Memory/initialize(i, data: i |> Int/to_bits(width: 8))
 ```
 
@@ -402,7 +402,7 @@ end
 ### Pixel Buffer
 
 ```boon
-screen: MEMORY { 1920 * 1080, Pixel { r: 0, g: 0, b: 0 } }
+screen: MEMORY[1920 * 1080] { Pixel { r: 0, g: 0, b: 0  } }
     |> Memory/write_entry(entry: draw_event |> THEN {
         [address: x + y * 1920, data: color]
     })
@@ -433,7 +433,7 @@ impl Memory<T> {
 
 ```boon
 BLOCK {
-    buffer: MEMORY { 4096, Sample { value: 0.0 } }
+    buffer: MEMORY[4096] { Sample { value: 0.0  } }
         |> Memory/write_entry(entry: push_event |> THEN {
             [address: write_ptr, data: audio_sample]
         })
@@ -453,7 +453,7 @@ BLOCK {
 ### Lookup Table / Cache
 
 ```boon
-lru_cache: MEMORY { 256, [valid: False, tag: 0, data: 0] }
+lru_cache: MEMORY[256] { [valid: False, tag: 0, data: 0]  }
     |> Memory/write_entry(entry: cache_miss |> THEN {
         [
             address: evict_index,
@@ -474,7 +474,7 @@ hit: cache_entry.valid |> Bool/and(cache_entry.tag = key)
 ```boon
 FUNCTION ram_with_enable(addr, wraddr, wrdata, write_enable) {
     BLOCK {
-        mem: MEMORY { 16, BITS { 8, 2u0 } }
+        mem: MEMORY[16] { BITS[8] { 2u0   } }
             |> Memory/write_entry(entry: write_enable |> WHEN {
                 True => [address: wraddr, data: wrdata]
                 False => SKIP
@@ -492,7 +492,7 @@ FUNCTION ram_with_enable(addr, wraddr, wrdata, write_enable) {
 ```boon
 FUNCTION sine_rom(angle) {
     BLOCK {
-        rom: MEMORY { 256, BITS { 16, 2u0 } }
+        rom: MEMORY[256] { BITS[16] { 2u0   } }
             |> Memory/initialize(i, data: SineLUT/get(i))
         // No write operations (read-only)
 
@@ -508,7 +508,7 @@ FUNCTION sine_rom(angle) {
 ```boon
 FUNCTION dual_port_ram(addr_a, addr_b, wraddr, wrdata, write_enable) {
     BLOCK {
-        mem: MEMORY { 16, BITS { 8, 2u0 } }
+        mem: MEMORY[16] { BITS[8] { 2u0   } }
             |> Memory/write_entry(entry: write_enable |> WHEN {
                 True => [address: wraddr, data: wrdata]
                 False => SKIP
@@ -528,7 +528,7 @@ FUNCTION dual_port_ram(addr_a, addr_b, wraddr, wrdata, write_enable) {
 ```boon
 FUNCTION true_dual_port_ram(addr_a, addr_b, wdata_a, wdata_b, we_a, we_b) {
     BLOCK {
-        mem: MEMORY { 16, BITS { 8, 2u0 } }
+        mem: MEMORY[16] { BITS[8] { 2u0   } }
             |> Memory/write_entry(entry: we_a |> WHEN {
                 True => [address: addr_a, data: wdata_a]
                 False => SKIP
@@ -552,7 +552,7 @@ FUNCTION true_dual_port_ram(addr_a, addr_b, wdata_a, wdata_b, we_a, we_b) {
 ```boon
 FUNCTION priority_ram(addr, data_high, data_med, data_low, we_high, we_med, we_low) {
     BLOCK {
-        mem: MEMORY { 16, BITS { 8, 2u0 } }
+        mem: MEMORY[16] { BITS[8] { 2u0   } }
             |> Memory/write_entry(entry: BLOCK {
                 [we_high, we_med, we_low] |> WHEN {
                     [True, __, __] => [address: addr, data: data_high]
@@ -575,7 +575,7 @@ FUNCTION priority_ram(addr, data_high, data_med, data_low, we_high, we_med, we_l
 FUNCTION fifo(push, pop, push_data) {
     BLOCK {
         // Data storage
-        fifo_mem: MEMORY { 16, BITS { 8, 2u0 } }
+        fifo_mem: MEMORY[16] { BITS[8] { 2u0   } }
             |> Memory/write_entry(entry: push |> WHEN {
                 True => [address: write_ptr, data: push_data]
                 False => SKIP
@@ -608,7 +608,7 @@ FUNCTION fifo(push, pop, push_data) {
 ```boon
 FUNCTION cache_memory(addr, write_data, write) {
     BLOCK {
-        cache: MEMORY { 256, [data: BITS { 32, 2u0 }, dirty: False] }
+        cache: MEMORY[256] { [data: BITS[32] { 2u0   }, dirty: False] }
             |> Memory/write_entry(entry: write |> WHEN {
                 True => [
                     address: addr,
@@ -632,7 +632,7 @@ FUNCTION cache_memory(addr, write_data, write) {
 
 **Before (with LATEST):**
 ```boon
-mem: ARRAY[16] { BITS { 8, 2u0 } } |> LATEST mem {
+mem: ARRAY[16] { BITS[8] { 2u0  } } |> LATEST mem {
     write_enable |> WHEN {
         True => mem |> Array/set(index: wraddr, value: wrdata)
         False => mem
@@ -642,7 +642,7 @@ mem: ARRAY[16] { BITS { 8, 2u0 } } |> LATEST mem {
 
 **After (with MEMORY):**
 ```boon
-mem: MEMORY { 16, BITS { 8, 2u0 } }
+mem: MEMORY[16] { BITS[8] { 2u0   } }
     |> Memory/write_entry(entry: write_enable |> WHEN {
         True => [address: wraddr, data: wrdata]
         False => SKIP
@@ -677,7 +677,7 @@ mem: MEMORY { 16, BITS { 8, 2u0 } }
 **Example: FIFO uses both**
 ```boon
 // MEMORY for data storage
-data: MEMORY { 16, BITS { 8, 2u0 } }
+data: MEMORY[16] { BITS[8] { 2u0   } }
 
 // LATEST for pointers
 write_ptr: 0 |> LATEST wr { ... }
@@ -706,7 +706,7 @@ todos: LIST {}
 // Sends VecDiff::Push, VecDiff::Remove, etc.
 
 // MEMORY: Fixed storage with per-cell updates
-pixels: MEMORY { 1920 * 1080, Pixel { ... } }
+pixels: MEMORY[1920 * 1080] { Pixel { ...  } }
     |> Memory/write(address: x + y * 1920, data: color)
 // Updates only the specific pixel at that address
 ```
@@ -768,7 +768,7 @@ pixels: MEMORY { 1920 * 1080, Pixel { ... } }
 ### Hardware (SystemVerilog)
 
 ```boon
-mem: MEMORY { 16, BITS { 8, 2u0 } }
+mem: MEMORY[16] { BITS[8] { 2u0   } }
     |> Memory/write(address: wraddr, data: wrdata)
 ```
 
@@ -790,7 +790,7 @@ end
 ### Software (Rust)
 
 ```boon
-mem: MEMORY { 16, Int }
+mem: MEMORY[16] { Int  }
     |> Memory/write(address: wraddr, data: wrdata)
 ```
 
@@ -825,13 +825,13 @@ impl<T: Clone> Memory<T> {
 
 ### Pattern 1: Simple RAM
 ```boon
-mem: MEMORY { size, BITS { width, 2u0 } }
+mem: MEMORY[size] { BITS[width] { 2u0   } }
     |> Memory/write(address: wraddr, data: wrdata)
 ```
 
 ### Pattern 2: RAM with Write Enable
 ```boon
-mem: MEMORY { size, default }
+mem: MEMORY[size] { default  }
     |> Memory/write_entry(entry: we |> WHEN {
         True => [address: addr, data: data]
         False => SKIP
@@ -840,14 +840,14 @@ mem: MEMORY { size, default }
 
 ### Pattern 3: ROM (Read-Only)
 ```boon
-rom: MEMORY { size, default }
+rom: MEMORY[size] { default  }
     |> Memory/initialize(i, data: LUT/get(i))
 // No write operations
 ```
 
 ### Pattern 4: Dual-Port RAM
 ```boon
-mem: MEMORY { size, default }
+mem: MEMORY[size] { default  }
     |> Memory/write(address: wraddr, data: wrdata)
 
 data_a: mem |> Memory/read(address: addr_a)
@@ -856,7 +856,7 @@ data_b: mem |> Memory/read(address: addr_b)
 
 ### Pattern 5: FIFO with Pointers
 ```boon
-data: MEMORY { size, default }
+data: MEMORY[size] { default  }
     |> Memory/write(address: write_ptr, data: input)
 
 write_ptr: 0 |> LATEST wr { ... }

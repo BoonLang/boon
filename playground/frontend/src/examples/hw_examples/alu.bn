@@ -7,8 +7,8 @@ AluOp: [Add, Sub, And, Or, Xor, ShiftLeft, ShiftRight, Equal]
 
 FUNCTION alu(a, b, op) {
     -- 8-bit ALU operations
-    -- a and b are BITS { 8, ... } (unsigned)
-    -- Returns BITS { 8, ... } result
+    -- a and b are BITS[8] { ...  } (unsigned)
+    -- Returns BITS[8] { ...  } result
 
     op |> WHEN {
         -- Arithmetic operations
@@ -26,8 +26,8 @@ FUNCTION alu(a, b, op) {
 
         -- Comparison (return all 1s if equal, all 0s if not)
         Equal => a |> Bits/equal(b) |> WHEN {
-            True => BITS { 8, 16uFF }    -- All ones
-            False => BITS { 8, 10u0 }    -- All zeros
+            True => BITS[8] { 16uFF  }    -- All ones
+            False => BITS[8] { 10u0  }    -- All zeros
         }
     }
 }

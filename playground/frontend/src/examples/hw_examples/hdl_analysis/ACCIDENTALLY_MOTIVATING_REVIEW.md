@@ -90,11 +90,11 @@ Hardware: stall → flush signal → bypass stages → pipeline bubble
 
 ```boon
 // The compiler ALREADY KNOWS which clock domain each LATEST belongs to!
-write_ptr: BITS{4, 10u0} |> LATEST wr {
+write_ptr: BITS[4] { 10u0 } |> LATEST wr {
     PASSED.clk[write_clk] |> THEN { ... }  // Write domain
 }
 
-read_ptr: BITS{4, 10u0} |> LATEST rd {
+read_ptr: BITS[4] { 10u0 } |> LATEST rd {
     PASSED.clk[read_clk] |> THEN { ... }   // Read domain
 }
 ```

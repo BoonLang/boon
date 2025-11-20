@@ -36,7 +36,7 @@ LATEST manages state for specific types. Understanding what LATEST supports is c
 
 **3. BITS** - Hardware bit vectors
 - Fixed-width bit patterns for hardware
-- Example: `reg: BITS { 8, 10u0 } |> LATEST reg { reg + 1 }`
+- Example: `reg: BITS[8] { 10u0  } |> LATEST reg { reg + 1 }`
 
 **4. Objects** - Structured data with named fields
 - Composite values like `[x: 0, y: 0]`, `[counter: 5, enabled: True]`
@@ -67,7 +67,7 @@ mem: List/range(0, 16) |> LATEST mem {
 }
 
 // ✅ DO: Use MEMORY for fixed-size indexed storage
-mem: MEMORY { 16, 0 }
+mem: MEMORY[16] { 0  }
     |> Memory/write(address: addr, data: data)
 ```
 
@@ -474,9 +474,9 @@ state: B |> LATEST current {
 
 **LFSR:**
 ```boon
-lfsr: BITS { 8, 10u0 } |> LATEST current {
+lfsr: BITS[8] { 10u0  } |> LATEST current {
     rst |> WHEN {
-        True => BITS { 8, 10u0 }
+        True => BITS[8] { 10u0  }
         False => BLOCK {
             feedback: current |> Bits/get(7) |> Bool/xor(current |> Bits/get(3))
             current |> Bits/shift_right(1) |> Bits/set(7, feedback)
@@ -665,7 +665,7 @@ app_state: Idle |> LATEST state {
 ```boon
 FUNCTION counter(rst, load, load_value, en) {
     BLOCK {
-        default: BITS { 8, 10u0 }
+        default: BITS[8] { 10u0  }
         control: [reset: rst, load: load, enabled: en]
 
         count: default |> LATEST current {

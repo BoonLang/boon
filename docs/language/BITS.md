@@ -90,42 +90,42 @@ LIST {
 
 ## Literal Syntax
 
-**Core format: `BITS { width, base[s|u]value }`**
+**Core format: `BITS[width] { base[s|u]value  }`**
 
 Width is always required. Value uses unified format: `base[s|u]digits` where base is 2, 8, 10, or 16, and `s`/`u` indicates signed/unsigned.
 
 ```boon
 -- Decimal values (base 10)
-counter: BITS { 8, 10u42 }              -- 8-bit, unsigned, value 42
-threshold: BITS { 16, 10u1000 }         -- 16-bit, unsigned, value 1000
-zero_reg: BITS { 32, 10u0 }             -- 32-bit, unsigned, all zeros
+counter: BITS[8] { 10u42  }              -- 8-bit, unsigned, value 42
+threshold: BITS[16] { 10u1000  }         -- 16-bit, unsigned, value 1000
+zero_reg: BITS[32] { 10u0  }             -- 32-bit, unsigned, all zeros
 
 -- Signed decimal values
-temperature: BITS { 12, 10s0 }          -- 12-bit, signed, value 0
-offset: BITS { 16, 10s-500 }            -- 16-bit, signed, negative 500
-positive_signed: BITS { 8, 10s100 }     -- 8-bit, signed, positive 100
+temperature: BITS[12] { 10s0  }          -- 12-bit, signed, value 0
+offset: BITS[16] { 10s-500  }            -- 16-bit, signed, negative 500
+positive_signed: BITS[8] { 10s100  }     -- 8-bit, signed, positive 100
 
 -- Binary patterns (base 2)
-flags: BITS { 8, 2u10110010 }           -- 8-bit, unsigned, binary pattern
-mask: BITS { 4, 2u1111 }                -- 4-bit, unsigned, all ones
-signed_pattern: BITS { 8, 2s11111111 }  -- 8-bit, signed, pattern = -1
+flags: BITS[8] { 2u10110010  }           -- 8-bit, unsigned, binary pattern
+mask: BITS[4] { 2u1111  }                -- 4-bit, unsigned, all ones
+signed_pattern: BITS[8] { 2s11111111  }  -- 8-bit, signed, pattern = -1
 
 -- Hexadecimal patterns (base 16)
-color: BITS { 32, 16uFF8040FF }         -- 32-bit, unsigned, RGBA
-address: BITS { 16, 16uABCD }           -- 16-bit, unsigned, hex
-signed_hex: BITS { 8, 16sFF }           -- 8-bit, signed, pattern = -1
+color: BITS[32] { 16uFF8040FF  }         -- 32-bit, unsigned, RGBA
+address: BITS[16] { 16uABCD  }           -- 16-bit, unsigned, hex
+signed_hex: BITS[8] { 16sFF  }           -- 8-bit, signed, pattern = -1
 
 -- Octal patterns (base 8)
-octal_val: BITS { 12, 8u7777 }          -- 12-bit, unsigned, octal
+octal_val: BITS[12] { 8u7777  }          -- 12-bit, unsigned, octal
 
 -- Compile-time parametric width (hardware generics/parameters)
-reg: BITS { width, 10u0 }               -- width must be compile-time constant
-reg: BITS { width * 2, 16uFF }          -- Expressions of compile-time constants
+reg: BITS[width] { 10u0  }               -- width must be compile-time constant
+reg: BITS[width * 2] { 16uFF  }          -- Expressions of compile-time constants
 
 -- Underscore separators for readability (planned feature)
-long_mask: BITS { 32, 2u1111_0000_1111_0000_1111_0000_1111_0000 }
-hex_color: BITS { 32, 16uFF_80_40_FF }  -- RGBA color
-ipv4_mask: BITS { 32, 16uFF_FF_FF_00 }  -- 255.255.255.0
+long_mask: BITS[32] { 2u1111_0000_1111_0000_1111_0000_1111_0000  }
+hex_color: BITS[32] { 16uFF_80_40_FF  }  -- RGBA color
+ipv4_mask: BITS[32] { 16uFF_FF_FF_00  }  -- 255.255.255.0
 ```
 
 ### Nested BITS (Concatenation)
@@ -134,38 +134,38 @@ BITS values can be nested for concatenation (useful for construction and pattern
 
 ```boon
 -- Define reusable bit fields
-opcode: BITS { 4, 16uA }        -- 4-bit opcode
-register: BITS { 3, 10u5 }      -- 3-bit register number
-immediate: BITS { 8, 10u42 }    -- 8-bit immediate value
+opcode: BITS[4] { 16uA  }        -- 4-bit opcode
+register: BITS[3] { 10u5  }      -- 3-bit register number
+immediate: BITS[8] { 10u42  }    -- 8-bit immediate value
 
 -- Concatenate fields (nested BITS are concatenated)
-instruction: BITS { __, { opcode, register, immediate } }
+instruction: BITS[__] {  opcode, register, immediate  }
 -- Width inferred: 4 + 3 + 8 = 15 bits
--- Result: BITS { 15, ... } with fields concatenated MSB-first
+-- Result: BITS[15] { ...  } with fields concatenated MSB-first
 
 -- Explicit width (must match sum of nested widths)
-instruction: BITS { 15, { opcode, register, immediate } }  -- OK: 15 = 4+3+8
+instruction: BITS[15] {  opcode, register, immediate  }  -- OK: 15 = 4+3+8
 
 -- ❌ Width mismatch - COMPILE ERROR
-bad: BITS { 16, { opcode, register, immediate } }  -- ERROR: Width 16 but content is 15 bits
+bad: BITS[16] {  opcode, register, immediate  }  -- ERROR: Width 16 but content is 15 bits
 
 -- Mix literals and nested BITS (literals must specify width)
-packet: BITS { __, { BITS { 2, 2u11 }, opcode, register, BITS { 2, 2u00 } } }
+packet: BITS { __, { BITS[2] { 2u11  }, opcode, register, BITS[2] { 2u00  } } }
 -- Width: 2 + 4 + 3 + 2 = 11 bits
 
 -- Pattern matching with nested BITS (destructuring)
 -- ALL fields must specify width (literals AND variables)
 instruction |> WHEN {
-    BITS { 15, {
-        BITS { 4, 16uA }    -- Match opcode = 0xA
-        BITS { 3, reg }     -- Extract 3-bit register
-        BITS { 8, imm }     -- Extract 8-bit immediate
+    BITS[15] {
+        BITS[4] { 16uA  }    -- Match opcode = 0xA
+        BITS[3] { reg  }     -- Extract 3-bit register
+        BITS[8] { imm  }     -- Extract 8-bit immediate
     }} => execute_load(register: reg, value: imm)
 
-    BITS { 15, {
-        BITS { 4, 16uB }    -- Match opcode = 0xB
-        BITS { 3, __ }      -- Ignore register
-        BITS { 8, __ }      -- Ignore immediate
+    BITS[15] {
+        BITS[4] { 16uB  }    -- Match opcode = 0xB
+        BITS[3] { __  }      -- Ignore register
+        BITS[8] { __  }      -- Ignore immediate
     }} => execute_store()
 
     __ => invalid_instruction()
@@ -175,10 +175,10 @@ instruction |> WHEN {
 **Concatenation order:** MSB (most significant) first, LSB (least significant) last
 
 ```boon
-high: BITS { 4, 16uA }   -- 1010
-low: BITS { 4, 16u5 }    -- 0101
-combined: BITS { __, { high, low } }
--- Result: BITS { 8, 2u10100101 }
+high: BITS[4] { 16uA  }   -- 1010
+low: BITS[4] { 16u5  }    -- 0101
+combined: BITS[__] {  high, low  }
+-- Result: BITS[8] { 2u10100101  }
 --         high ^^^^    low ^^^^
 ```
 
@@ -186,25 +186,25 @@ combined: BITS { __, { high, low } }
 
 **Pattern has more digits than width → ERROR**
 ```boon
-BITS { 4, 2u10110010 }  -- ERROR: 8-bit pattern doesn't fit in 4-bit width
+BITS[4] { 2u10110010  }  -- ERROR: 8-bit pattern doesn't fit in 4-bit width
 ```
 
 **Pattern has fewer digits than width → Zero-extend from left**
 ```boon
-BITS { 16, 2u1010 }     -- OK: becomes 0000_0000_0000_1010
-BITS { 8, 16uF }        -- OK: becomes 0000_1111
+BITS[16] { 2u1010  }     -- OK: becomes 0000_0000_0000_1010
+BITS[8] { 16uF  }        -- OK: becomes 0000_1111
 ```
 
 **Decimal value exceeds width → ERROR**
 ```boon
-BITS { 8, 10u256 }      -- ERROR: 256 requires 9 bits
-BITS { 8, 10s128 }      -- ERROR: 128 exceeds 8-bit signed max (127)
+BITS[8] { 10u256  }      -- ERROR: 256 requires 9 bits
+BITS[8] { 10s128  }      -- ERROR: 128 exceeds 8-bit signed max (127)
 ```
 
 **Negative values only with signed (s)**
 ```boon
-BITS { 8, 10s-100 }     -- OK: signed negative decimal
-BITS { 8, 10u-100 }     -- ERROR: unsigned cannot be negative
+BITS[8] { 10s-100  }     -- OK: signed negative decimal
+BITS[8] { 10u-100  }     -- ERROR: unsigned cannot be negative
 ```
 
 ---
@@ -217,19 +217,19 @@ BITS { 8, 10u-100 }     -- ERROR: unsigned cannot be negative
 
 ```boon
 -- ✅ Width matches nested content
-field1: BITS { 4, 16uA }
-field2: BITS { 4, 16uB }
-combined: BITS { 8, { field1, field2 } }  -- OK: 8 = 4 + 4
+field1: BITS[4] { 16uA  }
+field2: BITS[4] { 16uB  }
+combined: BITS[8] {  field1, field2  }  -- OK: 8 = 4 + 4
 
 -- ❌ Width mismatch - COMPILE ERROR
-bad: BITS { 10, { field1, field2 } }  -- ERROR: Width 10 but content is 8 bits
-bad: BITS { 6, { field1, field2 } }   -- ERROR: Width 6 but content is 8 bits
+bad: BITS[10] {  field1, field2  }  -- ERROR: Width 10 but content is 8 bits
+bad: BITS[6] {  field1, field2  }   -- ERROR: Width 6 but content is 8 bits
 
 -- ✅ Use __ to infer width from nested content
-combined: BITS { __, { field1, field2 } }  -- OK: Infers width = 8
+combined: BITS[__] {  field1, field2  }  -- OK: Infers width = 8
 
 -- ✅ Mix literals and nested BITS (literals must have width)
-packet: BITS { __, { BITS { 2, 2u11 }, field1, BITS { 2, 2u00 } } }  -- Infers: 2 + 4 + 2 = 8 bits
+packet: BITS { __, { BITS[2] { 2u11  }, field1, BITS[2] { 2u00  } } }  -- Infers: 2 + 4 + 2 = 8 bits
 ```
 
 ### Concatenation Order
@@ -237,11 +237,11 @@ packet: BITS { __, { BITS { 2, 2u11 }, field1, BITS { 2, 2u00 } } }  -- Infers: 
 **Rule: MSB (most significant) first, LSB (least significant) last**
 
 ```boon
-high: BITS { 4, 16uA }  -- 1010
-mid: BITS { 4, 16u5 }   -- 0101
-low: BITS { 4, 16u3 }   -- 0011
+high: BITS[4] { 16uA  }  -- 1010
+mid: BITS[4] { 16u5  }   -- 0101
+low: BITS[4] { 16u3  }   -- 0011
 
-result: BITS { __, { high, mid, low } }
+result: BITS[__] {  high, mid, low  }
 -- Width: 12 bits
 -- Value: 1010_0101_0011 (MSB first)
 --        high mid  low
@@ -253,33 +253,33 @@ result: BITS { __, { high, mid, low } }
 
 ```boon
 -- Construction
-opcode: BITS { 4, 16uA }
-register: BITS { 3, 10u5 }
-immediate: BITS { 8, 10u42 }
-instruction: BITS { __, { opcode, register, immediate } }
+opcode: BITS[4] { 16uA  }
+register: BITS[3] { 10u5  }
+immediate: BITS[8] { 10u42  }
+instruction: BITS[__] {  opcode, register, immediate  }
 
 -- Pattern matching (destructuring)
 -- Total width must be explicit, ALL fields need width
 instruction |> WHEN {
     -- Match specific opcode (literal), extract variables
-    BITS { 15, {
-        BITS { 4, 16uA }    -- Match: opcode must be 0xA
-        BITS { 3, reg }     -- Extract: 3-bit register
-        BITS { 8, imm }     -- Extract: 8-bit immediate
+    BITS[15] {
+        BITS[4] { 16uA  }    -- Match: opcode must be 0xA
+        BITS[3] { reg  }     -- Extract: 3-bit register
+        BITS[8] { imm  }     -- Extract: 8-bit immediate
     }} => load_instruction(reg, imm)
 
     -- Match specific opcode, ignore rest
-    BITS { 15, {
-        BITS { 4, 16uB }    -- Match: opcode must be 0xB
-        BITS { 3, __ }      -- Ignore: don't extract register
-        BITS { 8, __ }      -- Ignore: don't extract immediate
+    BITS[15] {
+        BITS[4] { 16uB  }    -- Match: opcode must be 0xB
+        BITS[3] { __  }      -- Ignore: don't extract register
+        BITS[8] { __  }      -- Ignore: don't extract immediate
     }} => store_instruction()
 
     -- Extract all fields (no literal matching)
-    BITS { 15, {
-        BITS { 4, op }      -- Extract: 4-bit opcode
-        BITS { 3, reg }     -- Extract: 3-bit register
-        BITS { 8, imm }     -- Extract: 8-bit immediate
+    BITS[15] {
+        BITS[4] { op  }      -- Extract: 4-bit opcode
+        BITS[3] { reg  }     -- Extract: 3-bit register
+        BITS[8] { imm  }     -- Extract: 8-bit immediate
     }} => generic_handler(op, reg, imm)
 
     -- Default
@@ -292,20 +292,20 @@ instruction |> WHEN {
 **Rule: In pattern matching, ALL fields need explicit width (literals and variables)**
 
 ```boon
-opcode: BITS { 4, 16uA }
-register: BITS { 3, 10u5 }
+opcode: BITS[4] { 16uA  }
+register: BITS[3] { 10u5  }
 
 -- Construction: Mix literal BITS and variables
-instruction: BITS { __, { opcode, register, BITS { 8, 10u42 }, BITS { 2, 2u11 } } }
+instruction: BITS { __, { opcode, register, BITS[8] { 10u42  }, BITS[2] { 2u11  } } }
 -- Width: 4 + 3 + 8 + 2 = 17 bits
 
 -- Pattern matching: ALL fields need width
 data |> WHEN {
-    BITS { 17, {
-        BITS { 4, 16uA }    -- Match literal
-        BITS { 3, reg }     -- Extract variable
-        BITS { 8, imm }     -- Extract variable
-        BITS { 2, 2u11 }    -- Match literal
+    BITS[17] {
+        BITS[4] { 16uA  }    -- Match literal
+        BITS[3] { reg  }     -- Extract variable
+        BITS[8] { imm  }     -- Extract variable
+        BITS[2] { 2u11  }    -- Match literal
     }} => process(reg, imm)
     __ => error()
 }
@@ -315,47 +315,47 @@ data |> WHEN {
 
 ```boon
 -- ❌ Standalone literal without width
-opcode: BITS { 4, 16uA }
-bad: BITS { __, { 16uA, opcode } }
--- ERROR: Literal 16uA must specify width (use BITS { width, 16uA })
+opcode: BITS[4] { 16uA  }
+bad: BITS[__] {  16uA, opcode  }
+-- ERROR: Literal 16uA must specify width (use BITS[width] { 16uA  })
 
 -- ✅ CORRECT: Wrap literals with width
-good: BITS { __, { BITS { 4, 16uA }, opcode } }
+good: BITS { __, { BITS[4] { 16uA  }, opcode } }
 
 -- ❌ Variables without width in pattern matching
 instruction |> WHEN {
-    BITS { 15, { BITS { 4, 16uA }, reg, imm } } => ...
+    BITS { 15, { BITS[4] { 16uA  }, reg, imm } } => ...
     -- ERROR: Variables 'reg' and 'imm' need width specification
 }
 
 -- ✅ CORRECT: All fields have explicit width
 instruction |> WHEN {
-    BITS { 15, {
-        BITS { 4, 16uA }    -- Literal with width
-        BITS { 3, reg }     -- Variable with width
-        BITS { 8, imm }     -- Variable with width
+    BITS[15] {
+        BITS[4] { 16uA  }    -- Literal with width
+        BITS[3] { reg  }     -- Variable with width
+        BITS[8] { imm  }     -- Variable with width
     }} => ...
 }
 
 -- ❌ Width mismatch in nested BITS
-field1: BITS { 4, 16uA }
-field2: BITS { 5, 16uB }
-bad: BITS { 8, { field1, field2 } }
+field1: BITS[4] { 16uA  }
+field2: BITS[5] { 16uB  }
+bad: BITS[8] {  field1, field2  }
 -- ERROR: Width 8 but content is 9 bits (4 + 5)
 
 -- ❌ Signedness mismatch in concatenation
-signed_field: BITS { 4, 10s-1 }
-unsigned_field: BITS { 4, 10u5 }
-bad: BITS { __, { signed_field, unsigned_field } }
+signed_field: BITS[4] { 10s-1  }
+unsigned_field: BITS[4] { 10u5  }
+bad: BITS[__] {  signed_field, unsigned_field  }
 -- ERROR: Cannot mix signed and unsigned BITS in concatenation
 
 -- ❌ Pattern exceeds width
-BITS { 4, 2u10110010 }
+BITS[4] { 2u10110010  }
 -- ERROR: 8-bit pattern doesn't fit in 4-bit width
 
 -- ❌ Using BITS<N> syntax (IDE display only)
 bad: BITS<16>
--- ERROR: Not valid Boon syntax (use BITS { 16, ... })
+-- ERROR: Not valid Boon syntax (use BITS[16] { ...  })
 ```
 
 ---
@@ -377,11 +377,11 @@ Width is part of the BITS type, similar to array sizes in systems languages:
 
 ```boon
 -- These are DIFFERENT types
-flags8: BITS(8) = BITS { 8, 16uFF }      -- Type: BITS(8)
-flags16: BITS(16) = BITS { 16, 16uFFFF } -- Type: BITS(16)
+flags8: BITS(8) = BITS[8] { 16uFF  }      -- Type: BITS(8)
+flags16: BITS(16) = BITS[16] { 16uFFFF  } -- Type: BITS(16)
 
 -- ❌ Type mismatch
-flags8: BITS(8) = BITS { 16, 16uFFFF }   -- ERROR: Expected BITS(8), got BITS(16)
+flags8: BITS(8) = BITS[16] { 16uFFFF  }   -- ERROR: Expected BITS(8), got BITS(16)
 
 -- ✅ Functions specify width in type signature
 process_byte: FUNCTION(data: BITS(8)) -> Result {
@@ -389,7 +389,7 @@ process_byte: FUNCTION(data: BITS(8)) -> Result {
 }
 
 -- ❌ Can't pass wrong width
-word: BITS(16) = BITS { 16, 16uABCD }
+word: BITS(16) = BITS[16] { 16uABCD  }
 process_byte(word)  -- ERROR: Expected BITS(8), got BITS(16)
 ```
 
@@ -397,14 +397,14 @@ process_byte(word)  -- ERROR: Expected BITS(8), got BITS(16)
 
 ```boon
 -- ✅ Literal width (most common)
-BITS { 8, 16uFF }                        -- Width: 8 (compile-time known)
+BITS[8] { 16uFF  }                        -- Width: 8 (compile-time known)
 
 -- ✅ Compile-time constant (parameter/generic)
 width: 8  -- Compile-time constant
-BITS { width, 16uFF }                    -- Width: 8 (compile-time known)
+BITS[width] { 16uFF  }                    -- Width: 8 (compile-time known)
 
 -- ✅ Compile-time expression
-BITS { width * 2, 16uABCD }              -- Width: 16 (compile-time known)
+BITS[width * 2] { 16uABCD  }              -- Width: 16 (compile-time known)
 
 -- ✅ Type parameter in generic functions
 FUNCTION create_register<width>() -> BITS(width) {
@@ -417,20 +417,20 @@ FUNCTION create_register<width>() -> BITS(width) {
 ```boon
 -- ❌ Runtime variable width
 user_input: get_width_from_user()
-BITS { user_input, 16uFF }               -- ERROR: Width must be compile-time constant
+BITS[user_input] { 16uFF  }               -- ERROR: Width must be compile-time constant
 
 -- ❌ Conditional width
 width: if condition { 8 } else { 16 }
-BITS { width, 16uFF }                    -- ERROR: Width unknown at compile-time
+BITS[width] { 16uFF  }                    -- ERROR: Width unknown at compile-time
 
 -- ❌ Function returning dynamic width
 get_dynamic_bits: FUNCTION() -> BITS {   -- ERROR: Width required in type
-    BITS { 8, 16uFF }
+    BITS[8] { 16uFF  }
 }
 
 -- ✅ Function with explicit width
 get_bits: FUNCTION() -> BITS(8) {        -- Width in return type
-    BITS { 8, 16uFF }
+    BITS[8] { 16uFF  }
 }
 
 -- ✅ Generic function with width parameter
@@ -481,9 +481,9 @@ In all cases, the width is defined by specifications, standards, or design decis
 -- Compile-time width checking in pattern matching
 parse_opcode: FUNCTION(code: BITS(4)) {
     code |> WHEN {
-        BITS { 4, 2u0000 } => Continuation  -- ✅ 4 bits
-        BITS { 4, 2u0001 } => TextFrame     -- ✅ 4 bits
-        BITS { 8, 16u00 } => Invalid        -- ❌ ERROR: 8 bits doesn't match BITS(4)
+        BITS[4] { 2u0000  } => Continuation  -- ✅ 4 bits
+        BITS[4] { 2u0001  } => TextFrame     -- ✅ 4 bits
+        BITS[8] { 16u00  } => Invalid        -- ❌ ERROR: 8 bits doesn't match BITS(4)
     }
 }
 ```
@@ -572,22 +572,22 @@ Bits/is_zero(bits)                      -- All zeros?
 
 ```boon
 -- Operations preserve width of first operand
-a: BITS { 8, 10u200 }
-b: BITS { 8, 10u100 }
-sum: a |> Bits/add(b)  -- Width preserved: BITS { 8, ... }
+a: BITS[8] { 10u200  }
+b: BITS[8] { 10u100  }
+sum: a |> Bits/add(b)  -- Width preserved: BITS[8] { ...  }
 
 -- ❌ Mismatched widths: COMPILE ERROR
-a: BITS { 8, 16uFF }
-b: BITS { 4, 16u3 }
+a: BITS[8] { 16uFF  }
+b: BITS[4] { 16u3  }
 result: a |> Bits/and(b)  -- ERROR: "Width mismatch: 8 bits vs 4 bits"
 
 -- ✅ CORRECT: Explicit width conversion
 result: a |> Bits/and(b |> Bits/zero_extend(to: 8))  -- OK
 
 -- Explicit width change
-extended: BITS { 4, 16uF } |> Bits/zero_extend(to: 8)  -- 16u0F
-extended: BITS { 4, 16sF } |> Bits/sign_extend(to: 8)  -- 16sFF
-truncated: BITS { 8, 16uFF } |> Bits/truncate(to: 4)   -- 16uF
+extended: BITS[4] { 16uF  } |> Bits/zero_extend(to: 8)  -- 16u0F
+extended: BITS[4] { 16sF  } |> Bits/sign_extend(to: 8)  -- 16sFF
+truncated: BITS[8] { 16uFF  } |> Bits/truncate(to: 4)   -- 16uF
 ```
 
 ### Overflow Behavior
@@ -596,11 +596,11 @@ truncated: BITS { 8, 16uFF } |> Bits/truncate(to: 4)   -- 16uF
 **Release/FPGA mode:** Wrap silently (hardware behavior)
 
 ```boon
-a: BITS { 8, 10u200 }
-b: BITS { 8, 10u100 }
+a: BITS[8] { 10u200  }
+b: BITS[8] { 10u100  }
 sum: a |> Bits/add(b)  -- 300 overflows 8 bits!
 -- Debug: PANIC
--- Release: Returns BITS { 8, 10u44 } (300 mod 256)
+-- Release: Returns BITS[8] { 10u44  } (300 mod 256)
 ```
 
 **Explicit variants:**
@@ -608,7 +608,7 @@ sum: a |> Bits/add(b)  -- 300 overflows 8 bits!
 sum: a |> Bits/add_wrapping(b)       -- Always wraps
 sum: a |> Bits/add_checked(b)        -- Returns Result
 sum: a |> Bits/add_saturating(b)     -- Clamps to max/min
-sum: a |> Bits/add_widening(b)       -- BITS { 9, ... }
+sum: a |> Bits/add_widening(b)       -- BITS[9] { ...  }
 ```
 
 ---
@@ -618,44 +618,44 @@ sum: a |> Bits/add_widening(b)       -- BITS { 9, ... }
 Build composite BITS values from multiple fields:
 
 ```boon
--- Construction syntax: BITS { __, { field_values }}
+-- Construction syntax: BITS[__] {  field_values  }
 -- Width is inferred from sum of field widths
 
 -- ✅ VALID: All unsigned fields
-header: BITS { 8, 10u5 }
-payload: BITS { 24, 16uDEADBEEF }
+header: BITS[8] { 10u5  }
+payload: BITS[24] { 16uDEADBEEF  }
 
-packet: BITS { __, {
+packet: BITS[__] { 
     header
     payload
-}}
--- Result: BITS { 32, ... } unsigned (8 + 24 = 32)
+ }
+-- Result: BITS[32] { ...  } unsigned (8 + 24 = 32)
 
 -- ✅ VALID: All signed fields
-temp1: BITS { 16, 10s-5 }
-temp2: BITS { 16, 10s-3 }
+temp1: BITS[16] { 10s-5  }
+temp2: BITS[16] { 10s-3  }
 
-temps: BITS { __, {
+temps: BITS[__] { 
     temp1
     temp2
-}}
--- Result: BITS { 32, ... } signed
+ }
+-- Result: BITS[32] { ...  } signed
 
 -- ❌ COMPILE ERROR: Mixed signedness not allowed
-s_field: BITS { 8, 10s-5 }      -- signed
-u_field: BITS { 8, 10u10 }      -- unsigned
+s_field: BITS[8] { 10s-5  }      -- signed
+u_field: BITS[8] { 10u10  }      -- unsigned
 
-bad: BITS { __, {
+bad: BITS[__] { 
     s_field
     u_field
-}}
+ }
 -- Error: "Cannot concatenate BITS with different signedness"
 
 -- ✅ Convert signedness explicitly
-packet: BITS { __, {
+packet: BITS[__] { 
     s_field |> Bits/as_unsigned()    -- Reinterpret
     u_field
-}}
+ }
 ```
 
 ### Real-World Example: RISC-V Instruction Encoding
@@ -666,30 +666,30 @@ Many instruction sets mix signed and unsigned fields. Here's how to handle it:
 -- I-type instruction: opcode + rd + funct3 + rs1 + imm
 -- Most fields unsigned, but immediate is signed (two's complement)
 
-opcode: BITS { 7, 10u19 }       -- ADDI opcode (unsigned)
-rd: BITS { 5, 10u10 }           -- Destination register x10 (unsigned)
-funct3: BITS { 3, 10u0 }        -- Function code 0 (unsigned)
-rs1: BITS { 5, 10u5 }           -- Source register x5 (unsigned)
-imm: BITS { 12, 10s-100 }       -- Signed immediate -100
+opcode: BITS[7] { 10u19  }       -- ADDI opcode (unsigned)
+rd: BITS[5] { 10u10  }           -- Destination register x10 (unsigned)
+funct3: BITS[3] { 10u0  }        -- Function code 0 (unsigned)
+rs1: BITS[5] { 10u5  }           -- Source register x5 (unsigned)
+imm: BITS[12] { 10s-100  }       -- Signed immediate -100
 
 -- ❌ Cannot concatenate directly due to mixed signedness
-bad: BITS { __, {
+bad: BITS[__] { 
     imm      -- signed
     rs1      -- unsigned (ERROR: mixed signedness)
     funct3
     rd
     opcode
-}}
+ }
 
 -- ✅ CORRECT: Treat immediate as bit pattern (reinterpret as unsigned)
-instruction: BITS { __, {
+instruction: BITS[__] { 
     imm |> Bits/as_unsigned()   -- Reinterpret two's complement as bit pattern
     rs1
     funct3
     rd
     opcode
-}}
--- Result: BITS { 32, ... } unsigned - ready to emit to assembler
+ }
+-- Result: BITS[32] { ...  } unsigned - ready to emit to assembler
 
 -- The immediate's two's complement encoding (-100) is preserved
 -- When decoded by CPU, it will interpret those bits as signed
@@ -709,23 +709,23 @@ instruction: BITS { __, {
 
 ```boon
 opcode |> WHEN {
-    BITS { 8, 16u00 } => Nop
-    BITS { 8, 16u01 } => Load
-    BITS { 8, 16u02 } => Store
+    BITS[8] { 16u00  } => Nop
+    BITS[8] { 16u01  } => Load
+    BITS[8] { 16u02  } => Store
     __ => Unknown
 }
 ```
 
 ### Field Decomposition
 
-**Syntax:** `BITS { total_width, { field_patterns }}`
+**Syntax:** `BITS[total_width] {  field_patterns  }`
 
 ```boon
 -- 8-bit value split into two 4-bit nibbles
 byte |> WHEN {
-    BITS { 8, {
-        BITS { 4, high }
-        BITS { 4, low }
+    BITS[8] {
+        BITS[4] { high  }
+        BITS[4] { low  }
     }} => process(high, low)
 }
 ```
@@ -740,13 +740,13 @@ byte |> WHEN {
 ```boon
 -- RISC-V R-type instruction (32-bit)
 instruction |> WHEN {
-    BITS { 32, {
-        BITS { 7, funct7 }
-        BITS { 5, rs2 }
-        BITS { 5, rs1 }
-        BITS { 3, funct3 }
-        BITS { 5, rd }
-        BITS { 7, 2u0110011 }    -- Match exact opcode
+    BITS[32] {
+        BITS[7] { funct7  }
+        BITS[5] { rs2  }
+        BITS[5] { rs1  }
+        BITS[3] { funct3  }
+        BITS[5] { rd  }
+        BITS[7] { 2u0110011  }    -- Match exact opcode
     }} => R_Type { funct7, rs2, rs1, funct3, rd }
 }
 ```
@@ -756,11 +756,11 @@ instruction |> WHEN {
 ```boon
 -- IPv4 header: [4-bit version][4-bit IHL][8-bit ToS][16-bit length]
 first_word |> WHEN {
-    BITS { 32, {
-        BITS { 4, 10u4 }     -- Match IPv4 version (literal 4)
-        BITS { 4, ihl }      -- Extract IHL
-        BITS { 8, tos }      -- Extract ToS
-        BITS { 16, length }  -- Extract length
+    BITS[32] {
+        BITS[4] { 10u4  }     -- Match IPv4 version (literal 4)
+        BITS[4] { ihl  }      -- Extract IHL
+        BITS[8] { tos  }      -- Extract ToS
+        BITS[16] { length  }  -- Extract length
     }} => IPv4Header { ihl, tos, length }
 }
 ```
@@ -769,9 +769,9 @@ first_word |> WHEN {
 
 ```boon
 instruction |> WHEN {
-    BITS { 32, {
-        BITS { 4, 16uF }     -- Match high nibble = F
-        BITS { 28, __ }      -- Ignore remaining 28 bits
+    BITS[32] {
+        BITS[4] { 16uF  }     -- Match high nibble = F
+        BITS[28] { __  }      -- Ignore remaining 28 bits
     }} => SpecialInstruction
 }
 ```
@@ -784,25 +784,25 @@ instruction |> WHEN {
 
 ```boon
 -- To number (respects internal signedness)
-num: BITS { 8, 16uFF } |> Bits/to_number()       -- 255 (unsigned)
-num: BITS { 8, 16sFF } |> Bits/to_number()       -- -1 (signed)
+num: BITS[8] { 16uFF  } |> Bits/to_number()       -- 255 (unsigned)
+num: BITS[8] { 16sFF  } |> Bits/to_number()       -- -1 (signed)
 
 -- From number (u_ or s_ prefix)
-bits: Bits/u_from_number(value: 42, width: 8)    -- BITS { 8, 10u42 }
-bits: Bits/s_from_number(value: -1, width: 8)    -- BITS { 8, 10s-1 }
+bits: Bits/u_from_number(value: 42, width: 8)    -- BITS[8] { 10u42  }
+bits: Bits/s_from_number(value: -1, width: 8)    -- BITS[8] { 10s-1  }
 ```
 
 ### BITS ↔ Bool
 
 ```boon
 -- Single bit to Bool
-bit: BITS { 1, 2u1 }
+bit: BITS[1] { 2u1  }
 bool: bit |> Bits/to_bool()  -- True
 
 -- Bool to single bit
 bool: True
-bit: bool |> Bool/to_u_bit()   -- BITS { 1, 2u1 }
-bit: bool |> Bool/to_s_bit()   -- BITS { 1, 2s1 }
+bit: bool |> Bool/to_u_bit()   -- BITS[1] { 2u1  }
+bit: bool |> Bool/to_s_bit()   -- BITS[1] { 2s1  }
 
 -- Get bit as Bool
 flag: register |> Bits/get(index: 7)  -- Returns Bool
@@ -812,7 +812,7 @@ flag: register |> Bits/get(index: 7)  -- Returns Bool
 
 ```boon
 -- BITS to LIST { Bool } (MSB-first order)
-bits: BITS { 8, 2u10110010 }
+bits: BITS[8] { 2u10110010  }
 bool_list: bits |> Bits/to_bool_list()
 -- Result: LIST { True, False, True, True, False, False, True, False }
 --         [bit 7, bit 6, bit 5, bit 4, bit 3, bit 2, bit 1, bit 0]
@@ -820,11 +820,11 @@ bool_list: bits |> Bits/to_bool_list()
 -- LIST { Bool } to unsigned BITS
 bool_list: LIST { True, False, True, False }  -- 4 bits
 bits: bool_list |> List/to_u_bits()
--- Result: BITS { 4, 2u1010 } (unsigned)
+-- Result: BITS[4] { 2u1010  } (unsigned)
 
 -- LIST { Bool } to signed BITS
 bits: bool_list |> List/to_s_bits()
--- Result: BITS { 4, 2s1010 } (signed)
+-- Result: BITS[4] { 2s1010  } (signed)
 ```
 
 ### BITS ← TEXT
@@ -835,20 +835,20 @@ TEXT can be converted to BITS (must be byte-aligned, auto-converts to UTF-8):
 -- Simple TEXT to BITS (UTF-8 encoding)
 signature: BITS { TEXT { BN } }
 // 'B' = 16u42, 'N' = 16u4E
-// Result: BITS { 16, 16u424E }  (2 chars × 8 bits = 16 bits)
+// Result: BITS[16] { 16u424E  }  (2 chars × 8 bits = 16 bits)
 
 -- Protocol header with TEXT
-header: BITS { __, {
-    BITS { 4, 16uA },              -- Version nibble
+header: BITS[__] {
+    BITS[4] { 16uA  },              -- Version nibble
     TEXT { OK },                   -- Status (16 bits, UTF-8)
-    BITS { 4, 16u0 }               -- Reserved
+    BITS[4] { 16u0  }               -- Reserved
 } }
-// Result: BITS { 24, ... }  (4 + 16 + 4 = 24 bits)
+// Result: BITS[24] { ...  }  (4 + 16 + 4 = 24 bits)
 
 -- Non-ASCII TEXT (UTF-8 multi-byte)
 status: BITS { TEXT { ✓ } }
 // ✓ = 3 bytes UTF-8 = 24 bits
-// Result: BITS { 24, ... }
+// Result: BITS[24] { ...  }
 ```
 
 **Requirements:**
@@ -860,13 +860,13 @@ status: BITS { TEXT { ✓ } }
 ```boon
 -- Protocol signature
 magic: BITS { TEXT { BOON } }
-// Result: BITS { 32, 16u424F4F4E }
+// Result: BITS[32] { 16u424F4F4E  }
 
 -- Instruction encoding with mnemonic
-instruction: BITS { __, {
+instruction: BITS[__] {
     TEXT { LD },                   -- Mnemonic (16 bits)
-    BITS { 8, reg_addr },          -- Register
-    BITS { 8, immediate }          -- Immediate value
+    BITS[8] { reg_addr  },          -- Register
+    BITS[8] { immediate  }          -- Immediate value
 } }
 // Total: 32 bits (16 + 8 + 8)
 ```
@@ -875,13 +875,13 @@ instruction: BITS { __, {
 
 ```boon
 -- BITS to BYTES (pads to byte boundary if needed)
-bits: BITS { 12, 16uABC }                  -- 12 bits
-bytes: bits |> Bits/to_bytes()             -- BYTES { 16#0A, 16#BC }
+bits: BITS[12] { 16uABC }                  -- 12 bits
+bytes: bits |> Bits/to_bytes()             -- BYTES[__] { 16u0A, 16uBC }
 
 -- BYTES to BITS (unsigned by default)
-bytes: BYTES { 16#FF, 16#00 }
-bits: bytes |> Bytes/to_u_bits()           -- BITS { 16, 16uFF00 }
-bits: bytes |> Bytes/to_s_bits()           -- BITS { 16, 16sFF00 }
+bytes: BYTES[__] { 16uFF, 16u00 }
+bits: bytes |> Bytes/to_u_bits()           -- BITS[16] { 16uFF00 }
+bits: bytes |> Bytes/to_s_bits()           -- BITS[16] { 16sFF00 }
 ```
 
 ---
@@ -894,7 +894,7 @@ bits: bytes |> Bytes/to_s_bits()           -- BITS { 16, 16sFF00 }
 FUNCTION counter(rst, load, load_value, up, en) {
     BLOCK {
         count_width: 8
-        default: BITS { count_width, 10s0 }
+        default: BITS[count_width] { 10s0  }
         control_signals: [reset: rst, load: load, up: up, enabled: en]
 
         -- Pipeline = next-state logic (this function IS a register)
@@ -909,9 +909,9 @@ FUNCTION counter(rst, load, load_value, up, en) {
             })
             |> Bits/sum(delta: control_signals |> WHEN {
                 [reset: False, load: False, up: True, enabled: True] =>
-                    BITS { count_width, 10s1 }
+                    BITS[count_width] { 10s1  }
                 [reset: False, load: False, up: False, enabled: True] =>
-                    BITS { count_width, 10s-1 }
+                    BITS[count_width] { 10s-1  }
                 __ => SKIP
             })
 
@@ -925,21 +925,21 @@ FUNCTION counter(rst, load, load_value, up, en) {
 ```boon
 FUNCTION priority_encoder(input) {
     input |> WHEN {
-        BITS { 4, {
-            BITS { 1, 2u1 }    -- Bit 3 set (highest priority)
-            BITS { 1, __ }
-            BITS { 1, __ }
-            BITS { 1, __ }
-        }} => [y: BITS { 2, 2u11 }, valid: True]
+        BITS[4] {
+            BITS[1] { 2u1  }    -- Bit 3 set (highest priority)
+            BITS[1] { __  }
+            BITS[1] { __  }
+            BITS[1] { __  }
+        }} => [y: BITS[2] { 2u11  }, valid: True]
 
-        BITS { 4, {
-            BITS { 1, 2u0 }    -- Bit 3 clear
-            BITS { 1, 2u1 }    -- Bit 2 set
-            BITS { 1, __ }
-            BITS { 1, __ }
-        }} => [y: BITS { 2, 2u10 }, valid: True]
+        BITS[4] {
+            BITS[1] { 2u0  }    -- Bit 3 clear
+            BITS[1] { 2u1  }    -- Bit 2 set
+            BITS[1] { __  }
+            BITS[1] { __  }
+        }} => [y: BITS[2] { 2u10  }, valid: True]
 
-        __ => [y: BITS { 2, 2u00 }, valid: False]
+        __ => [y: BITS[2] { 2u00  }, valid: False]
     }
 }
 ```
@@ -982,7 +982,7 @@ flag_schema: [
 ]
 
 packed: render_state |> Flags/u_pack(schema: flag_schema)
--- Result: BITS { 4, 2u0110 }
+-- Result: BITS[4] { 2u0110  }
 
 -- Individual flag operations
 Flags/set(packed, flag: depth_test, schema: flag_schema)

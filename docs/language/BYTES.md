@@ -37,27 +37,27 @@ All number literals require explicit base prefix for clarity:
 
 ```boon
 -- Hex bytes (most common for binary data)
-data: BYTES { __, { 16uFF, 16u00, 16uAB, 16uCD } }  -- 4 bytes (size inferred)
+data: BYTES[__] {  16uFF, 16u00, 16uAB, 16uCD  }  -- 4 bytes (size inferred)
 
 -- Decimal bytes (explicit base required)
-data: BYTES { __, { 10u255, 10u0, 10u171, 10u205 } }  -- Same as above
+data: BYTES[__] {  10u255, 10u0, 10u171, 10u205  }  -- Same as above
 
 -- Binary bytes (for bit patterns)
-flags: BYTES { __, { 2u10110000, 2u11111111 } }  -- 2 bytes
+flags: BYTES[__] {  2u10110000, 2u11111111  }  -- 2 bytes
 
 -- Octal bytes (rare, but supported)
-perms: BYTES { __, { 8u644 } }  -- 1 byte
+perms: BYTES[__] {  8u644  }  -- 1 byte
 
 -- Single byte
-single: BYTES { __, { 16uFF } }  -- 1 byte
+single: BYTES[__] {  16uFF  }  -- 1 byte
 
 -- Mixed bases (use the base that matches semantic meaning)
-header: BYTES { __, { 16u89, 16u50, 10u78, 10u71 } }  -- PNG magic bytes
+header: BYTES[__] {  16u89, 16u50, 10u78, 10u71  }  -- PNG magic bytes
 --                    ^^^^   ^^^^   ^^^^   ^^^^
 --                    hex    hex    dec    dec (all explicit!)
 
 -- Explicit size (must match content)
-exact: BYTES { 4, { 16uFF, 16u00, 16uAB, 16uCD } }  -- Exactly 4 bytes
+exact: BYTES[4] {  16uFF, 16u00, 16uAB, 16uCD  }  -- Exactly 4 bytes
 ```
 
 **Note on syntax:**
@@ -74,17 +74,17 @@ BYTES values can be nested for composition (useful for construction and pattern 
 
 ```boon
 -- Define reusable byte sequences
-CRLF: BYTES { __, { 10u13, 10u10 } }  -- CR LF (2 bytes)
-STX: BYTES { __, { 10u2 } }           -- Start of Text (1 byte)
-ETX: BYTES { __, { 10u3 } }           -- End of Text (1 byte)
+CRLF: BYTES[__] {  10u13, 10u10  }  -- CR LF (2 bytes)
+STX: BYTES[__] {  10u2  }           -- Start of Text (1 byte)
+ETX: BYTES[__] {  10u3  }           -- End of Text (1 byte)
 
 -- Compose messages (nested BYTES are flattened)
-message: BYTES { __, {
+message: BYTES[__] { 
     STX,                                      -- 1 byte (flattened)
     10u72, 10u101, 10u108, 10u108, 10u111,   -- "Hello"
     ETX,                                      -- 1 byte (flattened)
     CRLF                                      -- 2 bytes (flattened)
-} }
+ }
 -- Result: 9 bytes total (1 + 5 + 1 + 2)
 ```
 
@@ -94,18 +94,18 @@ Byte-aligned BITS (width must be multiple of 8) can be included and are auto-con
 
 ```boon
 -- 8-bit BITS → 1 byte
-flags: BITS { 8, 2u10110000 }
-packet: BYTES { __, { 16uFF, flags, 16u00 } }
+flags: BITS[8] { 2u10110000  }
+packet: BYTES[__] {  16uFF, flags, 16u00  }
 -- Result: 3 bytes (16uFF, 16uB0, 16u00)
 
 -- 16-bit BITS → 2 bytes (MSB-first)
-port: BITS { 16, 16u1F90 }  -- Port 8080
-header: BYTES { __, { 16uFF, 16u00, port } }
+port: BITS[16] { 16u1F90  }  -- Port 8080
+header: BYTES[__] {  16uFF, 16u00, port  }
 -- Result: 4 bytes (16uFF, 16u00, 16u1F, 16u90)
 
 -- ❌ Non-byte-aligned BITS are rejected
-partial: BITS { 12, 16uABC }
-bad: BYTES { __, { partial } }  -- ERROR: BITS width must be multiple of 8 (got 12)
+partial: BITS[12] { 16uABC  }
+bad: BYTES[__] {  partial  }  -- ERROR: BITS width must be multiple of 8 (got 12)
 ```
 
 **Multi-byte BITS conversion:**
@@ -148,18 +148,18 @@ buffer: Bytes/zeros(length: 1024)  -- 1KB of zeros
 
 ```boon
 -- ✅ Size matches content
-data: BYTES { 3, { 16uFF, 16u00, 16uAB } }  -- OK: 3 bytes in content
+data: BYTES[3] {  16uFF, 16u00, 16uAB  }  -- OK: 3 bytes in content
 
 -- ❌ Size mismatch - COMPILE ERROR
-bad: BYTES { 4, { 16uFF, 16u00 } }  -- ERROR: Size 4 but content is 2 bytes
-bad: BYTES { 2, { 16uFF, 16u00, 16uAB } }  -- ERROR: Size 2 but content is 3 bytes
+bad: BYTES[4] {  16uFF, 16u00  }  -- ERROR: Size 4 but content is 2 bytes
+bad: BYTES[2] {  16uFF, 16u00, 16uAB  }  -- ERROR: Size 2 but content is 3 bytes
 
 -- ✅ Use __ to infer size from content
-data: BYTES { __, { 16uFF, 16u00 } }  -- OK: Infers size = 2
+data: BYTES[__] {  16uFF, 16u00  }  -- OK: Infers size = 2
 
 -- ✅ Use {} for zero-fill (any size)
-buffer: BYTES { 1024, {} }  -- OK: 1024 zero bytes
-empty: BYTES { 0, {} }      -- OK: 0 bytes
+buffer: BYTES[1024] {  }  -- OK: 1024 zero bytes
+empty: BYTES[0] {  }      -- OK: 0 bytes
 ```
 
 ### Concatenation Rules
@@ -168,20 +168,20 @@ empty: BYTES { 0, {} }      -- OK: 0 bytes
 
 ```boon
 -- ✅ Fixed-size BYTES can concatenate other FIXED-SIZE BYTES
-header: BYTES { __, { 16uFF, 16u00 } }      -- Fixed (2 bytes)
-footer: BYTES { __, { 16u00, 16uFF } }      -- Fixed (2 bytes)
-frame: BYTES { __, { header, 16uAB, footer } }  -- Fixed (5 bytes = 2+1+2)
+header: BYTES[__] {  16uFF, 16u00  }      -- Fixed (2 bytes)
+footer: BYTES[__] {  16u00, 16uFF  }      -- Fixed (2 bytes)
+frame: BYTES[__] {  header, 16uAB, footer  }  -- Fixed (5 bytes = 2+1+2)
 
 -- ✅ Dynamic BYTES can concatenate any BYTES (fixed or dynamic)
 dynamic1: BYTES {}                          -- Dynamic
 dynamic2: BYTES {}                          -- Dynamic
-fixed: BYTES { __, { 16uFF, 16u00 } }       -- Fixed (2 bytes)
+fixed: BYTES[__] {  16uFF, 16u00  }       -- Fixed (2 bytes)
 
 combined_dynamic: BYTES { dynamic1, dynamic2 }     -- Dynamic result
 mixed: BYTES { fixed, dynamic1, 16uAB }            -- Dynamic result
 
 -- ❌ Fixed-size BYTES CANNOT contain dynamic BYTES
-bad: BYTES { __, { dynamic1, dynamic2 } }
+bad: BYTES[__] {  dynamic1, dynamic2  }
 -- ERROR: Cannot infer compile-time size from runtime-sized content
 ```
 
@@ -195,25 +195,25 @@ bad: BYTES { __, { dynamic1, dynamic2 } }
 
 ```boon
 -- Byte literals (1 byte each)
-data: BYTES { __, { 16uFF, 10u255, 2u11111111 } }  -- 3 bytes
+data: BYTES[__] {  16uFF, 10u255, 2u11111111  }  -- 3 bytes
 
 -- BITS values (must be byte-aligned: width % 8 == 0)
-flags: BITS { 8, 2u10110000 }   -- 8 bits = 1 byte
-status: BITS { 16, 16uABCD }    -- 16 bits = 2 bytes
-packet: BYTES { __, { 16uFF, flags, status, 16u00 } }
+flags: BITS[8] { 2u10110000  }   -- 8 bits = 1 byte
+status: BITS[16] { 16uABCD  }    -- 16 bits = 2 bytes
+packet: BYTES[__] {  16uFF, flags, status, 16u00  }
 -- Flattened: 1 + 1 + 2 + 1 = 5 bytes
 -- Result: { 16uFF, 16uB0, 16uAB, 16uCD, 16u00 }
 
 -- Nested BYTES (flattened to their full content)
-header: BYTES { __, { 16uFF, 16u00 } }     -- 2 bytes
-footer: BYTES { __, { 16u00, 16uFF } }     -- 2 bytes
-frame: BYTES { __, { header, 16uAB, footer } }
+header: BYTES[__] {  16uFF, 16u00  }     -- 2 bytes
+footer: BYTES[__] {  16u00, 16uFF  }     -- 2 bytes
+frame: BYTES[__] {  header, 16uAB, footer  }
 -- Flattened: 2 + 1 + 2 = 5 bytes
 -- Result: { 16uFF, 16u00, 16uAB, 16u00, 16uFF }
 
 -- ❌ BITS must be byte-aligned
-partial: BITS { 12, 16uABC }  -- 12 bits (not byte-aligned)
-bad: BYTES { __, { partial } }  -- ERROR: BITS width must be multiple of 8
+partial: BITS[12] { 16uABC  }  -- 12 bits (not byte-aligned)
+bad: BYTES[__] {  partial  }  -- ERROR: BITS width must be multiple of 8
 ```
 
 ### TEXT in BYTES Constructor
@@ -223,10 +223,10 @@ TEXT can be included directly in BYTES (auto-converts to UTF-8):
 ```boon
 -- Simple TEXT to BYTES (UTF-8 encoding)
 bytes: BYTES { TEXT { Hello } }
-// Result: BYTES { 5, { 16u48, 16u65, 16u6C, 16u6C, 16u6F } }
+// Result: BYTES[5] {  16u48, 16u65, 16u6C, 16u6C, 16u6F  }
 
 -- Mixed content (TEXT + bytes + BITS)
-packet: BYTES { __, {
+packet: BYTES[__] {
     16uFF,                         -- Header byte
     TEXT { GET },                   -- HTTP method (UTF-8)
     16u20,                         -- Space
@@ -250,7 +250,7 @@ command: TEXT { AT+RESET }
 ascii_bytes: command |> Text/to_bytes(encoding: Ascii)  -- Validates
 
 -- Then use in BYTES
-packet: BYTES { __, { 16uFF, ascii_bytes, 16u00 } }
+packet: BYTES[__] {  16uFF, ascii_bytes, 16u00  }
 ```
 
 ### Empty Content Semantics
@@ -259,41 +259,41 @@ packet: BYTES { __, { 16uFF, ascii_bytes, 16u00 } }
 
 ```boon
 -- Zero-filled buffer
-zeros: BYTES { 1024, {} }  -- 1024 bytes, all 0x00
+zeros: BYTES[1024] {  }  -- 1024 bytes, all 0x00
 
 -- Empty BYTES (size 0)
-empty: BYTES { 0, {} }     -- 0 bytes
-empty: BYTES { __, {} }    -- Also 0 bytes (inferred from empty content)
+empty: BYTES[0] {  }     -- 0 bytes
+empty: BYTES[__] {  }    -- Also 0 bytes (inferred from empty content)
 
 -- These are equivalent
-buffer1: BYTES { 4, {} }
-buffer2: BYTES { __, { 10u0, 10u0, 10u0, 10u0 } }  -- Same: 4 zero bytes
+buffer1: BYTES[4] {  }
+buffer2: BYTES[__] {  10u0, 10u0, 10u0, 10u0  }  -- Same: 4 zero bytes
 ```
 
 ### Common Errors
 
 ```boon
 -- ❌ Size mismatch
-bad: BYTES { 10, { 16uFF, 16u00 } }
+bad: BYTES[10] {  16uFF, 16u00  }
 -- ERROR: Size 10 but content has 2 bytes
 
 -- ❌ Non-byte-aligned BITS
-bad_bits: BITS { 5, 2u10110 }
-bad: BYTES { __, { bad_bits } }
+bad_bits: BITS[5] { 2u10110  }
+bad: BYTES[__] {  bad_bits  }
 -- ERROR: BITS width 5 is not multiple of 8
 
 -- ❌ Appending to fixed-size
-header: BYTES { __, { 16uFF, 16u00 } }
+header: BYTES[__] {  16uFF, 16u00  }
 header: header |> Bytes/append(byte: 16uAB)
 -- ERROR: Cannot append to fixed-size BYTES
 
 -- ❌ Cannot use BYTES<N> syntax (IDE display only)
 bad: BYTES<14>
--- ERROR: Not valid Boon syntax (use BYTES { 14, {} })
+-- ERROR: Not valid Boon syntax (use BYTES[14] {  })
 
 -- ❌ Cannot put dynamic BYTES in fixed-size container
 dynamic_data: BYTES {}
-bad: BYTES { __, { dynamic_data, 16uFF } }
+bad: BYTES[__] {  dynamic_data, 16uFF  }
 -- ERROR: Cannot infer compile-time size from runtime-sized content
 
 -- ✅ CORRECT: Use dynamic container for dynamic BYTES
@@ -335,23 +335,23 @@ buffer: buffer |> Bytes/take(count: 10)
 
 ```boon
 -- Fixed-size BYTES with explicit size (consistent with BITS/LIST)
-buffer: BYTES { 1024, {} }  -- 1024 bytes, zero-filled
-packet: BYTES { 64, {} }    -- 64 bytes, zero-filled
+buffer: BYTES[1024] {  }  -- 1024 bytes, zero-filled
+packet: BYTES[64] {  }    -- 64 bytes, zero-filled
 
 -- Size from compile-time constant
 packet_size: 64
-frame: BYTES { packet_size, {} }  -- 64 bytes
+frame: BYTES[packet_size] {  }  -- 64 bytes
 
 -- Size inference placeholder
-config: BYTES { __, {} }  -- Size inferred from context
+config: BYTES[__] {  }  -- Size inferred from context
 
 -- Literals have inferred size (IDE shows BYTES<4>)
-magic: BYTES { __, { 16u89, 16u50, 16u4E, 16u47 } }  -- 4 bytes
+magic: BYTES[__] {  16u89, 16u50, 16u4E, 16u47  }  -- 4 bytes
 
 -- Nested BYTES - size is sum (IDE shows BYTES<2>, BYTES<3>, BYTES<5>)
-header: BYTES { __, { 16uFF, 16u00 } }  -- 2 bytes
-payload: BYTES { __, { 16u01, 16u02, 16u03 } }  -- 3 bytes
-packet: BYTES { __, { header, payload } }  -- 5 bytes (2 + 3)
+header: BYTES[__] {  16uFF, 16u00  }  -- 2 bytes
+payload: BYTES[__] {  16u01, 16u02, 16u03  }  -- 3 bytes
+packet: BYTES[__] {  header, payload  }  -- 5 bytes (2 + 3)
 ```
 
 **Use fixed-size BYTES for:**
@@ -366,23 +366,23 @@ packet: BYTES { __, { header, payload } }  -- 5 bytes (2 + 3)
 
 ```boon
 -- ✅ Literal size (inferred from construction)
-data: BYTES { __, { 16uFF, 16u00, 16uAB } }  -- Size: 3 (compile-time known)
+data: BYTES[__] {  16uFF, 16u00, 16uAB  }  -- Size: 3 (compile-time known)
 
 -- ✅ Compile-time constant
 packet_size: 64  -- Compile-time constant (snake_case!)
-buffer: BYTES { packet_size, {} }  -- Size: 64 (compile-time known)
+buffer: BYTES[packet_size] {  }  -- Size: 64 (compile-time known)
 
 -- ✅ Compile-time expression
 header_size: 14
 payload_size: 1500
-frame: BYTES { header_size + payload_size, {} }  -- Size: 1514 (compile-time known)
+frame: BYTES[header_size + payload_size] {  }  -- Size: 1514 (compile-time known)
 
 -- ✅ Using function to create zero-filled buffer
 buffer: Bytes/zeros(length: packet_size)
 
 -- ❌ Runtime size
 user_size: get_size_from_input()
-buffer: BYTES { user_size, {} }  -- ERROR: Size must be compile-time constant
+buffer: BYTES[user_size] {  }  -- ERROR: Size must be compile-time constant
 
 -- ✅ Use dynamic BYTES instead
 dynamic_buffer: BYTES {}  -- OK: no size specified
@@ -400,8 +400,8 @@ FUNCTION process_packet(data) {
 }
 
 -- ✅ Good: Hardware knows exact width from call site
-ethernet_header: BYTES { 14, {} }  -- 14 bytes = 112 bits
-payload: BYTES { 1500, {} }  -- 1500 bytes = 12000 bits
+ethernet_header: BYTES[14] {  }  -- 14 bytes = 112 bits
+payload: BYTES[1500] {  }  -- 1500 bytes = 12000 bits
 
 result: parse_ethernet(header: ethernet_header, payload: payload)
 -- Compiler infers exact sizes from arguments
@@ -414,22 +414,22 @@ result: parse_ethernet(header: ethernet_header, payload: payload)
 
 ```boon
 -- Direct literal - size counted (4 bytes)
-magic: BYTES { __, { 16u89, 16u50, 16u4E, 16u47 } }
+magic: BYTES[__] {  16u89, 16u50, 16u4E, 16u47  }
 
 -- Nested BYTES - sizes summed
-header: BYTES { __, { 16uFF, 16u00 } }  -- 2 bytes
-footer: BYTES { __, { 16u00, 16uFF } }  -- 2 bytes
-frame: BYTES { __, { header, 16uAB, footer } }  -- 5 bytes (2 + 1 + 2)
+header: BYTES[__] {  16uFF, 16u00  }  -- 2 bytes
+footer: BYTES[__] {  16u00, 16uFF  }  -- 2 bytes
+frame: BYTES[__] {  header, 16uAB, footer  }  -- 5 bytes (2 + 1 + 2)
 
 -- BITS in BYTES - size from BITS width
-flags: BITS { 16, 16uABCD }  -- 16 bits = 2 bytes
-packet: BYTES { __, { 16uFF, flags, 16u00 } }  -- 4 bytes (1 + 2 + 1)
+flags: BITS[16] { 16uABCD  }  -- 16 bits = 2 bytes
+packet: BYTES[__] {  16uFF, flags, 16u00  }  -- 4 bytes (1 + 2 + 1)
 
 -- Mixed composition
-start: BYTES { __, { 16uAA, 16u55 } }  -- 2 bytes
-data_bits: BITS { 24, 16uABCDEF }  -- 24 bits = 3 bytes
-end: BYTES { __, { 16uFF } }  -- 1 byte
-message: BYTES { __, { start, data_bits, end } }  -- 6 bytes (2 + 3 + 1)
+start: BYTES[__] {  16uAA, 16u55  }  -- 2 bytes
+data_bits: BITS[24] { 16uABCDEF  }  -- 24 bits = 3 bytes
+end: BYTES[__] {  16uFF  }  -- 1 byte
+message: BYTES[__] {  start, data_bits, end  }  -- 6 bytes (2 + 3 + 1)
 ```
 
 ### Type Inference and Size Checking
@@ -438,11 +438,11 @@ message: BYTES { __, { start, data_bits, end } }  -- 6 bytes (2 + 3 + 1)
 
 ```boon
 -- These are DIFFERENT sizes (inferred by compiler)
-ethernet_header: BYTES { 14, {} }  -- 14 bytes
-ip_header: BYTES { 20, {} }  -- 20 bytes
+ethernet_header: BYTES[14] {  }  -- 14 bytes
+ip_header: BYTES[20] {  }  -- 20 bytes
 
 -- ❌ Can't mix different sizes in operations that expect same size
-headers: LIST { ethernet_header, ip_header }  -- ERROR: Inconsistent sizes
+headers: LIST[ethernet_header, ip_header]  -- ERROR: Inconsistent sizes
 
 -- ✅ Compiler infers size requirements from usage
 FUNCTION parse_ethernet_header(header) {
@@ -451,11 +451,11 @@ FUNCTION parse_ethernet_header(header) {
 }
 
 -- ✅ Call with correct size
-ethernet_header: BYTES { 14, {} }
+ethernet_header: BYTES[14] {  }
 result: parse_ethernet_header(header: ethernet_header)  -- OK: 14 bytes
 
 -- ❌ Call with wrong size causes error
-small_header: BYTES { 10, {} }
+small_header: BYTES[10] {  }
 result: parse_ethernet_header(header: small_header)  -- ERROR: Only 10 bytes, needs ≥14
 ```
 
@@ -467,14 +467,14 @@ buffer: BYTES {}
 buffer: buffer |> Bytes/append(byte: 16uFF)  -- OK: dynamic
 
 -- ✅ Fixed-size BYTES (hardware) - cannot grow
-header: BYTES { 14, {} }
+header: BYTES[14] {  }
 header: header |> Bytes/append(byte: 16uFF)  -- ERROR: Fixed size, cannot grow
 
 -- ✅ Pattern matching on first bytes (size check)
 parse_packet: FUNCTION(data) {
     data |> Bytes/take(count: 4) |> WHEN {
-        BYTES { __, { 16u89, 16u50, 16u4E, 16u47 } } => parse_png(data)
-        BYTES { __, { 16uFF, 16uD8, 16uFF, 16uE0 } } => parse_jpeg(data)
+        BYTES[__] {  16u89, 16u50, 16u4E, 16u47  } => parse_png(data)
+        BYTES[__] {  16uFF, 16uD8, 16uFF, 16uE0  } => parse_jpeg(data)
         __ => UnknownFormat
     }
 }
@@ -536,8 +536,8 @@ Bytes/from_hex(hex_text)
 Bytes/from_base64(base64_text)
 
 -- Search and comparison
-Bytes/find(bytes, pattern: BYTES { __, { 16uFF, 16u00 } })  -- Find pattern
-Bytes/starts_with(bytes, prefix: BYTES { __, { 16u89, 16u50 } })  -- PNG header?
+Bytes/find(bytes, pattern: BYTES[__] {  16uFF, 16u00  })  -- Find pattern
+Bytes/starts_with(bytes, prefix: BYTES[__] {  16u89, 16u50  })  -- PNG header?
 Bytes/ends_with(bytes, suffix: ...)
 Bytes/equal(a, b)                       -- Byte-wise equality
 
@@ -577,10 +577,10 @@ big_endian: Bytes/read_unsigned(data, offset: 0, byte_count: 4, endian: Big)
 ```boon
 -- File type by magic bytes
 file_bytes |> Bytes/take(count: 4) |> WHEN {
-    BYTES { __, { 16u89, 16u50, 16u4E, 16u47 } } => PngFile
-    BYTES { __, { 16uFF, 16uD8, 16uFF, 16uE0 } } => JpegFile
-    BYTES { __, { 16u47, 16u49, 16u46, 16u38 } } => GifFile
-    BYTES { __, { 16u25, 16u50, 16u44, 16u46 } } => PdfFile
+    BYTES[__] {  16u89, 16u50, 16u4E, 16u47  } => PngFile
+    BYTES[__] {  16uFF, 16uD8, 16uFF, 16uE0  } => JpegFile
+    BYTES[__] {  16u47, 16u49, 16u46, 16u38  } => GifFile
+    BYTES[__] {  16u25, 16u50, 16u44, 16u46  } => PdfFile
     __ => UnknownFile
 }
 ```
@@ -598,9 +598,9 @@ request_line |> Bytes/to_text(encoding: Ascii) |> Text/take(count: 4) |> WHEN {
 
 -- Option 2: Use direct hex bytes (for binary protocols)
 request_line |> Bytes/take(count: 3) |> WHEN {
-    BYTES { __, { 16u47, 16u45, 16u54 } } => GetMethod   -- "GET"
+    BYTES[__] {  16u47, 16u45, 16u54  } => GetMethod   -- "GET"
     __ => request_line |> Bytes/take(count: 4) |> WHEN {
-        BYTES { __, { 16u50, 16u4F, 16u53, 16u54 } } => PostMethod  -- "POST"
+        BYTES[__] {  16u50, 16u4F, 16u53, 16u54  } => PostMethod  -- "POST"
         __ => parse_other_method(request_line)
     }
 }
@@ -614,7 +614,7 @@ request_line |> Bytes/take(count: 3) |> WHEN {
 
 ```boon
 -- Single byte to number
-num: BYTES { __, { 16uFF } } |> Bytes/get(index: 0)  -- 255
+num: BYTES[__] {  16uFF  } |> Bytes/get(index: 0)  -- 255
 
 -- Multi-byte to number (via typed read)
 num: Bytes/read_unsigned(bytes, offset: 0, byte_count: 4, endian: Little)
@@ -624,12 +624,12 @@ num: Bytes/read_unsigned(bytes, offset: 0, byte_count: 4, endian: Little)
 
 ```boon
 -- BYTES to BITS (unsigned by default)
-bytes: BYTES { __, { 16uFF, 16u00 } }
-bits: bytes |> Bytes/to_u_bits()           -- BITS { 16, 16uFF00 }
-bits: bytes |> Bytes/to_s_bits()           -- BITS { 16, 16sFF00 }
+bytes: BYTES[__] {  16uFF, 16u00  }
+bits: bytes |> Bytes/to_u_bits()           -- BITS[16] { 16uFF00  }
+bits: bytes |> Bytes/to_s_bits()           -- BITS[16] { 16sFF00  }
 
 -- BITS to BYTES (pads to byte boundary if needed)
-bits: BITS { 12, 16uABC }                  -- 12 bits
+bits: BITS[12] { 16uABC  }                  -- 12 bits
 bytes: bits |> Bits/to_bytes()             -- 2 bytes (padded)
 ```
 
@@ -637,8 +637,8 @@ bytes: bits |> Bits/to_bytes()             -- 2 bytes (padded)
 
 ```boon
 -- BYTES to text
-BYTES { __, { 16uFF, 16u00 } } |> Bytes/to_hex()             -- "FF00"
-BYTES { __, { 16uFF, 16u00 } } |> Bytes/to_base64()          -- "/wA="
+BYTES[__] {  16uFF, 16u00  } |> Bytes/to_hex()             -- "FF00"
+BYTES[__] {  16uFF, 16u00  } |> Bytes/to_base64()          -- "/wA="
 utf8_bytes |> Bytes/to_text(encoding: Utf8)          -- "Hi"
 
 -- Text to BYTES (use functions, not literals)
@@ -712,7 +712,7 @@ FUNCTION build_message(type_tag, sequence, payload) {
         })
 
         header_bytes: header |> Bits/to_bytes()
-        Bytes/concat(LIST { header_bytes, payload })
+        Bytes/concat(LIST[header_bytes, payload])
     }
 }
 ```
@@ -748,7 +748,7 @@ FUNCTION uart_status() {
 -- Protocol with TEXT (mixed construction)
 FUNCTION uart_command(cmd_id) {
     BLOCK {
-        packet: BYTES { __, {
+        packet: BYTES[__] {
             16u02,                    -- STX (start of text)
             TEXT { CMD: },            -- Prefix (UTF-8)
             cmd_id,                   -- Command ID byte
@@ -779,9 +779,9 @@ FUNCTION uart_at_command(command) {
 ```boon
 FUNCTION detect_texture_format(header_bytes) {
     header_bytes |> Bytes/take(count: 4) |> WHEN {
-        BYTES { __, { 16u44, 16u44, 16u53, 16u20 } } => DDS
-        BYTES { __, { 16uAB, 16u4B, 16u54, 16u58 } } => KTX
-        BYTES { __, { 16u89, 16u50, 16u4E, 16u47 } } => PNG
+        BYTES[__] {  16u44, 16u44, 16u53, 16u20  } => DDS
+        BYTES[__] {  16uAB, 16u4B, 16u54, 16u58  } => KTX
+        BYTES[__] {  16u89, 16u50, 16u4E, 16u47  } => PNG
         __ => Unknown
     }
 }
@@ -793,9 +793,9 @@ FUNCTION detect_texture_format(header_bytes) {
 
 ### Literal Syntax
 
-- `BYTES { size, { byte, byte, ... } }` - From byte literals with explicit size
-- `BYTES { __, { byte, byte, ... } }` - From byte literals with inferred size
-- `BYTES { size, {} }` - Zero-filled buffer with explicit size
+- `BYTES[size] {  byte, byte, ...  }` - From byte literals with explicit size
+- `BYTES[__] {  byte, byte, ...  }` - From byte literals with inferred size
+- `BYTES[size] {  }` - Zero-filled buffer with explicit size
 - `BYTES {}` - Dynamic empty BYTES
 
 ### Construction Functions
@@ -882,7 +882,7 @@ Bytes/read_u32(bytes, offset: 0, endian: Big)
 ```
 
 **Benefits:**
-1. **Consistent with BITS** - `BITS { width, value }` uses width parameter
+1. **Consistent with BITS** - `BITS[width] { value  }` uses width parameter
 2. **Less API surface** - 3 functions instead of 10+ type-specific ones
 3. **More flexible** - Can read any byte width (not limited to 1,2,4,8)
 4. **No type system assumptions** - Boon doesn't have explicit u8/u16/u32/u64 types

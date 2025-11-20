@@ -194,7 +194,7 @@ FUNCTION merge_sort(list) {
 **Boon code:**
 ```boon
 // Transform all pixels in parallel
-pixels: LIST { 1000000, Pixel }
+pixels: LIST[1000000, Pixel]
 transformed: pixels |> List/map(pixel, new_pixel:
     transform_pixel(pixel)
 )
@@ -468,7 +468,7 @@ FUNCTION sum(list) {
     }
 }
 
-result: sum(LIST { 1000000, numbers })
+result: sum(LIST[1000000, numbers])
 ```
 
 **Via WGSL:** Would need manual parallel reduction

@@ -825,7 +825,7 @@ upload_progress: encoded_video.upload_percent       -- 0.0 to 1.0
 FUNCTION stream_processor(data_stream) {
     BLOCK {
         -- Buffer for incoming chunks
-        buffer: MEMORY { 1024, BITS { 8, 2u0 } }
+        buffer: MEMORY[1024] { BITS[8] { 2u0   } }
             |> Memory/write_entry(entry: data_stream |> THEN {
                 [address: write_ptr, data: data]
             })

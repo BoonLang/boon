@@ -11,7 +11,7 @@
 
 FUNCTION cycleadder(width, rst, en, a) {
     BLOCK {
-        default: BITS { width, 10u0 }
+        default: BITS[width] { 10u0  }
 
         -- Bundle control signals for pattern matching
         control_signals: [reset: rst, enabled: en]

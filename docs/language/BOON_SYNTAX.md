@@ -1288,7 +1288,7 @@ counter: 0 |> LATEST count {
 In hardware, LATEST must be driven by clock:
 
 ```boon
-counter: BITS{8, 0} |> LATEST count {
+counter: BITS[8] { 0 } |> LATEST count {
     clk |> THEN {
         PULSES { 10 } |> THEN { count + 1 }
     }
@@ -1449,23 +1449,23 @@ value |> WHEN {
 
 ✅ **Correct - Pattern matching on list values:**
 ```boon
-LIST { selected, hovered } |> WHEN {
-    LIST { True, __ } => [
+LIST[selected, hovered] |> WHEN {
+    LIST[True, __] => [
         color: primary_color
         intensity: 0.05
     ]
-    LIST { False, True } => [
+    LIST[False, True] => [
         color: primary_color
         intensity: 0.025
     ]
-    LIST { False, False } => None
+    LIST[False, False] => None
 }
 ```
 
 **In this pattern:**
-- `LIST { True, __ }` - First element is True, second can be anything
-- `LIST { False, True }` - First is False, second is True
-- `LIST { False, False }` - Both are False
+- `LIST[True, __]` - First element is True, second can be anything
+- `LIST[False, True]` - First is False, second is True
+- `LIST[False, False]` - Both are False
 
 **Use cases:**
 - Matching multiple boolean states
@@ -1787,7 +1787,7 @@ style: [
 | **SKIP** | Filter/early return in pipelines | Signals "skip this value" in WHEN/LATEST |
 | **LIST literals** | `LIST { }` syntax | `LIST { item1, item2, item3 }` |
 | **Wildcard `__`** | Matches anything in patterns | `\|> WHEN { specific => x, __ => default }` |
-| **LIST pattern matching** | Match list structures | `LIST { True, __ } => ...` |
+| **LIST pattern matching** | Match list structures | `LIST[True, __] => ...` |
 | **NoElement** | Absence of UI element | Use with WHILE for conditional rendering |
 | **LINK** | Reactive architecture pattern | See `/docs/language/LINK_PATTERN.md` |
 
@@ -1862,7 +1862,7 @@ When proposing new Boon APIs, remember:
 15. ✅ **Use LIST and wildcard patterns**
    - `LIST { }` for list literals
    - `__` for catch-all in pattern matching
-   - LIST pattern matching for coordinated state: `LIST { True, __ } => ...`
+   - LIST pattern matching for coordinated state: `LIST[True, __] => ...`
 
 16. ✅ **Use LINK for reactive architecture**
    - Declare → Advertise → Wire pattern

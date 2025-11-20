@@ -192,7 +192,7 @@ for (let __pulse = 0; __pulse < 10; __pulse++) {
 ### **Hardware Execution**
 
 ```boon
-counter: BITS{8, 0} |> LATEST count {
+counter: BITS[8] { 0 } |> LATEST count {
     clk |> THEN {
         PULSES { 10 } |> THEN { count + 1 }
     }
@@ -481,7 +481,7 @@ result: simulate_physics([
 In hardware, LATEST must be driven by clock:
 
 ```boon
-counter: BITS{8, 0} |> LATEST count {
+counter: BITS[8] { 0 } |> LATEST count {
     clk |> THEN {
         PULSES { 10 } |> THEN {
             count + 1
@@ -518,7 +518,7 @@ end
 ```boon
 FUNCTION pulse_counter_module(max_count) {
     BLOCK {
-        count: BITS{8, 0} |> LATEST count {
+        count: BITS[8] { 0 } |> LATEST count {
             clk |> THEN {
                 PULSES { max_count } |> THEN {
                     count + 1
@@ -552,9 +552,9 @@ FUNCTION lfsr_n_cycles(initial, cycles) {
 FUNCTION fibonacci_hw(position) {
     BLOCK {
         state: [
-            previous: BITS{16, 0},
-            current: BITS{16, 1},
-            iteration: BITS{16, 0}
+            previous: BITS[16] { 0 },
+            current: BITS[16] { 1 },
+            iteration: BITS[16] { 0 }
         ] |> LATEST state {
             clk |> THEN {
                 PULSES { position } |> THEN {
@@ -577,7 +577,7 @@ FUNCTION fibonacci_hw(position) {
 
 **4. Mixed with Conditions:**
 ```boon
-counter: BITS{8, 0} |> LATEST count {
+counter: BITS[8] { 0 } |> LATEST count {
     clk |> THEN {
         PULSES { 100 } |> THEN {
             enable |> WHEN {
@@ -804,9 +804,9 @@ result: initial |> LATEST state {
 
 **Queue:**
 ```boon
-LIST { 0, 1 }
+LIST[0, 1]
     |> Queue/iterate(previous, next: previous |> WHEN {
-        LIST { first, second } => LIST { second, first + second }
+        LIST[first, second] => LIST { second, first + second }
     })
     |> Queue/take_nth(position: 10)
 ```

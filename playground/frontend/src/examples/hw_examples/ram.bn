@@ -18,7 +18,7 @@ FUNCTION ram(addr, wraddr, wrdata) {
         -- Memory state: synchronous write on clock edges
         -- MEMORY primitive handles state internally, accesses PASSED.clk
         -- Initial: mem[address] = address
-        mem: MEMORY { 16, 0 }
+        mem: MEMORY[16] { 0  }
             |> Memory/initialize(address, data: address)
             |> Memory/write(address: wraddr, data: wrdata)
 

@@ -39,9 +39,9 @@ This document explores opportunities to reduce theme complexity by deriving visu
 ### Traditional Approach
 ```boon
 transform: LIST { element.hovered, element.pressed } |> WHEN {
-    LIST { __, True } => [move_further: 4]      // Pressed
-    LIST { True, False } => [move_closer: 6]    // Hover
-    LIST { False, False } => [move_closer: 4]   // Rest
+    LIST[__, True] => [move_further: 4]      // Pressed
+    LIST[True, False] => [move_closer: 6]    // Hover
+    LIST[False, False] => [move_closer: 4]   // Rest
 }
 ```
 

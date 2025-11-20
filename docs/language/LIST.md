@@ -21,7 +21,7 @@ LIST is Boon's universal collection type, working seamlessly across domains:
 **LIST uses different syntax for dynamic vs fixed-size:**
 
 - **Dynamic (no size parameter):** `LIST {}` or `LIST { item1, item2, ... }`
-- **Fixed-size (size parameter):** `LIST { size, content }`
+- **Fixed-size (size parameter):** `LIST[size, content]`
 
 ### Dynamic Lists (Software)
 
@@ -33,42 +33,42 @@ todos: LIST {}
 todos: LIST { item1, item2, item3 }  -- Can grow/shrink later
 
 -- ⚠️ NOT the same as fixed-size with inferred size:
-fixed: LIST { __, { item1, item2, item3 }}  -- Fixed at 3 elements, cannot grow
+fixed: LIST[__] {  item1, item2, item3  }  -- Fixed at 3 elements, cannot grow
 ```
 
 **Important distinction:**
 - `LIST { item1, item2, item3 }` → **Dynamic** (no size parameter, can grow/shrink)
-- `LIST { __, { item1, item2, item3 }}` → **Fixed-size** (size inferred from content, cannot grow)
+- `LIST[__] {  item1, item2, item3  }` → **Fixed-size** (size inferred from content, cannot grow)
 
 **Note:** This is consistent across all collection types:
 - Dynamic: `LIST { items }`, `BYTES { bytes }` (no size parameter)
-- Fixed-size: `LIST { size, items }`, `BYTES { size, bytes }` (with size parameter)
+- Fixed-size: `LIST[size, items]`, `BYTES { size, bytes }` (with size parameter)
 
 ### Fixed-Size Lists (Hardware Compatible)
 
 ```boon
 -- Empty fixed-size list (all elements get default value)
-bits: LIST { 8, {} }  -- 8 elements, all False (for Bool)
+bits: LIST[8] {  }  -- 8 elements, all False (for Bool)
 
 -- Partial initialization (remaining get default)
-flags: LIST { 4, { True, False } }  -- [True, False, False, False]
+flags: LIST[4] {  True, False  }  -- [True, False, False, False]
 
 -- Full initialization
-data: LIST { 3, { 10, 20, 30 }}
+data: LIST[3] {  10, 20, 30  }
 
 -- Size inference
-coords: LIST { __, { x, y, z }}  -- Size = 3
+coords: LIST[__] {  x, y, z  }  -- Size = 3
 
 -- Examples
-bits: LIST { 8, {} }             -- 8 elements (default values)
-signals: LIST { width, {} }      -- width elements (width is compile-time constant)
+bits: LIST[8] {  }             -- 8 elements (default values)
+signals: LIST[width] {  }      -- width elements (width is compile-time constant)
 ```
 
 **Default values:**
 - `Bool` → `False`
 - `Number` → `0`
 - `Text` → `TEXT {}`
-- `BITS { N, ... }` → `BITS { N, 10u0 }`
+- `BITS[N] { ...  }` → `BITS[N] { 10u0  }`
 - Records → All fields get their defaults
 - Tags → First variant (lexicographically)
 
@@ -80,9 +80,9 @@ signals: LIST { width, {} }      -- width elements (width is compile-time consta
 
 ```boon
 my_list |> WHEN {
-    LIST { 8, items } => process_8(items)     -- Match size 8
-    LIST { 4, items } => process_4(items)     -- Match size 4
-    LIST { __, items } => process_any(items)  -- Match any size
+    LIST[8, items] => process_8(items)     -- Match size 8
+    LIST[4, items] => process_4(items)     -- Match size 4
+    LIST[__, items] => process_any(items)  -- Match any size
 }
 ```
 
@@ -91,23 +91,23 @@ my_list |> WHEN {
 ```boon
 -- Extract specific elements
 my_list |> WHEN {
-    LIST { __, { a, b } } => combine(a, b)           -- Size 2, bind both
-    LIST { __, { first, __, third } } => ...         -- Size 3, ignore middle
-    LIST { 4, { a, b, __, __ } } => pair(a, b)       -- Size 4, bind first two
+    LIST[__] {  a, b  } => combine(a, b)           -- Size 2, bind both
+    LIST[__] {  first, __, third  } => ...         -- Size 3, ignore middle
+    LIST[4] {  a, b, __, __  } => pair(a, b)       -- Size 4, bind first two
 }
 
 -- Pattern with literals
 input |> WHEN {
-    LIST { 3, { True, __, False } } => ...  -- Size 3, first=True, last=False
-    LIST { __, { 0, x, y } } => ...         -- Size 3, first=0, bind rest
+    LIST[3] {  True, __, False  } => ...  -- Size 3, first=True, last=False
+    LIST[__] {  0, x, y  } => ...         -- Size 3, first=0, bind rest
 }
 
 -- Nested patterns
 points |> WHEN {
-    LIST { __, {
+    LIST[__] { 
         [x: 0, y: 0]      -- Origin
         [x: x, y: y]      -- Some point
-    }} => distance(x, y)
+     } => distance(x, y)
 }
 ```
 
@@ -116,7 +116,7 @@ points |> WHEN {
 ```boon
 -- Match minimum size with rest
 list |> WHEN {
-    LIST { __, { first, second, rest... } } => process(first, second, rest)
+    LIST[__] {  first, second, rest...  } => process(first, second, rest)
 }
 ```
 
@@ -142,19 +142,19 @@ subset: list |> List/slice(from: 2, to: 5)  -- Elements 2, 3, 4
 ```boon
 -- Map: transform each element
 doubled: numbers |> List/map(old, new: old * 2)
--- LIST { 3, Number } → LIST { 3, Number }
+-- LIST[3, Number] → LIST[3, Number]
 
 -- Reverse
 reversed: list |> List/reverse()
 
 -- Zip: combine two lists element-wise
 pairs: a_list |> List/zip(with: b_list)
--- LIST { N, A } + LIST { N, B } → LIST { N, [A, B] }
+-- LIST[N, A] + LIST[N, B] → LIST { N, [A, B] }
 -- Compile error if sizes don't match (for fixed-size)
 
 -- Enumerate: add indices
 indexed: items |> List/enumerate()
--- LIST { N, T } → LIST { N, [index: Number, item: T] }
+-- LIST[N, T] → LIST { N, [index: Number, item: T] }
 ```
 
 ### Reductions
@@ -165,7 +165,7 @@ sum: numbers |> List/fold(
     init: 0
     item, acc: acc + item
 )
--- LIST { N, Number } → Number
+-- LIST[N, Number] → Number
 
 -- Chain: thread state through list, collect outputs
 result: numbers |> List/chain(
@@ -177,7 +177,7 @@ result: numbers |> List/chain(
         next_state: state + item
     ]
 )
--- Returns: [values: LIST { N, Number }, final_state: Number]
+-- Returns: [values: LIST[N, Number], final_state: Number]
 
 -- Count
 length: list |> List/count()
@@ -244,7 +244,7 @@ filtered_todos: PASSED.todos
 
 ```boon
 -- Fixed-size list
-bits: LIST { 8, {} }
+bits: LIST[8] {  }
     |> List/map(old, new: old |> Bool/not())  -- Transpiler unrolls to 8 NOT gates
     |> List/fold(init: False, item, acc: item |> Bool/or(that: acc))
                                               -- Transpiler creates OR tree
@@ -262,12 +262,12 @@ bits: LIST { 8, {} }
 
 ### How the Transpiler Decides
 
-**Rule:** Operations on `LIST { size, T }` where `size` is compile-time constant are **elaboration-time** (unrolled).
+**Rule:** Operations on `LIST[size, T]` where `size` is compile-time constant are **elaboration-time** (unrolled).
 
 ```boon
 -- ✅ Elaboration-time (size known)
-a: BITS { 8, 10u42 }
-a_bits: a |> Bits/to_bool_list()     -- LIST { 8, Bool }
+a: BITS[8] { 10u42  }
+a_bits: a |> Bits/to_bool_list()     -- LIST[8, Bool]
 result: a_bits |> List/map(old, new: old)     -- Transpiler unrolls to 8 operations
 
 -- ❌ Runtime (size unknown) - ERROR in hardware context
@@ -280,7 +280,7 @@ result: dynamic |> List/map(...)      -- Software: OK, Hardware: ERROR
 **List/map (parallel):**
 ```boon
 -- Boon
-bits: LIST { 3, { a, b, c }}
+bits: LIST[3] {  a, b, c  }
 inverted: bits |> List/map(old, new: old |> Bool/not())
 
 -- Transpiles to SystemVerilog
@@ -292,7 +292,7 @@ inverted[2] = ~c;
 **List/fold (sequential chain):**
 ```boon
 -- Boon
-values: LIST { 4, { a, b, c, d }}
+values: LIST[4] {  a, b, c, d  }
 sum: values |> List/fold(init: 0, item, acc: acc + item)
 
 -- Transpiles to
@@ -306,7 +306,7 @@ sum = temp3 + d;
 **List/chain (chain with outputs):**
 ```boon
 -- Boon
-bits: LIST { 3, { a, b, c }}
+bits: LIST[3] {  a, b, c  }
 result: bits |> List/chain(
     item
     initial_state: False
@@ -335,8 +335,8 @@ result.final_state = ha2_carry;
 **List/zip (structural pairing):**
 ```boon
 -- Boon
-a: LIST { 3, { a0, a1, a2 }}
-b: LIST { 3, { b0, b1, b2 }}
+a: LIST[3] {  a0, a1, a2  }
+b: LIST[3] {  b0, b1, b2  }
 pairs: a |> List/zip(with: b)
 
 -- Transpiles to
@@ -353,12 +353,12 @@ pairs[2] = {a2, b2};
 
 ```boon
 -- BITS → Fixed-size LIST
-bits: BITS { 8, 10u42 }
+bits: BITS[8] { 10u42  }
 bool_list: bits |> Bits/to_bool_list()
--- Result: LIST { 8, Bool }
+-- Result: LIST[8, Bool]
 
 -- Fixed-size LIST → BITS
-list: LIST { 8, { True, False, True, False, True, False, True, False }}
+list: LIST[8] {  True, False, True, False, True, False, True, False  }
 bits: list |> List/to_u_bits()  -- Unsigned BITS
 bits: list |> List/to_s_bits()  -- Signed BITS
 
@@ -375,7 +375,7 @@ dynamic: LIST { 1, 2, 3 }
 fixed: dynamic |> List/to_fixed(size: 3)  -- Software only
 
 -- Fixed → Dynamic
-fixed: LIST { 3, { a, b, c }}
+fixed: LIST[3] {  a, b, c  }
 dynamic: fixed |> List/to_dynamic()  -- Software only
 ```
 
@@ -390,13 +390,13 @@ dynamic: fixed |> List/to_dynamic()  -- Software only
 LIST { element_type }
 
 -- Fixed-size list
-LIST { size, element_type }
+LIST[size, element_type]
 
 -- Examples
 LIST { TodoItem }           -- Dynamic list of TodoItem
-LIST { 8, Bool }            -- Fixed list of 8 booleans
-LIST { width, Bool }        -- Fixed list of width booleans (width is constant)
-LIST { __, Bool }           -- Size inferred from construction
+LIST[8, Bool]            -- Fixed list of 8 booleans
+LIST[width, Bool]        -- Fixed list of width booleans (width is constant)
+LIST[__, Bool]           -- Size inferred from construction
 ```
 
 ### Type Inference
@@ -408,13 +408,13 @@ items |> List/append(item: [x: 1, y: 2])
 -- Type: LIST { [x: Number, y: Number] }
 
 -- Infer size from construction
-coords: LIST { __, { 0, 1, 2 }}
--- Type: LIST { 3, Number }
+coords: LIST[__] {  0, 1, 2  }
+-- Type: LIST[3, Number]
 
 -- Infer both from BITS conversion
-bits: BITS { 8, 10u42 }
+bits: BITS[8] { 10u42  }
 bool_list: bits |> Bits/to_bool_list()
--- Type: LIST { 8, Bool }
+-- Type: LIST[8, Bool]
 ```
 
 ### Compile-Time Size Requirements
@@ -436,19 +436,19 @@ When specified, size becomes part of the LIST type:
 
 ```boon
 -- These are DIFFERENT types
-list3: LIST { 3, Number } = LIST { 3, { 1, 2, 3 }}
-list5: LIST { 5, Number } = LIST { 5, { 1, 2, 3, 4, 5 }}
+list3: LIST[3, Number] = LIST[3] {  1, 2, 3  }
+list5: LIST[5, Number] = LIST[5] {  1, 2, 3, 4, 5  }
 
 -- ❌ Type mismatch
-list3: LIST { 3, Number } = LIST { 5, { 1, 2, 3, 4, 5 }}  -- ERROR
+list3: LIST[3, Number] = LIST[5] {  1, 2, 3, 4, 5  }  -- ERROR
 
 -- ✅ Functions specify size in type signature
-process_triple: FUNCTION(data: LIST { 3, Number }) -> Result {
+process_triple: FUNCTION(data: LIST[3, Number]) -> Result {
     -- Compiler knows data has exactly 3 elements
 }
 
 -- ❌ Can't pass wrong size
-list5: LIST { 5, Number }
+list5: LIST[5, Number]
 process_triple(list5)  -- ERROR: Expected LIST(3), got LIST(5)
 ```
 
@@ -456,22 +456,22 @@ process_triple(list5)  -- ERROR: Expected LIST(3), got LIST(5)
 
 ```boon
 -- ✅ Literal size (most common)
-LIST { 8, Bool }                     -- Size: 8 (compile-time known)
+LIST[8, Bool]                     -- Size: 8 (compile-time known)
 
 -- ✅ Compile-time constant parameter
 width: 8  -- Compile-time constant
-LIST { width, Bool }                 -- Size: 8 (compile-time known)
+LIST[width, Bool]                 -- Size: 8 (compile-time known)
 
 -- ✅ Compile-time expression
 LIST { width * 2, Number }           -- Size: 16 (compile-time known)
 
 -- ✅ Type parameter in generic functions
-FUNCTION create_array<size>() -> LIST { size, Bool } {
-    LIST { size, {} }                -- size is compile-time parameter
+FUNCTION create_array<size>() -> LIST[size, Bool] {
+    LIST[size] {  }                -- size is compile-time parameter
 }
 
 -- ✅ Size inferred from construction
-coords: LIST { __, { x, y, z }}      -- Size: 3 (inferred at compile-time)
+coords: LIST[__] {  x, y, z  }      -- Size: 3 (inferred at compile-time)
 ```
 
 #### What's NOT Allowed: Runtime Size
@@ -479,15 +479,15 @@ coords: LIST { __, { x, y, z }}      -- Size: 3 (inferred at compile-time)
 ```boon
 -- ❌ Runtime variable size
 user_count: get_count_from_user()
-LIST { user_count, Number }          -- ERROR: Size must be compile-time constant
+LIST[user_count, Number]          -- ERROR: Size must be compile-time constant
 
 -- ❌ Conditional size
 size: if condition { 8 } else { 16 }
-LIST { size, Bool }                  -- ERROR: Size unknown at compile-time
+LIST[size, Bool]                  -- ERROR: Size unknown at compile-time
 
 -- ❌ Signal-dependent size (hardware)
 FUNCTION process(size_signal) {
-    LIST { size_signal, Bool }       -- ERROR: size must be compile-time constant
+    LIST[size_signal, Bool]       -- ERROR: size must be compile-time constant
 }
 
 -- ✅ Use dynamic LIST instead
@@ -503,7 +503,7 @@ Size is compile-time known in ALL contexts where specified:
 **Hardware (Fixed-size required):**
 ```boon
 -- Register file (8 registers, hardware-defined)
-registers: LIST { 8, BITS { 32, 10u0 } }
+registers: LIST[8] { BITS[32] { 10u0 } }
 
 -- Elaboration-time unrolling
 result: registers |> List/map(old, new: process(old))  -- Unrolls to 8 operations
@@ -512,7 +512,7 @@ result: registers |> List/map(old, new: process(old))  -- Unrolls to 8 operation
 **Software (Fixed-size optional):**
 ```boon
 -- Fixed-size buffer (stack-allocated)
-buffer: LIST { 256, Number }
+buffer: LIST[256, Number]
 
 -- Dynamic collection (heap-allocated)
 todos: LIST { TodoItem }  -- No size = dynamic
@@ -528,10 +528,10 @@ todos: LIST { TodoItem }  -- No size = dynamic
 
 ```boon
 -- Compile-time size checking in pattern matching
-parse_triple: FUNCTION(data: LIST { 3, Number }) {
+parse_triple: FUNCTION(data: LIST[3, Number]) {
     data |> WHEN {
-        LIST { 3, { a, b, c } } => process(a, b, c)  -- ✅ Size matches
-        LIST { 2, { a, b } } => invalid              -- ❌ ERROR: Size mismatch
+        LIST[3] {  a, b, c  } => process(a, b, c)  -- ✅ Size matches
+        LIST[2] {  a, b  } => invalid              -- ❌ ERROR: Size mismatch
     }
 }
 ```
@@ -544,7 +544,7 @@ todos: LIST { TodoItem }
 todos: todos |> List/append(item: new_todo)  -- ✅ OK: dynamic
 
 -- Fixed-size LIST (size specified) - cannot grow/shrink
-buffer: LIST { 16, Number }
+buffer: LIST[16, Number]
 buffer: buffer |> List/append(item: 42)      -- ❌ ERROR: Fixed size, cannot grow
 ```
 
@@ -557,8 +557,8 @@ buffer: buffer |> List/append(item: 42)      -- ❌ ERROR: Fixed size, cannot gr
 ```boon
 -- Invert all bits (8 parallel NOT gates)
 FUNCTION invert_byte(input) {
-    -- input: BITS { 8, ... }
-    bits: input |> Bits/to_bool_list()  -- LIST { 8, Bool }
+    -- input: BITS[8] { ...  }
+    bits: input |> Bits/to_bool_list()  -- LIST[8, Bool]
     inverted: bits |> List/map(old, new: old |> Bool/not())
     [output: inverted |> List/to_u_bits()]
 }
@@ -569,7 +569,7 @@ FUNCTION invert_byte(input) {
 ```boon
 -- Ripple-carry adder chain
 FUNCTION adder_chain(a, b) {
-    a_bits: a |> Bits/to_bool_list()  -- LIST { width, Bool }
+    a_bits: a |> Bits/to_bool_list()  -- LIST[width, Bool]
     b_bits: b |> Bits/to_bool_list()
 
     result: a_bits |> List/zip(with: b_bits)
@@ -631,7 +631,7 @@ events: LATEST {
 | Aspect | Dynamic (Software) | Fixed (Hardware) |
 |--------|-------------------|------------------|
 | **Size** | Unknown at compile-time | Known at compile-time |
-| **Type** | `LIST { T }` | `LIST { N, T }` |
+| **Type** | `LIST { T }` | `LIST[N, T]` |
 | **Growth** | ✅ append, filter, take | ❌ Compile error |
 | **Operations** | Runtime iteration | Elaboration-time unrolling |
 | **Memory** | Structural sharing | Static allocation |
@@ -647,7 +647,7 @@ events: LATEST {
 ```boon
 FUNCTION process_bits(input) {
     input
-        |> Bits/to_bool_list()           -- BITS → LIST { N, Bool }
+        |> Bits/to_bool_list()           -- BITS → LIST[N, Bool]
         |> List/map(old, new: old |> Bool/not())  -- Process as LIST
         |> List/to_u_bits()              -- LIST → BITS
 }
@@ -657,7 +657,7 @@ FUNCTION process_bits(input) {
 
 ```boon
 FUNCTION generate_adders(width) {
-    inputs: LIST { width, {} }  -- width adder inputs
+    inputs: LIST[width] {  }  -- width adder inputs
         |> List/enumerate()
         |> List/map(old, new: create_adder(index: old.index))
 }

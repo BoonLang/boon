@@ -343,16 +343,16 @@ FUNCTION filter_button_material(selected, hovered) {
             True => 0.2
         }
         metal: 0.03
-        glow: LIST { selected, hovered } |> WHEN {
-            LIST { True, __ } => [
+        glow: LIST[selected, hovered] |> WHEN {
+            LIST[True, __] => [
                 color: Theme/material(of: Primary).color
                 intensity: 0.05
             ]
-            LIST { False, True } => [
+            LIST[False, True] => [
                 color: Theme/material(of: Primary).color
                 intensity: 0.025
             ]
-            LIST { False, False } => None
+            LIST[False, False] => None
         }
     ]
 }

@@ -146,7 +146,7 @@ val io = IO(new Bundle {
 StreamInterface: [
     valid: Bool
     ready: Bool
-    data: BITS { width, ... }
+    data: BITS[width] { ...  }
 ]
 
 -- Producer side
@@ -260,31 +260,31 @@ AXI4_LITE: INTERFACE {
     -- Write address channel
     awvalid: Bool
     awready: Bool
-    awaddr: BITS { 32, ... }
-    awprot: BITS { 3, ... }
+    awaddr: BITS[32] { ...  }
+    awprot: BITS[3] { ...  }
 
     -- Write data channel
     wvalid: Bool
     wready: Bool
-    wdata: BITS { 32, ... }
-    wstrb: BITS { 4, ... }
+    wdata: BITS[32] { ...  }
+    wstrb: BITS[4] { ...  }
 
     -- Write response channel
     bvalid: Bool
     bready: Bool
-    bresp: BITS { 2, ... }
+    bresp: BITS[2] { ...  }
 
     -- Read address channel
     arvalid: Bool
     arready: Bool
-    araddr: BITS { 32, ... }
-    arprot: BITS { 3, ... }
+    araddr: BITS[32] { ...  }
+    arprot: BITS[3] { ...  }
 
     -- Read data channel
     rvalid: Bool
     rready: Bool
-    rdata: BITS { 32, ... }
-    rresp: BITS { 2, ... }
+    rdata: BITS[32] { ...  }
+    rresp: BITS[2] { ...  }
 }
 
 -- Use in function signatures
@@ -318,10 +318,10 @@ FUNCTION axi_slave(axi_master: AXI4_LITE) {
 **Suggested Boon syntax:**
 ```boon
 FUNCTION counter(rst, en) {
-    count: BITS{8, 10u0} |> LATEST count {
+    count: BITS[8] { 10u0 } |> LATEST count {
         PASSED.clk |> THEN {
             rst |> WHILE {
-                True => BITS{8, 10u0}
+                True => BITS[8] { 10u0 }
                 False => en |> WHILE {
                     True => count |> Bits/increment()
                     False => count
@@ -331,9 +331,9 @@ FUNCTION counter(rst, en) {
     }
 
     -- Formal assertions
-    #[assert] count |> Bits/less_than(BITS{8, 10u256})  -- Never overflow
-    #[assume] (en |> Bool/and(count |> Bits/equal(BITS{8, 10u255}))) |> Bool/not()
-    #[cover] count |> Bits/equal(BITS{8, 10u255})  -- Coverage goal
+    #[assert] count |> Bits/less_than(BITS[8] { 10u256 })  -- Never overflow
+    #[assume] (en |> Bool/and(count |> Bits/equal(BITS[8] { 10u255 }))) |> Bool/not()
+    #[cover] count |> Bits/equal(BITS[8] { 10u255 })  -- Coverage goal
 
     [count: count]
 }
@@ -376,12 +376,12 @@ TEST counter_basic {
 
     REPEAT 10 {
         WAIT_CYCLES 1
-        ASSERT dut.count |> Bits/equal(BITS{8, CYCLE_COUNT})
+        ASSERT dut.count |> Bits/equal(BITS[8] { CYCLE_COUNT })
     }
 
     test_en <- False
     WAIT_CYCLES 5
-    ASSERT dut.count |> Bits/equal(BITS{8, 10u10})  -- Should hold
+    ASSERT dut.count |> Bits/equal(BITS[8] { 10u10 })  -- Should hold
 }
 ```
 
@@ -416,7 +416,7 @@ TEST counter_basic {
 **Example need:**
 ```boon
 -- Generate N parallel adders
-FUNCTION parallel_adders<N>(inputs: LIST{N, BITS{8, ...}}) {
+FUNCTION parallel_adders<N>(inputs: LIST{N, BITS[8] { ... }}) {
     -- Would be nice to have more generation constructs
     results: inputs |> List/map(input, result: input |> Bits/increment())
     [results: results]

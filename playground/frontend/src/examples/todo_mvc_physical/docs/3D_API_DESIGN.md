@@ -281,9 +281,9 @@ Element/button(
         depth: 6
         rounded_corners: 4
         transform: LIST { element.hovered, element.pressed } |> WHEN {
-            LIST { __, True } => []                  -- Pressed flush
-            LIST { True, False } => [move_closer: 6] -- Lifted on hover
-            LIST { False, False } => [move_closer: 4] -- Resting raised
+            LIST[__, True] => []                  -- Pressed flush
+            LIST[True, False] => [move_closer: 6] -- Lifted on hover
+            LIST[False, False] => [move_closer: 4] -- Resting raised
         }
         material: [
             gloss: 0.3
@@ -684,9 +684,9 @@ FUNCTION todo_button() {
             depth: 6
             rounded_corners: Fully
             transform: LIST { element.hovered, element.pressed } |> WHEN {
-                LIST { __, True } => []                  -- Pressed flush
-                LIST { True, False } => [move_closer: 6] -- Lifted 6px
-                LIST { False, False } => [move_closer: 4] -- Resting 4px up
+                LIST[__, True] => []                  -- Pressed flush
+                LIST[True, False] => [move_closer: 6] -- Lifted 6px
+                LIST[False, False] => [move_closer: 4] -- Resting 4px up
             }
             material: [
                 gloss: 0.25

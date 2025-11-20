@@ -12,12 +12,12 @@
 
 FUNCTION lfsr(reset) {
     -- reset: Bool - synchronous reset
-    -- Returns: BITS { 8, ... } - current LFSR state
+    -- Returns: BITS[8] { ...  } - current LFSR state
 
-    out: BITS { 8, 10u0 } |> LATEST out {
+    out: BITS[8] { 10u0  } |> LATEST out {
         PASSED.clk |> THEN {
             reset |> WHILE {
-                True => BITS { 8, 10u0 }
+                True => BITS[8] { 10u0  }
                 False => BLOCK {
                     -- Linear feedback: NOT(out[7] XOR out[3])
                     feedback: out |> Bits/get(index: 7) |> Bool/xor(that:

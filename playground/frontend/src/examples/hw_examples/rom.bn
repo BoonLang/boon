@@ -7,7 +7,7 @@ FUNCTION rom(addr) {
         -- ROM content: each address contains its own value
         -- This models: initial for (i = 0; i < 2**AWIDTH; i = i+1) mem[i] = i;
 
-        mem: MEMORY { 16, 0 }
+        mem: MEMORY[16] { 0  }
             |> Memory/initialize(i, data: i)
 
         -- Asynchronous read
