@@ -51,6 +51,19 @@ FLUSH (bypass/early exit)
 
 ## Documents in This Folder
 
+### 0. [ACCIDENTALLY_MOTIVATING_REVIEW.md](./ACCIDENTALLY_MOTIVATING_REVIEW.md) ⭐
+**Start here! Philosophical review and motivational summary**
+
+- Why Boon is "accidentally" a complete HDL
+- The profound discovery about universal reactive abstractions
+- What this means practically and philosophically
+- Conference paper potential
+- The beauty of emergent design
+
+**Read this first for context and inspiration, then dive into the detailed analysis below.**
+
+---
+
 ### 1. [QUICK_REPORT.md](./QUICK_REPORT.md)
 **Comprehensive gap analysis comparing Boon to modern HDLs**
 

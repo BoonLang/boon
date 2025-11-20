@@ -492,6 +492,7 @@ This folder contains a detailed analysis comparing Boon to modern HDLs (SpinalHD
 - ✅ 7 out of 11 critical features are 75%+ naturally emergent
 
 **Documents:**
+- ⭐ [Motivational Review](./hdl_analysis/ACCIDENTALLY_MOTIVATING_REVIEW.md) - **Start here!** Why Boon is "accidentally" complete
 - [Gap Analysis Report](./hdl_analysis/QUICK_REPORT.md) - Comparison to modern HDLs
 - [Pipelines & Streaming](./hdl_analysis/NATURAL_EMERGENCE_ANALYSIS.md) - How they emerge naturally
 - [Remaining Features](./hdl_analysis/REMAINING_FEATURES_EMERGENCE.md) - CDC, interfaces, formal verification, etc.
