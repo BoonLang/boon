@@ -144,7 +144,7 @@ This is why the same primitives work in both domains - you found the universal a
 
 ## What This Means Practically
 
-### Short Term (0-3 months): Recognition Phase
+### Short Term: Recognition Phase
 
 **No code changes needed!** Just document existing patterns:
 
@@ -165,7 +165,7 @@ FUNCTION risc_pipeline(instruction) {
 - Show CDC safety with PASSED.clk[domain]
 - Market Boon as unified software+hardware language
 
-### Medium Term (3-6 months): Syntactic Sugar
+### Medium Term: Syntactic Sugar
 
 Add minimal extensions to surface existing patterns:
 
@@ -188,7 +188,7 @@ PIPELINE {
 - StreamInterface type bundle
 - Compiler domain checking
 
-### Long Term (6-12+ months): The Vision
+### Long Term: The Vision
 
 **Boon becomes the first unified software+hardware language:**
 

@@ -133,7 +133,7 @@ FLUSH (bypass/early exit)
 
 ## Implementation Roadmap
 
-### Phase 1: Document Existing Patterns (0-1 month)
+### Phase 1: Document Existing Patterns
 **No code changes - just recognition!**
 
 1. ✅ Standard protocol library (AXI, Wishbone, APB)
@@ -144,7 +144,7 @@ FLUSH (bypass/early exit)
 **Effort:** Documentation only
 **Impact:** Enables HDL development immediately
 
-### Phase 2: Syntactic Sugar (1-3 months)
+### Phase 2: Syntactic Sugar
 **Minimal additions to surface existing patterns**
 
 1. PIPELINE block (recognizes LATEST as stages)
@@ -156,7 +156,7 @@ FLUSH (bypass/early exit)
 **Effort:** Small language additions
 **Impact:** Natural pipeline and streaming syntax
 
-### Phase 3: Compiler Support (3-6 months)
+### Phase 3: Compiler Support
 **Leverage existing analysis capabilities**
 
 1. CDC domain tracking and violation detection
@@ -168,7 +168,7 @@ FLUSH (bypass/early exit)
 **Effort:** Compiler enhancements
 **Impact:** Safety, testing, tooling
 
-### Phase 4: Advanced Features (6-12 months)
+### Phase 4: Advanced Features
 **New capabilities where needed**
 
 1. Formal verification backend (SymbiYosys)

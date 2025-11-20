@@ -515,7 +515,7 @@ wishbone_master: Wishbone/master(
 
 ## PRIORITIZED ROADMAP
 
-### TIER 1: Must-Have for Production (Immediate - 0-6 months)
+### TIER 1: Must-Have for Production (Immediate Priority)
 
 **1. Streaming Interface Abstraction**
 - Ready/valid protocol
@@ -540,7 +540,7 @@ wishbone_master: Wishbone/master(
 - Reusable interface definitions
 - Direction modifiers (input/output)
 
-### TIER 2: Important for Productivity (Short-term - 6-12 months)
+### TIER 2: Important for Productivity (Short-term Priority)
 
 **5. Standard Protocol Library**
 - AXI4-Lite implementation
@@ -554,7 +554,7 @@ wishbone_master: Wishbone/master(
 - Signal poke/peek
 - Assertions in tests
 
-### TIER 3: Quality of Life (Medium-term - 12-18 months)
+### TIER 3: Quality of Life (Medium-term Priority)
 
 **7. Formal Verification**
 - Assert/assume/cover primitives
@@ -566,7 +566,7 @@ wishbone_master: Wishbone/master(
 - VCD waveform generation
 - Coverage metrics
 
-### TIER 4: Advanced Features (Long-term - 18+ months)
+### TIER 4: Advanced Features (Long-term Priority)
 
 **9. Hardware Generator Templates**
 - Standard component library
