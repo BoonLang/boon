@@ -1,0 +1,251 @@
+-- ACK Command Parser
+-- Parses ASCII command: "ACK <duration_ms>\n"
+-- Outputs trigger pulse and LED pulse duration in clock cycles
+--
+-- Example commands:
+--   "ACK 100\n"   -> 100ms LED pulse
+--   "ACK 2500\n"  -> 2.5s LED pulse
+--
+-- Protocol:
+--   1. Wait for 'A'
+--   2. Match 'C', then 'K', then ' ' (space)
+--   3. Accumulate decimal digits
+--   4. On '\n': convert ms to cycles, pulse trigger
+--
+-- Pattern: ASCII Parsing FSM + Decimal Accumulation
+-- - State machine for character-by-character parsing
+-- - ASCII character matching
+-- - Decimal string to integer conversion
+-- - Milliseconds to clock cycles conversion
+--
+-- Translated from: super_counter_rust/hardware/src/ack_parser.v
+--
+-- PROPOSED API ADDITIONS (marked with -- PROPOSED):
+--   - ASCII/is_digit() - Check if char is '0'-'9'
+--   - ASCII/to_digit() - Convert '0'-'9' to 0-9
+--   - ASCII constants (CHAR_A, CHAR_NEWLINE, etc.)
+--   - Decimal/accumulate() - decimal_value * 10 + digit
+--
+-- Parameters:
+--   clock_hz: System clock frequency in Hz
+--   data: UART RX data byte
+--   valid: UART RX valid pulse (one cycle)
+-- Returns:
+--   trigger: One-cycle pulse when valid ACK command received
+--   pulse_cycles: Duration in clock cycles for LED pulse
+
+FUNCTION ack_parser(rst, data, valid, clock_hz) {
+    BLOCK {
+        -- ========================================
+        -- Helper Functions
+        -- ========================================
+
+        -- Check if ASCII character is digit ('0'-'9')
+        -- PROPOSED: Move to ASCII module as ASCII/is_digit()
+        FUNCTION is_ascii_digit(char) {
+            in_range: (char >= BITS[8] { 16u30 }) |> Bool/and(char <= BITS[8] { 16u39 })
+            in_range
+        }
+
+        -- Convert ASCII digit to integer (0-9)
+        -- PROPOSED: Move to ASCII module as ASCII/to_digit()
+        FUNCTION ascii_digit_to_int(char) {
+            char |> Bits/sub(BITS[8] { 16u30 })  -- '0' = 0x30
+        }
+
+        -- Convert milliseconds to clock cycles
+        FUNCTION ms_to_cycles(ms, clock_freq) {
+            cycles_per_ms: clock_freq / 1000
+            ms * cycles_per_ms
+        }
+
+        -- ========================================
+        -- FSM States
+        -- ========================================
+
+        -- State encoding
+        state_idle: BITS[3] { 10u0 }
+        state_a: BITS[3] { 10u1 }
+        state_c1: BITS[3] { 10u2 }
+        state_c2: BITS[3] { 10u3 }
+        state_space: BITS[3] { 10u4 }
+        state_num: BITS[3] { 10u5 }
+
+        -- ASCII character constants
+        -- PROPOSED: ASCII module constants
+        char_a: BITS[8] { 16u41 }       -- 'A'
+        char_c: BITS[8] { 16u43 }       -- 'C'
+        char_k: BITS[8] { 16u4B }       -- 'K'
+        char_space: BITS[8] { 16u20 }   -- ' '
+        char_newline: BITS[8] { 16u0A } -- '\n'
+
+        -- ========================================
+        -- State Register
+        -- ========================================
+
+        state: state_idle |> LATEST state {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => state_idle
+                    False => valid |> WHILE {
+                        -- Process incoming character when valid
+                        True => state |> WHEN {
+                            -- IDLE: Wait for 'A'
+                            state_idle => data |> WHEN {
+                                char_a => state_a
+                                __ => state_idle
+                            }
+
+                            -- STATE_A: Expect 'C'
+                            state_a => data |> WHEN {
+                                char_c => state_c1
+                                __ => state_idle  -- Invalid, reset
+                            }
+
+                            -- STATE_C1: Expect 'K'
+                            state_c1 => data |> WHEN {
+                                char_k => state_c2
+                                __ => state_idle  -- Invalid, reset
+                            }
+
+                            -- STATE_C2: Expect ' ' (space)
+                            state_c2 => data |> WHEN {
+                                char_space => state_space
+                                __ => state_idle  -- Invalid, reset
+                            }
+
+                            -- STATE_SPACE: Expect digit or newline
+                            state_space => BLOCK {
+                                is_digit: data |> is_ascii_digit()
+                                is_newline: data == char_newline
+
+                                is_digit |> WHEN {
+                                    True => state_num  -- Start accumulating number
+                                    False => is_newline |> WHEN {
+                                        True => state_idle  -- Done (trigger output)
+                                        False => state_idle  -- Invalid char
+                                    }
+                                }
+                            }
+
+                            -- STATE_NUM: Accumulate digits or finish on newline
+                            state_num => BLOCK {
+                                is_digit: data |> is_ascii_digit()
+                                is_newline: data == char_newline
+
+                                is_digit |> WHEN {
+                                    True => state_num  -- Keep accumulating
+                                    False => is_newline |> WHEN {
+                                        True => state_idle  -- Done (trigger output)
+                                        False => state_idle  -- Invalid char
+                                    }
+                                }
+                            }
+
+                            -- Default: back to idle
+                            __ => state_idle
+                        }
+                        -- No valid data: hold state
+                        False => state
+                    }
+                }
+            }
+        }
+
+        -- ========================================
+        -- Duration Accumulator (milliseconds)
+        -- ========================================
+
+        duration_ms: BITS[32] { 10u0 } |> LATEST duration {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => BITS[32] { 10u0 }
+                    False => valid |> WHILE {
+                        True => state |> WHEN {
+                            -- Reset on entering IDLE
+                            state_idle => BITS[32] { 10u0 }
+
+                            -- First digit: replace with digit value
+                            state_space => BLOCK {
+                                is_digit: data |> is_ascii_digit()
+                                is_digit |> WHEN {
+                                    True => BLOCK {
+                                        digit_value: data |> ascii_digit_to_int()
+                                        digit_value |> Bits/zero_extend(width: 32)
+                                    }
+                                    False => BITS[32] { 10u0 }
+                                }
+                            }
+
+                            -- Subsequent digits: multiply by 10 and add
+                            state_num => BLOCK {
+                                is_digit: data |> is_ascii_digit()
+                                is_digit |> WHEN {
+                                    True => BLOCK {
+                                        digit_value: data |> ascii_digit_to_int() |> Bits/zero_extend(width: 32)
+                                        ten: BITS[32] { 10u10 }
+
+                                        -- duration * 10 + digit
+                                        -- PROPOSED: Decimal/accumulate(duration, digit)
+                                        duration_times_10: duration |> Bits/multiply(ten)
+                                        duration_times_10 |> Bits/add(digit_value)
+                                    }
+                                    False => duration  -- Not a digit, keep current
+                                }
+                            }
+
+                            -- Other states: hold duration
+                            __ => duration
+                        }
+                        False => duration
+                    }
+                }
+            }
+        }
+
+        -- ========================================
+        -- Output Trigger
+        -- ========================================
+
+        -- Pulse trigger for one cycle when valid command received
+        trigger: False |> LATEST trigger {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => False
+                    False => valid |> WHILE {
+                        True => BLOCK {
+                            -- Trigger on newline in STATE_SPACE or STATE_NUM
+                            is_newline: data == char_newline
+                            in_number_state: (state == state_space) |> Bool/or(state == state_num)
+
+                            is_newline |> Bool/and(in_number_state)
+                        }
+                        False => False
+                    }
+                }
+            }
+        }
+
+        -- ========================================
+        -- Pulse Cycles Calculation
+        -- ========================================
+
+        -- Convert milliseconds to clock cycles when trigger asserted
+        pulse_cycles: BITS[32] { 10u0 } |> LATEST cycles {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => BITS[32] { 10u0 }
+                    False => trigger |> WHILE {
+                        True => duration_ms |> ms_to_cycles(clock_hz)
+                        False => cycles
+                    }
+                }
+            }
+        }
+
+        [
+            trigger: trigger
+            pulse_cycles: pulse_cycles
+        ]
+    }
+}

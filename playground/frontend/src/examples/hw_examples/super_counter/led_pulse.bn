@@ -1,0 +1,60 @@
+-- LED Pulse Generator
+-- Generates an LED pulse of configurable duration (in clock cycles)
+--
+-- When trigger is asserted, the LED turns on and stays on for
+-- pulse_cycles clock cycles, then turns off.
+--
+-- Pattern: Down-counter with conditional load and LED control
+-- - Uses LATEST for both counter and LED state
+-- - Counter decrements when non-zero
+-- - LED state depends on counter value
+--
+-- Translated from: super_counter_rust/hardware/src/led_pulse.v
+
+FUNCTION led_pulse(rst, trigger, pulse_cycles) {
+    BLOCK {
+        -- Counter state (32-bit down counter)
+        counter: BITS[32] { 10u0 } |> LATEST count {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => BITS[32] { 10u0 }
+                    False => trigger |> WHILE {
+                        -- Trigger: Load pulse_cycles into counter
+                        True => pulse_cycles
+                        False => count |> WHEN {
+                            -- Counter is zero: stay at zero
+                            BITS[32] { 10u0 } => BITS[32] { 10u0 }
+                            -- Counter is non-zero: decrement
+                            __ => count |> Bits/decrement()
+                        }
+                    }
+                }
+            }
+        }
+
+        -- LED state
+        -- LED is on when counter is non-zero
+        -- LED turns off when counter reaches 0
+        led_state: False |> LATEST led {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => False
+                    False => trigger |> WHILE {
+                        -- Trigger: Turn on LED
+                        True => True
+                        False => counter |> WHEN {
+                            -- Counter reached 0: Turn off LED
+                            BITS[32] { 10u0 } => False
+                            -- Counter is 1: Turn off LED (on next cycle)
+                            BITS[32] { 10u1 } => False
+                            -- Counter is non-zero: Keep LED on
+                            __ => True
+                        }
+                    }
+                }
+            }
+        }
+
+        [led: led_state]
+    }
+}

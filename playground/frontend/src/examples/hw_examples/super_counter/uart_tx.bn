@@ -1,0 +1,158 @@
+-- UART Transmitter (8N1 - 8 data bits, No parity, 1 stop bit)
+-- Transmits bytes serially at configurable baud rate
+--
+-- Protocol: START(0) + DATA[0:7] + STOP(1) = 10 bits total
+-- Idle line state: HIGH (1)
+--
+-- Pattern: FSM + Baud Rate Generator + Shift Register
+-- - Baud rate divider generates timing tick
+-- - FSM controls transmission state (idle/busy)
+-- - Shift register holds and shifts out bits
+--
+-- Translated from: super_counter_rust/hardware/src/uart_tx.v
+--
+-- Parameters:
+--   clock_hz: System clock frequency in Hz
+--   baud_rate: UART baud rate (bits per second)
+--   divisor_width: Bit width for baud divider counter
+--                  NOTE: Would be computed as $clog2(clock_hz/baud_rate) in future
+--                  For now, must be calculated manually:
+--                  - 115200 baud @ 25MHz: divisor=217, width=8
+--                  - 9600 baud @ 25MHz: divisor=2604, width=12
+--   data: 8-bit byte to transmit
+--   start: Pulse high to begin transmission (when not busy)
+-- Returns:
+--   busy: Transmitter is busy (transmission in progress)
+--   serial_out: Serial output line (idle=1, transmitting=0/1 bits)
+
+FUNCTION uart_tx(rst, data, start, clock_hz, baud_rate, divisor_width) {
+    BLOCK {
+        -- Compute baud rate divisor (clock_hz / baud_rate)
+        -- In real transpiler, would use: divisor_width = $clog2(divisor)
+        divisor: clock_hz / baud_rate
+        divisor_minus_1: divisor - 1
+
+        -- Baud rate divider (counts down from divisor-1 to 0)
+        -- Generates a tick every (1/baud_rate) seconds
+        baud_counter: BITS[divisor_width] { 10u0 } |> LATEST baud_cnt {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => divisor_minus_1 |> Bits/from_nat()
+                    False => busy |> WHILE {
+                        -- Transmitting: count down
+                        True => baud_cnt |> WHEN {
+                            BITS[divisor_width] { 10u0 } => divisor_minus_1 |> Bits/from_nat()
+                            __ => baud_cnt |> Bits/decrement()
+                        }
+                        -- Idle: reload counter
+                        False => divisor_minus_1 |> Bits/from_nat()
+                    }
+                }
+            }
+        }
+
+        -- Baud tick: true when counter reaches 0
+        baud_tick: baud_counter == BITS[divisor_width] { 10u0 }
+
+        -- Busy flag (FSM state: idle=False, transmitting=True)
+        busy: False |> LATEST busy {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => False
+                    False => busy |> WHILE {
+                        -- Currently idle
+                        False => start |> WHILE {
+                            True => True   -- Start transmission
+                            False => False -- Stay idle
+                        }
+                        -- Currently transmitting
+                        True => baud_tick |> WHILE {
+                            True => BLOCK {
+                                -- Check if this is the last bit (bit 9)
+                                last_bit: bit_idx == BITS[4] { 10u9 }
+                                last_bit |> WHEN {
+                                    True => False  -- Done, go idle
+                                    False => True  -- Keep transmitting
+                                }
+                            }
+                            False => True  -- Not a baud tick, stay busy
+                        }
+                    }
+                }
+            }
+        }
+
+        -- Bit index counter (0-9 for 10 bits)
+        bit_idx: BITS[4] { 10u0 } |> LATEST idx {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => BITS[4] { 10u0 }
+                    False => busy |> WHILE {
+                        -- Idle: reset counter
+                        False => start |> WHILE {
+                            True => BITS[4] { 10u0 }  -- Starting transmission
+                            False => BITS[4] { 10u0 } -- Stay at 0
+                        }
+                        -- Transmitting: increment on baud tick
+                        True => baud_tick |> WHILE {
+                            True => idx |> Bits/increment()
+                            False => idx
+                        }
+                    }
+                }
+            }
+        }
+
+        -- Shift register (10 bits: stop + data[7:0] + start)
+        -- Format: {stop_bit, data[7], data[6], ..., data[0], start_bit}
+        --       = {1'b1, data[7:0], 1'b0}
+        -- Shifts right on each baud tick, LSB goes to serial_out
+        shifter: BITS[10] { 2u1023 } |> LATEST shift {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => BITS[10] { 2u1023 }  -- All 1's (idle state)
+                    False => busy |> WHILE {
+                        -- Idle: load shifter on start
+                        False => start |> WHILE {
+                            True => BLOCK {
+                                -- Construct: {stop=1, data[7:0], start=0}
+                                -- = {1, data, 0} as 10-bit value
+                                start_bit: BITS[10] { 2u0 }     -- Start bit = 0
+                                data_bits: data |> Bits/zero_extend(width: 10)
+                                    |> Bits/shift_left(by: 1)   -- Shift data left by 1
+                                stop_bit: BITS[10] { 2u512 }    -- Bit 9 = 1 (stop bit)
+
+                                start_bit
+                                    |> Bits/or(data_bits)
+                                    |> Bits/or(stop_bit)
+                            }
+                            False => BITS[10] { 2u1023 }  -- All 1's
+                        }
+                        -- Transmitting: shift right on baud tick
+                        True => baud_tick |> WHILE {
+                            True => BLOCK {
+                                -- Shift right by 1, fill MSB with 1
+                                shifted: shift |> Bits/shift_right(by: 1)
+                                msb_set: BITS[10] { 2u512 }  -- Set bit 9 to 1
+                                shifted |> Bits/or(msb_set)
+                            }
+                            False => shift  -- Hold value
+                        }
+                    }
+                }
+            }
+        }
+
+        -- Serial output (LSB of shifter, or idle=1)
+        serial_out: busy |> WHILE {
+            False => True  -- Idle: line high
+            True => BLOCK {
+                -- Extract LSB of shifter
+                lsb: shifter |> Bits/and(BITS[10] { 2u1 })
+                lsb == BITS[10] { 2u1 }  -- Convert to Bool
+            }
+        }
+
+        [busy: busy, serial_out: serial_out]
+    }
+}

@@ -1,0 +1,368 @@
+-- Button Message Formatter
+-- Maintains BCD decimal counter and formats as ASCII UART message
+--
+-- On button press:
+--   1. Increments 16-bit binary counter (seq_value)
+--   2. Increments 5-digit BCD counter (00000-99999)
+--   3. Formats message: "BTN <number>\n" (variable length)
+--   4. Sends message byte-by-byte via UART
+--
+-- Example messages:
+--   "BTN 0\n"      (6 bytes)
+--   "BTN 42\n"     (7 bytes)
+--   "BTN 12345\n"  (11 bytes)
+--
+-- Pattern: BCD Arithmetic + Array Management + UART Handshake FSM
+-- - BCD increment with ripple carry (List/fold pattern)
+-- - Dynamic message formatting (based on significant digits)
+-- - Byte-by-byte transmission FSM
+-- - UART handshake (start/busy protocol)
+--
+-- Translated from: super_counter_rust/hardware/src/btn_message.v
+--
+-- PROPOSED API ADDITIONS (marked with -- PROPOSED):
+--   - BCD/increment() - BCD arithmetic helper
+--   - BCD/count_digits() - Count significant BCD digits
+--   - ASCII/from_digit() - Convert 0-9 to ASCII '0'-'9'
+--   - ASCII constants (CHAR_B, CHAR_T, etc.)
+--   - List/concat() - Concatenate multiple lists
+--   - List/reverse() - Reverse list order
+--
+-- Parameters:
+--   btn_pressed: Single-cycle pulse when button pressed
+--   uart_busy: UART transmitter is busy
+-- Returns:
+--   seq_value: 16-bit binary counter
+--   uart_data: Byte to send to UART
+--   uart_start: Pulse to start UART transmission
+
+FUNCTION btn_message(rst, btn_pressed, uart_busy) {
+    BLOCK {
+        -- ========================================
+        -- Helper Functions
+        -- ========================================
+
+        -- Convert BCD digit (0-9) to ASCII ('0'-'9')
+        -- PROPOSED: Move to ASCII module
+        FUNCTION ascii_from_digit(digit) {
+            digit |> WHEN {
+                BITS[4] { 10u0 } => BITS[8] { 16u30 }  -- '0'
+                BITS[4] { 10u1 } => BITS[8] { 16u31 }  -- '1'
+                BITS[4] { 10u2 } => BITS[8] { 16u32 }  -- '2'
+                BITS[4] { 10u3 } => BITS[8] { 16u33 }  -- '3'
+                BITS[4] { 10u4 } => BITS[8] { 16u34 }  -- '4'
+                BITS[4] { 10u5 } => BITS[8] { 16u35 }  -- '5'
+                BITS[4] { 10u6 } => BITS[8] { 16u36 }  -- '6'
+                BITS[4] { 10u7 } => BITS[8] { 16u37 }  -- '7'
+                BITS[4] { 10u8 } => BITS[8] { 16u38 }  -- '8'
+                BITS[4] { 10u9 } => BITS[8] { 16u39 }  -- '9'
+                __ => BITS[8] { 16u30 }  -- Default '0'
+            }
+        }
+
+        -- Increment BCD digit array with carry propagation
+        -- PROPOSED: Move to BCD module as BCD/increment()
+        FUNCTION bcd_increment(digits) {
+            -- digits: LIST[5] { BITS[4] } (little-endian: [0] = ones place)
+            -- Returns: LIST[5] { BITS[4] } (incremented)
+
+            digits |> List/fold(
+                init: [result: LIST[5] { }, carry: True]
+                digit, acc: BLOCK {
+                    new_state: acc.carry |> WHEN {
+                        True => digit |> WHEN {
+                            BITS[4] { 10u9 } => BLOCK {
+                                -- Digit is 9: wrap to 0, carry = 1
+                                [new_digit: BITS[4] { 10u0 }, carry: True]
+                            }
+                            __ => BLOCK {
+                                -- Digit < 9: increment, carry = 0
+                                [new_digit: digit |> Bits/increment(), carry: False]
+                            }
+                        }
+                        False => BLOCK {
+                            -- No carry: keep digit unchanged
+                            [new_digit: digit, carry: False]
+                        }
+                    }
+
+                    [
+                        result: acc.result |> List/append(new_state.new_digit)
+                        carry: new_state.carry
+                    ]
+                }
+            ).result
+        }
+
+        -- Count significant digits (leading zeros don't count)
+        -- PROPOSED: Move to BCD module as BCD/count_digits()
+        FUNCTION bcd_count_significant_digits(digits) {
+            -- Returns: 1-5 (always at least 1 digit shown)
+            digits |> List/get(index: 4) |> WHEN {
+                BITS[4] { 10u0 } => digits |> List/get(index: 3) |> WHEN {
+                    BITS[4] { 10u0 } => digits |> List/get(index: 2) |> WHEN {
+                        BITS[4] { 10u0 } => digits |> List/get(index: 1) |> WHEN {
+                            BITS[4] { 10u0 } => 1  -- Only ones digit
+                            __ => 2
+                        }
+                        __ => 3
+                    }
+                    __ => 4
+                }
+                __ => 5
+            }
+        }
+
+        -- Build message based on digit count
+        -- Format: "BTN <digits>\n"
+        FUNCTION build_message(digits, count) {
+            -- ASCII constants
+            -- PROPOSED: ASCII module constants
+            char_b: BITS[8] { 16u42 }       -- 'B'
+            char_t: BITS[8] { 16u54 }       -- 'T'
+            char_n: BITS[8] { 16u4E }       -- 'N'
+            char_space: BITS[8] { 16u20 }   -- ' '
+            char_newline: BITS[8] { 16u0A } -- '\n'
+
+            -- Build prefix "BTN "
+            prefix: LIST { char_b, char_t, char_n, char_space }
+
+            -- Build digit string (big-endian for display)
+            -- PROPOSED: List/concat(), List/reverse()
+            digit_chars: count |> WHEN {
+                5 => LIST {
+                    digits |> List/get(index: 4) |> ascii_from_digit()
+                    digits |> List/get(index: 3) |> ascii_from_digit()
+                    digits |> List/get(index: 2) |> ascii_from_digit()
+                    digits |> List/get(index: 1) |> ascii_from_digit()
+                    digits |> List/get(index: 0) |> ascii_from_digit()
+                }
+                4 => LIST {
+                    digits |> List/get(index: 3) |> ascii_from_digit()
+                    digits |> List/get(index: 2) |> ascii_from_digit()
+                    digits |> List/get(index: 1) |> ascii_from_digit()
+                    digits |> List/get(index: 0) |> ascii_from_digit()
+                }
+                3 => LIST {
+                    digits |> List/get(index: 2) |> ascii_from_digit()
+                    digits |> List/get(index: 1) |> ascii_from_digit()
+                    digits |> List/get(index: 0) |> ascii_from_digit()
+                }
+                2 => LIST {
+                    digits |> List/get(index: 1) |> ascii_from_digit()
+                    digits |> List/get(index: 0) |> ascii_from_digit()
+                }
+                __ => LIST {
+                    digits |> List/get(index: 0) |> ascii_from_digit()
+                }
+            }
+
+            suffix: LIST { char_newline }
+
+            -- PROPOSED: List/concat() to join lists
+            -- For now, manually build fixed-size array (10 bytes max)
+            -- Pad with zeros (won't be sent if idx > last_idx)
+            [
+                msg: LIST {
+                    prefix |> List/get(index: 0)  -- 'B'
+                    prefix |> List/get(index: 1)  -- 'T'
+                    prefix |> List/get(index: 2)  -- 'N'
+                    prefix |> List/get(index: 3)  -- ' '
+                    digit_chars |> List/get_or_default(index: 0, default: BITS[8] { 10u0 })
+                    digit_chars |> List/get_or_default(index: 1, default: BITS[8] { 10u0 })
+                    digit_chars |> List/get_or_default(index: 2, default: BITS[8] { 10u0 })
+                    digit_chars |> List/get_or_default(index: 3, default: BITS[8] { 10u0 })
+                    digit_chars |> List/get_or_default(index: 4, default: BITS[8] { 10u0 })
+                    char_newline
+                }
+                last_idx: 3 + count  -- "BTN " (4) + digits + "\n" (1) - 1
+            ]
+        }
+
+        -- ========================================
+        -- State Machine
+        -- ========================================
+
+        -- FSM States
+        state_idle: False
+        state_send: True
+
+        state: state_idle |> LATEST state {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => state_idle
+                    False => state |> WHEN {
+                        state_idle => btn_pressed |> WHEN {
+                            True => state_send
+                            False => state_idle
+                        }
+                        state_send => BLOCK {
+                            done_sending: (idx == last_idx) |> Bool/and(waiting_busy) |> Bool/and(uart_busy)
+                            done_sending |> WHEN {
+                                True => state_idle
+                                False => state_send
+                            }
+                        }
+                        __ => state_idle
+                    }
+                }
+            }
+        }
+
+        -- ========================================
+        -- Counters
+        -- ========================================
+
+        -- Binary counter (16-bit, for tracking total presses)
+        seq_value: BITS[16] { 10u0 } |> LATEST seq {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => BITS[16] { 10u0 }
+                    False => BLOCK {
+                        in_idle: state == state_idle
+                        in_idle |> Bool/and(btn_pressed) |> WHEN {
+                            True => seq |> Bits/increment()
+                            False => seq
+                        }
+                    }
+                }
+            }
+        }
+
+        -- BCD counter (5 digits, little-endian)
+        bcd_digits: LIST[5] { BITS[4] { 10u0 } } |> LATEST digits {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => LIST[5] { BITS[4] { 10u0 } }
+                    False => BLOCK {
+                        in_idle: state == state_idle
+                        in_idle |> Bool/and(btn_pressed) |> WHEN {
+                            True => digits |> bcd_increment()
+                            False => digits
+                        }
+                    }
+                }
+            }
+        }
+
+        -- ========================================
+        -- Message Formatting
+        -- ========================================
+
+        -- Format message on button press (in idle state)
+        -- NOTE: This would be combinational in real hardware, but we model
+        -- it as a register that updates when entering SEND state
+
+        msg_and_last: [msg: LIST[10] { BITS[8] { 10u0 } }, last_idx: 5] |> LATEST formatted {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => [
+                        msg: LIST[10] { BITS[8] { 10u0 } }
+                        last_idx: 5  -- "BTN 0\n" = 6 bytes, last index = 5
+                    ]
+                    False => BLOCK {
+                        in_idle: state == state_idle
+                        in_idle |> Bool/and(btn_pressed) |> WHEN {
+                            True => BLOCK {
+                                -- Count significant digits
+                                digit_count: bcd_digits |> bcd_count_significant_digits()
+
+                                -- Build message
+                                bcd_digits |> build_message(digit_count)
+                            }
+                            False => formatted
+                        }
+                    }
+                }
+            }
+        }
+
+        msg: msg_and_last.msg
+        last_idx: msg_and_last.last_idx
+
+        -- ========================================
+        -- UART Transmission FSM
+        -- ========================================
+
+        -- Byte index (which byte we're sending, 0-9)
+        idx: BITS[4] { 10u0 } |> LATEST index {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => BITS[4] { 10u0 }
+                    False => state |> WHEN {
+                        state_idle => btn_pressed |> WHEN {
+                            True => BITS[4] { 10u0 }  -- Reset index when starting
+                            False => index
+                        }
+                        state_send => BLOCK {
+                            -- Increment index after UART accepts byte
+                            should_increment: waiting_busy |> Bool/and(uart_busy)
+                            should_increment |> WHEN {
+                                True => index |> Bits/increment()
+                                False => index
+                            }
+                        }
+                        __ => index
+                    }
+                }
+            }
+        }
+
+        -- Handshake state: waiting for UART to assert busy
+        waiting_busy: False |> LATEST waiting {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => False
+                    False => state |> WHEN {
+                        state_idle => btn_pressed |> WHEN {
+                            True => False  -- Reset when starting
+                            False => waiting
+                        }
+                        state_send => BLOCK {
+                            can_start: uart_busy |> Bool/not() |> Bool/and(waiting |> Bool/not())
+                            uart_accepted: waiting |> Bool/and(uart_busy)
+
+                            can_start |> WHEN {
+                                True => True   -- Pulse start, wait for busy
+                                False => uart_accepted |> WHEN {
+                                    True => False  -- UART accepted, done waiting
+                                    False => waiting  -- Keep current state
+                                }
+                            }
+                        }
+                        __ => waiting
+                    }
+                }
+            }
+        }
+
+        -- ========================================
+        -- Outputs
+        -- ========================================
+
+        -- UART data (current byte to send)
+        uart_data: msg |> List/get_or_default(index: idx |> Bits/to_nat(), default: BITS[8] { 10u0 })
+
+        -- UART start pulse (one cycle when ready to send)
+        uart_start_pulse: False |> LATEST start_pulse {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => False
+                    False => state |> WHEN {
+                        state_send => BLOCK {
+                            can_start: uart_busy |> Bool/not() |> Bool/and(waiting_busy |> Bool/not())
+                            can_start
+                        }
+                        __ => False
+                    }
+                }
+            }
+        }
+
+        [
+            seq_value: seq_value
+            uart_data: uart_data
+            uart_start: uart_start_pulse
+        ]
+    }
+}

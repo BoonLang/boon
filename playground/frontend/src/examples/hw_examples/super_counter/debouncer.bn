@@ -1,0 +1,112 @@
+-- Mechanical Button Debouncer with CDC Synchronizer
+-- Outputs a single-cycle pulse when a button press is detected
+--
+-- Pattern: CDC (Clock Domain Crossing) + Debounce Counter
+-- - 2-FF synchronizer for metastability protection (CDC pattern)
+-- - Counter-based debouncing (waits for stable signal)
+-- - One-cycle pulse output on successful press
+--
+-- CDC Pattern (from REMAINING_FEATURES_EMERGENCE.md:104-117):
+--   Two cascaded registers to safely bring async button signal
+--   into clock domain. This prevents metastability.
+--
+-- Debounce Pattern:
+--   Counter increments when button state != stable state
+--   When counter reaches max (all 1's), accept new stable state
+--   Output pulse only on transition to pressed (1'b0 -> 1'b1)
+--
+-- Translated from: super_counter_rust/hardware/src/debouncer.v
+--
+-- Parameters:
+--   btn_n: Active-low button input (async, external signal)
+--   cntr_width: Counter width (typically 18-20 bits for ~10-20ms @ 1-10MHz)
+-- Returns:
+--   pressed: Single-cycle pulse when button press detected
+
+FUNCTION debouncer(btn_n, cntr_width) {
+    BLOCK {
+        -- CDC Synchronizer (2-FF chain)
+        -- Stage 1: First register (may go metastable!)
+        sync_0: btn_n |> LATEST s0 {
+            PASSED.clk |> THEN { btn_n }
+        }
+
+        -- Stage 2: Second register (metastability resolved)
+        sync_1: sync_0 |> LATEST s1 {
+            PASSED.clk |> THEN { sync_0 }
+        }
+
+        -- Safe synchronized signal (active-high after inversion)
+        btn: sync_1 |> Bool/not()
+
+        -- Debounce state machine
+        -- stable: Last accepted stable button state
+        stable: False |> LATEST stable {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => False
+                    False => BLOCK {
+                        -- Check if counter reached max (all 1's)
+                        counter_max: counter |> Bits/all_ones()
+
+                        counter_max |> WHEN {
+                            True => btn  -- Accept new stable state
+                            False => stable  -- Keep current stable state
+                        }
+                    }
+                }
+            }
+        }
+
+        -- Debounce counter
+        -- Increments when btn != stable, resets when btn == stable
+        counter: BITS[cntr_width] { 10u0 } |> LATEST count {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => BITS[cntr_width] { 10u0 }
+                    False => BLOCK {
+                        btn_changed: btn != stable
+
+                        btn_changed |> WHEN {
+                            -- Button state differs from stable: increment counter
+                            True => BLOCK {
+                                counter_max: count |> Bits/all_ones()
+                                counter_max |> WHEN {
+                                    -- Counter maxed out: reset (will update stable)
+                                    True => BITS[cntr_width] { 10u0 }
+                                    -- Keep counting
+                                    False => count |> Bits/increment()
+                                }
+                            }
+                            -- Button state matches stable: reset counter
+                            False => BITS[cntr_width] { 10u0 }
+                        }
+                    }
+                }
+            }
+        }
+
+        -- Output pulse: Single-cycle pulse on transition to pressed
+        -- Only pulse when:
+        --   1. Counter reached max (counter_max == True)
+        --   2. New stable state is pressed (btn == True)
+        --   3. Previous stable state was not pressed (stable == False)
+        pressed_pulse: False |> LATEST pressed {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => False
+                    False => BLOCK {
+                        counter_max: counter |> Bits/all_ones()
+                        transitioning: counter_max
+                            |> Bool/and(btn)        -- New state is pressed
+                            |> Bool/and(stable |> Bool/not())  -- Was not pressed
+
+                        transitioning
+                    }
+                }
+            }
+        }
+
+        [pressed: pressed_pulse]
+    }
+}
