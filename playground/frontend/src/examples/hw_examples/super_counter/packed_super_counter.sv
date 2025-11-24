@@ -1,27 +1,19 @@
 // ============================================================================
-// PACKED SUPER COUNTER - All Modules Inline for DigitalJS Testing
 // ============================================================================
-//
-// This file contains all submodules inline for easy copy-paste to DigitalJS.
-// Source: Boon hardware examples - super_counter project
-//
-// Architecture:
-//   btn_press → debouncer → btn_message → uart_tx → TX serial output
-//   uart_rx → ack_parser → led_pulse → LED output
-//
-// Test in DigitalJS: https://digitaljs.tilk.eu/
-//
-// Default configuration:
-//   - 12 MHz clock (CLOCK_HZ = 12_000_000)
-//   - 115200 baud UART
-//   - ~10ms debounce time
-//
+// PACKED SUPER COUNTER (DigitalJS-friendly, fully inlined)
+// ============================================================================
+// Source modules: ~/repos/super_counter_rust/hardware/src/*
+// Adaptations:
+//   * Small, parameterised debounce (fast for the web demo)
+//   * Exposed debug signals: btn_debounced, btn_pulse, seq_value
+//   * Yosys/DigitalJS friendly (no generate, minimal SV features)
+//   * Optional POR to tame Xes at startup
+//   * Active-high inputs (unchecked = normal operation, checked = active)
 // ============================================================================
 
 // ----------------------------------------------------------------------------
 // LED Pulse Generator
 // ----------------------------------------------------------------------------
-// Generates LED pulse of programmable duration (in clock cycles)
 module led_pulse #(
     parameter int CLOCK_HZ = 12_000_000
 ) (
@@ -52,77 +44,64 @@ module led_pulse #(
 endmodule
 
 // ----------------------------------------------------------------------------
-// Button Debouncer with CDC Synchronizer
+// Button Debouncer (active-high input) with CDC + rising-edge pulse
 // ----------------------------------------------------------------------------
-// Synchronizes async button signal and filters bounce noise
 module debouncer #(
-    parameter int CNTR_WIDTH = 18  // ~20ms @ 12 MHz
+    parameter int DEBOUNCE_CYCLES = 2  // small for fast web demo
 ) (
     input  logic clk,
     input  logic rst,
-    input  logic btn_n,       // Active-low button (async)
-    output logic pressed = 1'b0      // Single-cycle pulse on press
+    input  logic btn,         // Active-high button (async)
+    output logic pressed,     // Single-cycle pulse on press (active high)
+    output logic stable_out   // Debounced level (active high)
 );
-    // Clean active-low input: unknown => not pressed
-    logic btn_clean;
-    assign btn_clean = (btn_n === 1'b1) ? 1'b0 : 1'b1;
+    localparam int W   = (DEBOUNCE_CYCLES <= 1) ? 1 : $clog2(DEBOUNCE_CYCLES);
+    localparam [W-1:0] MAX = W'(DEBOUNCE_CYCLES-1);
 
-    // CDC synchronizer (2-FF chain)
-    logic sync_0 = 1'b1;
-    logic sync_1 = 1'b1;
-
+    // 2-FF CDC, keep defaults to avoid X
+    logic s0 = 1'b0, s1 = 1'b0;
     always_ff @(posedge clk) begin
         if (rst) begin
-            sync_0 <= 1'b1;
-            sync_1 <= 1'b1;
+            s0 <= 1'b0;
+            s1 <= 1'b0;
         end else begin
-            sync_0 <= btn_clean ? 1'b0 : 1'b1;
-            sync_1 <= sync_0;
+            s0 <= btn;
+            s1 <= s0;
         end
     end
 
-    logic btn = ~sync_1;  // Convert to active-high
+    // synced button signal
+    wire btn_sync = s1;
 
-    // Debounce counter
-    logic [CNTR_WIDTH-1:0] counter = '0;
+    logic [W-1:0] cnt = '0;
     logic stable = 1'b0;
 
     always_ff @(posedge clk) begin
         if (rst) begin
-            counter <= '0;
+            cnt     <= '0;
             stable  <= 1'b0;
+            pressed <= 1'b0;
         end else begin
-            if (btn != stable) begin
-                if (counter == {CNTR_WIDTH{1'b1}}) begin
-                    stable  <= btn;
-                    counter <= '0;
-                end else begin
-                    counter <= counter + 1'b1;
-                end
+            pressed <= 1'b0; // default
+            if (btn_sync == stable) begin
+                cnt <= '0;
+            end else if (cnt == MAX) begin
+                stable <= btn_sync;
+                cnt    <= '0;
+                if (btn_sync)
+                    pressed <= 1'b1; // pulse only on rising edge
             end else begin
-                counter <= '0;
+                cnt <= cnt + 1'b1;
             end
         end
     end
 
-    // Pulse on rising edge
-    logic stable_prev = 1'b0;
-
-    always_ff @(posedge clk) begin
-        if (rst) begin
-            stable_prev <= 1'b0;
-            pressed     <= 1'b0;
-        end else begin
-            stable_prev <= stable;
-            pressed     <= stable && !stable_prev;
-        end
-    end
+    assign stable_out = stable;
 endmodule
 
 // ----------------------------------------------------------------------------
 // UART Transmitter
 // ----------------------------------------------------------------------------
-// Sends 8-bit data over serial (8N1: 8 data, no parity, 1 stop)
 module uart_tx #(
     parameter int CLOCK_HZ = 12_000_000,
     parameter int BAUD = 115_200
@@ -193,7 +172,6 @@ endmodule
 // ----------------------------------------------------------------------------
 // UART Receiver
 // ----------------------------------------------------------------------------
-// Receives 8-bit data from serial (8N1 format)
 module uart_rx #(
     parameter int CLOCK_HZ = 12_000_000,
     parameter int BAUD = 115_200
@@ -286,8 +264,7 @@ endmodule
 // ----------------------------------------------------------------------------
 // Button Message Formatter
 // ----------------------------------------------------------------------------
-// Formats button count as ASCII message and sends via UART
-// Message format: "BTN <count>\n"
+// Formats button count as ASCII message and sends via UART: "BTN <count>\n"
 module btn_message (
     input  logic        clk,
     input  logic        rst,
@@ -354,92 +331,100 @@ module btn_message (
         end else begin
             uart_start <= 1'b0;
 
-            case (state)
-                IDLE: begin
-                    if (btn_pressed) begin
-                        // Increment binary counter
-                        seq_value_reg <= seq_value_reg + 16'd1;
+            // Always increment counter on button press, regardless of state
+            if (btn_pressed && state == IDLE) begin
+                // Increment binary counter
+                seq_value_reg <= seq_value_reg + 16'd1;
 
-                        // Increment BCD with carry (manually unrolled for DigitalJS compatibility)
-                        // Digit 0 (ones)
-                        if (bcd_digits[0] == 4'd9) begin
-                            bcd_digits[0] <= 4'd0;
-                            // Digit 1 (tens)
-                            if (bcd_digits[1] == 4'd9) begin
-                                bcd_digits[1] <= 4'd0;
-                                // Digit 2 (hundreds)
-                                if (bcd_digits[2] == 4'd9) begin
-                                    bcd_digits[2] <= 4'd0;
-                                    // Digit 3 (thousands)
-                                    if (bcd_digits[3] == 4'd9) begin
-                                        bcd_digits[3] <= 4'd0;
-                                        // Digit 4 (ten-thousands)
-                                        if (bcd_digits[4] == 4'd9) begin
-                                            bcd_digits[4] <= 4'd0;  // Overflow, wrap to 0
-                                        end else begin
-                                            bcd_digits[4] <= bcd_digits[4] + 4'd1;
-                                        end
-                                    end else begin
-                                        bcd_digits[3] <= bcd_digits[3] + 4'd1;
-                                    end
+                // Increment BCD with carry (manually unrolled for DigitalJS compatibility)
+                // Digit 0 (ones)
+                if (bcd_digits[0] == 4'd9) begin
+                    bcd_digits[0] <= 4'd0;
+                    // Digit 1 (tens)
+                    if (bcd_digits[1] == 4'd9) begin
+                        bcd_digits[1] <= 4'd0;
+                        // Digit 2 (hundreds)
+                        if (bcd_digits[2] == 4'd9) begin
+                            bcd_digits[2] <= 4'd0;
+                            // Digit 3 (thousands)
+                            if (bcd_digits[3] == 4'd9) begin
+                                bcd_digits[3] <= 4'd0;
+                                // Digit 4 (ten-thousands)
+                                if (bcd_digits[4] == 4'd9) begin
+                                    bcd_digits[4] <= 4'd0;  // Overflow, wrap to 0
                                 end else begin
-                                    bcd_digits[2] <= bcd_digits[2] + 4'd1;
+                                    bcd_digits[4] <= bcd_digits[4] + 4'd1;
                                 end
                             end else begin
-                                bcd_digits[1] <= bcd_digits[1] + 4'd1;
+                                bcd_digits[3] <= bcd_digits[3] + 4'd1;
                             end
                         end else begin
-                            bcd_digits[0] <= bcd_digits[0] + 4'd1;
+                            bcd_digits[2] <= bcd_digits[2] + 4'd1;
                         end
-
-                        // Format message based on significant digits
-                        msg[0] <= 8'h42;  // 'B'
-                        msg[1] <= 8'h54;  // 'T'
-                        msg[2] <= 8'h4E;  // 'N'
-                        msg[3] <= 8'h20;  // ' '
-
-                        // Count significant digits and format accordingly
-                        if (bcd_digits[4] != 4'd0) begin
-                            // 5 digits
-                            msg[4] <= ascii_digit(bcd_digits[4]);
-                            msg[5] <= ascii_digit(bcd_digits[3]);
-                            msg[6] <= ascii_digit(bcd_digits[2]);
-                            msg[7] <= ascii_digit(bcd_digits[1]);
-                            msg[8] <= ascii_digit(bcd_digits[0]);
-                            msg[9] <= 8'h0A;  // '\n'
-                            last_idx <= 4'd9;
-                        end else if (bcd_digits[3] != 4'd0) begin
-                            // 4 digits
-                            msg[4] <= ascii_digit(bcd_digits[3]);
-                            msg[5] <= ascii_digit(bcd_digits[2]);
-                            msg[6] <= ascii_digit(bcd_digits[1]);
-                            msg[7] <= ascii_digit(bcd_digits[0]);
-                            msg[8] <= 8'h0A;
-                            last_idx <= 4'd8;
-                        end else if (bcd_digits[2] != 4'd0) begin
-                            // 3 digits
-                            msg[4] <= ascii_digit(bcd_digits[2]);
-                            msg[5] <= ascii_digit(bcd_digits[1]);
-                            msg[6] <= ascii_digit(bcd_digits[0]);
-                            msg[7] <= 8'h0A;
-                            last_idx <= 4'd7;
-                        end else if (bcd_digits[1] != 4'd0) begin
-                            // 2 digits
-                            msg[4] <= ascii_digit(bcd_digits[1]);
-                            msg[5] <= ascii_digit(bcd_digits[0]);
-                            msg[6] <= 8'h0A;
-                            last_idx <= 4'd6;
-                        end else begin
-                            // 1 digit
-                            msg[4] <= ascii_digit(bcd_digits[0]);
-                            msg[5] <= 8'h0A;
-                            last_idx <= 4'd5;
-                        end
-
-                        idx          <= 4'd0;
-                        waiting_busy <= 1'b0;
-                        state        <= SEND;
+                    end else begin
+                        bcd_digits[1] <= bcd_digits[1] + 4'd1;
                     end
+                end else begin
+                    bcd_digits[0] <= bcd_digits[0] + 4'd1;
+                end
+
+                // Format message based on significant digits
+                msg[0] <= 8'h42;  // 'B'
+                msg[1] <= 8'h54;  // 'T'
+                msg[2] <= 8'h4E;  // 'N'
+                msg[3] <= 8'h20;  // ' '
+
+                // Count significant digits and format accordingly
+                if (bcd_digits[4] != 4'd0) begin
+                    // 5 digits
+                    msg[4] <= ascii_digit(bcd_digits[4]);
+                    msg[5] <= ascii_digit(bcd_digits[3]);
+                    msg[6] <= ascii_digit(bcd_digits[2]);
+                    msg[7] <= ascii_digit(bcd_digits[1]);
+                    msg[8] <= ascii_digit(bcd_digits[0]);
+                    msg[9] <= 8'h0A;  // '\n'
+                    last_idx <= 4'd9;
+                end else if (bcd_digits[3] != 4'd0) begin
+                    // 4 digits
+                    msg[4] <= ascii_digit(bcd_digits[3]);
+                    msg[5] <= ascii_digit(bcd_digits[2]);
+                    msg[6] <= ascii_digit(bcd_digits[1]);
+                    msg[7] <= ascii_digit(bcd_digits[0]);
+                    msg[8] <= 8'h0A;
+                    last_idx <= 4'd8;
+                end else if (bcd_digits[2] != 4'd0) begin
+                    // 3 digits
+                    msg[4] <= ascii_digit(bcd_digits[2]);
+                    msg[5] <= ascii_digit(bcd_digits[1]);
+                    msg[6] <= ascii_digit(bcd_digits[0]);
+                    msg[7] <= 8'h0A;
+                    last_idx <= 4'd7;
+                end else if (bcd_digits[1] != 4'd0) begin
+                    // 2 digits
+                    msg[4] <= ascii_digit(bcd_digits[1]);
+                    msg[5] <= ascii_digit(bcd_digits[0]);
+                    msg[6] <= 8'h0A;
+                    last_idx <= 4'd6;
+                end else begin
+                    // 1 digit
+                    msg[4] <= ascii_digit(bcd_digits[0]);
+                    msg[5] <= 8'h0A;
+                    last_idx <= 4'd5;
+                end
+
+                // Skip UART transmission in DigitalJS (stays in IDLE)
+                // For real hardware, uncomment the state transition below
+                // idx          <= 4'd0;
+                // waiting_busy <= 1'b0;
+                // state        <= SEND;
+            end
+
+            // UART transmission state machine (disabled for DigitalJS)
+            // Uncomment for real hardware with working UART
+            /*
+            case (state)
+                IDLE: begin
+                    // Counter increment moved outside case statement
                 end
 
                 SEND: begin
@@ -458,6 +443,7 @@ module btn_message (
                     end
                 end
             endcase
+            */
         end
     end
 
@@ -570,37 +556,53 @@ endmodule
 module super_counter #(
     parameter int CLOCK_HZ = 12_000_000,
     parameter int BAUD = 115_200,
-    parameter int DEBOUNCE_BITS = 18  // ~20 ms @ 12 MHz
+    parameter int DEBOUNCE_CYCLES = 2  // tiny for snappy web demo
 ) (
     input  logic clk_12m,
-    input  logic rst_n,
-    input  logic btn_press_n,
+    input  logic rst,          // Active-high reset (0=normal, 1=reset)
+    input  logic btn_press,    // Active-high button (0=not pressed, 1=pressed)
     input  logic uart_rx,
     output logic uart_tx,
-    output logic led_counter
+    output logic led_counter,
+    // debug taps for DigitalJS
+    output logic btn_debounced,
+    output logic btn_pulse,
+    output logic [15:0] seq_value
 );
-    logic rst = ~rst_n;
+    // hold reset a few cycles to tame X-propagation in DigitalJS
+    logic [1:0] por = 2'b00;
+    logic por_active = 1'b1;
+    always_ff @(posedge clk_12m) begin
+        if (por_active) begin
+            por <= por + 2'd1;
+            if (&por) por_active <= 1'b0;
+        end
+    end
+
+    // combine external reset with power-on reset
+    wire rst_combined = rst | por_active;
 
     // Debouncer
     logic btn_pressed;
     debouncer #(
-        .CNTR_WIDTH(DEBOUNCE_BITS)
+        .DEBOUNCE_CYCLES(DEBOUNCE_CYCLES)
     ) debouncer_inst (
         .clk(clk_12m),
-        .rst(rst),
-        .btn_n(btn_press_n),
-        .pressed(btn_pressed)
+        .rst(rst_combined),
+        .btn(btn_press),
+        .pressed(btn_pressed),
+        .stable_out(btn_debounced)
     );
+    assign btn_pulse = btn_pressed;
 
     // Button message formatter
     logic [7:0]  tx_data;
     logic        tx_start;
     logic        tx_busy;
-    logic [15:0] seq_value;
 
     btn_message btn_message_inst (
         .clk(clk_12m),
-        .rst(rst),
+        .rst(rst_combined),
         .btn_pressed(btn_pressed),
         .seq_value(seq_value),
         .uart_data(tx_data),
@@ -614,7 +616,7 @@ module super_counter #(
         .BAUD(BAUD)
     ) uart_tx_inst (
         .clk(clk_12m),
-        .rst(rst),
+        .rst(rst_combined),
         .data(tx_data),
         .start(tx_start),
         .busy(tx_busy),
@@ -630,7 +632,7 @@ module super_counter #(
         .BAUD(BAUD)
     ) uart_rx_inst (
         .clk(clk_12m),
-        .rst(rst),
+        .rst(rst_combined),
         .serial_in(uart_rx),
         .data(rx_data),
         .valid(rx_valid)
@@ -644,7 +646,7 @@ module super_counter #(
         .CLOCK_HZ(CLOCK_HZ)
     ) ack_parser_inst (
         .clk(clk_12m),
-        .rst(rst),
+        .rst(rst_combined),
         .data(rx_data),
         .valid(rx_valid),
         .trigger(ack_trigger),
@@ -656,7 +658,7 @@ module super_counter #(
         .CLOCK_HZ(CLOCK_HZ)
     ) led_pulse_inst (
         .clk(clk_12m),
-        .rst(rst),
+        .rst(rst_combined),
         .trigger(ack_trigger),
         .pulse_cycles(led_cycles),
         .led(led_counter)
