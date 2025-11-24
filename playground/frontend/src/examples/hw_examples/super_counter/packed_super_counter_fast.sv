@@ -59,32 +59,42 @@ module debouncer #(
     input  logic clk,
     input  logic rst,
     input  logic btn,           // Active-high button input
-    output logic pressed,       // Single-cycle pulse on press
+    output logic pressed = 1'b0,       // Single-cycle pulse on press
     output logic stable_out     // Debounced stable state
 );
     localparam CNTR_WIDTH = $clog2(DEBOUNCE_CYCLES);
-    logic [CNTR_WIDTH-1:0] counter;
-    logic btn_sync;
-    logic btn_debounced;
-    logic btn_debounced_prev;
+    localparam [CNTR_WIDTH-1:0] DEBOUNCE_MAX = CNTR_WIDTH'(DEBOUNCE_CYCLES - 1);
+
+    // Treat unknown button values as 0 to avoid X-propagation in DigitalJS
+    logic btn_clean;
+    assign btn_clean = (btn === 1'b1);
+
+    // Known power-on state keeps DigitalJS from oscillating before reset
+    logic [CNTR_WIDTH-1:0] counter       = '0;
+    logic btn_sync_0                     = 1'b0;
+    logic btn_sync_1                     = 1'b0;
+    logic btn_debounced                  = 1'b0;
+    logic btn_debounced_prev             = 1'b0;
 
     always_ff @(posedge clk) begin
         if (rst) begin
-            btn_sync <= 1'b0;
+            btn_sync_0 <= 1'b0;
+            btn_sync_1 <= 1'b0;
             btn_debounced <= 1'b0;
             btn_debounced_prev <= 1'b0;
             counter <= '0;
             pressed <= 1'b0;
         end else begin
-            // Step 1: Synchronize button input
-            btn_sync <= btn;
+            // Step 1: 2‑FF synchronizer for async button
+            btn_sync_0 <= btn_clean;
+            btn_sync_1 <= btn_sync_0;
 
             // Step 2: Debounce logic
-            if (btn_sync == btn_debounced) begin
+            if (btn_sync_1 == btn_debounced) begin
                 counter <= '0;
             end else begin
-                if (counter == DEBOUNCE_CYCLES - 1) begin
-                    btn_debounced <= btn_sync;
+                if (counter == DEBOUNCE_MAX) begin
+                    btn_debounced <= btn_sync_1;
                     counter <= '0;
                 end else begin
                     counter <= counter + 1'b1;

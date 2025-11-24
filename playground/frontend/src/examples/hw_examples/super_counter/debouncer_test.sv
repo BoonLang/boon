@@ -1,4 +1,5 @@
-// Simple debouncer test - isolate the debouncer to verify it works
+// Minimal debouncer test for DigitalJS
+// 2‑FF sync, 2‑cycle debounce, single edge counter
 
 module debouncer_test (
     input  logic clk_12m,
@@ -8,40 +9,38 @@ module debouncer_test (
     output logic btn_pulse,
     output logic [7:0] pulse_count
 );
-    // Debouncer instance
-    logic pressed;
-    logic stable;
-
-    debouncer #(
-        .DEBOUNCE_CYCLES(16)
-    ) deb (
-        .clk(clk_12m),
-        .rst(rst),
-        .btn(btn_press),
-        .pressed(pressed),
-        .stable_out(stable)
-    );
-
-    // Counter for pulses
-    logic [7:0] counter;
-
+    // small POR (4 cycles) so startup is defined
+    logic [1:0] por = 2'b00;
+    logic por_active = 1'b1;
     always_ff @(posedge clk_12m) begin
-        if (rst) begin
-            counter <= 8'd0;
-        end else if (pressed) begin
-            counter <= counter + 8'd1;
+        if (por_active) begin
+            por <= por + 2'd1;
+            if (&por) por_active <= 1'b0;
         end
     end
+    wire rst_i = rst | por_active;
 
-    assign btn_debounced = stable;
-    assign btn_pulse = pressed;
-    assign pulse_count = counter;
+    // debounce + one-cycle pulse on a clean rising edge
+    logic pulse;
+    debouncer #(.DEBOUNCE_CYCLES(2)) db (
+        .clk(clk_12m), .rst(rst_i), .btn(btn_press),
+        .pressed(pulse), .stable_out(btn_debounced)
+    );
 
+    // count pulses directly (already single-cycle)
+    always_ff @(posedge clk_12m or posedge rst_i) begin
+        if (rst_i)
+            pulse_count <= 8'd0;
+        else if (pulse)
+            pulse_count <= pulse_count + 8'd1;
+    end
+
+    assign btn_pulse = pulse;
 endmodule
 
-// Debouncer module (copy from packed_super_counter_fast.sv)
+// 2‑FF sync, debounce counter, rising-edge pulse
 module debouncer #(
-    parameter int DEBOUNCE_CYCLES = 16
+    parameter int DEBOUNCE_CYCLES = 2
 ) (
     input  logic clk,
     input  logic rst,
@@ -49,40 +48,37 @@ module debouncer #(
     output logic pressed,
     output logic stable_out
 );
-    localparam CNTR_WIDTH = $clog2(DEBOUNCE_CYCLES);
-    logic [CNTR_WIDTH-1:0] counter;
-    logic btn_sync;
-    logic btn_debounced;
-    logic btn_debounced_prev;
+    localparam int W = (DEBOUNCE_CYCLES <= 1) ? 1 : $clog2(DEBOUNCE_CYCLES);
+    localparam [W-1:0] MAX = W'(DEBOUNCE_CYCLES-1);
 
-    always_ff @(posedge clk) begin
+    logic s0, s1;
+    logic [W-1:0] cnt;
+    logic stable;
+
+    always_ff @(posedge clk or posedge rst) begin
         if (rst) begin
-            btn_sync <= 1'b0;
-            btn_debounced <= 1'b0;
-            btn_debounced_prev <= 1'b0;
-            counter <= '0;
+            s0 <= 1'b0;
+            s1 <= 1'b0;
+            cnt <= '0;
+            stable <= 1'b0;
             pressed <= 1'b0;
         end else begin
-            // Step 1: Synchronize button input
-            btn_sync <= btn;
+            s0 <= btn;
+            s1 <= s0;
+            pressed <= 1'b0;  // default
 
-            // Step 2: Debounce logic
-            if (btn_sync == btn_debounced) begin
-                counter <= '0;
+            if (s1 == stable) begin
+                cnt <= '0;
+            end else if (cnt == MAX) begin
+                stable <= s1;
+                cnt <= '0;
+                if (s1)         // pulse only on rising edge
+                    pressed <= 1'b1;
             end else begin
-                if (counter == DEBOUNCE_CYCLES - 1) begin
-                    btn_debounced <= btn_sync;
-                    counter <= '0;
-                end else begin
-                    counter <= counter + 1'b1;
-                end
+                cnt <= cnt + 1'b1;
             end
-
-            // Step 3: Edge detection
-            btn_debounced_prev <= btn_debounced;
-            pressed <= btn_debounced && !btn_debounced_prev;
         end
     end
 
-    assign stable_out = btn_debounced;
+    assign stable_out = stable;
 endmodule

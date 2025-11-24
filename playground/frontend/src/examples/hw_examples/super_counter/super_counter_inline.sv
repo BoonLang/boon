@@ -31,9 +31,14 @@ module super_counter_inline (
     // Debounce parameters
     localparam DEBOUNCE_CYCLES = 16;
     localparam LED_CYCLES = 100;
+    localparam CNTR_WIDTH = $clog2(DEBOUNCE_CYCLES);
+    localparam [CNTR_WIDTH-1:0] DEBOUNCE_MAX = CNTR_WIDTH'(DEBOUNCE_CYCLES - 1);
 
     // Debounce state
-    logic [$clog2(DEBOUNCE_CYCLES)-1:0] debounce_counter;
+    logic btn_clean;
+    assign btn_clean = (btn_press === 1'b1);
+
+    logic [CNTR_WIDTH-1:0] debounce_counter;
     logic btn_sync;
     logic btn_stable;
     logic btn_stable_prev;
@@ -61,7 +66,7 @@ module super_counter_inline (
             // ================================================================
             // Step 1: Synchronize button input (CDC)
             // ================================================================
-            btn_sync <= btn_press;
+            btn_sync <= btn_clean;
 
             // ================================================================
             // Step 2: Debounce logic
@@ -71,7 +76,7 @@ module super_counter_inline (
                 debounce_counter <= '0;
             end else begin
                 // Button changed - count cycles
-                if (debounce_counter == DEBOUNCE_CYCLES - 1) begin
+                if (debounce_counter == DEBOUNCE_MAX) begin
                     // Enough cycles - accept new state
                     btn_stable <= btn_sync;
                     debounce_counter <= '0;

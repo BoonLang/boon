@@ -52,24 +52,28 @@ module debouncer #(
     input  logic clk,
     input  logic rst,
     input  logic btn_n,
-    output logic pressed
+    output logic pressed = 1'b0
 );
-    logic sync_0, sync_1;
+    logic btn_clean;
+    assign btn_clean = (btn_n === 1'b1) ? 1'b0 : 1'b1; // active-low input; unknown -> not pressed
+
+    logic sync_0 = 1'b1;
+    logic sync_1 = 1'b1;
 
     always_ff @(posedge clk) begin
         if (rst) begin
             sync_0 <= 1'b1;
             sync_1 <= 1'b1;
         end else begin
-            sync_0 <= btn_n;
+            sync_0 <= btn_clean ? 1'b0 : 1'b1; // already active-low cleaned
             sync_1 <= sync_0;
         end
     end
 
     logic btn = ~sync_1;
 
-    logic [CNTR_WIDTH-1:0] counter;
-    logic stable;
+    logic [CNTR_WIDTH-1:0] counter = '0;
+    logic stable = 1'b0;
 
     always_ff @(posedge clk) begin
         if (rst) begin
@@ -89,7 +93,7 @@ module debouncer #(
         end
     end
 
-    logic stable_prev;
+    logic stable_prev = 1'b0;
 
     always_ff @(posedge clk) begin
         if (rst) begin
