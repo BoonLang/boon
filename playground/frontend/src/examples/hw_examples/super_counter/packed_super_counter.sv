@@ -9,13 +9,16 @@
 //   * Yosys/DigitalJS friendly (no generate, minimal SV features)
 //   * Optional POR to tame Xes at startup
 //   * Active-high inputs (unchecked = normal operation, checked = active)
+//   * FAST_SIM mode: UART uses divisor=4 for quick DigitalJS testing
+//     - DigitalJS: Set FAST_SIM=1 (default) - UART completes in ~40 clocks
+//     - Real HW:   Set FAST_SIM=0 - UART uses correct baud rate timing
 // ============================================================================
 
 // ----------------------------------------------------------------------------
 // LED Pulse Generator
 // ----------------------------------------------------------------------------
 module led_pulse #(
-    parameter int CLOCK_HZ = 12_000_000
+    parameter CLOCK_HZ = 12_000_000
 ) (
     input  logic        clk,
     input  logic        rst,
@@ -47,7 +50,7 @@ endmodule
 // Button Debouncer (active-high input) with CDC + rising-edge pulse
 // ----------------------------------------------------------------------------
 module debouncer #(
-    parameter int DEBOUNCE_CYCLES = 2  // small for fast web demo
+    parameter DEBOUNCE_CYCLES = 2  // small for fast web demo
 ) (
     input  logic clk,
     input  logic rst,
@@ -55,7 +58,7 @@ module debouncer #(
     output logic pressed,     // Single-cycle pulse on press (active high)
     output logic stable_out   // Debounced level (active high)
 );
-    localparam int W   = (DEBOUNCE_CYCLES <= 1) ? 1 : $clog2(DEBOUNCE_CYCLES);
+    localparam W   = (DEBOUNCE_CYCLES <= 1) ? 1 : $clog2(DEBOUNCE_CYCLES);
     localparam [W-1:0] MAX = W'(DEBOUNCE_CYCLES-1);
 
     // 2-FF CDC, keep defaults to avoid X
@@ -103,8 +106,9 @@ endmodule
 // UART Transmitter
 // ----------------------------------------------------------------------------
 module uart_tx #(
-    parameter int CLOCK_HZ = 12_000_000,
-    parameter int BAUD = 115_200
+    parameter CLOCK_HZ = 12_000_000,
+    parameter BAUD = 115_200,
+    parameter FAST_SIM = 0  // Use tiny divisor for DigitalJS simulation
 ) (
     input  logic       clk,
     input  logic       rst,
@@ -113,8 +117,10 @@ module uart_tx #(
     output logic       busy,        // Transmitting flag
     output logic       serial_out   // Serial output (TX)
 );
-    localparam int DIVISOR = CLOCK_HZ / BAUD;
-    localparam int CTR_WIDTH = $clog2(DIVISOR);
+    // For DigitalJS: use divisor=4 (completes in ~40 clocks)
+    // For real hardware: use correct baud rate divisor
+    localparam DIVISOR = FAST_SIM ? 4 : (CLOCK_HZ / BAUD);
+    localparam CTR_WIDTH = $clog2(DIVISOR);
 
     // Baud rate generator
     logic [CTR_WIDTH-1:0] baud_counter;
@@ -173,8 +179,9 @@ endmodule
 // UART Receiver
 // ----------------------------------------------------------------------------
 module uart_rx #(
-    parameter int CLOCK_HZ = 12_000_000,
-    parameter int BAUD = 115_200
+    parameter CLOCK_HZ = 12_000_000,
+    parameter BAUD = 115_200,
+    parameter FAST_SIM = 0  // Use tiny divisor for DigitalJS simulation
 ) (
     input  logic       clk,
     input  logic       rst,
@@ -182,8 +189,10 @@ module uart_rx #(
     output logic [7:0] data,        // Received data
     output logic       valid        // Data valid pulse (one cycle)
 );
-    localparam int DIVISOR = CLOCK_HZ / BAUD;
-    localparam int CTR_WIDTH = $clog2(DIVISOR);
+    // For DigitalJS: use divisor=4 (completes in ~40 clocks)
+    // For real hardware: use correct baud rate divisor
+    localparam DIVISOR = FAST_SIM ? 4 : (CLOCK_HZ / BAUD);
+    localparam CTR_WIDTH = $clog2(DIVISOR);
 
     // CDC synchronizer
     logic sync_0, sync_1, serial;
@@ -412,19 +421,16 @@ module btn_message (
                     last_idx <= 4'd5;
                 end
 
-                // Skip UART transmission in DigitalJS (stays in IDLE)
-                // For real hardware, uncomment the state transition below
-                // idx          <= 4'd0;
-                // waiting_busy <= 1'b0;
-                // state        <= SEND;
+                // Transition to SEND state to transmit via UART
+                idx          <= 4'd0;
+                waiting_busy <= 1'b0;
+                state        <= SEND;
             end
 
-            // UART transmission state machine (disabled for DigitalJS)
-            // Uncomment for real hardware with working UART
-            /*
+            // UART transmission state machine
             case (state)
                 IDLE: begin
-                    // Counter increment moved outside case statement
+                    // Counter increment handled above
                 end
 
                 SEND: begin
@@ -443,7 +449,6 @@ module btn_message (
                     end
                 end
             endcase
-            */
         end
     end
 
@@ -455,7 +460,7 @@ endmodule
 // ----------------------------------------------------------------------------
 // Parses "ACK <duration_ms>\n" command from UART
 module ack_parser #(
-    parameter int CLOCK_HZ = 12_000_000
+    parameter CLOCK_HZ = 12_000_000
 ) (
     input  logic        clk,
     input  logic        rst,
@@ -554,9 +559,10 @@ endmodule
 // TOP LEVEL - Super Counter
 // ============================================================================
 module super_counter #(
-    parameter int CLOCK_HZ = 12_000_000,
-    parameter int BAUD = 115_200,
-    parameter int DEBOUNCE_CYCLES = 2  // tiny for snappy web demo
+    parameter CLOCK_HZ = 12_000_000,
+    parameter BAUD = 115_200,
+    parameter DEBOUNCE_CYCLES = 2,  // tiny for snappy web demo
+    parameter FAST_SIM = 1          // Enable fast UART for DigitalJS (set to 0 for real hardware)
 ) (
     input  logic clk_12m,
     input  logic rst,          // Active-high reset (0=normal, 1=reset)
@@ -613,7 +619,8 @@ module super_counter #(
     // UART transmitter
     uart_tx #(
         .CLOCK_HZ(CLOCK_HZ),
-        .BAUD(BAUD)
+        .BAUD(BAUD),
+        .FAST_SIM(FAST_SIM)
     ) uart_tx_inst (
         .clk(clk_12m),
         .rst(rst_combined),
@@ -629,7 +636,8 @@ module super_counter #(
 
     uart_rx #(
         .CLOCK_HZ(CLOCK_HZ),
-        .BAUD(BAUD)
+        .BAUD(BAUD),
+        .FAST_SIM(FAST_SIM)
     ) uart_rx_inst (
         .clk(clk_12m),
         .rst(rst_combined),
