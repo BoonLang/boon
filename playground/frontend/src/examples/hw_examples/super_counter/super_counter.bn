@@ -1,0 +1,641 @@
+-- Super Counter - UART-based button counter with LED acknowledgment
+--
+-- Protocol:
+--   TX: "BTN <seq>\n"  - Button press with sequence number (1-99999)
+--   RX: "ACK <ms>\n"   - Flash LED for <ms> milliseconds
+--
+-- Architecture:
+--   btn → debouncer → btn_message → uart_tx → TX
+--   RX → uart_rx → ack_parser → led_pulse → LED
+
+-- ============================================================================
+-- Configuration
+-- ============================================================================
+
+Config: [
+    clock_hz: 12_000_000
+    baud: 115_200
+    debounce_ms: 20
+]
+
+-- Derived constants
+baud_divisor: Config.clock_hz / Config.baud
+debounce_cycles: Config.clock_hz / 1000 * Config.debounce_ms
+
+-- ============================================================================
+-- Top-Level Module
+-- ============================================================================
+
+FUNCTION super_counter(rst_n, btn_n, uart_rx_i) {
+    BLOCK {
+        rst: rst_n |> Bool/not()
+
+        -- Debouncer
+        debounced: debouncer(rst: rst, btn_n: btn_n)
+
+        -- Button message generator
+        msg: btn_message(rst: rst, btn_pressed: debounced.pressed, tx_busy: tx.busy)
+
+        -- UART transmitter
+        tx: uart_tx(rst: rst, data: msg.tx_data, start: msg.tx_start)
+
+        -- UART receiver
+        rx: uart_rx(rst: rst, rx: uart_rx_i)
+
+        -- ACK parser
+        ack: ack_parser(rst: rst, rx_data: rx.data, rx_valid: rx.valid)
+
+        -- LED pulse generator
+        led: led_pulse(rst: rst, trigger: ack.trigger, cycles: ack.pulse_cycles)
+
+        [uart_tx_o: tx.tx, led_o: led.led]
+    }
+}
+
+-- ============================================================================
+-- Debouncer - CDC synchronizer + counter-based debounce filter
+-- ============================================================================
+
+FUNCTION debouncer(rst, btn_n) {
+    BLOCK {
+        -- CDC synchronizer (2-FF chain)
+        sync_0: True |> LATEST s0 {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => True
+                    False => btn_n
+                }
+            }
+        }
+
+        sync_1: True |> LATEST s1 {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => True
+                    False => sync_0
+                }
+            }
+        }
+
+        -- Active high button signal
+        btn: sync_1 |> Bool/not()
+
+        -- Debounce counter and stable state
+        state: [counter: BITS[20] { 10u0 }, stable: False, pressed: False]
+            |> LATEST state {
+                PASSED.clk |> THEN {
+                    rst |> WHILE {
+                        True => [counter: BITS[20] { 10u0 }, stable: False, pressed: False]
+                        False => btn |> Bits/equal(state.stable |> Bool/to_u_bit()) |> WHILE {
+                            -- Button matches stable: reset counter
+                            True => [counter: BITS[20] { 10u0 }, stable: state.stable, pressed: False]
+                            -- Button differs: count up
+                            False => state.counter |> Bits/equal(BITS[20] { 10u262143 }) |> WHILE {
+                                -- Counter maxed: update stable, generate press pulse
+                                True => [
+                                    counter: BITS[20] { 10u0 }
+                                    stable: btn
+                                    pressed: btn
+                                ]
+                                -- Still counting
+                                False => [
+                                    counter: state.counter |> Bits/add(BITS[20] { 10u1 })
+                                    stable: state.stable
+                                    pressed: False
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+
+        [pressed: state.pressed]
+    }
+}
+
+-- ============================================================================
+-- UART Transmitter - 8N1
+-- ============================================================================
+
+FUNCTION uart_tx(rst, data, start) {
+    BLOCK {
+        -- Baud rate generator state
+        baud_state: [cnt: BITS[8] { 10u0 }, tick: False] |> LATEST bs {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => [cnt: BITS[8] { 10u103 }, tick: False]
+                    False => bs.cnt |> Bits/equal(BITS[8] { 10u0 }) |> WHILE {
+                        True => [cnt: BITS[8] { 10u103 }, tick: True]
+                        False => [cnt: bs.cnt |> Bits/subtract(BITS[8] { 10u1 }), tick: False]
+                    }
+                }
+            }
+        }
+
+        -- Transmit state machine
+        tx_state: [busy: False, shifter: BITS[10] { 16u3FF }, bit_idx: BITS[4] { 10u0 }, tx: True]
+            |> LATEST ts {
+                PASSED.clk |> THEN {
+                    rst |> WHILE {
+                        True => [busy: False, shifter: BITS[10] { 16u3FF }, bit_idx: BITS[4] { 10u0 }, tx: True]
+                        False => ts.busy |> WHILE {
+                            -- Idle: wait for start
+                            False => start |> WHILE {
+                                True => [
+                                    busy: True
+                                    shifter: BITS[10] {
+                                        BITS[1] { 10u0 }    -- start bit
+                                        data                 -- 8 data bits
+                                        BITS[1] { 10u1 }    -- stop bit
+                                    }
+                                    bit_idx: BITS[4] { 10u0 }
+                                    tx: True
+                                ]
+                                False => [busy: False, shifter: ts.shifter, bit_idx: ts.bit_idx, tx: True]
+                            }
+                            -- Busy: transmit on baud tick
+                            True => baud_state.tick |> WHILE {
+                                True => ts.bit_idx |> Bits/equal(BITS[4] { 10u9 }) |> WHILE {
+                                    -- Done transmitting
+                                    True => [busy: False, shifter: ts.shifter, bit_idx: BITS[4] { 10u0 }, tx: True]
+                                    -- Shift out next bit
+                                    False => [
+                                        busy: True
+                                        shifter: ts.shifter |> Bits/shift_right(by: 1)
+                                        bit_idx: ts.bit_idx |> Bits/add(BITS[4] { 10u1 })
+                                        tx: ts.shifter |> Bits/get(index: 0)
+                                    ]
+                                }
+                                False => ts
+                            }
+                        }
+                    }
+                }
+            }
+
+        [busy: tx_state.busy, tx: tx_state.tx]
+    }
+}
+
+-- ============================================================================
+-- UART Receiver - 8N1 with CDC and mid-bit sampling
+-- ============================================================================
+
+FUNCTION uart_rx(rst, rx) {
+    BLOCK {
+        -- CDC synchronizer
+        sync_0: True |> LATEST s0 {
+            PASSED.clk |> THEN {
+                rst |> WHILE { True => True, False => rx }
+            }
+        }
+
+        sync_1: True |> LATEST s1 {
+            PASSED.clk |> THEN {
+                rst |> WHILE { True => True, False => sync_0 }
+            }
+        }
+
+        rx_sync: sync_1
+
+        -- Receiver state machine
+        rx_state: [busy: False, baud_cnt: BITS[8] { 10u0 }, bit_idx: BITS[4] { 10u0 },
+                   shifter: BITS[8] { 10u0 }, data: BITS[8] { 10u0 }, valid: False]
+            |> LATEST rs {
+                PASSED.clk |> THEN {
+                    rst |> WHILE {
+                        True => [busy: False, baud_cnt: BITS[8] { 10u0 }, bit_idx: BITS[4] { 10u0 },
+                                 shifter: BITS[8] { 10u0 }, data: BITS[8] { 10u0 }, valid: False]
+                        False => BLOCK {
+                            -- Clear valid flag by default
+                            base_state: [
+                                busy: rs.busy, baud_cnt: rs.baud_cnt, bit_idx: rs.bit_idx,
+                                shifter: rs.shifter, data: rs.data, valid: False
+                            ]
+
+                            rs.busy |> WHILE {
+                                -- Idle: wait for start bit
+                                False => rx_sync |> WHILE {
+                                    False => [
+                                        busy: True
+                                        baud_cnt: BITS[8] { 10u51 }  -- Half period for mid-bit
+                                        bit_idx: BITS[4] { 10u0 }
+                                        shifter: BITS[8] { 10u0 }
+                                        data: rs.data
+                                        valid: False
+                                    ]
+                                    True => base_state
+                                }
+                                -- Busy: sample bits
+                                True => rs.baud_cnt |> Bits/equal(BITS[8] { 10u0 }) |> WHILE {
+                                    -- Baud tick: sample bit
+                                    True => rs.bit_idx |> Bits/less_than(BITS[4] { 10u8 }) |> WHILE {
+                                        -- Data bits
+                                        True => [
+                                            busy: True
+                                            baud_cnt: BITS[8] { 10u103 }
+                                            bit_idx: rs.bit_idx |> Bits/add(BITS[4] { 10u1 })
+                                            shifter: rs.shifter |> Bits/shift_right(by: 1)
+                                                |> Bits/set(index: 7, value: rx_sync)
+                                            data: rs.data
+                                            valid: False
+                                        ]
+                                        -- Stop bit
+                                        False => rx_sync |> WHILE {
+                                            True => [
+                                                busy: False, baud_cnt: BITS[8] { 10u0 },
+                                                bit_idx: BITS[4] { 10u0 }, shifter: BITS[8] { 10u0 },
+                                                data: rs.shifter, valid: True
+                                            ]
+                                            False => [
+                                                busy: False, baud_cnt: BITS[8] { 10u0 },
+                                                bit_idx: BITS[4] { 10u0 }, shifter: BITS[8] { 10u0 },
+                                                data: rs.data, valid: False
+                                            ]
+                                        }
+                                    }
+                                    -- Count down
+                                    False => [
+                                        busy: True
+                                        baud_cnt: rs.baud_cnt |> Bits/subtract(BITS[8] { 10u1 })
+                                        bit_idx: rs.bit_idx
+                                        shifter: rs.shifter
+                                        data: rs.data
+                                        valid: False
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+        [data: rx_state.data, valid: rx_state.valid]
+    }
+}
+
+-- ============================================================================
+-- Button Message Generator - Sends "BTN <seq>\n" over UART
+-- ============================================================================
+
+-- FSM states
+BtnMsgState: [Idle, Send, Wait]
+
+FUNCTION btn_message(rst, btn_pressed, tx_busy) {
+    BLOCK {
+        -- ASCII helpers
+        FUNCTION digit_to_ascii(d) {
+            BITS[8] { 16u30 } |> Bits/add(d |> Bits/zero_extend(to: 8))
+        }
+
+        -- State machine
+        msg_state: [
+            fsm: Idle
+            seq: BITS[17] { 10u0 }
+            bcd: [BITS[4] { 10u0 }, BITS[4] { 10u0 }, BITS[4] { 10u0 }, BITS[4] { 10u0 }, BITS[4] { 10u0 }]
+            msg: LIST[10] { BITS[8] { 10u0 } }
+            msg_len: BITS[4] { 10u6 }
+            msg_idx: BITS[4] { 10u0 }
+            tx_data: BITS[8] { 10u0 }
+            tx_start: False
+        ] |> LATEST st {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => [
+                        fsm: Idle, seq: BITS[17] { 10u0 },
+                        bcd: [BITS[4] { 10u0 }, BITS[4] { 10u0 }, BITS[4] { 10u0 }, BITS[4] { 10u0 }, BITS[4] { 10u0 }],
+                        msg: LIST[10] { BITS[8] { 10u0 } },
+                        msg_len: BITS[4] { 10u6 }, msg_idx: BITS[4] { 10u0 },
+                        tx_data: BITS[8] { 10u0 }, tx_start: False
+                    ]
+                    False => st.fsm |> WHEN {
+                        Idle => btn_pressed |> WHILE {
+                            False => [
+                                fsm: Idle, seq: st.seq, bcd: st.bcd, msg: st.msg,
+                                msg_len: st.msg_len, msg_idx: st.msg_idx,
+                                tx_data: st.tx_data, tx_start: False
+                            ]
+                            True => BLOCK {
+                                -- Increment BCD counter
+                                new_bcd: bcd_increment(st.bcd)
+
+                                -- Count significant digits
+                                n_digits: new_bcd |> List/get(index: 4) |> Bits/not_equal(BITS[4] { 10u0 }) |> WHILE {
+                                    True => 5
+                                    False => new_bcd |> List/get(index: 3) |> Bits/not_equal(BITS[4] { 10u0 }) |> WHILE {
+                                        True => 4
+                                        False => new_bcd |> List/get(index: 2) |> Bits/not_equal(BITS[4] { 10u0 }) |> WHILE {
+                                            True => 3
+                                            False => new_bcd |> List/get(index: 1) |> Bits/not_equal(BITS[4] { 10u0 }) |> WHILE {
+                                                True => 2
+                                                False => 1
+                                            }
+                                        }
+                                    }
+                                }
+
+                                -- Build message
+                                new_msg: build_btn_message(new_bcd, n_digits)
+
+                                [
+                                    fsm: Send
+                                    seq: st.seq |> Bits/add(BITS[17] { 10u1 })
+                                    bcd: new_bcd
+                                    msg: new_msg.msg
+                                    msg_len: new_msg.len
+                                    msg_idx: BITS[4] { 10u0 }
+                                    tx_data: BITS[8] { 10u0 }
+                                    tx_start: False
+                                ]
+                            }
+                        }
+
+                        Send => tx_busy |> WHILE {
+                            True => st  -- Wait for TX to be ready
+                            False => [
+                                fsm: Wait
+                                seq: st.seq, bcd: st.bcd, msg: st.msg,
+                                msg_len: st.msg_len, msg_idx: st.msg_idx,
+                                tx_data: st.msg |> List/get(index: st.msg_idx |> Bits/to_number())
+                                tx_start: True
+                            ]
+                        }
+
+                        Wait => tx_busy |> WHILE {
+                            False => st  -- Wait for TX to start
+                            True => st.msg_idx |> Bits/equal(st.msg_len |> Bits/subtract(BITS[4] { 10u1 })) |> WHILE {
+                                True => [
+                                    fsm: Idle, seq: st.seq, bcd: st.bcd, msg: st.msg,
+                                    msg_len: st.msg_len, msg_idx: BITS[4] { 10u0 },
+                                    tx_data: st.tx_data, tx_start: False
+                                ]
+                                False => [
+                                    fsm: Send, seq: st.seq, bcd: st.bcd, msg: st.msg,
+                                    msg_len: st.msg_len, msg_idx: st.msg_idx |> Bits/add(BITS[4] { 10u1 }),
+                                    tx_data: st.tx_data, tx_start: False
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        [tx_data: msg_state.tx_data, tx_start: msg_state.tx_start]
+    }
+}
+
+-- BCD increment helper
+FUNCTION bcd_increment(bcd) {
+    BLOCK {
+        -- Ripple carry BCD increment
+        d0_next: bcd |> List/get(index: 0) |> Bits/equal(BITS[4] { 10u9 }) |> WHILE {
+            True => BITS[4] { 10u0 }
+            False => bcd |> List/get(index: 0) |> Bits/add(BITS[4] { 10u1 })
+        }
+        c0: bcd |> List/get(index: 0) |> Bits/equal(BITS[4] { 10u9 })
+
+        d1_next: c0 |> WHILE {
+            False => bcd |> List/get(index: 1)
+            True => bcd |> List/get(index: 1) |> Bits/equal(BITS[4] { 10u9 }) |> WHILE {
+                True => BITS[4] { 10u0 }
+                False => bcd |> List/get(index: 1) |> Bits/add(BITS[4] { 10u1 })
+            }
+        }
+        c1: c0 |> Bool/and(that: bcd |> List/get(index: 1) |> Bits/equal(BITS[4] { 10u9 }))
+
+        d2_next: c1 |> WHILE {
+            False => bcd |> List/get(index: 2)
+            True => bcd |> List/get(index: 2) |> Bits/equal(BITS[4] { 10u9 }) |> WHILE {
+                True => BITS[4] { 10u0 }
+                False => bcd |> List/get(index: 2) |> Bits/add(BITS[4] { 10u1 })
+            }
+        }
+        c2: c1 |> Bool/and(that: bcd |> List/get(index: 2) |> Bits/equal(BITS[4] { 10u9 }))
+
+        d3_next: c2 |> WHILE {
+            False => bcd |> List/get(index: 3)
+            True => bcd |> List/get(index: 3) |> Bits/equal(BITS[4] { 10u9 }) |> WHILE {
+                True => BITS[4] { 10u0 }
+                False => bcd |> List/get(index: 3) |> Bits/add(BITS[4] { 10u1 })
+            }
+        }
+        c3: c2 |> Bool/and(that: bcd |> List/get(index: 3) |> Bits/equal(BITS[4] { 10u9 }))
+
+        d4_next: c3 |> WHILE {
+            False => bcd |> List/get(index: 4)
+            True => bcd |> List/get(index: 4) |> Bits/equal(BITS[4] { 10u9 }) |> WHILE {
+                True => BITS[4] { 10u0 }
+                False => bcd |> List/get(index: 4) |> Bits/add(BITS[4] { 10u1 })
+            }
+        }
+
+        [d0_next, d1_next, d2_next, d3_next, d4_next]
+    }
+}
+
+-- Build "BTN <digits>\n" message
+FUNCTION build_btn_message(bcd, n_digits) {
+    BLOCK {
+        FUNCTION d2a(d) { BITS[8] { 16u30 } |> Bits/add(d |> Bits/zero_extend(to: 8)) }
+
+        B: BITS[8] { 16u42 }
+        T: BITS[8] { 16u54 }
+        N: BITS[8] { 16u4E }
+        SPACE: BITS[8] { 16u20 }
+        NEWLINE: BITS[8] { 16u0A }
+
+        n_digits |> WHEN {
+            5 => [
+                msg: [B, T, N, SPACE,
+                      d2a(bcd |> List/get(index: 4)),
+                      d2a(bcd |> List/get(index: 3)),
+                      d2a(bcd |> List/get(index: 2)),
+                      d2a(bcd |> List/get(index: 1)),
+                      d2a(bcd |> List/get(index: 0)),
+                      NEWLINE]
+                len: BITS[4] { 10u10 }
+            ]
+            4 => [
+                msg: [B, T, N, SPACE,
+                      d2a(bcd |> List/get(index: 3)),
+                      d2a(bcd |> List/get(index: 2)),
+                      d2a(bcd |> List/get(index: 1)),
+                      d2a(bcd |> List/get(index: 0)),
+                      NEWLINE,
+                      BITS[8] { 10u0 }]
+                len: BITS[4] { 10u9 }
+            ]
+            3 => [
+                msg: [B, T, N, SPACE,
+                      d2a(bcd |> List/get(index: 2)),
+                      d2a(bcd |> List/get(index: 1)),
+                      d2a(bcd |> List/get(index: 0)),
+                      NEWLINE,
+                      BITS[8] { 10u0 }, BITS[8] { 10u0 }]
+                len: BITS[4] { 10u8 }
+            ]
+            2 => [
+                msg: [B, T, N, SPACE,
+                      d2a(bcd |> List/get(index: 1)),
+                      d2a(bcd |> List/get(index: 0)),
+                      NEWLINE,
+                      BITS[8] { 10u0 }, BITS[8] { 10u0 }, BITS[8] { 10u0 }]
+                len: BITS[4] { 10u7 }
+            ]
+            __ => [
+                msg: [B, T, N, SPACE,
+                      d2a(bcd |> List/get(index: 0)),
+                      NEWLINE,
+                      BITS[8] { 10u0 }, BITS[8] { 10u0 }, BITS[8] { 10u0 }, BITS[8] { 10u0 }]
+                len: BITS[4] { 10u6 }
+            ]
+        }
+    }
+}
+
+-- ============================================================================
+-- ACK Parser - Parses "ACK <ms>\n" and triggers LED pulse
+-- ============================================================================
+
+AckState: [Idle, GotA, GotC, GotK, GotSpace, GotNum]
+
+FUNCTION ack_parser(rst, rx_data, rx_valid) {
+    BLOCK {
+        -- Character constants
+        CHAR_A: BITS[8] { 16u41 }
+        CHAR_C: BITS[8] { 16u43 }
+        CHAR_K: BITS[8] { 16u4B }
+        CHAR_SPACE: BITS[8] { 16u20 }
+        CHAR_0: BITS[8] { 16u30 }
+        CHAR_9: BITS[8] { 16u39 }
+        CHAR_NEWLINE: BITS[8] { 16u0A }
+
+        -- Helper: check if digit
+        FUNCTION is_digit(ch) {
+            ch |> Bits/greater_equal(CHAR_0) |> Bool/and(that: ch |> Bits/less_equal(CHAR_9))
+        }
+
+        -- Helper: ASCII to digit value
+        FUNCTION to_digit(ch) {
+            ch |> Bits/subtract(CHAR_0) |> Bits/slice(high: 3, low: 0)
+        }
+
+        -- Helper: ms to cycles
+        FUNCTION ms_to_cycles(ms) {
+            ms |> Bits/multiply(BITS[32] { 10u12000 })  -- 12MHz / 1000
+        }
+
+        -- Parser state
+        parser_state: [
+            fsm: Idle
+            duration_ms: BITS[32] { 10u0 }
+            trigger: False
+            pulse_cycles: BITS[32] { 10u0 }
+        ] |> LATEST ps {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => [fsm: Idle, duration_ms: BITS[32] { 10u0 }, trigger: False, pulse_cycles: BITS[32] { 10u0 }]
+                    False => BLOCK {
+                        -- Default: clear trigger
+                        base: [fsm: ps.fsm, duration_ms: ps.duration_ms, trigger: False, pulse_cycles: ps.pulse_cycles]
+
+                        rx_valid |> WHILE {
+                            False => base
+                            True => ps.fsm |> WHEN {
+                                Idle => rx_data |> Bits/equal(CHAR_A) |> WHILE {
+                                    True => [fsm: GotA, duration_ms: BITS[32] { 10u0 }, trigger: False, pulse_cycles: ps.pulse_cycles]
+                                    False => base
+                                }
+
+                                GotA => rx_data |> Bits/equal(CHAR_C) |> WHILE {
+                                    True => [fsm: GotC, duration_ms: ps.duration_ms, trigger: False, pulse_cycles: ps.pulse_cycles]
+                                    False => [fsm: Idle, duration_ms: ps.duration_ms, trigger: False, pulse_cycles: ps.pulse_cycles]
+                                }
+
+                                GotC => rx_data |> Bits/equal(CHAR_K) |> WHILE {
+                                    True => [fsm: GotK, duration_ms: ps.duration_ms, trigger: False, pulse_cycles: ps.pulse_cycles]
+                                    False => [fsm: Idle, duration_ms: ps.duration_ms, trigger: False, pulse_cycles: ps.pulse_cycles]
+                                }
+
+                                GotK => rx_data |> Bits/equal(CHAR_SPACE) |> WHILE {
+                                    True => [fsm: GotSpace, duration_ms: ps.duration_ms, trigger: False, pulse_cycles: ps.pulse_cycles]
+                                    False => [fsm: Idle, duration_ms: ps.duration_ms, trigger: False, pulse_cycles: ps.pulse_cycles]
+                                }
+
+                                GotSpace => is_digit(rx_data) |> WHILE {
+                                    True => [
+                                        fsm: GotNum
+                                        duration_ms: to_digit(rx_data) |> Bits/zero_extend(to: 32)
+                                        trigger: False
+                                        pulse_cycles: ps.pulse_cycles
+                                    ]
+                                    False => rx_data |> Bits/equal(CHAR_NEWLINE) |> WHILE {
+                                        True => [
+                                            fsm: Idle
+                                            duration_ms: BITS[32] { 10u0 }
+                                            trigger: True
+                                            pulse_cycles: ms_to_cycles(ps.duration_ms)
+                                        ]
+                                        False => [fsm: Idle, duration_ms: ps.duration_ms, trigger: False, pulse_cycles: ps.pulse_cycles]
+                                    }
+                                }
+
+                                GotNum => is_digit(rx_data) |> WHILE {
+                                    True => [
+                                        fsm: GotNum
+                                        duration_ms: ps.duration_ms |> Bits/multiply(BITS[32] { 10u10 })
+                                            |> Bits/add(to_digit(rx_data) |> Bits/zero_extend(to: 32))
+                                        trigger: False
+                                        pulse_cycles: ps.pulse_cycles
+                                    ]
+                                    False => rx_data |> Bits/equal(CHAR_NEWLINE) |> WHILE {
+                                        True => [
+                                            fsm: Idle
+                                            duration_ms: BITS[32] { 10u0 }
+                                            trigger: True
+                                            pulse_cycles: ms_to_cycles(ps.duration_ms)
+                                        ]
+                                        False => [fsm: Idle, duration_ms: ps.duration_ms, trigger: False, pulse_cycles: ps.pulse_cycles]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        [trigger: parser_state.trigger, pulse_cycles: parser_state.pulse_cycles]
+    }
+}
+
+-- ============================================================================
+-- LED Pulse Generator - Counts down from specified cycles
+-- ============================================================================
+
+FUNCTION led_pulse(rst, trigger, cycles) {
+    BLOCK {
+        state: [counter: BITS[32] { 10u0 }, led: False] |> LATEST st {
+            PASSED.clk |> THEN {
+                rst |> WHILE {
+                    True => [counter: BITS[32] { 10u0 }, led: False]
+                    False => trigger |> WHILE {
+                        -- Trigger: load counter and turn on LED
+                        True => [counter: cycles, led: True]
+                        -- No trigger: count down
+                        False => st.counter |> Bits/equal(BITS[32] { 10u0 }) |> WHILE {
+                            True => [counter: BITS[32] { 10u0 }, led: False]
+                            False => st.counter |> Bits/equal(BITS[32] { 10u1 }) |> WHILE {
+                                True => [counter: BITS[32] { 10u0 }, led: False]
+                                False => [counter: st.counter |> Bits/subtract(BITS[32] { 10u1 }), led: True]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        [led: state.led]
+    }
+}
