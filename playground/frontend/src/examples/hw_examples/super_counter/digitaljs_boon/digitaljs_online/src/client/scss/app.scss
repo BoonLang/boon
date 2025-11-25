@@ -1,0 +1,203 @@
+@import "~bootstrap/scss/bootstrap";
+@import "./global-vars.scss";
+
+@import "./split-gutters.module.scss";
+@import "./toolbar.module.scss";
+@import "./monitorbox.module.scss";
+@import "./editor.module.scss";
+@import "./tab-buttons.module.scss";
+
+body {
+    height: 100vh;
+}
+
+.main-wrapper-grid {
+    display: grid;
+    grid-template-rows: min-content 1fr;
+    height: 100%;
+}
+
+.grid {
+    display: grid;
+    grid-template-rows: 1fr 10px 0;
+    overflow: hidden;
+
+    &.monitor-open {
+        grid-template-rows: 4.5fr 10px 1fr;
+    }
+}
+
+.editor-circuit-wrapper {
+    display: grid;
+    grid-template-columns: 1fr 10px 1fr;
+    overflow-y: auto;
+}
+
+.tab-wrapper {
+    overflow: auto;
+}
+
+#paper {
+    height: 100%;
+
+    > div {
+        min-width: 100%;
+    }
+}
+
+.popover {
+    max-width: 600px !important;
+}
+
+div.tab-content form {
+    margin-bottom: 1em;
+}
+
+.CodeMirror {
+    height: auto !important;
+}
+
+.symbola {
+    font-family: "Symbola", $font-family-sans-serif;
+}
+
+.zoom-buttons-wrapper {
+    position: absolute;
+    right: 0;
+    margin: 1.5rem;
+    z-index: 1;
+}
+
+
+@media (max-width: $mobile-ui-max-width) {
+    .main-wrapper-grid {
+        grid-template-rows: min-content 1fr 0;
+        height: calc(100vh - 3.8rem);
+    }
+
+    .gutter-horizontal {
+        display: none;
+    }
+
+    .editor-circuit-wrapper {
+        display: block;
+        overflow-y: auto;
+    }
+
+    .tab-wrapper {
+        display: none;
+
+        &.active {
+            display: block;
+        }
+    }
+}
+
+/* UART Terminal Styles */
+.uart-terminal {
+    font-family: 'Courier New', Consolas, monospace;
+    background: #1e1e1e;
+    color: #d4d4d4;
+    padding: 10px;
+    border-radius: 4px;
+    margin-top: 15px;
+    font-size: 13px;
+}
+
+.uart-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #333;
+}
+
+.uart-title {
+    font-weight: bold;
+    color: #9cdcfe;
+}
+
+.uart-status {
+    display: flex;
+    gap: 8px;
+}
+
+.uart-indicator {
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: bold;
+    background: #333;
+    color: #666;
+
+    &.active {
+        color: #fff;
+    }
+
+    &.tx-indicator.active {
+        background: #4ec9b0;
+    }
+
+    &.rx-indicator.active {
+        background: #569cd6;
+    }
+}
+
+.uart-output {
+    height: 200px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    margin-bottom: 10px;
+    padding: 8px;
+    background: #0d0d0d;
+    border: 1px solid #333;
+    border-radius: 3px;
+}
+
+.uart-line {
+    line-height: 1.4;
+
+    &.uart-sent {
+        color: #569cd6;
+    }
+
+    &.uart-received {
+        color: #4ec9b0;
+    }
+
+    &.uart-error {
+        color: #f44747;
+        font-weight: bold;
+    }
+}
+
+.uart-input-wrapper {
+    display: flex;
+    align-items: center;
+    background: #252526;
+    border: 1px solid #333;
+    border-radius: 3px;
+}
+
+.uart-prompt {
+    padding: 6px 10px;
+    color: #569cd6;
+    user-select: none;
+}
+
+.uart-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: #d4d4d4;
+    padding: 6px;
+    font-family: inherit;
+    font-size: inherit;
+    outline: none;
+
+    &::placeholder {
+        color: #666;
+    }
+}

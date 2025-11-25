@@ -1,0 +1,15 @@
+{
+  "presets": [
+    [
+      "@babel/preset-env",
+      {
+        "targets": {
+          "node": true
+        },
+        "modules": "cjs",
+        "exclude": ["babel-plugin-transform-exponentiation-operator"]
+      }
+    ]
+  ],
+  "plugins": ["babel-plugin-add-import-extension", "babel-plugin-transform-import-meta"]
+}

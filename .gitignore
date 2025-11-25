@@ -1,3 +1,6 @@
 **/target
 .idea
 **/.DS_Store
+
+# DigitalJS development environment (cloned external repos)
+playground/frontend/src/examples/hw_examples/super_counter/digitaljs_boon/
