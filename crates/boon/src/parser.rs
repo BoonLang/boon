@@ -261,12 +261,174 @@ where
                 }),
         );
 
-        let when = just(Token::When).ignore_then(todo());
-        let while_ = just(Token::While).ignore_then(todo());
+        // Pattern parser for WHEN/WHILE arms
+        let pattern = recursive(|pattern| {
+            let pattern_wildcard = just(Token::Wildcard).map(|_| Pattern::WildCard);
+
+            let pattern_literal_number = select! { Token::Number(number) => Pattern::Literal(Literal::Number(number)) };
+            let pattern_literal_text = select! { Token::Text(text) => Pattern::Literal(Literal::Text(text)) };
+            let pattern_literal_tag = pascal_case_identifier.map(|tag| Pattern::Literal(Literal::Tag(tag)));
+
+            let pattern_alias = snake_case_identifier.map(|name| Pattern::Alias { name });
+
+            let pattern_variable = snake_case_identifier
+                .then(group((colon.clone(), pattern.clone())).or_not())
+                .map(|(name, value)| PatternVariable {
+                    name,
+                    value: value.map(|(_, v)| v),
+                });
+
+            let pattern_object = pattern_variable
+                .clone()
+                .separated_by(comma.clone().ignored().or(newlines.clone()))
+                .collect()
+                .delimited_by(
+                    bracket_square_open.clone().then(newlines.clone()),
+                    newlines.clone().then(bracket_square_close.clone()),
+                )
+                .map(|variables| Pattern::Object { variables });
+
+            let pattern_tagged_object = pascal_case_identifier
+                .then(
+                    pattern_variable
+                        .separated_by(comma.clone().ignored().or(newlines.clone()))
+                        .collect()
+                        .delimited_by(
+                            bracket_square_open.clone().then(newlines.clone()),
+                            newlines.clone().then(bracket_square_close.clone()),
+                        ),
+                )
+                .map(|(tag, variables)| Pattern::TaggedObject { tag, variables });
+
+            let pattern_list = just(Token::List)
+                .ignore_then(
+                    pattern
+                        .clone()
+                        .separated_by(comma.clone().ignored().or(newlines.clone()))
+                        .collect()
+                        .delimited_by(
+                            bracket_curly_open.clone().then(newlines.clone()),
+                            newlines.clone().then(bracket_curly_close.clone()),
+                        ),
+                )
+                .map(|items| Pattern::List { items });
+
+            choice((
+                pattern_wildcard,
+                pattern_list,
+                pattern_tagged_object,
+                pattern_object,
+                pattern_literal_number,
+                pattern_literal_text,
+                pattern_literal_tag,
+                pattern_alias,
+            ))
+        });
+
+        // Arm parser: pattern => body
+        let arm = pattern
+            .then_ignore(just(Token::Implies))
+            .then(expression.clone())
+            .map(|(pattern, body)| Arm { pattern, body: body.node });
+
+        let when = just(Token::When)
+            .ignore_then(
+                arm.clone()
+                    .separated_by(comma.clone().ignored().or(newlines.clone()))
+                    .collect()
+                    .delimited_by(
+                        bracket_curly_open.clone().then(newlines.clone()),
+                        newlines.clone().then(bracket_curly_close.clone()),
+                    ),
+            )
+            .map(|arms| Expression::When { arms });
+
+        let while_ = just(Token::While)
+            .ignore_then(
+                arm
+                    .separated_by(comma.clone().ignored().or(newlines.clone()))
+                    .collect()
+                    .delimited_by(
+                        bracket_curly_open.clone().then(newlines.clone()),
+                        newlines.clone().then(bracket_curly_close.clone()),
+                    ),
+            )
+            .map(|arms| Expression::While { arms });
 
         let skip = select! { Token::Skip => Expression::Skip };
 
-        let block = just(Token::Block).ignore_then(todo());
+        // TEXT { content with {var} interpolation }
+        let text_literal = select! { Token::TextContent(content) => content }
+            .map(|content: &str| {
+                let mut parts = Vec::new();
+                let mut current_text_start = 0;
+                let mut chars = content.char_indices().peekable();
+
+                while let Some((i, c)) = chars.next() {
+                    if c == '{' {
+                        // Save any text before this interpolation
+                        if i > current_text_start {
+                            parts.push(TextPart::Text(&content[current_text_start..i]));
+                        }
+
+                        // Find the closing brace
+                        let var_start = i + 1;
+                        let mut var_end = var_start;
+                        while let Some((j, c2)) = chars.next() {
+                            if c2 == '}' {
+                                var_end = j;
+                                break;
+                            }
+                        }
+
+                        let var_name = content[var_start..var_end].trim();
+                        if !var_name.is_empty() {
+                            parts.push(TextPart::Interpolation { var: var_name });
+                        }
+
+                        current_text_start = var_end + 1;
+                    }
+                }
+
+                // Add any remaining text after the last interpolation
+                if current_text_start < content.len() {
+                    parts.push(TextPart::Text(&content[current_text_start..]));
+                }
+
+                Expression::TextLiteral { parts }
+            });
+
+        // BLOCK { var: value, var2: value2, output_expression }
+        // Variables are bindings, the last expression without colon is the output
+        let variable_for_block = group((snake_case_identifier, colon.clone(), expression.clone())).map(|(name, _, value)| {
+            Variable {
+                name,
+                is_referenced: false,
+                value,
+            }
+        });
+        let block_variable = variable_for_block
+            .map_with(|variable, extra| Spanned {
+                node: variable,
+                span: extra.span(),
+                persistence: None,
+            });
+
+        let block = just(Token::Block)
+            .ignore_then(
+                block_variable
+                    .separated_by(comma.clone().ignored().or(newlines.clone()))
+                    .collect::<Vec<_>>()
+                    .then(expression.clone())
+                    .delimited_by(
+                        bracket_curly_open.clone().then(newlines.clone()),
+                        newlines.clone().then(bracket_curly_close.clone()),
+                    ),
+            )
+            .map(|(variables, output)| Expression::Block {
+                variables,
+                output: Box::new(output),
+            });
 
         // @TODO PASS, a part of function calls?
         // @TODO when, while
@@ -286,6 +448,7 @@ where
             tagged_object,
             map,
             expression_literal,
+            text_literal,
             function,
             expression_alias,
             link_setter,
@@ -306,17 +469,124 @@ where
             })
             .or(nested)
             .padded_by(newlines)
-            .pratt((infix(left(1), just(Token::Pipe), |l, _, r, extra| {
-                let expression = Expression::Pipe {
-                    from: Box::new(l),
-                    to: Box::new(r),
-                };
-                Spanned {
-                    span: extra.span(),
-                    node: expression,
-                    persistence: None,
-                }
-            }),))
+            .pratt((
+                // Precedence 1 (lowest): Pipe
+                infix(left(1), just(Token::Pipe), |l, _, r, extra| {
+                    Spanned {
+                        span: extra.span(),
+                        node: Expression::Pipe {
+                            from: Box::new(l),
+                            to: Box::new(r),
+                        },
+                        persistence: None,
+                    }
+                }),
+                // Precedence 3: Comparison operators
+                infix(left(3), just(Token::Equal), |l, _, r, extra| {
+                    Spanned {
+                        span: extra.span(),
+                        node: Expression::Comparator(Comparator::Equal {
+                            operand_a: Box::new(l),
+                            operand_b: Box::new(r),
+                        }),
+                        persistence: None,
+                    }
+                }),
+                infix(left(3), just(Token::NotEqual), |l, _, r, extra| {
+                    Spanned {
+                        span: extra.span(),
+                        node: Expression::Comparator(Comparator::NotEqual {
+                            operand_a: Box::new(l),
+                            operand_b: Box::new(r),
+                        }),
+                        persistence: None,
+                    }
+                }),
+                infix(left(3), just(Token::Greater), |l, _, r, extra| {
+                    Spanned {
+                        span: extra.span(),
+                        node: Expression::Comparator(Comparator::Greater {
+                            operand_a: Box::new(l),
+                            operand_b: Box::new(r),
+                        }),
+                        persistence: None,
+                    }
+                }),
+                infix(left(3), just(Token::GreaterOrEqual), |l, _, r, extra| {
+                    Spanned {
+                        span: extra.span(),
+                        node: Expression::Comparator(Comparator::GreaterOrEqual {
+                            operand_a: Box::new(l),
+                            operand_b: Box::new(r),
+                        }),
+                        persistence: None,
+                    }
+                }),
+                infix(left(3), just(Token::Less), |l, _, r, extra| {
+                    Spanned {
+                        span: extra.span(),
+                        node: Expression::Comparator(Comparator::Less {
+                            operand_a: Box::new(l),
+                            operand_b: Box::new(r),
+                        }),
+                        persistence: None,
+                    }
+                }),
+                infix(left(3), just(Token::LessOrEqual), |l, _, r, extra| {
+                    Spanned {
+                        span: extra.span(),
+                        node: Expression::Comparator(Comparator::LessOrEqual {
+                            operand_a: Box::new(l),
+                            operand_b: Box::new(r),
+                        }),
+                        persistence: None,
+                    }
+                }),
+                // Precedence 5: Additive operators
+                infix(left(5), just(Token::Plus), |l, _, r, extra| {
+                    Spanned {
+                        span: extra.span(),
+                        node: Expression::ArithmeticOperator(ArithmeticOperator::Add {
+                            operand_a: Box::new(l),
+                            operand_b: Box::new(r),
+                        }),
+                        persistence: None,
+                    }
+                }),
+                infix(left(5), just(Token::Minus), |l, _, r, extra| {
+                    Spanned {
+                        span: extra.span(),
+                        node: Expression::ArithmeticOperator(ArithmeticOperator::Subtract {
+                            operand_a: Box::new(l),
+                            operand_b: Box::new(r),
+                        }),
+                        persistence: None,
+                    }
+                }),
+                // Precedence 7: Multiplicative operators
+                infix(left(7), just(Token::Asterisk), |l, _, r, extra| {
+                    Spanned {
+                        span: extra.span(),
+                        node: Expression::ArithmeticOperator(ArithmeticOperator::Multiply {
+                            operand_a: Box::new(l),
+                            operand_b: Box::new(r),
+                        }),
+                        persistence: None,
+                    }
+                }),
+                // Note: Token::Slash is also used for function paths (Module/function)
+                // This may cause ambiguity - division should only work between expressions
+                infix(left(7), just(Token::Slash), |l, _, r, extra| {
+                    Spanned {
+                        span: extra.span(),
+                        node: Expression::ArithmeticOperator(ArithmeticOperator::Divide {
+                            operand_a: Box::new(l),
+                            operand_b: Box::new(r),
+                        }),
+                        persistence: None,
+                    }
+                }),
+            ))
     })
     .repeated()
     .collect()
@@ -376,6 +646,10 @@ pub enum Expression<'code> {
     },
     Comparator(Comparator<'code>),
     ArithmeticOperator(ArithmeticOperator<'code>),
+    // TEXT { content with {var} interpolation }
+    TextLiteral {
+        parts: Vec<TextPart<'code>>,
+    },
 }
 
 #[derive(Debug)]
@@ -427,6 +701,14 @@ pub enum ArithmeticOperator<'code> {
         operand_a: Box<Spanned<Expression<'code>>>,
         operand_b: Box<Spanned<Expression<'code>>>,
     },
+}
+
+#[derive(Debug)]
+pub enum TextPart<'code> {
+    // Plain text content
+    Text(&'code str),
+    // Interpolated variable: {var_name}
+    Interpolation { var: &'code str },
 }
 
 #[derive(Debug)]
@@ -537,4 +819,148 @@ pub struct PatternVariable<'code> {
 pub struct PatternMapEntry<'code> {
     pub key: Pattern<'code>,
     pub value: Option<Pattern<'code>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chumsky::prelude::Parser;
+
+    macro_rules! parse_and_test {
+        ($code:expr, $test:expr) => {{
+            let tokens = lexer().parse($code).unwrap();
+            let input = tokens.map(
+                Span::splat($code.len()),
+                |Spanned { node, span, persistence: _ }| (node, span),
+            );
+            let expressions = parser().parse(input).unwrap();
+            let expr = &expressions.into_iter().next().unwrap().node;
+            $test(expr)
+        }};
+    }
+
+    #[test]
+    fn test_text_literal_simple() {
+        parse_and_test!("TEXT { hello world }", |expr: &Expression| {
+            if let Expression::TextLiteral { parts } = expr {
+                assert_eq!(parts.len(), 1);
+                assert!(matches!(parts[0], TextPart::Text("hello world")));
+            } else {
+                panic!("Expected TextLiteral, got {:?}", expr);
+            }
+        });
+    }
+
+    #[test]
+    fn test_text_literal_with_interpolation() {
+        parse_and_test!("TEXT { hello {name} }", |expr: &Expression| {
+            if let Expression::TextLiteral { parts } = expr {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(parts[0], TextPart::Text("hello ")));
+                assert!(matches!(parts[1], TextPart::Interpolation { var: "name" }));
+            } else {
+                panic!("Expected TextLiteral, got {:?}", expr);
+            }
+        });
+    }
+
+    #[test]
+    fn test_text_literal_multiple_interpolations() {
+        parse_and_test!("TEXT { Hello {name}! You have {count} messages. }", |expr: &Expression| {
+            if let Expression::TextLiteral { parts } = expr {
+                assert_eq!(parts.len(), 5);
+                assert!(matches!(parts[0], TextPart::Text("Hello ")));
+                assert!(matches!(parts[1], TextPart::Interpolation { var: "name" }));
+                assert!(matches!(parts[2], TextPart::Text("! You have ")));
+                assert!(matches!(parts[3], TextPart::Interpolation { var: "count" }));
+                assert!(matches!(parts[4], TextPart::Text(" messages.")));
+            } else {
+                panic!("Expected TextLiteral, got {:?}", expr);
+            }
+        });
+    }
+
+    #[test]
+    fn test_when_statement() {
+        parse_and_test!("WHEN { True => 1, False => 0 }", |expr: &Expression| {
+            if let Expression::When { arms } = expr {
+                assert_eq!(arms.len(), 2);
+            } else {
+                panic!("Expected When, got {:?}", expr);
+            }
+        });
+    }
+
+    #[test]
+    fn test_while_statement() {
+        parse_and_test!("WHILE { __ => value }", |expr: &Expression| {
+            if let Expression::While { arms } = expr {
+                assert_eq!(arms.len(), 1);
+            } else {
+                panic!("Expected While, got {:?}", expr);
+            }
+        });
+    }
+
+    #[test]
+    fn test_block_statement() {
+        // BLOCK uses newlines between variables, output is the last expression (no colon)
+        parse_and_test!("BLOCK {\nx: 1\ny: 2\nx\n}", |expr: &Expression| {
+            if let Expression::Block { variables, output } = expr {
+                assert_eq!(variables.len(), 2);
+                assert!(matches!(output.node, Expression::Alias(_)));
+            } else {
+                panic!("Expected Block, got {:?}", expr);
+            }
+        });
+    }
+
+    #[test]
+    fn test_comparison_equal() {
+        parse_and_test!("1 == 2", |expr: &Expression| {
+            assert!(matches!(expr, Expression::Comparator(Comparator::Equal { .. })));
+        });
+    }
+
+    #[test]
+    fn test_comparison_not_equal() {
+        parse_and_test!("1 =/= 2", |expr: &Expression| {
+            assert!(matches!(expr, Expression::Comparator(Comparator::NotEqual { .. })));
+        });
+    }
+
+    #[test]
+    fn test_comparison_less() {
+        parse_and_test!("1 < 2", |expr: &Expression| {
+            assert!(matches!(expr, Expression::Comparator(Comparator::Less { .. })));
+        });
+    }
+
+    #[test]
+    fn test_comparison_greater() {
+        parse_and_test!("1 > 2", |expr: &Expression| {
+            assert!(matches!(expr, Expression::Comparator(Comparator::Greater { .. })));
+        });
+    }
+
+    #[test]
+    fn test_arithmetic_add() {
+        parse_and_test!("1 + 2", |expr: &Expression| {
+            assert!(matches!(expr, Expression::ArithmeticOperator(ArithmeticOperator::Add { .. })));
+        });
+    }
+
+    #[test]
+    fn test_arithmetic_subtract() {
+        parse_and_test!("3 - 1", |expr: &Expression| {
+            assert!(matches!(expr, Expression::ArithmeticOperator(ArithmeticOperator::Subtract { .. })));
+        });
+    }
+
+    #[test]
+    fn test_arithmetic_multiply() {
+        parse_and_test!("2 * 3", |expr: &Expression| {
+            assert!(matches!(expr, Expression::ArithmeticOperator(ArithmeticOperator::Multiply { .. })));
+        });
+    }
 }

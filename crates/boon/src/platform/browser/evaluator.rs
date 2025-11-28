@@ -393,18 +393,313 @@ fn spanned_expression_into_value_actor(
             span,
             "Not supported yet, sorry [Expression::Skip]",
         ))?,
-        Expression::Block { variables, output } => Err(ParseError::custom(
-            span,
-            "Not supported yet, sorry [Expression::Block]",
-        ))?,
-        Expression::Comparator(comparator) => Err(ParseError::custom(
-            span,
-            "Not supported yet, sorry [Expression::Comparator]",
-        ))?,
-        Expression::ArithmeticOperator(arithmetic_operator) => Err(ParseError::custom(
-            span,
-            "Not supported yet, sorry [Expression::ArithmeticOperator]",
-        ))?,
+        Expression::Block { variables, output } => {
+            // BLOCK creates a local scope with variables
+            // Variables can reference each other (defined earlier in the block)
+            // The output expression is evaluated in this scope
+
+            // Evaluate each variable and register it
+            for variable in variables {
+                let var = spanned_variable_into_variable(
+                    variable,
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    reference_connector.clone(),
+                )?;
+                // The variable is registered in reference_connector by spanned_variable_into_variable
+                // We just need to keep it alive - but we don't have a place to store it
+                // For now, leak it (not ideal, but works)
+                // @TODO: proper lifetime management for block variables
+                std::mem::forget(var);
+            }
+
+            // Evaluate the output expression
+            spanned_expression_into_value_actor(
+                *output,
+                construct_context,
+                actor_context,
+                reference_connector,
+            )?
+        }
+        Expression::Comparator(comparator) => {
+            let construct_info = ConstructInfo::new(
+                format!("PersistenceId: {persistence_id}"),
+                persistence,
+                format!("{span}; Comparator"),
+            );
+            match comparator {
+                parser::Comparator::Equal { operand_a, operand_b } => {
+                    let a = spanned_expression_into_value_actor(
+                        *operand_a,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector.clone(),
+                    )?;
+                    let b = spanned_expression_into_value_actor(
+                        *operand_b,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector,
+                    )?;
+                    ComparatorCombinator::new_equal(
+                        construct_info,
+                        construct_context,
+                        actor_context,
+                        a,
+                        b,
+                    )
+                }
+                parser::Comparator::NotEqual { operand_a, operand_b } => {
+                    let a = spanned_expression_into_value_actor(
+                        *operand_a,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector.clone(),
+                    )?;
+                    let b = spanned_expression_into_value_actor(
+                        *operand_b,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector,
+                    )?;
+                    ComparatorCombinator::new_not_equal(
+                        construct_info,
+                        construct_context,
+                        actor_context,
+                        a,
+                        b,
+                    )
+                }
+                parser::Comparator::Greater { operand_a, operand_b } => {
+                    let a = spanned_expression_into_value_actor(
+                        *operand_a,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector.clone(),
+                    )?;
+                    let b = spanned_expression_into_value_actor(
+                        *operand_b,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector,
+                    )?;
+                    ComparatorCombinator::new_greater(
+                        construct_info,
+                        construct_context,
+                        actor_context,
+                        a,
+                        b,
+                    )
+                }
+                parser::Comparator::GreaterOrEqual { operand_a, operand_b } => {
+                    let a = spanned_expression_into_value_actor(
+                        *operand_a,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector.clone(),
+                    )?;
+                    let b = spanned_expression_into_value_actor(
+                        *operand_b,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector,
+                    )?;
+                    ComparatorCombinator::new_greater_or_equal(
+                        construct_info,
+                        construct_context,
+                        actor_context,
+                        a,
+                        b,
+                    )
+                }
+                parser::Comparator::Less { operand_a, operand_b } => {
+                    let a = spanned_expression_into_value_actor(
+                        *operand_a,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector.clone(),
+                    )?;
+                    let b = spanned_expression_into_value_actor(
+                        *operand_b,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector,
+                    )?;
+                    ComparatorCombinator::new_less(
+                        construct_info,
+                        construct_context,
+                        actor_context,
+                        a,
+                        b,
+                    )
+                }
+                parser::Comparator::LessOrEqual { operand_a, operand_b } => {
+                    let a = spanned_expression_into_value_actor(
+                        *operand_a,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector.clone(),
+                    )?;
+                    let b = spanned_expression_into_value_actor(
+                        *operand_b,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector,
+                    )?;
+                    ComparatorCombinator::new_less_or_equal(
+                        construct_info,
+                        construct_context,
+                        actor_context,
+                        a,
+                        b,
+                    )
+                }
+            }
+        }
+        Expression::ArithmeticOperator(arithmetic_operator) => {
+            let construct_info = ConstructInfo::new(
+                format!("PersistenceId: {persistence_id}"),
+                persistence,
+                format!("{span}; ArithmeticOperator"),
+            );
+            match arithmetic_operator {
+                parser::ArithmeticOperator::Add { operand_a, operand_b } => {
+                    let a = spanned_expression_into_value_actor(
+                        *operand_a,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector.clone(),
+                    )?;
+                    let b = spanned_expression_into_value_actor(
+                        *operand_b,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector,
+                    )?;
+                    ArithmeticCombinator::new_add(
+                        construct_info,
+                        construct_context,
+                        actor_context,
+                        a,
+                        b,
+                    )
+                }
+                parser::ArithmeticOperator::Subtract { operand_a, operand_b } => {
+                    let a = spanned_expression_into_value_actor(
+                        *operand_a,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector.clone(),
+                    )?;
+                    let b = spanned_expression_into_value_actor(
+                        *operand_b,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector,
+                    )?;
+                    ArithmeticCombinator::new_subtract(
+                        construct_info,
+                        construct_context,
+                        actor_context,
+                        a,
+                        b,
+                    )
+                }
+                parser::ArithmeticOperator::Multiply { operand_a, operand_b } => {
+                    let a = spanned_expression_into_value_actor(
+                        *operand_a,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector.clone(),
+                    )?;
+                    let b = spanned_expression_into_value_actor(
+                        *operand_b,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector,
+                    )?;
+                    ArithmeticCombinator::new_multiply(
+                        construct_info,
+                        construct_context,
+                        actor_context,
+                        a,
+                        b,
+                    )
+                }
+                parser::ArithmeticOperator::Divide { operand_a, operand_b } => {
+                    let a = spanned_expression_into_value_actor(
+                        *operand_a,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector.clone(),
+                    )?;
+                    let b = spanned_expression_into_value_actor(
+                        *operand_b,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector,
+                    )?;
+                    ArithmeticCombinator::new_divide(
+                        construct_info,
+                        construct_context,
+                        actor_context,
+                        a,
+                        b,
+                    )
+                }
+                parser::ArithmeticOperator::Negate { operand } => {
+                    // Negate: multiply by -1
+                    let a = spanned_expression_into_value_actor(
+                        *operand,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector,
+                    )?;
+                    let neg_one = Number::new_arc_value_actor(
+                        ConstructInfo::new("neg_one", None, "-1 constant"),
+                        construct_context.clone(),
+                        idempotency_key,
+                        actor_context.clone(),
+                        -1.0,
+                    );
+                    ArithmeticCombinator::new_multiply(
+                        construct_info,
+                        construct_context,
+                        actor_context,
+                        neg_one,
+                        a,
+                    )
+                }
+            }
+        }
+        Expression::TextLiteral { parts } => {
+            // For now, only support static text (no interpolation)
+            // Interpolation requires reactive variable lookups
+            let mut text = String::new();
+            for part in parts {
+                match part {
+                    parser::TextPart::Text(t) => text.push_str(t),
+                    parser::TextPart::Interpolation { var } => {
+                        // @TODO: Implement reactive interpolation
+                        // For now, just include the variable reference as placeholder
+                        text.push('{');
+                        text.push_str(var);
+                        text.push('}');
+                    }
+                }
+            }
+            Text::new_arc_value_actor(
+                ConstructInfo::new(
+                    format!("PersistenceId: {persistence_id}"),
+                    persistence,
+                    format!("{span}; TEXT {{..}}"),
+                ),
+                construct_context,
+                idempotency_key,
+                actor_context,
+                text,
+            )
+        }
     };
     Ok(actor)
 }
@@ -565,14 +860,94 @@ fn pipe<'code>(
                 )?,
             ))
         }
-        Expression::When { arms } => Err(ParseError::custom(
-            to.span,
-            "Piping into it is not supported yet, sorry [Expression::When]",
-        ))?,
-        Expression::While { arms } => Err(ParseError::custom(
-            to.span,
-            "Piping into it is not supported yet, sorry [Expression::While]",
-        ))?,
+        Expression::When { arms } => {
+            // Evaluate the input
+            let input = spanned_expression_into_value_actor(
+                *from,
+                construct_context.clone(),
+                actor_context.clone(),
+                reference_connector.clone(),
+            )?;
+
+            // Compile each arm
+            let compiled_arms: Vec<CompiledArm> = arms
+                .into_iter()
+                .map(|arm| {
+                    let matcher = pattern_to_matcher(&arm.pattern);
+                    // Create a spanned expression for the body
+                    let body_expr = Spanned {
+                        span: to.span,
+                        persistence: to.persistence,
+                        node: arm.body,
+                    };
+                    let body = spanned_expression_into_value_actor(
+                        body_expr,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector.clone(),
+                    )?;
+                    Ok(CompiledArm { matcher, body })
+                })
+                .collect::<EvaluateResult<Vec<_>>>()?;
+
+            Ok(WhenCombinator::new_arc_value_actor(
+                ConstructInfo::new(
+                    format!("Persistence: {to_persistence_id}"),
+                    to.persistence,
+                    format!("{to_persistence_id}; WHEN"),
+                ),
+                construct_context,
+                actor_context,
+                input,
+                compiled_arms,
+            ))
+        }
+        Expression::While { arms } => {
+            // WHILE is similar to WHEN - pattern matching with continuous updates
+            // The main difference may be in semantics (continuous vs one-shot)
+            // For now, implement identically to WHEN
+
+            // Evaluate the input
+            let input = spanned_expression_into_value_actor(
+                *from,
+                construct_context.clone(),
+                actor_context.clone(),
+                reference_connector.clone(),
+            )?;
+
+            // Compile each arm
+            let compiled_arms: Vec<CompiledArm> = arms
+                .into_iter()
+                .map(|arm| {
+                    let matcher = pattern_to_matcher(&arm.pattern);
+                    // Create a spanned expression for the body
+                    let body_expr = Spanned {
+                        span: to.span,
+                        persistence: to.persistence,
+                        node: arm.body,
+                    };
+                    let body = spanned_expression_into_value_actor(
+                        body_expr,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                        reference_connector.clone(),
+                    )?;
+                    Ok(CompiledArm { matcher, body })
+                })
+                .collect::<EvaluateResult<Vec<_>>>()?;
+
+            Ok(WhenCombinator::new_arc_value_actor(
+                ConstructInfo::new(
+                    format!("Persistence: {to_persistence_id}"),
+                    to.persistence,
+                    format!("{to_persistence_id}; WHILE"),
+                ),
+                construct_context,
+                actor_context,
+                input,
+                compiled_arms,
+            ))
+        }
         Expression::Pipe { from, to } => Err(ParseError::custom(
             to.span,
             "Piping into it is not supported yet, sorry [Expression::Pipe]",

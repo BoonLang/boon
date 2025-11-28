@@ -430,6 +430,7 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
         Expression::Literal(_) => (),
         Expression::Link => (),
         Expression::Skip => (),
+        Expression::TextLiteral { .. } => (),
     }
 }
 

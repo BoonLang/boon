@@ -802,5 +802,14 @@ fn set_persistence<'a, 'code, 'old_code>(
                 });
             }
         }
+        Expression::TextLiteral { parts: _ } => {
+            // TextLiteral is like a Literal - just assign a new ID
+            let id: Ulid = PersistenceId::new();
+            new_span_id_pairs.insert(*span, id);
+            *persistence = Some(Persistence {
+                id,
+                status: PersistenceStatus::NewOrChanged,
+            });
+        }
     }
 }

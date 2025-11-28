@@ -46,6 +46,9 @@ pub enum Token<'code> {
     Block,
     Pass,
     Passed,
+    // TEXT literal content: TEXT { content with {var} interpolation }
+    // The content is the raw string between TEXT { and }
+    TextContent(&'code str),
 }
 
 impl<'code> Token<'code> {
@@ -71,7 +74,7 @@ impl<'code> Token<'code> {
             Self::Greater => ">".into(),
             Self::LessOrEqual => "<=".into(),
             Self::Less => "<".into(),
-            Self::Equal => "=".into(),
+            Self::Equal => "==".into(),
             Self::Minus => "-".into(),
             Self::Plus => "+".into(),
             Self::Asterisk => "*".into(),
@@ -91,6 +94,7 @@ impl<'code> Token<'code> {
             Self::Block => "BLOCK".into(),
             Self::Pass => "PASS".into(),
             Self::Passed => "PASSED".into(),
+            Self::TextContent(content) => format!("TEXT {{ {} }}", content).into(),
         }
     }
 }
@@ -118,7 +122,7 @@ pub fn lexer<'code>()
         just('>').to(Token::Greater),
         just("<=").to(Token::LessOrEqual),
         just('<').to(Token::Less),
-        just('=').to(Token::Equal),
+        just("==").to(Token::Equal),
     ));
 
     let arithmetic_operator_or_path_separator = choice((
@@ -201,11 +205,35 @@ pub fn lexer<'code>()
             "BLOCK" => Ok(Token::Block),
             "PASS" => Ok(Token::Pass),
             "PASSED" => Ok(Token::Passed),
+            // TEXT is handled specially below, not as a keyword
             _ => Err(ParseError::custom(
                 span,
                 format!("Unknown keyword '{keyword}'"),
             )),
         });
+
+    // TEXT { content } - captures content between TEXT { and }
+    // Content can include {var} for interpolation - we track brace depth to find the matching }
+    let text_content_inner = recursive(|text_content_inner| {
+        choice((
+            // Match balanced braces: { ... }
+            just('{')
+                .then(text_content_inner)
+                .then(just('}'))
+                .to_slice(),
+            // Match any single char except braces
+            none_of("{}").to_slice(),
+        ))
+        .repeated()
+        .to_slice()
+    });
+
+    let text_content = just("TEXT")
+        .then(text::inline_whitespace())
+        .ignore_then(just('{'))
+        .ignore_then(text_content_inner)
+        .then_ignore(just('}'))
+        .map(|content: &str| Token::TextContent(content.trim()));
 
     let token = choice((
         bracket,
@@ -220,6 +248,7 @@ pub fn lexer<'code>()
         text::newline().to(Token::Newline),
         comparator,
         arithmetic_operator_or_path_separator,
+        text_content,
         text,
         snake_case_identifier,
         pascal_case_identifier,
@@ -236,4 +265,31 @@ pub fn lexer<'code>()
         .recover_with(skip_then_retry_until(any().ignored(), end()))
         .repeated()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chumsky::prelude::Parser;
+
+    #[test]
+    fn test_text_content_simple() {
+        let result = lexer().parse("TEXT { hello }");
+        let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
+        assert_eq!(tokens, vec![&Token::TextContent("hello")]);
+    }
+
+    #[test]
+    fn test_text_content_with_interpolation() {
+        let result = lexer().parse("TEXT { hello {name} }");
+        let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
+        assert_eq!(tokens, vec![&Token::TextContent("hello {name}")]);
+    }
+
+    #[test]
+    fn test_text_content_multiple_interpolations() {
+        let result = lexer().parse("TEXT { Hello {name}! You have {count} messages. }");
+        let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
+        assert_eq!(tokens, vec![&Token::TextContent("Hello {name}! You have {count} messages.")]);
+    }
 }

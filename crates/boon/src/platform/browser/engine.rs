@@ -735,6 +735,474 @@ impl ThenCombinator {
     }
 }
 
+// --- BinaryOperatorCombinator ---
+
+/// Combines two value streams using a binary operation.
+/// Used for comparators (==, <, >, etc.) and arithmetic (+, -, *, /).
+pub struct BinaryOperatorCombinator {}
+
+impl BinaryOperatorCombinator {
+    /// Creates a ValueActor that combines two operands using the given operation.
+    /// The operation receives both values and returns a new Value.
+    pub fn new_arc_value_actor<F>(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        operand_a: Arc<ValueActor>,
+        operand_b: Arc<ValueActor>,
+        operation: F,
+    ) -> Arc<ValueActor>
+    where
+        F: Fn(Value, Value, ConstructContext, ValueIdempotencyKey) -> Value + 'static,
+    {
+        let construct_info = construct_info.complete(ConstructType::ValueActor);
+
+        // Merge both operand streams, tracking which operand changed
+        let value_stream = stream::select_all([
+            operand_a.subscribe().map(|v| (0usize, v)).boxed_local(),
+            operand_b.subscribe().map(|v| (1usize, v)).boxed_local(),
+        ])
+        .scan(
+            (None::<Value>, None::<Value>),
+            move |(latest_a, latest_b), (index, value)| {
+                match index {
+                    0 => *latest_a = Some(value),
+                    1 => *latest_b = Some(value),
+                    _ => unreachable!(),
+                }
+                let result = match (latest_a.clone(), latest_b.clone()) {
+                    (Some(a), Some(b)) => Some((a, b)),
+                    _ => None,
+                };
+                future::ready(Some(result))
+            },
+        )
+        .filter_map(future::ready)
+        .map({
+            let construct_context = construct_context.clone();
+            move |(a, b)| {
+                let idempotency_key = ValueIdempotencyKey::new();
+                operation(a, b, construct_context.clone(), idempotency_key)
+            }
+        });
+
+        Arc::new(ValueActor::new_internal(
+            construct_info,
+            actor_context,
+            value_stream,
+            (operand_a, operand_b),
+        ))
+    }
+}
+
+// --- ComparatorCombinator ---
+
+/// Helper for creating comparison combinators.
+pub struct ComparatorCombinator {}
+
+impl ComparatorCombinator {
+    pub fn new_equal(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        operand_a: Arc<ValueActor>,
+        operand_b: Arc<ValueActor>,
+    ) -> Arc<ValueActor> {
+        BinaryOperatorCombinator::new_arc_value_actor(
+            construct_info,
+            construct_context.clone(),
+            actor_context,
+            operand_a,
+            operand_b,
+            |a, b, ctx, key| {
+                let result = values_equal(&a, &b);
+                Tag::new_value(
+                    ConstructInfo::new("comparator_result", None, "== result"),
+                    ctx,
+                    key,
+                    if result { "True" } else { "False" },
+                )
+            },
+        )
+    }
+
+    pub fn new_not_equal(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        operand_a: Arc<ValueActor>,
+        operand_b: Arc<ValueActor>,
+    ) -> Arc<ValueActor> {
+        BinaryOperatorCombinator::new_arc_value_actor(
+            construct_info,
+            construct_context.clone(),
+            actor_context,
+            operand_a,
+            operand_b,
+            |a, b, ctx, key| {
+                let result = !values_equal(&a, &b);
+                Tag::new_value(
+                    ConstructInfo::new("comparator_result", None, "=/= result"),
+                    ctx,
+                    key,
+                    if result { "True" } else { "False" },
+                )
+            },
+        )
+    }
+
+    pub fn new_greater(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        operand_a: Arc<ValueActor>,
+        operand_b: Arc<ValueActor>,
+    ) -> Arc<ValueActor> {
+        BinaryOperatorCombinator::new_arc_value_actor(
+            construct_info,
+            construct_context.clone(),
+            actor_context,
+            operand_a,
+            operand_b,
+            |a, b, ctx, key| {
+                let result = compare_values(&a, &b).map(|o| o.is_gt()).unwrap_or(false);
+                Tag::new_value(
+                    ConstructInfo::new("comparator_result", None, "> result"),
+                    ctx,
+                    key,
+                    if result { "True" } else { "False" },
+                )
+            },
+        )
+    }
+
+    pub fn new_greater_or_equal(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        operand_a: Arc<ValueActor>,
+        operand_b: Arc<ValueActor>,
+    ) -> Arc<ValueActor> {
+        BinaryOperatorCombinator::new_arc_value_actor(
+            construct_info,
+            construct_context.clone(),
+            actor_context,
+            operand_a,
+            operand_b,
+            |a, b, ctx, key| {
+                let result = compare_values(&a, &b).map(|o| o.is_ge()).unwrap_or(false);
+                Tag::new_value(
+                    ConstructInfo::new("comparator_result", None, ">= result"),
+                    ctx,
+                    key,
+                    if result { "True" } else { "False" },
+                )
+            },
+        )
+    }
+
+    pub fn new_less(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        operand_a: Arc<ValueActor>,
+        operand_b: Arc<ValueActor>,
+    ) -> Arc<ValueActor> {
+        BinaryOperatorCombinator::new_arc_value_actor(
+            construct_info,
+            construct_context.clone(),
+            actor_context,
+            operand_a,
+            operand_b,
+            |a, b, ctx, key| {
+                let result = compare_values(&a, &b).map(|o| o.is_lt()).unwrap_or(false);
+                Tag::new_value(
+                    ConstructInfo::new("comparator_result", None, "< result"),
+                    ctx,
+                    key,
+                    if result { "True" } else { "False" },
+                )
+            },
+        )
+    }
+
+    pub fn new_less_or_equal(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        operand_a: Arc<ValueActor>,
+        operand_b: Arc<ValueActor>,
+    ) -> Arc<ValueActor> {
+        BinaryOperatorCombinator::new_arc_value_actor(
+            construct_info,
+            construct_context.clone(),
+            actor_context,
+            operand_a,
+            operand_b,
+            |a, b, ctx, key| {
+                let result = compare_values(&a, &b).map(|o| o.is_le()).unwrap_or(false);
+                Tag::new_value(
+                    ConstructInfo::new("comparator_result", None, "<= result"),
+                    ctx,
+                    key,
+                    if result { "True" } else { "False" },
+                )
+            },
+        )
+    }
+}
+
+/// Compare two Values for equality.
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(n1, _), Value::Number(n2, _)) => n1.number() == n2.number(),
+        (Value::Text(t1, _), Value::Text(t2, _)) => t1.text() == t2.text(),
+        (Value::Tag(tag1, _), Value::Tag(tag2, _)) => tag1.tag() == tag2.tag(),
+        _ => false, // Different types are not equal
+    }
+}
+
+/// Compare two Values for ordering. Returns None if types are incompatible.
+fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::Number(n1, _), Value::Number(n2, _)) => n1.number().partial_cmp(&n2.number()),
+        (Value::Text(t1, _), Value::Text(t2, _)) => Some(t1.text().cmp(t2.text())),
+        _ => None,
+    }
+}
+
+// --- ArithmeticCombinator ---
+
+/// Helper for creating arithmetic combinators.
+pub struct ArithmeticCombinator {}
+
+impl ArithmeticCombinator {
+    pub fn new_add(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        operand_a: Arc<ValueActor>,
+        operand_b: Arc<ValueActor>,
+    ) -> Arc<ValueActor> {
+        BinaryOperatorCombinator::new_arc_value_actor(
+            construct_info,
+            construct_context.clone(),
+            actor_context,
+            operand_a,
+            operand_b,
+            |a, b, ctx, key| {
+                let result = get_number(&a) + get_number(&b);
+                Number::new_value(
+                    ConstructInfo::new("arithmetic_result", None, "+ result"),
+                    ctx,
+                    key,
+                    result,
+                )
+            },
+        )
+    }
+
+    pub fn new_subtract(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        operand_a: Arc<ValueActor>,
+        operand_b: Arc<ValueActor>,
+    ) -> Arc<ValueActor> {
+        BinaryOperatorCombinator::new_arc_value_actor(
+            construct_info,
+            construct_context.clone(),
+            actor_context,
+            operand_a,
+            operand_b,
+            |a, b, ctx, key| {
+                let result = get_number(&a) - get_number(&b);
+                Number::new_value(
+                    ConstructInfo::new("arithmetic_result", None, "- result"),
+                    ctx,
+                    key,
+                    result,
+                )
+            },
+        )
+    }
+
+    pub fn new_multiply(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        operand_a: Arc<ValueActor>,
+        operand_b: Arc<ValueActor>,
+    ) -> Arc<ValueActor> {
+        BinaryOperatorCombinator::new_arc_value_actor(
+            construct_info,
+            construct_context.clone(),
+            actor_context,
+            operand_a,
+            operand_b,
+            |a, b, ctx, key| {
+                let result = get_number(&a) * get_number(&b);
+                Number::new_value(
+                    ConstructInfo::new("arithmetic_result", None, "* result"),
+                    ctx,
+                    key,
+                    result,
+                )
+            },
+        )
+    }
+
+    pub fn new_divide(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        operand_a: Arc<ValueActor>,
+        operand_b: Arc<ValueActor>,
+    ) -> Arc<ValueActor> {
+        BinaryOperatorCombinator::new_arc_value_actor(
+            construct_info,
+            construct_context.clone(),
+            actor_context,
+            operand_a,
+            operand_b,
+            |a, b, ctx, key| {
+                let result = get_number(&a) / get_number(&b);
+                Number::new_value(
+                    ConstructInfo::new("arithmetic_result", None, "/ result"),
+                    ctx,
+                    key,
+                    result,
+                )
+            },
+        )
+    }
+}
+
+/// Extract a number from a Value, panicking if not a Number.
+fn get_number(value: &Value) -> f64 {
+    match value {
+        Value::Number(n, _) => n.number(),
+        other => panic!(
+            "Expected Number for arithmetic operation, got {}",
+            other.construct_info()
+        ),
+    }
+}
+
+// --- WhenCombinator ---
+
+/// Pattern matching combinator for WHEN expressions.
+/// Matches an input value against patterns and returns the first matching arm's result.
+pub struct WhenCombinator {}
+
+/// A compiled arm for WHEN matching.
+pub struct CompiledArm {
+    pub matcher: Box<dyn Fn(&Value) -> bool + Send + Sync>,
+    pub body: Arc<ValueActor>,
+}
+
+impl WhenCombinator {
+    /// Creates a ValueActor for WHEN pattern matching.
+    /// The arms are tried in order; first matching pattern's body is returned.
+    pub fn new_arc_value_actor(
+        construct_info: ConstructInfo,
+        _construct_context: ConstructContext,
+        actor_context: ActorContext,
+        input: Arc<ValueActor>,
+        arms: Vec<CompiledArm>,
+    ) -> Arc<ValueActor> {
+        let construct_info = construct_info.complete(ConstructType::ValueActor);
+        let arms = Arc::new(arms);
+
+        // For each input value, find the matching arm and emit its body's value
+        let value_stream = input
+            .subscribe()
+            .flat_map({
+                let arms = arms.clone();
+                move |input_value| {
+                    // Find the first matching arm
+                    let matched_arm = arms
+                        .iter()
+                        .find(|arm| (arm.matcher)(&input_value));
+
+                    if let Some(arm) = matched_arm {
+                        // Subscribe to the matching arm's body
+                        arm.body.subscribe().boxed_local()
+                    } else {
+                        // No match - this shouldn't happen if we have a wildcard default
+                        // Return an empty stream
+                        stream::empty().boxed_local()
+                    }
+                }
+            });
+
+        Arc::new(ValueActor::new_internal(
+            construct_info,
+            actor_context,
+            value_stream,
+            (input, arms),
+        ))
+    }
+}
+
+/// Create a matcher function for a pattern.
+pub fn pattern_to_matcher(pattern: &crate::parser::Pattern) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
+    match pattern {
+        crate::parser::Pattern::WildCard => {
+            Box::new(|_| true)
+        }
+        crate::parser::Pattern::Literal(lit) => {
+            match lit {
+                crate::parser::Literal::Number(n) => {
+                    let n = *n;
+                    Box::new(move |v| {
+                        matches!(v, Value::Number(num, _) if num.number() == n)
+                    })
+                }
+                crate::parser::Literal::Text(t) => {
+                    let t = t.to_string();
+                    Box::new(move |v| {
+                        matches!(v, Value::Text(text, _) if text.text() == t)
+                    })
+                }
+                crate::parser::Literal::Tag(tag) => {
+                    let tag = tag.to_string();
+                    Box::new(move |v| {
+                        match v {
+                            Value::Tag(t, _) => t.tag() == tag,
+                            Value::TaggedObject(to, _) => to.tag == tag,
+                            _ => false,
+                        }
+                    })
+                }
+            }
+        }
+        crate::parser::Pattern::Alias { name: _ } => {
+            // Alias just binds the value, so it always matches
+            // (Variable binding will be handled separately)
+            Box::new(|_| true)
+        }
+        crate::parser::Pattern::TaggedObject { tag, variables: _ } => {
+            let tag = tag.to_string();
+            Box::new(move |v| {
+                matches!(v, Value::TaggedObject(to, _) if to.tag == tag)
+            })
+        }
+        crate::parser::Pattern::Object { variables: _ } => {
+            // Object pattern matches any object
+            Box::new(|v| matches!(v, Value::Object(_, _)))
+        }
+        crate::parser::Pattern::List { items: _ } => {
+            // List pattern matches any list (detailed matching would check items)
+            Box::new(|v| matches!(v, Value::List(_, _)))
+        }
+        crate::parser::Pattern::Map { entries: _ } => {
+            // Map pattern - not fully supported yet
+            Box::new(|_| false)
+        }
+    }
+}
+
 // --- ValueActor ---
 
 pub struct ValueActor {
