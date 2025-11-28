@@ -73,8 +73,9 @@ where
                     path
                 });
 
-            let argument = snake_case_identifier
-                .then(group((colon, expression.clone())).or_not())
+            // Regular argument: name: value or just name
+            let regular_argument = snake_case_identifier
+                .then(group((colon.clone(), expression.clone())).or_not())
                 .map_with(|(name, value), extra| {
                     let value = value.map(|(_, value)| value);
                     Spanned {
@@ -87,6 +88,24 @@ where
                         persistence: None,
                     }
                 });
+
+            // PASS: value - special argument for implicit context
+            let pass_argument = just(Token::Pass)
+                .ignore_then(colon.clone())
+                .ignore_then(expression.clone())
+                .map_with(|value, extra| {
+                    Spanned {
+                        node: Argument {
+                            name: "PASS",
+                            is_referenced: false,
+                            value: Some(value),
+                        },
+                        span: extra.span(),
+                        persistence: None,
+                    }
+                });
+
+            let argument = choice((pass_argument, regular_argument));
 
             path.then(
                 argument
@@ -594,7 +613,7 @@ where
 }
 
 // @TODO not everything is expression, FUNCTIONs can be defined only in the root, etc.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Expression<'code> {
     Variable(Box<Variable<'code>>),
     Literal(Literal<'code>),
@@ -652,7 +671,7 @@ pub enum Expression<'code> {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Comparator<'code> {
     Equal {
         operand_a: Box<Spanned<Expression<'code>>>,
@@ -680,7 +699,7 @@ pub enum Comparator<'code> {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ArithmeticOperator<'code> {
     Negate {
         operand: Box<Spanned<Expression<'code>>>,
@@ -703,7 +722,7 @@ pub enum ArithmeticOperator<'code> {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TextPart<'code> {
     // Plain text content
     Text(&'code str),
@@ -711,45 +730,45 @@ pub enum TextPart<'code> {
     Interpolation { var: &'code str },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Object<'code> {
     pub variables: Vec<Spanned<Variable<'code>>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Variable<'code> {
     pub name: &'code str,
     pub is_referenced: bool,
     pub value: Spanned<Expression<'code>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Literal<'code> {
     Number(f64),
     Text(&'code str),
     Tag(&'code str),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MapEntry<'code> {
     pub key: Spanned<MapEntryKey<'code>>,
     pub value: Spanned<Expression<'code>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum MapEntryKey<'code> {
     Literal(Literal<'code>),
     Alias(Alias<'code>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Argument<'code> {
     pub name: &'code str,
     pub is_referenced: bool,
     pub value: Option<Spanned<Expression<'code>>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Alias<'code> {
     WithoutPassed {
         parts: Vec<&'code str>,
@@ -781,13 +800,13 @@ impl<'code> fmt::Display for Alias<'code> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Arm<'code> {
     pub pattern: Pattern<'code>,
     pub body: Expression<'code>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Pattern<'code> {
     Literal(Literal<'code>),
     List {
@@ -809,13 +828,13 @@ pub enum Pattern<'code> {
     WildCard,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PatternVariable<'code> {
     pub name: &'code str,
     pub value: Option<Pattern<'code>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PatternMapEntry<'code> {
     pub key: Pattern<'code>,
     pub value: Option<Pattern<'code>>,

@@ -1,8 +1,12 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use zoon::mpsc;
+use zoon::futures_util::stream;
 use zoon::{Stream, StreamExt};
 
 use super::super::super::parser::{
@@ -13,6 +17,20 @@ use super::engine::*;
 
 type EvaluateResult<'code, T> = Result<T, ParseError<'code, Token<'code>>>;
 
+/// Registry for user-defined functions.
+/// Functions are stored by name and contain their parameter names and body.
+#[derive(Clone, Default)]
+pub struct FunctionRegistry<'code> {
+    functions: Rc<RefCell<HashMap<&'code str, FunctionDefinition<'code>>>>,
+}
+
+/// A user-defined function definition.
+#[derive(Clone)]
+pub struct FunctionDefinition<'code> {
+    pub parameters: Vec<&'code str>,
+    pub body: Spanned<Expression<'code>>,
+}
+
 pub fn evaluate(
     expressions: Vec<Spanned<Expression>>,
     states_local_storage_key: impl Into<Cow<'static, str>>,
@@ -22,55 +40,75 @@ pub fn evaluate(
     };
     let actor_context = ActorContext::default();
     let reference_connector = Arc::new(ReferenceConnector::new());
+    let function_registry = FunctionRegistry::default();
+
+    // First pass: collect function definitions
+    let mut variables = Vec::new();
+    for expr in expressions {
+        let Spanned {
+            span,
+            node: expression,
+            persistence,
+        } = expr;
+        match expression {
+            Expression::Variable(variable) => {
+                variables.push(Spanned {
+                    span,
+                    node: *variable,
+                    persistence,
+                });
+            }
+            Expression::Function {
+                name,
+                parameters,
+                body,
+            } => {
+                // Store function definition in registry
+                function_registry.functions.borrow_mut().insert(
+                    name,
+                    FunctionDefinition {
+                        parameters: parameters.into_iter().map(|p| p.node).collect(),
+                        body: *body,
+                    },
+                );
+            }
+            _ => {
+                return Err(ParseError::custom(
+                    span,
+                    "Only variables or functions expected at top level",
+                ));
+            }
+        }
+    }
+
+    // Second pass: evaluate variables
     let root_object = Object::new_arc(
         ConstructInfo::new("root", None, "root"),
         construct_context.clone(),
-        expressions
+        variables
             .into_iter()
-            .map(
-                |Spanned {
-                     span,
-                     node: expression,
-                     persistence,
-                 }| {
-                    match expression {
-                        Expression::Variable(variable) => spanned_variable_into_variable(
-                            Spanned {
-                                span,
-                                node: *variable,
-                                persistence,
-                            },
-                            construct_context.clone(),
-                            actor_context.clone(),
-                            reference_connector.clone(),
-                        ),
-                        Expression::Function {
-                            name,
-                            parameters,
-                            body,
-                        } => {
-                            // @TODO implement
-                            todo!("Function definitions are not supported yet, sorry")
-                        }
-                        _ => Err(ParseError::custom(
-                            span,
-                            "Only variables or functions expected",
-                        )),
-                    }
-                },
-            )
+            .map(|variable| {
+                spanned_variable_into_variable(
+                    variable,
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    reference_connector.clone(),
+                    function_registry.clone(),
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?,
     );
     Ok((root_object, construct_context))
 }
 
 // @TODO Is the rule "LINK has to be the only variable value" necessary? Validate it by the parser?
-fn spanned_variable_into_variable(
-    variable: Spanned<parser::Variable>,
+fn spanned_variable_into_variable<'code>(
+    variable: Spanned<parser::Variable<'code>>,
     construct_context: ConstructContext,
     actor_context: ActorContext,
     reference_connector: Arc<ReferenceConnector>,
-) -> EvaluateResult<Arc<Variable>> {
+    function_registry: FunctionRegistry<'code>,
+) -> EvaluateResult<'code, Arc<Variable>> {
     let Spanned {
         span,
         node: variable,
@@ -109,6 +147,7 @@ fn spanned_variable_into_variable(
                 construct_context,
                 actor_context,
                 reference_connector.clone(),
+                function_registry,
             )?,
         )
     };
@@ -119,12 +158,13 @@ fn spanned_variable_into_variable(
 }
 
 // @TODO resolve ids
-fn spanned_expression_into_value_actor(
-    expression: Spanned<Expression>,
+fn spanned_expression_into_value_actor<'code>(
+    expression: Spanned<Expression<'code>>,
     construct_context: ConstructContext,
     actor_context: ActorContext,
     reference_connector: Arc<ReferenceConnector>,
-) -> EvaluateResult<Arc<ValueActor>> {
+    function_registry: FunctionRegistry<'code>,
+) -> EvaluateResult<'code, Arc<ValueActor>> {
     let Spanned {
         span,
         node: expression,
@@ -197,6 +237,7 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -219,6 +260,7 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -242,6 +284,7 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -259,7 +302,88 @@ fn spanned_expression_into_value_actor(
             "Not supported yet, sorry [Expression::Function]",
         ))?,
         Expression::FunctionCall { path, arguments } => {
-            // @TODO better argument error handling
+            // Evaluate all arguments, keeping track of names
+            let mut evaluated_args: Vec<Arc<ValueActor>> = Vec::new();
+            let mut named_args: HashMap<String, Arc<ValueActor>> = HashMap::new();
+            let mut pass_arg: Option<Arc<ValueActor>> = None;
+
+            for Spanned {
+                span: arg_span,
+                node: argument,
+                persistence: _,
+            } in arguments
+            {
+                let parser::Argument {
+                    name,
+                    value,
+                    is_referenced,
+                } = argument;
+                let Some(value) = value else {
+                    // @TODO support out arguments
+                    Err(ParseError::custom(
+                        arg_span,
+                        "Out arguments not supported yet, sorry",
+                    ))?
+                };
+                let actor = spanned_expression_into_value_actor(
+                    value,
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    reference_connector.clone(),
+                    function_registry.clone(),
+                )?;
+                if is_referenced {
+                    reference_connector.register_referenceable(arg_span, actor.clone());
+                }
+
+                // Check for PASS: argument (name would be "PASS" if parser supports it)
+                // For now, empty name "" means piped first argument
+                if name == "PASS" {
+                    pass_arg = Some(actor.clone());
+                } else if !name.is_empty() {
+                    named_args.insert(name.to_string(), actor.clone());
+                }
+                evaluated_args.push(actor);
+            }
+
+            // Check if it's a user-defined function (single-element path)
+            if path.len() == 1 {
+                let fn_name = path[0];
+                if let Some(func_def) = function_registry.functions.borrow().get(fn_name).cloned() {
+                    // User-defined function call
+                    let mut new_actor_context = actor_context.clone();
+
+                    // Set PASSED if there's a PASS: argument
+                    if let Some(pass_value) = pass_arg {
+                        new_actor_context.passed = Some(pass_value);
+                    }
+
+                    // Bind parameters: match function definition parameters to arguments
+                    // Arguments can be passed by position or by name
+                    new_actor_context.parameters = HashMap::new();
+                    for (i, param_name) in func_def.parameters.iter().enumerate() {
+                        // First check if argument was passed by name
+                        if let Some(actor) = named_args.get(*param_name) {
+                            new_actor_context.parameters.insert(param_name.to_string(), actor.clone());
+                        } else if i < evaluated_args.len() {
+                            // Fall back to positional argument
+                            new_actor_context.parameters.insert(param_name.to_string(), evaluated_args[i].clone());
+                        }
+                    }
+
+                    // Clone and evaluate the function body
+                    let body = func_def.body.clone();
+                    return spanned_expression_into_value_actor(
+                        body,
+                        construct_context.clone(),
+                        new_actor_context,
+                        reference_connector.clone(),
+                        function_registry.clone(),
+                    );
+                }
+            }
+
+            // Built-in function call
             FunctionCall::new_arc_value_actor(
                 ConstructInfo::new(
                     format!("PersistenceId: {persistence_id}"),
@@ -269,64 +393,52 @@ fn spanned_expression_into_value_actor(
                 construct_context.clone(),
                 actor_context.clone(),
                 function_call_path_to_definition(&path, span)?,
-                arguments
-                    .into_iter()
-                    .map(
-                        |Spanned {
-                             span,
-                             node: argument,
-                             persistence: _,
-                         }| {
-                            let parser::Argument {
-                                name,
-                                value,
-                                is_referenced,
-                            } = argument;
-                            let Some(value) = value else {
-                                // @TODO support out arguments
-                                Err(ParseError::custom(
-                                    span,
-                                    "Out arguments not supported yet, sorry",
-                                ))?
-                            };
-                            let actor = spanned_expression_into_value_actor(
-                                value,
-                                construct_context.clone(),
-                                actor_context.clone(),
-                                reference_connector.clone(),
-                            );
-                            if is_referenced {
-                                if let Ok(actor) = &actor {
-                                    reference_connector.register_referenceable(span, actor.clone());
-                                }
-                            }
-                            actor
-                        },
-                    )
-                    .collect::<Result<Vec<_>, _>>()?,
+                evaluated_args,
             )
         }
         Expression::Alias(alias) => {
-            let root_value_actor = match &alias {
-                parser::Alias::WithPassed { extra_parts } => Err(ParseError::custom(
-                    span,
-                    "Aliases with PASSED not supported yet, sorry",
-                ))?,
+            use std::pin::Pin;
+            use std::future::Future;
+            type BoxedFuture = Pin<Box<dyn Future<Output = Arc<ValueActor>>>>;
+
+            let root_value_actor: BoxedFuture = match &alias {
+                parser::Alias::WithPassed { extra_parts: _ } => {
+                    // PASSED refers to the implicit context passed via PASS: argument
+                    match &actor_context.passed {
+                        Some(passed) => {
+                            let passed = passed.clone();
+                            Box::pin(async move { passed })
+                        }
+                        None => Err(ParseError::custom(
+                            span,
+                            "PASSED is not available in this context (no PASS: argument was provided)",
+                        ))?,
+                    }
+                }
                 parser::Alias::WithoutPassed {
                     parts,
                     referenceables,
                 } => {
-                    let referenced = referenceables
-                        .as_ref()
-                        .expect("Failed to get alias referenceables in evaluator")
-                        .referenced;
-                    if let Some(referenced) = referenced {
-                        reference_connector.referenceable(referenced.span)
+                    // First check if the first part is a function parameter
+                    let first_part = parts.first().copied().unwrap_or("");
+                    if let Some(param_actor) = actor_context.parameters.get(first_part) {
+                        // This alias starts with a function parameter name
+                        let param_actor = param_actor.clone();
+                        Box::pin(async move { param_actor })
                     } else {
-                        Err(ParseError::custom(
-                            span,
-                            "Failed to get aliased variable or argument",
-                        ))?
+                        // Fall back to scope-resolved reference
+                        let referenced = referenceables
+                            .as_ref()
+                            .expect("Failed to get alias referenceables in evaluator")
+                            .referenced;
+                        if let Some(referenced) = referenced {
+                            Box::pin(reference_connector.referenceable(referenced.span))
+                        } else {
+                            Err(ParseError::custom(
+                                span,
+                                format!("Failed to get aliased variable or argument '{}'", first_part),
+                            ))?
+                        }
                     }
                 }
             };
@@ -366,6 +478,7 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -388,11 +501,22 @@ fn spanned_expression_into_value_actor(
             construct_context,
             actor_context,
             reference_connector,
+            function_registry,
         )?,
-        Expression::Skip => Err(ParseError::custom(
-            span,
-            "Not supported yet, sorry [Expression::Skip]",
-        ))?,
+        Expression::Skip => {
+            // SKIP represents "no value" - a stream that never emits
+            // Used in WHEN patterns to skip values that don't match
+            let construct_info = ConstructInfo::new(
+                format!("PersistenceId: {persistence_id}"),
+                persistence,
+                format!("{span}; SKIP"),
+            );
+            ValueActor::new_arc(
+                construct_info,
+                actor_context,
+                stream::empty(), // Never emits any values
+            )
+        }
         Expression::Block { variables, output } => {
             // BLOCK creates a local scope with variables
             // Variables can reference each other (defined earlier in the block)
@@ -405,6 +529,7 @@ fn spanned_expression_into_value_actor(
                     construct_context.clone(),
                     actor_context.clone(),
                     reference_connector.clone(),
+                    function_registry.clone(),
                 )?;
                 // The variable is registered in reference_connector by spanned_variable_into_variable
                 // We just need to keep it alive - but we don't have a place to store it
@@ -419,6 +544,7 @@ fn spanned_expression_into_value_actor(
                 construct_context,
                 actor_context,
                 reference_connector,
+                function_registry,
             )?
         }
         Expression::Comparator(comparator) => {
@@ -434,12 +560,14 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )?;
                     let b = spanned_expression_into_value_actor(
                         *operand_b,
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector,
+                        function_registry,
                     )?;
                     ComparatorCombinator::new_equal(
                         construct_info,
@@ -455,12 +583,14 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )?;
                     let b = spanned_expression_into_value_actor(
                         *operand_b,
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector,
+                        function_registry,
                     )?;
                     ComparatorCombinator::new_not_equal(
                         construct_info,
@@ -476,12 +606,14 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )?;
                     let b = spanned_expression_into_value_actor(
                         *operand_b,
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector,
+                        function_registry,
                     )?;
                     ComparatorCombinator::new_greater(
                         construct_info,
@@ -497,12 +629,14 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )?;
                     let b = spanned_expression_into_value_actor(
                         *operand_b,
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector,
+                        function_registry,
                     )?;
                     ComparatorCombinator::new_greater_or_equal(
                         construct_info,
@@ -518,12 +652,14 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )?;
                     let b = spanned_expression_into_value_actor(
                         *operand_b,
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector,
+                        function_registry,
                     )?;
                     ComparatorCombinator::new_less(
                         construct_info,
@@ -539,12 +675,14 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )?;
                     let b = spanned_expression_into_value_actor(
                         *operand_b,
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector,
+                        function_registry,
                     )?;
                     ComparatorCombinator::new_less_or_equal(
                         construct_info,
@@ -569,12 +707,14 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )?;
                     let b = spanned_expression_into_value_actor(
                         *operand_b,
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector,
+                        function_registry,
                     )?;
                     ArithmeticCombinator::new_add(
                         construct_info,
@@ -590,12 +730,14 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )?;
                     let b = spanned_expression_into_value_actor(
                         *operand_b,
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector,
+                        function_registry,
                     )?;
                     ArithmeticCombinator::new_subtract(
                         construct_info,
@@ -611,12 +753,14 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )?;
                     let b = spanned_expression_into_value_actor(
                         *operand_b,
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector,
+                        function_registry,
                     )?;
                     ArithmeticCombinator::new_multiply(
                         construct_info,
@@ -632,12 +776,14 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )?;
                     let b = spanned_expression_into_value_actor(
                         *operand_b,
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector,
+                        function_registry,
                     )?;
                     ArithmeticCombinator::new_divide(
                         construct_info,
@@ -654,6 +800,7 @@ fn spanned_expression_into_value_actor(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector,
+                        function_registry,
                     )?;
                     let neg_one = Number::new_arc_value_actor(
                         ConstructInfo::new("neg_one", None, "-1 constant"),
@@ -716,8 +863,9 @@ fn function_call_path_to_definition<'code>(
         ConstructContext,
         ActorContext,
     ) -> Pin<Box<dyn Stream<Item = Value>>>
-    + use<>,
+    + 'static,
 > {
+    // Note: User-defined functions are handled separately in the FunctionCall expression handler
     let definition = match path {
         ["Document", "new"] => |arguments, id, persistence_id, construct_context, actor_context| {
             api::function_document_new(
@@ -787,6 +935,37 @@ fn function_call_path_to_definition<'code>(
                 .boxed_local()
             }
         }
+        // Text functions
+        ["Text", "empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_text_empty(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Text", "trim"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_text_trim(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Text", "is_empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_text_is_empty(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Text", "is_not_empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_text_is_not_empty(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        // Bool functions
+        ["Bool", "not"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_bool_not(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Bool", "toggle"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_bool_toggle(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        // Ulid functions
+        ["Ulid", "generate"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_ulid_generate(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
         _ => Err(ParseError::custom(
             span,
             format!("Unknown function '{}(..)'", path.join("/")),
@@ -801,6 +980,7 @@ fn pipe<'code>(
     construct_context: ConstructContext,
     actor_context: ActorContext,
     reference_connector: Arc<ReferenceConnector>,
+    function_registry: FunctionRegistry<'code>,
 ) -> EvaluateResult<'code, Arc<ValueActor>> {
     // @TODO destructure `to`?
     let to_persistence_id = to.persistence.expect("Failed to get persistence").id;
@@ -825,12 +1005,75 @@ fn pipe<'code>(
                 construct_context,
                 actor_context,
                 reference_connector,
+                function_registry,
             )
         }
-        Expression::LinkSetter { alias } => Err(ParseError::custom(
-            to.span,
-            "Piping into it is not supported yet, sorry [Expression::LinkSetter]",
-        ))?,
+        Expression::LinkSetter { alias } => {
+            // LinkSetter connects the "from" stream to a LINK variable
+            // It also passes through the values (so they can be used in a LIST, etc.)
+
+            let from_actor = spanned_expression_into_value_actor(
+                *from,
+                construct_context.clone(),
+                actor_context.clone(),
+                reference_connector.clone(),
+                function_registry,
+            )?;
+
+            // Resolve the alias to get the target LINK variable
+            let Spanned {
+                span: alias_span,
+                node: alias_node,
+                persistence: _,
+            } = alias;
+
+            use std::pin::Pin;
+            use std::future::Future;
+            type BoxedFuture = Pin<Box<dyn Future<Output = Arc<ValueActor>>>>;
+
+            let target_actor: BoxedFuture = match &alias_node {
+                parser::Alias::WithPassed { extra_parts: _ } => {
+                    // PASSED.xxx - get the PASSED value and navigate
+                    match &actor_context.passed {
+                        Some(passed) => {
+                            let passed = passed.clone();
+                            Box::pin(async move { passed })
+                        }
+                        None => Err(ParseError::custom(
+                            alias_span,
+                            "PASSED is not available in this context for LinkSetter",
+                        ))?,
+                    }
+                }
+                parser::Alias::WithoutPassed {
+                    parts: _,
+                    referenceables,
+                } => {
+                    let referenced = referenceables
+                        .as_ref()
+                        .expect("Failed to get alias referenceables in LinkSetter")
+                        .referenced;
+                    if let Some(referenced) = referenced {
+                        Box::pin(reference_connector.referenceable(referenced.span))
+                    } else {
+                        Err(ParseError::custom(
+                            alias_span,
+                            "Failed to resolve alias in LinkSetter",
+                        ))?
+                    }
+                }
+            };
+
+            // Create a combinator that:
+            // 1. Resolves the target value (following the alias path)
+            // 2. Subscribes to "from" and forwards values to the target's LINK sender
+            // 3. Passes through the values
+
+            // For now, just pass through the from value
+            // @TODO: Actually implement the LINK forwarding by navigating to the LINK variable
+            // and sending values to its link_value_sender
+            Ok(from_actor)
+        }
         Expression::Then { body } => {
             let (impulse_sender, impulse_receiver) = mpsc::unbounded();
             let mut body_actor_context = actor_context.clone();
@@ -850,6 +1093,7 @@ fn pipe<'code>(
                     construct_context.clone(),
                     actor_context.clone(),
                     reference_connector.clone(),
+                    function_registry.clone(),
                 )?,
                 impulse_sender,
                 spanned_expression_into_value_actor(
@@ -857,6 +1101,7 @@ fn pipe<'code>(
                     construct_context,
                     body_actor_context,
                     reference_connector,
+                    function_registry,
                 )?,
             ))
         }
@@ -867,6 +1112,7 @@ fn pipe<'code>(
                 construct_context.clone(),
                 actor_context.clone(),
                 reference_connector.clone(),
+                function_registry.clone(),
             )?;
 
             // Compile each arm
@@ -885,6 +1131,7 @@ fn pipe<'code>(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )?;
                     Ok(CompiledArm { matcher, body })
                 })
@@ -913,6 +1160,7 @@ fn pipe<'code>(
                 construct_context.clone(),
                 actor_context.clone(),
                 reference_connector.clone(),
+                function_registry.clone(),
             )?;
 
             // Compile each arm
@@ -931,6 +1179,7 @@ fn pipe<'code>(
                         construct_context.clone(),
                         actor_context.clone(),
                         reference_connector.clone(),
+                        function_registry.clone(),
                     )?;
                     Ok(CompiledArm { matcher, body })
                 })

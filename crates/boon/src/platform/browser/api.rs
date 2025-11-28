@@ -463,3 +463,191 @@ pub fn function_timer_interval(
             })
         })
 }
+
+// --- Text functions ---
+
+/// Text/empty constant
+pub fn function_text_empty(
+    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    stream::once(future::ready(Text::new_value(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/empty"),
+        construct_context,
+        ValueIdempotencyKey::new(),
+        String::new(),
+    )))
+}
+
+/// Text/trim(text) -> Text
+pub fn function_text_trim(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_text] = arguments.as_slice() else {
+        panic!("Text/trim expects 1 argument")
+    };
+    argument_text.subscribe().map(move |value| {
+        let text = match &value {
+            Value::Text(t, _) => t.text(),
+            _ => panic!("Text/trim expects a Text value"),
+        };
+        Text::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/trim result"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            text.trim().to_string(),
+        )
+    })
+}
+
+/// Text/is_empty(text) -> Tag (True/False)
+pub fn function_text_is_empty(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_text] = arguments.as_slice() else {
+        panic!("Text/is_empty expects 1 argument")
+    };
+    argument_text.subscribe().map(move |value| {
+        let text = match &value {
+            Value::Text(t, _) => t.text(),
+            _ => panic!("Text/is_empty expects a Text value"),
+        };
+        let tag = if text.is_empty() { "True" } else { "False" };
+        Tag::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/is_empty result"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            tag.to_string(),
+        )
+    })
+}
+
+/// Text/is_not_empty(text) -> Tag (True/False)
+pub fn function_text_is_not_empty(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_text] = arguments.as_slice() else {
+        panic!("Text/is_not_empty expects 1 argument")
+    };
+    argument_text.subscribe().map(move |value| {
+        let text = match &value {
+            Value::Text(t, _) => t.text(),
+            _ => panic!("Text/is_not_empty expects a Text value"),
+        };
+        let tag = if !text.is_empty() { "True" } else { "False" };
+        Tag::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/is_not_empty result"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            tag.to_string(),
+        )
+    })
+}
+
+// --- Bool functions ---
+
+/// Bool/not(value) -> Tag (True/False)
+pub fn function_bool_not(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_value] = arguments.as_slice() else {
+        panic!("Bool/not expects 1 argument")
+    };
+    argument_value.subscribe().map(move |value| {
+        let is_true = match &value {
+            Value::Tag(tag, _) => tag.tag() == "True",
+            _ => panic!("Bool/not expects a Tag (True/False)"),
+        };
+        let result_tag = if is_true { "False" } else { "True" };
+        Tag::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Bool/not result"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            result_tag.to_string(),
+        )
+    })
+}
+
+/// Bool/toggle(value, when) -> Tag (True/False)
+/// Toggles the boolean value each time 'when' stream produces a value
+pub fn function_bool_toggle(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    // Clone to avoid lifetime issues
+    let argument_value = arguments[0].clone();
+    let argument_when = arguments[1].clone();
+
+    // Get initial value and toggle on each 'when' event
+    let initial = argument_value.clone();
+    let when_stream = argument_when.subscribe();
+
+    stream::once(async move {
+        // Get initial boolean state
+        let _current = true; // Will be set by first value
+        initial
+    })
+    .chain(when_stream.map(move |_| {
+        // This is a simplified implementation - real implementation would need state
+        argument_value.clone()
+    }))
+    .flat_map(|actor| actor.subscribe())
+    .scan(None::<bool>, move |state, value| {
+        let is_true = match &value {
+            Value::Tag(tag, _) => tag.tag() == "True",
+            _ => false,
+        };
+        let new_value = match state {
+            None => is_true, // First value sets initial state
+            Some(_) => !state.unwrap(), // Toggle on subsequent values
+        };
+        *state = Some(new_value);
+        let result_tag = if new_value { "True" } else { "False" };
+        future::ready(Some(Tag::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Bool/toggle result"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            result_tag.to_string(),
+        )))
+    })
+}
+
+// --- Ulid functions ---
+
+/// Ulid/generate() -> Text
+pub fn function_ulid_generate(
+    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    stream::once(future::ready(Text::new_value(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "Ulid/generate"),
+        construct_context,
+        ValueIdempotencyKey::new(),
+        ulid::Ulid::new().to_string(),
+    )))
+}

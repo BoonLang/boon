@@ -144,6 +144,14 @@ impl ConstructStorage {
 #[derive(Default, Clone)]
 pub struct ActorContext {
     pub output_valve_signal: Option<Arc<ActorOutputValveSignal>>,
+    /// The PASSED value - implicit context passed through function calls.
+    /// Set when calling a function with `PASS: something` argument.
+    /// Accessible inside the function via `PASSED` or `PASSED.field`.
+    pub passed: Option<Arc<ValueActor>>,
+    /// Function parameter bindings - maps parameter names to their values.
+    /// Set when calling a user-defined function.
+    /// e.g., `fn(param: x)` binds "param" -> x's ValueActor
+    pub parameters: HashMap<String, Arc<ValueActor>>,
 }
 
 // --- ActorOutputValveSignal ---

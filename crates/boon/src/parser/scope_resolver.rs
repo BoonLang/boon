@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 // @TODO Immutables or different tree traversal algorithm?
 pub type ReachableReferenceables<'code> = BTreeMap<&'code str, Vec<Referenceable<'code>>>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Referenceables<'code> {
     pub referenced: Option<Referenceable<'code>>,
 }
