@@ -1,0 +1,34 @@
+[package]
+name = "boon-tools"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone crate - not part of boon workspace
+[workspace]
+
+[[bin]]
+name = "boon-tools"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Chrome DevTools Protocol
+chromiumoxide = { git = "https://github.com/mattsse/chromiumoxide", features = ["tokio-runtime"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+env_logger = "0.11"
+log = "0.4"
+
+# Base64 for screenshot fallback
+base64 = "0.21"
