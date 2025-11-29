@@ -4,14 +4,19 @@
 use boon::zoon::{eprintln, println, *};
 use boon::zoon::{map_ref, Rgba};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use boon::platform::browser::{bridge::object_with_document_to_element_signal, interpreter};
+use boon::platform::browser::{
+    bridge::object_with_document_to_element_signal, engine::VirtualFilesystem, interpreter,
+};
 
 mod code_editor;
 use code_editor::CodeEditor;
 
 static SOURCE_CODE_STORAGE_KEY: &str = "boon-playground-source-code";
+static PROJECT_FILES_STORAGE_KEY: &str = "boon-playground-project-files";
+static CURRENT_FILE_STORAGE_KEY: &str = "boon-playground-current-file";
 
 static OLD_SOURCE_CODE_STORAGE_KEY: &str = "boon-playground-old-source-code";
 static OLD_SPAN_ID_PAIRS_STORAGE_KEY: &str = "boon-playground-span-id-pairs";
@@ -75,27 +80,70 @@ fn main() {
     start_app("app", Playground::new);
 }
 
+const DEFAULT_FILE_NAME: &str = "main.bn";
+
 #[derive(Clone)]
 struct Playground {
+    /// All files in the project (filename -> content)
+    files: Mutable<Rc<BTreeMap<String, String>>>,
+    /// Currently selected/edited file name
+    current_file: Mutable<String>,
+    /// Current file content for the code editor
     source_code: Mutable<Rc<Cow<'static, str>>>,
     run_command: Mutable<Option<RunCommand>>,
     snippet_screenshot_mode: Mutable<bool>,
     panel_split_ratio: Mutable<f64>,
     panel_container_width: Mutable<u32>,
     is_dragging_panel_split: Mutable<bool>,
-    _store_source_code_task: Rc<TaskHandle>,
+    _store_files_task: Rc<TaskHandle>,
+    _store_current_file_task: Rc<TaskHandle>,
     _store_panel_split_task: Rc<TaskHandle>,
+    _sync_source_to_files_task: Rc<TaskHandle>,
 }
 
 impl Playground {
     fn new() -> impl Element {
-        let source_code =
-            if let Some(Ok(source_code)) = local_storage().get(SOURCE_CODE_STORAGE_KEY) {
-                Cow::Owned(source_code)
-            } else {
-                Cow::Borrowed(EXAMPLE_DATAS[0].source_code)
-            };
-        let source_code = Mutable::new(Rc::new(source_code));
+        // Load files from storage, or initialize with default example
+        let (files, current_file) = if let Some(Ok(stored_files)) =
+            local_storage().get::<BTreeMap<String, String>>(PROJECT_FILES_STORAGE_KEY)
+        {
+            let current = local_storage()
+                .get::<String>(CURRENT_FILE_STORAGE_KEY)
+                .and_then(Result::ok)
+                .unwrap_or_else(|| {
+                    stored_files
+                        .keys()
+                        .next()
+                        .cloned()
+                        .unwrap_or_else(|| DEFAULT_FILE_NAME.to_string())
+                });
+            (stored_files, current)
+        } else if let Some(Ok(legacy_code)) = local_storage().get::<String>(SOURCE_CODE_STORAGE_KEY)
+        {
+            // Migrate from old single-file storage
+            let mut files = BTreeMap::new();
+            files.insert(DEFAULT_FILE_NAME.to_string(), legacy_code);
+            (files, DEFAULT_FILE_NAME.to_string())
+        } else {
+            // Use default example
+            let mut files = BTreeMap::new();
+            files.insert(
+                EXAMPLE_DATAS[0].filename.to_string(),
+                EXAMPLE_DATAS[0].source_code.to_string(),
+            );
+            (files, EXAMPLE_DATAS[0].filename.to_string())
+        };
+
+        // Get current file content for editor
+        let current_content = files
+            .get(&current_file)
+            .cloned()
+            .unwrap_or_default();
+
+        let files = Mutable::new(Rc::new(files));
+        let current_file = Mutable::new(current_file);
+        let source_code = Mutable::new(Rc::new(Cow::from(current_content)));
+
         let panel_split_ratio_value =
             if let Some(Ok(ratio)) = local_storage().get(PANEL_SPLIT_STORAGE_KEY) {
                 ratio
@@ -104,14 +152,26 @@ impl Playground {
             };
         let panel_split_ratio =
             Mutable::new(Self::clamp_panel_split_ratio(panel_split_ratio_value));
-        let _store_source_code_task = Rc::new(Task::start_droppable(
-            source_code.signal_cloned().for_each_sync(|source_code| {
-                if let Err(error) = local_storage().insert(SOURCE_CODE_STORAGE_KEY, &source_code)
+
+        // Auto-save files to storage
+        let _store_files_task = Rc::new(Task::start_droppable(
+            files.signal_cloned().for_each_sync(|files| {
+                if let Err(error) = local_storage().insert(PROJECT_FILES_STORAGE_KEY, files.as_ref())
                 {
-                    eprintln!("Failed to store source code: {error:#?}");
+                    eprintln!("Failed to store project files: {error:#?}");
                 }
             }),
         ));
+
+        // Auto-save current file name to storage
+        let _store_current_file_task = Rc::new(Task::start_droppable(
+            current_file.signal_cloned().for_each_sync(|filename| {
+                if let Err(error) = local_storage().insert(CURRENT_FILE_STORAGE_KEY, &filename) {
+                    eprintln!("Failed to store current file name: {error:#?}");
+                }
+            }),
+        ));
+
         let _store_panel_split_task = Rc::new(Task::start_droppable(
             panel_split_ratio
                 .signal_cloned()
@@ -121,15 +181,35 @@ impl Playground {
                     }
                 }),
         ));
+
+        // Sync source_code changes back to files map
+        let _sync_source_to_files_task = {
+            let files = files.clone();
+            let current_file = current_file.clone();
+            Rc::new(Task::start_droppable(
+                source_code.signal_cloned().for_each_sync(move |content| {
+                    let filename = current_file.lock_ref().clone();
+                    // Clone the inner BTreeMap (not just the Rc)
+                    let mut files_map = (**files.lock_ref()).clone();
+                    files_map.insert(filename, content.to_string());
+                    files.set(Rc::new(files_map));
+                }),
+            ))
+        };
+
         Self {
+            files,
+            current_file,
             source_code,
             run_command: Mutable::new(None),
             snippet_screenshot_mode: Mutable::new(false),
             panel_split_ratio,
             panel_container_width: Mutable::new(0),
             is_dragging_panel_split: Mutable::new(false),
-            _store_source_code_task,
+            _store_files_task,
+            _store_current_file_task,
             _store_panel_split_task,
+            _sync_source_to_files_task,
         }
         .root()
     }
@@ -790,7 +870,134 @@ impl Playground {
             .s(Width::fill())
             .s(Height::fill())
             .s(Gap::new().y(8))
+            .item(self.file_tabs_row())
             .item(self.standard_code_editor_surface())
+    }
+
+    fn file_tabs_row(&self) -> impl Element + use<> {
+        Row::new()
+            .s(Width::fill())
+            .s(Align::new().center_y())
+            .s(Gap::new().x(6))
+            .s(Padding::new().x(4).y(4))
+            .s(Background::new().color(color!("rgba(8, 12, 22, 0.5)")))
+            .s(RoundedCorners::all(16))
+            .multiline()
+            .items_signal_vec(
+                self.files
+                    .signal_cloned()
+                    .map({
+                        let this = self.clone();
+                        move |files| {
+                            files
+                                .keys()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .map({
+                                    let this = this.clone();
+                                    move |filename| this.file_tab(filename)
+                                })
+                                .collect::<Vec<_>>()
+                        }
+                    })
+                    .to_signal_vec(),
+            )
+            .item(self.add_file_button())
+    }
+
+    fn file_tab(&self, filename: String) -> impl Element + use<> {
+        let hovered = Mutable::new(false);
+        let filename_for_check = filename.clone();
+        let filename_for_click = filename.clone();
+        let is_active_signal = self
+            .current_file
+            .signal_cloned()
+            .map(move |current| current == filename_for_check)
+            .broadcast();
+
+        Button::new()
+            .s(Padding::new().x(12).y(6))
+            .s(RoundedCorners::all(12))
+            .s(Font::new().size(13).weight(FontWeight::Medium).no_wrap())
+            .s(Background::new().color_signal(map_ref! {
+                let hovered = hovered.signal(),
+                let is_active = is_active_signal.signal() =>
+                match (*is_active, *hovered) {
+                    (true, _) => color!("rgba(60, 94, 148, 0.65)"),
+                    (false, true) => color!("rgba(36, 48, 72, 0.5)"),
+                    (false, false) => color!("rgba(20, 28, 44, 0.4)"),
+                }
+            }))
+            .s(Font::new().color_signal(map_ref! {
+                let hovered = hovered.signal(),
+                let is_active = is_active_signal.signal() =>
+                if *is_active {
+                    color!("#f6f8ff")
+                } else if *hovered {
+                    color!("rgba(214, 223, 255, 0.9)")
+                } else {
+                    muted_text_color()
+                }
+            }))
+            .label(El::new().child(filename.clone()))
+            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+            .on_press({
+                let files = self.files.clone();
+                let current_file = self.current_file.clone();
+                let source_code = self.source_code.clone();
+                move || {
+                    // Switch to this file
+                    let files_ref = files.lock_ref();
+                    if let Some(content) = files_ref.get(&filename_for_click) {
+                        source_code.set(Rc::new(Cow::from(content.clone())));
+                        current_file.set(filename_for_click.clone());
+                    }
+                }
+            })
+    }
+
+    fn add_file_button(&self) -> impl Element + use<> {
+        let hovered = Mutable::new(false);
+        Button::new()
+            .s(Padding::new().x(10).y(6))
+            .s(RoundedCorners::all(12))
+            .s(Font::new().size(13).weight(FontWeight::Medium))
+            .s(Background::new().color_signal(
+                hovered
+                    .signal()
+                    .map_bool(|| color!("rgba(60, 140, 90, 0.5)"), || color!("rgba(40, 90, 60, 0.35)")),
+            ))
+            .s(Font::new().color_signal(
+                hovered
+                    .signal()
+                    .map_bool(|| color!("rgba(180, 255, 200, 0.95)"), || color!("rgba(160, 230, 180, 0.8)")),
+            ))
+            .label(El::new().child("+"))
+            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+            .on_press({
+                let files = self.files.clone();
+                let current_file = self.current_file.clone();
+                let source_code = self.source_code.clone();
+                move || {
+                    // Find a unique filename
+                    let files_ref = files.lock_ref();
+                    let mut new_name = "new.bn".to_string();
+                    let mut counter = 1;
+                    while files_ref.contains_key(&new_name) {
+                        new_name = format!("new_{counter}.bn");
+                        counter += 1;
+                    }
+                    drop(files_ref);
+
+                    // Create new file
+                    let mut new_files = (**files.lock_ref()).clone();
+                    new_files.insert(new_name.clone(), String::new());
+                    files.set(Rc::new(new_files));
+                    current_file.set(new_name);
+                    source_code.set(Rc::new(Cow::from(String::new())));
+                }
+            })
     }
 
     fn snippet_screenshot_surface(&self) -> impl Element + use<> {
@@ -945,14 +1152,49 @@ impl Playground {
 
     fn example_runner(&self, run_command: RunCommand) -> impl Element + use<> {
         println!("Command to run example received!");
-        let filename = run_command.filename.unwrap_or("custom code");
+
+        // Get all files and current file info
+        let files = self.files.lock_ref();
+        let current_file_name = self.current_file.lock_ref().clone();
+        let filename = run_command.filename.unwrap_or(&current_file_name);
         let source_code = self.source_code.lock_ref();
+
+        // Create VirtualFilesystem with all project files
+        let virtual_fs = VirtualFilesystem::with_files(
+            files
+                .iter()
+                .map(|(name, content)| (name.clone(), content.clone()))
+                .collect(),
+        );
+
+        // Check if BUILD.bn exists and run it first
+        let build_source = files.get("BUILD.bn").cloned();
+        drop(files);
+
+        if let Some(build_code) = build_source {
+            println!("Running BUILD.bn first...");
+            // Run BUILD.bn with the same VirtualFilesystem
+            // This allows BUILD.bn to write files that the main file can read
+            let _build_result = interpreter::run(
+                "BUILD.bn",
+                &build_code,
+                // Use separate storage keys for build to avoid conflicts
+                "boon-playground-build-states",
+                "boon-playground-build-old-code",
+                "boon-playground-build-span-id-pairs",
+                virtual_fs.clone(),
+            );
+            // We don't care about BUILD.bn's return value, just its side effects
+            println!("BUILD.bn completed");
+        }
+
         let object_and_construct_context = interpreter::run(
             filename,
             &source_code,
             STATES_STORAGE_KEY,
             OLD_SOURCE_CODE_STORAGE_KEY,
             OLD_SPAN_ID_PAIRS_STORAGE_KEY,
+            virtual_fs,
         );
         drop(source_code);
         if let Some((object, construct_context)) = object_and_construct_context {
@@ -1011,9 +1253,19 @@ impl Playground {
             )
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press({
+                let files = self.files.clone();
+                let current_file = self.current_file.clone();
                 let source_code = self.source_code.clone();
                 let run_command = self.run_command.clone();
                 move || {
+                    // Replace project files with just this example
+                    let mut new_files = BTreeMap::new();
+                    new_files.insert(
+                        example_data.filename.to_string(),
+                        example_data.source_code.to_string(),
+                    );
+                    files.set(Rc::new(new_files));
+                    current_file.set(example_data.filename.to_string());
                     source_code.set_neq(Rc::new(Cow::from(example_data.source_code)));
                     run_command.set(Some(RunCommand {
                         filename: Some(example_data.filename),

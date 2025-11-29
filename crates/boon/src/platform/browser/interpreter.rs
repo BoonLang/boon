@@ -14,7 +14,7 @@ use crate::parser::{
     resolve_persistence, resolve_references, static_expression,
 };
 use crate::platform::browser::{
-    engine::{ConstructContext, Object},
+    engine::{ConstructContext, Object, VirtualFilesystem},
     evaluator::evaluate,
 };
 
@@ -24,6 +24,7 @@ pub fn run(
     states_local_storage_key: impl Into<Cow<'static, str>>,
     old_code_local_storage_key: impl Into<Cow<'static, str>>,
     old_span_id_pairs_local_storage_key: impl Into<Cow<'static, str>>,
+    virtual_fs: VirtualFilesystem,
 ) -> Option<(Arc<Object>, ConstructContext)> {
     let states_local_storage_key = states_local_storage_key.into();
     let old_code_local_storage_key = old_code_local_storage_key.into();
@@ -103,7 +104,7 @@ pub fn run(
     let source_code_arc = SourceCode::new(source_code.to_string());
     let static_ast = static_expression::convert_expressions(source_code_arc.clone(), ast);
 
-    let evaluation_result = match evaluate(source_code_arc, static_ast, states_local_storage_key.clone()) {
+    let evaluation_result = match evaluate(source_code_arc, static_ast, states_local_storage_key.clone(), virtual_fs) {
         Ok(result) => Some(result),
         Err(error) => {
             println!("[Evaluation Error]");

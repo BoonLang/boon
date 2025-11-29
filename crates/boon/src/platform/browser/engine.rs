@@ -33,11 +33,103 @@ pub fn constant<T>(item: T) -> impl Stream<Item = T> {
     stream::once(future::ready(item)).chain(stream::once(future::pending()))
 }
 
+// --- VirtualFilesystem ---
+
+/// In-memory filesystem for WASM environment
+/// Stores files as path -> content mappings
+#[derive(Clone, Default)]
+pub struct VirtualFilesystem {
+    files: Arc<std::cell::RefCell<HashMap<String, String>>>,
+}
+
+impl VirtualFilesystem {
+    pub fn new() -> Self {
+        Self {
+            files: Arc::new(std::cell::RefCell::new(HashMap::new())),
+        }
+    }
+
+    /// Create a VirtualFilesystem pre-populated with files
+    pub fn with_files(files: HashMap<String, String>) -> Self {
+        Self {
+            files: Arc::new(std::cell::RefCell::new(files)),
+        }
+    }
+
+    /// Read text content from a file
+    pub fn read_text(&self, path: &str) -> Option<String> {
+        let normalized = Self::normalize_path(path);
+        self.files.borrow().get(&normalized).cloned()
+    }
+
+    /// Write text content to a file
+    pub fn write_text(&self, path: &str, content: String) {
+        let normalized = Self::normalize_path(path);
+        self.files.borrow_mut().insert(normalized, content);
+    }
+
+    /// List entries in a directory
+    pub fn list_directory(&self, path: &str) -> Vec<String> {
+        let normalized = Self::normalize_path(path);
+        let prefix = if normalized.is_empty() || normalized == "/" {
+            String::new()
+        } else if normalized.ends_with('/') {
+            normalized.clone()
+        } else {
+            format!("{}/", normalized)
+        };
+
+        let files = self.files.borrow();
+        let mut entries: Vec<String> = files
+            .keys()
+            .filter_map(|file_path| {
+                if prefix.is_empty() {
+                    // Root directory - get first path component
+                    file_path.split('/').next().map(|s| s.to_string())
+                } else if file_path.starts_with(&prefix) {
+                    // Get the next path component after the prefix
+                    let remainder = &file_path[prefix.len()..];
+                    remainder.split('/').next().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Remove duplicates and sort
+        entries.sort();
+        entries.dedup();
+        entries
+    }
+
+    /// Check if a file exists
+    pub fn exists(&self, path: &str) -> bool {
+        let normalized = Self::normalize_path(path);
+        self.files.borrow().contains_key(&normalized)
+    }
+
+    /// Delete a file
+    pub fn delete(&self, path: &str) -> bool {
+        let normalized = Self::normalize_path(path);
+        self.files.borrow_mut().remove(&normalized).is_some()
+    }
+
+    /// Normalize path by removing leading/trailing slashes and "./" prefixes
+    fn normalize_path(path: &str) -> String {
+        let path = path.trim();
+        let path = path.strip_prefix("./").unwrap_or(path);
+        let path = path.strip_prefix('/').unwrap_or(path);
+        let path = path.strip_suffix('/').unwrap_or(path);
+        path.to_string()
+    }
+}
+
 // --- ConstructContext ---
 
 #[derive(Clone)]
 pub struct ConstructContext {
     pub construct_storage: Arc<ConstructStorage>,
+    pub virtual_fs: VirtualFilesystem,
 }
 
 // --- ConstructStorage ---

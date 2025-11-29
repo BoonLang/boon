@@ -1688,8 +1688,7 @@ pub fn function_theme_accent_color(
 // --- File functions ---
 
 /// File/read_text(path) -> Text
-/// Reads text content from a file at the given path (stub - returns empty string)
-/// @TODO: Implement actual file reading with VirtualFS
+/// Reads text content from a file at the given path
 pub fn function_file_read_text(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     function_call_id: ConstructId,
@@ -1699,23 +1698,25 @@ pub fn function_file_read_text(
 ) -> impl Stream<Item = Value> {
     let path_actor = arguments[0].clone();
     path_actor.subscribe().map(move |value| {
-        let _path = match &value {
+        let path = match &value {
             Value::Text(text, _) => text.text().to_string(),
             _ => String::new(),
         };
-        // @TODO: Implement actual file reading with VirtualFS
+        let content = construct_context
+            .virtual_fs
+            .read_text(&path)
+            .unwrap_or_default();
         Text::new_value(
             ConstructInfo::new(function_call_id.with_child_id(0), None, "File/read_text"),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
-            String::new(), // Returns empty string as stub
+            content,
         )
     })
 }
 
 /// File/write_text(path, content) -> Tag (Success/Failure)
-/// Writes text content to a file at the given path (stub - always returns Success)
-/// @TODO: Implement actual file writing with VirtualFS
+/// Writes text content to a file at the given path
 pub fn function_file_write_text(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     function_call_id: ConstructId,
@@ -1728,18 +1729,18 @@ pub fn function_file_write_text(
 
     let construct_context_clone = construct_context.clone();
     path_actor.subscribe().flat_map(move |path_value| {
-        let _path = match &path_value {
+        let path = match &path_value {
             Value::Text(text, _) => text.text().to_string(),
             _ => String::new(),
         };
         let function_call_id = function_call_id.clone();
         let construct_context = construct_context_clone.clone();
         content_actor.subscribe().map(move |content_value| {
-            let _content = match &content_value {
+            let content = match &content_value {
                 Value::Text(text, _) => text.text().to_string(),
                 _ => String::new(),
             };
-            // @TODO: Implement actual file writing with VirtualFS
+            construct_context.virtual_fs.write_text(&path, content);
             Tag::new_value(
                 ConstructInfo::new(function_call_id.with_child_id(0), None, "File/write_text"),
                 construct_context.clone(),
@@ -1753,8 +1754,7 @@ pub fn function_file_write_text(
 // --- Directory functions ---
 
 /// Directory/entries(path) -> List<Text>
-/// Returns a list of file/directory names in the given directory (stub - returns empty list)
-/// @TODO: Implement actual directory listing with VirtualFS
+/// Returns a list of file/directory names in the given directory
 pub fn function_directory_entries(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     function_call_id: ConstructId,
@@ -1764,17 +1764,34 @@ pub fn function_directory_entries(
 ) -> impl Stream<Item = Value> {
     let path_actor = arguments[0].clone();
     path_actor.subscribe().map(move |value| {
-        let _path = match &value {
+        let path = match &value {
             Value::Text(text, _) => text.text().to_string(),
             _ => String::new(),
         };
-        // @TODO: Implement actual directory listing with VirtualFS
+        let entries = construct_context.virtual_fs.list_directory(&path);
+        let entry_actors: Vec<Arc<ValueActor>> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                Text::new_arc_value_actor(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(i as u32),
+                        None,
+                        "Directory/entries item",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    actor_context.clone(),
+                    entry,
+                )
+            })
+            .collect();
         List::new_value(
             ConstructInfo::new(function_call_id.with_child_id(0), None, "Directory/entries"),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
             actor_context.clone(),
-            Vec::<Arc<ValueActor>>::new(), // Empty list stub
+            entry_actors,
         )
     })
 }

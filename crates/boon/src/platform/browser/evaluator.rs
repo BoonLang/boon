@@ -32,9 +32,11 @@ pub fn evaluate(
     source_code: SourceCode,
     expressions: Vec<static_expression::Spanned<static_expression::Expression>>,
     states_local_storage_key: impl Into<Cow<'static, str>>,
+    virtual_fs: VirtualFilesystem,
 ) -> Result<(Arc<Object>, ConstructContext), String> {
     let construct_context = ConstructContext {
         construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
+        virtual_fs,
     };
     let actor_context = ActorContext::default();
     let reference_connector = Arc::new(ReferenceConnector::new());
