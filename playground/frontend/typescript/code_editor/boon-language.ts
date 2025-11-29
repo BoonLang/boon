@@ -52,6 +52,7 @@ const pipeMark = Decoration.mark({class: "cm-boon-pipe"})
 const chainAlternateMark = Decoration.mark({class: "cm-boon-chain-alt"})
 const textLiteralContentMark = Decoration.mark({class: "cm-boon-text-literal-content"})
 const textLiteralInterpolationMark = Decoration.mark({class: "cm-boon-text-literal-interpolation"})
+const textLiteralInterpolationDelimiterMark = Decoration.mark({class: "cm-boon-text-literal-interpolation-delimiter"})
 
 const boonSemanticHighlight = ViewPlugin.fromClass(class {
   decorations
@@ -73,11 +74,17 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
     let pendingDefinition: {from: number, to: number} | null = null
     let pendingFunctionCall: {from: number, to: number} | null = null
     let chainIndex = 0
+    let textLiteralEnd = 0  // Track end of TEXT literal to skip nodes inside it
 
     syntaxTree(view.state).iterate({
       from,
       to,
       enter: node => {
+        // Skip nodes that fall within a TEXT literal we already processed
+        if (node.from < textLiteralEnd) {
+          return
+        }
+
         const text = view.state.doc.sliceString(node.from, node.to)
 
         if (node.name === "Keyword") {
@@ -85,18 +92,30 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
           pendingDefinition = null
           pendingFunctionCall = null
 
-          // Handle TEXT { content } literals
+          // Handle TEXT { content } or TEXT #{ content } literals with hash escaping
           if (text === "TEXT") {
-            // Look ahead for the opening brace
+            // Look ahead for optional hashes and opening brace
             const docText = view.state.doc.toString()
             let pos = node.to
             // Skip whitespace
             while (pos < docText.length && /\s/.test(docText[pos])) {
               pos++
             }
+            // Count hashes (hash escaping: TEXT #{ uses #{var}, TEXT ##{ uses ##{var}, etc.)
+            let hashCount = 0
+            while (pos < docText.length && docText[pos] === '#') {
+              hashCount++
+              pos++
+            }
+            // Build interpolation marker based on hash count
+            const interpMarker = hashCount === 0 ? '{' : '#'.repeat(hashCount) + '{'
             // Check for opening brace
             if (docText[pos] === '{') {
               const openBrace = pos
+              // Mark outer opening delimiter: #{ or ##{ or { (hashes + brace)
+              const outerOpenStart = openBrace - hashCount
+              builder.add(outerOpenStart, openBrace + 1, textLiteralInterpolationDelimiterMark)
+
               pos++
               let braceDepth = 1
               // Find matching closing brace with balanced braces
@@ -115,21 +134,21 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
                 const contentEnd = closeBrace
                 const content = docText.slice(contentStart, contentEnd)
 
-                // Find and mark interpolations {var}
+                // Find and mark interpolations using the correct marker
                 let contentPos = 0
                 let lastTextEnd = contentStart
                 while (contentPos < content.length) {
-                  const nextBrace = content.indexOf('{', contentPos)
-                  if (nextBrace === -1) break
+                  const nextInterp = content.indexOf(interpMarker, contentPos)
+                  if (nextInterp === -1) break
 
                   // Mark text before interpolation
-                  if (contentStart + nextBrace > lastTextEnd) {
-                    builder.add(lastTextEnd, contentStart + nextBrace, textLiteralContentMark)
+                  if (contentStart + nextInterp > lastTextEnd) {
+                    builder.add(lastTextEnd, contentStart + nextInterp, textLiteralContentMark)
                   }
 
                   // Find closing brace of interpolation
-                  const interpStart = contentStart + nextBrace
-                  let interpEnd = interpStart + 1
+                  const interpStart = contentStart + nextInterp
+                  let interpEnd = interpStart + interpMarker.length
                   let interpDepth = 1
                   while (interpEnd < contentEnd && interpDepth > 0) {
                     if (docText[interpEnd] === '{') interpDepth++
@@ -137,8 +156,17 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
                     interpEnd++
                   }
 
-                  // Mark interpolation
-                  builder.add(interpStart, interpEnd, textLiteralInterpolationMark)
+                  // Mark interpolation delimiters and content separately
+                  // Opening delimiter: #{ or ##{ or { etc.
+                  const openDelimEnd = interpStart + interpMarker.length
+                  builder.add(interpStart, openDelimEnd, textLiteralInterpolationDelimiterMark)
+                  // Inner content (variable name)
+                  const closeDelimStart = interpEnd - 1
+                  if (openDelimEnd < closeDelimStart) {
+                    builder.add(openDelimEnd, closeDelimStart, textLiteralInterpolationMark)
+                  }
+                  // Closing delimiter: }
+                  builder.add(closeDelimStart, interpEnd, textLiteralInterpolationDelimiterMark)
 
                   lastTextEnd = interpEnd
                   contentPos = interpEnd - contentStart
@@ -149,6 +177,10 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
                   builder.add(lastTextEnd, contentEnd, textLiteralContentMark)
                 }
               }
+              // Mark outer closing delimiter: }
+              builder.add(closeBrace, closeBrace + 1, textLiteralInterpolationDelimiterMark)
+              // Track end so we skip nodes inside this TEXT literal
+              textLiteralEnd = closeBrace + 1
             }
           }
           return

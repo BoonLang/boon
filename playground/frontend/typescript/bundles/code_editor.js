@@ -23037,7 +23037,6 @@ const parser = parser$1.configure({ props: [styleTags({
 	SnakeCase: tags.variableName,
 	Wildcard: tags.special(tags.variableName),
 	Number: tags.number,
-	Text: tags.string,
 	LineComment: tags.lineComment,
 	Operator: tags.operator,
 	Pipe: tags.operator,
@@ -23070,11 +23069,11 @@ const modulePathSlashMark = Decoration.mark({ class: "cm-boon-module-slash" });
 const functionNameMark = Decoration.mark({ class: "cm-boon-function-name" });
 const variableDefinitionMark = Decoration.mark({ class: "cm-boon-variable-definition" });
 const dotMark = Decoration.mark({ class: "cm-boon-dot" });
-const apostropheMark = Decoration.mark({ class: "cm-boon-apostrophe" });
 const pipeMark = Decoration.mark({ class: "cm-boon-pipe" });
 const chainAlternateMark = Decoration.mark({ class: "cm-boon-chain-alt" });
 const textLiteralContentMark = Decoration.mark({ class: "cm-boon-text-literal-content" });
 const textLiteralInterpolationMark = Decoration.mark({ class: "cm-boon-text-literal-interpolation" });
+const textLiteralInterpolationDelimiterMark = Decoration.mark({ class: "cm-boon-text-literal-interpolation-delimiter" });
 const boonSemanticHighlight = ViewPlugin.fromClass(class {
 	decorations;
 	constructor(view) {
@@ -23090,10 +23089,12 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 		let pendingDefinition = null;
 		let pendingFunctionCall = null;
 		let chainIndex = 0;
+		let textLiteralEnd = 0;
 		syntaxTree(view.state).iterate({
 			from,
 			to,
 			enter: (node) => {
+				if (node.from < textLiteralEnd) return;
 				const text = view.state.doc.sliceString(node.from, node.to);
 				if (node.name === "Keyword") {
 					expectFunctionName = text === "FUNCTION";
@@ -23103,8 +23104,16 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 						const docText = view.state.doc.toString();
 						let pos = node.to;
 						while (pos < docText.length && /\s/.test(docText[pos])) pos++;
+						let hashCount = 0;
+						while (pos < docText.length && docText[pos] === "#") {
+							hashCount++;
+							pos++;
+						}
+						const interpMarker = hashCount === 0 ? "{" : "#".repeat(hashCount) + "{";
 						if (docText[pos] === "{") {
 							const openBrace = pos;
+							const outerOpenStart = openBrace - hashCount;
+							builder.add(outerOpenStart, openBrace + 1, textLiteralInterpolationDelimiterMark);
 							pos++;
 							let braceDepth = 1;
 							while (pos < docText.length && braceDepth > 0) {
@@ -23120,23 +23129,29 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 								let contentPos = 0;
 								let lastTextEnd = contentStart;
 								while (contentPos < content$1.length) {
-									const nextBrace = content$1.indexOf("{", contentPos);
-									if (nextBrace === -1) break;
-									if (contentStart + nextBrace > lastTextEnd) builder.add(lastTextEnd, contentStart + nextBrace, textLiteralContentMark);
-									const interpStart = contentStart + nextBrace;
-									let interpEnd = interpStart + 1;
+									const nextInterp = content$1.indexOf(interpMarker, contentPos);
+									if (nextInterp === -1) break;
+									if (contentStart + nextInterp > lastTextEnd) builder.add(lastTextEnd, contentStart + nextInterp, textLiteralContentMark);
+									const interpStart = contentStart + nextInterp;
+									let interpEnd = interpStart + interpMarker.length;
 									let interpDepth = 1;
 									while (interpEnd < contentEnd && interpDepth > 0) {
 										if (docText[interpEnd] === "{") interpDepth++;
 										else if (docText[interpEnd] === "}") interpDepth--;
 										interpEnd++;
 									}
-									builder.add(interpStart, interpEnd, textLiteralInterpolationMark);
+									const openDelimEnd = interpStart + interpMarker.length;
+									builder.add(interpStart, openDelimEnd, textLiteralInterpolationDelimiterMark);
+									const closeDelimStart = interpEnd - 1;
+									if (openDelimEnd < closeDelimStart) builder.add(openDelimEnd, closeDelimStart, textLiteralInterpolationMark);
+									builder.add(closeDelimStart, interpEnd, textLiteralInterpolationDelimiterMark);
 									lastTextEnd = interpEnd;
 									contentPos = interpEnd - contentStart;
 								}
 								if (lastTextEnd < contentEnd) builder.add(lastTextEnd, contentEnd, textLiteralContentMark);
 							}
+							builder.add(closeBrace, closeBrace + 1, textLiteralInterpolationDelimiterMark);
+							textLiteralEnd = closeBrace + 1;
 						}
 					}
 					return;
@@ -23192,16 +23207,6 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 					expectFunctionName = false;
 					pendingFunctionCall = null;
 					return;
-				}
-				if (node.name === "Text") {
-					for (let index = text.indexOf("'"); index !== -1; index = text.indexOf("'", index + 1)) {
-						const position = node.from + index;
-						builder.add(position, position + 1, apostropheMark);
-					}
-					pendingDefinition = null;
-					expectFunctionName = false;
-					pendingFunctionCall = null;
-					return false;
 				}
 				if (node.name === "Pipe" || node.name === "PipeBreak") {
 					builder.add(node.from, node.to, pipeMark);
@@ -23334,12 +23339,16 @@ const oneDarkTheme = EditorView.theme({
 	},
 	".cm-content span.cm-boon-text-literal-content": { color: `${stringGold} !important` },
 	".cm-content span.cm-boon-text-literal-content > span": { color: `${stringGold} !important` },
-	".cm-content span.cm-boon-text-literal-interpolation": {
-		color: `${variableWhite} !important`,
-		backgroundColor: "rgba(255, 245, 158, 0.15)",
-		borderRadius: "2px"
-	},
+	".cm-content span.cm-boon-text-literal-interpolation": { color: `${variableWhite} !important` },
 	".cm-content span.cm-boon-text-literal-interpolation > span": { color: `${variableWhite} !important` },
+	".cm-content span.cm-boon-text-literal-interpolation-delimiter": {
+		color: `${chocolate} !important`,
+		fontWeight: "700"
+	},
+	".cm-content span.cm-boon-text-literal-interpolation-delimiter > span": {
+		color: `${chocolate} !important`,
+		fontWeight: "700"
+	},
 	".cm-content": { caretColor: cursor },
 	".cm-cursor, .cm-dropCursor": { borderLeftColor: cursor },
 	"&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection": { backgroundColor: selection },

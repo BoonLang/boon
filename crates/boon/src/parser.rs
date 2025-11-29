@@ -474,36 +474,42 @@ where
 
         let skip = select! { Token::Skip => Expression::Skip };
 
-        // TEXT { content with {var} interpolation }
-        let text_literal = select! { Token::TextContent(content) => content }
-            .map(|content: &str| {
+        // TEXT { content with {var} interpolation } or TEXT #{ content with #{var} interpolation }
+        let text_literal = select! { Token::TextContent(content, hash_count) => (content, hash_count) }
+            .map(|(content, hash_count): (&str, usize)| {
                 let mut parts = Vec::new();
                 let mut current_text_start = 0;
-                let mut chars = content.char_indices().peekable();
 
-                while let Some((i, c)) = chars.next() {
-                    if c == '{' {
-                        // Save any text before this interpolation
-                        if i > current_text_start {
-                            parts.push(TextPart::Text(&content[current_text_start..i]));
-                        }
+                // Build the interpolation marker based on hash_count
+                // hash_count 0 -> "{", hash_count 1 -> "#{", hash_count 2 -> "##{", etc.
+                let interp_marker = if hash_count == 0 {
+                    "{".to_string()
+                } else {
+                    format!("{}{}", "#".repeat(hash_count), "{")
+                };
 
-                        // Find the closing brace
-                        let var_start = i + 1;
-                        let mut var_end = var_start;
-                        while let Some((j, c2)) = chars.next() {
-                            if c2 == '}' {
-                                var_end = j;
-                                break;
-                            }
-                        }
+                let mut search_start = 0;
+                while let Some(interp_start) = content[search_start..].find(&interp_marker) {
+                    let absolute_start = search_start + interp_start;
 
+                    // Save any text before this interpolation
+                    if absolute_start > current_text_start {
+                        parts.push(TextPart::Text(&content[current_text_start..absolute_start]));
+                    }
+
+                    // Find the closing brace
+                    let var_start = absolute_start + interp_marker.len();
+                    if let Some(close_pos) = content[var_start..].find('}') {
+                        let var_end = var_start + close_pos;
                         let var_name = content[var_start..var_end].trim();
                         if !var_name.is_empty() {
                             parts.push(TextPart::Interpolation { var: var_name });
                         }
-
                         current_text_start = var_end + 1;
+                        search_start = current_text_start;
+                    } else {
+                        // No closing brace found, treat as literal text
+                        search_start = absolute_start + interp_marker.len();
                     }
                 }
 

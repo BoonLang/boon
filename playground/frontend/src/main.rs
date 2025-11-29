@@ -63,11 +63,12 @@ macro_rules! make_example_data {
     }};
 }
 
-static EXAMPLE_DATAS: [ExampleData; 4] = [
+static EXAMPLE_DATAS: [ExampleData; 5] = [
     make_example_data!("minimal"),
     make_example_data!("hello_world"),
     make_example_data!("interval"),
     make_example_data!("counter"),
+    make_example_data!("todo_mvc"),
 ];
 
 #[derive(Clone, Copy)]

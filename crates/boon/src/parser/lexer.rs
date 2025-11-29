@@ -49,8 +49,10 @@ pub enum Token<'code> {
     Pulses,
     Spread,
     // TEXT literal content: TEXT { content with {var} interpolation }
-    // The content is the raw string between TEXT { and }
-    TextContent(&'code str),
+    // or TEXT #{ content with #{var} interpolation } for hash escaping
+    // The content is the raw string between TEXT [#*]{ and }
+    // Second field is hash_count (0 for no hashes, 1 for TEXT #{, etc.)
+    TextContent(&'code str, usize),
     // Hardware types (parse-only for now)
     Bits,
     Memory,
@@ -102,7 +104,10 @@ impl<'code> Token<'code> {
             Self::Flush => "FLUSH".into(),
             Self::Pulses => "PULSES".into(),
             Self::Spread => "...".into(),
-            Self::TextContent(content) => format!("TEXT {{ {} }}", content).into(),
+            Self::TextContent(content, hash_count) => {
+                let hashes = "#".repeat(hash_count);
+                format!("TEXT {}{{ {} }}", hashes, content).into()
+            }
             Self::Bits => "BITS".into(),
             Self::Memory => "MEMORY".into(),
             Self::Bytes => "BYTES".into(),
@@ -221,8 +226,9 @@ pub fn lexer<'code>()
             )),
         });
 
-    // TEXT { content } - captures content between TEXT { and }
-    // Content can include {var} for interpolation - we track brace depth to find the matching }
+    // TEXT { content } or TEXT #{ content } - captures content between TEXT [#*]{ and }
+    // Content can include {var} or #{var} for interpolation based on hash count
+    // We track brace depth to find the matching closing }
     let text_content_inner = recursive(|text_content_inner| {
         choice((
             // Match balanced braces: { ... }
@@ -239,10 +245,13 @@ pub fn lexer<'code>()
 
     let text_content = just("TEXT")
         .then(text::inline_whitespace())
-        .ignore_then(just('{'))
-        .ignore_then(text_content_inner)
+        .ignore_then(
+            just('#').repeated().collect::<Vec<_>>()
+        )
+        .then_ignore(just('{'))
+        .then(text_content_inner)
         .then_ignore(just('}'))
-        .map(|content: &str| Token::TextContent(content.trim()));
+        .map(|(hashes, content): (Vec<_>, &str)| Token::TextContent(content.trim(), hashes.len()));
 
     let token = choice((
         bracket,
@@ -285,20 +294,41 @@ mod tests {
     fn test_text_content_simple() {
         let result = lexer().parse("TEXT { hello }");
         let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
-        assert_eq!(tokens, vec![&Token::TextContent("hello")]);
+        assert_eq!(tokens, vec![&Token::TextContent("hello", 0)]);
     }
 
     #[test]
     fn test_text_content_with_interpolation() {
         let result = lexer().parse("TEXT { hello {name} }");
         let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
-        assert_eq!(tokens, vec![&Token::TextContent("hello {name}")]);
+        assert_eq!(tokens, vec![&Token::TextContent("hello {name}", 0)]);
     }
 
     #[test]
     fn test_text_content_multiple_interpolations() {
         let result = lexer().parse("TEXT { Hello {name}! You have {count} messages. }");
         let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
-        assert_eq!(tokens, vec![&Token::TextContent("Hello {name}! You have {count} messages.")]);
+        assert_eq!(tokens, vec![&Token::TextContent("Hello {name}! You have {count} messages.", 0)]);
+    }
+
+    #[test]
+    fn test_text_content_one_hash() {
+        let result = lexer().parse("TEXT #{ function() { return #{value}; } }");
+        let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
+        assert_eq!(tokens, vec![&Token::TextContent("function() { return #{value}; }", 1)]);
+    }
+
+    #[test]
+    fn test_text_content_two_hashes() {
+        let result = lexer().parse("TEXT ##{ a[href^=\"#{url}\"] { color: ##{color}; } }");
+        let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
+        assert_eq!(tokens, vec![&Token::TextContent("a[href^=\"#{url}\"] { color: ##{color}; }", 2)]);
+    }
+
+    #[test]
+    fn test_text_content_empty_with_hash() {
+        let result = lexer().parse("TEXT #{}");
+        let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
+        assert_eq!(tokens, vec![&Token::TextContent("", 1)]);
     }
 }
