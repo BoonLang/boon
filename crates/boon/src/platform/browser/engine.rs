@@ -9,6 +9,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::parser;
+use crate::parser::SourceCode;
+use crate::parser::static_expression;
+use super::evaluator::evaluate_static_expression;
 
 use ulid::Ulid;
 
@@ -411,30 +414,30 @@ impl Drop for Variable {
 pub struct VariableOrArgumentReference {}
 
 impl VariableOrArgumentReference {
-    pub fn new_arc_value_actor<'code>(
+    pub fn new_arc_value_actor(
         construct_info: ConstructInfo,
         construct_context: ConstructContext,
         actor_context: ActorContext,
-        alias: parser::Alias<'code>,
+        alias: static_expression::Alias,
         root_value_actor: impl Future<Output = Arc<ValueActor>> + 'static,
     ) -> Arc<ValueActor> {
         let construct_info = construct_info.complete(ConstructType::VariableOrArgumentReference);
         let mut skip_alias_parts = 0;
         let alias_parts = match alias {
-            parser::Alias::WithoutPassed {
+            static_expression::Alias::WithoutPassed {
                 parts,
-                referenceables: _,
+                referenced_span: _,
             } => {
                 skip_alias_parts = 1;
                 parts
             }
-            parser::Alias::WithPassed { extra_parts } => extra_parts,
+            static_expression::Alias::WithPassed { extra_parts } => extra_parts,
         };
         let mut value_stream = stream::once(root_value_actor)
             .flat_map(|actor| actor.subscribe())
             .boxed_local();
         for alias_part in alias_parts.into_iter().skip(skip_alias_parts) {
-            let alias_part = alias_part.to_owned();
+            let alias_part = alias_part.to_string();
             value_stream = value_stream
                 .flat_map(move |value| match value {
                     Value::Object(object, _) => object.expect_variable(&alias_part).subscribe(),
@@ -2253,7 +2256,8 @@ impl ListChange {
 
 // --- ListBindingFunction ---
 
-use crate::parser::{StaticExpression, StaticSpanned, StrSlice};
+use crate::parser::static_expression::{Expression as StaticExpression, Spanned as StaticSpanned};
+use crate::parser::StrSlice;
 
 /// Handles List binding functions (map, retain, every, any) that need to
 /// evaluate an expression for each list item.
@@ -2275,6 +2279,10 @@ pub struct ListBindingConfig {
     pub transform_expr: StaticSpanned<StaticExpression>,
     /// The type of list operation
     pub operation: ListBindingOperation,
+    /// Reference connector for looking up scope-resolved references
+    pub reference_connector: Arc<ReferenceConnector>,
+    /// Source code for creating borrowed expressions
+    pub source_code: SourceCode,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2293,7 +2301,7 @@ impl ListBindingFunction {
     /// - For each item, evaluates transform_expr with 'old' bound to the item
     /// - Produces the transformed list
     ///
-    /// The OwnedExpression is 'static, so it can be used in async handlers
+    /// The StaticExpression is 'static, so it can be used in async handlers
     /// and potentially sent to WebWorkers for parallel processing.
     pub fn new_arc_value_actor(
         construct_info: ConstructInfo,
@@ -2303,69 +2311,506 @@ impl ListBindingFunction {
         config: ListBindingConfig,
     ) -> Arc<ValueActor> {
         let construct_info = construct_info.complete(ConstructType::FunctionCall);
+        let config = Rc::new(config);
 
-        let is_map = config.operation == ListBindingOperation::Map;
-        let is_retain = config.operation == ListBindingOperation::Retain;
-
-        // Store the config in an Rc for sharing in async handlers
-        let _config = Rc::new(config);
-
-        // For now, create a stub that passes through the list unchanged (for map/retain)
-        // or returns True (for every/any)
-        //
-        // TODO: Full implementation will:
-        // 1. For each item in the source list, create a ValueActor for the transformed value
-        // 2. The transform evaluator will use the OwnedExpression with the binding set
-        // 3. For heavy transforms, optionally offload to WebWorker
-        if is_map || is_retain {
-            // Pass through the source list unchanged (stub behavior)
-            let change_stream = source_list_actor.subscribe().filter_map(|value| {
-                future::ready(match value {
-                    Value::List(list, _) => Some(list),
-                    _ => None,
-                })
-            }).flat_map(|list| list.subscribe());
-
-            let list = List::new_with_change_stream(
-                ConstructInfo::new(
-                    construct_info.id.clone().with_child_id(0),
-                    None,
-                    format!("List binding function result (stub): {}", if is_map { "map" } else { "retain" }),
-                ),
-                actor_context.clone(),
-                change_stream,
-                source_list_actor.clone(),
-            );
-
-            Arc::new(ValueActor::new_internal(
-                construct_info,
-                actor_context,
-                constant(Value::List(
-                    Arc::new(list),
-                    ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
-                )),
-                vec![source_list_actor],
-            ))
-        } else {
-            // For every/any, return True as a placeholder
-            let tag_value = Value::Tag(
-                Arc::new(Tag::new(
-                    ConstructInfo::new(
-                        construct_info.id.clone().with_child_id(0),
-                        None,
-                        "List binding predicate result (stub)",
-                    ),
+        match config.operation {
+            ListBindingOperation::Map => {
+                Self::create_map_actor(
+                    construct_info,
                     construct_context,
-                    "True",
-                )),
+                    actor_context,
+                    source_list_actor,
+                    config,
+                )
+            }
+            ListBindingOperation::Retain => {
+                Self::create_retain_actor(
+                    construct_info,
+                    construct_context,
+                    actor_context,
+                    source_list_actor,
+                    config,
+                )
+            }
+            ListBindingOperation::Every => {
+                Self::create_every_any_actor(
+                    construct_info,
+                    construct_context,
+                    actor_context,
+                    source_list_actor,
+                    config,
+                    true, // is_every
+                )
+            }
+            ListBindingOperation::Any => {
+                Self::create_every_any_actor(
+                    construct_info,
+                    construct_context,
+                    actor_context,
+                    source_list_actor,
+                    config,
+                    false, // is_every (false = any)
+                )
+            }
+        }
+    }
+
+    /// Creates a map actor that transforms each list item.
+    fn create_map_actor(
+        construct_info: ConstructInfoComplete,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        source_list_actor: Arc<ValueActor>,
+        config: Rc<ListBindingConfig>,
+    ) -> Arc<ValueActor> {
+        let config_for_stream = config.clone();
+        let construct_context_for_stream = construct_context.clone();
+        let actor_context_for_stream = actor_context.clone();
+
+        let change_stream = source_list_actor.subscribe().filter_map(|value| {
+            future::ready(match value {
+                Value::List(list, _) => Some(list),
+                _ => None,
+            })
+        }).flat_map(move |list| {
+            let config = config_for_stream.clone();
+            let construct_context = construct_context_for_stream.clone();
+            let actor_context = actor_context_for_stream.clone();
+
+            list.subscribe().map(move |change| {
+                Self::transform_list_change_for_map(
+                    change,
+                    &config,
+                    construct_context.clone(),
+                    actor_context.clone(),
+                )
+            })
+        });
+
+        let list = List::new_with_change_stream(
+            ConstructInfo::new(
+                construct_info.id.clone().with_child_id(0),
+                None,
+                "List/map result",
+            ),
+            actor_context.clone(),
+            change_stream,
+            source_list_actor.clone(),
+        );
+
+        Arc::new(ValueActor::new_internal(
+            construct_info,
+            actor_context,
+            constant(Value::List(
+                Arc::new(list),
                 ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
-            );
-            Arc::new(ValueActor::new_internal(
-                construct_info,
-                actor_context,
-                constant(tag_value),
-                vec![source_list_actor],
-            ))
+            )),
+            vec![source_list_actor],
+        ))
+    }
+
+    /// Creates a retain actor that filters list items based on predicate.
+    /// When any item's predicate changes, emits an updated filtered list.
+    fn create_retain_actor(
+        construct_info: ConstructInfoComplete,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        source_list_actor: Arc<ValueActor>,
+        config: Rc<ListBindingConfig>,
+    ) -> Arc<ValueActor> {
+        let construct_info_id = construct_info.id.clone();
+
+        // Clone for use after the flat_map chain
+        let actor_context_for_list = actor_context.clone();
+        let actor_context_for_result = actor_context.clone();
+
+        // Create a stream that:
+        // 1. Subscribes to source list changes
+        // 2. For each item, evaluates predicate and subscribes to its changes
+        // 3. When list or any predicate changes, emits filtered Replace
+        let value_stream = source_list_actor.subscribe().filter_map(|value| {
+            future::ready(match value {
+                Value::List(list, _) => Some(list),
+                _ => None,
+            })
+        }).flat_map(move |list| {
+            let config = config.clone();
+            let construct_context = construct_context.clone();
+            let actor_context = actor_context.clone();
+            let construct_info_id = construct_info_id.clone();
+
+            // Clone for the second flat_map
+            let construct_info_id_inner = construct_info_id.clone();
+
+            // Track items and their predicates
+            list.subscribe().scan(
+                Vec::<(Arc<ValueActor>, Arc<ValueActor>)>::new(), // (item, predicate)
+                move |item_predicates, change| {
+                    let config = config.clone();
+                    let construct_context = construct_context.clone();
+                    let actor_context = actor_context.clone();
+
+                    // Apply change and update predicate actors
+                    match &change {
+                        ListChange::Replace { items } => {
+                            *item_predicates = items.iter().map(|item| {
+                                let predicate = Self::transform_item(
+                                    item.clone(),
+                                    &config,
+                                    construct_context.clone(),
+                                    actor_context.clone(),
+                                );
+                                (item.clone(), predicate)
+                            }).collect();
+                        }
+                        ListChange::Push { item } => {
+                            let predicate = Self::transform_item(
+                                item.clone(),
+                                &config,
+                                construct_context.clone(),
+                                actor_context.clone(),
+                            );
+                            item_predicates.push((item.clone(), predicate));
+                        }
+                        ListChange::InsertAt { index, item } => {
+                            let predicate = Self::transform_item(
+                                item.clone(),
+                                &config,
+                                construct_context.clone(),
+                                actor_context.clone(),
+                            );
+                            if *index <= item_predicates.len() {
+                                item_predicates.insert(*index, (item.clone(), predicate));
+                            }
+                        }
+                        ListChange::RemoveAt { index } => {
+                            if *index < item_predicates.len() {
+                                item_predicates.remove(*index);
+                            }
+                        }
+                        ListChange::Clear => {
+                            item_predicates.clear();
+                        }
+                        ListChange::Pop => {
+                            item_predicates.pop();
+                        }
+                        _ => {}
+                    }
+
+                    future::ready(Some(item_predicates.clone()))
+                }
+            ).flat_map(move |item_predicates| {
+                let construct_info_id = construct_info_id_inner.clone();
+
+                if item_predicates.is_empty() {
+                    // Empty list - emit empty Replace
+                    return stream::once(future::ready(ListChange::Replace { items: vec![] })).boxed_local();
+                }
+
+                // Subscribe to all predicates and emit filtered list when any changes
+                let predicate_streams: Vec<_> = item_predicates.iter().enumerate().map(|(idx, (item, pred))| {
+                    let item = item.clone();
+                    pred.subscribe().map(move |value| (idx, item.clone(), value))
+                }).collect();
+
+                stream::select_all(predicate_streams)
+                    .scan(
+                        item_predicates.iter().map(|(item, _)| (item.clone(), None::<bool>)).collect::<Vec<_>>(),
+                        move |states, (idx, item, value)| {
+                            // Update the predicate result for this item
+                            let is_true = match &value {
+                                Value::Tag(tag, _) => tag.tag() == "True",
+                                _ => false,
+                            };
+                            if idx < states.len() {
+                                states[idx] = (item, Some(is_true));
+                            }
+
+                            // If all items have predicate results, emit filtered list
+                            let all_evaluated = states.iter().all(|(_, result)| result.is_some());
+                            if all_evaluated {
+                                let filtered: Vec<Arc<ValueActor>> = states.iter()
+                                    .filter_map(|(item, result)| {
+                                        if result == &Some(true) {
+                                            Some(item.clone())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+                                future::ready(Some(Some(ListChange::Replace { items: filtered })))
+                            } else {
+                                future::ready(Some(None))
+                            }
+                        }
+                    )
+                    .filter_map(future::ready)
+                    .boxed_local()
+            })
+        });
+
+        let list = List::new_with_change_stream(
+            ConstructInfo::new(
+                construct_info.id.clone().with_child_id(0),
+                None,
+                "List/retain result",
+            ),
+            actor_context_for_list,
+            value_stream,
+            source_list_actor.clone(),
+        );
+
+        Arc::new(ValueActor::new_internal(
+            construct_info,
+            actor_context_for_result,
+            constant(Value::List(
+                Arc::new(list),
+                ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+            )),
+            vec![source_list_actor],
+        ))
+    }
+
+    /// Creates an every/any actor that produces True/False based on predicates.
+    fn create_every_any_actor(
+        construct_info: ConstructInfoComplete,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        source_list_actor: Arc<ValueActor>,
+        config: Rc<ListBindingConfig>,
+        is_every: bool, // true = every, false = any
+    ) -> Arc<ValueActor> {
+        let construct_info_id = construct_info.id.clone();
+
+        // Clone for use after the flat_map chain
+        let actor_context_for_result = actor_context.clone();
+
+        let value_stream = source_list_actor.subscribe().filter_map(|value| {
+            future::ready(match value {
+                Value::List(list, _) => Some(list),
+                _ => None,
+            })
+        }).flat_map(move |list| {
+            let config = config.clone();
+            let construct_context = construct_context.clone();
+            let actor_context = actor_context.clone();
+            let construct_info_id = construct_info_id.clone();
+
+            // Clone for the second flat_map
+            let construct_info_id_inner = construct_info_id.clone();
+            let construct_context_inner = construct_context.clone();
+
+            list.subscribe().scan(
+                Vec::<(Arc<ValueActor>, Arc<ValueActor>)>::new(),
+                move |item_predicates, change| {
+                    let config = config.clone();
+                    let construct_context = construct_context.clone();
+                    let actor_context = actor_context.clone();
+
+                    match &change {
+                        ListChange::Replace { items } => {
+                            *item_predicates = items.iter().map(|item| {
+                                let predicate = Self::transform_item(
+                                    item.clone(),
+                                    &config,
+                                    construct_context.clone(),
+                                    actor_context.clone(),
+                                );
+                                (item.clone(), predicate)
+                            }).collect();
+                        }
+                        ListChange::Push { item } => {
+                            let predicate = Self::transform_item(
+                                item.clone(),
+                                &config,
+                                construct_context.clone(),
+                                actor_context.clone(),
+                            );
+                            item_predicates.push((item.clone(), predicate));
+                        }
+                        ListChange::Clear => {
+                            item_predicates.clear();
+                        }
+                        ListChange::Pop => {
+                            item_predicates.pop();
+                        }
+                        ListChange::RemoveAt { index } => {
+                            if *index < item_predicates.len() {
+                                item_predicates.remove(*index);
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    future::ready(Some(item_predicates.clone()))
+                }
+            ).flat_map(move |item_predicates| {
+                let construct_info_id = construct_info_id_inner.clone();
+                let construct_context = construct_context_inner.clone();
+
+                if item_predicates.is_empty() {
+                    // Empty list: every([]) = True, any([]) = False
+                    let result = if is_every { "True" } else { "False" };
+                    return stream::once(future::ready(Tag::new_value(
+                        ConstructInfo::new(
+                            construct_info_id.clone().with_child_id(0),
+                            None,
+                            if is_every { "List/every result" } else { "List/any result" },
+                        ),
+                        construct_context,
+                        ValueIdempotencyKey::new(),
+                        result.to_string(),
+                    ))).boxed_local();
+                }
+
+                // Clone for the map closure
+                let construct_info_id_map = construct_info_id.clone();
+                let construct_context_map = construct_context.clone();
+
+                let predicate_streams: Vec<_> = item_predicates.iter().enumerate().map(|(idx, (_, pred))| {
+                    pred.subscribe().map(move |value| (idx, value))
+                }).collect();
+
+                stream::select_all(predicate_streams)
+                    .scan(
+                        vec![None::<bool>; item_predicates.len()],
+                        move |states, (idx, value)| {
+                            let is_true = match &value {
+                                Value::Tag(tag, _) => tag.tag() == "True",
+                                _ => false,
+                            };
+                            if idx < states.len() {
+                                states[idx] = Some(is_true);
+                            }
+
+                            let all_evaluated = states.iter().all(|r| r.is_some());
+                            if all_evaluated {
+                                let result = if is_every {
+                                    states.iter().all(|r| r == &Some(true))
+                                } else {
+                                    states.iter().any(|r| r == &Some(true))
+                                };
+                                future::ready(Some(Some(result)))
+                            } else {
+                                future::ready(Some(None))
+                            }
+                        }
+                    )
+                    .filter_map(future::ready)
+                    .map(move |result| {
+                        let tag = if result { "True" } else { "False" };
+                        Tag::new_value(
+                            ConstructInfo::new(
+                                construct_info_id_map.clone().with_child_id(0),
+                                None,
+                                if is_every { "List/every result" } else { "List/any result" },
+                            ),
+                            construct_context_map.clone(),
+                            ValueIdempotencyKey::new(),
+                            tag.to_string(),
+                        )
+                    })
+                    .boxed_local()
+            })
+        });
+
+        Arc::new(ValueActor::new_internal(
+            construct_info,
+            actor_context_for_result,
+            value_stream,
+            vec![source_list_actor],
+        ))
+    }
+
+    /// Transform a single list item using the config's transform expression.
+    fn transform_item(
+        item_actor: Arc<ValueActor>,
+        config: &ListBindingConfig,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+    ) -> Arc<ValueActor> {
+        // Create a new ActorContext with the binding variable set
+        let binding_name = config.binding_name.to_string();
+        let mut new_params = actor_context.parameters.clone();
+        new_params.insert(binding_name, item_actor.clone());
+
+        let new_actor_context = ActorContext {
+            parameters: new_params,
+            ..actor_context
+        };
+
+        // Evaluate the transform expression with the binding in scope
+        match evaluate_static_expression(
+            &config.transform_expr,
+            construct_context,
+            new_actor_context,
+            config.reference_connector.clone(),
+            config.source_code.clone(),
+        ) {
+            Ok(result_actor) => result_actor,
+            Err(e) => {
+                eprintln!("Error evaluating transform expression: {e}");
+                // Return the original item as fallback
+                item_actor
+            }
+        }
+    }
+
+    /// Transform a ListChange by applying the transform expression to affected items.
+    /// Only used for map operation.
+    fn transform_list_change_for_map(
+        change: ListChange,
+        config: &ListBindingConfig,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+    ) -> ListChange {
+        match change {
+            ListChange::Replace { items } => {
+                let transformed_items: Vec<Arc<ValueActor>> = items
+                    .into_iter()
+                    .map(|item| {
+                        Self::transform_item(
+                            item,
+                            config,
+                            construct_context.clone(),
+                            actor_context.clone(),
+                        )
+                    })
+                    .collect();
+                ListChange::Replace { items: transformed_items }
+            }
+            ListChange::InsertAt { index, item } => {
+                let transformed_item = Self::transform_item(
+                    item,
+                    config,
+                    construct_context,
+                    actor_context,
+                );
+                ListChange::InsertAt { index, item: transformed_item }
+            }
+            ListChange::UpdateAt { index, item } => {
+                let transformed_item = Self::transform_item(
+                    item,
+                    config,
+                    construct_context,
+                    actor_context,
+                );
+                ListChange::UpdateAt { index, item: transformed_item }
+            }
+            ListChange::Push { item } => {
+                let transformed_item = Self::transform_item(
+                    item,
+                    config,
+                    construct_context,
+                    actor_context,
+                );
+                ListChange::Push { item: transformed_item }
+            }
+            // These operations don't involve new items, pass through unchanged
+            ListChange::RemoveAt { index } => ListChange::RemoveAt { index },
+            ListChange::Move { old_index, new_index } => ListChange::Move { old_index, new_index },
+            ListChange::Pop => ListChange::Pop,
+            ListChange::Clear => ListChange::Clear,
         }
     }
 }

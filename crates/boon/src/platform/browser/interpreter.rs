@@ -11,7 +11,7 @@ use zoon::{UnwrapThrowExt, WebStorage, eprintln, local_storage, println, serde_j
 
 use crate::parser::{
     Expression, Input, ParseError, Parser, SourceCode, Span, Spanned, Token, lexer, parser,
-    resolve_persistence, resolve_references,
+    resolve_persistence, resolve_references, static_expression,
 };
 use crate::platform::browser::{
     engine::{ConstructContext, Object},
@@ -99,15 +99,18 @@ pub fn run(
     println!("[Abstract Syntax Tree with Reference Data and Persistence]");
     println!("{ast:#?}");
 
+    // Convert to static expressions (owned, 'static, no lifetimes)
     let source_code_arc = SourceCode::new(source_code.to_string());
-    let (evaluation_result, errors) = match evaluate(source_code_arc, ast, states_local_storage_key.clone()) {
-        Ok(evaluation_result) => (Some(evaluation_result), vec![]),
-        Err(evaluation_error) => (None, vec![evaluation_error]),
+    let static_ast = static_expression::convert_expressions(source_code_arc.clone(), ast);
+
+    let evaluation_result = match evaluate(source_code_arc, static_ast, states_local_storage_key.clone()) {
+        Ok(result) => Some(result),
+        Err(error) => {
+            println!("[Evaluation Error]");
+            eprintln!("{error}");
+            None
+        }
     };
-    if !errors.is_empty() {
-        println!("[Evaluation Errors]");
-    }
-    report_errors(errors, filename, source_code);
 
     if evaluation_result.is_some() {
         if let Err(error) = local_storage().insert(&old_code_local_storage_key, &source_code) {

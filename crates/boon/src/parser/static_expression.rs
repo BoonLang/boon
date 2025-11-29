@@ -8,18 +8,18 @@
 //! - `Clone` (cheap - just Arc increment + offset copy)
 //! - `Send + Sync` (can be used with WebWorkers)
 //!
-//! The conversion from `Expression<'code>` to `StaticExpression` happens
+//! The conversion from `Expression<'code>` to `Expression` happens
 //! once after parsing. Since `StrSlice` stores offsets into the source
 //! (which is in `Arc<String>`), there are zero string allocations during
 //! conversion.
 
 use super::source::{SourceCode, StrSlice};
-use super::{Expression, Persistence, Span, Spanned};
+use super::{Persistence, Span};
 use crate::parser;
 
 /// Spanned wrapper for static expressions.
 #[derive(Debug, Clone)]
-pub struct StaticSpanned<T> {
+pub struct Spanned<T> {
     pub span: Span,
     pub persistence: Option<Persistence>,
     pub node: T,
@@ -27,161 +27,165 @@ pub struct StaticSpanned<T> {
 
 /// Static expression type - all strings are StrSlice (zero-copy).
 #[derive(Debug, Clone)]
-pub enum StaticExpression {
-    Variable(Box<StaticVariable>),
-    Literal(StaticLiteral),
+pub enum Expression {
+    Variable(Box<Variable>),
+    Literal(Literal),
     List {
-        items: Vec<StaticSpanned<Self>>,
+        items: Vec<Spanned<Self>>,
     },
-    Object(StaticObject),
+    Object(Object),
     TaggedObject {
         tag: StrSlice,
-        object: StaticObject,
+        object: Object,
     },
     Map {
-        entries: Vec<StaticMapEntry>,
+        entries: Vec<MapEntry>,
     },
     Function {
         name: StrSlice,
-        parameters: Vec<StaticSpanned<StrSlice>>,
-        body: Box<StaticSpanned<Self>>,
+        parameters: Vec<Spanned<StrSlice>>,
+        body: Box<Spanned<Self>>,
     },
     FunctionCall {
         path: Vec<StrSlice>,
-        arguments: Vec<StaticSpanned<StaticArgument>>,
+        arguments: Vec<Spanned<Argument>>,
     },
-    Alias(StaticAlias),
+    Alias(Alias),
     LinkSetter {
-        alias: StaticSpanned<StaticAlias>,
+        alias: Spanned<Alias>,
     },
     Link,
     Latest {
-        inputs: Vec<StaticSpanned<Self>>,
+        inputs: Vec<Spanned<Self>>,
     },
     Then {
-        body: Box<StaticSpanned<Self>>,
+        body: Box<Spanned<Self>>,
     },
     When {
-        arms: Vec<StaticArm>,
+        arms: Vec<Arm>,
     },
     While {
-        arms: Vec<StaticArm>,
+        arms: Vec<Arm>,
     },
     Pipe {
-        from: Box<StaticSpanned<Self>>,
-        to: Box<StaticSpanned<Self>>,
+        from: Box<Spanned<Self>>,
+        to: Box<Spanned<Self>>,
     },
     Skip,
     Block {
-        variables: Vec<StaticSpanned<StaticVariable>>,
-        output: Box<StaticSpanned<Self>>,
+        variables: Vec<Spanned<Variable>>,
+        output: Box<Spanned<Self>>,
     },
-    Comparator(StaticComparator),
-    ArithmeticOperator(StaticArithmeticOperator),
+    Comparator(Comparator),
+    ArithmeticOperator(ArithmeticOperator),
     TextLiteral {
-        parts: Vec<StaticTextPart>,
+        parts: Vec<TextPart>,
     },
 }
 
 #[derive(Debug, Clone)]
-pub enum StaticComparator {
+pub enum Comparator {
     Equal {
-        operand_a: Box<StaticSpanned<StaticExpression>>,
-        operand_b: Box<StaticSpanned<StaticExpression>>,
+        operand_a: Box<Spanned<Expression>>,
+        operand_b: Box<Spanned<Expression>>,
     },
     NotEqual {
-        operand_a: Box<StaticSpanned<StaticExpression>>,
-        operand_b: Box<StaticSpanned<StaticExpression>>,
+        operand_a: Box<Spanned<Expression>>,
+        operand_b: Box<Spanned<Expression>>,
     },
     Greater {
-        operand_a: Box<StaticSpanned<StaticExpression>>,
-        operand_b: Box<StaticSpanned<StaticExpression>>,
+        operand_a: Box<Spanned<Expression>>,
+        operand_b: Box<Spanned<Expression>>,
     },
     GreaterOrEqual {
-        operand_a: Box<StaticSpanned<StaticExpression>>,
-        operand_b: Box<StaticSpanned<StaticExpression>>,
+        operand_a: Box<Spanned<Expression>>,
+        operand_b: Box<Spanned<Expression>>,
     },
     Less {
-        operand_a: Box<StaticSpanned<StaticExpression>>,
-        operand_b: Box<StaticSpanned<StaticExpression>>,
+        operand_a: Box<Spanned<Expression>>,
+        operand_b: Box<Spanned<Expression>>,
     },
     LessOrEqual {
-        operand_a: Box<StaticSpanned<StaticExpression>>,
-        operand_b: Box<StaticSpanned<StaticExpression>>,
+        operand_a: Box<Spanned<Expression>>,
+        operand_b: Box<Spanned<Expression>>,
     },
 }
 
 #[derive(Debug, Clone)]
-pub enum StaticArithmeticOperator {
+pub enum ArithmeticOperator {
     Negate {
-        operand: Box<StaticSpanned<StaticExpression>>,
+        operand: Box<Spanned<Expression>>,
     },
     Add {
-        operand_a: Box<StaticSpanned<StaticExpression>>,
-        operand_b: Box<StaticSpanned<StaticExpression>>,
+        operand_a: Box<Spanned<Expression>>,
+        operand_b: Box<Spanned<Expression>>,
     },
     Subtract {
-        operand_a: Box<StaticSpanned<StaticExpression>>,
-        operand_b: Box<StaticSpanned<StaticExpression>>,
+        operand_a: Box<Spanned<Expression>>,
+        operand_b: Box<Spanned<Expression>>,
     },
     Multiply {
-        operand_a: Box<StaticSpanned<StaticExpression>>,
-        operand_b: Box<StaticSpanned<StaticExpression>>,
+        operand_a: Box<Spanned<Expression>>,
+        operand_b: Box<Spanned<Expression>>,
     },
     Divide {
-        operand_a: Box<StaticSpanned<StaticExpression>>,
-        operand_b: Box<StaticSpanned<StaticExpression>>,
+        operand_a: Box<Spanned<Expression>>,
+        operand_b: Box<Spanned<Expression>>,
     },
 }
 
 #[derive(Debug, Clone)]
-pub enum StaticTextPart {
+pub enum TextPart {
     Text(StrSlice),
     Interpolation { var: StrSlice },
 }
 
 #[derive(Debug, Clone)]
-pub struct StaticObject {
-    pub variables: Vec<StaticSpanned<StaticVariable>>,
+pub struct Object {
+    pub variables: Vec<Spanned<Variable>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct StaticVariable {
+pub struct Variable {
     pub name: StrSlice,
     pub is_referenced: bool,
-    pub value: StaticSpanned<StaticExpression>,
+    pub value: Spanned<Expression>,
 }
 
 #[derive(Debug, Clone)]
-pub enum StaticLiteral {
+pub enum Literal {
     Number(f64),
     Text(StrSlice),
     Tag(StrSlice),
 }
 
 #[derive(Debug, Clone)]
-pub struct StaticMapEntry {
-    pub key: StaticSpanned<StaticMapEntryKey>,
-    pub value: StaticSpanned<StaticExpression>,
+pub struct MapEntry {
+    pub key: Spanned<MapEntryKey>,
+    pub value: Spanned<Expression>,
 }
 
 #[derive(Debug, Clone)]
-pub enum StaticMapEntryKey {
-    Literal(StaticLiteral),
-    Alias(StaticAlias),
+pub enum MapEntryKey {
+    Literal(Literal),
+    Alias(Alias),
 }
 
 #[derive(Debug, Clone)]
-pub struct StaticArgument {
+pub struct Argument {
     pub name: StrSlice,
     pub is_referenced: bool,
-    pub value: Option<StaticSpanned<StaticExpression>>,
+    pub value: Option<Spanned<Expression>>,
 }
 
 #[derive(Debug, Clone)]
-pub enum StaticAlias {
+pub enum Alias {
     WithoutPassed {
         parts: Vec<StrSlice>,
+        /// The span of the referenced variable (from scope resolution).
+        /// Used to look up variables via reference_connector.referenceable(span).
+        /// None if no reference was resolved (e.g., for function parameters bound at runtime).
+        referenced_span: Option<Span>,
     },
     WithPassed {
         extra_parts: Vec<StrSlice>,
@@ -189,26 +193,26 @@ pub enum StaticAlias {
 }
 
 #[derive(Debug, Clone)]
-pub struct StaticArm {
-    pub pattern: StaticPattern,
-    pub body: StaticExpression,
+pub struct Arm {
+    pub pattern: Pattern,
+    pub body: Expression,
 }
 
 #[derive(Debug, Clone)]
-pub enum StaticPattern {
-    Literal(StaticLiteral),
+pub enum Pattern {
+    Literal(Literal),
     List {
-        items: Vec<StaticPattern>,
+        items: Vec<Pattern>,
     },
     Object {
-        variables: Vec<StaticPatternVariable>,
+        variables: Vec<PatternVariable>,
     },
     TaggedObject {
         tag: StrSlice,
-        variables: Vec<StaticPatternVariable>,
+        variables: Vec<PatternVariable>,
     },
     Map {
-        entries: Vec<StaticPatternMapEntry>,
+        entries: Vec<PatternMapEntry>,
     },
     Alias {
         name: StrSlice,
@@ -217,19 +221,19 @@ pub enum StaticPattern {
 }
 
 #[derive(Debug, Clone)]
-pub struct StaticPatternVariable {
+pub struct PatternVariable {
     pub name: StrSlice,
-    pub value: Option<StaticPattern>,
+    pub value: Option<Pattern>,
 }
 
 #[derive(Debug, Clone)]
-pub struct StaticPatternMapEntry {
-    pub key: StaticPattern,
-    pub value: Option<StaticPattern>,
+pub struct PatternMapEntry {
+    pub key: Pattern,
+    pub value: Option<Pattern>,
 }
 
 // ============================================================================
-// Conversion from borrowed Expression<'code> to StaticExpression
+// Conversion from borrowed Expression<'code> to Expression
 // ============================================================================
 
 /// Converter that holds the source code reference.
@@ -248,38 +252,38 @@ impl ExpressionConverter {
         self.source.slice_from_str(s)
     }
 
-    /// Convert Spanned<Expression> to StaticSpanned<StaticExpression>.
-    pub fn convert_spanned(&self, spanned: &Spanned<Expression>) -> StaticSpanned<StaticExpression> {
-        StaticSpanned {
+    /// Convert parser::Spanned<parser::Expression> to Spanned<Expression>.
+    pub fn convert_spanned(&self, spanned: &parser::Spanned<parser::Expression>) -> Spanned<Expression> {
+        Spanned {
             span: spanned.span,
             persistence: spanned.persistence.clone(),
             node: self.convert_expr(&spanned.node),
         }
     }
 
-    /// Convert Expression to StaticExpression.
-    pub fn convert_expr(&self, expr: &Expression) -> StaticExpression {
+    /// Convert parser::Expression to Expression.
+    pub fn convert_expr(&self, expr: &parser::Expression) -> Expression {
         match expr {
-            Expression::Variable(var) => {
-                StaticExpression::Variable(Box::new(self.convert_variable(var)))
+            parser::Expression::Variable(var) => {
+                Expression::Variable(Box::new(self.convert_variable(var)))
             }
-            Expression::Literal(lit) => StaticExpression::Literal(self.convert_literal(lit)),
-            Expression::List { items } => StaticExpression::List {
+            parser::Expression::Literal(lit) => Expression::Literal(self.convert_literal(lit)),
+            parser::Expression::List { items } => Expression::List {
                 items: items.iter().map(|i| self.convert_spanned(i)).collect(),
             },
-            Expression::Object(obj) => StaticExpression::Object(self.convert_object(obj)),
-            Expression::TaggedObject { tag, object } => StaticExpression::TaggedObject {
+            parser::Expression::Object(obj) => Expression::Object(self.convert_object(obj)),
+            parser::Expression::TaggedObject { tag, object } => Expression::TaggedObject {
                 tag: self.str_to_slice(tag),
                 object: self.convert_object(object),
             },
-            Expression::Map { entries } => StaticExpression::Map {
+            parser::Expression::Map { entries } => Expression::Map {
                 entries: entries.iter().map(|e| self.convert_map_entry(e)).collect(),
             },
-            Expression::Function { name, parameters, body } => StaticExpression::Function {
+            parser::Expression::Function { name, parameters, body } => Expression::Function {
                 name: self.str_to_slice(name),
                 parameters: parameters
                     .iter()
-                    .map(|p| StaticSpanned {
+                    .map(|p| Spanned {
                         span: p.span,
                         persistence: p.persistence.clone(),
                         node: self.str_to_slice(p.node),
@@ -287,47 +291,47 @@ impl ExpressionConverter {
                     .collect(),
                 body: Box::new(self.convert_spanned(body)),
             },
-            Expression::FunctionCall { path, arguments } => StaticExpression::FunctionCall {
+            parser::Expression::FunctionCall { path, arguments } => Expression::FunctionCall {
                 path: path.iter().map(|s| self.str_to_slice(s)).collect(),
                 arguments: arguments
                     .iter()
-                    .map(|a| StaticSpanned {
+                    .map(|a| Spanned {
                         span: a.span,
                         persistence: a.persistence.clone(),
                         node: self.convert_argument(&a.node),
                     })
                     .collect(),
             },
-            Expression::Alias(alias) => StaticExpression::Alias(self.convert_alias(alias)),
-            Expression::LinkSetter { alias } => StaticExpression::LinkSetter {
-                alias: StaticSpanned {
+            parser::Expression::Alias(alias) => Expression::Alias(self.convert_alias(alias)),
+            parser::Expression::LinkSetter { alias } => Expression::LinkSetter {
+                alias: Spanned {
                     span: alias.span,
                     persistence: alias.persistence.clone(),
                     node: self.convert_alias(&alias.node),
                 },
             },
-            Expression::Link => StaticExpression::Link,
-            Expression::Latest { inputs } => StaticExpression::Latest {
+            parser::Expression::Link => Expression::Link,
+            parser::Expression::Latest { inputs } => Expression::Latest {
                 inputs: inputs.iter().map(|i| self.convert_spanned(i)).collect(),
             },
-            Expression::Then { body } => StaticExpression::Then {
+            parser::Expression::Then { body } => Expression::Then {
                 body: Box::new(self.convert_spanned(body)),
             },
-            Expression::When { arms } => StaticExpression::When {
+            parser::Expression::When { arms } => Expression::When {
                 arms: arms.iter().map(|a| self.convert_arm(a)).collect(),
             },
-            Expression::While { arms } => StaticExpression::While {
+            parser::Expression::While { arms } => Expression::While {
                 arms: arms.iter().map(|a| self.convert_arm(a)).collect(),
             },
-            Expression::Pipe { from, to } => StaticExpression::Pipe {
+            parser::Expression::Pipe { from, to } => Expression::Pipe {
                 from: Box::new(self.convert_spanned(from)),
                 to: Box::new(self.convert_spanned(to)),
             },
-            Expression::Skip => StaticExpression::Skip,
-            Expression::Block { variables, output } => StaticExpression::Block {
+            parser::Expression::Skip => Expression::Skip,
+            parser::Expression::Block { variables, output } => Expression::Block {
                 variables: variables
                     .iter()
-                    .map(|v| StaticSpanned {
+                    .map(|v| Spanned {
                         span: v.span,
                         persistence: v.persistence.clone(),
                         node: self.convert_variable(&v.node),
@@ -335,40 +339,40 @@ impl ExpressionConverter {
                     .collect(),
                 output: Box::new(self.convert_spanned(output)),
             },
-            Expression::Comparator(cmp) => {
-                StaticExpression::Comparator(self.convert_comparator(cmp))
+            parser::Expression::Comparator(cmp) => {
+                Expression::Comparator(self.convert_comparator(cmp))
             }
-            Expression::ArithmeticOperator(op) => {
-                StaticExpression::ArithmeticOperator(self.convert_arithmetic(op))
+            parser::Expression::ArithmeticOperator(op) => {
+                Expression::ArithmeticOperator(self.convert_arithmetic(op))
             }
-            Expression::TextLiteral { parts } => StaticExpression::TextLiteral {
+            parser::Expression::TextLiteral { parts } => Expression::TextLiteral {
                 parts: parts.iter().map(|p| self.convert_text_part(p)).collect(),
             },
         }
     }
 
-    fn convert_variable(&self, var: &parser::Variable) -> StaticVariable {
-        StaticVariable {
+    fn convert_variable(&self, var: &parser::Variable) -> Variable {
+        Variable {
             name: self.str_to_slice(var.name),
             is_referenced: var.is_referenced,
             value: self.convert_spanned(&var.value),
         }
     }
 
-    fn convert_literal(&self, lit: &parser::Literal) -> StaticLiteral {
+    fn convert_literal(&self, lit: &parser::Literal) -> Literal {
         match lit {
-            parser::Literal::Number(n) => StaticLiteral::Number(*n),
-            parser::Literal::Text(s) => StaticLiteral::Text(self.str_to_slice(s)),
-            parser::Literal::Tag(s) => StaticLiteral::Tag(self.str_to_slice(s)),
+            parser::Literal::Number(n) => Literal::Number(*n),
+            parser::Literal::Text(s) => Literal::Text(self.str_to_slice(s)),
+            parser::Literal::Tag(s) => Literal::Tag(self.str_to_slice(s)),
         }
     }
 
-    fn convert_object(&self, obj: &parser::Object) -> StaticObject {
-        StaticObject {
+    fn convert_object(&self, obj: &parser::Object) -> Object {
+        Object {
             variables: obj
                 .variables
                 .iter()
-                .map(|v| StaticSpanned {
+                .map(|v| Spanned {
                     span: v.span,
                     persistence: v.persistence.clone(),
                     node: self.convert_variable(&v.node),
@@ -377,9 +381,9 @@ impl ExpressionConverter {
         }
     }
 
-    fn convert_map_entry(&self, entry: &parser::MapEntry) -> StaticMapEntry {
-        StaticMapEntry {
-            key: StaticSpanned {
+    fn convert_map_entry(&self, entry: &parser::MapEntry) -> MapEntry {
+        MapEntry {
+            key: Spanned {
                 span: entry.key.span,
                 persistence: entry.key.persistence.clone(),
                 node: self.convert_map_entry_key(&entry.key.node),
@@ -388,137 +392,138 @@ impl ExpressionConverter {
         }
     }
 
-    fn convert_map_entry_key(&self, key: &parser::MapEntryKey) -> StaticMapEntryKey {
+    fn convert_map_entry_key(&self, key: &parser::MapEntryKey) -> MapEntryKey {
         match key {
             parser::MapEntryKey::Literal(lit) => {
-                StaticMapEntryKey::Literal(self.convert_literal(lit))
+                MapEntryKey::Literal(self.convert_literal(lit))
             }
             parser::MapEntryKey::Alias(alias) => {
-                StaticMapEntryKey::Alias(self.convert_alias(alias))
+                MapEntryKey::Alias(self.convert_alias(alias))
             }
         }
     }
 
-    fn convert_argument(&self, arg: &parser::Argument) -> StaticArgument {
-        StaticArgument {
+    fn convert_argument(&self, arg: &parser::Argument) -> Argument {
+        Argument {
             name: self.str_to_slice(arg.name),
             is_referenced: arg.is_referenced,
             value: arg.value.as_ref().map(|v| self.convert_spanned(v)),
         }
     }
 
-    fn convert_alias(&self, alias: &parser::Alias) -> StaticAlias {
+    fn convert_alias(&self, alias: &parser::Alias) -> Alias {
         match alias {
-            parser::Alias::WithoutPassed { parts, .. } => StaticAlias::WithoutPassed {
+            parser::Alias::WithoutPassed { parts, referenceables } => Alias::WithoutPassed {
                 parts: parts.iter().map(|s| self.str_to_slice(s)).collect(),
+                referenced_span: referenceables.as_ref().and_then(|r| r.referenced.map(|ref_| ref_.span)),
             },
-            parser::Alias::WithPassed { extra_parts } => StaticAlias::WithPassed {
+            parser::Alias::WithPassed { extra_parts } => Alias::WithPassed {
                 extra_parts: extra_parts.iter().map(|s| self.str_to_slice(s)).collect(),
             },
         }
     }
 
-    fn convert_arm(&self, arm: &parser::Arm) -> StaticArm {
-        StaticArm {
+    fn convert_arm(&self, arm: &parser::Arm) -> Arm {
+        Arm {
             pattern: self.convert_pattern(&arm.pattern),
             body: self.convert_expr(&arm.body),
         }
     }
 
-    fn convert_pattern(&self, pattern: &parser::Pattern) -> StaticPattern {
+    fn convert_pattern(&self, pattern: &parser::Pattern) -> Pattern {
         match pattern {
-            parser::Pattern::Literal(lit) => StaticPattern::Literal(self.convert_literal(lit)),
-            parser::Pattern::List { items } => StaticPattern::List {
+            parser::Pattern::Literal(lit) => Pattern::Literal(self.convert_literal(lit)),
+            parser::Pattern::List { items } => Pattern::List {
                 items: items.iter().map(|i| self.convert_pattern(i)).collect(),
             },
-            parser::Pattern::Object { variables } => StaticPattern::Object {
+            parser::Pattern::Object { variables } => Pattern::Object {
                 variables: variables.iter().map(|v| self.convert_pattern_variable(v)).collect(),
             },
-            parser::Pattern::TaggedObject { tag, variables } => StaticPattern::TaggedObject {
+            parser::Pattern::TaggedObject { tag, variables } => Pattern::TaggedObject {
                 tag: self.str_to_slice(tag),
                 variables: variables.iter().map(|v| self.convert_pattern_variable(v)).collect(),
             },
-            parser::Pattern::Map { entries } => StaticPattern::Map {
+            parser::Pattern::Map { entries } => Pattern::Map {
                 entries: entries.iter().map(|e| self.convert_pattern_map_entry(e)).collect(),
             },
-            parser::Pattern::Alias { name } => StaticPattern::Alias {
+            parser::Pattern::Alias { name } => Pattern::Alias {
                 name: self.str_to_slice(name),
             },
-            parser::Pattern::WildCard => StaticPattern::WildCard,
+            parser::Pattern::WildCard => Pattern::WildCard,
         }
     }
 
-    fn convert_pattern_variable(&self, var: &parser::PatternVariable) -> StaticPatternVariable {
-        StaticPatternVariable {
+    fn convert_pattern_variable(&self, var: &parser::PatternVariable) -> PatternVariable {
+        PatternVariable {
             name: self.str_to_slice(var.name),
             value: var.value.as_ref().map(|v| self.convert_pattern(v)),
         }
     }
 
-    fn convert_pattern_map_entry(&self, entry: &parser::PatternMapEntry) -> StaticPatternMapEntry {
-        StaticPatternMapEntry {
+    fn convert_pattern_map_entry(&self, entry: &parser::PatternMapEntry) -> PatternMapEntry {
+        PatternMapEntry {
             key: self.convert_pattern(&entry.key),
             value: entry.value.as_ref().map(|v| self.convert_pattern(v)),
         }
     }
 
-    fn convert_comparator(&self, cmp: &parser::Comparator) -> StaticComparator {
+    fn convert_comparator(&self, cmp: &parser::Comparator) -> Comparator {
         match cmp {
-            parser::Comparator::Equal { operand_a, operand_b } => StaticComparator::Equal {
+            parser::Comparator::Equal { operand_a, operand_b } => Comparator::Equal {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::Comparator::NotEqual { operand_a, operand_b } => StaticComparator::NotEqual {
+            parser::Comparator::NotEqual { operand_a, operand_b } => Comparator::NotEqual {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::Comparator::Greater { operand_a, operand_b } => StaticComparator::Greater {
+            parser::Comparator::Greater { operand_a, operand_b } => Comparator::Greater {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::Comparator::GreaterOrEqual { operand_a, operand_b } => StaticComparator::GreaterOrEqual {
+            parser::Comparator::GreaterOrEqual { operand_a, operand_b } => Comparator::GreaterOrEqual {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::Comparator::Less { operand_a, operand_b } => StaticComparator::Less {
+            parser::Comparator::Less { operand_a, operand_b } => Comparator::Less {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::Comparator::LessOrEqual { operand_a, operand_b } => StaticComparator::LessOrEqual {
+            parser::Comparator::LessOrEqual { operand_a, operand_b } => Comparator::LessOrEqual {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
         }
     }
 
-    fn convert_arithmetic(&self, op: &parser::ArithmeticOperator) -> StaticArithmeticOperator {
+    fn convert_arithmetic(&self, op: &parser::ArithmeticOperator) -> ArithmeticOperator {
         match op {
-            parser::ArithmeticOperator::Negate { operand } => StaticArithmeticOperator::Negate {
+            parser::ArithmeticOperator::Negate { operand } => ArithmeticOperator::Negate {
                 operand: Box::new(self.convert_spanned(operand)),
             },
-            parser::ArithmeticOperator::Add { operand_a, operand_b } => StaticArithmeticOperator::Add {
+            parser::ArithmeticOperator::Add { operand_a, operand_b } => ArithmeticOperator::Add {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::ArithmeticOperator::Subtract { operand_a, operand_b } => StaticArithmeticOperator::Subtract {
+            parser::ArithmeticOperator::Subtract { operand_a, operand_b } => ArithmeticOperator::Subtract {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::ArithmeticOperator::Multiply { operand_a, operand_b } => StaticArithmeticOperator::Multiply {
+            parser::ArithmeticOperator::Multiply { operand_a, operand_b } => ArithmeticOperator::Multiply {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
-            parser::ArithmeticOperator::Divide { operand_a, operand_b } => StaticArithmeticOperator::Divide {
+            parser::ArithmeticOperator::Divide { operand_a, operand_b } => ArithmeticOperator::Divide {
                 operand_a: Box::new(self.convert_spanned(operand_a)),
                 operand_b: Box::new(self.convert_spanned(operand_b)),
             },
         }
     }
 
-    fn convert_text_part(&self, part: &parser::TextPart) -> StaticTextPart {
+    fn convert_text_part(&self, part: &parser::TextPart) -> TextPart {
         match part {
-            parser::TextPart::Text(s) => StaticTextPart::Text(self.str_to_slice(s)),
-            parser::TextPart::Interpolation { var } => StaticTextPart::Interpolation {
+            parser::TextPart::Text(s) => TextPart::Text(self.str_to_slice(s)),
+            parser::TextPart::Interpolation { var } => TextPart::Interpolation {
                 var: self.str_to_slice(var),
             },
         }
@@ -526,10 +531,10 @@ impl ExpressionConverter {
 }
 
 /// Convenience function to convert parsed expressions to static expressions.
-pub fn to_static(
+pub fn convert_expressions(
     source: SourceCode,
-    expressions: Vec<Spanned<Expression>>,
-) -> Vec<StaticSpanned<StaticExpression>> {
+    expressions: Vec<parser::Spanned<parser::Expression>>,
+) -> Vec<Spanned<Expression>> {
     let converter = ExpressionConverter::new(source);
     expressions.iter().map(|e| converter.convert_spanned(e)).collect()
 }
@@ -545,7 +550,7 @@ mod tests {
         // This test just verifies the types compile with 'static
         let source = SourceCode::new("test: 42".to_string());
         let slice = source.slice(0, 4);
-        let expr = StaticExpression::Literal(StaticLiteral::Text(slice));
+        let expr = Expression::Literal(Literal::Text(slice));
         takes_static(expr);
     }
 
@@ -553,7 +558,7 @@ mod tests {
     fn test_static_expression_is_send_sync() {
         fn is_send<T: Send>() {}
         fn is_sync<T: Sync>() {}
-        is_send::<StaticExpression>();
-        is_sync::<StaticExpression>();
+        is_send::<Expression>();
+        is_sync::<Expression>();
     }
 }

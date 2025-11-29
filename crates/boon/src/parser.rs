@@ -16,8 +16,7 @@ pub use persistence_resolver::{Persistence, PersistenceId, resolve_persistence};
 mod source;
 pub use source::{SourceCode, StrSlice};
 
-mod static_expression;
-pub use static_expression::*;
+pub mod static_expression;
 
 pub use chumsky::prelude::{Input, Parser};
 
