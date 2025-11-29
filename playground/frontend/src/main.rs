@@ -1171,11 +1171,14 @@ impl Playground {
         let build_source = files.get("BUILD.bn").cloned();
         drop(files);
 
-        if let Some(build_code) = build_source {
+        // Run BUILD.bn if it exists, collecting its function definitions
+        let shared_registry = if let Some(build_code) = build_source {
             println!("Running BUILD.bn first...");
             // Run BUILD.bn with the same VirtualFilesystem
-            // This allows BUILD.bn to write files that the main file can read
-            let _build_result = interpreter::run(
+            // This allows BUILD.bn to:
+            // 1. Write files that the main file can read
+            // 2. Define functions that the main file can use
+            let build_result = interpreter::run_with_registry(
                 "BUILD.bn",
                 &build_code,
                 // Use separate storage keys for build to avoid conflicts
@@ -1183,19 +1186,25 @@ impl Playground {
                 "boon-playground-build-old-code",
                 "boon-playground-build-span-id-pairs",
                 virtual_fs.clone(),
+                None, // No incoming registry for BUILD.bn
             );
-            // We don't care about BUILD.bn's return value, just its side effects
             println!("BUILD.bn completed");
-        }
+            // Extract the function registry from BUILD.bn to share with RUN.bn
+            build_result.map(|(_, _, registry)| registry)
+        } else {
+            None
+        };
 
-        let object_and_construct_context = interpreter::run(
+        // Run the main file with functions from BUILD.bn available
+        let object_and_construct_context = interpreter::run_with_registry(
             filename,
             &source_code,
             STATES_STORAGE_KEY,
             OLD_SOURCE_CODE_STORAGE_KEY,
             OLD_SPAN_ID_PAIRS_STORAGE_KEY,
             virtual_fs,
-        );
+            shared_registry,
+        ).map(|(obj, ctx, _)| (obj, ctx));
         drop(source_code);
         if let Some((object, construct_context)) = object_and_construct_context {
             El::new()

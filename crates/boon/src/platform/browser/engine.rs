@@ -2927,6 +2927,82 @@ pub enum ListBindingOperation {
     Retain,
     Every,
     Any,
+    SortBy,
+}
+
+/// A sortable key extracted from a Value for use in List/sort_by.
+/// Supports comparison of Numbers, Text, and Tags.
+#[derive(Clone, Debug)]
+pub enum SortKey {
+    Number(f64),
+    Text(String),
+    Tag(String),
+    /// Fallback for unsupported types - sorts last
+    Unsupported,
+}
+
+impl SortKey {
+    /// Extract a sortable key from a Value
+    pub fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Number(num, _) => SortKey::Number(num.number()),
+            Value::Text(text, _) => SortKey::Text(text.text().to_string()),
+            Value::Tag(tag, _) => SortKey::Tag(tag.tag().to_string()),
+            Value::Flushed(inner, _) => SortKey::from_value(inner),
+            _ => SortKey::Unsupported,
+        }
+    }
+}
+
+impl PartialEq for SortKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SortKey::Number(a), SortKey::Number(b)) => {
+                // Handle NaN properly
+                if a.is_nan() && b.is_nan() { true }
+                else { a == b }
+            }
+            (SortKey::Text(a), SortKey::Text(b)) => a == b,
+            (SortKey::Tag(a), SortKey::Tag(b)) => a == b,
+            (SortKey::Unsupported, SortKey::Unsupported) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SortKey {}
+
+impl PartialOrd for SortKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SortKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (SortKey::Number(a), SortKey::Number(b)) => {
+                // Handle NaN: NaN sorts last
+                match (a.is_nan(), b.is_nan()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+                }
+            }
+            (SortKey::Text(a), SortKey::Text(b)) => a.cmp(b),
+            (SortKey::Tag(a), SortKey::Tag(b)) => a.cmp(b),
+            // Different types sort by type priority: Number < Text < Tag < Unsupported
+            (SortKey::Number(_), _) => Ordering::Less,
+            (_, SortKey::Number(_)) => Ordering::Greater,
+            (SortKey::Text(_), _) => Ordering::Less,
+            (_, SortKey::Text(_)) => Ordering::Greater,
+            (SortKey::Tag(_), _) => Ordering::Less,
+            (_, SortKey::Tag(_)) => Ordering::Greater,
+            (SortKey::Unsupported, SortKey::Unsupported) => Ordering::Equal,
+        }
+    }
 }
 
 impl ListBindingFunction {
@@ -2986,6 +3062,15 @@ impl ListBindingFunction {
                     source_list_actor,
                     config,
                     false, // is_every (false = any)
+                )
+            }
+            ListBindingOperation::SortBy => {
+                Self::create_sort_by_actor(
+                    construct_info,
+                    construct_context,
+                    actor_context,
+                    source_list_actor,
+                    config,
                 )
             }
         }
@@ -3354,6 +3439,169 @@ impl ListBindingFunction {
             construct_info,
             actor_context_for_result,
             value_stream,
+            vec![source_list_actor],
+        ))
+    }
+
+    /// Creates a sort_by actor that sorts list items based on a key expression.
+    /// When any item's key changes, emits an updated sorted list.
+    fn create_sort_by_actor(
+        construct_info: ConstructInfoComplete,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        source_list_actor: Arc<ValueActor>,
+        config: Rc<ListBindingConfig>,
+    ) -> Arc<ValueActor> {
+        let construct_info_id = construct_info.id.clone();
+
+        // Clone for use after the flat_map chain
+        let actor_context_for_list = actor_context.clone();
+        let actor_context_for_result = actor_context.clone();
+
+        // Create a stream that:
+        // 1. Subscribes to source list changes
+        // 2. For each item, evaluates key expression and subscribes to its changes
+        // 3. When list or any key changes, emits sorted Replace
+        let value_stream = source_list_actor.subscribe().filter_map(|value| {
+            future::ready(match value {
+                Value::List(list, _) => Some(list),
+                _ => None,
+            })
+        }).flat_map(move |list| {
+            let config = config.clone();
+            let construct_context = construct_context.clone();
+            let actor_context = actor_context.clone();
+            let construct_info_id = construct_info_id.clone();
+
+            // Clone for the second flat_map
+            let construct_info_id_inner = construct_info_id.clone();
+
+            // Track items and their keys
+            list.subscribe().scan(
+                Vec::<(Arc<ValueActor>, Arc<ValueActor>)>::new(), // (item, key_actor)
+                move |item_keys, change| {
+                    let config = config.clone();
+                    let construct_context = construct_context.clone();
+                    let actor_context = actor_context.clone();
+
+                    // Apply change and update key actors
+                    match &change {
+                        ListChange::Replace { items } => {
+                            *item_keys = items.iter().map(|item| {
+                                let key_actor = Self::transform_item(
+                                    item.clone(),
+                                    &config,
+                                    construct_context.clone(),
+                                    actor_context.clone(),
+                                );
+                                (item.clone(), key_actor)
+                            }).collect();
+                        }
+                        ListChange::Push { item } => {
+                            let key_actor = Self::transform_item(
+                                item.clone(),
+                                &config,
+                                construct_context.clone(),
+                                actor_context.clone(),
+                            );
+                            item_keys.push((item.clone(), key_actor));
+                        }
+                        ListChange::InsertAt { index, item } => {
+                            let key_actor = Self::transform_item(
+                                item.clone(),
+                                &config,
+                                construct_context.clone(),
+                                actor_context.clone(),
+                            );
+                            if *index <= item_keys.len() {
+                                item_keys.insert(*index, (item.clone(), key_actor));
+                            }
+                        }
+                        ListChange::RemoveAt { index } => {
+                            if *index < item_keys.len() {
+                                item_keys.remove(*index);
+                            }
+                        }
+                        ListChange::Clear => {
+                            item_keys.clear();
+                        }
+                        ListChange::Pop => {
+                            item_keys.pop();
+                        }
+                        _ => {}
+                    }
+
+                    future::ready(Some(item_keys.clone()))
+                }
+            ).flat_map(move |item_keys| {
+                let construct_info_id = construct_info_id_inner.clone();
+
+                if item_keys.is_empty() {
+                    // Empty list - emit empty Replace
+                    return stream::once(future::ready(ListChange::Replace { items: vec![] })).boxed_local();
+                }
+
+                // Subscribe to all keys and emit sorted list when any changes
+                let key_streams: Vec<_> = item_keys.iter().enumerate().map(|(idx, (item, key_actor))| {
+                    let item = item.clone();
+                    key_actor.subscribe().map(move |value| (idx, item.clone(), value))
+                }).collect();
+
+                stream::select_all(key_streams)
+                    .scan(
+                        item_keys.iter().map(|(item, _)| (item.clone(), None::<SortKey>)).collect::<Vec<_>>(),
+                        move |states, (idx, item, value)| {
+                            // Extract sortable key from value
+                            let sort_key = SortKey::from_value(&value);
+                            if idx < states.len() {
+                                states[idx] = (item, Some(sort_key));
+                            }
+
+                            // If all items have key results, emit sorted list
+                            let all_evaluated = states.iter().all(|(_, result)| result.is_some());
+                            if all_evaluated {
+                                // Sort by key, preserving original order for equal keys (stable sort)
+                                let mut indexed_items: Vec<_> = states.iter().enumerate()
+                                    .map(|(orig_idx, (item, key))| (orig_idx, item.clone(), key.clone().unwrap()))
+                                    .collect();
+                                indexed_items.sort_by(|(orig_a, _, key_a), (orig_b, _, key_b)| {
+                                    match key_a.cmp(key_b) {
+                                        std::cmp::Ordering::Equal => orig_a.cmp(orig_b), // stable sort
+                                        other => other,
+                                    }
+                                });
+                                let sorted: Vec<Arc<ValueActor>> = indexed_items.into_iter()
+                                    .map(|(_, item, _)| item)
+                                    .collect();
+                                future::ready(Some(Some(ListChange::Replace { items: sorted })))
+                            } else {
+                                future::ready(Some(None))
+                            }
+                        }
+                    )
+                    .filter_map(future::ready)
+                    .boxed_local()
+            })
+        });
+
+        let list = List::new_with_change_stream(
+            ConstructInfo::new(
+                construct_info.id.clone().with_child_id(0),
+                None,
+                "List/sort_by result",
+            ),
+            actor_context_for_list,
+            value_stream,
+            source_list_actor.clone(),
+        );
+
+        Arc::new(ValueActor::new_internal(
+            construct_info,
+            actor_context_for_result,
+            constant(Value::List(
+                Arc::new(list),
+                ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+            )),
             vec![source_list_actor],
         ))
     }

@@ -15,7 +15,7 @@ use crate::parser::{
 };
 use crate::platform::browser::{
     engine::{ConstructContext, Object, VirtualFilesystem},
-    evaluator::evaluate,
+    evaluator::{evaluate, evaluate_with_registry, StaticFunctionRegistry},
 };
 
 pub fn run(
@@ -105,6 +105,132 @@ pub fn run(
     let static_ast = static_expression::convert_expressions(source_code_arc.clone(), ast);
 
     let evaluation_result = match evaluate(source_code_arc, static_ast, states_local_storage_key.clone(), virtual_fs) {
+        Ok(result) => Some(result),
+        Err(error) => {
+            println!("[Evaluation Error]");
+            eprintln!("{error}");
+            None
+        }
+    };
+
+    if evaluation_result.is_some() {
+        if let Err(error) = local_storage().insert(&old_code_local_storage_key, &source_code) {
+            eprintln!("Failed to store source code as old source code: {error:#?}");
+        }
+
+        if let Err(error) = local_storage().insert(
+            &old_span_id_pairs_local_storage_key,
+            &new_span_id_pairs.to_json_map().unwrap(),
+        ) {
+            eprintln!("Failed to store Span-PersistenceId pairs: {error:#}");
+        }
+
+        if let Some(states) =
+            local_storage().get::<BTreeMap<String, serde_json::Value>>(&states_local_storage_key)
+        {
+            let mut states = states.expect("Failed to deseralize states");
+            let persistent_ids = new_span_id_pairs
+                .values()
+                .map(|id| id.to_string())
+                .collect::<HashSet<_>>();
+            states.retain(|id, _| persistent_ids.contains(id));
+            if let Err(error) = local_storage().insert(&states_local_storage_key, &states) {
+                eprintln!("Failed to store states after removing old ones: {error:#?}");
+            }
+        }
+    }
+
+    evaluation_result
+}
+
+/// Run with function registry support for sharing functions across files.
+/// Accepts an optional function registry and returns it along with the result.
+/// This enables patterns like: run BUILD.bn, get its functions, pass to RUN.bn.
+pub fn run_with_registry(
+    filename: &str,
+    source_code: &str,
+    states_local_storage_key: impl Into<Cow<'static, str>>,
+    old_code_local_storage_key: impl Into<Cow<'static, str>>,
+    old_span_id_pairs_local_storage_key: impl Into<Cow<'static, str>>,
+    virtual_fs: VirtualFilesystem,
+    function_registry: Option<StaticFunctionRegistry>,
+) -> Option<(Arc<Object>, ConstructContext, StaticFunctionRegistry)> {
+    let states_local_storage_key = states_local_storage_key.into();
+    let old_code_local_storage_key = old_code_local_storage_key.into();
+    let old_span_id_pairs_local_storage_key = old_span_id_pairs_local_storage_key.into();
+
+    let old_source_code = local_storage().get::<String>(&old_code_local_storage_key);
+    let old_ast = if let Some(Ok(old_source_code)) = &old_source_code {
+        parse_old(filename, old_source_code)
+    } else {
+        None
+    };
+
+    println!("[Source Code ({filename})]");
+    println!("{source_code}");
+
+    let (tokens, errors) = lexer().parse(source_code).into_output_errors();
+    if !errors.is_empty() {
+        println!("[Lex Errors]");
+    }
+    report_errors(errors, filename, source_code);
+    let Some(mut tokens) = tokens else {
+        return None;
+    };
+
+    tokens.retain(|spanned_token| !matches!(spanned_token.node, Token::Comment(_)));
+
+    let (ast, errors) = parser()
+        .parse(tokens.map(
+            Span::splat(source_code.len()),
+            |Spanned {
+                 node,
+                 span,
+                 persistence: _,
+             }| { (node, span) },
+        ))
+        .into_output_errors();
+    if !errors.is_empty() {
+        println!("[Parse Errors]");
+    }
+    report_errors(errors, filename, source_code);
+    let Some(ast) = ast else {
+        return None;
+    };
+
+    let ast = match resolve_references(ast) {
+        Ok(ast) => ast,
+        Err(errors) => {
+            println!("[Reference Errors]");
+            report_errors(errors, filename, source_code);
+            return None;
+        }
+    };
+
+    let (ast, new_span_id_pairs) =
+        match resolve_persistence(ast, old_ast, &old_span_id_pairs_local_storage_key) {
+            Ok(ast) => ast,
+            Err(errors) => {
+                println!("[Persistence Errors]");
+                report_errors(errors, filename, source_code);
+                return None;
+            }
+        };
+    println!("[Abstract Syntax Tree with Reference Data and Persistence]");
+    println!("{ast:#?}");
+
+    // Convert to static expressions (owned, 'static, no lifetimes)
+    let source_code_arc = SourceCode::new(source_code.to_string());
+    let static_ast = static_expression::convert_expressions(source_code_arc.clone(), ast);
+
+    let registry = function_registry.unwrap_or_default();
+    let evaluation_result = match evaluate_with_registry(
+        source_code_arc,
+        static_ast,
+        states_local_storage_key.clone(),
+        virtual_fs,
+        registry,
+    ) {
         Ok(result) => Some(result),
         Err(error) => {
             println!("[Evaluation Error]");

@@ -34,6 +34,26 @@ pub fn evaluate(
     states_local_storage_key: impl Into<Cow<'static, str>>,
     virtual_fs: VirtualFilesystem,
 ) -> Result<(Arc<Object>, ConstructContext), String> {
+    let function_registry = StaticFunctionRegistry::default();
+    let (obj, ctx, _) = evaluate_with_registry(
+        source_code,
+        expressions,
+        states_local_storage_key,
+        virtual_fs,
+        function_registry,
+    )?;
+    Ok((obj, ctx))
+}
+
+/// Evaluation function that accepts and returns a function registry.
+/// This enables sharing function definitions across multiple files.
+pub fn evaluate_with_registry(
+    source_code: SourceCode,
+    expressions: Vec<static_expression::Spanned<static_expression::Expression>>,
+    states_local_storage_key: impl Into<Cow<'static, str>>,
+    virtual_fs: VirtualFilesystem,
+    function_registry: StaticFunctionRegistry,
+) -> Result<(Arc<Object>, ConstructContext, StaticFunctionRegistry), String> {
     let construct_context = ConstructContext {
         construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
         virtual_fs,
@@ -41,7 +61,6 @@ pub fn evaluate(
     let actor_context = ActorContext::default();
     let reference_connector = Arc::new(ReferenceConnector::new());
     let link_connector = Arc::new(LinkConnector::new());
-    let function_registry = StaticFunctionRegistry::default();
 
     // First pass: collect function definitions and variables
     let mut variables = Vec::new();
@@ -102,7 +121,7 @@ pub fn evaluate(
         construct_context.clone(),
         evaluated_variables?,
     );
-    Ok((root_object, construct_context))
+    Ok((root_object, construct_context, function_registry))
 }
 
 /// Evaluates a static variable into a Variable.
@@ -642,15 +661,16 @@ fn static_spanned_expression_into_value_actor(
             // Handle built-in function calls
             let path_strs: Vec<&str> = path.iter().map(|s| &**s).collect();
 
-            // Special handling for List binding functions (map, retain, every, any)
+            // Special handling for List binding functions (map, retain, every, any, sort_by)
             // These need the unevaluated expression to evaluate per-item with bindings
             match path_strs.as_slice() {
-                ["List", "map"] | ["List", "retain"] | ["List", "every"] | ["List", "any"] => {
+                ["List", "map"] | ["List", "retain"] | ["List", "every"] | ["List", "any"] | ["List", "sort_by"] => {
                     let operation = match path_strs[1] {
                         "map" => ListBindingOperation::Map,
                         "retain" => ListBindingOperation::Retain,
                         "every" => ListBindingOperation::Every,
                         "any" => ListBindingOperation::Any,
+                        "sort_by" => ListBindingOperation::SortBy,
                         _ => unreachable!(),
                     };
 
