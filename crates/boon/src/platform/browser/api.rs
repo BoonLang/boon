@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use zoon::Timer;
 use zoon::futures_util::stream::{self, Stream, StreamExt};
+use zoon::futures_channel::mpsc;
 use zoon::{Deserialize, Serialize, serde};
+use zoon::{window, history, Closure, JsValue, UnwrapThrowExt, JsCast, SendWrapper};
 
 use super::engine::*;
 
@@ -330,6 +332,499 @@ pub fn function_element_button(
     )
 }
 
+/// ```
+/// Element/text_input(
+///     element<[event?<[change?: LINK, key_down?: LINK, blur?: LINK]>]>
+///     style<[]>
+///     label<Hidden[text: Text] | ...>
+///     text<Text>
+///     placeholder<[style?: [], text?: Text]>
+///     focus<Bool>
+/// ) -> ELEMENT_TEXT_INPUT
+/// ```
+pub fn function_element_text_input(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_element, argument_style, argument_label, argument_text, argument_placeholder, argument_focus] =
+        arguments.as_slice()
+    else {
+        panic!("Element/text_input expects 6 arguments")
+    };
+    TaggedObject::new_constant(
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Element/text_input(..) -> ElementTextInput[..]",
+        ),
+        construct_context.clone(),
+        ValueIdempotencyKey::new(),
+        "ElementTextInput",
+        [
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(1),
+                    None,
+                    "ElementTextInput[element]",
+                ),
+                construct_context.clone(),
+                "element",
+                argument_element.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(2),
+                    None,
+                    "ElementTextInput[settings]",
+                ),
+                construct_context.clone(),
+                "settings",
+                Object::new_arc_value_actor(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(3),
+                        None,
+                        "ElementTextInput[settings: [..]]",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    actor_context,
+                    [
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(4),
+                                None,
+                                "ElementTextInput[settings: [style]]",
+                            ),
+                            construct_context.clone(),
+                            "style",
+                            argument_style.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(5),
+                                None,
+                                "ElementTextInput[settings: [label]]",
+                            ),
+                            construct_context.clone(),
+                            "label",
+                            argument_label.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(6),
+                                None,
+                                "ElementTextInput[settings: [text]]",
+                            ),
+                            construct_context.clone(),
+                            "text",
+                            argument_text.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(7),
+                                None,
+                                "ElementTextInput[settings: [placeholder]]",
+                            ),
+                            construct_context.clone(),
+                            "placeholder",
+                            argument_placeholder.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(8),
+                                None,
+                                "ElementTextInput[settings: [focus]]",
+                            ),
+                            construct_context,
+                            "focus",
+                            argument_focus.clone(),
+                        ),
+                    ],
+                ),
+            ),
+        ],
+    )
+}
+
+/// ```
+/// Element/checkbox(
+///     element<[event?<[click?: LINK]>]>
+///     style<[]>
+///     label<Hidden[text: Text] | Reference[element: ...] | ...>
+///     checked<Bool>
+///     icon<Element>
+/// ) -> ELEMENT_CHECKBOX
+/// ```
+pub fn function_element_checkbox(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_element, argument_style, argument_label, argument_checked, argument_icon] =
+        arguments.as_slice()
+    else {
+        panic!("Element/checkbox expects 5 arguments")
+    };
+    TaggedObject::new_constant(
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Element/checkbox(..) -> ElementCheckbox[..]",
+        ),
+        construct_context.clone(),
+        ValueIdempotencyKey::new(),
+        "ElementCheckbox",
+        [
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(1),
+                    None,
+                    "ElementCheckbox[element]",
+                ),
+                construct_context.clone(),
+                "element",
+                argument_element.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(2),
+                    None,
+                    "ElementCheckbox[settings]",
+                ),
+                construct_context.clone(),
+                "settings",
+                Object::new_arc_value_actor(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(3),
+                        None,
+                        "ElementCheckbox[settings: [..]]",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    actor_context,
+                    [
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(4),
+                                None,
+                                "ElementCheckbox[settings: [style]]",
+                            ),
+                            construct_context.clone(),
+                            "style",
+                            argument_style.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(5),
+                                None,
+                                "ElementCheckbox[settings: [label]]",
+                            ),
+                            construct_context.clone(),
+                            "label",
+                            argument_label.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(6),
+                                None,
+                                "ElementCheckbox[settings: [checked]]",
+                            ),
+                            construct_context.clone(),
+                            "checked",
+                            argument_checked.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(7),
+                                None,
+                                "ElementCheckbox[settings: [icon]]",
+                            ),
+                            construct_context,
+                            "icon",
+                            argument_icon.clone(),
+                        ),
+                    ],
+                ),
+            ),
+        ],
+    )
+}
+
+/// ```
+/// Element/label(
+///     element<[event?<[double_click?: LINK]>, hovered?: LINK, nearby_element?: ...]>
+///     style<[]>
+///     label<Text | Element>
+/// ) -> ELEMENT_LABEL
+/// ```
+pub fn function_element_label(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_element, argument_style, argument_label] = arguments.as_slice() else {
+        panic!("Element/label expects 3 arguments")
+    };
+    TaggedObject::new_constant(
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Element/label(..) -> ElementLabel[..]",
+        ),
+        construct_context.clone(),
+        ValueIdempotencyKey::new(),
+        "ElementLabel",
+        [
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(1),
+                    None,
+                    "ElementLabel[element]",
+                ),
+                construct_context.clone(),
+                "element",
+                argument_element.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(2),
+                    None,
+                    "ElementLabel[settings]",
+                ),
+                construct_context.clone(),
+                "settings",
+                Object::new_arc_value_actor(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(3),
+                        None,
+                        "ElementLabel[settings: [..]]",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    actor_context,
+                    [
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(4),
+                                None,
+                                "ElementLabel[settings: [style]]",
+                            ),
+                            construct_context.clone(),
+                            "style",
+                            argument_style.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(5),
+                                None,
+                                "ElementLabel[settings: [label]]",
+                            ),
+                            construct_context,
+                            "label",
+                            argument_label.clone(),
+                        ),
+                    ],
+                ),
+            ),
+        ],
+    )
+}
+
+/// ```
+/// Element/paragraph(
+///     element<[]>
+///     style<[]>
+///     contents<List<Text | Link | ...>>
+/// ) -> ELEMENT_PARAGRAPH
+/// ```
+pub fn function_element_paragraph(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_element, argument_style, argument_contents] = arguments.as_slice() else {
+        panic!("Element/paragraph expects 3 arguments")
+    };
+    TaggedObject::new_constant(
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Element/paragraph(..) -> ElementParagraph[..]",
+        ),
+        construct_context.clone(),
+        ValueIdempotencyKey::new(),
+        "ElementParagraph",
+        [
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(1),
+                    None,
+                    "ElementParagraph[element]",
+                ),
+                construct_context.clone(),
+                "element",
+                argument_element.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(2),
+                    None,
+                    "ElementParagraph[settings]",
+                ),
+                construct_context.clone(),
+                "settings",
+                Object::new_arc_value_actor(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(3),
+                        None,
+                        "ElementParagraph[settings: [..]]",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    actor_context,
+                    [
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(4),
+                                None,
+                                "ElementParagraph[settings: [style]]",
+                            ),
+                            construct_context.clone(),
+                            "style",
+                            argument_style.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(5),
+                                None,
+                                "ElementParagraph[settings: [contents]]",
+                            ),
+                            construct_context,
+                            "contents",
+                            argument_contents.clone(),
+                        ),
+                    ],
+                ),
+            ),
+        ],
+    )
+}
+
+/// ```
+/// Element/link(
+///     element<[hovered?: LINK]>
+///     style<[]>
+///     label<Text | Element>
+///     to<Text>
+///     new_tab<[] | NewTab[...]>
+/// ) -> ELEMENT_LINK
+/// ```
+pub fn function_element_link(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_element, argument_style, argument_label, argument_to, argument_new_tab] =
+        arguments.as_slice()
+    else {
+        panic!("Element/link expects 5 arguments")
+    };
+    TaggedObject::new_constant(
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Element/link(..) -> ElementLink[..]",
+        ),
+        construct_context.clone(),
+        ValueIdempotencyKey::new(),
+        "ElementLink",
+        [
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(1),
+                    None,
+                    "ElementLink[element]",
+                ),
+                construct_context.clone(),
+                "element",
+                argument_element.clone(),
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(2),
+                    None,
+                    "ElementLink[settings]",
+                ),
+                construct_context.clone(),
+                "settings",
+                Object::new_arc_value_actor(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(3),
+                        None,
+                        "ElementLink[settings: [..]]",
+                    ),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    actor_context,
+                    [
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(4),
+                                None,
+                                "ElementLink[settings: [style]]",
+                            ),
+                            construct_context.clone(),
+                            "style",
+                            argument_style.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(5),
+                                None,
+                                "ElementLink[settings: [label]]",
+                            ),
+                            construct_context.clone(),
+                            "label",
+                            argument_label.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(6),
+                                None,
+                                "ElementLink[settings: [to]]",
+                            ),
+                            construct_context.clone(),
+                            "to",
+                            argument_to.clone(),
+                        ),
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                function_call_id.with_child_id(7),
+                                None,
+                                "ElementLink[settings: [new_tab]]",
+                            ),
+                            construct_context,
+                            "new_tab",
+                            argument_new_tab.clone(),
+                        ),
+                    ],
+                ),
+            ),
+        ],
+    )
+}
+
 // @TODO refactor
 /// ```
 /// Math/sum(increment<Number>) -> Number
@@ -631,6 +1126,467 @@ pub fn function_bool_toggle(
             ValueIdempotencyKey::new(),
             result_tag.to_string(),
         )))
+    })
+}
+
+/// Bool/or(this, that) -> Tag (True/False)
+/// Returns True if either this or that is True
+pub fn function_bool_or(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let this_actor = arguments[0].clone();
+    let that_actor = arguments[1].clone();
+
+    // Combine both boolean streams using select
+    let this_stream = this_actor.subscribe().map(|v| (true, v));
+    let that_stream = that_actor.subscribe().map(|v| (false, v));
+
+    stream::select(this_stream, that_stream)
+        .scan((None::<bool>, None::<bool>), move |state, (is_this, value)| {
+            let is_true = match &value {
+                Value::Tag(tag, _) => tag.tag() == "True",
+                _ => false,
+            };
+            if is_this {
+                state.0 = Some(is_true);
+            } else {
+                state.1 = Some(is_true);
+            }
+            future::ready(Some(*state))
+        })
+        .filter_map(move |(this_bool, that_bool)| {
+            let construct_context = construct_context.clone();
+            let function_call_id = function_call_id.clone();
+            future::ready(match (this_bool, that_bool) {
+                (Some(a), Some(b)) => {
+                    let result = a || b;
+                    let tag = if result { "True" } else { "False" };
+                    Some(Tag::new_value(
+                        ConstructInfo::new(function_call_id.with_child_id(0), None, "Bool/or result"),
+                        construct_context,
+                        ValueIdempotencyKey::new(),
+                        tag.to_string(),
+                    ))
+                }
+                _ => None, // Wait for both values
+            })
+        })
+}
+
+// --- List functions ---
+
+/// List/empty() -> Tag (True/False)
+/// Checks if the piped list is empty
+pub fn function_list_empty(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let list_actor = arguments[0].clone();
+    list_actor.subscribe().filter_map(move |value| {
+        let result = match &value {
+            Value::List(list, _) => Some(list.clone()),
+            _ => None,
+        };
+        future::ready(result)
+    }).flat_map(move |list| {
+        let construct_context = construct_context.clone();
+        let function_call_id = function_call_id.clone();
+        list.subscribe().scan(Vec::<Arc<ValueActor>>::new(), move |items, change| {
+            change.apply_to_vec(items);
+            let is_empty = items.is_empty();
+            let tag = if is_empty { "True" } else { "False" };
+            future::ready(Some(Tag::new_value(
+                ConstructInfo::new(function_call_id.with_child_id(0), None, "List/empty result"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                tag.to_string(),
+            )))
+        })
+    })
+}
+
+/// List/count -> Number
+/// Returns the count of items in the list
+pub fn function_list_count(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let list_actor = arguments[0].clone();
+    list_actor.subscribe().filter_map(move |value| {
+        let result = match &value {
+            Value::List(list, _) => Some(list.clone()),
+            _ => None,
+        };
+        future::ready(result)
+    }).flat_map(move |list| {
+        let construct_context = construct_context.clone();
+        let function_call_id = function_call_id.clone();
+        list.subscribe().scan(Vec::<Arc<ValueActor>>::new(), move |items, change| {
+            change.apply_to_vec(items);
+            let count = items.len() as f64;
+            future::ready(Some(Number::new_value(
+                ConstructInfo::new(function_call_id.with_child_id(0), None, "List/count result"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                count,
+            )))
+        })
+    })
+}
+
+/// List/append(item: value) -> List
+/// Appends an item to the list when the item stream produces a value
+pub fn function_list_append(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    // arguments[0] = the list (piped)
+    // arguments[1] = the item to append
+    let list_actor = arguments[0].clone();
+    let item_actor = arguments[1].clone();
+
+    // Create a change stream that:
+    // 1. Forwards all changes from the original list
+    // 2. Adds Push changes when the item stream produces values
+    let item_actor_for_push = item_actor.clone();
+    let change_stream = {
+        let list_changes = list_actor.subscribe().filter_map(|value| {
+            future::ready(match value {
+                Value::List(list, _) => Some(list),
+                _ => None,
+            })
+        }).flat_map(|list| list.subscribe());
+
+        let append_changes = item_actor.subscribe().map(move |_value| {
+            // When item stream produces a value, push the item actor
+            ListChange::Push { item: item_actor_for_push.clone() }
+        });
+
+        // Merge both change streams
+        stream::select(list_changes, append_changes)
+    };
+
+    let list = List::new_with_change_stream(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "List/append result"),
+        actor_context,
+        change_stream,
+        (list_actor, item_actor),
+    );
+
+    constant(Value::List(
+        Arc::new(list),
+        ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+    ))
+}
+
+/// List/latest() -> Value
+/// Merges a list of streams, emitting whenever any stream produces a value
+/// Returns the value from the stream that most recently produced
+pub fn function_list_latest(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let list_actor = arguments[0].clone();
+
+    list_actor.subscribe().filter_map(|value| {
+        future::ready(match value {
+            Value::List(list, _) => Some(list),
+            _ => None,
+        })
+    }).flat_map(move |list| {
+        let construct_context = construct_context.clone();
+        let function_call_id = function_call_id.clone();
+
+        // Subscribe to list changes and maintain current items
+        list.subscribe().scan(Vec::<Arc<ValueActor>>::new(), move |items, change| {
+            change.apply_to_vec(items);
+            // Return current items for merging
+            future::ready(Some(items.clone()))
+        }).flat_map(move |items| {
+            // Merge all item streams
+            let streams: Vec<_> = items.iter().map(|item| item.subscribe()).collect();
+            stream::select_all(streams)
+        })
+    })
+}
+
+/// List/every(item, if: predicate) -> Tag (True/False)
+/// Returns True if all items in the list match the predicate
+/// Note: This is a simplified implementation - full version needs predicate binding
+pub fn function_list_every(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    // arguments[0] = the list (piped)
+    // arguments[1] = the predicate result for each item (already evaluated)
+    // For now, simplified: we expect the predicate to be pre-evaluated per item
+    let list_actor = arguments[0].clone();
+
+    list_actor.subscribe().filter_map(|value| {
+        future::ready(match value {
+            Value::List(list, _) => Some(list),
+            _ => None,
+        })
+    }).flat_map(move |list| {
+        let construct_context = construct_context.clone();
+        let function_call_id = function_call_id.clone();
+
+        list.subscribe().scan(Vec::<Arc<ValueActor>>::new(), move |items, change| {
+            change.apply_to_vec(items);
+            future::ready(Some(items.clone()))
+        }).then(move |items| {
+            let construct_context = construct_context.clone();
+            let function_call_id = function_call_id.clone();
+
+            async move {
+                // Check if all items have "completed: True" or similar
+                // This is a placeholder - real implementation needs predicate evaluation
+                let all_true = true; // Placeholder
+                let tag = if all_true { "True" } else { "False" };
+                Tag::new_value(
+                    ConstructInfo::new(function_call_id.with_child_id(0), None, "List/every result"),
+                    construct_context,
+                    ValueIdempotencyKey::new(),
+                    tag.to_string(),
+                )
+            }
+        })
+    })
+}
+
+/// List/any(item, if: predicate) -> Tag (True/False)
+/// Returns True if any item in the list matches the predicate
+/// Note: This is a simplified implementation - full version needs predicate binding
+pub fn function_list_any(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let list_actor = arguments[0].clone();
+
+    list_actor.subscribe().filter_map(|value| {
+        future::ready(match value {
+            Value::List(list, _) => Some(list),
+            _ => None,
+        })
+    }).flat_map(move |list| {
+        let construct_context = construct_context.clone();
+        let function_call_id = function_call_id.clone();
+
+        list.subscribe().scan(Vec::<Arc<ValueActor>>::new(), move |items, change| {
+            change.apply_to_vec(items);
+            future::ready(Some(items.clone()))
+        }).then(move |items| {
+            let construct_context = construct_context.clone();
+            let function_call_id = function_call_id.clone();
+
+            async move {
+                // Check if any item matches - placeholder
+                let any_true = !items.is_empty(); // Placeholder: true if list not empty
+                let tag = if any_true { "True" } else { "False" };
+                Tag::new_value(
+                    ConstructInfo::new(function_call_id.with_child_id(0), None, "List/any result"),
+                    construct_context,
+                    ValueIdempotencyKey::new(),
+                    tag.to_string(),
+                )
+            }
+        })
+    })
+}
+
+/// List/retain(item, if: predicate) -> List
+/// Filters the list, keeping items where predicate is True
+/// @TODO: This is a stub - needs proper predicate binding per item
+pub fn function_list_retain(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    // arguments[0] = the list (piped)
+    // arguments[1] = the predicate (needs to be evaluated per item)
+    // For now, just pass through the list unchanged
+    let list_actor = arguments[0].clone();
+
+    let change_stream = list_actor.subscribe().filter_map(|value| {
+        future::ready(match value {
+            Value::List(list, _) => Some(list),
+            _ => None,
+        })
+    }).flat_map(|list| list.subscribe());
+
+    let list = List::new_with_change_stream(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "List/retain result (stub)"),
+        actor_context,
+        change_stream,
+        list_actor,
+    );
+
+    constant(Value::List(
+        Arc::new(list),
+        ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+    ))
+}
+
+/// List/map(old, new: transform) -> List
+/// Transforms each item in the list
+/// @TODO: This is a stub - needs proper variable binding per item
+pub fn function_list_map(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    // arguments[0] = the list (piped)
+    // arguments[1] = the transform (needs to be evaluated per item with 'old' bound)
+    // For now, just pass through the list unchanged
+    let list_actor = arguments[0].clone();
+
+    let change_stream = list_actor.subscribe().filter_map(|value| {
+        future::ready(match value {
+            Value::List(list, _) => Some(list),
+            _ => None,
+        })
+    }).flat_map(|list| list.subscribe());
+
+    let list = List::new_with_change_stream(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "List/map result (stub)"),
+        actor_context,
+        change_stream,
+        list_actor,
+    );
+
+    constant(Value::List(
+        Arc::new(list),
+        ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+    ))
+}
+
+// --- Router functions ---
+
+/// Get the current URL pathname from the browser
+fn get_current_pathname() -> String {
+    window().location().pathname().unwrap_or_else(|_| "/".to_string())
+}
+
+/// Router/route() -> Text
+/// Returns the current route/URL path as a reactive stream
+/// Updates whenever the URL changes (via popstate event)
+pub fn function_router_route(
+    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    // Create a channel for route changes
+    let (route_sender, route_receiver) = mpsc::unbounded::<String>();
+
+    // Send initial route
+    let initial_path = get_current_pathname();
+    let _ = route_sender.unbounded_send(initial_path);
+
+    // Set up popstate listener for browser back/forward navigation
+    let popstate_closure: Closure<dyn Fn()> = Closure::new({
+        let route_sender = route_sender.clone();
+        move || {
+            let path = get_current_pathname();
+            let _ = route_sender.unbounded_send(path);
+        }
+    });
+
+    window()
+        .add_event_listener_with_callback("popstate", popstate_closure.as_ref().unchecked_ref())
+        .unwrap_throw();
+
+    // Keep the closure alive by wrapping it
+    let popstate_closure = SendWrapper::new(popstate_closure);
+
+    // Store the global route sender for go_to to use
+    // Note: This is a simplified approach - in production we'd use a proper global state
+    ROUTE_SENDER.with(|cell| {
+        *cell.borrow_mut() = Some(route_sender);
+    });
+
+    // Convert route strings to Text values
+    route_receiver.map(move |path| {
+        // Keep closure alive
+        let _ = &popstate_closure;
+        Text::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Router/route"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            path,
+        )
+    })
+}
+
+// Thread-local storage for route sender (allows go_to to trigger route updates)
+thread_local! {
+    static ROUTE_SENDER: std::cell::RefCell<Option<mpsc::UnboundedSender<String>>> = std::cell::RefCell::new(None);
+}
+
+/// Router/go_to(route) -> []
+/// Navigates to the specified route using browser history API
+pub fn function_router_go_to(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let route_actor = arguments[0].clone();
+
+    route_actor.subscribe().map(move |value| {
+        let route = match &value {
+            Value::Text(text, _) => text.text().to_string(),
+            _ => "/".to_string(),
+        };
+
+        // Navigate using browser history API
+        if route.starts_with('/') {
+            history()
+                .push_state_with_url(&JsValue::NULL, "", Some(&route))
+                .unwrap_throw();
+
+            // Notify route listeners about the change
+            ROUTE_SENDER.with(|cell| {
+                if let Some(sender) = cell.borrow().as_ref() {
+                    let _ = sender.unbounded_send(route);
+                }
+            });
+        }
+
+        Object::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Router/go_to result"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            [],
+        )
     })
 }
 

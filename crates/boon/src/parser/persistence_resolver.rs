@@ -662,13 +662,49 @@ fn set_persistence<'a, 'code, 'old_code>(
                     .to_owned(),
             ))
         }
-        Expression::Function { .. } => {
-            // @TODO implement, see the error message below
-            errors.push(ResolveError::custom(
-                *span,
-                "Persistence resolver cannot resolve Persistence in Expression::Function yet, sorry"
-                    .to_owned(),
-            ))
+        Expression::Function {
+            name,
+            parameters,
+            body,
+        } => {
+            let old_body_and_id =
+                old_expressions
+                    .iter()
+                    .find_map(|old_expression| match old_expression {
+                        Spanned {
+                            span,
+                            persistence: _,
+                            node:
+                                Expression::Function {
+                                    name: old_name,
+                                    parameters: _,
+                                    body: old_body,
+                                },
+                        } if old_name == name => Some((old_body, old_span_id_pairs[span])),
+                        _ => None,
+                    });
+            if let Some((old_body, id)) = old_body_and_id {
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::Unchanged,
+                });
+                set_persistence(
+                    body,
+                    &[old_body],
+                    &old_span_id_pairs,
+                    new_span_id_pairs,
+                    errors,
+                );
+            } else {
+                let id: Ulid = PersistenceId::new();
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::NewOrChanged,
+                });
+                set_persistence(body, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+            }
         }
         Expression::LinkSetter { alias } => {
             // @TODO implement, see the error message below

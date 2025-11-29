@@ -13,6 +13,12 @@ pub use scope_resolver::{Referenceables, resolve_references};
 mod persistence_resolver;
 pub use persistence_resolver::{Persistence, PersistenceId, resolve_persistence};
 
+mod source;
+pub use source::{SourceCode, StrSlice};
+
+mod static_expression;
+pub use static_expression::*;
+
 pub use chumsky::prelude::{Input, Parser};
 
 pub type Span = SimpleSpan;

@@ -10,7 +10,7 @@ use serde_json_any_key::MapIterToJson;
 use zoon::{UnwrapThrowExt, WebStorage, eprintln, local_storage, println, serde_json};
 
 use crate::parser::{
-    Expression, Input, ParseError, Parser, Span, Spanned, Token, lexer, parser,
+    Expression, Input, ParseError, Parser, SourceCode, Span, Spanned, Token, lexer, parser,
     resolve_persistence, resolve_references,
 };
 use crate::platform::browser::{
@@ -99,7 +99,8 @@ pub fn run(
     println!("[Abstract Syntax Tree with Reference Data and Persistence]");
     println!("{ast:#?}");
 
-    let (evaluation_result, errors) = match evaluate(ast, states_local_storage_key.clone()) {
+    let source_code_arc = SourceCode::new(source_code.to_string());
+    let (evaluation_result, errors) = match evaluate(source_code_arc, ast, states_local_storage_key.clone()) {
         Ok(evaluation_result) => (Some(evaluation_result), vec![]),
         Err(evaluation_error) => (None, vec![evaluation_error]),
     };

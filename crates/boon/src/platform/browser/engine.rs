@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::pin;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::parser;
@@ -2246,6 +2247,125 @@ impl ListChange {
             Self::Clear => {
                 vec.clear();
             }
+        }
+    }
+}
+
+// --- ListBindingFunction ---
+
+use crate::parser::{StaticExpression, StaticSpanned, StrSlice};
+
+/// Handles List binding functions (map, retain, every, any) that need to
+/// evaluate an expression for each list item.
+///
+/// Uses StaticExpression which is 'static (via StrSlice into Arc<String> source)
+/// and can be:
+/// - Stored in async contexts without lifetime issues
+/// - Sent to WebWorkers for parallel processing
+/// - Cloned cheaply (just Arc increment + offset copy)
+/// - Serialized for distributed evaluation
+pub struct ListBindingFunction;
+
+/// Configuration for a list binding operation.
+#[derive(Clone)]
+pub struct ListBindingConfig {
+    /// The variable name that will be bound to each list item
+    pub binding_name: StrSlice,
+    /// The expression to evaluate for each item (with binding_name in scope)
+    pub transform_expr: StaticSpanned<StaticExpression>,
+    /// The type of list operation
+    pub operation: ListBindingOperation,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ListBindingOperation {
+    Map,
+    Retain,
+    Every,
+    Any,
+}
+
+impl ListBindingFunction {
+    /// Creates a new ValueActor for a List binding function.
+    ///
+    /// For List/map(old, new: expr):
+    /// - Subscribes to the source list
+    /// - For each item, evaluates transform_expr with 'old' bound to the item
+    /// - Produces the transformed list
+    ///
+    /// The OwnedExpression is 'static, so it can be used in async handlers
+    /// and potentially sent to WebWorkers for parallel processing.
+    pub fn new_arc_value_actor(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        source_list_actor: Arc<ValueActor>,
+        config: ListBindingConfig,
+    ) -> Arc<ValueActor> {
+        let construct_info = construct_info.complete(ConstructType::FunctionCall);
+
+        let is_map = config.operation == ListBindingOperation::Map;
+        let is_retain = config.operation == ListBindingOperation::Retain;
+
+        // Store the config in an Rc for sharing in async handlers
+        let _config = Rc::new(config);
+
+        // For now, create a stub that passes through the list unchanged (for map/retain)
+        // or returns True (for every/any)
+        //
+        // TODO: Full implementation will:
+        // 1. For each item in the source list, create a ValueActor for the transformed value
+        // 2. The transform evaluator will use the OwnedExpression with the binding set
+        // 3. For heavy transforms, optionally offload to WebWorker
+        if is_map || is_retain {
+            // Pass through the source list unchanged (stub behavior)
+            let change_stream = source_list_actor.subscribe().filter_map(|value| {
+                future::ready(match value {
+                    Value::List(list, _) => Some(list),
+                    _ => None,
+                })
+            }).flat_map(|list| list.subscribe());
+
+            let list = List::new_with_change_stream(
+                ConstructInfo::new(
+                    construct_info.id.clone().with_child_id(0),
+                    None,
+                    format!("List binding function result (stub): {}", if is_map { "map" } else { "retain" }),
+                ),
+                actor_context.clone(),
+                change_stream,
+                source_list_actor.clone(),
+            );
+
+            Arc::new(ValueActor::new_internal(
+                construct_info,
+                actor_context,
+                constant(Value::List(
+                    Arc::new(list),
+                    ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+                )),
+                vec![source_list_actor],
+            ))
+        } else {
+            // For every/any, return True as a placeholder
+            let tag_value = Value::Tag(
+                Arc::new(Tag::new(
+                    ConstructInfo::new(
+                        construct_info.id.clone().with_child_id(0),
+                        None,
+                        "List binding predicate result (stub)",
+                    ),
+                    construct_context,
+                    "True",
+                )),
+                ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+            );
+            Arc::new(ValueActor::new_internal(
+                construct_info,
+                actor_context,
+                constant(tag_value),
+                vec![source_list_actor],
+            ))
         }
     }
 }

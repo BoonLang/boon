@@ -1,9 +1,14 @@
 use std::sync::Arc;
 
 use zoon::futures_util::{select, stream};
+use zoon::futures_channel::mpsc;
 use zoon::{eprintln, *};
 
-use super::engine::*;
+use super::engine::{
+    ActorContext, ConstructContext, ConstructInfo, ListChange, Object,
+    TaggedObject, Value, ValueActor, ValueIdempotencyKey, Variable,
+    Text as EngineText, Tag as EngineTag,
+};
 
 pub fn object_with_document_to_element_signal(
     root_object: Arc<Object>,
@@ -27,11 +32,23 @@ fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElO
     match value {
         Value::Text(text, _) => zoon::Text::new(text.text()).unify(),
         Value::Number(number, _) => zoon::Text::new(number.number()).unify(),
+        Value::Tag(tag, _) => {
+            // Handle special tags like NoElement
+            match tag.tag() {
+                "NoElement" => El::new().unify(), // Empty element
+                other => zoon::Text::new(other).unify(), // Render tag as text
+            }
+        }
         Value::TaggedObject(tagged_object, _) => match tagged_object.tag() {
             "ElementContainer" => element_container(tagged_object, construct_context).unify(),
             "ElementStripe" => element_stripe(tagged_object, construct_context).unify(),
             "ElementButton" => element_button(tagged_object, construct_context).unify(),
-            other => panic!("Element cannot be created from the tagged objectwith tag '{other}'"),
+            "ElementTextInput" => element_text_input(tagged_object, construct_context).unify(),
+            "ElementCheckbox" => element_checkbox(tagged_object, construct_context).unify(),
+            "ElementLabel" => element_label(tagged_object, construct_context).unify(),
+            "ElementParagraph" => element_paragraph(tagged_object, construct_context).unify(),
+            "ElementLink" => element_link(tagged_object, construct_context).unify(),
+            other => panic!("Element cannot be created from the tagged object with tag '{other}'"),
         },
         _ => panic!("Element cannot be created from the given Value type"),
     }
@@ -156,6 +173,398 @@ fn element_button(
             }
         })
         .after_remove(move |_| drop(press_handler_task))
+}
+
+fn element_text_input(
+    tagged_object: Arc<TaggedObject>,
+    construct_context: ConstructContext,
+) -> impl Element {
+    type ChangeEvent = String;
+    type KeyDownEvent = String;
+    type BlurEvent = ();
+
+    let (change_event_sender, mut change_event_receiver) = mpsc::unbounded::<ChangeEvent>();
+    let (key_down_event_sender, mut key_down_event_receiver) = mpsc::unbounded::<KeyDownEvent>();
+    let (blur_event_sender, mut blur_event_receiver) = mpsc::unbounded::<BlurEvent>();
+
+    let element_variable = tagged_object.expect_variable("element");
+
+    // Set up event handlers - create separate subscriptions
+    let mut change_stream = element_variable
+        .subscribe()
+        .filter_map(|value| future::ready(value.expect_object().variable("event")))
+        .flat_map(|variable| variable.subscribe())
+        .filter_map(|value| future::ready(value.expect_object().variable("change")))
+        .map(|variable| variable.expect_link_value_sender())
+        .fuse();
+
+    let mut key_down_stream = element_variable
+        .subscribe()
+        .filter_map(|value| future::ready(value.expect_object().variable("event")))
+        .flat_map(|variable| variable.subscribe())
+        .filter_map(|value| future::ready(value.expect_object().variable("key_down")))
+        .map(|variable| variable.expect_link_value_sender())
+        .fuse();
+
+    let mut blur_stream = element_variable
+        .subscribe()
+        .filter_map(|value| future::ready(value.expect_object().variable("event")))
+        .flat_map(|variable| variable.subscribe())
+        .filter_map(|value| future::ready(value.expect_object().variable("blur")))
+        .map(|variable| variable.expect_link_value_sender())
+        .fuse();
+
+    let event_handler_task = Task::start_droppable({
+        let construct_context = construct_context.clone();
+        async move {
+            let mut change_link_value_sender = None;
+            let mut key_down_link_value_sender = None;
+            let mut blur_link_value_sender = None;
+            loop {
+                select! {
+                    new_sender = change_stream.next() => {
+                        if let Some(sender) = new_sender {
+                            change_link_value_sender = Some(sender);
+                        }
+                    }
+                    new_sender = key_down_stream.next() => {
+                        if let Some(sender) = new_sender {
+                            key_down_link_value_sender = Some(sender);
+                        }
+                    }
+                    new_sender = blur_stream.next() => {
+                        if let Some(sender) = new_sender {
+                            blur_link_value_sender = Some(sender);
+                        }
+                    }
+                    text = change_event_receiver.select_next_some() => {
+                        if let Some(sender) = change_link_value_sender.as_ref() {
+                            let event_value = Object::new_value(
+                                ConstructInfo::new("text_input::change_event", None, "TextInput change event"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                [Variable::new_arc(
+                                    ConstructInfo::new("text_input::change_event::text", None, "change text"),
+                                    construct_context.clone(),
+                                    "text",
+                                    ValueActor::new_arc(
+                                        ConstructInfo::new("text_input::change_event::text_actor", None, "change text actor"),
+                                        ActorContext::default(),
+                                        stream::once(future::ready(EngineText::new_value(
+                                            ConstructInfo::new("text_input::change_event::text_value", None, "change text value"),
+                                            construct_context.clone(),
+                                            ValueIdempotencyKey::new(),
+                                            text,
+                                        ))).chain(stream::pending()),
+                                    ),
+                                )],
+                            );
+                            let _ = sender.unbounded_send(event_value);
+                        }
+                    }
+                    key = key_down_event_receiver.select_next_some() => {
+                        if let Some(sender) = key_down_link_value_sender.as_ref() {
+                            let event_value = Object::new_value(
+                                ConstructInfo::new("text_input::key_down_event", None, "TextInput key_down event"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                [Variable::new_arc(
+                                    ConstructInfo::new("text_input::key_down_event::key", None, "key_down key"),
+                                    construct_context.clone(),
+                                    "key",
+                                    ValueActor::new_arc(
+                                        ConstructInfo::new("text_input::key_down_event::key_actor", None, "key_down key actor"),
+                                        ActorContext::default(),
+                                        stream::once(future::ready(EngineTag::new_value(
+                                            ConstructInfo::new("text_input::key_down_event::key_value", None, "key_down key value"),
+                                            construct_context.clone(),
+                                            ValueIdempotencyKey::new(),
+                                            key,
+                                        ))).chain(stream::pending()),
+                                    ),
+                                )],
+                            );
+                            let _ = sender.unbounded_send(event_value);
+                        }
+                    }
+                    _blur = blur_event_receiver.select_next_some() => {
+                        if let Some(sender) = blur_link_value_sender.as_ref() {
+                            let event_value = Object::new_value(
+                                ConstructInfo::new("text_input::blur_event", None, "TextInput blur event"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                [],
+                            );
+                            let _ = sender.unbounded_send(event_value);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let settings_variable = tagged_object.expect_variable("settings");
+
+    let text_stream = settings_variable
+        .subscribe()
+        .flat_map(|value| value.expect_object().expect_variable("text").subscribe())
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Text(text, _) => Some(text.text().to_string()),
+                _ => None,
+            })
+        });
+
+    let placeholder_stream = settings_variable
+        .subscribe()
+        .flat_map(|value| value.expect_object().expect_variable("placeholder").subscribe())
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Object(obj, _) => obj.variable("text").map(|_| "placeholder"),
+                _ => None,
+            })
+        });
+
+    TextInput::new()
+        .label_hidden("text input")
+        .text_signal(signal::from_stream(text_stream).map(|t| t.unwrap_or_default()))
+        .on_change({
+            let sender = change_event_sender.clone();
+            move |text| {
+                let _ = sender.unbounded_send(text);
+            }
+        })
+        .on_key_down_event({
+            let sender = key_down_event_sender.clone();
+            move |event| {
+                let key_name = match event.key() {
+                    Key::Enter => "Enter".to_string(),
+                    Key::Escape => "Escape".to_string(),
+                    Key::Other(k) => k.clone(),
+                };
+                let _ = sender.unbounded_send(key_name);
+            }
+        })
+        .on_blur({
+            let sender = blur_event_sender.clone();
+            move || {
+                let _ = sender.unbounded_send(());
+            }
+        })
+        .after_remove(move |_| drop(event_handler_task))
+}
+
+fn element_checkbox(
+    tagged_object: Arc<TaggedObject>,
+    construct_context: ConstructContext,
+) -> impl Element {
+    type ClickEvent = ();
+
+    let (click_event_sender, mut click_event_receiver) = mpsc::unbounded::<ClickEvent>();
+
+    let element_variable = tagged_object.expect_variable("element");
+
+    let event_stream = element_variable
+        .subscribe()
+        .filter_map(|value| future::ready(value.expect_object().variable("event")))
+        .flat_map(|variable| variable.subscribe());
+
+    let mut click_stream = event_stream
+        .filter_map(|value| future::ready(value.expect_object().variable("click")))
+        .map(|variable| variable.expect_link_value_sender())
+        .fuse();
+
+    let event_handler_task = Task::start_droppable({
+        let construct_context = construct_context.clone();
+        async move {
+            let mut click_link_value_sender = None;
+            loop {
+                select! {
+                    new_sender = click_stream.next() => {
+                        if let Some(sender) = new_sender {
+                            click_link_value_sender = Some(sender);
+                        }
+                    }
+                    _click = click_event_receiver.select_next_some() => {
+                        if let Some(sender) = click_link_value_sender.as_ref() {
+                            let event_value = Object::new_value(
+                                ConstructInfo::new("checkbox::click_event", None, "Checkbox click event"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                [],
+                            );
+                            let _ = sender.unbounded_send(event_value);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let settings_variable = tagged_object.expect_variable("settings");
+
+    let checked_stream = settings_variable
+        .subscribe()
+        .flat_map(|value| value.expect_object().expect_variable("checked").subscribe())
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Tag(tag, _) => Some(tag.tag() == "True"),
+                _ => None,
+            })
+        });
+
+    let icon_stream = settings_variable
+        .subscribe()
+        .flat_map(|value| value.expect_object().expect_variable("icon").subscribe())
+        .map(move |value| value_to_element(value, construct_context.clone()));
+
+    Checkbox::new()
+        .label_hidden("checkbox")
+        .checked_signal(signal::from_stream(checked_stream).map(|c| c.unwrap_or(false)))
+        .icon(move |_checked_mutable| {
+            // For now, just use the icon from settings
+            El::new()
+        })
+        .on_click({
+            let sender = click_event_sender.clone();
+            move || {
+                let _ = sender.unbounded_send(());
+            }
+        })
+        .after_remove(move |_| drop(event_handler_task))
+}
+
+fn element_label(
+    tagged_object: Arc<TaggedObject>,
+    construct_context: ConstructContext,
+) -> impl Element {
+    type DoubleClickEvent = ();
+
+    let (double_click_sender, mut double_click_receiver) = mpsc::unbounded::<DoubleClickEvent>();
+    let (hovered_sender, _hovered_receiver) = mpsc::unbounded::<bool>();
+
+    let element_variable = tagged_object.expect_variable("element");
+
+    // Set up hovered link
+    let hovered_stream = element_variable
+        .subscribe()
+        .filter_map(|value| future::ready(value.expect_object().variable("hovered")))
+        .map(|variable| variable.expect_link_value_sender());
+
+    // Set up double_click event
+    let event_stream = element_variable
+        .subscribe()
+        .filter_map(|value| future::ready(value.expect_object().variable("event")))
+        .flat_map(|variable| variable.subscribe());
+
+    let mut double_click_stream = event_stream
+        .filter_map(|value| future::ready(value.expect_object().variable("double_click")))
+        .map(|variable| variable.expect_link_value_sender())
+        .fuse();
+
+    let event_handler_task = Task::start_droppable({
+        let construct_context = construct_context.clone();
+        async move {
+            let mut double_click_link_value_sender = None;
+            let mut _hovered_link_value_sender = None;
+            let mut hovered_stream = hovered_stream.fuse();
+            loop {
+                select! {
+                    new_sender = double_click_stream.next() => {
+                        if let Some(sender) = new_sender {
+                            double_click_link_value_sender = Some(sender);
+                        }
+                    }
+                    new_sender = hovered_stream.next() => {
+                        if let Some(sender) = new_sender {
+                            _hovered_link_value_sender = Some(sender);
+                        }
+                    }
+                    _click = double_click_receiver.select_next_some() => {
+                        if let Some(sender) = double_click_link_value_sender.as_ref() {
+                            let event_value = Object::new_value(
+                                ConstructInfo::new("label::double_click_event", None, "Label double_click event"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                [],
+                            );
+                            let _ = sender.unbounded_send(event_value);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let settings_variable = tagged_object.expect_variable("settings");
+
+    let label_stream = settings_variable
+        .subscribe()
+        .flat_map(|value| value.expect_object().expect_variable("label").subscribe())
+        .map(move |value| value_to_element(value, construct_context.clone()));
+
+    Label::new()
+        .label_signal(signal::from_stream(label_stream).map(|l| {
+            l.unwrap_or_else(|| zoon::Text::new("").unify())
+        }))
+        .on_double_click({
+            let sender = double_click_sender.clone();
+            move || {
+                let _ = sender.unbounded_send(());
+            }
+        })
+        .after_remove(move |_| drop(event_handler_task))
+}
+
+fn element_paragraph(
+    tagged_object: Arc<TaggedObject>,
+    construct_context: ConstructContext,
+) -> impl Element {
+    let settings_variable = tagged_object.expect_variable("settings");
+
+    let contents_vec_diff_stream = settings_variable
+        .subscribe()
+        .flat_map(|value| value.expect_object().expect_variable("contents").subscribe())
+        .flat_map(|value| value.expect_list().subscribe())
+        .map(list_change_to_vec_diff);
+
+    Paragraph::new().contents_signal_vec(
+        VecDiffStreamSignalVec(contents_vec_diff_stream).map_signal(move |value_actor| {
+            signal::from_stream(value_actor.subscribe().map({
+                let construct_context = construct_context.clone();
+                move |value| value_to_element(value, construct_context.clone())
+            }))
+        }),
+    )
+}
+
+fn element_link(
+    tagged_object: Arc<TaggedObject>,
+    construct_context: ConstructContext,
+) -> impl Element {
+    let settings_variable = tagged_object.expect_variable("settings");
+
+    let label_stream = settings_variable
+        .subscribe()
+        .flat_map(|value| value.expect_object().expect_variable("label").subscribe())
+        .map(move |value| value_to_element(value, construct_context.clone()));
+
+    let to_stream = settings_variable
+        .subscribe()
+        .flat_map(|value| value.expect_object().expect_variable("to").subscribe())
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Text(text, _) => Some(text.text().to_string()),
+                _ => None,
+            })
+        });
+
+    Link::new()
+        .label_signal(signal::from_stream(label_stream).map(|l| {
+            l.unwrap_or_else(|| zoon::Text::new("").unify())
+        }))
+        .to_signal(signal::from_stream(to_stream).map(|t| t.unwrap_or_default()))
+        .new_tab(NewTab::new())
 }
 
 #[pin_project]

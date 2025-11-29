@@ -396,13 +396,37 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                     .to_owned(),
             ))
         }
-        Expression::Function { .. } => {
-            // @TODO implement, see the error message below
-            errors.push(ResolveError::custom(
-                *span,
-                "Scope resolver cannot resolve references in Expression::Function yet, sorry"
-                    .to_owned(),
-            ))
+        Expression::Function {
+            name,
+            parameters,
+            body,
+        } => {
+            // Add parameters to reachable referenceables so they can be referenced in the body
+            level += 1;
+            for parameter in parameters.iter() {
+                let Spanned {
+                    span,
+                    node: param_name,
+                    persistence: _,
+                } = parameter;
+                reachable_referenceables
+                    .entry(param_name)
+                    .or_default()
+                    .push(Referenceable {
+                        name: param_name,
+                        span: *span,
+                        level,
+                    });
+            }
+            // Resolve references in the function body
+            set_is_referenced_and_alias_referenceables(
+                body,
+                reachable_referenceables.clone(),
+                level,
+                Some(*name),
+                errors,
+                all_referenced,
+            );
         }
         Expression::Alias(alias) => set_referenced_referenceable(
             alias,
