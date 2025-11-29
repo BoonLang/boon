@@ -5,11 +5,15 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use chumsky::Parser as ChumskyParser;
+use chumsky::input::{Input as ChumskyInput, Stream as ChumskyStream};
 use ulid::Ulid;
 use zoon::futures_util::stream;
-use zoon::{Stream, StreamExt};
+use zoon::{Stream, StreamExt, println, eprintln};
 
-use super::super::super::parser::{PersistenceId, SourceCode, Span, static_expression};
+use super::super::super::parser::{
+    PersistenceId, SourceCode, Span, static_expression, lexer, parser, resolve_references, Token, Spanned,
+};
 use super::api;
 use super::engine::*;
 
@@ -27,6 +31,186 @@ pub struct StaticFunctionDefinition {
     pub body: static_expression::Spanned<static_expression::Expression>,
 }
 
+/// Cached module data - contains functions and variables from a parsed module file.
+#[derive(Clone)]
+pub struct ModuleData {
+    /// Functions defined in this module (name -> definition)
+    pub functions: HashMap<String, StaticFunctionDefinition>,
+    /// Variables defined in this module (name -> value expression)
+    pub variables: HashMap<String, static_expression::Spanned<static_expression::Expression>>,
+}
+
+/// Module loader with caching for loading and parsing Boon modules.
+/// Resolves module paths like "Theme" to file paths and caches parsed modules.
+#[derive(Clone, Default)]
+pub struct ModuleLoader {
+    /// Cache of loaded modules (module_path -> ModuleData)
+    cache: Rc<RefCell<HashMap<String, ModuleData>>>,
+    /// Base directory for module resolution (e.g., the directory containing RUN.bn)
+    base_dir: Rc<RefCell<String>>,
+}
+
+impl ModuleLoader {
+    pub fn new(base_dir: impl Into<String>) -> Self {
+        Self {
+            cache: Rc::new(RefCell::new(HashMap::new())),
+            base_dir: Rc::new(RefCell::new(base_dir.into())),
+        }
+    }
+
+    /// Set the base directory for module resolution
+    pub fn set_base_dir(&self, dir: impl Into<String>) {
+        *self.base_dir.borrow_mut() = dir.into();
+    }
+
+    /// Get the base directory
+    pub fn base_dir(&self) -> String {
+        self.base_dir.borrow().clone()
+    }
+
+    /// Load a module by name (e.g., "Theme", "Professional", "Assets")
+    /// Tries multiple resolution paths:
+    /// 1. {base_dir}/{module_name}.bn
+    /// 2. {base_dir}/{module_name}/{module_name}.bn
+    /// 3. {base_dir}/Generated/{module_name}.bn (for generated files)
+    pub fn load_module(
+        &self,
+        module_name: &str,
+        virtual_fs: &VirtualFilesystem,
+        current_dir: Option<&str>,
+    ) -> Option<ModuleData> {
+        // Check cache first
+        if let Some(cached) = self.cache.borrow().get(module_name) {
+            return Some(cached.clone());
+        }
+
+        let base_dir_binding = self.base_dir.borrow();
+        let base = current_dir.unwrap_or(&base_dir_binding);
+
+        // Helper to create path, avoiding leading slash when base is empty
+        let make_path = |base: &str, rest: &str| {
+            if base.is_empty() {
+                rest.to_string()
+            } else {
+                format!("{}/{}", base, rest)
+            }
+        };
+
+        // Try different resolution paths
+        let paths_to_try = vec![
+            make_path(base, &format!("{}.bn", module_name)),
+            make_path(base, &format!("{}/{}.bn", module_name, module_name)),
+            make_path(base, &format!("Generated/{}.bn", module_name)),
+            // Also try from the module loader's base directory if current_dir is different
+            make_path(&base_dir_binding, &format!("{}.bn", module_name)),
+            make_path(&base_dir_binding, &format!("{}/{}.bn", module_name, module_name)),
+            make_path(&base_dir_binding, &format!("Generated/{}.bn", module_name)),
+        ];
+
+        for path in paths_to_try {
+            if let Some(source_code) = virtual_fs.read_text(&path) {
+                println!("[ModuleLoader] Loading module '{}' from '{}'", module_name, path);
+                if let Some(module_data) = self.parse_module(&path, &source_code) {
+                    // Cache the module
+                    self.cache.borrow_mut().insert(module_name.to_string(), module_data.clone());
+                    return Some(module_data);
+                }
+            }
+        }
+
+        eprintln!("[ModuleLoader] Could not find module '{}' (tried from base '{}')", module_name, base);
+        None
+    }
+
+    /// Parse module source code into ModuleData
+    fn parse_module(&self, filename: &str, source_code: &str) -> Option<ModuleData> {
+        // Lexer
+        let (tokens, errors) = lexer().parse(source_code).into_output_errors();
+        if !errors.is_empty() {
+            eprintln!("[ModuleLoader] Lex errors in '{}': {:?}", filename, errors.len());
+            return None;
+        }
+        let mut tokens = tokens?;
+        tokens.retain(|spanned_token| !matches!(spanned_token.node, Token::Comment(_)));
+
+        // Parser
+        let (ast, errors) = parser()
+            .parse(ChumskyStream::from_iter(tokens).map(
+                Span::splat(source_code.len()),
+                |Spanned { node, span, persistence: _ }| (node, span),
+            ))
+            .into_output_errors();
+        if !errors.is_empty() {
+            eprintln!("[ModuleLoader] Parse errors in '{}': {:?}", filename, errors.len());
+            return None;
+        }
+        let ast = ast?;
+
+        // Reference resolution
+        let ast = match resolve_references(ast) {
+            Ok(ast) => ast,
+            Err(errors) => {
+                eprintln!("[ModuleLoader] Reference errors in '{}': {:?}", filename, errors.len());
+                return None;
+            }
+        };
+
+        // Convert to static expressions
+        let source_code_arc = SourceCode::new(source_code.to_string());
+        let static_ast = static_expression::convert_expressions(source_code_arc, ast);
+
+        // Extract functions and variables
+        let mut functions = HashMap::new();
+        let mut variables = HashMap::new();
+
+        for expr in static_ast {
+            match expr.node.clone() {
+                static_expression::Expression::Variable(variable) => {
+                    let name = variable.name.to_string();
+                    let value_expr = variable.value;
+                    variables.insert(name, value_expr);
+                }
+                static_expression::Expression::Function { name, parameters, body } => {
+                    functions.insert(
+                        name.to_string(),
+                        StaticFunctionDefinition {
+                            parameters: parameters.into_iter().map(|p| p.node.to_string()).collect(),
+                            body: *body,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        Some(ModuleData { functions, variables })
+    }
+
+    /// Get a function from a module
+    pub fn get_function(
+        &self,
+        module_name: &str,
+        function_name: &str,
+        virtual_fs: &VirtualFilesystem,
+        current_dir: Option<&str>,
+    ) -> Option<StaticFunctionDefinition> {
+        let module = self.load_module(module_name, virtual_fs, current_dir)?;
+        module.functions.get(function_name).cloned()
+    }
+
+    /// Get a variable from a module
+    pub fn get_variable(
+        &self,
+        module_name: &str,
+        variable_name: &str,
+        virtual_fs: &VirtualFilesystem,
+        current_dir: Option<&str>,
+    ) -> Option<static_expression::Spanned<static_expression::Expression>> {
+        let module = self.load_module(module_name, virtual_fs, current_dir)?;
+        module.variables.get(variable_name).cloned()
+    }
+}
+
 /// Main evaluation function - takes static expressions (owned, 'static, no lifetimes).
 pub fn evaluate(
     source_code: SourceCode,
@@ -35,17 +219,19 @@ pub fn evaluate(
     virtual_fs: VirtualFilesystem,
 ) -> Result<(Arc<Object>, ConstructContext), String> {
     let function_registry = StaticFunctionRegistry::default();
-    let (obj, ctx, _) = evaluate_with_registry(
+    let module_loader = ModuleLoader::default();
+    let (obj, ctx, _, _) = evaluate_with_registry(
         source_code,
         expressions,
         states_local_storage_key,
         virtual_fs,
         function_registry,
+        module_loader,
     )?;
     Ok((obj, ctx))
 }
 
-/// Evaluation function that accepts and returns a function registry.
+/// Evaluation function that accepts and returns a function registry and module loader.
 /// This enables sharing function definitions across multiple files.
 pub fn evaluate_with_registry(
     source_code: SourceCode,
@@ -53,7 +239,8 @@ pub fn evaluate_with_registry(
     states_local_storage_key: impl Into<Cow<'static, str>>,
     virtual_fs: VirtualFilesystem,
     function_registry: StaticFunctionRegistry,
-) -> Result<(Arc<Object>, ConstructContext, StaticFunctionRegistry), String> {
+    module_loader: ModuleLoader,
+) -> Result<(Arc<Object>, ConstructContext, StaticFunctionRegistry, ModuleLoader), String> {
     let construct_context = ConstructContext {
         construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
         virtual_fs,
@@ -111,6 +298,7 @@ pub fn evaluate_with_registry(
                 reference_connector.clone(),
                 link_connector.clone(),
                 function_registry.clone(),
+                module_loader.clone(),
                 source_code.clone(),
             )
         })
@@ -121,7 +309,7 @@ pub fn evaluate_with_registry(
         construct_context.clone(),
         evaluated_variables?,
     );
-    Ok((root_object, construct_context, function_registry))
+    Ok((root_object, construct_context, function_registry, module_loader))
 }
 
 /// Evaluates a static variable into a Variable.
@@ -132,6 +320,7 @@ fn static_spanned_variable_into_variable(
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
     function_registry: StaticFunctionRegistry,
+    module_loader: ModuleLoader,
     source_code: SourceCode,
 ) -> Result<Arc<Variable>, String> {
     let static_expression::Spanned {
@@ -170,6 +359,7 @@ fn static_spanned_variable_into_variable(
                 reference_connector.clone(),
                 link_connector.clone(),
                 function_registry,
+                module_loader,
                 source_code,
             )?,
         )
@@ -208,6 +398,7 @@ pub fn evaluate_static_expression(
         reference_connector,
         link_connector,
         StaticFunctionRegistry::default(),
+        ModuleLoader::default(),
         source_code,
     )
 }
@@ -221,6 +412,7 @@ fn static_spanned_expression_into_value_actor(
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
     function_registry: StaticFunctionRegistry,
+    module_loader: ModuleLoader,
     source_code: SourceCode,
 ) -> Result<Arc<ValueActor>, String> {
     let static_expression::Spanned {
@@ -288,6 +480,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector.clone(),
                         link_connector.clone(),
                         function_registry.clone(),
+                        module_loader.clone(),
                         source_code.clone(),
                     )
                 })
@@ -326,6 +519,34 @@ fn static_spanned_expression_into_value_actor(
                         Box::pin(async move { param_actor })
                     } else if let Some(ref_span) = referenced_span {
                         Box::pin(reference_connector.referenceable(*ref_span))
+                    } else if parts.len() >= 2 {
+                        // Try module variable access: e.g., Assets/icon.checkbox_active
+                        // parts[0] = module name (Assets), parts[1] = variable name (icon)
+                        let module_name = &parts[0];
+                        let var_name = parts[1].to_string();
+
+                        if let Some(module_data) = module_loader.load_module(module_name, &construct_context.virtual_fs, None) {
+                            if let Some(var_expr) = module_data.variables.get(&var_name).cloned() {
+                                println!("[ModuleLoader] Found variable '{}' in module '{}'", var_name, module_name);
+
+                                // Evaluate the module's variable expression
+                                let var_actor = static_spanned_expression_into_value_actor(
+                                    var_expr,
+                                    construct_context.clone(),
+                                    actor_context.clone(),
+                                    reference_connector.clone(),
+                                    link_connector.clone(),
+                                    function_registry.clone(),
+                                    module_loader.clone(),
+                                    source_code.clone(),
+                                )?;
+                                Box::pin(async move { var_actor })
+                            } else {
+                                return Err(format!("Variable '{}' not found in module '{}'", var_name, module_name));
+                            }
+                        } else {
+                            return Err(format!("Module '{}' not found for variable access", module_name));
+                        }
                     } else {
                         return Err(format!("Failed to get aliased variable '{}'", first_part));
                     }
@@ -359,6 +580,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector.clone(),
                         link_connector.clone(),
                         function_registry.clone(),
+                        module_loader.clone(),
                         source_code.clone(),
                     )?;
                     let b = static_spanned_expression_into_value_actor(
@@ -368,6 +590,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector,
                         link_connector,
                         function_registry,
+                        module_loader,
                         source_code,
                     )?;
                     ArithmeticCombinator::new_add(
@@ -386,6 +609,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector.clone(),
                         link_connector.clone(),
                         function_registry.clone(),
+                        module_loader.clone(),
                         source_code.clone(),
                     )?;
                     let b = static_spanned_expression_into_value_actor(
@@ -395,6 +619,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector,
                         link_connector,
                         function_registry,
+                        module_loader,
                         source_code,
                     )?;
                     ArithmeticCombinator::new_subtract(
@@ -413,6 +638,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector.clone(),
                         link_connector.clone(),
                         function_registry.clone(),
+                        module_loader.clone(),
                         source_code.clone(),
                     )?;
                     let b = static_spanned_expression_into_value_actor(
@@ -422,6 +648,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector,
                         link_connector,
                         function_registry,
+                        module_loader,
                         source_code,
                     )?;
                     ArithmeticCombinator::new_multiply(
@@ -440,6 +667,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector.clone(),
                         link_connector.clone(),
                         function_registry.clone(),
+                        module_loader.clone(),
                         source_code.clone(),
                     )?;
                     let b = static_spanned_expression_into_value_actor(
@@ -449,6 +677,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector,
                         link_connector,
                         function_registry,
+                        module_loader,
                         source_code,
                     )?;
                     ArithmeticCombinator::new_divide(
@@ -467,6 +696,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector,
                         link_connector,
                         function_registry,
+                        module_loader,
                         source_code,
                     )?;
                     let neg_one = Number::new_arc_value_actor(
@@ -501,6 +731,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector.clone(),
                         link_connector.clone(),
                         function_registry.clone(),
+                        module_loader.clone(),
                         source_code.clone(),
                     )?;
                     let b = static_spanned_expression_into_value_actor(
@@ -510,6 +741,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector,
                         link_connector,
                         function_registry,
+                        module_loader,
                         source_code,
                     )?;
                     ComparatorCombinator::new_equal(
@@ -528,6 +760,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector.clone(),
                         link_connector.clone(),
                         function_registry.clone(),
+                        module_loader.clone(),
                         source_code.clone(),
                     )?;
                     let b = static_spanned_expression_into_value_actor(
@@ -537,6 +770,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector,
                         link_connector,
                         function_registry,
+                        module_loader,
                         source_code,
                     )?;
                     ComparatorCombinator::new_not_equal(
@@ -555,6 +789,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector.clone(),
                         link_connector.clone(),
                         function_registry.clone(),
+                        module_loader.clone(),
                         source_code.clone(),
                     )?;
                     let b = static_spanned_expression_into_value_actor(
@@ -564,6 +799,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector,
                         link_connector,
                         function_registry,
+                        module_loader,
                         source_code,
                     )?;
                     ComparatorCombinator::new_greater(
@@ -582,6 +818,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector.clone(),
                         link_connector.clone(),
                         function_registry.clone(),
+                        module_loader.clone(),
                         source_code.clone(),
                     )?;
                     let b = static_spanned_expression_into_value_actor(
@@ -591,6 +828,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector,
                         link_connector,
                         function_registry,
+                        module_loader,
                         source_code,
                     )?;
                     ComparatorCombinator::new_greater_or_equal(
@@ -609,6 +847,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector.clone(),
                         link_connector.clone(),
                         function_registry.clone(),
+                        module_loader.clone(),
                         source_code.clone(),
                     )?;
                     let b = static_spanned_expression_into_value_actor(
@@ -618,6 +857,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector,
                         link_connector,
                         function_registry,
+                        module_loader,
                         source_code,
                     )?;
                     ComparatorCombinator::new_less(
@@ -636,6 +876,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector.clone(),
                         link_connector.clone(),
                         function_registry.clone(),
+                        module_loader.clone(),
                         source_code.clone(),
                     )?;
                     let b = static_spanned_expression_into_value_actor(
@@ -645,6 +886,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector,
                         link_connector,
                         function_registry,
+                        module_loader,
                         source_code,
                     )?;
                     ComparatorCombinator::new_less_or_equal(
@@ -693,6 +935,7 @@ fn static_spanned_expression_into_value_actor(
                             reference_connector.clone(),
                             link_connector.clone(),
                             function_registry.clone(),
+                            module_loader.clone(),
                             source_code.clone(),
                         )?
                     } else if let Some(ref piped) = actor_context.piped {
@@ -757,6 +1000,7 @@ fn static_spanned_expression_into_value_actor(
                                             reference_connector.clone(),
                                             link_connector.clone(),
                                             function_registry.clone(),
+                                            module_loader.clone(),
                                             source_code.clone(),
                                         )?;
                                         passed_context = Some(pass_actor);
@@ -774,6 +1018,7 @@ fn static_spanned_expression_into_value_actor(
                                         reference_connector.clone(),
                                         link_connector.clone(),
                                         function_registry.clone(),
+                                        module_loader.clone(),
                                         source_code.clone(),
                                     )?;
                                     param_bindings.insert(param_name, actor);
@@ -796,8 +1041,92 @@ fn static_spanned_expression_into_value_actor(
                                 reference_connector,
                                 link_connector,
                                 function_registry,
+                                module_loader,
                                 source_code,
                             );
+                        }
+                    }
+
+                    // Check for module function call (path.len() >= 2, e.g., Theme/material)
+                    // Built-in modules: Math, Text, List, Bool, Logic, Storage, Time, Object, Browser, Ui, Css, Selector
+                    let builtin_modules = ["Math", "Text", "List", "Bool", "Logic", "Storage", "Time", "Object", "Browser", "Ui", "Css", "Selector", "Color", "Spring", "Page", "Attr", "Router"];
+                    if path.len() >= 2 && !builtin_modules.contains(&path[0].as_str()) {
+                        let module_name = &path[0];
+                        let func_name = &path[1];
+
+                        // Try to load module and get the function
+                        if let Some(module_data) = module_loader.load_module(module_name, &construct_context.virtual_fs, None) {
+                            if let Some(user_func) = module_data.functions.get(func_name.as_str()) {
+                                println!("[ModuleLoader] Found function '{}' in module '{}'", func_name, module_name);
+
+                                // User-defined function from module - evaluate arguments and bind to parameters
+                                let mut param_bindings: HashMap<String, Arc<ValueActor>> = HashMap::new();
+                                let mut passed_context: Option<Arc<ValueActor>> = actor_context.passed.clone();
+
+                                // If there's a piped value, bind it to the first parameter
+                                if let Some(piped) = &actor_context.piped {
+                                    if let Some(first_param) = user_func.parameters.first() {
+                                        param_bindings.insert(first_param.clone(), piped.clone());
+                                    }
+                                }
+
+                                // Process named arguments
+                                for arg in &arguments {
+                                    // Check for PASS: argument
+                                    if arg.node.name.as_str() == "PASS" {
+                                        if let Some(value) = &arg.node.value {
+                                            let pass_actor = static_spanned_expression_into_value_actor(
+                                                value.clone(),
+                                                construct_context.clone(),
+                                                actor_context.clone(),
+                                                reference_connector.clone(),
+                                                link_connector.clone(),
+                                                function_registry.clone(),
+                                                module_loader.clone(),
+                                                source_code.clone(),
+                                            )?;
+                                            passed_context = Some(pass_actor);
+                                        }
+                                        continue;
+                                    }
+
+                                    // Bind named argument to parameter
+                                    let param_name = arg.node.name.to_string();
+                                    if let Some(value) = &arg.node.value {
+                                        let actor = static_spanned_expression_into_value_actor(
+                                            value.clone(),
+                                            construct_context.clone(),
+                                            actor_context.clone(),
+                                            reference_connector.clone(),
+                                            link_connector.clone(),
+                                            function_registry.clone(),
+                                            module_loader.clone(),
+                                            source_code.clone(),
+                                        )?;
+                                        param_bindings.insert(param_name, actor);
+                                    }
+                                }
+
+                                // Create actor context with parameter bindings for the function body
+                                let func_actor_context = ActorContext {
+                                    output_valve_signal: actor_context.output_valve_signal.clone(),
+                                    piped: None, // Clear piped - it was bound to first param
+                                    passed: passed_context,
+                                    parameters: param_bindings,
+                                };
+
+                                // Evaluate the function body with the new context
+                                return static_spanned_expression_into_value_actor(
+                                    user_func.body.clone(),
+                                    construct_context,
+                                    func_actor_context,
+                                    reference_connector,
+                                    link_connector,
+                                    function_registry,
+                                    module_loader,
+                                    source_code,
+                                );
+                            }
                         }
                     }
 
@@ -821,6 +1150,7 @@ fn static_spanned_expression_into_value_actor(
                                     reference_connector.clone(),
                                     link_connector.clone(),
                                     function_registry.clone(),
+                                    module_loader.clone(),
                                     source_code.clone(),
                                 )?;
                                 passed_context = Some(pass_actor);
@@ -836,6 +1166,7 @@ fn static_spanned_expression_into_value_actor(
                                 reference_connector.clone(),
                                 link_connector.clone(),
                                 function_registry.clone(),
+                                module_loader.clone(),
                                 source_code.clone(),
                             )?;
                             evaluated_args.push(actor);
@@ -893,6 +1224,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector.clone(),
                         link_connector.clone(),
                         function_registry.clone(),
+                        module_loader.clone(),
                         source_code.clone(),
                     )?;
                     Ok(Variable::new_arc(
@@ -933,6 +1265,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector.clone(),
                         link_connector.clone(),
                         function_registry.clone(),
+                        module_loader.clone(),
                         source_code.clone(),
                     )?;
                     Ok(Variable::new_arc(
@@ -1028,6 +1361,7 @@ fn static_spanned_expression_into_value_actor(
                         reference_connector.clone(),
                         link_connector.clone(),
                         function_registry.clone(),
+                        module_loader.clone(),
                         source_code.clone(),
                     )
                 })
@@ -1060,6 +1394,7 @@ fn static_spanned_expression_into_value_actor(
                     let reference_connector_for_then = reference_connector.clone();
                     let link_connector_for_then = link_connector.clone();
                     let function_registry_for_then = function_registry.clone();
+                    let module_loader_for_then = module_loader.clone();
                     let source_code_for_then = source_code.clone();
                     let persistence_for_then = persistence.clone();
                     let span_for_then = span;
@@ -1072,6 +1407,7 @@ fn static_spanned_expression_into_value_actor(
                         let reference_connector_clone = reference_connector_for_then.clone();
                         let link_connector_clone = link_connector_for_then.clone();
                         let function_registry_clone = function_registry_for_then.clone();
+                        let module_loader_clone = module_loader_for_then.clone();
                         let source_code_clone = source_code_for_then.clone();
                         let persistence_clone = persistence_for_then.clone();
                         let body_clone = body_for_closure.clone();
@@ -1109,6 +1445,7 @@ fn static_spanned_expression_into_value_actor(
                                 reference_connector_clone,
                                 link_connector_clone,
                                 function_registry_clone,
+                                module_loader_clone,
                                 source_code_clone,
                             ) {
                                 Ok(result_actor) => {
@@ -1149,6 +1486,7 @@ fn static_spanned_expression_into_value_actor(
                     let reference_connector_for_when = reference_connector.clone();
                     let link_connector_for_when = link_connector.clone();
                     let function_registry_for_when = function_registry.clone();
+                    let module_loader_for_when = module_loader.clone();
                     let source_code_for_when = source_code.clone();
                     let persistence_for_when = persistence.clone();
                     let span_for_when = span;
@@ -1161,6 +1499,7 @@ fn static_spanned_expression_into_value_actor(
                         let reference_connector_clone = reference_connector_for_when.clone();
                         let link_connector_clone = link_connector_for_when.clone();
                         let function_registry_clone = function_registry_for_when.clone();
+                        let module_loader_clone = module_loader_for_when.clone();
                         let source_code_clone = source_code_for_when.clone();
                         let persistence_clone = persistence_for_when.clone();
                         let arms_clone = arms_for_closure.clone();
@@ -1201,6 +1540,7 @@ fn static_spanned_expression_into_value_actor(
                                         reference_connector_clone,
                                         link_connector_clone,
                                         function_registry_clone,
+                                        module_loader_clone,
                                         source_code_clone,
                                     ) {
                                         Ok(result_actor) => return Some(result_actor),
@@ -1243,6 +1583,7 @@ fn static_spanned_expression_into_value_actor(
                     let link_connector_for_while = link_connector.clone();
                     let function_registry_for_while = function_registry.clone();
                     let source_code_for_while = source_code.clone();
+                    let module_loader_for_while = module_loader.clone();
                     let persistence_for_while = persistence.clone();
                     let span_for_while = span;
                     let arms_for_closure = arms.clone();
@@ -1255,6 +1596,7 @@ fn static_spanned_expression_into_value_actor(
                         let link_connector_clone = link_connector_for_while.clone();
                         let function_registry_clone = function_registry_for_while.clone();
                         let source_code_clone = source_code_for_while.clone();
+                        let module_loader_clone = module_loader_for_while.clone();
                         let persistence_clone = persistence_for_while.clone();
                         let arms_clone = arms_for_closure.clone();
 
@@ -1294,6 +1636,7 @@ fn static_spanned_expression_into_value_actor(
                                         reference_connector_clone,
                                         link_connector_clone,
                                         function_registry_clone,
+                                        module_loader_clone,
                                         source_code_clone,
                                     ) {
                                         Ok(result_actor) => return Some(result_actor),
@@ -1393,6 +1736,7 @@ fn static_spanned_expression_into_value_actor(
                 reference_connector.clone(),
                 link_connector.clone(),
                 function_registry.clone(),
+                module_loader.clone(),
                 source_code.clone(),
             )?;
 
@@ -1452,6 +1796,7 @@ fn static_spanned_expression_into_value_actor(
                 reference_connector.clone(),
                 link_connector.clone(),
                 function_registry.clone(),
+                module_loader.clone(),
                 source_code.clone(),
             )?;
 
@@ -1481,6 +1826,7 @@ fn static_spanned_expression_into_value_actor(
                 reference_connector.clone(),
                 link_connector.clone(),
                 function_registry.clone(),
+                module_loader.clone(),
                 source_code.clone(),
             )?;
 
@@ -1536,6 +1882,7 @@ fn static_spanned_expression_into_value_actor(
                 reference_connector,
                 link_connector,
                 function_registry,
+                module_loader,
                 source_code,
             )?
         }
@@ -1548,6 +1895,7 @@ fn static_spanned_expression_into_value_actor(
                 reference_connector.clone(),
                 link_connector.clone(),
                 function_registry.clone(),
+                module_loader.clone(),
                 source_code.clone(),
             )?;
 
@@ -1567,6 +1915,7 @@ fn static_spanned_expression_into_value_actor(
                 reference_connector,
                 link_connector,
                 function_registry,
+                module_loader,
                 source_code,
             );
         }
@@ -1593,6 +1942,7 @@ fn static_spanned_expression_into_value_actor(
                     reference_connector.clone(),
                     link_connector.clone(),
                     function_registry.clone(),
+                    module_loader.clone(),
                     source_code.clone(),
                 )?;
                 local_parameters.insert(var_name, value_actor);
@@ -1611,6 +1961,7 @@ fn static_spanned_expression_into_value_actor(
                 reference_connector,
                 link_connector,
                 function_registry,
+                module_loader,
                 source_code,
             );
         }

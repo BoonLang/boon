@@ -15,7 +15,7 @@ use crate::parser::{
 };
 use crate::platform::browser::{
     engine::{ConstructContext, Object, VirtualFilesystem},
-    evaluator::{evaluate, evaluate_with_registry, StaticFunctionRegistry},
+    evaluator::{evaluate, evaluate_with_registry, ModuleLoader, StaticFunctionRegistry},
 };
 
 pub fn run(
@@ -154,7 +154,7 @@ pub fn run_with_registry(
     old_span_id_pairs_local_storage_key: impl Into<Cow<'static, str>>,
     virtual_fs: VirtualFilesystem,
     function_registry: Option<StaticFunctionRegistry>,
-) -> Option<(Arc<Object>, ConstructContext, StaticFunctionRegistry)> {
+) -> Option<(Arc<Object>, ConstructContext, StaticFunctionRegistry, ModuleLoader)> {
     let states_local_storage_key = states_local_storage_key.into();
     let old_code_local_storage_key = old_code_local_storage_key.into();
     let old_span_id_pairs_local_storage_key = old_span_id_pairs_local_storage_key.into();
@@ -224,12 +224,14 @@ pub fn run_with_registry(
     let static_ast = static_expression::convert_expressions(source_code_arc.clone(), ast);
 
     let registry = function_registry.unwrap_or_default();
+    let module_loader = ModuleLoader::default();
     let evaluation_result = match evaluate_with_registry(
         source_code_arc,
         static_ast,
         states_local_storage_key.clone(),
         virtual_fs,
         registry,
+        module_loader,
     ) {
         Ok(result) => Some(result),
         Err(error) => {
