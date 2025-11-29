@@ -117,6 +117,20 @@ export const oneDarkTheme = EditorView.theme({
     color: `${chocolate} !important`,
     fontWeight: "700",
   },
+  ".cm-content span.cm-boon-text-literal-content": {
+    color: `${stringGold} !important`,
+  },
+  ".cm-content span.cm-boon-text-literal-content > span": {
+    color: `${stringGold} !important`,
+  },
+  ".cm-content span.cm-boon-text-literal-interpolation": {
+    color: `${variableWhite} !important`,
+    backgroundColor: "rgba(255, 245, 158, 0.15)",
+    borderRadius: "2px",
+  },
+  ".cm-content span.cm-boon-text-literal-interpolation > span": {
+    color: `${variableWhite} !important`,
+  },
 
   ".cm-content": {
     caretColor: cursor,

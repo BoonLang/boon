@@ -1302,6 +1302,221 @@ fn static_spanned_expression_into_value_actor(
                 }
             }
         }
+        static_expression::Expression::LatestWithState { state_param, body } => {
+            // Stateful LATEST: `initial |> LATEST state_param { body }`
+            // The piped value is the initial state.
+            // The body can reference `state_param` to get the current state.
+            // The body expression's result becomes the new state value.
+            // CRITICAL: The state is NOT self-reactive - changes to state don't
+            // trigger re-evaluation of body. Only external events trigger updates.
+            //
+            // Example:
+            // ```boon
+            // counter: 0 |> LATEST count {
+            //     increment |> THEN { count + 1 }
+            //     decrement |> THEN { count - 1 }
+            // }
+            // ```
+            // Here, `count` is bound to the current state value. When `increment`
+            // fires, `count + 1` is computed using current state, result becomes new state.
+
+            let initial_actor = actor_context.piped.clone()
+                .ok_or("LatestWithState requires a piped initial value")?;
+
+            let state_param_string = state_param.to_string();
+            let construct_context_for_state = construct_context.clone();
+            let actor_context_for_state = actor_context.clone();
+            let persistence_for_state = persistence.clone();
+            let span_for_state = span;
+
+            // Use a channel to hold current state value and broadcast updates
+            let (state_sender, state_receiver) = zoon::futures_channel::mpsc::unbounded::<Value>();
+            let state_sender = Rc::new(RefCell::new(state_sender));
+            let state_sender_for_body = state_sender.clone();
+            let state_sender_for_update = state_sender.clone();
+
+            // Current state holder (starts with None, will be set when initial emits)
+            let current_state: Rc<RefCell<Option<Value>>> = Rc::new(RefCell::new(None));
+            let current_state_for_body = current_state.clone();
+            let current_state_for_update = current_state.clone();
+
+            // Create a ValueActor that provides the current state to the body
+            // This is what the state_param references
+            let state_actor = ValueActor::new_arc(
+                ConstructInfo::new(
+                    format!("LatestWithState state actor for {state_param_string}"),
+                    None,
+                    format!("{span}; LATEST state parameter"),
+                ),
+                actor_context.clone(),
+                state_receiver,
+            );
+
+            // Bind the state parameter in the context so body can reference it
+            let mut body_parameters = actor_context.parameters.clone();
+            body_parameters.insert(state_param_string.clone(), state_actor);
+
+            let body_actor_context = ActorContext {
+                output_valve_signal: actor_context.output_valve_signal.clone(),
+                piped: None, // Clear piped - the body shouldn't re-use it
+                passed: actor_context.passed.clone(),
+                parameters: body_parameters,
+            };
+
+            // Evaluate the body with state parameter bound
+            let body_result = static_spanned_expression_into_value_actor(
+                *body,
+                construct_context.clone(),
+                body_actor_context,
+                reference_connector.clone(),
+                link_connector.clone(),
+                function_registry.clone(),
+                source_code.clone(),
+            )?;
+
+            // When body produces new values, update the state
+            // Note: We avoid self-reactivity by not triggering body re-evaluation
+            // from state changes. Body only evaluates when its event sources fire.
+            let body_subscription = body_result.subscribe();
+            let state_update_stream = body_subscription.map(move |new_value| {
+                // Update current state
+                *current_state_for_update.borrow_mut() = Some(new_value.clone());
+                // Send to state channel so body can see it on next event
+                let _ = state_sender_for_update.borrow().unbounded_send(new_value.clone());
+                new_value
+            });
+
+            // When initial value emits, set up initial state
+            let initial_stream = initial_actor.subscribe().map(move |initial| {
+                // Set current state
+                *current_state_for_body.borrow_mut() = Some(initial.clone());
+                // Send initial state to the state channel
+                let _ = state_sender_for_body.borrow().unbounded_send(initial.clone());
+                initial
+            });
+
+            // Combine: first emit initial, then emit body updates
+            // Use select to merge both streams - initial will emit once, body emits on events
+            let combined_stream = stream::select(
+                initial_stream.take(1), // Only take initial value once
+                state_update_stream
+            );
+
+            ValueActor::new_arc(
+                ConstructInfo::new(
+                    format!("PersistenceId: {persistence_id}"),
+                    persistence,
+                    format!("{span}; LATEST {state_param_string} {{..}}"),
+                ),
+                actor_context,
+                combined_stream,
+            )
+        }
+        static_expression::Expression::Flush { value } => {
+            // FLUSH for fail-fast error handling
+            // `FLUSH { error_value }` creates a FLUSHED[value] wrapper that propagates transparently
+            // The wrapper bypasses function processing and unwraps at boundaries
+            // (variable bindings, function returns, BLOCK returns)
+            //
+            // From FLUSH.md:
+            // - FLUSHED[value] propagates transparently through pipelines
+            // - Functions check if input is FLUSHED, if so bypass processing
+            // - Unwraps at boundaries (assignment, function return, BLOCK return)
+
+            let error_actor = static_spanned_expression_into_value_actor(
+                *value,
+                construct_context.clone(),
+                actor_context.clone(),
+                reference_connector.clone(),
+                link_connector.clone(),
+                function_registry.clone(),
+                source_code.clone(),
+            )?;
+
+            // Wrap each emitted value in Value::Flushed
+            let flushed_stream = error_actor.subscribe().map(|value| {
+                value.into_flushed()
+            });
+
+            ValueActor::new_arc(
+                ConstructInfo::new(
+                    format!("PersistenceId: {persistence_id}"),
+                    persistence,
+                    format!("{span}; FLUSH {{..}}"),
+                ),
+                actor_context,
+                flushed_stream,
+            )
+        }
+        static_expression::Expression::Pulses { count } => {
+            // PULSES for iteration: `PULSES { count }` emits count values (0 to count-1)
+            // Can be used with THEN for iteration: `PULSES { 10 } |> THEN { ... }`
+
+            let count_actor = static_spanned_expression_into_value_actor(
+                *count,
+                construct_context.clone(),
+                actor_context.clone(),
+                reference_connector.clone(),
+                link_connector.clone(),
+                function_registry.clone(),
+                source_code.clone(),
+            )?;
+
+            let construct_context_for_pulses = construct_context.clone();
+
+            // When count changes, emit that many pulses
+            let pulses_stream = count_actor.subscribe().flat_map(move |count_value| {
+                let n = match &count_value {
+                    Value::Number(num, _) => num.number() as i64,
+                    _ => 0,
+                };
+
+                let construct_context_inner = construct_context_for_pulses.clone();
+
+                stream::iter((0..n.max(0)).map(move |i| {
+                    Value::Number(
+                        Arc::new(Number::new(
+                            ConstructInfo::new(
+                                format!("PULSES iteration {i}"),
+                                None,
+                                format!("PULSES iteration {i}"),
+                            ),
+                            construct_context_inner.clone(),
+                            i as f64,
+                        )),
+                        ValueMetadata {
+                            idempotency_key: Ulid::new(),
+                        },
+                    )
+                }))
+            });
+
+            ValueActor::new_arc(
+                ConstructInfo::new(
+                    format!("PersistenceId: {persistence_id}"),
+                    persistence,
+                    format!("{span}; PULSES {{..}}"),
+                ),
+                actor_context,
+                pulses_stream,
+            )
+        }
+        static_expression::Expression::Spread { value } => {
+            // Spread operator: `...expression` - spreads object fields
+            // Used in object literals: `[...base, override: new_value]`
+            // For now, just evaluate the expression and return it
+            // The actual spreading happens at object construction time
+
+            static_spanned_expression_into_value_actor(
+                *value,
+                construct_context,
+                actor_context,
+                reference_connector,
+                link_connector,
+                function_registry,
+                source_code,
+            )?
+        }
         static_expression::Expression::Pipe { from, to } => {
             // Evaluate the 'from' expression to get the piped value
             let from_actor = static_spanned_expression_into_value_actor(
@@ -1507,6 +1722,12 @@ fn static_spanned_expression_into_value_actor(
                 )
             }
         }
+        // Hardware types (parse-only for now - return error if used)
+        static_expression::Expression::Bits { .. }
+        | static_expression::Expression::Memory { .. }
+        | static_expression::Expression::Bytes { .. } => {
+            return Err("Hardware types (BITS, MEMORY, BYTES) are parse-only and cannot be evaluated yet".to_string());
+        }
     };
     Ok(actor)
 }
@@ -1575,6 +1796,10 @@ fn static_function_call_path_to_definition(
             api::function_list_empty(arguments, id, persistence_id, construct_context, actor_context)
                 .boxed_local()
         },
+        ["List", "not_empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_list_not_empty(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
         ["Router", "route"] => |arguments, id, persistence_id, construct_context, actor_context| {
             api::function_router_route(arguments, id, persistence_id, construct_context, actor_context)
                 .boxed_local()
@@ -1621,6 +1846,50 @@ fn static_function_call_path_to_definition(
         },
         ["Timer", "interval"] => |arguments, id, persistence_id, construct_context, actor_context| {
             api::function_timer_interval(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Log", "info"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_log_info(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Log", "error"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_log_error(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Build", "succeed"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_build_succeed(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Build", "fail"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_build_fail(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Scene", "new"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_scene_new(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Theme", "background_color"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_theme_background_color(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Theme", "text_color"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_theme_text_color(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Theme", "accent_color"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_theme_accent_color(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["File", "read_text"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_file_read_text(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["File", "write_text"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_file_write_text(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Directory", "entries"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_directory_entries(arguments, id, persistence_id, construct_context, actor_context)
                 .boxed_local()
         },
         _ => return Err(format!("Unknown function '{}(..)' in static context", path.join("/"))),

@@ -635,8 +635,25 @@ impl FunctionCall {
         + 'static,
         arguments: impl Into<Vec<Arc<ValueActor>>>,
     ) -> Arc<ValueActor> {
+        use zoon::futures_util::stream::StreamExt;
+
         let construct_info = construct_info.complete(ConstructType::FunctionCall);
         let arguments = Arc::new(arguments.into());
+
+        // FLUSHED bypass logic: If any argument emits a FLUSHED value,
+        // bypass the function and emit that FLUSHED value immediately.
+        // This implements fail-fast error handling per FLUSH.md specification.
+        //
+        // Implementation:
+        // 1. Subscribe to all arguments and merge their streams
+        // 2. If any value is FLUSHED, emit it and don't call the function for that cycle
+        // 3. If all values are non-FLUSHED, proceed with normal function processing
+        //
+        // For simplicity, we use a hybrid approach:
+        // - Call the function normally
+        // - Wrap the result stream to also listen to arguments for FLUSHED values
+        // - If any argument emits FLUSHED before/during function processing, bypass
+
         let value_stream = definition(
             arguments.clone(),
             construct_info.id(),
@@ -647,10 +664,39 @@ impl FunctionCall {
             construct_context,
             actor_context.clone(),
         );
+
+        // Create a stream that monitors arguments for FLUSHED values
+        // and bypasses the function when FLUSHED is detected
+        let arguments_for_flushed = arguments.clone();
+        let flushed_bypass_stream = if arguments_for_flushed.is_empty() {
+            // No arguments - no FLUSHED bypass needed
+            zoon::futures_util::stream::empty().boxed_local()
+        } else {
+            // Subscribe to all arguments and filter for FLUSHED values only
+            let flushed_streams: Vec<_> = arguments_for_flushed
+                .iter()
+                .map(|arg| arg.subscribe().filter(|v| {
+                    let is_flushed = v.is_flushed();
+                    std::future::ready(is_flushed)
+                }))
+                .collect();
+            zoon::futures_util::stream::select_all(flushed_streams).boxed_local()
+        };
+
+        // Select between normal function output and FLUSHED bypass
+        // FLUSHED values from arguments take priority
+        let combined_stream = zoon::futures_util::stream::select(
+            flushed_bypass_stream,
+            value_stream.map(|v| {
+                // If the function itself produces FLUSHED, pass it through
+                v
+            }),
+        );
+
         Arc::new(ValueActor::new_internal(
             construct_info,
             actor_context,
-            value_stream,
+            combined_stream,
             arguments,
         ))
     }
@@ -1448,6 +1494,10 @@ pub enum Value {
     Tag(Arc<Tag>, ValueMetadata),
     Number(Arc<Number>, ValueMetadata),
     List(Arc<List>, ValueMetadata),
+    /// FLUSHED[value] - internal wrapper for fail-fast error handling
+    /// Created by FLUSH { value }, propagates transparently through pipelines,
+    /// and unwraps at boundaries (variable bindings, function returns, BLOCK returns)
+    Flushed(Box<Value>, ValueMetadata),
 }
 
 impl Value {
@@ -1459,6 +1509,7 @@ impl Value {
             Self::Tag(tag, _) => &tag.construct_info,
             Self::Number(number, _) => &number.construct_info,
             Self::List(list, _) => &list.construct_info,
+            Self::Flushed(inner, _) => inner.construct_info(),
         }
     }
 
@@ -1470,6 +1521,7 @@ impl Value {
             Self::Tag(_, metadata) => *metadata,
             Self::Number(_, metadata) => *metadata,
             Self::List(_, metadata) => *metadata,
+            Self::Flushed(_, metadata) => *metadata,
         }
     }
     pub fn metadata_mut(&mut self) -> &mut ValueMetadata {
@@ -1480,7 +1532,30 @@ impl Value {
             Self::Tag(_, metadata) => metadata,
             Self::Number(_, metadata) => metadata,
             Self::List(_, metadata) => metadata,
+            Self::Flushed(_, metadata) => metadata,
         }
+    }
+
+    /// Check if this value is a FLUSHED wrapper
+    pub fn is_flushed(&self) -> bool {
+        matches!(self, Self::Flushed(_, _))
+    }
+
+    /// Unwrap FLUSHED to get the inner value (for boundary unwrapping)
+    /// Returns self unchanged if not FLUSHED
+    pub fn unwrap_flushed(self) -> Value {
+        match self {
+            Self::Flushed(inner, _) => *inner,
+            other => other,
+        }
+    }
+
+    /// Create a FLUSHED wrapper around this value
+    pub fn into_flushed(self) -> Value {
+        let metadata = ValueMetadata {
+            idempotency_key: Ulid::new(),
+        };
+        Value::Flushed(Box::new(self), metadata)
     }
 
     pub fn idempotency_key(&self) -> ValueIdempotencyKey {
@@ -1595,6 +1670,13 @@ impl Value {
                 } else {
                     serde_json::Value::Array(Vec::new())
                 }
+            }
+            Value::Flushed(inner, _) => {
+                // Serialize FLUSHED values with a wrapper to preserve the flushed state
+                let mut obj = serde_json::Map::new();
+                obj.insert("_flushed".to_string(), serde_json::Value::Bool(true));
+                obj.insert("value".to_string(), Box::pin(inner.to_json()).await);
+                serde_json::Value::Object(obj)
             }
         }
     }

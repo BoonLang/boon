@@ -455,6 +455,81 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
         Expression::Link => (),
         Expression::Skip => (),
         Expression::TextLiteral { .. } => (),
+        Expression::LatestWithState { state_param, body } => {
+            // Add state_param to reachable referenceables so it can be referenced in the body
+            // Note: The span of state_param is part of the overall expression span
+            set_is_referenced_and_alias_referenceables(
+                body,
+                reachable_referenceables,
+                level,
+                parent_name,
+                errors,
+                all_referenced,
+            );
+        }
+        Expression::Flush { value } => {
+            set_is_referenced_and_alias_referenceables(
+                value,
+                reachable_referenceables,
+                level,
+                parent_name,
+                errors,
+                all_referenced,
+            );
+        }
+        Expression::Pulses { count } => {
+            set_is_referenced_and_alias_referenceables(
+                count,
+                reachable_referenceables,
+                level,
+                parent_name,
+                errors,
+                all_referenced,
+            );
+        }
+        Expression::Spread { value } => {
+            set_is_referenced_and_alias_referenceables(
+                value,
+                reachable_referenceables,
+                level,
+                parent_name,
+                errors,
+                all_referenced,
+            );
+        }
+        // Hardware types (parse-only for now)
+        Expression::Bits { size } => {
+            set_is_referenced_and_alias_referenceables(
+                size,
+                reachable_referenceables,
+                level,
+                parent_name,
+                errors,
+                all_referenced,
+            );
+        }
+        Expression::Memory { address } => {
+            set_is_referenced_and_alias_referenceables(
+                address,
+                reachable_referenceables,
+                level,
+                parent_name,
+                errors,
+                all_referenced,
+            );
+        }
+        Expression::Bytes { data } => {
+            for item in data {
+                set_is_referenced_and_alias_referenceables(
+                    item,
+                    reachable_referenceables.clone(),
+                    level,
+                    parent_name,
+                    errors,
+                    all_referenced,
+                );
+            }
+        }
     }
 }
 

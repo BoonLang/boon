@@ -1244,6 +1244,39 @@ pub fn function_list_count(
     })
 }
 
+/// List/not_empty() -> Tag (True/False)
+/// Checks if the piped list is not empty (inverse of List/empty)
+pub fn function_list_not_empty(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let list_actor = arguments[0].clone();
+    list_actor.subscribe().filter_map(move |value| {
+        let result = match &value {
+            Value::List(list, _) => Some(list.clone()),
+            _ => None,
+        };
+        future::ready(result)
+    }).flat_map(move |list| {
+        let construct_context = construct_context.clone();
+        let function_call_id = function_call_id.clone();
+        list.subscribe().scan(Vec::<Arc<ValueActor>>::new(), move |items, change| {
+            change.apply_to_vec(items);
+            let is_not_empty = !items.is_empty();
+            let tag = if is_not_empty { "True" } else { "False" };
+            future::ready(Some(Tag::new_value(
+                ConstructInfo::new(function_call_id.with_child_id(0), None, "List/not_empty result"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                tag.to_string(),
+            )))
+        })
+    })
+}
+
 /// List/append(item: value) -> List
 /// Appends an item to the list when the item stream produces a value
 pub fn function_list_append(
@@ -1457,4 +1490,291 @@ pub fn function_ulid_generate(
         ValueIdempotencyKey::new(),
         ulid::Ulid::new().to_string(),
     )))
+}
+
+// --- Log functions ---
+
+/// Helper function to convert a Value to a string for logging
+fn value_to_log_string(value: &Value) -> String {
+    match value {
+        Value::Text(text, _) => text.text().to_string(),
+        Value::Number(num, _) => num.number().to_string(),
+        Value::Tag(tag, _) => tag.tag().to_string(),
+        Value::Object(_, _) => "[Object]".to_string(),
+        Value::TaggedObject(tagged, _) => format!("{}[...]", tagged.tag()),
+        Value::List(_, _) => "[List]".to_string(),
+        Value::Flushed(inner, _) => format!("Flushed[{}]", value_to_log_string(inner)),
+    }
+}
+
+/// Log/info(message) -> []
+/// Logs an info message to the console (placeholder - actual logging to be implemented)
+pub fn function_log_info(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let message_actor = arguments[0].clone();
+    message_actor.subscribe().map(move |value| {
+        // @TODO: Add proper console logging when web_sys console feature is available
+        let _message = value_to_log_string(&value);
+        Object::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Log/info result"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            [],
+        )
+    })
+}
+
+/// Log/error(message) -> []
+/// Logs an error message to the console (placeholder - actual logging to be implemented)
+pub fn function_log_error(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let message_actor = arguments[0].clone();
+    message_actor.subscribe().map(move |value| {
+        // @TODO: Add proper console logging when web_sys console feature is available
+        let _message = value_to_log_string(&value);
+        Object::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Log/error result"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            [],
+        )
+    })
+}
+
+// --- Build functions ---
+
+/// Build/succeed() -> Tag (Success)
+/// Returns a successful build result
+pub fn function_build_succeed(
+    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    stream::once(future::ready(Tag::new_value(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "Build/succeed"),
+        construct_context,
+        ValueIdempotencyKey::new(),
+        "Success".to_string(),
+    )))
+}
+
+/// Build/fail(error) -> Tag (Failure)
+/// Returns a failed build result (placeholder - logging to be implemented)
+pub fn function_build_fail(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let error_actor = arguments[0].clone();
+    error_actor.subscribe().map(move |value| {
+        let _error_message = match &value {
+            Value::Text(text, _) => text.text().to_string(),
+            _ => "Unknown build error".to_string(),
+        };
+        // @TODO: Add proper console logging when web_sys console feature is available
+        Tag::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Build/fail"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            "Failure".to_string(),
+        )
+    })
+}
+
+// --- Scene functions ---
+
+/// Scene/new(root<INTO_ELEMENT>) -> []
+/// Creates a new scene for DOM rendering (stub - passes through to Document/new behavior)
+/// @TODO: Implement proper scene management when needed
+pub fn function_scene_new(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [argument_root] = arguments.as_slice() else {
+        panic!("Unexpected argument count for Scene/new")
+    };
+    // Scene/new returns an empty object - the actual rendering is handled by the element tree
+    Object::new_constant(
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Scene/new(..) -> []",
+        ),
+        construct_context.clone(),
+        ValueIdempotencyKey::new(),
+        [Variable::new_arc(
+            ConstructInfo::new(
+                function_call_id.with_child_id(1),
+                None,
+                "Scene/new(..) -> [root_element]",
+            ),
+            construct_context,
+            "root_element",
+            argument_root.clone(),
+        )],
+    )
+}
+
+// --- Theme functions ---
+
+/// Theme/background_color() -> Text
+/// Returns the current theme background color (stub)
+pub fn function_theme_background_color(
+    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    stream::once(future::ready(Text::new_value(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "Theme/background_color"),
+        construct_context,
+        ValueIdempotencyKey::new(),
+        "#ffffff".to_string(),
+    )))
+}
+
+/// Theme/text_color() -> Text
+/// Returns the current theme text color (stub)
+pub fn function_theme_text_color(
+    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    stream::once(future::ready(Text::new_value(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "Theme/text_color"),
+        construct_context,
+        ValueIdempotencyKey::new(),
+        "#000000".to_string(),
+    )))
+}
+
+/// Theme/accent_color() -> Text
+/// Returns the current theme accent color (stub)
+pub fn function_theme_accent_color(
+    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    stream::once(future::ready(Text::new_value(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "Theme/accent_color"),
+        construct_context,
+        ValueIdempotencyKey::new(),
+        "#0066cc".to_string(),
+    )))
+}
+
+// --- File functions ---
+
+/// File/read_text(path) -> Text
+/// Reads text content from a file at the given path (stub - returns empty string)
+/// @TODO: Implement actual file reading with VirtualFS
+pub fn function_file_read_text(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let path_actor = arguments[0].clone();
+    path_actor.subscribe().map(move |value| {
+        let _path = match &value {
+            Value::Text(text, _) => text.text().to_string(),
+            _ => String::new(),
+        };
+        // @TODO: Implement actual file reading with VirtualFS
+        Text::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "File/read_text"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            String::new(), // Returns empty string as stub
+        )
+    })
+}
+
+/// File/write_text(path, content) -> Tag (Success/Failure)
+/// Writes text content to a file at the given path (stub - always returns Success)
+/// @TODO: Implement actual file writing with VirtualFS
+pub fn function_file_write_text(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let path_actor = arguments[0].clone();
+    let content_actor = arguments[1].clone();
+
+    let construct_context_clone = construct_context.clone();
+    path_actor.subscribe().flat_map(move |path_value| {
+        let _path = match &path_value {
+            Value::Text(text, _) => text.text().to_string(),
+            _ => String::new(),
+        };
+        let function_call_id = function_call_id.clone();
+        let construct_context = construct_context_clone.clone();
+        content_actor.subscribe().map(move |content_value| {
+            let _content = match &content_value {
+                Value::Text(text, _) => text.text().to_string(),
+                _ => String::new(),
+            };
+            // @TODO: Implement actual file writing with VirtualFS
+            Tag::new_value(
+                ConstructInfo::new(function_call_id.with_child_id(0), None, "File/write_text"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                "Success".to_string(),
+            )
+        })
+    })
+}
+
+// --- Directory functions ---
+
+/// Directory/entries(path) -> List<Text>
+/// Returns a list of file/directory names in the given directory (stub - returns empty list)
+/// @TODO: Implement actual directory listing with VirtualFS
+pub fn function_directory_entries(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let path_actor = arguments[0].clone();
+    path_actor.subscribe().map(move |value| {
+        let _path = match &value {
+            Value::Text(text, _) => text.text().to_string(),
+            _ => String::new(),
+        };
+        // @TODO: Implement actual directory listing with VirtualFS
+        List::new_value(
+            ConstructInfo::new(function_call_id.with_child_id(0), None, "Directory/entries"),
+            construct_context.clone(),
+            ValueIdempotencyKey::new(),
+            actor_context.clone(),
+            Vec::<Arc<ValueActor>>::new(), // Empty list stub
+        )
+    })
 }

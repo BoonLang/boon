@@ -34,5 +34,7 @@ The editor uses a custom palette on top of CodeMirror’s one-dark theme. When m
 | Punctuation (`(){}[]`, commas, etc.) | `t.separator`, `t.paren`, `t.brace`, `t.squareBracket` | chocolate, bold | `#d2691e` |
 | Operators (non-pipe) | `t.operator`, `t.operatorKeyword` | vivid orange | `#ff9f43` |
 | Comments | `t.lineComment`, `t.comment`, `t.meta` | lightslategray, italic | `#778899` |
+| TEXT literal content | `.cm-boon-text-literal-content` | bright yellow | `#fff59e` |
+| TEXT literal interpolation | `.cm-boon-text-literal-interpolation` | near-white with subtle gold bg | `#eeeeee` |
 
 These are implemented in `boon-language.ts` (decorations) and `boon-theme.ts` (colors). If you introduce new semantic classes, consider updating this table.

@@ -23073,6 +23073,8 @@ const dotMark = Decoration.mark({ class: "cm-boon-dot" });
 const apostropheMark = Decoration.mark({ class: "cm-boon-apostrophe" });
 const pipeMark = Decoration.mark({ class: "cm-boon-pipe" });
 const chainAlternateMark = Decoration.mark({ class: "cm-boon-chain-alt" });
+const textLiteralContentMark = Decoration.mark({ class: "cm-boon-text-literal-content" });
+const textLiteralInterpolationMark = Decoration.mark({ class: "cm-boon-text-literal-interpolation" });
 const boonSemanticHighlight = ViewPlugin.fromClass(class {
 	decorations;
 	constructor(view) {
@@ -23097,6 +23099,46 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 					expectFunctionName = text === "FUNCTION";
 					pendingDefinition = null;
 					pendingFunctionCall = null;
+					if (text === "TEXT") {
+						const docText = view.state.doc.toString();
+						let pos = node.to;
+						while (pos < docText.length && /\s/.test(docText[pos])) pos++;
+						if (docText[pos] === "{") {
+							const openBrace = pos;
+							pos++;
+							let braceDepth = 1;
+							while (pos < docText.length && braceDepth > 0) {
+								if (docText[pos] === "{") braceDepth++;
+								else if (docText[pos] === "}") braceDepth--;
+								pos++;
+							}
+							const closeBrace = pos - 1;
+							if (openBrace + 1 < closeBrace) {
+								const contentStart = openBrace + 1;
+								const contentEnd = closeBrace;
+								const content$1 = docText.slice(contentStart, contentEnd);
+								let contentPos = 0;
+								let lastTextEnd = contentStart;
+								while (contentPos < content$1.length) {
+									const nextBrace = content$1.indexOf("{", contentPos);
+									if (nextBrace === -1) break;
+									if (contentStart + nextBrace > lastTextEnd) builder.add(lastTextEnd, contentStart + nextBrace, textLiteralContentMark);
+									const interpStart = contentStart + nextBrace;
+									let interpEnd = interpStart + 1;
+									let interpDepth = 1;
+									while (interpEnd < contentEnd && interpDepth > 0) {
+										if (docText[interpEnd] === "{") interpDepth++;
+										else if (docText[interpEnd] === "}") interpDepth--;
+										interpEnd++;
+									}
+									builder.add(interpStart, interpEnd, textLiteralInterpolationMark);
+									lastTextEnd = interpEnd;
+									contentPos = interpEnd - contentStart;
+								}
+								if (lastTextEnd < contentEnd) builder.add(lastTextEnd, contentEnd, textLiteralContentMark);
+							}
+						}
+					}
 					return;
 				}
 				if (node.name === "SnakeCase") {
@@ -23290,6 +23332,14 @@ const oneDarkTheme = EditorView.theme({
 		color: `${chocolate} !important`,
 		fontWeight: "700"
 	},
+	".cm-content span.cm-boon-text-literal-content": { color: `${stringGold} !important` },
+	".cm-content span.cm-boon-text-literal-content > span": { color: `${stringGold} !important` },
+	".cm-content span.cm-boon-text-literal-interpolation": {
+		color: `${variableWhite} !important`,
+		backgroundColor: "rgba(255, 245, 158, 0.15)",
+		borderRadius: "2px"
+	},
+	".cm-content span.cm-boon-text-literal-interpolation > span": { color: `${variableWhite} !important` },
 	".cm-content": { caretColor: cursor },
 	".cm-cursor, .cm-dropCursor": { borderLeftColor: cursor },
 	"&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection": { backgroundColor: selection },

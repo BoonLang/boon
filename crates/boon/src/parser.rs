@@ -260,6 +260,24 @@ where
                 }),
         );
 
+        // Stateful LATEST: `LATEST state_param { body }` - has identifier before body
+        // Used with pipe: `initial |> LATEST state_param { body }`
+        let latest_with_state = just(Token::Latest)
+            .ignore_then(snake_case_identifier)
+            .then(
+                expression
+                    .clone()
+                    .delimited_by(
+                        bracket_curly_open.then(newlines),
+                        newlines.then(bracket_curly_close),
+                    ),
+            )
+            .map(|(state_param, body)| Expression::LatestWithState {
+                state_param,
+                body: Box::new(body),
+            });
+
+        // Simple LATEST: `LATEST { inputs }` - merges multiple inputs
         let latest = just(Token::Latest)
             .ignore_then(
                 expression
@@ -272,6 +290,84 @@ where
                     ),
             )
             .map(|inputs| Expression::Latest { inputs });
+
+        // FLUSH for fail-fast error handling: `FLUSH { expression }`
+        let flush = just(Token::Flush)
+            .ignore_then(
+                expression
+                    .clone()
+                    .delimited_by(
+                        bracket_curly_open.then(newlines),
+                        newlines.then(bracket_curly_close),
+                    ),
+            )
+            .map(|value| Expression::Flush {
+                value: Box::new(value),
+            });
+
+        // PULSES for iteration: `PULSES { count }`
+        let pulses = just(Token::Pulses)
+            .ignore_then(
+                expression
+                    .clone()
+                    .delimited_by(
+                        bracket_curly_open.then(newlines),
+                        newlines.then(bracket_curly_close),
+                    ),
+            )
+            .map(|count| Expression::Pulses {
+                count: Box::new(count),
+            });
+
+        // Spread operator: `...expression`
+        let spread = just(Token::Spread)
+            .ignore_then(expression.clone())
+            .map(|value| Expression::Spread {
+                value: Box::new(value),
+            });
+
+        // Hardware types (parse-only for now)
+        // BITS { size } - define bit width
+        let bits = just(Token::Bits)
+            .ignore_then(
+                expression
+                    .clone()
+                    .delimited_by(
+                        bracket_curly_open.clone().then(newlines.clone()),
+                        newlines.clone().then(bracket_curly_close.clone()),
+                    ),
+            )
+            .map(|size| Expression::Bits {
+                size: Box::new(size),
+            });
+
+        // MEMORY { address } - memory access
+        let memory = just(Token::Memory)
+            .ignore_then(
+                expression
+                    .clone()
+                    .delimited_by(
+                        bracket_curly_open.clone().then(newlines.clone()),
+                        newlines.clone().then(bracket_curly_close.clone()),
+                    ),
+            )
+            .map(|address| Expression::Memory {
+                address: Box::new(address),
+            });
+
+        // BYTES { data, ... } - byte sequence
+        let bytes = just(Token::Bytes)
+            .ignore_then(
+                expression
+                    .clone()
+                    .separated_by(comma.clone().ignored().or(newlines.clone()))
+                    .collect()
+                    .delimited_by(
+                        bracket_curly_open.clone().then(newlines.clone()),
+                        newlines.clone().then(bracket_curly_close.clone()),
+                    ),
+            )
+            .map(|data| Expression::Bytes { data });
 
         let then = just(Token::Then).ignore_then(
             expression
@@ -477,12 +573,19 @@ where
             expression_alias,
             link_setter,
             link_expression,
+            latest_with_state,  // Must come before `latest` since it has more specific pattern
             latest,
             then,
             when,
             while_,
             skip,
             block,
+            flush,
+            pulses,
+            spread,
+            bits,
+            memory,
+            bytes,
         ));
 
         expression
@@ -650,8 +753,25 @@ pub enum Expression<'code> {
     Latest {
         inputs: Vec<Spanned<Self>>,
     },
+    // Stateful LATEST - used with pipe: `initial |> LATEST state_param { body }`
+    LatestWithState {
+        state_param: &'code str,
+        body: Box<Spanned<Self>>,
+    },
     Then {
         body: Box<Spanned<Self>>,
+    },
+    // FLUSH for fail-fast error handling
+    Flush {
+        value: Box<Spanned<Self>>,
+    },
+    // PULSES for iteration
+    Pulses {
+        count: Box<Spanned<Self>>,
+    },
+    // Spread operator: ...expression (in objects)
+    Spread {
+        value: Box<Spanned<Self>>,
     },
     When {
         arms: Vec<Arm<'code>>,
@@ -673,6 +793,16 @@ pub enum Expression<'code> {
     // TEXT { content with {var} interpolation }
     TextLiteral {
         parts: Vec<TextPart<'code>>,
+    },
+    // Hardware types (parse-only for now)
+    Bits {
+        size: Box<Spanned<Self>>,
+    },
+    Memory {
+        address: Box<Spanned<Self>>,
+    },
+    Bytes {
+        data: Vec<Spanned<Self>>,
     },
 }
 

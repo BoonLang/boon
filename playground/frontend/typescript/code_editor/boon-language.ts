@@ -52,6 +52,8 @@ const dotMark = Decoration.mark({class: "cm-boon-dot"})
 const apostropheMark = Decoration.mark({class: "cm-boon-apostrophe"})
 const pipeMark = Decoration.mark({class: "cm-boon-pipe"})
 const chainAlternateMark = Decoration.mark({class: "cm-boon-chain-alt"})
+const textLiteralContentMark = Decoration.mark({class: "cm-boon-text-literal-content"})
+const textLiteralInterpolationMark = Decoration.mark({class: "cm-boon-text-literal-interpolation"})
 
 const boonSemanticHighlight = ViewPlugin.fromClass(class {
   decorations
@@ -84,6 +86,73 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
           expectFunctionName = text === "FUNCTION"
           pendingDefinition = null
           pendingFunctionCall = null
+
+          // Handle TEXT { content } literals
+          if (text === "TEXT") {
+            // Look ahead for the opening brace
+            const docText = view.state.doc.toString()
+            let pos = node.to
+            // Skip whitespace
+            while (pos < docText.length && /\s/.test(docText[pos])) {
+              pos++
+            }
+            // Check for opening brace
+            if (docText[pos] === '{') {
+              const openBrace = pos
+              pos++
+              let braceDepth = 1
+              // Find matching closing brace with balanced braces
+              while (pos < docText.length && braceDepth > 0) {
+                if (docText[pos] === '{') {
+                  braceDepth++
+                } else if (docText[pos] === '}') {
+                  braceDepth--
+                }
+                pos++
+              }
+              const closeBrace = pos - 1
+              // Mark content between braces (excluding the braces)
+              if (openBrace + 1 < closeBrace) {
+                const contentStart = openBrace + 1
+                const contentEnd = closeBrace
+                const content = docText.slice(contentStart, contentEnd)
+
+                // Find and mark interpolations {var}
+                let contentPos = 0
+                let lastTextEnd = contentStart
+                while (contentPos < content.length) {
+                  const nextBrace = content.indexOf('{', contentPos)
+                  if (nextBrace === -1) break
+
+                  // Mark text before interpolation
+                  if (contentStart + nextBrace > lastTextEnd) {
+                    builder.add(lastTextEnd, contentStart + nextBrace, textLiteralContentMark)
+                  }
+
+                  // Find closing brace of interpolation
+                  const interpStart = contentStart + nextBrace
+                  let interpEnd = interpStart + 1
+                  let interpDepth = 1
+                  while (interpEnd < contentEnd && interpDepth > 0) {
+                    if (docText[interpEnd] === '{') interpDepth++
+                    else if (docText[interpEnd] === '}') interpDepth--
+                    interpEnd++
+                  }
+
+                  // Mark interpolation
+                  builder.add(interpStart, interpEnd, textLiteralInterpolationMark)
+
+                  lastTextEnd = interpEnd
+                  contentPos = interpEnd - contentStart
+                }
+
+                // Mark remaining text after last interpolation
+                if (lastTextEnd < contentEnd) {
+                  builder.add(lastTextEnd, contentEnd, textLiteralContentMark)
+                }
+              }
+            }
+          }
           return
         }
 

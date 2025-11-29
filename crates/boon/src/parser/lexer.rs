@@ -46,9 +46,16 @@ pub enum Token<'code> {
     Block,
     Pass,
     Passed,
+    Flush,
+    Pulses,
+    Spread,
     // TEXT literal content: TEXT { content with {var} interpolation }
     // The content is the raw string between TEXT { and }
     TextContent(&'code str),
+    // Hardware types (parse-only for now)
+    Bits,
+    Memory,
+    Bytes,
 }
 
 impl<'code> Token<'code> {
@@ -94,7 +101,13 @@ impl<'code> Token<'code> {
             Self::Block => "BLOCK".into(),
             Self::Pass => "PASS".into(),
             Self::Passed => "PASSED".into(),
+            Self::Flush => "FLUSH".into(),
+            Self::Pulses => "PULSES".into(),
+            Self::Spread => "...".into(),
             Self::TextContent(content) => format!("TEXT {{ {} }}", content).into(),
+            Self::Bits => "BITS".into(),
+            Self::Memory => "MEMORY".into(),
+            Self::Bytes => "BYTES".into(),
         }
     }
 }
@@ -205,6 +218,12 @@ pub fn lexer<'code>()
             "BLOCK" => Ok(Token::Block),
             "PASS" => Ok(Token::Pass),
             "PASSED" => Ok(Token::Passed),
+            "FLUSH" => Ok(Token::Flush),
+            "PULSES" => Ok(Token::Pulses),
+            // Hardware types (parse-only for now)
+            "BITS" => Ok(Token::Bits),
+            "MEMORY" => Ok(Token::Memory),
+            "BYTES" => Ok(Token::Bytes),
             // TEXT is handled specially below, not as a keyword
             _ => Err(ParseError::custom(
                 span,
@@ -244,6 +263,7 @@ pub fn lexer<'code>()
         just("=>").to(Token::Implies),
         just(':').to(Token::Colon),
         just(',').to(Token::Comma),
+        just("...").to(Token::Spread),
         just('.').to(Token::Dot),
         text::newline().to(Token::Newline),
         comparator,

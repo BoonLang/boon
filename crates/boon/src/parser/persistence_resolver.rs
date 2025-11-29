@@ -1,4 +1,4 @@
-use super::{Expression, Literal, ParseError, Span, Spanned, Token};
+use super::{ArithmeticOperator, Comparator, Expression, Literal, ParseError, Span, Spanned, Token};
 
 use std::collections::HashMap;
 
@@ -447,12 +447,107 @@ fn set_persistence<'a, 'code, 'old_code>(
             }
         }
         Expression::Block { variables, output } => {
-            // @TODO implement, see the error message below
-            errors.push(ResolveError::custom(
-                *span,
-                "Persistence resolver cannot resolve Persistence in Expression::Block yet, sorry"
-                    .to_owned(),
-            ))
+            let old_variables_output_and_id =
+                old_expressions
+                    .iter()
+                    .find_map(|old_expression| match old_expression {
+                        Spanned {
+                            span,
+                            persistence: _,
+                            node: Expression::Block { variables: old_variables, output: old_output },
+                        } => Some((old_variables, old_output, old_span_id_pairs[span])),
+                        _ => None,
+                    });
+            if let Some((old_variables, old_output, id)) = old_variables_output_and_id {
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::Unchanged,
+                });
+                for variable in variables.iter_mut() {
+                    let Spanned {
+                        span,
+                        node: variable,
+                        persistence,
+                    } = variable;
+                    let old_variable_value_and_id =
+                        old_variables
+                            .iter()
+                            .find_map(|old_variable| match old_variable {
+                                Spanned {
+                                    span,
+                                    persistence: _,
+                                    node: old_variable,
+                                } if variable.name == old_variable.name => {
+                                    Some((&old_variable.value, old_span_id_pairs[span]))
+                                }
+                                _ => None,
+                            });
+                    if let Some((old_variable_value, id)) = old_variable_value_and_id {
+                        new_span_id_pairs.insert(*span, id);
+                        *persistence = Some(Persistence {
+                            id,
+                            status: PersistenceStatus::Unchanged,
+                        });
+                        set_persistence(
+                            &mut variable.value,
+                            &[old_variable_value],
+                            &old_span_id_pairs,
+                            new_span_id_pairs,
+                            errors,
+                        );
+                    } else {
+                        let id: Ulid = PersistenceId::new();
+                        new_span_id_pairs.insert(*span, id);
+                        *persistence = Some(Persistence {
+                            id,
+                            status: PersistenceStatus::NewOrChanged,
+                        });
+                        set_persistence(
+                            &mut variable.value,
+                            &[],
+                            &old_span_id_pairs,
+                            new_span_id_pairs,
+                            errors,
+                        )
+                    }
+                }
+                set_persistence(
+                    output,
+                    &[old_output],
+                    &old_span_id_pairs,
+                    new_span_id_pairs,
+                    errors,
+                );
+            } else {
+                let id: Ulid = PersistenceId::new();
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::NewOrChanged,
+                });
+                for variable in variables.iter_mut() {
+                    let Spanned {
+                        span,
+                        node: variable,
+                        persistence,
+                    } = variable;
+                    let id: Ulid = PersistenceId::new();
+                    new_span_id_pairs.insert(*span, id);
+                    *persistence = Some(Persistence {
+                        id,
+                        status: PersistenceStatus::NewOrChanged,
+                    });
+                    set_persistence(
+                        &mut variable.value,
+                        &[],
+                        &old_span_id_pairs,
+                        new_span_id_pairs,
+                        errors,
+                    );
+                }
+                set_persistence(output, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+            }
         }
         Expression::List { items } => {
             let old_items_and_id =
@@ -503,12 +598,23 @@ fn set_persistence<'a, 'code, 'old_code>(
             }
         }
         Expression::Map { entries } => {
-            // @TODO implement, see the error message below
-            errors.push(ResolveError::custom(
-                *span,
-                "Persistence resolver cannot resolve Persistence in Expression::Map yet, sorry"
-                    .to_owned(),
-            ))
+            // For maps, just assign new persistence IDs to all entries
+            // (More sophisticated comparison would require comparing keys)
+            let id: Ulid = PersistenceId::new();
+            new_span_id_pairs.insert(*span, id);
+            *persistence = Some(Persistence {
+                id,
+                status: PersistenceStatus::NewOrChanged,
+            });
+            for entry in entries {
+                set_persistence(
+                    &mut entry.value,
+                    &[],
+                    &old_span_id_pairs,
+                    new_span_id_pairs,
+                    errors,
+                );
+            }
         }
         Expression::Latest { inputs } => {
             let old_inputs_and_id =
@@ -594,20 +700,22 @@ fn set_persistence<'a, 'code, 'old_code>(
             }
         }
         Expression::When { arms } => {
-            // @TODO implement, see the error message below
-            errors.push(ResolveError::custom(
-                *span,
-                "Persistence resolver cannot resolve Persistence in Expression::When yet, sorry"
-                    .to_owned(),
-            ))
+            // For When expressions, assign a new ID (arms have non-Spanned bodies)
+            let id: Ulid = PersistenceId::new();
+            new_span_id_pairs.insert(*span, id);
+            *persistence = Some(Persistence {
+                id,
+                status: PersistenceStatus::NewOrChanged,
+            });
         }
         Expression::While { arms } => {
-            // @TODO implement, see the error message below
-            errors.push(ResolveError::custom(
-                *span,
-                "Persistence resolver cannot resolve Persistence in Expression::While yet, sorry"
-                    .to_owned(),
-            ))
+            // For While expressions, assign a new ID (arms have non-Spanned bodies)
+            let id: Ulid = PersistenceId::new();
+            new_span_id_pairs.insert(*span, id);
+            *persistence = Some(Persistence {
+                id,
+                status: PersistenceStatus::NewOrChanged,
+            });
         }
         Expression::Pipe { from, to } => {
             let old_from_to_and_id =
@@ -650,17 +758,46 @@ fn set_persistence<'a, 'code, 'old_code>(
                 set_persistence(to, &[], &old_span_id_pairs, new_span_id_pairs, errors);
             }
         }
-        Expression::ArithmeticOperator(_) => {
-            // @TODO implement, see the error message below
-            errors.push(ResolveError::custom(*span, "Persistence resolver cannot resolve Persistence in Expression::ArithmeticOperator yet, sorry".to_owned()))
+        Expression::ArithmeticOperator(op) => {
+            let id: Ulid = PersistenceId::new();
+            new_span_id_pairs.insert(*span, id);
+            *persistence = Some(Persistence {
+                id,
+                status: PersistenceStatus::NewOrChanged,
+            });
+            // Recurse into operands
+            match op {
+                ArithmeticOperator::Negate { operand } => {
+                    set_persistence(operand, &[], &old_span_id_pairs, new_span_id_pairs, errors);
+                }
+                ArithmeticOperator::Add { operand_a, operand_b }
+                | ArithmeticOperator::Subtract { operand_a, operand_b }
+                | ArithmeticOperator::Multiply { operand_a, operand_b }
+                | ArithmeticOperator::Divide { operand_a, operand_b } => {
+                    set_persistence(operand_a, &[], &old_span_id_pairs, new_span_id_pairs, errors);
+                    set_persistence(operand_b, &[], &old_span_id_pairs, new_span_id_pairs, errors);
+                }
+            }
         }
-        Expression::Comparator(_) => {
-            // @TODO implement, see the error message below
-            errors.push(ResolveError::custom(
-                *span,
-                "Persistence resolver cannot resolve Persistence in Expression::Comparator yet, sorry"
-                    .to_owned(),
-            ))
+        Expression::Comparator(cmp) => {
+            let id: Ulid = PersistenceId::new();
+            new_span_id_pairs.insert(*span, id);
+            *persistence = Some(Persistence {
+                id,
+                status: PersistenceStatus::NewOrChanged,
+            });
+            // Recurse into operands
+            match cmp {
+                Comparator::Equal { operand_a, operand_b }
+                | Comparator::NotEqual { operand_a, operand_b }
+                | Comparator::Greater { operand_a, operand_b }
+                | Comparator::GreaterOrEqual { operand_a, operand_b }
+                | Comparator::Less { operand_a, operand_b }
+                | Comparator::LessOrEqual { operand_a, operand_b } => {
+                    set_persistence(operand_a, &[], &old_span_id_pairs, new_span_id_pairs, errors);
+                    set_persistence(operand_b, &[], &old_span_id_pairs, new_span_id_pairs, errors);
+                }
+            }
         }
         Expression::Function {
             name,
@@ -706,13 +843,14 @@ fn set_persistence<'a, 'code, 'old_code>(
                 set_persistence(body, &[], &old_span_id_pairs, new_span_id_pairs, errors)
             }
         }
-        Expression::LinkSetter { alias } => {
-            // @TODO implement, see the error message below
-            errors.push(ResolveError::custom(
-                *span,
-                "Persistence resolver cannot resolve Persistence in Expression::LinkSetter yet, sorry"
-                    .to_owned(),
-            ))
+        Expression::LinkSetter { alias: _ } => {
+            // LinkSetter just needs a persistence ID like Alias
+            let id: Ulid = PersistenceId::new();
+            new_span_id_pairs.insert(*span, id);
+            *persistence = Some(Persistence {
+                id,
+                status: PersistenceStatus::NewOrChanged,
+            });
         }
         Expression::Alias(alias) => {
             let alias_string = alias.to_string();
@@ -846,6 +984,265 @@ fn set_persistence<'a, 'code, 'old_code>(
                 id,
                 status: PersistenceStatus::NewOrChanged,
             });
+        }
+        Expression::LatestWithState { state_param, body } => {
+            let old_body_and_id =
+                old_expressions
+                    .iter()
+                    .find_map(|old_expression| match old_expression {
+                        Spanned {
+                            span,
+                            persistence: _,
+                            node: Expression::LatestWithState { state_param: old_state_param, body: old_body },
+                        } if old_state_param == state_param => Some((old_body, old_span_id_pairs[span])),
+                        _ => None,
+                    });
+            if let Some((old_body, id)) = old_body_and_id {
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::Unchanged,
+                });
+                set_persistence(
+                    body,
+                    &[old_body],
+                    &old_span_id_pairs,
+                    new_span_id_pairs,
+                    errors,
+                );
+            } else {
+                let id: Ulid = PersistenceId::new();
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::NewOrChanged,
+                });
+                set_persistence(body, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+            }
+        }
+        Expression::Flush { value } => {
+            let old_value_and_id =
+                old_expressions
+                    .iter()
+                    .find_map(|old_expression| match old_expression {
+                        Spanned {
+                            span,
+                            persistence: _,
+                            node: Expression::Flush { value: old_value },
+                        } => Some((old_value, old_span_id_pairs[span])),
+                        _ => None,
+                    });
+            if let Some((old_value, id)) = old_value_and_id {
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::Unchanged,
+                });
+                set_persistence(
+                    value,
+                    &[old_value],
+                    &old_span_id_pairs,
+                    new_span_id_pairs,
+                    errors,
+                );
+            } else {
+                let id: Ulid = PersistenceId::new();
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::NewOrChanged,
+                });
+                set_persistence(value, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+            }
+        }
+        Expression::Pulses { count } => {
+            let old_count_and_id =
+                old_expressions
+                    .iter()
+                    .find_map(|old_expression| match old_expression {
+                        Spanned {
+                            span,
+                            persistence: _,
+                            node: Expression::Pulses { count: old_count },
+                        } => Some((old_count, old_span_id_pairs[span])),
+                        _ => None,
+                    });
+            if let Some((old_count, id)) = old_count_and_id {
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::Unchanged,
+                });
+                set_persistence(
+                    count,
+                    &[old_count],
+                    &old_span_id_pairs,
+                    new_span_id_pairs,
+                    errors,
+                );
+            } else {
+                let id: Ulid = PersistenceId::new();
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::NewOrChanged,
+                });
+                set_persistence(count, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+            }
+        }
+        Expression::Spread { value } => {
+            let old_value_and_id =
+                old_expressions
+                    .iter()
+                    .find_map(|old_expression| match old_expression {
+                        Spanned {
+                            span,
+                            persistence: _,
+                            node: Expression::Spread { value: old_value },
+                        } => Some((old_value, old_span_id_pairs[span])),
+                        _ => None,
+                    });
+            if let Some((old_value, id)) = old_value_and_id {
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::Unchanged,
+                });
+                set_persistence(
+                    value,
+                    &[old_value],
+                    &old_span_id_pairs,
+                    new_span_id_pairs,
+                    errors,
+                );
+            } else {
+                let id: Ulid = PersistenceId::new();
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::NewOrChanged,
+                });
+                set_persistence(value, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+            }
+        }
+        // Hardware types (parse-only for now)
+        Expression::Bits { size } => {
+            let old_size_and_id =
+                old_expressions
+                    .iter()
+                    .find_map(|old_expression| match old_expression {
+                        Spanned {
+                            span,
+                            persistence: _,
+                            node: Expression::Bits { size: old_size },
+                        } => Some((old_size, old_span_id_pairs[span])),
+                        _ => None,
+                    });
+            if let Some((old_size, id)) = old_size_and_id {
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::Unchanged,
+                });
+                set_persistence(
+                    size,
+                    &[old_size],
+                    &old_span_id_pairs,
+                    new_span_id_pairs,
+                    errors,
+                );
+            } else {
+                let id: Ulid = PersistenceId::new();
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::NewOrChanged,
+                });
+                set_persistence(size, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+            }
+        }
+        Expression::Memory { address } => {
+            let old_address_and_id =
+                old_expressions
+                    .iter()
+                    .find_map(|old_expression| match old_expression {
+                        Spanned {
+                            span,
+                            persistence: _,
+                            node: Expression::Memory { address: old_address },
+                        } => Some((old_address, old_span_id_pairs[span])),
+                        _ => None,
+                    });
+            if let Some((old_address, id)) = old_address_and_id {
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::Unchanged,
+                });
+                set_persistence(
+                    address,
+                    &[old_address],
+                    &old_span_id_pairs,
+                    new_span_id_pairs,
+                    errors,
+                );
+            } else {
+                let id: Ulid = PersistenceId::new();
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::NewOrChanged,
+                });
+                set_persistence(address, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+            }
+        }
+        Expression::Bytes { data } => {
+            let old_data_and_id =
+                old_expressions
+                    .iter()
+                    .find_map(|old_expression| match old_expression {
+                        Spanned {
+                            span,
+                            persistence: _,
+                            node: Expression::Bytes { data: old_data },
+                        } => Some((old_data, old_span_id_pairs[span])),
+                        _ => None,
+                    });
+            if let Some((old_data, id)) = old_data_and_id {
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::Unchanged,
+                });
+                for (index, item) in data.iter_mut().enumerate() {
+                    let old_item_and_id = if let Some(old_item) = old_data.get(index) {
+                        Some((old_item, old_span_id_pairs[&old_item.span]))
+                    } else {
+                        None
+                    };
+                    if let Some((old_item, _id)) = old_item_and_id {
+                        set_persistence(
+                            item,
+                            &[old_item],
+                            &old_span_id_pairs,
+                            new_span_id_pairs,
+                            errors,
+                        );
+                    } else {
+                        set_persistence(item, &[], &old_span_id_pairs, new_span_id_pairs, errors)
+                    }
+                }
+            } else {
+                let id: Ulid = PersistenceId::new();
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::NewOrChanged,
+                });
+                for item in data {
+                    set_persistence(item, &[], &old_span_id_pairs, new_span_id_pairs, errors);
+                }
+            }
         }
     }
 }

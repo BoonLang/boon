@@ -58,8 +58,25 @@ pub enum Expression {
     Latest {
         inputs: Vec<Spanned<Self>>,
     },
+    // Stateful LATEST - used with pipe: `initial |> LATEST state_param { body }`
+    LatestWithState {
+        state_param: StrSlice,
+        body: Box<Spanned<Self>>,
+    },
     Then {
         body: Box<Spanned<Self>>,
+    },
+    // FLUSH for fail-fast error handling
+    Flush {
+        value: Box<Spanned<Self>>,
+    },
+    // PULSES for iteration
+    Pulses {
+        count: Box<Spanned<Self>>,
+    },
+    // Spread operator: ...expression (in objects)
+    Spread {
+        value: Box<Spanned<Self>>,
     },
     When {
         arms: Vec<Arm>,
@@ -80,6 +97,16 @@ pub enum Expression {
     ArithmeticOperator(ArithmeticOperator),
     TextLiteral {
         parts: Vec<TextPart>,
+    },
+    // Hardware types (parse-only for now)
+    Bits {
+        size: Box<Spanned<Self>>,
+    },
+    Memory {
+        address: Box<Spanned<Self>>,
+    },
+    Bytes {
+        data: Vec<Spanned<Self>>,
     },
 }
 
@@ -314,8 +341,21 @@ impl ExpressionConverter {
             parser::Expression::Latest { inputs } => Expression::Latest {
                 inputs: inputs.iter().map(|i| self.convert_spanned(i)).collect(),
             },
+            parser::Expression::LatestWithState { state_param, body } => Expression::LatestWithState {
+                state_param: self.str_to_slice(state_param),
+                body: Box::new(self.convert_spanned(body)),
+            },
             parser::Expression::Then { body } => Expression::Then {
                 body: Box::new(self.convert_spanned(body)),
+            },
+            parser::Expression::Flush { value } => Expression::Flush {
+                value: Box::new(self.convert_spanned(value)),
+            },
+            parser::Expression::Pulses { count } => Expression::Pulses {
+                count: Box::new(self.convert_spanned(count)),
+            },
+            parser::Expression::Spread { value } => Expression::Spread {
+                value: Box::new(self.convert_spanned(value)),
             },
             parser::Expression::When { arms } => Expression::When {
                 arms: arms.iter().map(|a| self.convert_arm(a)).collect(),
@@ -347,6 +387,16 @@ impl ExpressionConverter {
             }
             parser::Expression::TextLiteral { parts } => Expression::TextLiteral {
                 parts: parts.iter().map(|p| self.convert_text_part(p)).collect(),
+            },
+            // Hardware types (parse-only for now)
+            parser::Expression::Bits { size } => Expression::Bits {
+                size: Box::new(self.convert_spanned(size)),
+            },
+            parser::Expression::Memory { address } => Expression::Memory {
+                address: Box::new(self.convert_spanned(address)),
+            },
+            parser::Expression::Bytes { data } => Expression::Bytes {
+                data: data.iter().map(|item| self.convert_spanned(item)).collect(),
             },
         }
     }
