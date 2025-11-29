@@ -182,7 +182,6 @@ pub struct Variable {
 #[derive(Debug, Clone)]
 pub enum Literal {
     Number(f64),
-    Text(StrSlice),
     Tag(StrSlice),
 }
 
@@ -412,7 +411,6 @@ impl ExpressionConverter {
     fn convert_literal(&self, lit: &parser::Literal) -> Literal {
         match lit {
             parser::Literal::Number(n) => Literal::Number(*n),
-            parser::Literal::Text(s) => Literal::Text(self.str_to_slice(s)),
             parser::Literal::Tag(s) => Literal::Tag(self.str_to_slice(s)),
         }
     }
@@ -600,7 +598,7 @@ mod tests {
         // This test just verifies the types compile with 'static
         let source = SourceCode::new("test: 42".to_string());
         let slice = source.slice(0, 4);
-        let expr = Expression::Literal(Literal::Text(slice));
+        let expr = Expression::Literal(Literal::Tag(slice));
         takes_static(expr);
     }
 

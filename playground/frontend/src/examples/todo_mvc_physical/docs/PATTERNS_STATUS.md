@@ -645,9 +645,9 @@ Current code already uses best pattern:
 #### Router LATEST Usage
 ```boon
 go_to_result: LATEST {
-    filter_buttons.all.event.press |> THEN { '/' }
-    filter_buttons.active.event.press |> THEN { '/active' }
-    filter_buttons.completed.event.press |> THEN { '/completed' }
+    filter_buttons.all.event.press |> THEN { TEXT {/} }
+    filter_buttons.active.event.press |> THEN { TEXT {/active} }
+    filter_buttons.completed.event.press |> THEN { TEXT {/completed} }
 } |> Router/go_to()
 ```
 

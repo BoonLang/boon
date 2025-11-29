@@ -31,7 +31,6 @@ pub enum Token<'code> {
     Plus,
     Asterisk,
     Slash,
-    Text(&'code str),
     SnakeCaseIdentifier(&'code str),
     PascalCaseIdentifier(&'code str),
     List,
@@ -86,7 +85,6 @@ impl<'code> Token<'code> {
             Self::Plus => "+".into(),
             Self::Asterisk => "*".into(),
             Self::Slash => "/".into(),
-            Self::Text(text) => text.into(),
             Self::SnakeCaseIdentifier(identifier) => identifier.into(),
             Self::PascalCaseIdentifier(identifier) => identifier.into(),
             Self::List => "LIST".into(),
@@ -163,14 +161,6 @@ pub fn lexer<'code>()
         .from_str()
         .unwrapped()
         .map(Token::Number);
-
-    // @TODO multiline indentation?
-    // @TODO "raw" text or escape '? Idea: 'I am {name}' or #'I'm #{name}'#
-    // - the same number of # at the beginning, at the end and before aliases
-    let text = just('\'')
-        .ignore_then(none_of('\'').repeated().to_slice())
-        .then_ignore(just('\''))
-        .map(Token::Text);
 
     let snake_case_identifier = any()
         .filter(char::is_ascii_lowercase)
@@ -269,7 +259,6 @@ pub fn lexer<'code>()
         comparator,
         arithmetic_operator_or_path_separator,
         text_content,
-        text,
         snake_case_identifier,
         pascal_case_identifier,
         keyword,

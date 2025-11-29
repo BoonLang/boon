@@ -13,7 +13,6 @@ const parser = baseParser.configure({
       SnakeCase: t.variableName,
       Wildcard: t.special(t.variableName),
       Number: t.number,
-      Text: t.string,
       LineComment: t.lineComment,
       Operator: t.operator,
       Pipe: t.operator,
@@ -49,7 +48,6 @@ const modulePathSlashMark = Decoration.mark({class: "cm-boon-module-slash"})
 const functionNameMark = Decoration.mark({class: "cm-boon-function-name"})
 const variableDefinitionMark = Decoration.mark({class: "cm-boon-variable-definition"})
 const dotMark = Decoration.mark({class: "cm-boon-dot"})
-const apostropheMark = Decoration.mark({class: "cm-boon-apostrophe"})
 const pipeMark = Decoration.mark({class: "cm-boon-pipe"})
 const chainAlternateMark = Decoration.mark({class: "cm-boon-chain-alt"})
 const textLiteralContentMark = Decoration.mark({class: "cm-boon-text-literal-content"})
@@ -209,17 +207,6 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
           expectFunctionName = false
           pendingFunctionCall = null
           return
-        }
-
-        if (node.name === "Text") {
-          for (let index = text.indexOf("'"); index !== -1; index = text.indexOf("'", index + 1)) {
-            const position = node.from + index
-            builder.add(position, position + 1, apostropheMark)
-          }
-          pendingDefinition = null
-          expectFunctionName = false
-          pendingFunctionCall = null
-          return false
         }
 
         if (node.name === "Pipe" || node.name === "PipeBreak") {

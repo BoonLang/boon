@@ -440,20 +440,6 @@ fn static_spanned_expression_into_value_actor(
                 actor_context,
                 number,
             ),
-            static_expression::Literal::Text(text) => {
-                let text = text.to_string();
-                Text::new_arc_value_actor(
-                    ConstructInfo::new(
-                        format!("PersistenceId: {persistence_id}"),
-                        persistence,
-                        format!("{span}; Text {text}"),
-                    ),
-                    construct_context,
-                    idempotency_key,
-                    actor_context,
-                    text,
-                )
-            }
             static_expression::Literal::Tag(tag) => {
                 let tag = tag.to_string();
                 Tag::new_arc_value_actor(
@@ -2311,13 +2297,6 @@ fn match_pattern(
             match (lit, value) {
                 (static_expression::Literal::Number(pattern_num), Value::Number(num, _)) => {
                     if (num.number() - pattern_num).abs() < f64::EPSILON {
-                        Some(bindings)
-                    } else {
-                        None
-                    }
-                }
-                (static_expression::Literal::Text(pattern_text), Value::Text(text, _)) => {
-                    if text.text() == pattern_text.as_ref() {
                         Some(bindings)
                     } else {
                         None

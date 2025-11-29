@@ -125,10 +125,9 @@ where
         };
 
         let number = select! { Token::Number(number) => Literal::Number(number) };
-        let text = select! { Token::Text(text) => Literal::Text(text) };
         let tag = pascal_case_identifier.map(Literal::Tag);
 
-        let literal = choice((number, text, tag));
+        let literal = choice((number, tag));
         let expression_literal = literal.map(Expression::Literal);
 
         let list = just(Token::List)
@@ -386,7 +385,6 @@ where
             let pattern_wildcard = just(Token::Wildcard).map(|_| Pattern::WildCard);
 
             let pattern_literal_number = select! { Token::Number(number) => Pattern::Literal(Literal::Number(number)) };
-            let pattern_literal_text = select! { Token::Text(text) => Pattern::Literal(Literal::Text(text)) };
             let pattern_literal_tag = pascal_case_identifier.map(|tag| Pattern::Literal(Literal::Tag(tag)));
 
             let pattern_alias = snake_case_identifier.map(|name| Pattern::Alias { name });
@@ -439,7 +437,6 @@ where
                 pattern_tagged_object,
                 pattern_object,
                 pattern_literal_number,
-                pattern_literal_text,
                 pattern_literal_tag,
                 pattern_alias,
             ))
@@ -880,7 +877,6 @@ pub struct Variable<'code> {
 #[derive(Debug, Clone)]
 pub enum Literal<'code> {
     Number(f64),
-    Text(&'code str),
     Tag(&'code str),
 }
 

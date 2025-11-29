@@ -14,7 +14,6 @@ use boon::platform::browser::{
 mod code_editor;
 use code_editor::CodeEditor;
 
-static SOURCE_CODE_STORAGE_KEY: &str = "boon-playground-source-code";
 static PROJECT_FILES_STORAGE_KEY: &str = "boon-playground-project-files";
 static CURRENT_FILE_STORAGE_KEY: &str = "boon-playground-current-file";
 
@@ -118,12 +117,6 @@ impl Playground {
                         .unwrap_or_else(|| DEFAULT_FILE_NAME.to_string())
                 });
             (stored_files, current)
-        } else if let Some(Ok(legacy_code)) = local_storage().get::<String>(SOURCE_CODE_STORAGE_KEY)
-        {
-            // Migrate from old single-file storage
-            let mut files = BTreeMap::new();
-            files.insert(DEFAULT_FILE_NAME.to_string(), legacy_code);
-            (files, DEFAULT_FILE_NAME.to_string())
         } else {
             // Use default example
             let mut files = BTreeMap::new();

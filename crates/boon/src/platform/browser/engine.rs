@@ -1393,12 +1393,6 @@ pub fn pattern_to_matcher(pattern: &crate::parser::Pattern) -> Box<dyn Fn(&Value
                         matches!(v, Value::Number(num, _) if num.number() == n)
                     })
                 }
-                crate::parser::Literal::Text(t) => {
-                    let t = t.to_string();
-                    Box::new(move |v| {
-                        matches!(v, Value::Text(text, _) if text.text() == t)
-                    })
-                }
                 crate::parser::Literal::Tag(tag) => {
                     let tag = tag.to_string();
                     Box::new(move |v| {
