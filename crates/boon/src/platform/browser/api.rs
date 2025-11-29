@@ -1261,7 +1261,6 @@ pub fn function_list_append(
     // Create a change stream that:
     // 1. Forwards all changes from the original list
     // 2. Adds Push changes when the item stream produces values
-    let item_actor_for_push = item_actor.clone();
     let change_stream = {
         let list_changes = list_actor.subscribe().filter_map(|value| {
             future::ready(match value {
@@ -1270,9 +1269,21 @@ pub fn function_list_append(
             })
         }).flat_map(|list| list.subscribe());
 
-        let append_changes = item_actor.subscribe().map(move |_value| {
-            // When item stream produces a value, push the item actor
-            ListChange::Push { item: item_actor_for_push.clone() }
+        let function_call_id_for_append = function_call_id.clone();
+        let actor_context_for_append = actor_context.clone();
+        let append_changes = item_actor.subscribe().map(move |value| {
+            // When item stream produces a value, create a new constant ValueActor
+            // containing that specific value and push it
+            let new_item_actor = ValueActor::new_arc(
+                ConstructInfo::new(
+                    function_call_id_for_append.with_child_id("appended_item"),
+                    None,
+                    "List/append appended item",
+                ),
+                actor_context_for_append.clone(),
+                constant(value),
+            );
+            ListChange::Push { item: new_item_actor }
         });
 
         // Merge both change streams

@@ -148,9 +148,15 @@ impl ConstructStorage {
 #[derive(Default, Clone)]
 pub struct ActorContext {
     pub output_valve_signal: Option<Arc<ActorOutputValveSignal>>,
-    /// The PASSED value - implicit context passed through function calls.
+    /// The piped value from `|>` operator.
+    /// Set when evaluating `x |> expr` - the `x` becomes `piped` for `expr`.
+    /// Used by function calls to prepend as first argument.
+    /// Also used by THEN/WHEN/WHILE/LinkSetter to process the piped stream.
+    pub piped: Option<Arc<ValueActor>>,
+    /// The PASSED context - implicit context passed through function calls.
     /// Set when calling a function with `PASS: something` argument.
     /// Accessible inside the function via `PASSED` or `PASSED.field`.
+    /// Propagates automatically through nested function calls.
     pub passed: Option<Arc<ValueActor>>,
     /// Function parameter bindings - maps parameter names to their values.
     /// Set when calling a user-defined function.
@@ -533,6 +539,80 @@ impl ReferenceConnector {
         referenceable_receiver
             .await
             .expect("Failed to get referenceable from ReferenceConnector")
+    }
+}
+
+// --- LinkConnector ---
+
+/// Connects LINK variables with their setters.
+/// Similar to ReferenceConnector but stores mpsc senders for LINK variables.
+pub struct LinkConnector {
+    link_inserter_sender: mpsc::UnboundedSender<(parser::Span, mpsc::UnboundedSender<Value>)>,
+    link_getter_sender:
+        mpsc::UnboundedSender<(parser::Span, oneshot::Sender<mpsc::UnboundedSender<Value>>)>,
+    loop_task: TaskHandle,
+}
+
+impl LinkConnector {
+    pub fn new() -> Self {
+        let (link_inserter_sender, mut link_inserter_receiver) = mpsc::unbounded();
+        let (link_getter_sender, mut link_getter_receiver) = mpsc::unbounded();
+        Self {
+            link_inserter_sender,
+            link_getter_sender,
+            loop_task: Task::start_droppable(async move {
+                let mut links = HashMap::<parser::Span, mpsc::UnboundedSender<Value>>::new();
+                let mut link_senders =
+                    HashMap::<parser::Span, Vec<oneshot::Sender<mpsc::UnboundedSender<Value>>>>::new();
+                loop {
+                    select! {
+                        (span, sender) = link_inserter_receiver.select_next_some() => {
+                            if let Some(senders) = link_senders.remove(&span) {
+                                for link_sender in senders {
+                                    if link_sender.send(sender.clone()).is_err() {
+                                        eprintln!("Failed to send link sender from link connector");
+                                    }
+                                }
+                            }
+                            links.insert(span, sender);
+                        },
+                        (span, link_sender) = link_getter_receiver.select_next_some() => {
+                            if let Some(sender) = links.get(&span) {
+                                if link_sender.send(sender.clone()).is_err() {
+                                    eprintln!("Failed to send link sender from link connector");
+                                }
+                            } else {
+                                link_senders.entry(span).or_default().push(link_sender);
+                            }
+                        }
+                    }
+                }
+            }),
+        }
+    }
+
+    /// Register a LINK variable's sender with its span.
+    pub fn register_link(&self, span: parser::Span, sender: mpsc::UnboundedSender<Value>) {
+        if let Err(error) = self
+            .link_inserter_sender
+            .unbounded_send((span, sender))
+        {
+            eprintln!("Failed to register link: {error:#}")
+        }
+    }
+
+    /// Get a LINK variable's sender by its span.
+    pub async fn link_sender(self: Arc<Self>, span: parser::Span) -> mpsc::UnboundedSender<Value> {
+        let (link_sender, link_receiver) = oneshot::channel();
+        if let Err(error) = self
+            .link_getter_sender
+            .unbounded_send((span, link_sender))
+        {
+            eprintln!("Failed to get link sender: {error:#}")
+        }
+        link_receiver
+            .await
+            .expect("Failed to get link sender from LinkConnector")
     }
 }
 
@@ -2661,6 +2741,8 @@ pub struct ListBindingConfig {
     pub operation: ListBindingOperation,
     /// Reference connector for looking up scope-resolved references
     pub reference_connector: Arc<ReferenceConnector>,
+    /// Link connector for connecting LINK variables with their setters
+    pub link_connector: Arc<LinkConnector>,
     /// Source code for creating borrowed expressions
     pub source_code: SourceCode,
 }
@@ -3125,6 +3207,7 @@ impl ListBindingFunction {
             construct_context,
             new_actor_context,
             config.reference_connector.clone(),
+            config.link_connector.clone(),
             config.source_code.clone(),
         ) {
             Ok(result_actor) => result_actor,

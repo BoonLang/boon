@@ -77,7 +77,20 @@ FUNCTION header() {
 
 ## Implementation Notes
 
-- **Parser**: PASS: is parsed as a special argument with name "PASS"
-- **Evaluator**: When PASS: argument is present, sets `actor_context.passed`
-- **Nested calls**: PASSED value persists in actor_context through the call stack
+The `ActorContext` struct has separate fields for piping and PASS context:
+
+```rust
+pub struct ActorContext {
+    pub piped: Option<Arc<ValueActor>>,    // From |> operator
+    pub passed: Option<Arc<ValueActor>>,   // From PASS: argument (not yet implemented)
+    pub parameters: HashMap<String, Arc<ValueActor>>,
+}
+```
+
+- **Piping**: The `|>` operator sets `actor_context.piped`. Function calls prepend it as the first argument.
+- **PASS/PASSED**: The `PASS:` argument sets `actor_context.passed`. The `PASSED` keyword accesses it.
 - **Parameter binding**: Regular parameters are bound in `actor_context.parameters`
+
+Both can be used together: `x |> fn(PASS: context)` where:
+- `x` becomes the first parameter (via `piped`)
+- `context` is accessible via `PASSED` keyword (via `passed`)
