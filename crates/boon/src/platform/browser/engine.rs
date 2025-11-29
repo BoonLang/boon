@@ -385,6 +385,10 @@ impl Variable {
         self.value_actor.clone()
     }
 
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn link_value_sender(&self) -> Option<mpsc::UnboundedSender<Value>> {
         self.link_value_sender.clone()
     }
@@ -1457,6 +1461,245 @@ impl Value {
         };
         list
     }
+
+    /// Serializes this Value to a JSON representation.
+    /// This is an async function because it needs to subscribe to streaming values.
+    pub async fn to_json(&self) -> serde_json::Value {
+        match self {
+            Value::Text(text, _) => {
+                serde_json::Value::String(text.text().to_string())
+            }
+            Value::Tag(tag, _) => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("_tag".to_string(), serde_json::Value::String(tag.tag().to_string()));
+                serde_json::Value::Object(obj)
+            }
+            Value::Number(number, _) => {
+                serde_json::json!(number.number())
+            }
+            Value::Object(object, _) => {
+                let mut obj = serde_json::Map::new();
+                for variable in object.variables() {
+                    let value = variable.value_actor().subscribe().next().await;
+                    if let Some(value) = value {
+                        let json_value = Box::pin(value.to_json()).await;
+                        obj.insert(variable.name().to_string(), json_value);
+                    }
+                }
+                serde_json::Value::Object(obj)
+            }
+            Value::TaggedObject(tagged_object, _) => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("_tag".to_string(), serde_json::Value::String(tagged_object.tag().to_string()));
+                for variable in tagged_object.variables() {
+                    let value = variable.value_actor().subscribe().next().await;
+                    if let Some(value) = value {
+                        let json_value = Box::pin(value.to_json()).await;
+                        obj.insert(variable.name().to_string(), json_value);
+                    }
+                }
+                serde_json::Value::Object(obj)
+            }
+            Value::List(list, _) => {
+                let first_change = list.subscribe().next().await;
+                if let Some(ListChange::Replace { items }) = first_change {
+                    let mut json_items = Vec::new();
+                    for item in items {
+                        let value = item.subscribe().next().await;
+                        if let Some(value) = value {
+                            let json_value = Box::pin(value.to_json()).await;
+                            json_items.push(json_value);
+                        }
+                    }
+                    serde_json::Value::Array(json_items)
+                } else {
+                    serde_json::Value::Array(Vec::new())
+                }
+            }
+        }
+    }
+
+    /// Deserializes a JSON value into a Value (not wrapped in ValueActor).
+    /// This is used internally by `value_actor_from_json`.
+    pub fn from_json(
+        json: &serde_json::Value,
+        construct_id: ConstructId,
+        construct_context: ConstructContext,
+        idempotency_key: ValueIdempotencyKey,
+        actor_context: ActorContext,
+    ) -> Value {
+        match json {
+            serde_json::Value::String(s) => {
+                let construct_info = ConstructInfo::new(
+                    construct_id,
+                    None,
+                    "Text from JSON",
+                );
+                Text::new_value(construct_info, construct_context, idempotency_key, s.clone())
+            }
+            serde_json::Value::Number(n) => {
+                let construct_info = ConstructInfo::new(
+                    construct_id,
+                    None,
+                    "Number from JSON",
+                );
+                let number = n.as_f64().unwrap_or(0.0);
+                Number::new_value(construct_info, construct_context, idempotency_key, number)
+            }
+            serde_json::Value::Object(obj) => {
+                if let Some(serde_json::Value::String(tag)) = obj.get("_tag") {
+                    // TaggedObject or Tag
+                    let other_fields: Vec<_> = obj.iter()
+                        .filter(|(k, _)| *k != "_tag")
+                        .collect();
+
+                    if other_fields.is_empty() {
+                        // Just a Tag
+                        let construct_info = ConstructInfo::new(
+                            construct_id,
+                            None,
+                            "Tag from JSON",
+                        );
+                        Tag::new_value(construct_info, construct_context, idempotency_key, tag.clone())
+                    } else {
+                        // TaggedObject
+                        let construct_info = ConstructInfo::new(
+                            construct_id.clone(),
+                            None,
+                            "TaggedObject from JSON",
+                        );
+                        let variables: Vec<Arc<Variable>> = other_fields.iter()
+                            .enumerate()
+                            .map(|(i, (name, value))| {
+                                let var_construct_info = ConstructInfo::new(
+                                    construct_id.with_child_id(format!("var_{name}")),
+                                    None,
+                                    "Variable from JSON",
+                                );
+                                let value_actor = value_actor_from_json(
+                                    value,
+                                    construct_id.with_child_id(format!("value_{name}")),
+                                    construct_context.clone(),
+                                    Ulid::new(),
+                                    actor_context.clone(),
+                                );
+                                Variable::new_arc(
+                                    var_construct_info,
+                                    construct_context.clone(),
+                                    (*name).clone(),
+                                    value_actor,
+                                )
+                            })
+                            .collect();
+                        TaggedObject::new_value(
+                            construct_info,
+                            construct_context,
+                            idempotency_key,
+                            tag.clone(),
+                            variables,
+                        )
+                    }
+                } else {
+                    // Regular Object
+                    let construct_info = ConstructInfo::new(
+                        construct_id.clone(),
+                        None,
+                        "Object from JSON",
+                    );
+                    let variables: Vec<Arc<Variable>> = obj.iter()
+                        .map(|(name, value)| {
+                            let var_construct_info = ConstructInfo::new(
+                                construct_id.with_child_id(format!("var_{name}")),
+                                None,
+                                "Variable from JSON",
+                            );
+                            let value_actor = value_actor_from_json(
+                                value,
+                                construct_id.with_child_id(format!("value_{name}")),
+                                construct_context.clone(),
+                                Ulid::new(),
+                                actor_context.clone(),
+                            );
+                            Variable::new_arc(
+                                var_construct_info,
+                                construct_context.clone(),
+                                name.clone(),
+                                value_actor,
+                            )
+                        })
+                        .collect();
+                    Object::new_value(construct_info, construct_context, idempotency_key, variables)
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                let construct_info = ConstructInfo::new(
+                    construct_id.clone(),
+                    None,
+                    "List from JSON",
+                );
+                let items: Vec<Arc<ValueActor>> = arr.iter()
+                    .enumerate()
+                    .map(|(i, item)| {
+                        value_actor_from_json(
+                            item,
+                            construct_id.with_child_id(format!("item_{i}")),
+                            construct_context.clone(),
+                            Ulid::new(),
+                            actor_context.clone(),
+                        )
+                    })
+                    .collect();
+                List::new_value(construct_info, construct_context, idempotency_key, actor_context, items)
+            }
+            serde_json::Value::Bool(b) => {
+                // Represent booleans as tags
+                let construct_info = ConstructInfo::new(
+                    construct_id,
+                    None,
+                    "Tag from JSON bool",
+                );
+                let tag = if *b { "True" } else { "False" };
+                Tag::new_value(construct_info, construct_context, idempotency_key, tag)
+            }
+            serde_json::Value::Null => {
+                // Represent null as a tag
+                let construct_info = ConstructInfo::new(
+                    construct_id,
+                    None,
+                    "Tag from JSON null",
+                );
+                Tag::new_value(construct_info, construct_context, idempotency_key, "None")
+            }
+        }
+    }
+}
+
+/// Creates a ValueActor from a JSON value.
+pub fn value_actor_from_json(
+    json: &serde_json::Value,
+    construct_id: ConstructId,
+    construct_context: ConstructContext,
+    idempotency_key: ValueIdempotencyKey,
+    actor_context: ActorContext,
+) -> Arc<ValueActor> {
+    let value = Value::from_json(
+        json,
+        construct_id.clone(),
+        construct_context,
+        idempotency_key,
+        actor_context.clone(),
+    );
+    let actor_construct_info = ConstructInfo::new(
+        construct_id.with_child_id("value_actor"),
+        None,
+        "ValueActor from JSON",
+    ).complete(ConstructType::ValueActor);
+    Arc::new(ValueActor::new_internal(
+        actor_construct_info,
+        actor_context,
+        constant(value),
+        (),
+    ))
 }
 
 // --- Object ---
@@ -1560,6 +1803,10 @@ impl Object {
                 self.construct_info
             )
         })
+    }
+
+    pub fn variables(&self) -> &[Arc<Variable>] {
+        &self.variables
     }
 }
 
@@ -1685,6 +1932,10 @@ impl TaggedObject {
 
     pub fn tag(&self) -> &str {
         &self.tag
+    }
+
+    pub fn variables(&self) -> &[Arc<Variable>] {
+        &self.variables
     }
 }
 
@@ -2196,6 +2447,135 @@ impl List {
             eprintln!("Failed to subscribe to {}: {error:#}", self.construct_info);
         }
         change_receiver
+    }
+
+    /// Creates a List with persistence support.
+    /// - If saved data exists, it's loaded and used as initial items (code items are ignored)
+    /// - On any change, the current list state is saved to storage
+    pub fn new_arc_value_actor_with_persistence(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        idempotency_key: ValueIdempotencyKey,
+        actor_context: ActorContext,
+        code_items: impl Into<Vec<Arc<ValueActor>>>,
+    ) -> Arc<ValueActor> {
+        let code_items = code_items.into();
+        let persistence = construct_info.persistence;
+
+        // If no persistence, just use the regular constructor
+        let Some(persistence_data) = persistence else {
+            return Self::new_arc_value_actor(
+                construct_info,
+                construct_context,
+                idempotency_key,
+                actor_context,
+                code_items,
+            );
+        };
+
+        let persistence_id = persistence_data.id;
+        let construct_storage = construct_context.construct_storage.clone();
+
+        let ConstructInfo {
+            id: actor_id,
+            persistence: _,
+            description: list_description,
+        } = construct_info;
+
+        // Create a stream that:
+        // 1. First emits loaded items from storage (or code items if nothing saved)
+        // 2. Then wraps further changes to save them
+        let construct_context_for_load = construct_context.clone();
+        let actor_context_for_load = actor_context.clone();
+        let actor_id_for_load = actor_id.clone();
+
+        let value_stream = stream::once(async move {
+            // Try to load from storage
+            let loaded_items: Option<Vec<serde_json::Value>> = construct_storage
+                .clone()
+                .load_state(persistence_id)
+                .await;
+
+            let initial_items = if let Some(json_items) = loaded_items {
+                // Deserialize items from JSON
+                json_items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, json)| {
+                        value_actor_from_json(
+                            json,
+                            actor_id_for_load.with_child_id(format!("loaded_item_{i}")),
+                            construct_context_for_load.clone(),
+                            Ulid::new(),
+                            actor_context_for_load.clone(),
+                        )
+                    })
+                    .collect()
+            } else {
+                // Use code-defined items
+                code_items
+            };
+
+            // Create the inner list
+            let inner_construct_info = ConstructInfo::new(
+                actor_id_for_load.with_child_id("persistent_list"),
+                Some(persistence_data),
+                "Persistent List",
+            );
+            let list = List::new_arc(
+                inner_construct_info,
+                construct_context_for_load.clone(),
+                actor_context_for_load.clone(),
+                initial_items,
+            );
+
+            // Start a background task to save changes
+            let list_for_save = list.clone();
+            let construct_storage_for_save = construct_storage;
+            Task::start(async move {
+                let mut change_stream = pin!(list_for_save.subscribe());
+                while let Some(change) = change_stream.next().await {
+                    // After any change, serialize and save the current list
+                    if let ListChange::Replace { ref items } = change {
+                        let mut json_items = Vec::new();
+                        for item in items {
+                            if let Some(value) = item.subscribe().next().await {
+                                json_items.push(value.to_json().await);
+                            }
+                        }
+                        construct_storage_for_save.save_state(persistence_id, &json_items).await;
+                    } else {
+                        // For incremental changes, we need to get the full list and save it
+                        // This is done by getting the next Replace event after the change is applied
+                        // But for simplicity, let's re-subscribe to get the current state
+                        if let Some(ListChange::Replace { items }) = list_for_save.subscribe().next().await {
+                            let mut json_items = Vec::new();
+                            for item in &items {
+                                if let Some(value) = item.subscribe().next().await {
+                                    json_items.push(value.to_json().await);
+                                }
+                            }
+                            construct_storage_for_save.save_state(persistence_id, &json_items).await;
+                        }
+                    }
+                }
+            });
+
+            Value::List(list, ValueMetadata { idempotency_key })
+        }).chain(stream::pending());
+
+        let actor_construct_info = ConstructInfo::new(
+            actor_id,
+            Some(persistence_data),
+            "Persistent list wrapper",
+        ).complete(ConstructType::ValueActor);
+
+        Arc::new(ValueActor::new_internal(
+            actor_construct_info,
+            actor_context,
+            value_stream,
+            (),
+        ))
     }
 }
 

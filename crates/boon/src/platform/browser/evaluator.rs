@@ -257,7 +257,7 @@ fn static_spanned_expression_into_value_actor(
                     )
                 })
                 .collect();
-            List::new_arc_value_actor(
+            List::new_arc_value_actor_with_persistence(
                 ConstructInfo::new(
                     format!("PersistenceId: {persistence_id}"),
                     persistence,
