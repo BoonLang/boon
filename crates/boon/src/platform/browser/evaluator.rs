@@ -705,7 +705,81 @@ fn static_spanned_expression_into_value_actor(
                     )
                 }
                 _ => {
-                    // Standard function call - evaluate all arguments
+                    // Check for user-defined function first (single-element path like "new_todo")
+                    if path.len() == 1 {
+                        let func_name = path[0].as_str();
+                        let maybe_user_func = function_registry.functions.borrow().get(func_name).cloned();
+
+                        if let Some(user_func) = maybe_user_func {
+                            // User-defined function call
+                            // Evaluate arguments and bind to parameters
+                            let mut param_bindings: HashMap<String, Arc<ValueActor>> = HashMap::new();
+                            let mut passed_context: Option<Arc<ValueActor>> = actor_context.passed.clone();
+
+                            // If there's a piped value, bind it to the first parameter
+                            if let Some(piped) = &actor_context.piped {
+                                if let Some(first_param) = user_func.parameters.first() {
+                                    param_bindings.insert(first_param.clone(), piped.clone());
+                                }
+                            }
+
+                            // Process named arguments
+                            for arg in &arguments {
+                                // Check for PASS: argument
+                                if arg.node.name.as_str() == "PASS" {
+                                    if let Some(value) = &arg.node.value {
+                                        let pass_actor = static_spanned_expression_into_value_actor(
+                                            value.clone(),
+                                            construct_context.clone(),
+                                            actor_context.clone(),
+                                            reference_connector.clone(),
+                                            link_connector.clone(),
+                                            function_registry.clone(),
+                                            source_code.clone(),
+                                        )?;
+                                        passed_context = Some(pass_actor);
+                                    }
+                                    continue;
+                                }
+
+                                // Bind named argument to parameter
+                                let param_name = arg.node.name.to_string();
+                                if let Some(value) = &arg.node.value {
+                                    let actor = static_spanned_expression_into_value_actor(
+                                        value.clone(),
+                                        construct_context.clone(),
+                                        actor_context.clone(),
+                                        reference_connector.clone(),
+                                        link_connector.clone(),
+                                        function_registry.clone(),
+                                        source_code.clone(),
+                                    )?;
+                                    param_bindings.insert(param_name, actor);
+                                }
+                            }
+
+                            // Create actor context with parameter bindings for the function body
+                            let func_actor_context = ActorContext {
+                                output_valve_signal: actor_context.output_valve_signal.clone(),
+                                piped: None, // Clear piped - it was bound to first param
+                                passed: passed_context,
+                                parameters: param_bindings,
+                            };
+
+                            // Evaluate the function body with the new context
+                            return static_spanned_expression_into_value_actor(
+                                user_func.body,
+                                construct_context,
+                                func_actor_context,
+                                reference_connector,
+                                link_connector,
+                                function_registry,
+                                source_code,
+                            );
+                        }
+                    }
+
+                    // Built-in function call - evaluate all arguments
                     let mut evaluated_args: Vec<Arc<ValueActor>> = Vec::new();
                     let mut passed_context: Option<Arc<ValueActor>> = actor_context.passed.clone();
 
