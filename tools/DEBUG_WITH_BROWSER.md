@@ -149,19 +149,14 @@ boon-tools exec test "code" --expect "expected text" --screenshot output.png
 
 # Manually reload extension (triggers chrome.runtime.reload())
 boon-tools exec reload
-```
 
-### Legacy CDP Commands (No Extension Required)
-These work without the extension but have limitations with Zoon's reactive system:
-```bash
-# Screenshot (works)
-boon-tools screenshot --output test.png --url http://localhost:8081
+# Get console messages from browser
+boon-tools exec console
 
-# Console monitoring (works)
-boon-tools console --wait 5
-
-# Code injection (works, but run doesn't trigger)
-boon-tools inject "document: Document/new(root: 123)"
+# Scroll preview panel
+boon-tools exec scroll --to-bottom          # Scroll to bottom
+boon-tools exec scroll --y 100              # Scroll to absolute position
+boon-tools exec scroll --delta 50           # Scroll by relative amount
 ```
 
 ## Playground JavaScript API
@@ -207,17 +202,19 @@ The WebSocket server supports automatic extension reloading during development:
 boon-tools exec reload
 ```
 
-## Why Chrome Extension?
+## Why Chrome Extension Instead of CDP?
 
-The original CDP (Chrome DevTools Protocol) approach couldn't trigger Zoon's reactive system:
-- Synthetic DOM events are ignored by Zoon
+We tried CDP (Chrome DevTools Protocol) first, but it couldn't trigger Zoon's reactive system:
+- Synthetic DOM events from CDP are ignored by Zoon
 - CDP mouse/keyboard events don't trigger Zoon handlers
 - wasm_bindgen closures setting Mutable don't trigger reactive updates
 
 The Chrome Extension solution works because:
-- Content scripts run in the actual page context
+- Scripts execute in the actual page context (MAIN world)
 - Can call `window.boonPlayground` which runs within Zoon's reactive system
 - Native DOM operations are trusted by the browser
+
+**Note:** CDP support was removed from boon-tools to simplify the codebase. All browser automation now goes through the extension.
 
 ## Troubleshooting
 
@@ -259,6 +256,10 @@ cd playground && makers kill && makers mzoon start
 { "id": 7, "command": { "type": "ping" } }
 { "id": 8, "command": { "type": "getStatus" } }
 { "id": 9, "command": { "type": "reload" } }
+{ "id": 10, "command": { "type": "getConsole" } }
+{ "id": 11, "command": { "type": "scroll", "y": 100 } }
+{ "id": 12, "command": { "type": "scroll", "delta": 50 } }
+{ "id": 13, "command": { "type": "scroll", "toBottom": true } }
 ```
 
 ### Responses (Extension -> CLI)
@@ -268,6 +269,7 @@ cd playground && makers kill && makers mzoon start
 { "id": 3, "response": { "type": "screenshot", "base64": "..." } }
 { "id": 4, "response": { "type": "previewText", "text": "..." } }
 { "id": 5, "response": { "type": "status", "connected": true, "pageUrl": "...", "apiReady": true } }
+{ "id": 6, "response": { "type": "console", "messages": [{"level": "log", "text": "...", "timestamp": 123}] } }
 ```
 
 ---

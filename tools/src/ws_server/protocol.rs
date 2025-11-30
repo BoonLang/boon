@@ -35,6 +35,16 @@ pub enum Command {
 
     /// Reload the extension itself (hot reload for development)
     Reload,
+
+    /// Scroll the preview panel
+    Scroll {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        y: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        delta: Option<i32>,
+        #[serde(default)]
+        to_bottom: bool,
+    },
 }
 
 /// Response from Extension to CLI via Server

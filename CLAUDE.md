@@ -15,10 +15,13 @@ boon/
 │       ├── parser/        # Lexer, parser, scope/persistence resolution
 │       └── platform/
 │           └── browser/   # Browser runtime (interpreter, evaluator, engine)
-└── playground/            # Web playground (MoonZoon full-stack app)
-    ├── frontend/          # Zoon (Rust->WASM) + TypeScript (CodeMirror)
-    ├── backend/           # Moon server
-    └── shared/            # Shared types
+├── playground/            # Web playground (MoonZoon full-stack app)
+│   ├── frontend/          # Zoon (Rust->WASM) + TypeScript (CodeMirror)
+│   ├── backend/           # Moon server
+│   └── shared/            # Shared types
+└── tools/                 # Browser automation tools (standalone crate)
+    ├── src/               # CLI + WebSocket server
+    └── extension/         # Chrome extension for browser control
 ```
 
 ## Build Commands
@@ -72,6 +75,40 @@ cd playground/frontend/typescript/code_editor && ./node_modules/.bin/rolldown co
 ```bash
 cd playground && cargo make install
 ```
+
+### Browser automation (boon-tools)
+
+The `tools/` directory contains browser automation for testing and debugging. It uses a Chrome extension + WebSocket server architecture.
+
+**Build boon-tools:**
+```bash
+cd tools && cargo build --release --target-dir ../target
+```
+
+**Quick start for debugging:**
+```bash
+# Terminal 1: Playground (if not already running)
+cd playground && makers mzoon start &
+
+# Terminal 2: WebSocket server with extension hot reload
+cd tools && cargo run --release -- server start --watch ./extension
+
+# Terminal 3: Load extension in Chrome (one-time manual setup)
+# 1. Open chrome://extensions/
+# 2. Enable "Developer mode"
+# 3. Click "Load unpacked" → select tools/extension/
+# 4. Navigate to http://localhost:8081
+
+# Terminal 4: Execute commands
+boon-tools exec status                    # Check connection
+boon-tools exec inject "code here"        # Inject code into editor
+boon-tools exec run                       # Trigger execution
+boon-tools exec console                   # Get browser console logs
+boon-tools exec preview                   # Get preview panel text
+boon-tools exec screenshot -o test.png    # Capture page
+```
+
+See `tools/DEBUG_WITH_BROWSER.md` for full documentation.
 
 ## Architecture
 

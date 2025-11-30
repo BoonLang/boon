@@ -126,6 +126,9 @@ async function handleCommand(id, command) {
       case 'getPreviewText':
         return await executeInTab(tab.id, getPreviewText);
 
+      case 'scroll':
+        return await executeInTab(tab.id, scrollPreview, command.y, command.delta, command.toBottom);
+
       case 'reload':
         // Hot reload: reload the extension and refresh the playground tab
         console.log('[Boon] Reloading extension...');
@@ -340,6 +343,35 @@ function getPreviewText() {
   }
 
   return { type: 'error', message: 'Could not get preview text' };
+}
+
+function scrollPreview(y, delta, toBottom) {
+  // Find the preview panel - try various selectors
+  const preview = document.querySelector('.preview-panel') ||
+                  document.querySelector('[data-panel="preview"]') ||
+                  document.querySelector('#preview') ||
+                  document.querySelector('.preview');
+
+  if (!preview) {
+    return { type: 'error', message: 'Could not find preview panel to scroll' };
+  }
+
+  if (toBottom) {
+    preview.scrollTop = preview.scrollHeight;
+    return { type: 'success', data: { scrollTop: preview.scrollTop } };
+  }
+
+  if (y !== undefined && y !== null) {
+    preview.scrollTop = y;
+    return { type: 'success', data: { scrollTop: preview.scrollTop } };
+  }
+
+  if (delta !== undefined && delta !== null) {
+    preview.scrollBy(0, delta);
+    return { type: 'success', data: { scrollTop: preview.scrollTop } };
+  }
+
+  return { type: 'success', data: { scrollTop: preview.scrollTop, scrollHeight: preview.scrollHeight } };
 }
 
 // Initialize connection when service worker starts

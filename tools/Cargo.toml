@@ -18,10 +18,6 @@ anyhow = "1"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# Chrome DevTools Protocol
-chromiumoxide = { git = "https://github.com/mattsse/chromiumoxide", features = ["tokio-runtime"] }
-futures = "0.3"
-
 # WebSocket server
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
