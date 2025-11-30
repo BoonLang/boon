@@ -1496,7 +1496,15 @@ fn static_spanned_expression_into_value_actor(
                     });
 
                     // Flatten the stream of actors into a stream of values
-                    let flattened_stream = mapped_stream.flat_map(|actor| actor.subscribe());
+                    // IMPORTANT: We use `stream::unfold` instead of just `flat_map(|actor| actor.subscribe())`
+                    // to keep the body actor alive while consuming its subscription. Without this,
+                    // the actor would be dropped immediately after `subscribe()` is called, which
+                    // cancels its internal task via `Task::start_droppable` before it can send values.
+                    let flattened_stream = mapped_stream.flat_map(|actor| {
+                        stream::unfold((actor.subscribe(), actor), |(mut subscription, actor)| async move {
+                            subscription.next().await.map(|value| (value, (subscription, actor)))
+                        })
+                    });
 
                     // Keep the piped ValueActor alive as long as the THEN ValueActor is alive
                     ValueActor::new_arc_with_extra_owned_data(
@@ -1594,7 +1602,15 @@ fn static_spanned_expression_into_value_actor(
                     });
 
                     // Flatten the stream of actors into a stream of values
-                    let flattened_stream = mapped_stream.flat_map(|actor| actor.subscribe());
+                    // IMPORTANT: We use `stream::unfold` instead of just `flat_map(|actor| actor.subscribe())`
+                    // to keep the body actor alive while consuming its subscription. Without this,
+                    // the actor would be dropped immediately after `subscribe()` is called, which
+                    // cancels its internal task via `Task::start_droppable` before it can send values.
+                    let flattened_stream = mapped_stream.flat_map(|actor| {
+                        stream::unfold((actor.subscribe(), actor), |(mut subscription, actor)| async move {
+                            subscription.next().await.map(|value| (value, (subscription, actor)))
+                        })
+                    });
 
                     // Keep the piped ValueActor alive as long as the WHEN ValueActor is alive
                     ValueActor::new_arc_with_extra_owned_data(
@@ -1692,7 +1708,15 @@ fn static_spanned_expression_into_value_actor(
                     });
 
                     // Flatten the stream of actors into a stream of values
-                    let flattened_stream = mapped_stream.flat_map(|actor| actor.subscribe());
+                    // IMPORTANT: We use `stream::unfold` instead of just `flat_map(|actor| actor.subscribe())`
+                    // to keep the body actor alive while consuming its subscription. Without this,
+                    // the actor would be dropped immediately after `subscribe()` is called, which
+                    // cancels its internal task via `Task::start_droppable` before it can send values.
+                    let flattened_stream = mapped_stream.flat_map(|actor| {
+                        stream::unfold((actor.subscribe(), actor), |(mut subscription, actor)| async move {
+                            subscription.next().await.map(|value| (value, (subscription, actor)))
+                        })
+                    });
 
                     // Keep the piped ValueActor alive as long as the WHILE ValueActor is alive
                     ValueActor::new_arc_with_extra_owned_data(

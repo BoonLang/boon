@@ -34,7 +34,14 @@ pub enum Command {
     GetStatus,
 
     /// Reload the extension itself (hot reload for development)
+    /// WARNING: This disconnects the extension. Use Refresh instead for page reload.
     Reload,
+
+    /// Detach CDP debugger (use when "debugger already attached" errors occur)
+    Detach,
+
+    /// Refresh the page without reloading extension (safer than Reload)
+    Refresh,
 
     /// Scroll the preview panel
     Scroll {

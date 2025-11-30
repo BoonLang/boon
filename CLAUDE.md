@@ -157,6 +157,67 @@ Most Boon language features are documented in `docs/language/`:
 - `storage/` - Durable state and persistence research
 - `gpu/` - GPU/HVM research and analysis
 
+## Debugging the Engine
+
+### Common Issues: Actor Drop Problems
+
+The reactive engine uses actors (ValueActors) that maintain subscriptions via channels. A common bug pattern is "receiver is gone" errors, which occur when:
+- A ValueActor is dropped while subscriptions are still active
+- Subscriber actors are dropped before all events are processed
+- `extra_owned_data` doesn't properly keep dependent actors alive
+
+### Debug Logging
+
+In `crates/boon/src/platform/browser/engine.rs`, there's a debug flag:
+
+```rust
+const LOG_DROPS_AND_LOOP_ENDS: bool = false;  // Set to true to debug
+```
+
+When enabled, it prints:
+- `"Dropped: {construct_info}"` - when a ValueActor/Variable is deallocated
+- `"Loop ended {construct_info}"` - when a ValueActor's internal loop exits
+
+This helps trace the lifecycle of actors and identify premature drops.
+
+### Key Patterns to Watch
+
+1. **`flat_map(|actor| actor.subscribe())`** - The closure drops `actor` after `subscribe()`. If no one else holds a reference, the actor's task is cancelled and subscription fails.
+
+2. **`extra_owned_data`** - Used with `ValueActor::new_arc_with_extra_owned_data()` to keep data alive while the actor runs. Check if the right data is being preserved.
+
+3. **`output_valve_signal`** - If this stream ends, the ValueActor's loop breaks (see line ~1522 in engine.rs).
+
+### Browser Automation Rules
+
+When debugging with browser automation (`boon-tools exec`):
+
+1. **Never use `exec reload`** - it disconnects the extension. Use `exec refresh` instead.
+
+2. **When "debugger already attached" error occurs**:
+   - Run `exec detach` FIRST - this is mandatory before retrying
+   - Then retry the original command
+   - Do NOT use `exec reload`
+   - Do NOT try non-CDP fallbacks - always resolve debugger issues first
+
+3. **Always use CDP commands** - they emulate real human interaction:
+   - CDP creates trusted events (`isTrusted: true`)
+   - Results are consistent and reproducible
+   - Never mix CDP and non-CDP approaches in the same workflow
+
+4. **One browser instance**: Keep a single Chromium instance running. Don't kill it.
+
+5. **Auto-reload**:
+   - mzoon auto-reloads WASM when Rust changes
+   - WebSocket server `--watch` auto-reloads extension when JS changes
+   - No manual restarts needed for most changes
+
+**Error Resolution Order**:
+1. Debugger conflict → `exec detach` → retry
+2. Page state issues → `exec refresh` → retry
+3. Extension disconnected → refresh browser tab manually
+4. Complete failure (last resort) → kill browser, restart
+
 ## Key Dependencies
 - **chumsky** - Parser combinator library (with pratt parsing for operators)
 - **ariadne** - Error reporting

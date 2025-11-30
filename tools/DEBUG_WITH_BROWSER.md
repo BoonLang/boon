@@ -147,7 +147,13 @@ boon-tools exec type "input.search" "search text"
 # Full test cycle
 boon-tools exec test "code" --expect "expected text" --screenshot output.png
 
-# Manually reload extension (triggers chrome.runtime.reload())
+# Detach CDP debugger (use when "debugger already attached" errors occur)
+boon-tools exec detach
+
+# Refresh page without reloading extension (safer than reload)
+boon-tools exec refresh
+
+# Manually reload extension (WARNING: disconnects extension, prefer 'refresh')
 boon-tools exec reload
 
 # Get console messages from browser
@@ -350,6 +356,57 @@ cd playground && makers kill && makers mzoon start
 { "id": 5, "response": { "type": "status", "connected": true, "pageUrl": "...", "apiReady": true } }
 { "id": 6, "response": { "type": "console", "messages": [{"level": "log", "text": "...", "timestamp": 123}] } }
 ```
+
+## Debugging Workflow Rules
+
+### NEVER do these:
+1. **Never use `exec reload` unless absolutely necessary** - it disconnects the extension
+2. **Never kill the browser** to fix debugger issues - use `exec detach` first
+3. **Never restart the WebSocket server** if extension is connected - use `exec refresh`
+
+### Error Recovery Guide:
+
+| Error | Solution |
+|-------|----------|
+| "Another debugger is already attached" | `boon-tools exec detach` then retry |
+| "No extension connected" | Refresh browser tab at localhost:8081 |
+| Extension stops responding | `boon-tools exec refresh` (NOT reload) |
+| Complete failure | Kill Chromium: `pkill -f boon-chromium`, then relaunch |
+
+### Ideal single-browser workflow:
+
+1. **Setup (once)**:
+   ```bash
+   # Terminal 1: Start playground (stays running, auto-reloads on code changes)
+   cd playground && makers mzoon start
+
+   # Terminal 2: Start WebSocket server (stays running, watches extension changes)
+   cd tools && ../target/release/boon-tools server start --watch ./extension
+
+   # Terminal 3: Start Chromium (stays running, one tab, one extension instance)
+   chromium --load-extension=./extension --user-data-dir=/tmp/boon-chromium \
+            --no-first-run http://localhost:8081
+   ```
+
+2. **Testing cycle (no restarts needed)**:
+   ```bash
+   # Run tests - mzoon auto-reloads WASM when you change Rust code
+   boon-tools exec inject "counter: 0"
+   boon-tools exec run
+   boon-tools exec preview
+
+   # If CDP error: detach and retry
+   boon-tools exec detach
+   boon-tools exec click ".btn"
+
+   # If page needs refresh (NOT extension reload):
+   boon-tools exec refresh
+   ```
+
+3. **When to restart browser (last resort)**:
+   - Extension JavaScript changes (rare - usually hot-reloaded)
+   - Complete system hang
+   - Permission changes in manifest.json
 
 ---
 *Last updated: 2025-11-30*

@@ -30,6 +30,21 @@ async function attachDebugger(tabId) {
     await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable');
     await chrome.debugger.sendCommand({ tabId }, 'Page.enable');
   } catch (e) {
+    if (e.message && e.message.includes('Another debugger is already attached')) {
+      console.log('[Boon] CDP: Another debugger attached, trying to reuse...');
+      // Mark as attached and try to use existing session
+      debuggerAttached.set(tabId, true);
+      try {
+        await chrome.debugger.sendCommand({ tabId }, 'DOM.enable');
+        await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable');
+        await chrome.debugger.sendCommand({ tabId }, 'Page.enable');
+        console.log('[Boon] CDP: Reusing existing debugger session');
+        return;
+      } catch (e2) {
+        debuggerAttached.delete(tabId);
+        throw new Error('CDP debugger conflict. Run "boon-tools exec detach" or close Chrome DevTools.');
+      }
+    }
     console.error(`[Boon] CDP: Failed to attach debugger:`, e);
     throw e;
   }
@@ -58,17 +73,64 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 // ============ CDP OPERATIONS ============
 
 // Click at coordinates (trusted event)
+// NOTE: CDP mouse events may not trigger Zoon button handlers directly because
+// Zoon uses pointer events. We use a hybrid approach: CDP for coordinates,
+// then JS dispatch for pointer events.
+// IMPORTANT: x,y can be either page coordinates (from DOM.getBoxModel) or viewport coordinates.
+// CDP Input.dispatchMouseEvent expects viewport coordinates, so we convert if needed.
 async function cdpClickAt(tabId, x, y) {
   await attachDebugger(tabId);
 
+  // Get scroll offset to convert page coords to viewport coords for CDP events
+  const scrollOffset = await cdpEvaluate(tabId, `({ scrollX: window.scrollX, scrollY: window.scrollY })`);
+  const viewportX = x - (scrollOffset?.scrollX || 0);
+  const viewportY = y - (scrollOffset?.scrollY || 0);
+
+  // First, move mouse to position (some UIs require this)
   await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
-    type: 'mousePressed', x, y, button: 'left', clickCount: 1
-  });
-  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
-    type: 'mouseReleased', x, y, button: 'left', clickCount: 1
+    type: 'mouseMoved', x: viewportX, y: viewportY, button: 'none'
   });
 
-  console.log(`[Boon] CDP: Clicked at (${x}, ${y})`);
+  // Then send mouse press/release
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mousePressed', x: viewportX, y: viewportY, button: 'left', clickCount: 1
+  });
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x: viewportX, y: viewportY, button: 'left', clickCount: 1
+  });
+
+  // Also dispatch pointer events via JS since Zoon uses pointer events
+  // This ensures Zoon button handlers are triggered
+  // NOTE: x,y from DOM.getBoxModel are page coordinates, but elementFromPoint needs viewport coordinates
+  await cdpEvaluate(tabId, `
+    (function() {
+      // Convert page coordinates to viewport coordinates
+      const viewportX = ${x} - window.scrollX;
+      const viewportY = ${y} - window.scrollY;
+      const el = document.elementFromPoint(viewportX, viewportY);
+      if (!el) {
+        console.warn('[Boon] No element at viewport coords:', viewportX, viewportY, 'page coords:', ${x}, ${y});
+        return;
+      }
+
+      // Dispatch pointer events (what Zoon listens to)
+      ['pointerdown', 'pointerup'].forEach(type => {
+        el.dispatchEvent(new PointerEvent(type, {
+          bubbles: true, cancelable: true, view: window,
+          clientX: viewportX, clientY: viewportY,
+          pointerId: 1, pointerType: 'mouse', isPrimary: true
+        }));
+      });
+
+      // Also dispatch click for good measure
+      el.dispatchEvent(new MouseEvent('click', {
+        bubbles: true, cancelable: true, view: window,
+        clientX: viewportX, clientY: viewportY
+      }));
+    })()
+  `);
+
+  console.log(`[Boon] CDP: Clicked at (${x}, ${y}) with pointer events`);
 }
 
 // Get element bounding box via CDP
@@ -465,6 +527,38 @@ async function handleCommand(id, command) {
 
       case 'getDOM':
         return await executeInTab(tab.id, getDOMStructure, command.selector || null, command.depth || 4);
+
+      case 'detach':
+        // Detach CDP debugger to resolve "debugger already attached" conflicts
+        try {
+          if (debuggerAttached.get(tab.id)) {
+            await chrome.debugger.detach({ tabId: tab.id });
+            debuggerAttached.delete(tab.id);
+            cdpConsoleMessages.delete(tab.id);
+            console.log(`[Boon] CDP: Debugger detached from tab ${tab.id}`);
+          }
+          return { type: 'success', data: 'Debugger detached' };
+        } catch (e) {
+          // Even if detach fails, clear our state
+          debuggerAttached.delete(tab.id);
+          cdpConsoleMessages.delete(tab.id);
+          return { type: 'success', data: `Cleared state (detach error: ${e.message})` };
+        }
+
+      case 'refresh':
+        // Refresh the tab WITHOUT reloading the extension (safer than reload)
+        console.log('[Boon] Refreshing page...');
+        await chrome.tabs.reload(tab.id);
+        // Wait for page to load and API to be ready
+        let attempts = 0;
+        while (attempts < 30) {
+          await new Promise(r => setTimeout(r, 500));
+          if (await checkApiReady(tab.id)) {
+            return { type: 'success', data: 'Page refreshed, API ready' };
+          }
+          attempts++;
+        }
+        return { type: 'error', message: 'Page refreshed but API not ready after 15s' };
 
       case 'reload':
         // Hot reload: send response FIRST, then reload

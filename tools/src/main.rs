@@ -145,7 +145,13 @@ enum ExecAction {
         to_bottom: bool,
     },
 
-    /// Reload the extension (hot reload)
+    /// Detach CDP debugger (use when "debugger already attached" errors occur)
+    Detach,
+
+    /// Refresh the page without reloading extension (safer than reload)
+    Refresh,
+
+    /// Reload the extension (WARNING: disconnects extension, prefer 'refresh' for page reload)
     Reload,
 
     /// Full test: inject, run, check
@@ -368,7 +374,20 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
             print_response(response);
         }
 
+        ExecAction::Detach => {
+            println!("Detaching CDP debugger...");
+            let response = send_command_to_server(port, WsCommand::Detach).await?;
+            print_response(response);
+        }
+
+        ExecAction::Refresh => {
+            println!("Refreshing page (extension stays connected)...");
+            let response = send_command_to_server(port, WsCommand::Refresh).await?;
+            print_response(response);
+        }
+
         ExecAction::Reload => {
+            eprintln!("WARNING: 'reload' disconnects the extension. Consider using 'refresh' instead.");
             println!("Sending reload command to extension...");
             let response = send_command_to_server(port, WsCommand::Reload).await?;
             print_response(response);

@@ -25,7 +25,19 @@ use zoon::{Task, TaskHandle};
 use zoon::{WebStorage, local_storage};
 use zoon::{eprintln, println};
 
-const LOG_DROPS_AND_LOOP_ENDS: bool = false;
+/// Debug flag to log when ValueActors, Variables, and other constructs are dropped,
+/// and when their internal loops end. This is useful for debugging premature drop issues
+/// where subscriptions fail with "receiver is gone" errors.
+///
+/// When enabled, prints messages like:
+/// - "Dropped: {construct_info}" - when a construct is deallocated
+/// - "Loop ended {construct_info}" - when a ValueActor's internal loop exits
+///
+/// Common drop-related issues in the engine:
+/// - Subscriber dropped before all events are processed
+/// - ValueActor dropped while subscriptions are still active
+/// - Extra owned data not properly keeping actors alive
+const LOG_DROPS_AND_LOOP_ENDS: bool = true;
 
 // --- constant ---
 
@@ -535,8 +547,16 @@ impl VariableOrArgumentReference {
             }
             static_expression::Alias::WithPassed { extra_parts } => extra_parts,
         };
+        // IMPORTANT: We use `stream::unfold` instead of just `flat_map(|actor| actor.subscribe())`
+        // to keep the root actor alive while consuming its subscription. Without this,
+        // the actor would be dropped immediately after `subscribe()` is called, which
+        // cancels its internal task via `Task::start_droppable` before it can send values.
         let mut value_stream = stream::once(root_value_actor)
-            .flat_map(|actor| actor.subscribe())
+            .flat_map(|actor| {
+                stream::unfold((actor.subscribe(), actor), |(mut subscription, actor)| async move {
+                    subscription.next().await.map(|value| (value, (subscription, actor)))
+                })
+            })
             .boxed_local();
         for alias_part in alias_parts.into_iter().skip(skip_alias_parts) {
             let alias_part = alias_part.to_string();
@@ -544,20 +564,29 @@ impl VariableOrArgumentReference {
                 .flat_map(move |value| {
                     match value {
                         Value::Object(object, _) => {
-                            let inner_stream = object.expect_variable(&alias_part).subscribe();
-                            // Keep object alive by moving it into the stream closure
-                            inner_stream.map(move |v| {
-                                let _keep_alive = &object;
-                                v
-                            }).boxed_local()
+                            let variable = object.expect_variable(&alias_part);
+                            let variable_actor = variable.value_actor();
+                            // IMPORTANT: Use stream::unfold to keep both the object and the variable's
+                            // actor alive while consuming the subscription. Without this, actors get
+                            // dropped immediately after subscribe() is called.
+                            stream::unfold(
+                                (variable_actor.subscribe(), object, variable_actor),
+                                |(mut subscription, object, actor)| async move {
+                                    subscription.next().await.map(|value| (value, (subscription, object, actor)))
+                                }
+                            ).boxed_local()
                         }
                         Value::TaggedObject(tagged_object, _) => {
-                            let inner_stream = tagged_object.expect_variable(&alias_part).subscribe();
-                            // Keep tagged_object alive by moving it into the stream closure
-                            inner_stream.map(move |v| {
-                                let _keep_alive = &tagged_object;
-                                v
-                            }).boxed_local()
+                            let variable = tagged_object.expect_variable(&alias_part);
+                            let variable_actor = variable.value_actor();
+                            // IMPORTANT: Use stream::unfold to keep both the tagged_object and the variable's
+                            // actor alive while consuming the subscription.
+                            stream::unfold(
+                                (variable_actor.subscribe(), tagged_object, variable_actor),
+                                |(mut subscription, tagged_object, actor)| async move {
+                                    subscription.next().await.map(|value| (value, (subscription, tagged_object, actor)))
+                                }
+                            ).boxed_local()
                         }
                         other => panic!(
                             "Failed to get Object or TaggedObject to create VariableOrArgumentReference: The Value has a different type {}",

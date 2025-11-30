@@ -564,7 +564,8 @@ impl Playground {
                     Some(Width::fill())
                 } else {
                     let container_width = *container as f64;
-                    if container_width > PANEL_DIVIDER_WIDTH {
+                    let min_total = MIN_EDITOR_WIDTH_PX + MIN_PREVIEW_WIDTH_PX + PANEL_DIVIDER_WIDTH;
+                    if container_width >= min_total {
                         let available = container_width - PANEL_DIVIDER_WIDTH;
                         let desired = (available * ratio).clamp(
                             MIN_EDITOR_WIDTH_PX,
@@ -641,7 +642,8 @@ impl Playground {
                     Some(Width::fill())
                 } else {
                     let container_width = *container as f64;
-                    if container_width > PANEL_DIVIDER_WIDTH {
+                    let min_total = MIN_EDITOR_WIDTH_PX + MIN_PREVIEW_WIDTH_PX + PANEL_DIVIDER_WIDTH;
+                    if container_width >= min_total {
                         let available = container_width - PANEL_DIVIDER_WIDTH;
                         let editor = (available * ratio).clamp(
                             MIN_EDITOR_WIDTH_PX,

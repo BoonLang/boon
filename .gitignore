@@ -2,5 +2,8 @@
 .idea
 **/.DS_Store
 
+# Chrome profile for browser automation testing
+tools/.chrome-profile/
+
 # DigitalJS development environment (cloned external repos)
 playground/frontend/src/examples/hw_examples/super_counter/digitaljs_boon/
