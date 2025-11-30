@@ -53,6 +53,15 @@ pub enum Command {
         #[serde(skip_serializing_if = "Option::is_none")]
         depth: Option<u32>,
     },
+
+    /// Get preview panel elements with bounding boxes
+    GetPreviewElements,
+
+    /// Click at absolute screen coordinates
+    ClickAt { x: i32, y: i32 },
+
+    /// Clear saved states (reset localStorage for Boon playground)
+    ClearStates,
 }
 
 /// Response from Extension to CLI via Server
@@ -91,6 +100,9 @@ pub enum Response {
 
     /// DOM structure
     Dom { structure: String },
+
+    /// Preview elements with bounding boxes
+    PreviewElements { data: serde_json::Value },
 }
 
 /// Console message from browser

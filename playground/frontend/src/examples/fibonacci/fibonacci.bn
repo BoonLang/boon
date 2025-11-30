@@ -9,7 +9,7 @@ FUNCTION fibonacci(position) {
                 ]
             }
         }
-        // Only return when iteration reaches target position
+        -- Only return when iteration reaches target position
         state.iteration |> WHEN {
             position => state.current
             __ => SKIP
@@ -19,4 +19,4 @@ FUNCTION fibonacci(position) {
 
 position: 5
 result: position |> fibonacci()
-TEXT { "{position}. Fibonacci number is {result}" } |> Console/log()
+TEXT { "{position}. Fibonacci number is {result}" } |> Log/info()

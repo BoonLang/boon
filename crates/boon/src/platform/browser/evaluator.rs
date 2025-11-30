@@ -1409,7 +1409,8 @@ fn static_spanned_expression_into_value_actor(
                 inputs.iter().map(|input| input.subscribe())
             );
 
-            ValueActor::new_arc(
+            // Keep the input ValueActors alive as long as the LATEST ValueActor is alive
+            ValueActor::new_arc_with_extra_owned_data(
                 ConstructInfo::new(
                     format!("PersistenceId: {persistence_id}"),
                     persistence,
@@ -1417,6 +1418,7 @@ fn static_spanned_expression_into_value_actor(
                 ),
                 actor_context,
                 merged_stream,
+                inputs, // Keep inputs alive in the spawned task
             )
         }
         static_expression::Expression::Then { body } => {
@@ -1496,7 +1498,8 @@ fn static_spanned_expression_into_value_actor(
                     // Flatten the stream of actors into a stream of values
                     let flattened_stream = mapped_stream.flat_map(|actor| actor.subscribe());
 
-                    ValueActor::new_arc(
+                    // Keep the piped ValueActor alive as long as the THEN ValueActor is alive
+                    ValueActor::new_arc_with_extra_owned_data(
                         ConstructInfo::new(
                             format!("PersistenceId: {persistence_id}"),
                             persistence,
@@ -1504,6 +1507,7 @@ fn static_spanned_expression_into_value_actor(
                         ),
                         actor_context,
                         flattened_stream,
+                        piped, // Keep piped alive in the spawned task
                     )
                 }
                 None => {
@@ -1592,7 +1596,8 @@ fn static_spanned_expression_into_value_actor(
                     // Flatten the stream of actors into a stream of values
                     let flattened_stream = mapped_stream.flat_map(|actor| actor.subscribe());
 
-                    ValueActor::new_arc(
+                    // Keep the piped ValueActor alive as long as the WHEN ValueActor is alive
+                    ValueActor::new_arc_with_extra_owned_data(
                         ConstructInfo::new(
                             format!("PersistenceId: {persistence_id}"),
                             persistence,
@@ -1600,6 +1605,7 @@ fn static_spanned_expression_into_value_actor(
                         ),
                         actor_context,
                         flattened_stream,
+                        piped, // Keep piped alive in the spawned task
                     )
                 }
                 None => {
@@ -1688,7 +1694,8 @@ fn static_spanned_expression_into_value_actor(
                     // Flatten the stream of actors into a stream of values
                     let flattened_stream = mapped_stream.flat_map(|actor| actor.subscribe());
 
-                    ValueActor::new_arc(
+                    // Keep the piped ValueActor alive as long as the WHILE ValueActor is alive
+                    ValueActor::new_arc_with_extra_owned_data(
                         ConstructInfo::new(
                             format!("PersistenceId: {persistence_id}"),
                             persistence,
@@ -1696,6 +1703,7 @@ fn static_spanned_expression_into_value_actor(
                         ),
                         actor_context,
                         flattened_stream,
+                        piped, // Keep piped alive in the spawned task
                     )
                 }
                 None => {
@@ -1804,7 +1812,8 @@ fn static_spanned_expression_into_value_actor(
                 state_update_stream
             );
 
-            ValueActor::new_arc(
+            // Keep initial_actor and body_result alive as long as the LatestWithState ValueActor is alive
+            ValueActor::new_arc_with_extra_owned_data(
                 ConstructInfo::new(
                     format!("PersistenceId: {persistence_id}"),
                     persistence,
@@ -1812,6 +1821,7 @@ fn static_spanned_expression_into_value_actor(
                 ),
                 actor_context,
                 combined_stream,
+                (initial_actor, body_result), // Keep both alive in the spawned task
             )
         }
         static_expression::Expression::Flush { value } => {

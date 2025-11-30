@@ -6,7 +6,9 @@
   "permissions": [
     "activeTab",
     "scripting",
-    "tabs"
+    "tabs",
+    "alarms",
+    "debugger"
   ],
   "host_permissions": [
     "http://localhost:8081/*",

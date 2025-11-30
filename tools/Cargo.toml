@@ -35,3 +35,6 @@ base64 = "0.21"
 
 # File watching for extension hot reload
 notify = "6"
+
+# Find browser binaries in PATH
+which = "7"

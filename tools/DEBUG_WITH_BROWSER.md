@@ -202,19 +202,98 @@ The WebSocket server supports automatic extension reloading during development:
 boon-tools exec reload
 ```
 
-## Why Chrome Extension Instead of CDP?
+## CDP Support via chrome.debugger API
 
-We tried CDP (Chrome DevTools Protocol) first, but it couldn't trigger Zoon's reactive system:
-- Synthetic DOM events from CDP are ignored by Zoon
-- CDP mouse/keyboard events don't trigger Zoon handlers
-- wasm_bindgen closures setting Mutable don't trigger reactive updates
+The extension now uses Chrome DevTools Protocol (CDP) via the `chrome.debugger` API for trusted events.
 
-The Chrome Extension solution works because:
-- Scripts execute in the actual page context (MAIN world)
-- Can call `window.boonPlayground` which runs within Zoon's reactive system
-- Native DOM operations are trusted by the browser
+### Why CDP?
 
-**Note:** CDP support was removed from boon-tools to simplify the codebase. All browser automation now goes through the extension.
+Synthetic DOM events created with `dispatchEvent()` have `isTrusted: false`:
+- They are detectable as fake events
+- Zoon/MoonZoon event handlers may ignore them
+- They don't accurately simulate real user interaction
+
+CDP's `Input.dispatchMouseEvent` creates events with `isTrusted: true` because they go through the browser's actual input pipeline.
+
+### How It Works
+
+```
+┌─────────────────┐     WebSocket      ┌─────────────────────┐     CDP API      ┌─────────────┐
+│   boon-tools    │ ◄──────────────────► │  Chrome Extension   │ ◄───────────────► │   Browser   │
+│   (CLI/Rust)    │     port 9222      │  (background.js)    │  chrome.debugger │   (Tab)     │
+└─────────────────┘                    └─────────────────────┘                  └─────────────┘
+```
+
+### CDP Operations in background.js
+
+**Debugger Attachment:**
+```javascript
+async function attachDebugger(tabId) {
+  await chrome.debugger.attach({ tabId }, '1.3');  // CDP version 1.3
+  await chrome.debugger.sendCommand({ tabId }, 'DOM.enable');
+  await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable');
+  await chrome.debugger.sendCommand({ tabId }, 'Page.enable');
+}
+```
+
+**Trusted Click (isTrusted: true):**
+```javascript
+async function cdpClickAt(tabId, x, y) {
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mousePressed', x, y, button: 'left', clickCount: 1
+  });
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x, y, button: 'left', clickCount: 1
+  });
+}
+```
+
+**Get Element Coordinates:**
+```javascript
+async function cdpGetElementBox(tabId, selector) {
+  const { root } = await chrome.debugger.sendCommand({ tabId }, 'DOM.getDocument');
+  const { nodeId } = await chrome.debugger.sendCommand({ tabId }, 'DOM.querySelector', {
+    nodeId: root.nodeId, selector
+  });
+  const { model } = await chrome.debugger.sendCommand({ tabId }, 'DOM.getBoxModel', { nodeId });
+  // Returns centerX, centerY for clicking
+}
+```
+
+**Screenshot via CDP:**
+```javascript
+async function cdpScreenshot(tabId) {
+  const { data } = await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', { format: 'png' });
+  return data;  // base64 encoded
+}
+```
+
+### Debug Banner
+
+When the debugger is attached, Chrome shows a blue banner:
+> "Boon Browser Control" started debugging this browser
+
+This is expected and cannot be hidden (security feature).
+
+### CDP vs executeScript
+
+| Feature | CDP | executeScript |
+|---------|-----|---------------|
+| isTrusted events | Yes | No |
+| Works on any page | Yes | Needs host_permissions |
+| Screenshot | Native | Requires canvas |
+| Performance | Fast | Slower |
+
+### Hybrid Approach
+
+The extension uses CDP for:
+- Click events (`Input.dispatchMouseEvent`)
+- Screenshots (`Page.captureScreenshot`)
+- Element queries (`DOM.querySelector`, `DOM.getBoxModel`)
+
+And still uses executeScript for:
+- Calling `window.boonPlayground` API (code injection, run, preview)
+- Operations that need to interact with the page's JavaScript context
 
 ## Troubleshooting
 

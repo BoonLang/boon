@@ -7,9 +7,250 @@ let reconnectTimer = null;
 let contentPort = null;
 let pendingRequests = new Map();
 
+// Exponential backoff for reconnection
+let reconnectAttempts = 0;
+const MAX_RECONNECT_DELAY = 30000; // 30 seconds max
+
+// ============ CDP INFRASTRUCTURE ============
+// Chrome DevTools Protocol for trusted events (isTrusted: true)
+
+let debuggerAttached = new Map(); // tabId -> boolean
+let cdpConsoleMessages = new Map(); // tabId -> messages[]
+
+async function attachDebugger(tabId) {
+  if (debuggerAttached.get(tabId)) return;
+
+  try {
+    await chrome.debugger.attach({ tabId }, '1.3');
+    debuggerAttached.set(tabId, true);
+    console.log(`[Boon] CDP: Debugger attached to tab ${tabId}`);
+
+    // Enable domains we need
+    await chrome.debugger.sendCommand({ tabId }, 'DOM.enable');
+    await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable');
+    await chrome.debugger.sendCommand({ tabId }, 'Page.enable');
+  } catch (e) {
+    console.error(`[Boon] CDP: Failed to attach debugger:`, e);
+    throw e;
+  }
+}
+
+// Handle debugger events (console messages)
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (method === 'Runtime.consoleAPICalled') {
+    const messages = cdpConsoleMessages.get(source.tabId) || [];
+    messages.push({
+      level: params.type, // 'log', 'warn', 'error', etc.
+      text: params.args.map(arg => arg.value || arg.description || '').join(' '),
+      timestamp: Date.now()
+    });
+    if (messages.length > 100) messages.shift();
+    cdpConsoleMessages.set(source.tabId, messages);
+  }
+});
+
+chrome.debugger.onDetach.addListener((source, reason) => {
+  console.log(`[Boon] CDP: Debugger detached from tab ${source.tabId}, reason: ${reason}`);
+  debuggerAttached.delete(source.tabId);
+  cdpConsoleMessages.delete(source.tabId);
+});
+
+// ============ CDP OPERATIONS ============
+
+// Click at coordinates (trusted event)
+async function cdpClickAt(tabId, x, y) {
+  await attachDebugger(tabId);
+
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mousePressed', x, y, button: 'left', clickCount: 1
+  });
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x, y, button: 'left', clickCount: 1
+  });
+
+  console.log(`[Boon] CDP: Clicked at (${x}, ${y})`);
+}
+
+// Get element bounding box via CDP
+async function cdpGetElementBox(tabId, selector) {
+  await attachDebugger(tabId);
+
+  const { root } = await chrome.debugger.sendCommand({ tabId }, 'DOM.getDocument');
+  const { nodeId } = await chrome.debugger.sendCommand({ tabId }, 'DOM.querySelector', {
+    nodeId: root.nodeId, selector
+  });
+
+  if (!nodeId) return null;
+
+  const { model } = await chrome.debugger.sendCommand({ tabId }, 'DOM.getBoxModel', { nodeId });
+  const content = model.content; // [x1,y1, x2,y2, x3,y3, x4,y4]
+
+  return {
+    x: content[0],
+    y: content[1],
+    width: content[2] - content[0],
+    height: content[5] - content[1],
+    centerX: (content[0] + content[2]) / 2,
+    centerY: (content[1] + content[5]) / 2
+  };
+}
+
+// Click by selector (find element, then click at center)
+async function cdpClickSelector(tabId, selector) {
+  const box = await cdpGetElementBox(tabId, selector);
+  if (!box) throw new Error(`Element not found: ${selector}`);
+
+  await cdpClickAt(tabId, box.centerX, box.centerY);
+  return { x: box.centerX, y: box.centerY };
+}
+
+// Type text (as if typing on keyboard - insertText is fast)
+async function cdpTypeText(tabId, text) {
+  await attachDebugger(tabId);
+  await chrome.debugger.sendCommand({ tabId }, 'Input.insertText', { text });
+}
+
+// Press special key (Enter, Tab, Escape, etc.)
+async function cdpPressKey(tabId, key, modifiers = 0) {
+  await attachDebugger(tabId);
+
+  const keyMap = {
+    'Enter': { key: 'Enter', code: 'Enter', keyCode: 13, windowsVirtualKeyCode: 13 },
+    'Tab': { key: 'Tab', code: 'Tab', keyCode: 9, windowsVirtualKeyCode: 9 },
+    'Escape': { key: 'Escape', code: 'Escape', keyCode: 27, windowsVirtualKeyCode: 27 },
+    'Backspace': { key: 'Backspace', code: 'Backspace', keyCode: 8, windowsVirtualKeyCode: 8 },
+    'Delete': { key: 'Delete', code: 'Delete', keyCode: 46, windowsVirtualKeyCode: 46 },
+    'a': { key: 'a', code: 'KeyA', keyCode: 65, windowsVirtualKeyCode: 65 },
+  };
+
+  const keyInfo = keyMap[key] || { key, code: key, keyCode: 0, windowsVirtualKeyCode: 0 };
+
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+    type: 'keyDown', ...keyInfo, modifiers
+  });
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+    type: 'keyUp', ...keyInfo, modifiers
+  });
+}
+
+// Keyboard shortcut (Ctrl+A, Ctrl+V, etc.)
+async function cdpKeyboardShortcut(tabId, key, ctrl = false, shift = false, alt = false) {
+  let modifiers = 0;
+  if (ctrl) modifiers |= 2;
+  if (shift) modifiers |= 8;
+  if (alt) modifiers |= 1;
+
+  await cdpPressKey(tabId, key, modifiers);
+}
+
+// Screenshot via CDP
+async function cdpScreenshot(tabId) {
+  await attachDebugger(tabId);
+
+  const { data } = await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', {
+    format: 'png'
+  });
+  return data; // base64 encoded
+}
+
+// Scroll via mouse wheel
+async function cdpScroll(tabId, x, y, deltaX = 0, deltaY = 0) {
+  await attachDebugger(tabId);
+
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseWheel', x, y, deltaX, deltaY
+  });
+}
+
+// Get console messages (captured via Runtime.consoleAPICalled)
+function cdpGetConsole(tabId) {
+  return cdpConsoleMessages.get(tabId) || [];
+}
+
+// Execute JavaScript via CDP (only when CDP doesn't have equivalent)
+async function cdpEvaluate(tabId, expression) {
+  await attachDebugger(tabId);
+
+  const { result, exceptionDetails } = await chrome.debugger.sendCommand(
+    { tabId }, 'Runtime.evaluate', { expression, returnByValue: true }
+  );
+
+  if (exceptionDetails) {
+    throw new Error(exceptionDetails.exception?.description || 'Evaluation failed');
+  }
+
+  return result.value;
+}
+
+// Focus element via CDP
+async function cdpFocusElement(tabId, selector) {
+  await attachDebugger(tabId);
+
+  const { root } = await chrome.debugger.sendCommand({ tabId }, 'DOM.getDocument');
+  const { nodeId } = await chrome.debugger.sendCommand({ tabId }, 'DOM.querySelector', {
+    nodeId: root.nodeId, selector
+  });
+
+  if (!nodeId) throw new Error(`Element not found: ${selector}`);
+
+  await chrome.debugger.sendCommand({ tabId }, 'DOM.focus', { nodeId });
+}
+
+// Get all elements matching selector with their boxes
+async function cdpQuerySelectorAll(tabId, selector) {
+  await attachDebugger(tabId);
+
+  const { root } = await chrome.debugger.sendCommand({ tabId }, 'DOM.getDocument');
+  const { nodeIds } = await chrome.debugger.sendCommand({ tabId }, 'DOM.querySelectorAll', {
+    nodeId: root.nodeId, selector
+  });
+
+  const elements = [];
+  for (const nodeId of nodeIds) {
+    try {
+      const { model } = await chrome.debugger.sendCommand({ tabId }, 'DOM.getBoxModel', { nodeId });
+      const content = model.content;
+
+      // Get node info
+      const { outerHTML } = await chrome.debugger.sendCommand({ tabId }, 'DOM.getOuterHTML', { nodeId });
+
+      elements.push({
+        nodeId,
+        x: content[0],
+        y: content[1],
+        width: content[2] - content[0],
+        height: content[5] - content[1],
+        centerX: (content[0] + content[2]) / 2,
+        centerY: (content[1] + content[5]) / 2,
+        html: outerHTML.substring(0, 200)
+      });
+    } catch (e) {
+      // Element might be invisible or have no layout
+    }
+  }
+
+  return elements;
+}
+
+// Safe send that handles errors
+function safeSend(message) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(typeof message === 'string' ? message : JSON.stringify(message));
+      return true;
+    } catch (e) {
+      console.error('[Boon] Send failed:', e);
+      scheduleReconnect();
+      return false;
+    }
+  }
+  return false;
+}
+
 // Connect to WebSocket server
 function connect() {
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  // Check both CONNECTING and OPEN states to avoid race conditions
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
     return;
   }
 
@@ -25,12 +266,14 @@ function connect() {
 
   ws.onopen = () => {
     console.log('[Boon] Connected to WebSocket server');
+    // Reset reconnect attempts on successful connection
+    reconnectAttempts = 0;
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
     // Identify as extension to the server
-    ws.send(JSON.stringify({ clientType: 'extension' }));
+    safeSend({ clientType: 'extension' });
   };
 
   ws.onclose = () => {
@@ -50,13 +293,12 @@ function connect() {
 
       const response = await handleCommand(request.id, request.command);
 
-      const responseMsg = JSON.stringify({
-        id: request.id,
-        response: response
-      });
-
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(responseMsg);
+      // Some commands (like reload) return null to indicate no response needed
+      if (response !== null) {
+        safeSend({
+          id: request.id,
+          response: response
+        });
         console.log('[Boon] Sent response:', response);
       }
     } catch (e) {
@@ -68,10 +310,16 @@ function connect() {
 function scheduleReconnect() {
   if (reconnectTimer) return;
 
+  // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (max)
+  const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY);
+  reconnectAttempts++;
+
+  console.log(`[Boon] Scheduling reconnect in ${delay}ms (attempt ${reconnectAttempts})`);
+
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connect();
-  }, 3000);
+  }, delay);
 }
 
 // Handle incoming commands
@@ -100,53 +348,141 @@ async function handleCommand(id, command) {
           apiReady: await checkApiReady(tab.id)
         };
 
+      // ============ CDP-BASED COMMANDS (trusted events) ============
+
       case 'click':
-        return await executeInTab(tab.id, clickElement, command.selector);
+        // Use CDP for trusted click events
+        try {
+          const clickPos = await cdpClickSelector(tab.id, command.selector);
+          return { type: 'success', data: { ...clickPos, method: 'cdp' } };
+        } catch (e) {
+          return { type: 'error', message: e.message };
+        }
+
+      case 'clickAt':
+        // Use CDP for trusted click at coordinates
+        await cdpClickAt(tab.id, command.x, command.y);
+        return { type: 'success', data: { x: command.x, y: command.y, method: 'cdp' } };
 
       case 'type':
-        return await executeInTab(tab.id, typeInElement, command.selector, command.text);
-
-      case 'injectCode':
-        return await executeInTab(tab.id, injectCode, command.code);
-
-      case 'triggerRun':
-        return await executeInTab(tab.id, triggerRun);
+        // Use CDP: focus element, then type
+        try {
+          await cdpFocusElement(tab.id, command.selector);
+          await cdpKeyboardShortcut(tab.id, 'a', true); // Ctrl+A to select all
+          await cdpTypeText(tab.id, command.text);
+          return { type: 'success', data: null };
+        } catch (e) {
+          return { type: 'error', message: e.message };
+        }
 
       case 'screenshot':
-        return await captureScreenshot(tab.id);
+        // Use CDP for screenshot
+        try {
+          const base64 = await cdpScreenshot(tab.id);
+          return { type: 'screenshot', base64 };
+        } catch (e) {
+          return { type: 'error', message: `Screenshot failed: ${e.message}` };
+        }
 
       case 'getConsole':
-        // First ensure console capture is set up
-        await executeInTab(tab.id, setupConsoleCapture);
-        return await executeInTab(tab.id, getConsoleMessages);
+        // Use CDP console capture (automatic via Runtime.consoleAPICalled)
+        return { type: 'console', messages: cdpGetConsole(tab.id) };
 
       case 'setupConsole':
-        return await executeInTab(tab.id, setupConsoleCapture);
+        // CDP handles console capture automatically when attached
+        await attachDebugger(tab.id);
+        return { type: 'success', data: 'CDP console capture enabled' };
+
+      case 'scroll':
+        // Use CDP mouse wheel for scrolling
+        try {
+          const previewBox = await cdpGetElementBox(tab.id, '[data-boon-panel="preview"]');
+          if (!previewBox) return { type: 'error', message: 'Preview panel not found' };
+          const deltaY = command.toBottom ? 10000 : (command.delta || command.y || 0);
+          await cdpScroll(tab.id, previewBox.centerX, previewBox.centerY, 0, deltaY);
+          return { type: 'success', data: null };
+        } catch (e) {
+          return { type: 'error', message: e.message };
+        }
+
+      // ============ CDP Runtime.evaluate for playground API ============
+
+      case 'injectCode':
+        // Use CDP Runtime.evaluate (still CDP, minimal JS injection)
+        try {
+          await cdpEvaluate(tab.id, `window.boonPlayground.setCode(${JSON.stringify(command.code)})`);
+          return { type: 'success', data: null };
+        } catch (e) {
+          return { type: 'error', message: e.message };
+        }
+
+      case 'triggerRun':
+        // Use CDP Runtime.evaluate for playground API
+        try {
+          await cdpEvaluate(tab.id, 'window.boonPlayground.run()');
+          return { type: 'success', data: null };
+        } catch (e) {
+          return { type: 'error', message: e.message };
+        }
 
       case 'getPreviewText':
-        return await executeInTab(tab.id, getPreviewText);
+        // Use CDP Runtime.evaluate
+        try {
+          const text = await cdpEvaluate(tab.id,
+            `document.querySelector('[data-boon-panel="preview"]')?.textContent || ''`);
+          return { type: 'previewText', text };
+        } catch (e) {
+          return { type: 'error', message: e.message };
+        }
+
+      case 'getPreviewElements':
+        // Use CDP to get elements with bounding boxes
+        try {
+          const elements = await cdpQuerySelectorAll(tab.id,
+            '[data-boon-panel="preview"] [role="button"], [data-boon-panel="preview"] button');
+          return { type: 'previewElements', data: { elements } };
+        } catch (e) {
+          return { type: 'error', message: e.message };
+        }
+
+      case 'clearStates':
+        // Use CDP to click the Clear saved states button
+        try {
+          // Find the button by its text content via CDP
+          const buttons = await cdpQuerySelectorAll(tab.id, 'button');
+          const clearButton = buttons.find(b =>
+            b.html.toLowerCase().includes('clear') && b.html.toLowerCase().includes('states'));
+          if (clearButton) {
+            await cdpClickAt(tab.id, clearButton.centerX, clearButton.centerY);
+            return { type: 'success', data: { method: 'cdp' } };
+          }
+          return { type: 'error', message: 'Clear saved states button not found' };
+        } catch (e) {
+          return { type: 'error', message: e.message };
+        }
+
+      // ============ Legacy commands still using executeScript ============
 
       case 'getDOM':
         return await executeInTab(tab.id, getDOMStructure, command.selector || null, command.depth || 4);
 
-      case 'scroll':
-        return await executeInTab(tab.id, scrollPreview, command.y, command.delta, command.toBottom);
-
       case 'reload':
-        // Hot reload: reload the extension and refresh the playground tab
+        // Hot reload: send response FIRST, then reload
         console.log('[Boon] Reloading extension...');
-        // Refresh the playground tab first
+        // Send success response before we terminate
+        safeSend({ id, response: { type: 'success', data: null } });
+        // Small delay to allow response to send
+        await new Promise(resolve => setTimeout(resolve, 100));
+        // Refresh the playground tab
         try {
           await chrome.tabs.reload(tab.id);
         } catch (e) {
           console.log('[Boon] Could not refresh tab:', e);
         }
-        // Small delay to allow tab refresh to start
-        await new Promise(resolve => setTimeout(resolve, 100));
         // Now reload the extension - this will terminate the service worker
         chrome.runtime.reload();
-        // Code after this won't run - extension terminates
-        return { type: 'success', data: null };
+        // Return null to indicate response already sent
+        return null;
 
       default:
         return { type: 'error', message: `Unknown command: ${type}` };
@@ -208,12 +544,110 @@ async function captureScreenshot(tabId) {
 
 // Functions to be injected into page context
 function clickElement(selector) {
-  const el = document.querySelector(selector);
-  if (!el) {
-    return { type: 'error', message: `Element not found: ${selector}` };
+  let el = null;
+  let foundBy = 'selector';
+  const preview = document.querySelector('[data-boon-panel="preview"]');
+
+  // First try exact CSS selector in whole document
+  try {
+    el = document.querySelector(selector);
+  } catch (e) {
+    // Invalid selector, will try text matching below
   }
-  el.click();
-  return { type: 'success', data: null };
+
+  // If not found, try within the preview panel
+  if (!el && preview) {
+    try {
+      el = preview.querySelector(selector);
+    } catch (e) {}
+
+    // Boon/Zoon renders buttons as <div role="button">, not <button> elements
+    // If selector is "button" and not found, try [role="button"]
+    if (!el && selector === 'button') {
+      el = preview.querySelector('[role="button"]');
+      if (el) foundBy = 'role=button';
+    }
+
+    // Try finding by text content in preview panel (for Boon UI elements)
+    // This works now with DOM and will need adaptation for WebGPU later
+    if (!el) {
+      const searchText = selector.toLowerCase().trim();
+      const candidates = preview.querySelectorAll('[role="button"], [tabindex], [onclick]');
+
+      // First pass: look for exact text match (most specific)
+      for (const candidate of candidates) {
+        const text = (candidate.textContent || '').trim().toLowerCase();
+        if (text === searchText) {
+          el = candidate;
+          foundBy = 'text content (exact)';
+          break;
+        }
+      }
+
+      // Second pass: look for partial match if no exact match found
+      if (!el) {
+        for (const candidate of candidates) {
+          const text = (candidate.textContent || '').trim().toLowerCase();
+          if (text.includes(searchText)) {
+            el = candidate;
+            foundBy = 'text content (partial)';
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // Final fallback: try [role="button"] anywhere
+  if (!el && selector === 'button') {
+    el = document.querySelector('[role="button"]');
+    if (el) foundBy = 'role=button (document)';
+  }
+
+  if (!el) {
+    return { type: 'error', message: `Element not found: ${selector}. Try using 'elements' command to get bounding boxes, then 'click-at x y'.` };
+  }
+
+  // Click at center of element's bounding box
+  const rect = el.getBoundingClientRect();
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+
+  // Zoon/MoonZoon uses pointer events, dispatch both pointer and mouse events for compatibility
+  const pointerEvents = ['pointerdown', 'pointerup'];
+  for (const eventType of pointerEvents) {
+    const event = new PointerEvent(eventType, {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: x,
+      clientY: y,
+      pointerId: 1,
+      pointerType: 'mouse',
+      isPrimary: true
+    });
+    el.dispatchEvent(event);
+  }
+
+  // Also dispatch mouse events and click for general compatibility
+  const mouseEvents = ['mousedown', 'mouseup', 'click'];
+  for (const eventType of mouseEvents) {
+    const event = new MouseEvent(eventType, {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: x,
+      clientY: y
+    });
+    el.dispatchEvent(event);
+  }
+
+  return { type: 'success', data: {
+    tag: el.tagName.toLowerCase(),
+    text: (el.textContent || '').trim().substring(0, 50),
+    foundBy,
+    bounds: { x: Math.round(rect.left), y: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height) }
+  }};
 }
 
 function typeInElement(selector, text) {
@@ -339,6 +773,157 @@ function getPreviewText() {
   return { type: 'error', message: 'Could not get preview text' };
 }
 
+function getPreviewElements() {
+  const preview = document.querySelector('[data-boon-panel="preview"]');
+  if (!preview) {
+    return { type: 'error', message: 'Preview panel not found' };
+  }
+
+  const panelRect = preview.getBoundingClientRect();
+  const elements = [];
+
+  // Find all interactive/significant elements in preview
+  const interactiveSelectors = [
+    '[role="button"]',
+    'button',
+    'a',
+    'input',
+    'select',
+    'textarea',
+    '[onclick]',
+    '[tabindex]'
+  ];
+
+  const allInteractive = preview.querySelectorAll(interactiveSelectors.join(','));
+
+  allInteractive.forEach((el, index) => {
+    const rect = el.getBoundingClientRect();
+    // Get relative position within preview panel
+    const relX = rect.left - panelRect.left;
+    const relY = rect.top - panelRect.top;
+
+    elements.push({
+      index,
+      tag: el.tagName.toLowerCase(),
+      text: (el.textContent || '').trim().substring(0, 50),
+      role: el.getAttribute('role'),
+      classes: el.className,
+      // Bounding box relative to preview panel
+      bbox: {
+        x: Math.round(relX),
+        y: Math.round(relY),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        // Absolute position for clicking
+        absX: Math.round(rect.left + rect.width / 2),
+        absY: Math.round(rect.top + rect.height / 2)
+      },
+      // Generate a unique selector
+      selector: generateSelector(el, preview)
+    });
+  });
+
+  // Also get all text nodes with their positions
+  const textNodes = [];
+  const walker = document.createTreeWalker(preview, NodeFilter.SHOW_TEXT, null, false);
+  let node;
+  while (node = walker.nextNode()) {
+    const text = node.textContent.trim();
+    if (text) {
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const rect = range.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        textNodes.push({
+          text: text.substring(0, 100),
+          bbox: {
+            x: Math.round(rect.left - panelRect.left),
+            y: Math.round(rect.top - panelRect.top),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
+          }
+        });
+      }
+    }
+  }
+
+  return {
+    type: 'previewElements',
+    data: {
+      panelSize: {
+        width: Math.round(panelRect.width),
+        height: Math.round(panelRect.height)
+      },
+      elements,
+      textNodes,
+      html: preview.innerHTML.substring(0, 2000)
+    }
+  };
+}
+
+// Helper to generate a unique selector for an element
+function generateSelector(el, container) {
+  // Try ID first
+  if (el.id) return `#${el.id}`;
+
+  // Try unique class within container
+  if (el.className && typeof el.className === 'string') {
+    const classes = el.className.split(' ').filter(c => c && !c.startsWith('_'));
+    for (const cls of classes) {
+      if (container.querySelectorAll(`.${cls}`).length === 1) {
+        return `.${cls}`;
+      }
+    }
+  }
+
+  // Try role + text content
+  const role = el.getAttribute('role');
+  if (role) {
+    const text = (el.textContent || '').trim();
+    if (text && text.length < 30) {
+      // This is just informational - actual click should use coordinates
+      return `[role="${role}"] containing "${text}"`;
+    }
+    return `[role="${role}"]`;
+  }
+
+  // Try data-boon-panel child path
+  const boonPanel = el.closest('[data-boon-panel="preview"]');
+  if (boonPanel) {
+    return `[data-boon-panel="preview"] ${el.tagName.toLowerCase()}`;
+  }
+
+  return el.tagName.toLowerCase();
+}
+
+function clickAtCoordinates(x, y) {
+  const element = document.elementFromPoint(x, y);
+  if (!element) {
+    return { type: 'error', message: `No element at coordinates (${x}, ${y})` };
+  }
+
+  // Create and dispatch proper mouse events
+  const events = ['mousedown', 'mouseup', 'click'];
+  for (const eventType of events) {
+    const event = new MouseEvent(eventType, {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: x,
+      clientY: y
+    });
+    element.dispatchEvent(event);
+  }
+
+  return {
+    type: 'success',
+    data: {
+      clickedTag: element.tagName.toLowerCase(),
+      clickedText: (element.textContent || '').trim().substring(0, 50)
+    }
+  };
+}
+
 function getDOMStructure(selector, maxDepth = 4) {
   const root = selector ? document.querySelector(selector) : document.body;
   if (!root) {
@@ -414,8 +999,70 @@ function scrollPreview(y, delta, toBottom) {
   return { type: 'success', data: { scrollTop: preview.scrollTop, scrollHeight: preview.scrollHeight } };
 }
 
-// Initialize connection when service worker starts
-connect();
+// Clear saved states by clicking the "Clear saved states" button
+function clearSavedStates() {
+  // Normalize text for comparison (trim and collapse whitespace)
+  function normalizeText(text) {
+    return (text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  // Look for the clear states button
+  const clearButton = document.querySelector('[data-action="clear-states"]') ||
+                      Array.from(document.querySelectorAll('button')).find(btn => {
+                        const text = normalizeText(btn.textContent);
+                        return text === 'clear saved states' || text.includes('clear saved states');
+                      });
+  if (clearButton) {
+    clearButton.click();
+    return { type: 'success', data: null };
+  }
+
+  // Fallback: try to find by partial match on any clickable element
+  const allElements = document.querySelectorAll('button, [role="button"], [onclick]');
+  for (const el of allElements) {
+    const text = normalizeText(el.textContent);
+    if (text.includes('clear') && text.includes('states')) {
+      el.click();
+      return { type: 'success', data: { foundBy: 'partial match', text: el.textContent.trim() } };
+    }
+  }
+
+  return { type: 'error', message: 'Could not find Clear saved states button' };
+}
+
+// Service worker lifecycle handlers - critical for MV3 reliability
+chrome.runtime.onStartup.addListener(() => {
+  console.log('[Boon] Service worker started (onStartup), connecting...');
+  connect();
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  console.log('[Boon] Extension installed/updated (onInstalled), connecting...');
+  connect();
+  // Set up the alarm for keep-alive
+  setupKeepAliveAlarm();
+});
+
+// Set up chrome.alarms for reliable keep-alive (survives service worker restart)
+function setupKeepAliveAlarm() {
+  // Create alarm that fires every 24 seconds (under the 30s MV3 limit)
+  chrome.alarms.create('boonKeepAlive', { periodInMinutes: 0.4 });
+  console.log('[Boon] Keep-alive alarm created');
+}
+
+// Handle alarm events
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'boonKeepAlive') {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      console.log('[Boon] Alarm: WebSocket not connected, reconnecting...');
+      connect();
+    } else {
+      // Send keep-alive ping
+      safeSend({ type: 'keepAlive' });
+      console.log('[Boon] Sent keep-alive ping via alarm');
+    }
+  }
+});
 
 // Register content script that runs at document_start to capture console early
 // This uses the scripting API to register a MAIN world script
@@ -441,20 +1088,8 @@ async function registerEarlyConsoleCapture() {
   }
 }
 
+// Initialize on service worker load
+console.log('[Boon] Service worker loading...');
+connect();
 registerEarlyConsoleCapture();
-
-// Keep service worker alive by reconnecting periodically
-setInterval(() => {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    connect();
-  }
-}, 10000);
-
-// Send keep-alive ping every 20 seconds to prevent MV3 service worker from going inactive
-// Chrome MV3 service workers can become inactive after 30s of inactivity
-setInterval(() => {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'keepAlive' }));
-    console.log('[Boon] Sent keep-alive ping');
-  }
-}, 20000);
+setupKeepAliveAlarm();

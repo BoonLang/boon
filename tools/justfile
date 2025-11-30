@@ -1,0 +1,86 @@
+# Boon Tools Justfile
+# Usage: just <command>
+
+boon_tools := "../target/release/boon-tools"
+extension_dir := "./extension"
+
+# Default: show available commands
+default:
+    @just --list
+
+# Build boon-tools
+build:
+    cargo build --release
+
+# Start WebSocket server (extension connects to this)
+server:
+    {{boon_tools}} server start --watch {{extension_dir}}
+
+# Check if extension is connected
+status:
+    {{boon_tools}} exec status
+
+# Run the current code in playground
+run:
+    {{boon_tools}} exec run
+
+# Get console messages from browser
+console:
+    {{boon_tools}} exec console
+
+# Take screenshot of playground
+screenshot name="screenshot":
+    {{boon_tools}} exec screenshot {{name}}
+
+# Get preview panel text
+preview:
+    {{boon_tools}} exec preview
+
+# Click element by selector
+click selector:
+    {{boon_tools}} exec click "{{selector}}"
+
+# Type text into element
+type selector text:
+    {{boon_tools}} exec type "{{selector}}" "{{text}}"
+
+# Get DOM structure
+dom depth="3":
+    {{boon_tools}} exec dom -d {{depth}}
+
+# Inject code into editor
+inject code:
+    {{boon_tools}} exec inject "{{code}}"
+
+# Test counter.bn - inject, run, click button, check console
+test-counter:
+    @echo "Testing counter.bn..."
+    {{boon_tools}} exec inject "$(cat ../playground/frontend/src/examples/counter/counter.bn)"
+    sleep 1
+    {{boon_tools}} exec run
+    sleep 2
+    {{boon_tools}} exec click "button"
+    sleep 1
+    {{boon_tools}} exec console
+
+# Test interval.bn - inject, run, wait, check preview
+test-interval:
+    @echo "Testing interval.bn..."
+    {{boon_tools}} exec inject "$(cat ../playground/frontend/src/examples/interval/interval.bn)"
+    sleep 1
+    {{boon_tools}} exec run
+    sleep 5
+    {{boon_tools}} exec preview
+    {{boon_tools}} exec console
+
+# Full test: inject code, run, check results
+test file:
+    {{boon_tools}} exec test "{{file}}"
+
+# Get preview elements with bounding boxes
+elements:
+    {{boon_tools}} exec elements
+
+# Click at absolute coordinates
+click-at x y:
+    {{boon_tools}} exec click-at {{x}} {{y}}

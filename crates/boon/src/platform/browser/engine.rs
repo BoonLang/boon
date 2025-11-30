@@ -541,15 +541,29 @@ impl VariableOrArgumentReference {
         for alias_part in alias_parts.into_iter().skip(skip_alias_parts) {
             let alias_part = alias_part.to_string();
             value_stream = value_stream
-                .flat_map(move |value| match value {
-                    Value::Object(object, _) => object.expect_variable(&alias_part).subscribe(),
-                    Value::TaggedObject(tagged_object, _) => {
-                        tagged_object.expect_variable(&alias_part).subscribe()
+                .flat_map(move |value| {
+                    match value {
+                        Value::Object(object, _) => {
+                            let inner_stream = object.expect_variable(&alias_part).subscribe();
+                            // Keep object alive by moving it into the stream closure
+                            inner_stream.map(move |v| {
+                                let _keep_alive = &object;
+                                v
+                            }).boxed_local()
+                        }
+                        Value::TaggedObject(tagged_object, _) => {
+                            let inner_stream = tagged_object.expect_variable(&alias_part).subscribe();
+                            // Keep tagged_object alive by moving it into the stream closure
+                            inner_stream.map(move |v| {
+                                let _keep_alive = &tagged_object;
+                                v
+                            }).boxed_local()
+                        }
+                        other => panic!(
+                            "Failed to get Object or TaggedObject to create VariableOrArgumentReference: The Value has a different type {}",
+                            other.construct_info()
+                        ),
                     }
-                    other => panic!(
-                        "Failed to get Object or TaggedObject to create VariableOrArgumentReference: The Value has a different type {}",
-                        other.construct_info()
-                    ),
                 })
                 .boxed_local();
         }
@@ -1542,6 +1556,16 @@ impl ValueActor {
         Arc::new(Self::new(construct_info, actor_context, value_stream))
     }
 
+    pub fn new_arc_with_extra_owned_data<EOD: 'static>(
+        construct_info: ConstructInfo,
+        actor_context: ActorContext,
+        value_stream: impl Stream<Item = Value> + 'static,
+        extra_owned_data: EOD,
+    ) -> Arc<Self> {
+        let construct_info = construct_info.complete(ConstructType::ValueActor);
+        Arc::new(Self::new_internal(construct_info, actor_context, value_stream, extra_owned_data))
+    }
+
     pub fn subscribe(&self) -> impl Stream<Item = Value> + use<> {
         let (value_sender, value_receiver) = mpsc::unbounded();
         if let Err(error) = self.value_sender_sender.unbounded_send(value_sender) {
@@ -1724,6 +1748,15 @@ impl Value {
                     let value = variable.value_actor().subscribe().next().await;
                     if let Some(value) = value {
                         let json_value = Box::pin(value.to_json()).await;
+                        // Mark LINK variables so they can be restored with their channel
+                        let json_value = if variable.link_value_sender().is_some() {
+                            let mut link_wrapper = serde_json::Map::new();
+                            link_wrapper.insert("_link".to_string(), serde_json::Value::Bool(true));
+                            link_wrapper.insert("value".to_string(), json_value);
+                            serde_json::Value::Object(link_wrapper)
+                        } else {
+                            json_value
+                        };
                         obj.insert(variable.name().to_string(), json_value);
                     }
                 }
@@ -1736,6 +1769,15 @@ impl Value {
                     let value = variable.value_actor().subscribe().next().await;
                     if let Some(value) = value {
                         let json_value = Box::pin(value.to_json()).await;
+                        // Mark LINK variables so they can be restored with their channel
+                        let json_value = if variable.link_value_sender().is_some() {
+                            let mut link_wrapper = serde_json::Map::new();
+                            link_wrapper.insert("_link".to_string(), serde_json::Value::Bool(true));
+                            link_wrapper.insert("value".to_string(), json_value);
+                            serde_json::Value::Object(link_wrapper)
+                        } else {
+                            json_value
+                        };
                         obj.insert(variable.name().to_string(), json_value);
                     }
                 }
@@ -1819,24 +1861,50 @@ impl Value {
                         let variables: Vec<Arc<Variable>> = other_fields.iter()
                             .enumerate()
                             .map(|(i, (name, value))| {
+                                // Check if this is a LINK variable (wrapped with _link marker)
+                                let (is_link, actual_value) = if let serde_json::Value::Object(wrapper) = value {
+                                    if wrapper.get("_link") == Some(&serde_json::Value::Bool(true)) {
+                                        if let Some(inner_value) = wrapper.get("value") {
+                                            (true, inner_value)
+                                        } else {
+                                            (false, *value)
+                                        }
+                                    } else {
+                                        (false, *value)
+                                    }
+                                } else {
+                                    (false, *value)
+                                };
+
                                 let var_construct_info = ConstructInfo::new(
                                     construct_id.with_child_id(format!("var_{name}")),
                                     None,
-                                    "Variable from JSON",
+                                    if is_link { "LINK Variable from JSON" } else { "Variable from JSON" },
                                 );
-                                let value_actor = value_actor_from_json(
-                                    value,
-                                    construct_id.with_child_id(format!("value_{name}")),
-                                    construct_context.clone(),
-                                    Ulid::new(),
-                                    actor_context.clone(),
-                                );
-                                Variable::new_arc(
-                                    var_construct_info,
-                                    construct_context.clone(),
-                                    (*name).clone(),
-                                    value_actor,
-                                )
+
+                                if is_link {
+                                    // Create LINK variable with channel
+                                    Variable::new_link_arc(
+                                        var_construct_info,
+                                        construct_context.clone(),
+                                        (*name).clone(),
+                                        actor_context.clone(),
+                                    )
+                                } else {
+                                    let value_actor = value_actor_from_json(
+                                        actual_value,
+                                        construct_id.with_child_id(format!("value_{name}")),
+                                        construct_context.clone(),
+                                        Ulid::new(),
+                                        actor_context.clone(),
+                                    );
+                                    Variable::new_arc(
+                                        var_construct_info,
+                                        construct_context.clone(),
+                                        (*name).clone(),
+                                        value_actor,
+                                    )
+                                }
                             })
                             .collect();
                         TaggedObject::new_value(
@@ -1856,24 +1924,50 @@ impl Value {
                     );
                     let variables: Vec<Arc<Variable>> = obj.iter()
                         .map(|(name, value)| {
+                            // Check if this is a LINK variable (wrapped with _link marker)
+                            let (is_link, actual_value) = if let serde_json::Value::Object(wrapper) = value {
+                                if wrapper.get("_link") == Some(&serde_json::Value::Bool(true)) {
+                                    if let Some(inner_value) = wrapper.get("value") {
+                                        (true, inner_value)
+                                    } else {
+                                        (false, value)
+                                    }
+                                } else {
+                                    (false, value)
+                                }
+                            } else {
+                                (false, value)
+                            };
+
                             let var_construct_info = ConstructInfo::new(
                                 construct_id.with_child_id(format!("var_{name}")),
                                 None,
-                                "Variable from JSON",
+                                if is_link { "LINK Variable from JSON" } else { "Variable from JSON" },
                             );
-                            let value_actor = value_actor_from_json(
-                                value,
-                                construct_id.with_child_id(format!("value_{name}")),
-                                construct_context.clone(),
-                                Ulid::new(),
-                                actor_context.clone(),
-                            );
-                            Variable::new_arc(
-                                var_construct_info,
-                                construct_context.clone(),
-                                name.clone(),
-                                value_actor,
-                            )
+
+                            if is_link {
+                                // Create LINK variable with channel
+                                Variable::new_link_arc(
+                                    var_construct_info,
+                                    construct_context.clone(),
+                                    name.clone(),
+                                    actor_context.clone(),
+                                )
+                            } else {
+                                let value_actor = value_actor_from_json(
+                                    actual_value,
+                                    construct_id.with_child_id(format!("value_{name}")),
+                                    construct_context.clone(),
+                                    Ulid::new(),
+                                    actor_context.clone(),
+                                );
+                                Variable::new_arc(
+                                    var_construct_info,
+                                    construct_context.clone(),
+                                    name.clone(),
+                                    value_actor,
+                                )
+                            }
                         })
                         .collect();
                     Object::new_value(construct_info, construct_context, idempotency_key, variables)

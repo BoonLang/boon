@@ -1,7 +1,9 @@
+mod commands;
 mod ws_server;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use ws_server::{Command as WsCommand, Response as WsResponse};
 
 #[derive(Parser)]
@@ -20,6 +22,12 @@ enum Commands {
         action: ServerAction,
     },
 
+    /// Launch and manage browser with extension
+    Browser {
+        #[command(subcommand)]
+        action: BrowserAction,
+    },
+
     /// Execute command via WebSocket server (requires extension)
     Exec {
         #[command(subcommand)]
@@ -29,6 +37,42 @@ enum Commands {
         #[arg(short, long, default_value = "9222")]
         port: u16,
     },
+}
+
+#[derive(Subcommand)]
+enum BrowserAction {
+    /// Launch Chromium with Boon extension pre-loaded
+    Launch {
+        /// Playground server port
+        #[arg(long, default_value = "8081")]
+        playground_port: u16,
+
+        /// WebSocket server port
+        #[arg(long, default_value = "9222")]
+        ws_port: u16,
+
+        /// Run in headless mode
+        #[arg(long)]
+        headless: bool,
+
+        /// Keep browser open (don't wait for connection)
+        #[arg(long)]
+        keep_open: bool,
+
+        /// Override browser binary path
+        #[arg(long)]
+        browser: Option<PathBuf>,
+
+        /// Connection timeout in seconds
+        #[arg(long, default_value = "30")]
+        timeout: u64,
+    },
+
+    /// Kill all browser automation instances
+    Kill,
+
+    /// Check if Chromium is available
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -125,6 +169,20 @@ enum ExecAction {
         #[arg(short, long, default_value = "4")]
         depth: u32,
     },
+
+    /// Get preview panel elements with bounding boxes
+    Elements,
+
+    /// Click at absolute screen coordinates
+    ClickAt {
+        /// X coordinate
+        x: i32,
+        /// Y coordinate
+        y: i32,
+    },
+
+    /// Clear saved states (reset localStorage for tests)
+    ClearStates,
 }
 
 fn main() -> Result<()> {
@@ -141,9 +199,71 @@ fn main() -> Result<()> {
             }
         },
 
+        Commands::Browser { action } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(handle_browser(action))?;
+        }
+
         Commands::Exec { action, port } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(handle_exec(action, port))?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_browser(action: BrowserAction) -> Result<()> {
+    use commands::browser;
+
+    match action {
+        BrowserAction::Launch {
+            playground_port,
+            ws_port,
+            headless,
+            keep_open,
+            browser,
+            timeout,
+        } => {
+            let opts = browser::LaunchOptions {
+                playground_port,
+                ws_port,
+                headless,
+                keep_open,
+                browser_path: browser,
+            };
+
+            let mut child = browser::launch_browser(opts)?;
+
+            if keep_open {
+                println!("Browser launched. Process will run in background.");
+                // Detach from the child process
+                std::mem::forget(child);
+            } else {
+                // Wait for extension to connect
+                let timeout_duration = std::time::Duration::from_secs(timeout);
+                browser::wait_for_extension_connection(ws_port, timeout_duration).await?;
+                println!("Browser ready. Press Ctrl+C to terminate.");
+
+                // Wait for the browser process
+                child.wait()?;
+            }
+        }
+
+        BrowserAction::Kill => {
+            browser::kill_browser_instances()?;
+        }
+
+        BrowserAction::Check => {
+            match browser::check_chromium_available() {
+                Ok(path) => {
+                    println!("Chromium found: {}", path.display());
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            }
         }
     }
 
@@ -326,6 +446,27 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
                 }
                 _ => print_response(response),
             }
+        }
+
+        ExecAction::Elements => {
+            let response = send_command_to_server(port, WsCommand::GetPreviewElements).await?;
+            match response {
+                WsResponse::PreviewElements { data } => {
+                    println!("{}", serde_json::to_string_pretty(&data).unwrap());
+                }
+                _ => print_response(response),
+            }
+        }
+
+        ExecAction::ClickAt { x, y } => {
+            let response = send_command_to_server(port, WsCommand::ClickAt { x, y }).await?;
+            print_response(response);
+        }
+
+        ExecAction::ClearStates => {
+            println!("Clearing saved states...");
+            let response = send_command_to_server(port, WsCommand::ClearStates).await?;
+            print_response(response);
         }
     }
 
