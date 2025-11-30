@@ -30,6 +30,13 @@ pub fn run(
     let old_code_local_storage_key = old_code_local_storage_key.into();
     let old_span_id_pairs_local_storage_key = old_span_id_pairs_local_storage_key.into();
 
+    // Create SourceCode FIRST so all parsing borrows from this Arc'd String.
+    // This is critical: the AST will contain &str slices that point into this allocation.
+    // If we create SourceCode after parsing, the pointers won't match.
+    let source_code_for_storage = source_code.to_string();
+    let source_code_arc = SourceCode::new(source_code_for_storage.clone());
+    let source_code = source_code_arc.as_str();
+
     let old_source_code = local_storage().get::<String>(&old_code_local_storage_key);
     let old_ast = if let Some(Ok(old_source_code)) = &old_source_code {
         parse_old(filename, old_source_code)
@@ -101,7 +108,7 @@ pub fn run(
     println!("{ast:#?}");
 
     // Convert to static expressions (owned, 'static, no lifetimes)
-    let source_code_arc = SourceCode::new(source_code.to_string());
+    // Note: source_code_arc was created at the start of this function
     let static_ast = static_expression::convert_expressions(source_code_arc.clone(), ast);
 
     let evaluation_result = match evaluate(source_code_arc, static_ast, states_local_storage_key.clone(), virtual_fs) {
@@ -114,7 +121,7 @@ pub fn run(
     };
 
     if evaluation_result.is_some() {
-        if let Err(error) = local_storage().insert(&old_code_local_storage_key, &source_code) {
+        if let Err(error) = local_storage().insert(&old_code_local_storage_key, &source_code_for_storage) {
             eprintln!("Failed to store source code as old source code: {error:#?}");
         }
 
@@ -158,6 +165,13 @@ pub fn run_with_registry(
     let states_local_storage_key = states_local_storage_key.into();
     let old_code_local_storage_key = old_code_local_storage_key.into();
     let old_span_id_pairs_local_storage_key = old_span_id_pairs_local_storage_key.into();
+
+    // Create SourceCode FIRST so all parsing borrows from this Arc'd String.
+    // This is critical: the AST will contain &str slices that point into this allocation.
+    // If we create SourceCode after parsing, the pointers won't match.
+    let source_code_for_storage = source_code.to_string();
+    let source_code_arc = SourceCode::new(source_code_for_storage.clone());
+    let source_code = source_code_arc.as_str();
 
     let old_source_code = local_storage().get::<String>(&old_code_local_storage_key);
     let old_ast = if let Some(Ok(old_source_code)) = &old_source_code {
@@ -220,7 +234,7 @@ pub fn run_with_registry(
     println!("{ast:#?}");
 
     // Convert to static expressions (owned, 'static, no lifetimes)
-    let source_code_arc = SourceCode::new(source_code.to_string());
+    // Note: source_code_arc was created at the start of this function
     let static_ast = static_expression::convert_expressions(source_code_arc.clone(), ast);
 
     let registry = function_registry.unwrap_or_default();
@@ -242,7 +256,7 @@ pub fn run_with_registry(
     };
 
     if evaluation_result.is_some() {
-        if let Err(error) = local_storage().insert(&old_code_local_storage_key, &source_code) {
+        if let Err(error) = local_storage().insert(&old_code_local_storage_key, &source_code_for_storage) {
             eprintln!("Failed to store source code as old source code: {error:#?}");
         }
 

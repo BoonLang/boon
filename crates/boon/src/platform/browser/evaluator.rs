@@ -1035,7 +1035,7 @@ fn static_spanned_expression_into_value_actor(
 
                     // Check for module function call (path.len() >= 2, e.g., Theme/material)
                     // Built-in modules: Math, Text, List, Bool, Logic, Storage, Time, Object, Browser, Ui, Css, Selector
-                    let builtin_modules = ["Math", "Text", "List", "Bool", "Logic", "Storage", "Time", "Object", "Browser", "Ui", "Css", "Selector", "Color", "Spring", "Page", "Attr", "Router"];
+                    let builtin_modules = ["Math", "Text", "List", "Bool", "Logic", "Storage", "Time", "Object", "Browser", "Ui", "Css", "Selector", "Color", "Spring", "Page", "Attr", "Router", "Ulid", "Document", "Element", "Timer", "Log", "Build", "Scene", "Theme", "File", "Directory"];
                     if path.len() >= 2 && !builtin_modules.contains(&path[0].as_str()) {
                         let module_name = &path[0];
                         let func_name = &path[1];
@@ -1203,26 +1203,51 @@ fn static_spanned_expression_into_value_actor(
                 .into_iter()
                 .map(|var| {
                     let var_name = var.node.name.to_string();
-                    let value_actor = static_spanned_expression_into_value_actor(
-                        var.node.value,
-                        construct_context.clone(),
-                        actor_context.clone(),
-                        reference_connector.clone(),
-                        link_connector.clone(),
-                        function_registry.clone(),
-                        module_loader.clone(),
-                        source_code.clone(),
-                    )?;
-                    Ok(Variable::new_arc(
-                        ConstructInfo::new(
-                            format!("PersistenceId: {persistence_id}; var: {var_name}"),
-                            None,
-                            format!("{span}; Object variable {var_name}"),
-                        ),
-                        construct_context.clone(),
-                        var_name,
-                        value_actor,
-                    ))
+                    let var_span = var.span.clone();
+                    let is_link = matches!(&var.node.value.node, static_expression::Expression::Link);
+
+                    let variable = if is_link {
+                        Variable::new_link_arc(
+                            ConstructInfo::new(
+                                format!("PersistenceId: {persistence_id}; var: {var_name}"),
+                                None,
+                                format!("{span}; Object variable {var_name} (LINK)"),
+                            ),
+                            construct_context.clone(),
+                            var_name,
+                            actor_context.clone(),
+                        )
+                    } else {
+                        let value_actor = static_spanned_expression_into_value_actor(
+                            var.node.value,
+                            construct_context.clone(),
+                            actor_context.clone(),
+                            reference_connector.clone(),
+                            link_connector.clone(),
+                            function_registry.clone(),
+                            module_loader.clone(),
+                            source_code.clone(),
+                        )?;
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                format!("PersistenceId: {persistence_id}; var: {var_name}"),
+                                None,
+                                format!("{span}; Object variable {var_name}"),
+                            ),
+                            construct_context.clone(),
+                            var_name,
+                            value_actor,
+                        )
+                    };
+
+                    // Register LINK variable senders with LinkConnector
+                    if is_link {
+                        if let Some(sender) = variable.link_value_sender() {
+                            link_connector.register_link(var_span, sender);
+                        }
+                    }
+
+                    Ok(variable)
                 })
                 .collect();
             Object::new_arc_value_actor(
@@ -1244,26 +1269,51 @@ fn static_spanned_expression_into_value_actor(
                 .into_iter()
                 .map(|var| {
                     let var_name = var.node.name.to_string();
-                    let value_actor = static_spanned_expression_into_value_actor(
-                        var.node.value,
-                        construct_context.clone(),
-                        actor_context.clone(),
-                        reference_connector.clone(),
-                        link_connector.clone(),
-                        function_registry.clone(),
-                        module_loader.clone(),
-                        source_code.clone(),
-                    )?;
-                    Ok(Variable::new_arc(
-                        ConstructInfo::new(
-                            format!("PersistenceId: {persistence_id}; var: {var_name}"),
-                            None,
-                            format!("{span}; TaggedObject {tag_string} variable {var_name}"),
-                        ),
-                        construct_context.clone(),
-                        var_name,
-                        value_actor,
-                    ))
+                    let var_span = var.span.clone();
+                    let is_link = matches!(&var.node.value.node, static_expression::Expression::Link);
+
+                    let variable = if is_link {
+                        Variable::new_link_arc(
+                            ConstructInfo::new(
+                                format!("PersistenceId: {persistence_id}; var: {var_name}"),
+                                None,
+                                format!("{span}; TaggedObject {tag_string} variable {var_name} (LINK)"),
+                            ),
+                            construct_context.clone(),
+                            var_name,
+                            actor_context.clone(),
+                        )
+                    } else {
+                        let value_actor = static_spanned_expression_into_value_actor(
+                            var.node.value,
+                            construct_context.clone(),
+                            actor_context.clone(),
+                            reference_connector.clone(),
+                            link_connector.clone(),
+                            function_registry.clone(),
+                            module_loader.clone(),
+                            source_code.clone(),
+                        )?;
+                        Variable::new_arc(
+                            ConstructInfo::new(
+                                format!("PersistenceId: {persistence_id}; var: {var_name}"),
+                                None,
+                                format!("{span}; TaggedObject {tag_string} variable {var_name}"),
+                            ),
+                            construct_context.clone(),
+                            var_name,
+                            value_actor,
+                        )
+                    };
+
+                    // Register LINK variable senders with LinkConnector
+                    if is_link {
+                        if let Some(sender) = variable.link_value_sender() {
+                            link_connector.register_link(var_span, sender);
+                        }
+                    }
+
+                    Ok(variable)
                 })
                 .collect();
             TaggedObject::new_arc_value_actor(

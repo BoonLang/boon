@@ -45,6 +45,14 @@ pub enum Command {
         #[serde(default)]
         to_bottom: bool,
     },
+
+    /// Get DOM structure for debugging
+    GetDOM {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        depth: Option<u32>,
+    },
 }
 
 /// Response from Extension to CLI via Server
@@ -80,6 +88,9 @@ pub enum Response {
         #[serde(rename = "apiReady")]
         api_ready: bool,
     },
+
+    /// DOM structure
+    Dom { structure: String },
 }
 
 /// Console message from browser

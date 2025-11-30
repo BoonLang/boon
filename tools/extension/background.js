@@ -126,6 +126,9 @@ async function handleCommand(id, command) {
       case 'getPreviewText':
         return await executeInTab(tab.id, getPreviewText);
 
+      case 'getDOM':
+        return await executeInTab(tab.id, getDOMStructure, command.selector || null, command.depth || 4);
+
       case 'scroll':
         return await executeInTab(tab.id, scrollPreview, command.y, command.delta, command.toBottom);
 
@@ -329,20 +332,57 @@ function setupConsoleCapture() {
 }
 
 function getPreviewText() {
-  if (typeof window.boonPlayground !== 'undefined' && window.boonPlayground.getPreview) {
-    const text = window.boonPlayground.getPreview();
-    return { type: 'previewText', text };
-  }
-
-  // Fallback: try to get preview panel content
-  const preview = document.querySelector('.preview-panel') ||
-                  document.querySelector('[data-panel="preview"]') ||
-                  document.querySelector('#preview');
+  const preview = document.querySelector('[data-boon-panel="preview"]');
   if (preview) {
     return { type: 'previewText', text: preview.textContent || '' };
   }
-
   return { type: 'error', message: 'Could not get preview text' };
+}
+
+function getDOMStructure(selector, maxDepth = 4) {
+  const root = selector ? document.querySelector(selector) : document.body;
+  if (!root) {
+    return { type: 'error', message: `Element not found: ${selector}` };
+  }
+
+  function describeElement(el, depth = 0) {
+    if (depth > maxDepth) return '...';
+    if (el.nodeType === Node.TEXT_NODE) {
+      const text = el.textContent.trim();
+      return text ? `"${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"` : null;
+    }
+    if (el.nodeType !== Node.ELEMENT_NODE) return null;
+
+    const tag = el.tagName.toLowerCase();
+    const id = el.id ? `#${el.id}` : '';
+    const classes = el.className && typeof el.className === 'string'
+      ? '.' + el.className.split(' ').filter(c => c).join('.')
+      : '';
+    const attrs = [];
+    for (const attr of el.attributes) {
+      if (attr.name !== 'id' && attr.name !== 'class' && attr.name !== 'style') {
+        attrs.push(`${attr.name}="${attr.value.substring(0, 30)}"`);
+      }
+    }
+    const attrStr = attrs.length ? ` [${attrs.join(', ')}]` : '';
+
+    const children = [];
+    for (const child of el.childNodes) {
+      const desc = describeElement(child, depth + 1);
+      if (desc) children.push(desc);
+    }
+
+    const childStr = children.length
+      ? (children.length <= 3
+          ? ` { ${children.join(', ')} }`
+          : ` { ${children.slice(0, 3).join(', ')}, ...(${children.length} total) }`)
+      : '';
+
+    return `${tag}${id}${classes}${attrStr}${childStr}`;
+  }
+
+  const structure = describeElement(root);
+  return { type: 'dom', structure };
 }
 
 function scrollPreview(y, delta, toBottom) {
@@ -376,6 +416,32 @@ function scrollPreview(y, delta, toBottom) {
 
 // Initialize connection when service worker starts
 connect();
+
+// Register content script that runs at document_start to capture console early
+// This uses the scripting API to register a MAIN world script
+async function registerEarlyConsoleCapture() {
+  try {
+    // First unregister any existing scripts to avoid duplicates
+    try {
+      await chrome.scripting.unregisterContentScripts({ ids: ['boon-console-capture'] });
+    } catch (e) {
+      // Ignore if not registered
+    }
+
+    await chrome.scripting.registerContentScripts([{
+      id: 'boon-console-capture',
+      matches: ['http://localhost:8081/*'],
+      js: ['console-capture.js'],
+      runAt: 'document_start',
+      world: 'MAIN'
+    }]);
+    console.log('[Boon] Early console capture registered');
+  } catch (e) {
+    console.log('[Boon] Could not register early console capture:', e.message);
+  }
+}
+
+registerEarlyConsoleCapture();
 
 // Keep service worker alive by reconnecting periodically
 setInterval(() => {

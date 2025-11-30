@@ -15,13 +15,6 @@
   "background": {
     "service_worker": "background.js"
   },
-  "content_scripts": [
-    {
-      "matches": ["http://localhost:8081/*"],
-      "js": ["content.js"],
-      "run_at": "document_idle"
-    }
-  ],
   "action": {
     "default_popup": "popup.html",
     "default_title": "Boon Browser Control"
@@ -30,5 +23,9 @@
     "16": "icon16.png",
     "48": "icon48.png",
     "128": "icon128.png"
-  }
+  },
+  "web_accessible_resources": [{
+    "resources": ["console-capture.js"],
+    "matches": ["http://localhost:8081/*"]
+  }]
 }

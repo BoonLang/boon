@@ -1208,6 +1208,7 @@ impl Playground {
                             .s(Height::fill())
                             .s(Padding::new().x(12).y(12))
                             .s(Scrollbars::both())
+                            .update_raw_el(|raw_el| raw_el.attr("data-boon-panel", "preview"))
                             .child_signal(self.run_command.signal().map({
                                 let this = self.clone();
                                 move |maybe_run| Some(match maybe_run {

@@ -115,6 +115,16 @@ enum ExecAction {
         #[arg(short, long)]
         screenshot: Option<String>,
     },
+
+    /// Get DOM structure (for debugging)
+    Dom {
+        /// CSS selector to start from (default: body)
+        #[arg(short, long)]
+        selector: Option<String>,
+        /// Max depth to traverse
+        #[arg(short, long, default_value = "4")]
+        depth: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -145,6 +155,14 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
 
     match action {
         ExecAction::Inject { code } => {
+            // Support @filename syntax to read code from file
+            let code = if code.starts_with('@') {
+                let path = &code[1..];
+                std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read file '{}': {}", path, e))?
+            } else {
+                code
+            };
             let response = send_command_to_server(port, WsCommand::InjectCode { code }).await?;
             print_response(response);
         }
@@ -237,6 +255,14 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
         }
 
         ExecAction::Test { code, expect, screenshot } => {
+            // Support @filename syntax to read code from file
+            let code = if code.starts_with('@') {
+                let path = &code[1..];
+                std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read file '{}': {}", path, e))?
+            } else {
+                code
+            };
             // Inject code
             println!("Injecting code...");
             let response = send_command_to_server(port, WsCommand::InjectCode { code }).await?;
@@ -285,6 +311,20 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
                     std::fs::write(&output, data)?;
                     println!("Screenshot saved to: {}", output);
                 }
+            }
+        }
+
+        ExecAction::Dom { selector, depth } => {
+            let response = send_command_to_server(
+                port,
+                WsCommand::GetDOM { selector, depth: Some(depth) },
+            )
+            .await?;
+            match response {
+                WsResponse::Dom { structure } => {
+                    println!("{}", structure);
+                }
+                _ => print_response(response),
             }
         }
     }
