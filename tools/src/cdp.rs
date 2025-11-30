@@ -114,6 +114,11 @@ impl BrowserSession {
                 "--hide-scrollbars",
                 "--disable-session-crashed-bubble",
                 "--hide-crash-restore-bubble",
+                "--disable-application-cache",
+                "--disable-cache",
+                "--disk-cache-size=0",
+                "--aggressive-cache-discard",
+                "--incognito",
             ])
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build browser config: {}", e))?;
@@ -245,6 +250,128 @@ impl BrowserSession {
         page.evaluate(js)
             .await
             .context("Failed to evaluate JavaScript")?;
+        Ok(())
+    }
+
+    /// Click at specific coordinates using CDP Input domain
+    pub async fn click_at(page: &Page, x: f64, y: f64) -> Result<()> {
+        use chromiumoxide::cdp::browser_protocol::input::{
+            DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+        };
+
+        // Mouse move to element first
+        page.execute(
+            DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MouseMoved)
+                .x(x)
+                .y(y)
+                .build()
+                .unwrap(),
+        )
+        .await
+        .context("Failed to dispatch mousemove")?;
+
+        // Small delay
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Mouse down
+        page.execute(
+            DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MousePressed)
+                .x(x)
+                .y(y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build()
+                .unwrap(),
+        )
+        .await
+        .context("Failed to dispatch mousedown")?;
+
+        // Small delay
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Mouse up
+        page.execute(
+            DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MouseReleased)
+                .x(x)
+                .y(y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build()
+                .unwrap(),
+        )
+        .await
+        .context("Failed to dispatch mouseup")?;
+
+        Ok(())
+    }
+
+    /// Send Shift+Enter keyboard shortcut using CDP Input domain
+    pub async fn send_shift_enter(page: &Page) -> Result<()> {
+        use chromiumoxide::cdp::browser_protocol::input::{
+            DispatchKeyEventParams, DispatchKeyEventType,
+        };
+
+        // Key down for Shift
+        page.execute(
+            DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyDown)
+                .key("Shift")
+                .code("ShiftLeft")
+                .modifiers(8) // Shift modifier
+                .build()
+                .unwrap(),
+        )
+        .await
+        .context("Failed to dispatch Shift keydown")?;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Key down for Enter (with Shift held)
+        page.execute(
+            DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyDown)
+                .key("Enter")
+                .code("Enter")
+                .modifiers(8) // Shift modifier
+                .build()
+                .unwrap(),
+        )
+        .await
+        .context("Failed to dispatch Enter keydown")?;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Key up for Enter
+        page.execute(
+            DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyUp)
+                .key("Enter")
+                .code("Enter")
+                .modifiers(8) // Shift modifier
+                .build()
+                .unwrap(),
+        )
+        .await
+        .context("Failed to dispatch Enter keyup")?;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Key up for Shift
+        page.execute(
+            DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyUp)
+                .key("Shift")
+                .code("ShiftLeft")
+                .modifiers(0) // No modifiers
+                .build()
+                .unwrap(),
+        )
+        .await
+        .context("Failed to dispatch Shift keyup")?;
+
         Ok(())
     }
 }

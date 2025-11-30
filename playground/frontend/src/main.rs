@@ -236,6 +236,93 @@ impl Playground {
                     )
                 }
             })
+            // Expose window.boonPlayground API for browser automation
+            .update_raw_el({
+                let run_command = self.run_command.clone();
+                let source_code = self.source_code.clone();
+                move |raw_el| {
+                    use wasm_bindgen::prelude::*;
+                    use wasm_bindgen::JsCast;
+
+                    let window = web_sys::window().unwrap();
+
+                    // Create boonPlayground API object
+                    let api = js_sys::Object::new();
+
+                    // isReady() - always returns true once API is set up
+                    let is_ready = Closure::wrap(Box::new(|| true) as Box<dyn Fn() -> bool>);
+                    js_sys::Reflect::set(&api, &"isReady".into(), is_ready.as_ref()).ok();
+                    is_ready.forget();
+
+                    // setCode(code) - set editor content
+                    let source_code_for_set = source_code.clone();
+                    let set_code = Closure::wrap(Box::new(move |code: String| {
+                        let source_code_inner = source_code_for_set.clone();
+                        Task::start(async move {
+                            source_code_inner.set(Rc::new(Cow::from(code)));
+                        });
+                    }) as Box<dyn Fn(String)>);
+                    js_sys::Reflect::set(&api, &"setCode".into(), set_code.as_ref()).ok();
+                    set_code.forget();
+
+                    // getCode() - get current editor content
+                    let source_code_for_get = source_code.clone();
+                    let get_code = Closure::wrap(Box::new(move || -> String {
+                        source_code_for_get.lock_ref().to_string()
+                    }) as Box<dyn Fn() -> String>);
+                    js_sys::Reflect::set(&api, &"getCode".into(), get_code.as_ref()).ok();
+                    get_code.forget();
+
+                    // run() - trigger code execution
+                    let run_command_for_run = run_command.clone();
+                    let run_fn = Closure::wrap(Box::new(move || {
+                        let run_command_inner = run_command_for_run.clone();
+                        Task::start(async move {
+                            run_command_inner.set(Some(RunCommand { filename: None }));
+                        });
+                    }) as Box<dyn Fn()>);
+                    js_sys::Reflect::set(&api, &"run".into(), run_fn.as_ref()).ok();
+                    run_fn.forget();
+
+                    // getPreview() - get preview panel text content
+                    let get_preview = Closure::wrap(Box::new(|| -> String {
+                        if let Some(win) = web_sys::window() {
+                            if let Some(doc) = win.document() {
+                                // Try to find preview panel content
+                                if let Some(el) = doc.query_selector(".preview-panel, [data-panel=\"preview\"], #preview").ok().flatten() {
+                                    return el.text_content().unwrap_or_default();
+                                }
+                                // Fallback: get the example panel content
+                                if let Some(el) = doc.query_selector(".example-panel").ok().flatten() {
+                                    return el.text_content().unwrap_or_default();
+                                }
+                            }
+                        }
+                        String::new()
+                    }) as Box<dyn Fn() -> String>);
+                    js_sys::Reflect::set(&api, &"getPreview".into(), get_preview.as_ref()).ok();
+                    get_preview.forget();
+
+                    // Set window.boonPlayground
+                    js_sys::Reflect::set(&window, &"boonPlayground".into(), &api).ok();
+
+                    // Also keep the legacy boon-run event listener for backwards compatibility
+                    let run_command_clone = run_command.clone();
+                    let closure = Closure::wrap(Box::new(move |_: web_sys::Event| {
+                        let run_command_inner = run_command_clone.clone();
+                        Task::start(async move {
+                            run_command_inner.set(Some(RunCommand { filename: None }));
+                        });
+                    }) as Box<dyn FnMut(_)>);
+
+                    window
+                        .add_event_listener_with_callback("boon-run", closure.as_ref().unchecked_ref())
+                        .unwrap();
+                    closure.forget();
+
+                    raw_el
+                }
+            })
             .on_pointer_up({
                 let this = self.clone();
                 move || this.stop_panel_drag()

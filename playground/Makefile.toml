@@ -27,6 +27,56 @@ args = ["${@}"]
 # command = "cargo"
 # args = ["run", "--manifest-path", "../../MoonZoon/crates/mzoon/Cargo.toml", "${@}"]
 
+[tasks.kill]
+description = "Stop all MoonZoon development processes (mzoon, makers)"
+script = '''
+PORT=$(grep "^port = " MoonZoon.toml | head -1 | cut -d' ' -f3 || echo "8081")
+KILLED_ANY=false
+
+echo "Stopping development processes on port $PORT..."
+
+# Kill process on configured port
+PID=$(lsof -ti:$PORT 2>/dev/null || true)
+if [ -n "$PID" ]; then
+    if kill -TERM $PID 2>/dev/null; then
+        echo "Sent TERM signal to process on port $PORT"
+        KILLED_ANY=true
+    fi
+fi
+
+# Kill makers processes
+if pkill -TERM -f "makers.*mzoon" 2>/dev/null; then
+    echo "Sent TERM signal to makers process"
+    KILLED_ANY=true
+fi
+
+# Kill mzoon processes
+if pkill -TERM -f "mzoon" 2>/dev/null; then
+    echo "Sent TERM signal to mzoon process"
+    KILLED_ANY=true
+fi
+
+if [ "$KILLED_ANY" = "true" ]; then
+    echo "Waiting 2 seconds for graceful shutdown..."
+    sleep 2
+
+    # Force kill if still running
+    PID=$(lsof -ti:$PORT 2>/dev/null || true)
+    if [ -n "$PID" ]; then
+        if kill -KILL $PID 2>/dev/null; then
+            echo "Force killed process on port $PORT"
+        fi
+    fi
+
+    pkill -KILL -f "makers.*mzoon" 2>/dev/null && echo "Force killed makers process" || true
+    pkill -KILL -f "mzoon" 2>/dev/null && echo "Force killed mzoon process" || true
+
+    echo "✓ Development processes terminated"
+else
+    echo "No development processes found to kill"
+fi
+'''
+
 ######  HELPER TASKS  ######
 
 [tasks.install_wasm_target]

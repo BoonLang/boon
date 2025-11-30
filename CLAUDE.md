@@ -37,15 +37,29 @@ Reasons:
 2. MoonZoon (mzoon) supports **auto-reload** and **auto-compilation** - manual restarts are unnecessary
 3. When you edit Rust files, mzoon will automatically recompile and hot-reload
 
-Start the playground:
+**Start the playground using makers (correct way):**
 ```bash
-cd playground && mzoon start &
+cd playground && makers mzoon start &
+```
+
+This runs mzoon through the Makefile.toml configuration, which properly sets up the local mzoon binary.
+
+**Alternative (if makers not available):**
+```bash
+cd playground && mzoon/bin/mzoon start &
 ```
 
 Wait for compilation (1-2 minutes fresh, seconds incremental). Check if running:
 ```bash
 curl -s http://localhost:8081 | head -5
 ```
+
+**Stopping the playground (kill zombie processes on Linux):**
+```bash
+cd playground && makers kill
+```
+
+This is necessary because on Linux, process hierarchy auto-killing doesn't work properly, leaving zombie mzoon processes. The `kill` task gracefully terminates all mzoon-related processes and force-kills any that don't respond.
 
 ### TypeScript/CodeMirror (separate watcher)
 
