@@ -10,10 +10,10 @@ document:
 -- Separates state from view for clarity
 -- Commented out: For educational comparison
 --
--- counter: 0 |> HOLD count {
+-- counter: 0 |> HOLD counter {
 --     Duration[seconds: 1]
 --     |> Timer/interval()
---     |> THEN { count + 1 }
+--     |> THEN { counter + 1 }
 -- }
 --
 -- document: counter |> Document/new()

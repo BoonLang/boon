@@ -3,10 +3,10 @@ store: [
         decrement_button: LINK
         increment_button: LINK
     ]
-    counter: 0 |> HOLD count {
+    counter: 0 |> HOLD counter {
         LATEST {
-            elements.decrement_button.event.press |> THEN { count - 1 }
-            elements.increment_button.event.press |> THEN { count + 1 }
+            elements.decrement_button.event.press |> THEN { counter - 1 }
+            elements.increment_button.event.press |> THEN { counter + 1 }
         }
     }
 ]

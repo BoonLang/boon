@@ -21,8 +21,8 @@ counter:
 -- This pattern directly computes next value from current value
 -- Commented out: For educational comparison
 --
--- counter: 0 |> HOLD count {
---     increment_button.event.press |> THEN { count + 1 }
+-- counter: 0 |> HOLD counter {
+--     increment_button.event.press |> THEN { counter + 1 }
 -- }
 
 increment_button: Element/button(
