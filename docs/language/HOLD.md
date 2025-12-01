@@ -246,26 +246,41 @@ lfsr: BITS[8] { 0 } |> HOLD lfsr {
 
 ## Supported Types
 
-HOLD works with these types:
+HOLD only allows **cheaply-copyable, fixed-size types**.
 
-### Supported
+Like Rust's `Copy` vs `Clone` - HOLD replaces the entire value on each update,
+so expensive-to-clone types are a performance trap.
 
-- **Scalars**: `Number`, `Text`
-- **Tags/Enums**: `True`, `False`, user-defined tags
-- **BITS**: Hardware bit vectors
-- **Objects**: Structured data like `[x: 0, y: 0]`
+### Allowed (cheap to copy)
 
-### NOT Supported
+- **Number** - scalar
+- **Text** - scalar (immutable)
+- **Tag** - scalar (enum discriminant)
+- **BITS[n]** - fixed-size hardware primitive
+- **Objects** - fixed structure with allowed-type fields only
 
-**LIST** - Use reactive LIST operations instead:
+### NOT Allowed (expensive/variable size)
+
+- **LIST** - variable size, full copy on each update
+- **MAP** - variable size, full copy on each update
+- **BYTES** - can be very long, expensive to recreate
+- **MEMORY** - indexed storage, has its own operations
+
+### Why?
+
+1. **Copy cost** - HOLD replaces entire value; large types = O(n) per update
+2. **Hardware target** - variable-size types don't map to registers
+3. **Better alternatives** - LIST/MAP/MEMORY have dedicated reactive operations
+
+### Use Reactive Operations Instead
 
 ```boon
--- Don't do this
+-- Don't do this (expensive full copy on each update)
 items: LIST {} |> HOLD items {
     event |> THEN { items |> List/push(item) }
 }
 
--- Do this instead
+-- Do this instead (O(1) diff-based updates)
 items: LIST {}
     |> List/push(item: new_event)
     |> List/take_last(count: 100)

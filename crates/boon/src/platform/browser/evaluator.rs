@@ -1779,6 +1779,10 @@ fn static_spanned_expression_into_value_actor(
             }
         }
         static_expression::Expression::Hold { state_param, body } => {
+            // TODO: Add compiler check to reject expensive-to-copy types (LIST, MAP, BYTES, MEMORY) in HOLD.
+            // HOLD replaces entire value on each update - variable-size types are a performance trap.
+            // See docs/language/HOLD.md "Supported Types".
+
             // HOLD: `input |> HOLD state_param { body }`
             // The piped value sets/resets the state (not just initial - any emission).
             // The body can reference `state_param` to get the current state.

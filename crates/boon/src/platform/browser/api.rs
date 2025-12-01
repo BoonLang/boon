@@ -13,7 +13,7 @@ use crate::parser::PersistenceId;
 
 // @TODO make sure Values are deduplicated everywhere it makes sense
 
-/// ```
+/// ```text
 /// Document/new(root<INTO_ELEMENT>) -> [root_element<INTO_ELEMENT>]
 /// INTO_ELEMENT: <ELEMENT | Text | Number>
 /// ELEMENT: <
@@ -77,7 +77,7 @@ pub fn function_document_new(
     )
 }
 
-/// ```
+/// ```text
 /// Element/stripe(
 ///     element<[]>
 ///     direction<Column | Row>
@@ -168,7 +168,7 @@ pub fn function_element_stripe(
     )
 }
 
-/// ```
+/// ```text
 /// Element/button(
 ///     element<[
 ///         event?<[
@@ -272,7 +272,7 @@ pub fn function_element_button(
     )
 }
 
-/// ```
+/// ```text
 /// Element/text_input(
 ///     element<[event?<[change?: LINK, key_down?: LINK, blur?: LINK]>]>
 ///     style<[]>
@@ -396,7 +396,7 @@ pub fn function_element_text_input(
     )
 }
 
-/// ```
+/// ```text
 /// Element/checkbox(
 ///     element<[event?<[click?: LINK]>]>
 ///     style<[]>
@@ -508,7 +508,7 @@ pub fn function_element_checkbox(
     )
 }
 
-/// ```
+/// ```text
 /// Element/label(
 ///     element<[event?<[double_click?: LINK]>, hovered?: LINK, nearby_element?: ...]>
 ///     style<[]>
@@ -594,7 +594,7 @@ pub fn function_element_label(
     )
 }
 
-/// ```
+/// ```text
 /// Element/paragraph(
 ///     element<[]>
 ///     style<[]>
@@ -680,7 +680,7 @@ pub fn function_element_paragraph(
     )
 }
 
-/// ```
+/// ```text
 /// Element/link(
 ///     element<[hovered?: LINK]>
 ///     style<[]>
@@ -793,7 +793,7 @@ pub fn function_element_link(
 }
 
 // @TODO refactor
-/// ```
+/// ```text
 /// Math/sum(increment<Number>) -> Number
 /// ``````
 pub fn function_math_sum(
@@ -886,7 +886,7 @@ pub fn function_math_sum(
 }
 
 // @TODO remember configuration?
-/// ```
+/// ```text
 /// Timer/interval(duration<Duration[seconds<Number> | milliseconds<Number>]>) -> []
 /// ```
 pub fn function_timer_interval(
