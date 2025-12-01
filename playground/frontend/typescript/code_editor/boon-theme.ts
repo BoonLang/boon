@@ -137,6 +137,12 @@ export const oneDarkTheme = EditorView.theme({
     color: `${chocolate} !important`,
     fontWeight: "700",
   },
+  ".cm-content span.cm-boon-negative-sign": {
+    color: `${numberBlue} !important`,
+  },
+  ".cm-content span.cm-boon-negative-sign > span": {
+    color: `${numberBlue} !important`,
+  },
 
   ".cm-content": {
     caretColor: cursor,

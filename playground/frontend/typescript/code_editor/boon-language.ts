@@ -53,6 +53,7 @@ const chainAlternateMark = Decoration.mark({class: "cm-boon-chain-alt"})
 const textLiteralContentMark = Decoration.mark({class: "cm-boon-text-literal-content"})
 const textLiteralInterpolationMark = Decoration.mark({class: "cm-boon-text-literal-interpolation"})
 const textLiteralInterpolationDelimiterMark = Decoration.mark({class: "cm-boon-text-literal-interpolation-delimiter"})
+const negativeSignMark = Decoration.mark({class: "cm-boon-negative-sign"})
 
 const boonSemanticHighlight = ViewPlugin.fromClass(class {
   decorations
@@ -73,6 +74,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
     let expectFunctionName = false
     let pendingDefinition: {from: number, to: number} | null = null
     let pendingFunctionCall: {from: number, to: number} | null = null
+    let pendingMinus: {from: number, to: number} | null = null
     let chainIndex = 0
     let textLiteralEnd = 0  // Track end of TEXT literal to skip nodes inside it
 
@@ -263,6 +265,27 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
           return
         }
 
+        // Handle negative numbers: - immediately followed by Number
+        if (node.name === "Minus") {
+          pendingMinus = {from: node.from, to: node.to}
+          pendingDefinition = null
+          expectFunctionName = false
+          pendingFunctionCall = null
+          return
+        }
+
+        if (node.name === "Number") {
+          // If Minus immediately precedes this Number, color it as part of the number
+          if (pendingMinus && pendingMinus.to === node.from) {
+            builder.add(pendingMinus.from, pendingMinus.to, negativeSignMark)
+          }
+          pendingMinus = null
+          pendingDefinition = null
+          expectFunctionName = false
+          pendingFunctionCall = null
+          return
+        }
+
         if (
           node.name === "Punctuation" ||
           node.name === "Program" ||
@@ -279,12 +302,14 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
           }
 
           chainIndex = 0
+          pendingMinus = null
           return
         }
 
         pendingDefinition = null
         expectFunctionName = false
         pendingFunctionCall = null
+        pendingMinus = null
         chainIndex = 0
         return undefined
       }

@@ -23074,6 +23074,7 @@ const chainAlternateMark = Decoration.mark({ class: "cm-boon-chain-alt" });
 const textLiteralContentMark = Decoration.mark({ class: "cm-boon-text-literal-content" });
 const textLiteralInterpolationMark = Decoration.mark({ class: "cm-boon-text-literal-interpolation" });
 const textLiteralInterpolationDelimiterMark = Decoration.mark({ class: "cm-boon-text-literal-interpolation-delimiter" });
+const negativeSignMark = Decoration.mark({ class: "cm-boon-negative-sign" });
 const boonSemanticHighlight = ViewPlugin.fromClass(class {
 	decorations;
 	constructor(view) {
@@ -23088,6 +23089,7 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 		let expectFunctionName = false;
 		let pendingDefinition = null;
 		let pendingFunctionCall = null;
+		let pendingMinus = null;
 		let chainIndex = 0;
 		let textLiteralEnd = 0;
 		syntaxTree(view.state).iterate({
@@ -23225,17 +23227,37 @@ const boonSemanticHighlight = ViewPlugin.fromClass(class {
 					return;
 				}
 				if (node.name === "WS" || node.name === "Piece") return;
+				if (node.name === "Minus") {
+					pendingMinus = {
+						from: node.from,
+						to: node.to
+					};
+					pendingDefinition = null;
+					expectFunctionName = false;
+					pendingFunctionCall = null;
+					return;
+				}
+				if (node.name === "Number") {
+					if (pendingMinus && pendingMinus.to === node.from) builder.add(pendingMinus.from, pendingMinus.to, negativeSignMark);
+					pendingMinus = null;
+					pendingDefinition = null;
+					expectFunctionName = false;
+					pendingFunctionCall = null;
+					return;
+				}
 				if (node.name === "Punctuation" || node.name === "Program" || node.name === "ProgramItems" || node.name === "ObjectLiteral" || node.name === "ListLiteral" || node.name === "TaggedObject") {
 					if (node.name === "Punctuation") {
 						const punctuationText = view.state.doc.sliceString(node.from, node.to);
 						if (punctuationText === ".") return;
 					}
 					chainIndex = 0;
+					pendingMinus = null;
 					return;
 				}
 				pendingDefinition = null;
 				expectFunctionName = false;
 				pendingFunctionCall = null;
+				pendingMinus = null;
 				chainIndex = 0;
 				return undefined;
 			}
@@ -23349,6 +23371,8 @@ const oneDarkTheme = EditorView.theme({
 		color: `${chocolate} !important`,
 		fontWeight: "700"
 	},
+	".cm-content span.cm-boon-negative-sign": { color: `${numberBlue} !important` },
+	".cm-content span.cm-boon-negative-sign > span": { color: `${numberBlue} !important` },
 	".cm-content": { caretColor: cursor },
 	".cm-cursor, .cm-dropCursor": { borderLeftColor: cursor },
 	"&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection": { backgroundColor: selection },
