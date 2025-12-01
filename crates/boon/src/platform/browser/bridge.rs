@@ -6,7 +6,7 @@ use zoon::{eprintln, *};
 
 use super::engine::{
     ActorContext, ConstructContext, ConstructInfo, ListChange, Object,
-    TaggedObject, Value, ValueActor, ValueIdempotencyKey, Variable,
+    TaggedObject, TypedStream, Value, ValueActor, ValueIdempotencyKey, Variable,
     Text as EngineText, Tag as EngineTag,
 };
 
@@ -75,6 +75,7 @@ fn element_stripe(
     let settings_variable = tagged_object.expect_variable("settings");
 
     let direction_stream = settings_variable
+        .clone()
         .subscribe()
         .flat_map(|value| value.expect_object().expect_variable("direction").subscribe())
         .map(|direction| match direction.expect_tag().tag() {
@@ -120,7 +121,7 @@ fn element_button(
     let press_handler_task = Task::start_droppable({
         let construct_context = construct_context.clone();
         async move {
-            let mut press_link_value_sender = None;
+            let mut press_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
             let mut press_event_object_value_version = 0u64;
             loop {
                 select! {
@@ -191,6 +192,7 @@ fn element_text_input(
 
     // Set up event handlers - create separate subscriptions
     let mut change_stream = element_variable
+        .clone()
         .subscribe()
         .filter_map(|value| future::ready(value.expect_object().variable("event")))
         .flat_map(|variable| variable.subscribe())
@@ -199,6 +201,7 @@ fn element_text_input(
         .fuse();
 
     let mut key_down_stream = element_variable
+        .clone()
         .subscribe()
         .filter_map(|value| future::ready(value.expect_object().variable("event")))
         .flat_map(|variable| variable.subscribe())
@@ -217,9 +220,9 @@ fn element_text_input(
     let event_handler_task = Task::start_droppable({
         let construct_context = construct_context.clone();
         async move {
-            let mut change_link_value_sender = None;
-            let mut key_down_link_value_sender = None;
-            let mut blur_link_value_sender = None;
+            let mut change_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
+            let mut key_down_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
+            let mut blur_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
             loop {
                 select! {
                     new_sender = change_stream.next() => {
@@ -250,12 +253,13 @@ fn element_text_input(
                                     ValueActor::new_arc(
                                         ConstructInfo::new("text_input::change_event::text_actor", None, "change text actor"),
                                         ActorContext::default(),
-                                        stream::once(future::ready(EngineText::new_value(
+                                        // Already infinite via chain(pending())
+                                        TypedStream::infinite(stream::once(future::ready(EngineText::new_value(
                                             ConstructInfo::new("text_input::change_event::text_value", None, "change text value"),
                                             construct_context.clone(),
                                             ValueIdempotencyKey::new(),
                                             text,
-                                        ))).chain(stream::pending()),
+                                        ))).chain(stream::pending())),
                                     ),
                                 )],
                             );
@@ -275,12 +279,13 @@ fn element_text_input(
                                     ValueActor::new_arc(
                                         ConstructInfo::new("text_input::key_down_event::key_actor", None, "key_down key actor"),
                                         ActorContext::default(),
-                                        stream::once(future::ready(EngineTag::new_value(
+                                        // Already infinite via chain(pending())
+                                        TypedStream::infinite(stream::once(future::ready(EngineTag::new_value(
                                             ConstructInfo::new("text_input::key_down_event::key_value", None, "key_down key value"),
                                             construct_context.clone(),
                                             ValueIdempotencyKey::new(),
                                             key,
-                                        ))).chain(stream::pending()),
+                                        ))).chain(stream::pending())),
                                     ),
                                 )],
                             );
@@ -306,6 +311,7 @@ fn element_text_input(
     let settings_variable = tagged_object.expect_variable("settings");
 
     let text_stream = settings_variable
+        .clone()
         .subscribe()
         .flat_map(|value| value.expect_object().expect_variable("text").subscribe())
         .filter_map(|value| {
@@ -377,7 +383,7 @@ fn element_checkbox(
     let event_handler_task = Task::start_droppable({
         let construct_context = construct_context.clone();
         async move {
-            let mut click_link_value_sender = None;
+            let mut click_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
             loop {
                 select! {
                     new_sender = click_stream.next() => {
@@ -404,6 +410,7 @@ fn element_checkbox(
     let settings_variable = tagged_object.expect_variable("settings");
 
     let checked_stream = settings_variable
+        .clone()
         .subscribe()
         .flat_map(|value| value.expect_object().expect_variable("checked").subscribe())
         .filter_map(|value| {
@@ -447,6 +454,7 @@ fn element_label(
 
     // Set up hovered link
     let hovered_stream = element_variable
+        .clone()
         .subscribe()
         .filter_map(|value| future::ready(value.expect_object().variable("hovered")))
         .map(|variable| variable.expect_link_value_sender());
@@ -465,8 +473,8 @@ fn element_label(
     let event_handler_task = Task::start_droppable({
         let construct_context = construct_context.clone();
         async move {
-            let mut double_click_link_value_sender = None;
-            let mut _hovered_link_value_sender = None;
+            let mut double_click_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
+            let mut _hovered_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
             let mut hovered_stream = hovered_stream.fuse();
             loop {
                 select! {
@@ -545,6 +553,7 @@ fn element_link(
     let settings_variable = tagged_object.expect_variable("settings");
 
     let label_stream = settings_variable
+        .clone()
         .subscribe()
         .flat_map(|value| value.expect_object().expect_variable("label").subscribe())
         .map(move |value| value_to_element(value, construct_context.clone()));

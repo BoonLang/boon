@@ -4,9 +4,11 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::pin::pin;
+use std::marker::PhantomData;
+use std::pin::{pin, Pin};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use crate::parser;
 use crate::parser::SourceCode;
@@ -19,7 +21,7 @@ use zoon::IntoCowStr;
 use zoon::future;
 use zoon::futures_channel::{mpsc, oneshot};
 use zoon::futures_util::select;
-use zoon::futures_util::stream::{self, Stream, StreamExt};
+use zoon::futures_util::stream::{self, LocalBoxStream, Stream, StreamExt};
 use zoon::{Deserialize, DeserializeOwned, Serialize, serde, serde_json};
 use zoon::{Task, TaskHandle};
 use zoon::{WebStorage, local_storage};
@@ -39,10 +41,103 @@ use zoon::{eprintln, println};
 /// - Extra owned data not properly keeping actors alive
 const LOG_DROPS_AND_LOOP_ENDS: bool = true;
 
+// --- TypedStream ---
+
+/// Marker for streams that never terminate (safe for ValueActor).
+/// Streams with this marker can be safely used as input to ValueActor
+/// because they will never cause the actor's internal loop to exit.
+pub struct Infinite;
+
+/// Marker for streams that will terminate (unsafe for ValueActor without conversion).
+/// Using a Finite stream directly with ValueActor will cause "receiver is gone" errors
+/// when the stream terminates and the actor's loop exits.
+pub struct Finite;
+
+/// A stream wrapper with compile-time lifecycle information.
+///
+/// This type enforces at compile time that only infinite streams are used
+/// with ValueActor, preventing "receiver is gone" errors.
+///
+/// # Type Parameters
+/// - `S`: The underlying stream type
+/// - `Lifecycle`: Either `Infinite` or `Finite`, indicating whether the stream terminates
+///
+/// # Example
+/// ```ignore
+/// // This compiles - constant() returns TypedStream<_, Infinite>
+/// ValueActor::new(constant(value), ...);
+///
+/// // This would NOT compile - stream::once() is Finite
+/// ValueActor::new(TypedStream::finite(stream::once(...)), ...);
+///
+/// // To fix, convert to infinite:
+/// ValueActor::new(TypedStream::finite(stream::once(...)).keep_alive(), ...);
+/// ```
+#[pin_project::pin_project]
+pub struct TypedStream<S, Lifecycle> {
+    #[pin]
+    pub(crate) inner: S,
+    _marker: PhantomData<Lifecycle>,
+}
+
+impl<S> TypedStream<S, Infinite> {
+    /// Create an infinite stream wrapper.
+    /// Use this for streams that you know will never terminate.
+    pub fn infinite(stream: S) -> Self {
+        Self {
+            inner: stream,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<S> TypedStream<S, Finite> {
+    /// Create a finite stream wrapper.
+    /// Use this for streams that will terminate (like stream::once()).
+    pub fn finite(stream: S) -> Self {
+        Self {
+            inner: stream,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Convert a finite stream to an infinite one by chaining with pending().
+    /// This is the proper way to use a finite stream with ValueActor.
+    pub fn keep_alive(self) -> TypedStream<stream::Chain<S, stream::Once<future::Pending<S::Item>>>, Infinite>
+    where
+        S: Stream,
+    {
+        TypedStream::infinite(self.inner.chain(stream::once(future::pending())))
+    }
+}
+
+impl<S: Stream, L> Stream for TypedStream<S, L> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.project().inner.poll_next(cx)
+    }
+}
+
 // --- constant ---
 
-pub fn constant<T>(item: T) -> impl Stream<Item = T> {
-    stream::once(future::ready(item)).chain(stream::once(future::pending()))
+/// Creates an infinite stream that emits a single value and then stays pending forever.
+///
+/// This is the preferred way to create a ValueActor for a constant value.
+/// Unlike `stream::once()`, this stream never terminates, so the ValueActor's
+/// internal loop will never exit and subscribers will never receive
+/// "receiver is gone" errors.
+///
+/// # Example
+/// ```ignore
+/// // Safe: constant() returns an infinite stream
+/// ValueActor::new(constant(value), ...);
+///
+/// // Unsafe: stream::once() terminates after emitting
+/// ValueActor::new(TypedStream::infinite(stream::once(...)), ...); // BUG! Will cause errors
+/// ```
+pub fn constant<T>(item: T) -> TypedStream<impl Stream<Item = T>, Infinite> {
+    TypedStream::infinite(stream::once(future::ready(item)).chain(stream::once(future::pending())))
 }
 
 // --- VirtualFilesystem ---
@@ -477,8 +572,9 @@ impl Variable {
             ConstructInfo::new(actor_id, persistence, "Link variable value actor")
                 .complete(ConstructType::ValueActor);
         let (link_value_sender, link_value_receiver) = mpsc::unbounded();
+        // UnboundedReceiver is infinite - it never terminates unless sender is dropped
         let value_actor =
-            ValueActor::new_internal(actor_construct_info, actor_context, link_value_receiver, ());
+            ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_value_receiver));
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
             name: name.into(),
@@ -487,8 +583,24 @@ impl Variable {
         })
     }
 
-    pub fn subscribe(&self) -> impl Stream<Item = Value> + use<> {
-        self.value_actor.subscribe()
+    pub fn subscribe(&self) -> Subscription {
+        self.value_actor.clone().subscribe()
+    }
+
+    /// Subscribe to this variable's values while keeping the variable alive.
+    /// This is important for LINK variables because dropping the Variable would drop
+    /// the link_value_sender, closing the channel and preventing new values from being sent.
+    /// Use this method instead of `subscribe()` when the variable might be dropped
+    /// before all values are consumed (e.g., in flat_map closures).
+    pub fn subscribe_keeping_alive(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        let subscription = self.value_actor.clone().subscribe();
+        // Subscription keeps the actor alive; we also need to keep the Variable alive
+        stream::unfold(
+            (subscription, self),
+            |(mut subscription, variable)| async move {
+                subscription.next().await.map(|value| (value, (subscription, variable)))
+            }
+        ).boxed_local()
     }
 
     pub fn value_actor(&self) -> Arc<ValueActor> {
@@ -547,16 +659,10 @@ impl VariableOrArgumentReference {
             }
             static_expression::Alias::WithPassed { extra_parts } => extra_parts,
         };
-        // IMPORTANT: We use `stream::unfold` instead of just `flat_map(|actor| actor.subscribe())`
-        // to keep the root actor alive while consuming its subscription. Without this,
-        // the actor would be dropped immediately after `subscribe()` is called, which
-        // cancels its internal task via `Task::start_droppable` before it can send values.
+        // The `subscribe()` method returns a `Subscription` that keeps the actor alive
+        // for the duration of the subscription, so we no longer need the manual unfold pattern.
         let mut value_stream = stream::once(root_value_actor)
-            .flat_map(|actor| {
-                stream::unfold((actor.subscribe(), actor), |(mut subscription, actor)| async move {
-                    subscription.next().await.map(|value| (value, (subscription, actor)))
-                })
-            })
+            .flat_map(|actor| actor.subscribe())
             .boxed_local();
         for alias_part in alias_parts.into_iter().skip(skip_alias_parts) {
             let alias_part = alias_part.to_string();
@@ -564,27 +670,24 @@ impl VariableOrArgumentReference {
                 .flat_map(move |value| {
                     match value {
                         Value::Object(object, _) => {
-                            let variable = object.expect_variable(&alias_part);
-                            let variable_actor = variable.value_actor();
-                            // IMPORTANT: Use stream::unfold to keep both the object and the variable's
-                            // actor alive while consuming the subscription. Without this, actors get
-                            // dropped immediately after subscribe() is called.
+                            let variable_actor = object.expect_variable(&alias_part).value_actor();
+                            // The Subscription keeps the ValueActor alive. We still keep the parent
+                            // object alive via unfold to ensure any back-references remain valid.
                             stream::unfold(
-                                (variable_actor.subscribe(), object, variable_actor),
-                                |(mut subscription, object, actor)| async move {
-                                    subscription.next().await.map(|value| (value, (subscription, object, actor)))
+                                (variable_actor.subscribe(), object),
+                                |(mut subscription, object)| async move {
+                                    subscription.next().await.map(|value| (value, (subscription, object)))
                                 }
                             ).boxed_local()
                         }
                         Value::TaggedObject(tagged_object, _) => {
-                            let variable = tagged_object.expect_variable(&alias_part);
-                            let variable_actor = variable.value_actor();
-                            // IMPORTANT: Use stream::unfold to keep both the tagged_object and the variable's
-                            // actor alive while consuming the subscription.
+                            let variable_actor = tagged_object.expect_variable(&alias_part).value_actor();
+                            // The Subscription keeps the ValueActor alive. We still keep the parent
+                            // tagged_object alive via unfold to ensure any back-references remain valid.
                             stream::unfold(
-                                (variable_actor.subscribe(), tagged_object, variable_actor),
-                                |(mut subscription, tagged_object, actor)| async move {
-                                    subscription.next().await.map(|value| (value, (subscription, tagged_object, actor)))
+                                (variable_actor.subscribe(), tagged_object),
+                                |(mut subscription, tagged_object)| async move {
+                                    subscription.next().await.map(|value| (value, (subscription, tagged_object)))
                                 }
                             ).boxed_local()
                         }
@@ -596,11 +699,11 @@ impl VariableOrArgumentReference {
                 })
                 .boxed_local();
         }
-        Arc::new(ValueActor::new_internal(
+        // Subscription-based streams are infinite (subscriptions never terminate first)
+        Arc::new(ValueActor::new(
             construct_info,
             actor_context,
-            value_stream,
-            (),
+            TypedStream::infinite(value_stream),
         ))
     }
 }
@@ -810,7 +913,7 @@ impl FunctionCall {
             // Subscribe to all arguments and filter for FLUSHED values only
             let flushed_streams: Vec<_> = arguments_for_flushed
                 .iter()
-                .map(|arg| arg.subscribe().filter(|v| {
+                .map(|arg| arg.clone().subscribe().filter(|v| {
                     let is_flushed = v.is_flushed();
                     std::future::ready(is_flushed)
                 }))
@@ -828,11 +931,11 @@ impl FunctionCall {
             }),
         );
 
-        Arc::new(ValueActor::new_internal(
+        // Combined stream is infinite (subscriptions never terminate first)
+        Arc::new(ValueActor::new(
             construct_info,
             actor_context,
-            combined_stream,
-            arguments,
+            TypedStream::infinite(combined_stream),
         ))
     }
 }
@@ -864,7 +967,7 @@ impl LatestCombinator {
 
         let value_stream =
             stream::select_all(inputs.iter().enumerate().map(|(index, value_actor)| {
-                value_actor.subscribe().map(move |value| (index, value))
+                value_actor.clone().subscribe().map(move |value| (index, value))
             }))
             .scan(true, {
                 let storage = storage.clone();
@@ -910,11 +1013,11 @@ impl LatestCombinator {
             })
             .filter_map(future::ready);
 
-        Arc::new(ValueActor::new_internal(
+        // Subscription-based streams are infinite (subscriptions never terminate first)
+        Arc::new(ValueActor::new(
             construct_info,
             actor_context,
-            value_stream,
-            inputs,
+            TypedStream::infinite(value_stream),
         ))
     }
 }
@@ -1003,11 +1106,11 @@ impl ThenCombinator {
             value.set_idempotency_key(ValueIdempotencyKey::new());
             value
         });
-        Arc::new(ValueActor::new_internal(
+        // Subscription-based streams are infinite (subscriptions never terminate first)
+        Arc::new(ValueActor::new(
             construct_info,
             actor_context,
-            value_stream,
-            (observed, send_impulse_task, body),
+            TypedStream::infinite(value_stream),
         ))
     }
 }
@@ -1063,11 +1166,11 @@ impl BinaryOperatorCombinator {
             }
         });
 
-        Arc::new(ValueActor::new_internal(
+        // Subscription-based streams are infinite (subscriptions never terminate first)
+        Arc::new(ValueActor::new(
             construct_info,
             actor_context,
-            value_stream,
-            (operand_a, operand_b),
+            TypedStream::infinite(value_stream),
         ))
     }
 }
@@ -1404,7 +1507,7 @@ impl WhenCombinator {
 
                     if let Some(arm) = matched_arm {
                         // Subscribe to the matching arm's body
-                        arm.body.subscribe().boxed_local()
+                        arm.body.clone().subscribe().boxed_local()
                     } else {
                         // No match - this shouldn't happen if we have a wildcard default
                         // Return an empty stream
@@ -1413,11 +1516,11 @@ impl WhenCombinator {
                 }
             });
 
-        Arc::new(ValueActor::new_internal(
+        // Subscription-based streams are infinite (subscriptions never terminate first)
+        Arc::new(ValueActor::new(
             construct_info,
             actor_context,
-            value_stream,
-            (input, arms),
+            TypedStream::infinite(value_stream),
         ))
     }
 }
@@ -1483,21 +1586,33 @@ pub struct ValueActor {
 }
 
 impl ValueActor {
-    pub fn new(
-        construct_info: ConstructInfo,
-        actor_context: ActorContext,
-        value_stream: impl Stream<Item = Value> + 'static,
-    ) -> Self {
-        let construct_info = construct_info.complete(ConstructType::ValueActor);
-        Self::new_internal(construct_info, actor_context, value_stream, ())
-    }
-
-    fn new_internal<EOD: 'static>(
+    /// Create a new ValueActor from a stream.
+    ///
+    /// # Warning
+    /// The stream MUST be infinite (never terminate). If the stream terminates,
+    /// the actor's internal loop will exit, dropping all sender channels and causing
+    /// "receiver is gone" errors for active subscribers.
+    ///
+    /// For compile-time safety, prefer using `constant(value)` for constant values,
+    /// which is guaranteed to be infinite.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Safe: constant() returns an infinite stream
+    /// ValueActor::new(info, context, constant(value));
+    ///
+    /// // Safe: unfold patterns are infinite by design
+    /// ValueActor::new(info, context, stream::unfold(...));
+    ///
+    /// // UNSAFE: stream::once() terminates - will cause "receiver is gone" errors!
+    /// ValueActor::new(info, context, stream::once(...)); // BUG!
+    /// ```
+    pub fn new<S: Stream<Item = Value> + 'static>(
         construct_info: ConstructInfoComplete,
         actor_context: ActorContext,
-        value_stream: impl Stream<Item = Value> + 'static,
-        extra_owned_data: EOD,
+        value_stream: TypedStream<S, Infinite>,
     ) -> Self {
+        let value_stream = value_stream.inner;
         let construct_info = Arc::new(construct_info);
         let (value_sender_sender, mut value_sender_receiver) =
             mpsc::unbounded::<mpsc::UnboundedSender<Value>>();
@@ -1567,7 +1682,6 @@ impl ValueActor {
                 if LOG_DROPS_AND_LOOP_ENDS {
                     println!("Loop ended {construct_info}");
                 }
-                drop(extra_owned_data);
             }
         });
         Self {
@@ -1577,31 +1691,34 @@ impl ValueActor {
         }
     }
 
-    pub fn new_arc(
+    pub fn new_arc<S: Stream<Item = Value> + 'static>(
         construct_info: ConstructInfo,
         actor_context: ActorContext,
-        value_stream: impl Stream<Item = Value> + 'static,
+        value_stream: TypedStream<S, Infinite>,
     ) -> Arc<Self> {
-        Arc::new(Self::new(construct_info, actor_context, value_stream))
+        Arc::new(Self::new(
+            construct_info.complete(ConstructType::ValueActor),
+            actor_context,
+            value_stream,
+        ))
     }
 
-    pub fn new_arc_with_extra_owned_data<EOD: 'static>(
-        construct_info: ConstructInfo,
-        actor_context: ActorContext,
-        value_stream: impl Stream<Item = Value> + 'static,
-        extra_owned_data: EOD,
-    ) -> Arc<Self> {
-        let construct_info = construct_info.complete(ConstructType::ValueActor);
-        Arc::new(Self::new_internal(construct_info, actor_context, value_stream, extra_owned_data))
-    }
-
-    pub fn subscribe(&self) -> impl Stream<Item = Value> + use<> {
+    /// Subscribe to this actor's values.
+    ///
+    /// The returned `Subscription` stream keeps the actor alive for the
+    /// duration of the subscription. When the stream is dropped, the
+    /// actor reference is released.
+    pub fn subscribe(self: Arc<Self>) -> Subscription {
         let (value_sender, value_receiver) = mpsc::unbounded();
         if let Err(error) = self.value_sender_sender.unbounded_send(value_sender) {
             eprintln!("Failed to subscribe to {}: {error:#}", self.construct_info);
         }
-        value_receiver
+        Subscription {
+            receiver: value_receiver,
+            _actor: self,
+        }
     }
+
 }
 
 impl Drop for ValueActor {
@@ -1609,6 +1726,24 @@ impl Drop for ValueActor {
         if LOG_DROPS_AND_LOOP_ENDS {
             println!("Dropped: {}", self.construct_info);
         }
+    }
+}
+
+// --- Subscription ---
+
+/// A subscription stream that keeps its source ValueActor alive.
+/// The `_actor` field holds an `Arc<ValueActor>` reference that is automatically
+/// dropped when the subscription stream is dropped, ensuring proper lifecycle management.
+pub struct Subscription {
+    receiver: mpsc::UnboundedReceiver<Value>,
+    _actor: Arc<ValueActor>,
+}
+
+impl Stream for Subscription {
+    type Item = Value;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.receiver).poll_next(cx)
     }
 }
 
@@ -1813,7 +1948,7 @@ impl Value {
                 serde_json::Value::Object(obj)
             }
             Value::List(list, _) => {
-                let first_change = list.subscribe().next().await;
+                let first_change = list.clone().subscribe().next().await;
                 if let Some(ListChange::Replace { items }) = first_change {
                     let mut json_items = Vec::new();
                     for item in items {
@@ -2065,11 +2200,10 @@ pub fn value_actor_from_json(
         None,
         "ValueActor from JSON",
     ).complete(ConstructType::ValueActor);
-    Arc::new(ValueActor::new_internal(
+    Arc::new(ValueActor::new(
         actor_construct_info,
         actor_context,
         constant(value),
-        (),
     ))
 }
 
@@ -2117,7 +2251,7 @@ impl Object {
         construct_context: ConstructContext,
         idempotency_key: ValueIdempotencyKey,
         variables: impl Into<Vec<Arc<Variable>>>,
-    ) -> impl Stream<Item = Value> {
+    ) -> TypedStream<impl Stream<Item = Value>, Infinite> {
         constant(Self::new_value(
             construct_info,
             construct_context,
@@ -2152,11 +2286,10 @@ impl Object {
             idempotency_key,
             variables.into(),
         );
-        Arc::new(ValueActor::new_internal(
+        Arc::new(ValueActor::new(
             actor_construct_info,
             actor_context,
             value_stream,
-            (),
         ))
     }
 
@@ -2239,7 +2372,7 @@ impl TaggedObject {
         idempotency_key: ValueIdempotencyKey,
         tag: impl Into<Cow<'static, str>>,
         variables: impl Into<Vec<Arc<Variable>>>,
-    ) -> impl Stream<Item = Value> {
+    ) -> TypedStream<impl Stream<Item = Value>, Infinite> {
         constant(Self::new_value(
             construct_info,
             construct_context,
@@ -2277,11 +2410,10 @@ impl TaggedObject {
             tag.into(),
             variables.into(),
         );
-        Arc::new(ValueActor::new_internal(
+        Arc::new(ValueActor::new(
             actor_construct_info,
             actor_context,
             value_stream,
-            (),
         ))
     }
 
@@ -2362,7 +2494,7 @@ impl Text {
         construct_context: ConstructContext,
         idempotency_key: ValueIdempotencyKey,
         text: impl Into<Cow<'static, str>>,
-    ) -> impl Stream<Item = Value> {
+    ) -> TypedStream<impl Stream<Item = Value>, Infinite> {
         constant(Self::new_value(
             construct_info,
             construct_context,
@@ -2397,11 +2529,10 @@ impl Text {
             idempotency_key,
             text.into(),
         );
-        Arc::new(ValueActor::new_internal(
+        Arc::new(ValueActor::new(
             actor_construct_info,
             actor_context,
             value_stream,
-            (),
         ))
     }
 
@@ -2462,7 +2593,7 @@ impl Tag {
         construct_context: ConstructContext,
         idempotency_key: ValueIdempotencyKey,
         tag: impl Into<Cow<'static, str>>,
-    ) -> impl Stream<Item = Value> {
+    ) -> TypedStream<impl Stream<Item = Value>, Infinite> {
         constant(Self::new_value(
             construct_info,
             construct_context,
@@ -2497,11 +2628,10 @@ impl Tag {
             idempotency_key,
             tag.into(),
         );
-        Arc::new(ValueActor::new_internal(
+        Arc::new(ValueActor::new(
             actor_construct_info,
             actor_context,
             value_stream,
-            (),
         ))
     }
 
@@ -2562,7 +2692,7 @@ impl Number {
         construct_context: ConstructContext,
         idempotency_key: ValueIdempotencyKey,
         number: impl Into<f64>,
-    ) -> impl Stream<Item = Value> {
+    ) -> TypedStream<impl Stream<Item = Value>, Infinite> {
         constant(Self::new_value(
             construct_info,
             construct_context,
@@ -2597,11 +2727,10 @@ impl Number {
             idempotency_key,
             number.into(),
         );
-        Arc::new(ValueActor::new_internal(
+        Arc::new(ValueActor::new(
             actor_construct_info,
             actor_context,
             value_stream,
-            (),
         ))
     }
 
@@ -2767,7 +2896,7 @@ impl List {
         idempotency_key: ValueIdempotencyKey,
         actor_context: ActorContext,
         items: impl Into<Vec<Arc<ValueActor>>>,
-    ) -> impl Stream<Item = Value> {
+    ) -> TypedStream<impl Stream<Item = Value>, Infinite> {
         constant(Self::new_value(
             construct_info,
             construct_context,
@@ -2804,20 +2933,27 @@ impl List {
             actor_context.clone(),
             items.into(),
         );
-        Arc::new(ValueActor::new_internal(
+        Arc::new(ValueActor::new(
             actor_construct_info,
             actor_context,
             value_stream,
-            (),
         ))
     }
 
-    pub fn subscribe(&self) -> impl Stream<Item = ListChange> + use<> {
+    /// Subscribe to this list's changes.
+    ///
+    /// The returned `ListSubscription` stream keeps the list alive for the
+    /// duration of the subscription. When the stream is dropped, the
+    /// list reference is released.
+    pub fn subscribe(self: Arc<Self>) -> ListSubscription {
         let (change_sender, change_receiver) = mpsc::unbounded();
         if let Err(error) = self.change_sender_sender.unbounded_send(change_sender) {
             eprintln!("Failed to subscribe to {}: {error:#}", self.construct_info);
         }
-        change_receiver
+        ListSubscription {
+            receiver: change_receiver,
+            _list: self,
+        }
     }
 
     /// Creates a List with persistence support.
@@ -2904,13 +3040,13 @@ impl List {
             let list_for_save = list.clone();
             let construct_storage_for_save = construct_storage;
             Task::start(async move {
-                let mut change_stream = pin!(list_for_save.subscribe());
+                let mut change_stream = pin!(list_for_save.clone().subscribe());
                 while let Some(change) = change_stream.next().await {
                     // After any change, serialize and save the current list
                     if let ListChange::Replace { ref items } = change {
                         let mut json_items = Vec::new();
                         for item in items {
-                            if let Some(value) = item.subscribe().next().await {
+                            if let Some(value) = item.clone().subscribe().next().await {
                                 json_items.push(value.to_json().await);
                             }
                         }
@@ -2919,10 +3055,10 @@ impl List {
                         // For incremental changes, we need to get the full list and save it
                         // This is done by getting the next Replace event after the change is applied
                         // But for simplicity, let's re-subscribe to get the current state
-                        if let Some(ListChange::Replace { items }) = list_for_save.subscribe().next().await {
+                        if let Some(ListChange::Replace { items }) = list_for_save.clone().subscribe().next().await {
                             let mut json_items = Vec::new();
                             for item in &items {
-                                if let Some(value) = item.subscribe().next().await {
+                                if let Some(value) = item.clone().subscribe().next().await {
                                     json_items.push(value.to_json().await);
                                 }
                             }
@@ -2941,11 +3077,10 @@ impl List {
             "Persistent list wrapper",
         ).complete(ConstructType::ValueActor);
 
-        Arc::new(ValueActor::new_internal(
+        Arc::new(ValueActor::new(
             actor_construct_info,
             actor_context,
-            value_stream,
-            (),
+            TypedStream::infinite(value_stream),
         ))
     }
 }
@@ -2957,6 +3092,26 @@ impl Drop for List {
         }
     }
 }
+
+// --- ListSubscription ---
+
+/// A subscription stream that keeps its source List alive.
+/// The `_list` field holds an `Arc<List>` reference that is automatically
+/// dropped when the subscription stream is dropped, ensuring proper lifecycle management.
+pub struct ListSubscription {
+    receiver: mpsc::UnboundedReceiver<ListChange>,
+    _list: Arc<List>,
+}
+
+impl Stream for ListSubscription {
+    type Item = ListChange;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.receiver).poll_next(cx)
+    }
+}
+
+// --- ListChange ---
 
 #[derive(Clone)]
 pub enum ListChange {
@@ -3205,7 +3360,7 @@ impl ListBindingFunction {
         let construct_context_for_stream = construct_context.clone();
         let actor_context_for_stream = actor_context.clone();
 
-        let change_stream = source_list_actor.subscribe().filter_map(|value| {
+        let change_stream = source_list_actor.clone().subscribe().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
                 _ => None,
@@ -3236,14 +3391,13 @@ impl ListBindingFunction {
             source_list_actor.clone(),
         );
 
-        Arc::new(ValueActor::new_internal(
+        Arc::new(ValueActor::new(
             construct_info,
             actor_context,
             constant(Value::List(
                 Arc::new(list),
                 ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
             )),
-            vec![source_list_actor],
         ))
     }
 
@@ -3266,7 +3420,7 @@ impl ListBindingFunction {
         // 1. Subscribes to source list changes
         // 2. For each item, evaluates predicate and subscribes to its changes
         // 3. When list or any predicate changes, emits filtered Replace
-        let value_stream = source_list_actor.subscribe().filter_map(|value| {
+        let value_stream = source_list_actor.clone().subscribe().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
                 _ => None,
@@ -3348,7 +3502,7 @@ impl ListBindingFunction {
                 // Subscribe to all predicates and emit filtered list when any changes
                 let predicate_streams: Vec<_> = item_predicates.iter().enumerate().map(|(idx, (item, pred))| {
                     let item = item.clone();
-                    pred.subscribe().map(move |value| (idx, item.clone(), value))
+                    pred.clone().subscribe().map(move |value| (idx, item.clone(), value))
                 }).collect();
 
                 stream::select_all(predicate_streams)
@@ -3398,14 +3552,13 @@ impl ListBindingFunction {
             source_list_actor.clone(),
         );
 
-        Arc::new(ValueActor::new_internal(
+        Arc::new(ValueActor::new(
             construct_info,
             actor_context_for_result,
             constant(Value::List(
                 Arc::new(list),
                 ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
             )),
-            vec![source_list_actor],
         ))
     }
 
@@ -3506,7 +3659,7 @@ impl ListBindingFunction {
                 let construct_context_map = construct_context.clone();
 
                 let predicate_streams: Vec<_> = item_predicates.iter().enumerate().map(|(idx, (_, pred))| {
-                    pred.subscribe().map(move |value| (idx, value))
+                    pred.clone().subscribe().map(move |value| (idx, value))
                 }).collect();
 
                 stream::select_all(predicate_streams)
@@ -3552,11 +3705,10 @@ impl ListBindingFunction {
             })
         });
 
-        Arc::new(ValueActor::new_internal(
+        Arc::new(ValueActor::new(
             construct_info,
             actor_context_for_result,
-            value_stream,
-            vec![source_list_actor],
+            TypedStream::infinite(value_stream),
         ))
     }
 
@@ -3579,7 +3731,7 @@ impl ListBindingFunction {
         // 1. Subscribes to source list changes
         // 2. For each item, evaluates key expression and subscribes to its changes
         // 3. When list or any key changes, emits sorted Replace
-        let value_stream = source_list_actor.subscribe().filter_map(|value| {
+        let value_stream = source_list_actor.clone().subscribe().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
                 _ => None,
@@ -3661,7 +3813,7 @@ impl ListBindingFunction {
                 // Subscribe to all keys and emit sorted list when any changes
                 let key_streams: Vec<_> = item_keys.iter().enumerate().map(|(idx, (item, key_actor))| {
                     let item = item.clone();
-                    key_actor.subscribe().map(move |value| (idx, item.clone(), value))
+                    key_actor.clone().subscribe().map(move |value| (idx, item.clone(), value))
                 }).collect();
 
                 stream::select_all(key_streams)
@@ -3712,14 +3864,13 @@ impl ListBindingFunction {
             source_list_actor.clone(),
         );
 
-        Arc::new(ValueActor::new_internal(
+        Arc::new(ValueActor::new(
             construct_info,
             actor_context_for_result,
             constant(Value::List(
                 Arc::new(list),
                 ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
             )),
-            vec![source_list_actor],
         ))
     }
 

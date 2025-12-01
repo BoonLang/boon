@@ -218,6 +218,56 @@ When debugging with browser automation (`boon-tools exec`):
 3. Extension disconnected → refresh browser tab manually
 4. Complete failure (last resort) → kill browser, restart
 
+## Stream Lifecycle Safety
+
+ValueActors require **infinite streams** (streams that never terminate). If a stream terminates, the actor's internal loop exits, dropping all sender channels and causing "receiver is gone" errors for active subscribers.
+
+### The Problem with `stream::once()`
+
+```rust
+// BROKEN - stream terminates after emitting one value:
+ValueActor::new(construct_info, actor_context, stream::once(async move { value }));
+```
+
+### The Solution: `constant()`
+
+```rust
+// CORRECT - stream emits once, then stays alive forever:
+ValueActor::new(construct_info, actor_context, constant(value));
+```
+
+The `constant()` function (in `engine.rs`) creates a stream that emits one value, then hangs forever using `stream::pending()`:
+
+```rust
+pub fn constant<T>(item: T) -> TypedStream<impl Stream<Item = T>, Infinite> {
+    TypedStream::infinite(stream::once(future::ready(item)).chain(stream::once(future::pending())))
+}
+```
+
+### TypedStream System
+
+The codebase provides compile-time markers for stream lifecycle:
+
+- **`TypedStream<S, Infinite>`** - Stream that never terminates (safe for ValueActor)
+- **`TypedStream<S, Finite>`** - Stream that will terminate (needs conversion)
+- **`finite_stream.keep_alive()`** - Converts Finite to Infinite by chaining with `pending()`
+
+While not fully enforced on `ValueActor::new()` yet, these types serve as documentation and can be gradually adopted.
+
+### Safe Patterns
+
+| Use Case | Pattern |
+|----------|---------|
+| Single constant value | `constant(value)` |
+| Subscription stream | Already infinite (receiver never closes first) |
+| `stream::unfold()` | Usually infinite if the closure never returns `None` |
+| Finite stream from external source | `TypedStream::finite(stream).keep_alive()` |
+
+### Known Bug Locations (Fixed)
+
+- `evaluator.rs:1463` - THEN input value: Changed from `stream::once()` to `constant()`
+- `evaluator.rs:2349` - Pattern bindings: Changed from `stream::once()` to `constant()`
+
 ## Key Dependencies
 - **chumsky** - Parser combinator library (with pratt parsing for operators)
 - **ariadne** - Error reporting

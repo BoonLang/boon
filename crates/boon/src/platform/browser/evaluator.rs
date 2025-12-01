@@ -1194,7 +1194,7 @@ fn static_spanned_expression_into_value_actor(
             ValueActor::new_arc(
                 construct_info,
                 actor_context,
-                stream::empty(),
+                TypedStream::infinite(stream::empty()),
             )
         }
         // Object expressions - [key: value, ...]
@@ -1353,7 +1353,7 @@ fn static_spanned_expression_into_value_actor(
                     let link_connector_for_setter = link_connector.clone();
 
                     // Subscribe to the piped stream and send each value to the link sender
-                    let sending_stream = piped.subscribe().then(move |value| {
+                    let sending_stream = piped.clone().subscribe().then(move |value| {
                         let link_connector_clone = link_connector_for_setter.clone();
                         async move {
                             // Get the link sender from the connector
@@ -1373,7 +1373,7 @@ fn static_spanned_expression_into_value_actor(
                             format!("{span}; LinkSetter"),
                         ),
                         actor_context,
-                        sending_stream,
+                        TypedStream::infinite(sending_stream),
                     )
                 }
                 None => {
@@ -1405,20 +1405,19 @@ fn static_spanned_expression_into_value_actor(
             let inputs = evaluated_inputs?;
 
             // Merge all input streams using select_all
+            // subscribe() returns a Subscription that keeps the actor alive
             let merged_stream = stream::select_all(
-                inputs.iter().map(|input| input.subscribe())
+                inputs.iter().map(|input| input.clone().subscribe())
             );
 
-            // Keep the input ValueActors alive as long as the LATEST ValueActor is alive
-            ValueActor::new_arc_with_extra_owned_data(
+            ValueActor::new_arc(
                 ConstructInfo::new(
                     format!("PersistenceId: {persistence_id}"),
                     persistence,
                     format!("{span}; LATEST {{..}}"),
                 ),
                 actor_context,
-                merged_stream,
-                inputs, // Keep inputs alive in the spawned task
+                TypedStream::infinite(merged_stream),
             )
         }
         static_expression::Expression::Then { body } => {
@@ -1439,7 +1438,7 @@ fn static_spanned_expression_into_value_actor(
 
                     // Subscribe to the piped stream and for each value, evaluate the body
                     let body_for_closure = body;
-                    let mapped_stream = piped.subscribe().filter_map(move |value| {
+                    let mapped_stream = piped.clone().subscribe().filter_map(move |value| {
                         let actor_context_clone = actor_context_for_then.clone();
                         let construct_context_clone = construct_context_for_then.clone();
                         let reference_connector_clone = reference_connector_for_then.clone();
@@ -1452,6 +1451,8 @@ fn static_spanned_expression_into_value_actor(
 
                         async move {
                             // Create a new value actor for this specific value
+                            // Use constant() to keep the actor alive (emits once then stays pending)
+                            // rather than stream::once() which ends after emitting.
                             let value_actor = ValueActor::new_arc(
                                 ConstructInfo::new(
                                     format!("THEN input value"),
@@ -1459,7 +1460,7 @@ fn static_spanned_expression_into_value_actor(
                                     format!("{span_for_then}; THEN input"),
                                 ),
                                 actor_context_clone.clone(),
-                                stream::once(async move { value }),
+                                constant(value),
                             );
 
                             // Evaluate the body with PASSED set to this value
@@ -1496,26 +1497,31 @@ fn static_spanned_expression_into_value_actor(
                     });
 
                     // Flatten the stream of actors into a stream of values
-                    // IMPORTANT: We use `stream::unfold` instead of just `flat_map(|actor| actor.subscribe())`
-                    // to keep the body actor alive while consuming its subscription. Without this,
-                    // the actor would be dropped immediately after `subscribe()` is called, which
-                    // cancels its internal task via `Task::start_droppable` before it can send values.
+                    // subscribe() returns Subscription which keeps the actor alive
+                    // IMPORTANT: Use .take(1) because body results use constant() streams
+                    // which never complete. Without take(1), flat_map blocks waiting for
+                    // the inner stream to finish, preventing subsequent input values from
+                    // being processed (causing interval/counter to only process first tick).
+                    //
+                    // THEN SEMANTICS: Each input pulse produces a conceptually "new" value,
+                    // even if the body evaluates to the same content (e.g., constant `1`).
+                    // We assign fresh idempotency keys so downstream consumers (like Math/sum)
+                    // treat each pulse's output as unique rather than skipping "duplicates".
                     let flattened_stream = mapped_stream.flat_map(|actor| {
-                        stream::unfold((actor.subscribe(), actor), |(mut subscription, actor)| async move {
-                            subscription.next().await.map(|value| (value, (subscription, actor)))
+                        actor.subscribe().take(1).map(|mut value| {
+                            value.set_idempotency_key(ValueIdempotencyKey::new());
+                            value
                         })
                     });
 
-                    // Keep the piped ValueActor alive as long as the THEN ValueActor is alive
-                    ValueActor::new_arc_with_extra_owned_data(
+                    ValueActor::new_arc(
                         ConstructInfo::new(
                             format!("PersistenceId: {persistence_id}"),
                             persistence,
                             format!("{span}; THEN {{..}}"),
                         ),
                         actor_context,
-                        flattened_stream,
-                        piped, // Keep piped alive in the spawned task
+                        TypedStream::infinite(flattened_stream),
                     )
                 }
                 None => {
@@ -1541,7 +1547,7 @@ fn static_spanned_expression_into_value_actor(
                     let arms_for_closure = arms.clone();
 
                     // For each value, try to match against arms and evaluate matching body
-                    let mapped_stream = piped.subscribe().filter_map(move |value| {
+                    let mapped_stream = piped.clone().subscribe().filter_map(move |value| {
                         let actor_context_clone = actor_context_for_when.clone();
                         let construct_context_clone = construct_context_for_when.clone();
                         let reference_connector_clone = reference_connector_for_when.clone();
@@ -1602,26 +1608,29 @@ fn static_spanned_expression_into_value_actor(
                     });
 
                     // Flatten the stream of actors into a stream of values
-                    // IMPORTANT: We use `stream::unfold` instead of just `flat_map(|actor| actor.subscribe())`
-                    // to keep the body actor alive while consuming its subscription. Without this,
-                    // the actor would be dropped immediately after `subscribe()` is called, which
-                    // cancels its internal task via `Task::start_droppable` before it can send values.
+                    // subscribe() returns Subscription which keeps the actor alive
+                    // IMPORTANT: Use .take(1) because body results use constant() streams
+                    // which never complete. Without take(1), flat_map blocks waiting for
+                    // the inner stream to finish, preventing subsequent input values from
+                    // being processed (causing interval/counter to only process first tick).
+                    //
+                    // WHEN SEMANTICS: Like THEN, each input pulse produces a conceptually "new" value.
+                    // We assign fresh idempotency keys so downstream consumers treat each pulse as unique.
                     let flattened_stream = mapped_stream.flat_map(|actor| {
-                        stream::unfold((actor.subscribe(), actor), |(mut subscription, actor)| async move {
-                            subscription.next().await.map(|value| (value, (subscription, actor)))
+                        actor.subscribe().take(1).map(|mut value| {
+                            value.set_idempotency_key(ValueIdempotencyKey::new());
+                            value
                         })
                     });
 
-                    // Keep the piped ValueActor alive as long as the WHEN ValueActor is alive
-                    ValueActor::new_arc_with_extra_owned_data(
+                    ValueActor::new_arc(
                         ConstructInfo::new(
                             format!("PersistenceId: {persistence_id}"),
                             persistence,
                             format!("{span}; WHEN {{..}}"),
                         ),
                         actor_context,
-                        flattened_stream,
-                        piped, // Keep piped alive in the spawned task
+                        TypedStream::infinite(flattened_stream),
                     )
                 }
                 None => {
@@ -1647,7 +1656,7 @@ fn static_spanned_expression_into_value_actor(
                     let arms_for_closure = arms.clone();
 
                     // For each value, try to match against arms and evaluate matching body
-                    let mapped_stream = piped.subscribe().filter_map(move |value| {
+                    let mapped_stream = piped.clone().subscribe().filter_map(move |value| {
                         let actor_context_clone = actor_context_for_while.clone();
                         let construct_context_clone = construct_context_for_while.clone();
                         let reference_connector_clone = reference_connector_for_while.clone();
@@ -1708,26 +1717,31 @@ fn static_spanned_expression_into_value_actor(
                     });
 
                     // Flatten the stream of actors into a stream of values
-                    // IMPORTANT: We use `stream::unfold` instead of just `flat_map(|actor| actor.subscribe())`
-                    // to keep the body actor alive while consuming its subscription. Without this,
-                    // the actor would be dropped immediately after `subscribe()` is called, which
-                    // cancels its internal task via `Task::start_droppable` before it can send values.
+                    // subscribe() returns Subscription which keeps the actor alive
+                    // IMPORTANT: Use .take(1) because body results use constant() streams
+                    // which never complete. Without take(1), flat_map blocks waiting for
+                    // the inner stream to finish, preventing subsequent input values from
+                    // being processed (causing interval/counter to only process first tick).
+                    //
+                    // WHILE: Like THEN/WHEN, each matching input produces a body evaluation.
+                    // While WHILE has "let everything flow" semantics at a conceptual level,
+                    // the current implementation evaluates the body per input pulse, so we
+                    // need fresh idempotency keys to prevent downstream duplicate skipping.
                     let flattened_stream = mapped_stream.flat_map(|actor| {
-                        stream::unfold((actor.subscribe(), actor), |(mut subscription, actor)| async move {
-                            subscription.next().await.map(|value| (value, (subscription, actor)))
+                        actor.subscribe().take(1).map(|mut value| {
+                            value.set_idempotency_key(ValueIdempotencyKey::new());
+                            value
                         })
                     });
 
-                    // Keep the piped ValueActor alive as long as the WHILE ValueActor is alive
-                    ValueActor::new_arc_with_extra_owned_data(
+                    ValueActor::new_arc(
                         ConstructInfo::new(
                             format!("PersistenceId: {persistence_id}"),
                             persistence,
                             format!("{span}; WHILE {{..}}"),
                         ),
                         actor_context,
-                        flattened_stream,
-                        piped, // Keep piped alive in the spawned task
+                        TypedStream::infinite(flattened_stream),
                     )
                 }
                 None => {
@@ -1782,7 +1796,7 @@ fn static_spanned_expression_into_value_actor(
                     format!("{span}; LATEST state parameter"),
                 ),
                 actor_context.clone(),
-                state_receiver,
+                TypedStream::infinite(state_receiver),
             );
 
             // Bind the state parameter in the context so body can reference it
@@ -1836,16 +1850,14 @@ fn static_spanned_expression_into_value_actor(
                 state_update_stream
             );
 
-            // Keep initial_actor and body_result alive as long as the LatestWithState ValueActor is alive
-            ValueActor::new_arc_with_extra_owned_data(
+            ValueActor::new_arc(
                 ConstructInfo::new(
                     format!("PersistenceId: {persistence_id}"),
                     persistence,
                     format!("{span}; LATEST {state_param_string} {{..}}"),
                 ),
                 actor_context,
-                combined_stream,
-                (initial_actor, body_result), // Keep both alive in the spawned task
+                TypedStream::infinite(combined_stream),
             )
         }
         static_expression::Expression::Flush { value } => {
@@ -1882,7 +1894,7 @@ fn static_spanned_expression_into_value_actor(
                     format!("{span}; FLUSH {{..}}"),
                 ),
                 actor_context,
-                flushed_stream,
+                TypedStream::infinite(flushed_stream),
             )
         }
         static_expression::Expression::Pulses { count } => {
@@ -1936,7 +1948,7 @@ fn static_spanned_expression_into_value_actor(
                     format!("{span}; PULSES {{..}}"),
                 ),
                 actor_context,
-                pulses_stream,
+                TypedStream::infinite(pulses_stream),
             )
         }
         static_expression::Expression::Spread { value } => {
@@ -2098,7 +2110,7 @@ fn static_spanned_expression_into_value_actor(
                 // Each time any part emits, we need to recombine
                 let part_subscriptions: Vec<_> = part_actors
                     .iter()
-                    .map(|(_, actor)| actor.subscribe())
+                    .map(|(_, actor)| actor.clone().subscribe())
                     .collect();
 
                 // For simplicity, use select_all and latest values approach
@@ -2161,7 +2173,7 @@ fn static_spanned_expression_into_value_actor(
                         format!("{span}; TextLiteral {{..}}"),
                     ),
                     actor_context,
-                    flattened,
+                    TypedStream::infinite(flattened),
                 )
             }
         }
@@ -2368,10 +2380,7 @@ fn match_pattern(
                     format!("Pattern binding {name_string}"),
                 ),
                 actor_context.clone(),
-                stream::once({
-                    let value = value.clone();
-                    async move { value }
-                }),
+                constant(value.clone()),
             );
             bindings.insert(name_string, value_actor);
             Some(bindings)

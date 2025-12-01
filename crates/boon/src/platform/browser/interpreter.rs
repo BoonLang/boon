@@ -111,7 +111,7 @@ pub fn run(
     // Note: source_code_arc was created at the start of this function
     let static_ast = static_expression::convert_expressions(source_code_arc.clone(), ast);
 
-    let evaluation_result = match evaluate(source_code_arc, static_ast, states_local_storage_key.clone(), virtual_fs) {
+    let evaluation_result = match evaluate(source_code_arc.clone(), static_ast, states_local_storage_key.clone(), virtual_fs) {
         Ok(result) => Some(result),
         Err(error) => {
             println!("[Evaluation Error]");
@@ -240,7 +240,7 @@ pub fn run_with_registry(
     let registry = function_registry.unwrap_or_default();
     let module_loader = ModuleLoader::default();
     let evaluation_result = match evaluate_with_registry(
-        source_code_arc,
+        source_code_arc.clone(),
         static_ast,
         states_local_storage_key.clone(),
         virtual_fs,
