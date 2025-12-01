@@ -1,4 +1,4 @@
-use super::{Alias, Expression, ParseError, Span, Spanned, Token};
+use super::{Alias, ArithmeticOperator, Comparator, Expression, ParseError, Span, Spanned, Token};
 use std::collections::{BTreeMap, HashSet};
 
 // @TODO Immutables or different tree traversal algorithm?
@@ -384,17 +384,63 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                 all_referenced,
             );
         }
-        Expression::ArithmeticOperator(_) => {
-            // @TODO implement, see the error message below
-            errors.push(ResolveError::custom(*span, "Scope resolver cannot resolve references in Expression::ArithmeticOperator yet, sorry".to_owned()))
+        Expression::ArithmeticOperator(op) => match op {
+            ArithmeticOperator::Negate { operand } => {
+                set_is_referenced_and_alias_referenceables(
+                    operand,
+                    reachable_referenceables,
+                    level,
+                    parent_name,
+                    errors,
+                    all_referenced,
+                );
+            }
+            ArithmeticOperator::Add { operand_a, operand_b }
+            | ArithmeticOperator::Subtract { operand_a, operand_b }
+            | ArithmeticOperator::Multiply { operand_a, operand_b }
+            | ArithmeticOperator::Divide { operand_a, operand_b } => {
+                set_is_referenced_and_alias_referenceables(
+                    operand_a,
+                    reachable_referenceables.clone(),
+                    level,
+                    parent_name,
+                    errors,
+                    all_referenced,
+                );
+                set_is_referenced_and_alias_referenceables(
+                    operand_b,
+                    reachable_referenceables,
+                    level,
+                    parent_name,
+                    errors,
+                    all_referenced,
+                );
+            }
         }
-        Expression::Comparator(_) => {
-            // @TODO implement, see the error message below
-            errors.push(ResolveError::custom(
-                *span,
-                "Scope resolver cannot resolve references in Expression::Comparator yet, sorry"
-                    .to_owned(),
-            ))
+        Expression::Comparator(cmp) => match cmp {
+            Comparator::Equal { operand_a, operand_b }
+            | Comparator::NotEqual { operand_a, operand_b }
+            | Comparator::Greater { operand_a, operand_b }
+            | Comparator::GreaterOrEqual { operand_a, operand_b }
+            | Comparator::Less { operand_a, operand_b }
+            | Comparator::LessOrEqual { operand_a, operand_b } => {
+                set_is_referenced_and_alias_referenceables(
+                    operand_a,
+                    reachable_referenceables.clone(),
+                    level,
+                    parent_name,
+                    errors,
+                    all_referenced,
+                );
+                set_is_referenced_and_alias_referenceables(
+                    operand_b,
+                    reachable_referenceables,
+                    level,
+                    parent_name,
+                    errors,
+                    all_referenced,
+                );
+            }
         }
         Expression::Function {
             name,
@@ -457,7 +503,15 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
         Expression::TextLiteral { .. } => (),
         Expression::Hold { state_param, body } => {
             // Add state_param to reachable referenceables so it can be referenced in the body
-            // Note: The span of state_param is part of the overall expression span
+            level += 1;
+            reachable_referenceables
+                .entry(state_param)
+                .or_default()
+                .push(Referenceable {
+                    name: state_param,
+                    span: *span,
+                    level,
+                });
             set_is_referenced_and_alias_referenceables(
                 body,
                 reachable_referenceables,
