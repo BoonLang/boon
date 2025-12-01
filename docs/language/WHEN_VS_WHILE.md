@@ -133,7 +133,7 @@ rst \|> WHILE {
 }
 
 -- ✅ Combined with state machines
-state \|> LATEST state {
+state \|> HOLD state {
     reset \|> WHILE {
         True => InitialState
         False => state \|> WHEN {
@@ -153,7 +153,7 @@ Perfect example showing both WHEN and WHILE:
 ```boon
 FUNCTION fsm(rst, a) {
     BLOCK {
-        state: B \|> LATEST state {
+        state: B \|> HOLD state {
             rst \|> WHILE {                    -- ✅ WHILE: level-sensitive reset
                 True => B                     -- While reset high, stay in B
                 False => state \|> WHEN {      -- ✅ WHEN: state pattern matching
@@ -273,7 +273,7 @@ Does pattern matching access dependencies (record fields or outer scope)?
 
 ### Pattern 1: FSM with Reset
 ```boon
-state \|> LATEST state {
+state \|> HOLD state {
     reset \|> WHILE {              -- WHILE: signal check
         True => InitialState
         False => state \|> WHEN {   -- WHEN: state match
@@ -286,7 +286,7 @@ state \|> LATEST state {
 
 ### Pattern 2: Conditional State Transition
 ```boon
-state \|> LATEST state {
+state \|> HOLD state {
     state \|> WHEN {                      -- WHEN: state match
         StateA => input \|> WHILE {        -- WHILE: signal check
             True => StateB
@@ -299,7 +299,7 @@ state \|> LATEST state {
 
 ### Pattern 3: Multi-Signal Control
 ```boon
-state \|> LATEST state {
+state \|> HOLD state {
     reset \|> WHILE {                     -- WHILE: reset signal
         True => InitialState
         False => enable \|> WHILE {        -- WHILE: enable signal

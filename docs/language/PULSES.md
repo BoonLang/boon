@@ -17,7 +17,7 @@ PULSES { N }  // Generates N pulses: [], [], [], ... (N times)
 
 **Used with LATEST for iteration:**
 ```boon
-result: initial |> LATEST state {
+result: initial |> HOLD state {
     PULSES { 10 } |> THEN {
         transform(state)
     }
@@ -62,7 +62,7 @@ result: initial |> LATEST state {
 ```boon
 FUNCTION fibonacci(position) {
     BLOCK {
-        state: [previous: 0, current: 1, iteration: 0] |> LATEST state {
+        state: [previous: 0, current: 1, iteration: 0] |> HOLD state {
             PULSES { position } |> THEN {
                 [
                     previous: state.current,
@@ -86,7 +86,7 @@ fibonacci(10)  // Returns 55
 ```boon
 FUNCTION factorial(n) {
     BLOCK {
-        final: [count: 1, product: 1] |> LATEST state {
+        final: [count: 1, product: 1] |> HOLD state {
             PULSES { n } |> THEN {
                 [count: state.count + 1, product: state.product * state.count]
             }
@@ -101,7 +101,7 @@ factorial(5)  // Returns 120
 ### **Powers of 2**
 ```boon
 FUNCTION power_of_2(n) {
-    1 |> LATEST value {
+    1 |> HOLD value {
         PULSES { n } |> THEN { value * 2 }
     }
 }
@@ -153,7 +153,7 @@ PULSES { N }  // Type: Event source producing [] (unit values)
 
 ### **Used with LATEST**
 ```boon
-value: initial |> LATEST state {
+value: initial |> HOLD state {
     PULSES { N } |> THEN {
         expression
     }
@@ -167,7 +167,7 @@ value: initial |> LATEST state {
 ### **Software Execution**
 
 ```boon
-result: 0 |> LATEST count {
+result: 0 |> HOLD count {
     PULSES { 10 } |> THEN { count + 1 }
 }
 ```
@@ -192,7 +192,7 @@ for (let __pulse = 0; __pulse < 10; __pulse++) {
 ### **Hardware Execution**
 
 ```boon
-counter: BITS[8] { 0 } |> LATEST count {
+counter: BITS[8] { 0 } |> HOLD count {
     clk |> THEN {
         PULSES { 10 } |> THEN { count + 1 }
     }
@@ -232,7 +232,7 @@ PULSES is an **event source** that works with LATEST:
 
 ### **Pattern:**
 ```boon
-result: initial_value |> LATEST state_name {
+result: initial_value |> HOLD state_name {
     PULSES { count } |> THEN {
         state_transformation
     }
@@ -249,7 +249,7 @@ result: initial_value |> LATEST state_name {
 
 ### **Multiple events in LATEST:**
 ```boon
-state: initial |> LATEST state {
+state: initial |> HOLD state {
     // Automatic pulses
     PULSES { 100 } |> THEN {
         state |> transform()
@@ -272,7 +272,7 @@ PULSES can coexist with other events!
 ```boon
 FUNCTION fibonacci(position) {
     BLOCK {
-        state: [previous: 0, current: 1, iteration: 0] |> LATEST state {
+        state: [previous: 0, current: 1, iteration: 0] |> HOLD state {
             PULSES { position } |> THEN {
                 [
                     previous: state.current,
@@ -298,7 +298,7 @@ fib_20: fibonacci(20)  // 6765 (emits once when iteration matches 20)
 ```boon
 FUNCTION factorial(n) {
     BLOCK {
-        final: [count: 1, product: 1] |> LATEST state {
+        final: [count: 1, product: 1] |> HOLD state {
             PULSES { n } |> THEN {
                 [
                     count: state.count + 1,
@@ -318,7 +318,7 @@ factorial(10) // 3628800
 ```boon
 FUNCTION sum_to_n(n) {
     BLOCK {
-        result: [index: 1, sum: 0] |> LATEST state {
+        result: [index: 1, sum: 0] |> HOLD state {
             PULSES { n } |> THEN {
                 [index: state.index + 1, sum: state.sum + state.index]
             }
@@ -333,7 +333,7 @@ sum_to_n(10)  // 55 (1+2+3+...+10)
 ### **4. Powers of 2 (simple state)**
 ```boon
 FUNCTION power_of_2(n) {
-    1 |> LATEST value {
+    1 |> HOLD value {
         PULSES { n } |> THEN { value * 2 }
     }
 }
@@ -347,7 +347,7 @@ power_of_2(10) // 1024
 ```boon
 FUNCTION sqrt_approx(n, max_iterations) {
     BLOCK {
-        final: [guess: n / 2, prev: 0] |> LATEST state {
+        final: [guess: n / 2, prev: 0] |> HOLD state {
             PULSES { max_iterations } |> THEN {
                 // Stop if converged
                 Math/abs(state.guess - state.prev) < 0.0001 |> WHEN {
@@ -370,7 +370,7 @@ sqrt_approx(100, 10) // 10.0
 ### **6. Countdown**
 ```boon
 FUNCTION countdown(start) {
-    start |> LATEST count {
+    start |> HOLD count {
         PULSES { start } |> THEN { count - 1 }
     }
 }
@@ -382,7 +382,7 @@ countdown(5)   // 0
 ### **7. Accumulate Values**
 ```boon
 FUNCTION accumulate_values(values) {
-    0 |> LATEST sum {
+    0 |> HOLD sum {
         PULSES { values |> List/length() } |> THEN {
             sum + (values |> List/at(sum))  // Use sum as index
         }
@@ -397,7 +397,7 @@ Wait, that's wrong - sum is not the index. Let me fix:
 ```boon
 FUNCTION accumulate_values(values) {
     BLOCK {
-        final: [index: 0, sum: 0] |> LATEST state {
+        final: [index: 0, sum: 0] |> HOLD state {
             PULSES { values |> List/length() } |> THEN {
                 [
                     index: state.index + 1,
@@ -413,7 +413,7 @@ FUNCTION accumulate_values(values) {
 ### **8. Compound Interest**
 ```boon
 FUNCTION compound_interest(principal, rate, years) {
-    principal |> LATEST amount {
+    principal |> HOLD amount {
         PULSES { years } |> THEN {
             amount * (1 + rate)
         }
@@ -427,7 +427,7 @@ compound_interest(1000, 0.05, 10)  // 1628.89
 ```boon
 FUNCTION collatz_steps(n, max_steps) {
     BLOCK {
-        final: [value: n, steps: 0] |> LATEST state {
+        final: [value: n, steps: 0] |> HOLD state {
             PULSES { max_steps } |> THEN {
                 state.value |> WHEN {
                     1 => SKIP  // Already at 1
@@ -452,7 +452,7 @@ collatz_steps(13, 100)  // Number of steps to reach 1
 ```boon
 FUNCTION simulate_physics(config) {
     BLOCK {
-        final: [position: 0, velocity: config.v0] |> LATEST state {
+        final: [position: 0, velocity: config.v0] |> HOLD state {
             PULSES { config.timesteps } |> THEN {
                 [
                     position: state.position + state.velocity * config.dt,
@@ -481,7 +481,7 @@ result: simulate_physics([
 In hardware, LATEST must be driven by clock:
 
 ```boon
-counter: BITS[8] { 0 } |> LATEST count {
+counter: BITS[8] { 0 } |> HOLD count {
     clk |> THEN {
         PULSES { 10 } |> THEN {
             count + 1
@@ -518,7 +518,7 @@ end
 ```boon
 FUNCTION pulse_counter_module(max_count) {
     BLOCK {
-        count: BITS[8] { 0 } |> LATEST count {
+        count: BITS[8] { 0 } |> HOLD count {
             clk |> THEN {
                 PULSES { max_count } |> THEN {
                     count + 1
@@ -536,7 +536,7 @@ FUNCTION pulse_counter_module(max_count) {
 **2. LFSR Iterations:**
 ```boon
 FUNCTION lfsr_n_cycles(initial, cycles) {
-    initial |> LATEST lfsr {
+    initial |> HOLD lfsr {
         clk |> THEN {
             PULSES { cycles } |> THEN {
                 feedback: lfsr |> Bits/get(7) |> Bool/xor(lfsr |> Bits/get(3))
@@ -555,7 +555,7 @@ FUNCTION fibonacci_hw(position) {
             previous: BITS[16] { 0 },
             current: BITS[16] { 1 },
             iteration: BITS[16] { 0 }
-        ] |> LATEST state {
+        ] |> HOLD state {
             clk |> THEN {
                 PULSES { position } |> THEN {
                     [
@@ -577,7 +577,7 @@ FUNCTION fibonacci_hw(position) {
 
 **4. Mixed with Conditions:**
 ```boon
-counter: BITS[8] { 0 } |> LATEST count {
+counter: BITS[8] { 0 } |> HOLD count {
     clk |> THEN {
         PULSES { 100 } |> THEN {
             enable |> WHEN {
@@ -599,7 +599,7 @@ counter: BITS[8] { 0 } |> LATEST count {
 **PULSES fires asynchronously to maintain Boon's actor model:**
 
 ```boon
-result: 0 |> LATEST count {
+result: 0 |> HOLD count {
     PULSES { 10 } |> THEN { count + 1 }
 }
 ```
@@ -615,7 +615,7 @@ result: 0 |> LATEST count {
 ```boon
 FUNCTION fibonacci(position) {
     BLOCK {
-        state: [previous: 0, current: 1, iteration: 0] |> LATEST state {
+        state: [previous: 0, current: 1, iteration: 0] |> HOLD state {
             PULSES { position } |> THEN {
                 [
                     previous: state.current,
@@ -649,7 +649,7 @@ TEXT { "{position}. Fibonacci number is {result}" } |> Console/log()
 **1. Generate Sequence:**
 ```boon
 FUNCTION generate_sequence(n, fn) {
-    LIST {} |> LATEST items {
+    LIST {} |> HOLD items {
         PULSES { n } |> THEN {
             items |> List/push(fn(items |> List/length()))
         }
@@ -665,7 +665,7 @@ squares: generate_sequence(10, FUNCTION(i) { i * i })
 ```boon
 FUNCTION retry_operation(operation, max_retries) {
     BLOCK {
-        result: [success: False, value: None, attempts: 0] |> LATEST state {
+        result: [success: False, value: None, attempts: 0] |> HOLD state {
             PULSES { max_retries } |> THEN {
                 state.success |> WHEN {
                     True => SKIP  // Already succeeded
@@ -695,7 +695,7 @@ FUNCTION retry_operation(operation, max_retries) {
 **3. Animation Frames:**
 ```boon
 FUNCTION animate(initial_frame, frame_count, animate_fn) {
-    initial_frame |> LATEST frame {
+    initial_frame |> HOLD frame {
         PULSES { frame_count } |> THEN {
             animate_fn(frame)
         }
@@ -714,14 +714,14 @@ final_frame: animate(initial_state, 60, FUNCTION(frame) {
 
 ### **Pattern 1: Transform N Times**
 ```boon
-result: initial |> LATEST state {
+result: initial |> HOLD state {
     PULSES { n } |> THEN { transform(state) }
 }
 ```
 
 ### **Pattern 2: Accumulate with Index**
 ```boon
-result: [index: 0, accumulator: initial] |> LATEST state {
+result: [index: 0, accumulator: initial] |> HOLD state {
     PULSES { n } |> THEN {
         [
             index: state.index + 1,
@@ -733,7 +733,7 @@ result: [index: 0, accumulator: initial] |> LATEST state {
 
 ### **Pattern 3: Early Termination**
 ```boon
-result: initial |> LATEST state {
+result: initial |> HOLD state {
     PULSES { max } |> THEN {
         done(state) |> WHEN {
             True => SKIP
@@ -745,7 +745,7 @@ result: initial |> LATEST state {
 
 ### **Pattern 4: Conditional Update**
 ```boon
-result: initial |> LATEST state {
+result: initial |> HOLD state {
     PULSES { n } |> THEN {
         condition(state) |> WHEN {
             True => state_a(state)
@@ -757,7 +757,7 @@ result: initial |> LATEST state {
 
 ### **Pattern 5: Mixed Events (Software/Hardware)**
 ```boon
-state: initial |> LATEST state {
+state: initial |> HOLD state {
     // Automatic iteration
     PULSES { max } |> THEN {
         auto_update(state)
@@ -788,7 +788,7 @@ result: initial |> UNFOLD times: 10 { state => transform(state) }
 
 **PULSES + LATEST:**
 ```boon
-result: initial |> LATEST state {
+result: initial |> HOLD state {
     PULSES { 10 } |> THEN { transform(state) }
 }
 ```
@@ -814,7 +814,7 @@ LIST[0, 1]
 **PULSES:**
 ```boon
 BLOCK {
-    state: [previous: 0, current: 1, iteration: 0] |> LATEST state {
+    state: [previous: 0, current: 1, iteration: 0] |> HOLD state {
         PULSES { 10 } |> THEN {
             [
                 previous: state.current,
@@ -849,7 +849,7 @@ for (let i = 0; i < 10; i++) {
 
 **PULSES:**
 ```boon
-state |> LATEST state {
+state |> HOLD state {
     PULSES { 10 } |> THEN { transform(state) }
 }
 ```
@@ -978,7 +978,7 @@ If index access is frequently needed:
 PULSES_indexed { 10 }  // Produces: 0, 1, 2, ..., 9
 
 // Usage:
-result: initial |> LATEST state {
+result: initial |> HOLD state {
     PULSES_indexed { 10 } |> THEN { index =>
         transform(state, index)
     }
@@ -1012,7 +1012,7 @@ PULSES { n } |> THEN { transform(state) }
 ```boon
 FUNCTION fibonacci(position) {
     BLOCK {
-        state: [previous: 0, current: 1, iteration: 0] |> LATEST state {
+        state: [previous: 0, current: 1, iteration: 0] |> HOLD state {
             PULSES { position } |> THEN {
                 [
                     previous: state.current,
@@ -1038,7 +1038,7 @@ PULSES { max } |> THEN {
 
 ✅ **Use explicit clk in hardware:**
 ```boon
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     clk |> THEN {
         PULSES { 10 } |> THEN { count + 1 }
     }
@@ -1075,7 +1075,7 @@ counter: 0 |> LATEST count {
 PULSES { N }  // Generates N pulses
 
 // Used with LATEST:
-result: initial |> LATEST state {
+result: initial |> HOLD state {
     PULSES { count } |> THEN {
         transform(state)
     }

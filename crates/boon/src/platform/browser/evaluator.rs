@@ -1778,8 +1778,8 @@ fn static_spanned_expression_into_value_actor(
                 }
             }
         }
-        static_expression::Expression::LatestWithState { state_param, body } => {
-            // Stateful LATEST: `initial |> LATEST state_param { body }`
+        static_expression::Expression::Hold { state_param, body } => {
+            // HOLD: `initial |> HOLD state_param { body }`
             // The piped value is the initial state.
             // The body can reference `state_param` to get the current state.
             // The body expression's result becomes the new state value.
@@ -1788,16 +1788,18 @@ fn static_spanned_expression_into_value_actor(
             //
             // Example:
             // ```boon
-            // counter: 0 |> LATEST count {
-            //     increment |> THEN { count + 1 }
-            //     decrement |> THEN { count - 1 }
+            // counter: 0 |> HOLD count {
+            //     LATEST {
+            //         increment |> THEN { count + 1 }
+            //         decrement |> THEN { count - 1 }
+            //     }
             // }
             // ```
             // Here, `count` is bound to the current state value. When `increment`
             // fires, `count + 1` is computed using current state, result becomes new state.
 
             let initial_actor = actor_context.piped.clone()
-                .ok_or("LatestWithState requires a piped initial value")?;
+                .ok_or("HOLD requires a piped initial value")?;
 
             let state_param_string = state_param.to_string();
             let construct_context_for_state = construct_context.clone();
@@ -1820,9 +1822,9 @@ fn static_spanned_expression_into_value_actor(
             // This is what the state_param references
             let state_actor = ValueActor::new_arc(
                 ConstructInfo::new(
-                    format!("LatestWithState state actor for {state_param_string}"),
+                    format!("Hold state actor for {state_param_string}"),
                     None,
-                    format!("{span}; LATEST state parameter"),
+                    format!("{span}; HOLD state parameter"),
                 ),
                 actor_context.clone(),
                 TypedStream::infinite(state_receiver),
@@ -1884,7 +1886,7 @@ fn static_spanned_expression_into_value_actor(
                 ConstructInfo::new(
                     format!("PersistenceId: {persistence_id}"),
                     persistence,
-                    format!("{span}; LATEST {state_param_string} {{..}}"),
+                    format!("{span}; HOLD {state_param_string} {{..}}"),
                 ),
                 actor_context,
                 TypedStream::infinite(combined_stream),

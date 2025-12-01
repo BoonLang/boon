@@ -251,7 +251,7 @@ LIST[8, Number] { 1, 2, 3 }  -- Type constraints
 
 **Before**:
 ```boon
-out: BITS { 8, 10u0 } |> LATEST out {
+out: BITS { 8, 10u0 } |> HOLD out {
     reset |> WHILE {
         True => BITS { 8, 10u0 }
         False => ...
@@ -261,7 +261,7 @@ out: BITS { 8, 10u0 } |> LATEST out {
 
 **After**:
 ```boon
-out: BITS[8] { 10u0 } |> LATEST out {
+out: BITS[8] { 10u0 } |> HOLD out {
     reset |> WHILE {
         True => BITS[8] { 10u0 }
         False => ...

@@ -18,7 +18,7 @@ Boon hardware uses **ambient context** (`PASSED`) for clock signals, with two co
 
 2. **Two register patterns**
    - **Bits/sum pattern** - For counters/accumulators (delta accumulation)
-   - **LATEST pattern** - For FSMs/transformations (needs current value)
+   - **HOLD pattern** - For FSMs/transformations (needs current value)
 
 3. **Pattern matching = Declarative logic**
    - Control signals bundled into records
@@ -68,7 +68,7 @@ FUNCTION counter(rst, load, load_value, up, en) {
 ```boon
 FUNCTION fsm(rst, a) {
     BLOCK {
-        state: B |> LATEST state {
+        state: B |> HOLD state {
             PASSED.clk |> THEN {
                 rst |> WHILE {
                     True => B
@@ -260,7 +260,7 @@ state |> WHEN {
 
 ### Example: FSM with Both
 ```boon
-state: B |> LATEST state {
+state: B |> HOLD state {
     PASSED.clk |> THEN {              -- Clock trigger
         rst |> WHILE {                -- ✅ WHILE: Bool signal
             True => B

@@ -26,7 +26,7 @@
 **Detects:**
 ```boon
 -- 🛑 ERROR: LIST is not a supported type in LATEST
-items: LIST {} |> LATEST list {
+items: LIST {} |> HOLD list {
     event |> THEN { list |> List/push(item) }
 }
 ```
@@ -56,7 +56,7 @@ fn check_latest_type(latest_expr: &Expr) -> Result<()> {
 Error: LIST is not a supported type in LATEST
   --> example.bn:1:8
    |
- 1 | items: LIST {} |> LATEST list {
+ 1 | items: LIST {} |> HOLD list {
    |        ^^^^^^^ LIST not allowed in LATEST
    |
    = note: LATEST supports: Number, Text, tags/enums, BITS, objects
@@ -82,7 +82,7 @@ Error: LIST is not a supported type in LATEST
 **Detects:**
 ```boon
 -- ⚠️ WARNING: LATEST has no external trigger
-x: 0 |> LATEST x { x + 1 }
+x: 0 |> HOLD x { x + 1 }
 ```
 
 **Detection Algorithm:**
@@ -113,7 +113,7 @@ fn check_external_trigger(latest_body: &Expr) -> Result<()> {
 Warning: LATEST has no external trigger
   --> example.bn:5:1
    |
- 5 | x: 0 |> LATEST x { x + 1 }
+ 5 | x: 0 |> HOLD x { x + 1 }
    |        ^^^^^^^^^^^^^^^^^^^ evaluates once, then stays constant (1)
    |
    = note: Did you mean to add an event trigger?
@@ -130,7 +130,7 @@ Warning: LATEST has no external trigger
 **Detects:**
 ```boon
 -- 🛑 ERROR: Unused return value from pure function
-x: LIST {} |> LATEST list {
+x: LIST {} |> HOLD list {
     event |> THEN {
         List/push(list, item)  -- Returns new list
         list  -- Returns OLD list (bug!)
@@ -186,7 +186,7 @@ Error: Unused return value from `List/push`
 **Detects:**
 ```boon
 -- ⚠️ WARNING: Circular dependency
-a: 0 |> LATEST a { event |> THEN { a + b } }
+a: 0 |> HOLD a { event |> THEN { a + b } }
 b: a * 2  -- Depends on 'a'
 ```
 
@@ -217,7 +217,7 @@ fn check_circular_deps(bindings: &[Binding]) -> Result<()> {
 Warning: Circular dependency detected
   --> example.bn:1:1
    |
- 1 | a: 0 |> LATEST a { event |> THEN { a + b } }
+ 1 | a: 0 |> HOLD a { event |> THEN { a + b } }
    |    ^ LATEST reads 'b'
  2 | b: a * 2
    |    ^ depends on 'a'
@@ -238,7 +238,7 @@ Warning: Circular dependency detected
 **Detects:**
 ```boon
 -- ⚠️ WARNING: Side effect in LATEST
-x: 0 |> LATEST x {
+x: 0 |> HOLD x {
     event |> THEN {
         Console/log(TEXT { Value: {x} })  -- Side effect!
         x + 1
@@ -277,7 +277,7 @@ Warning: Side effect in LATEST body
 **Detects:**
 ```boon
 -- ⚠️ WARNING: Non-exhaustive WHEN
-state: Idle |> LATEST state {
+state: Idle |> HOLD state {
     event |> WHEN {
         Start => Running
         -- Missing: Stop, Pause, etc.
@@ -314,7 +314,7 @@ Warning: Non-exhaustive pattern match in LATEST
 **Detects:**
 ```boon
 -- ℹ️ INFO: Expensive operation in LATEST
-data: initial |> LATEST data {
+data: initial |> HOLD data {
     event |> THEN {
         data |> List/sort()  -- O(n log n)
     }
@@ -352,8 +352,8 @@ Info: Expensive operation in reactive context
 -- 🛑 ERROR: Multiple LATEST share mutable state
 shared: [counter: 0]
 
-a: 0 |> LATEST a { event |> THEN { shared.counter + 1 } }
-b: 0 |> LATEST b { event |> THEN { shared.counter + 1 } }
+a: 0 |> HOLD a { event |> THEN { shared.counter + 1 } }
+b: 0 |> HOLD b { event |> THEN { shared.counter + 1 } }
 ```
 
 **Detection Algorithm:**
@@ -367,9 +367,9 @@ b: 0 |> LATEST b { event |> THEN { shared.counter + 1 } }
 Error: Multiple LATEST depend on mutable shared state
   --> example.bn:3:1
    |
- 3 | a: 0 |> LATEST a { event |> THEN { shared.counter + 1 } }
+ 3 | a: 0 |> HOLD a { event |> THEN { shared.counter + 1 } }
    |                                    ^^^^^^^^^^^^^^^ reads mutable state
- 4 | b: 0 |> LATEST b { event |> THEN { shared.counter + 1 } }
+ 4 | b: 0 |> HOLD b { event |> THEN { shared.counter + 1 } }
    |                                    ^^^^^^^^^^^^^^^ also reads same state
    |
    = note: Evaluation order affects results
@@ -398,7 +398,7 @@ Error: Multiple LATEST depend on mutable shared state
 **Example:**
 ```boon
 -- 🛑 ERROR: LIST not allowed
-items: LIST {} |> LATEST list { ... }
+items: LIST {} |> HOLD list { ... }
 
 -- 🛑 ERROR: Unused return value
 some_pure_function(v)
@@ -416,10 +416,10 @@ v
 **Example:**
 ```boon
 -- ⚠️ WARNING: No external trigger
-x: 0 |> LATEST x { x + 1 }
+x: 0 |> HOLD x { x + 1 }
 
 -- ⚠️ WARNING: Circular dependency
-a: 0 |> LATEST a { event |> THEN { a + b } }
+a: 0 |> HOLD a { event |> THEN { a + b } }
 b: a * 2
 ```
 
@@ -432,7 +432,7 @@ b: a * 2
 **Example:**
 ```boon
 -- ℹ️ INFO: Expensive operation
-data: initial |> LATEST data {
+data: initial |> HOLD data {
     event |> THEN { data |> sort() }
 }
 ```
@@ -498,12 +498,12 @@ latest_checks = "pedantic"
 ```boon
 -- Suppress specific warning
 -- @allow-no-external-trigger
-x: 0 |> LATEST x { x + 1 }
+x: 0 |> HOLD x { x + 1 }
 
 -- Suppress multiple warnings
 -- @allow-no-external-trigger
 -- @allow-circular-dependency
-x: 0 |> LATEST x { ... }
+x: 0 |> HOLD x { ... }
 ```
 
 ---
@@ -514,9 +514,9 @@ x: 0 |> LATEST x { ... }
 ```boon
 -- @allow-latest-warnings
 BLOCK {
-    a: 0 |> LATEST a { ... }
-    b: 0 |> LATEST b { ... }
-    c: 0 |> LATEST c { ... }
+    a: 0 |> HOLD a { ... }
+    b: 0 |> HOLD b { ... }
+    c: 0 |> HOLD c { ... }
 }
 ```
 
@@ -556,12 +556,12 @@ BLOCK {
 **Rule 1: LIST in LATEST**
 ```boon
 -- Should ERROR
-items: LIST {} |> LATEST list {
+items: LIST {} |> HOLD list {
     event |> THEN { list |> List/push(item) }
 }
 
 -- Should NOT error (no LIST)
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     event |> THEN { count + 1 }
 }
 ```
@@ -569,16 +569,16 @@ counter: 0 |> LATEST count {
 **Rule 2: No External Trigger**
 ```boon
 -- Should warn
-x: 0 |> LATEST x { x + 1 }
+x: 0 |> HOLD x { x + 1 }
 
 -- Should NOT warn
-x: 0 |> LATEST x { event |> THEN { x + 1 } }
+x: 0 |> HOLD x { event |> THEN { x + 1 } }
 ```
 
 **Rule 3: Unused Return Value**
 ```boon
 -- Should error
-x: 0 |> LATEST v {
+x: 0 |> HOLD v {
     event |> THEN {
         some_pure_function(v)
         v
@@ -586,7 +586,7 @@ x: 0 |> LATEST v {
 }
 
 -- Should NOT error
-x: 0 |> LATEST v {
+x: 0 |> HOLD v {
     event |> THEN { v |> some_pure_function() }
 }
 ```

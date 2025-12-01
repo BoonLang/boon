@@ -1,6 +1,6 @@
 FUNCTION fibonacci(position) {
     BLOCK {
-        state: [previous: 0, current: 1, iteration: 0] |> LATEST state {
+        state: [previous: 0, current: 1, iteration: 0] |> HOLD state {
             PULSES { position } |> THEN {
                 [
                     previous: state.current,

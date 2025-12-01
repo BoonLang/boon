@@ -628,10 +628,12 @@ counter_actor: ACTOR @HVM {
     }
 }
 
-# Option 2: LATEST as actor (if using HVM backend)
-counter: 0 |> LATEST count @HVM {
-    increment_msg |> THEN { count + 1 }
-    decrement_msg |> THEN { count - 1 }
+# Option 2: HOLD as actor (if using HVM backend)
+counter: 0 |> HOLD count @HVM {
+    LATEST {
+        increment_msg |> THEN { count + 1 }
+        decrement_msg |> THEN { count - 1 }
+    }
 }
 
 # Option 3: Explicit process spawn

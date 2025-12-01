@@ -134,7 +134,7 @@ See `tools/DEBUG_WITH_BROWSER.md` for full documentation.
 
 ### Language Constructs
 - `LATEST { a, b, c }` - Merge multiple reactive streams
-- `initial |> LATEST state { body }` - Stateful transformation with self-reference
+- `initial |> HOLD state { body }` - Stateful accumulator with self-reference (single-arm)
 - `input |> THEN { body }` - Copy data when input arrives
 - `input |> WHEN { pattern => body }` - Pattern match and copy on input
 - `input |> WHILE { pattern => body }` - Continuous data flow while pattern matches

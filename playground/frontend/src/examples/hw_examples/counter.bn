@@ -6,7 +6,7 @@
 --   - Clock accessed via PASSED.clk (ambient context from hardware module)
 --   - PASSED.clk: [] = impulse, SKIP = no impulse
 --   - THEN triggers when PASSED.clk = [] (clock tick/impulse occurs)
---   - LATEST creates register that holds count value
+--   - HOLD creates register that holds count value
 --   - Pipeline describes next-state logic for the register
 --
 -- Key pattern: State-based pattern matching with delta accumulation
@@ -32,7 +32,7 @@ FUNCTION counter(rst, load, load_value, up, en) {
         control_signals: [reset: rst, load: load, up: up, enabled: en]
 
         -- Sequential register with clock-triggered updates
-        count: default |> LATEST count {
+        count: default |> HOLD count {
             PASSED.clk |> THEN {
                 count
                     |> Bits/set(control_signals |> WHILE {

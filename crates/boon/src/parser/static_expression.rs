@@ -58,8 +58,8 @@ pub enum Expression {
     Latest {
         inputs: Vec<Spanned<Self>>,
     },
-    // Stateful LATEST - used with pipe: `initial |> LATEST state_param { body }`
-    LatestWithState {
+    // HOLD - stateful accumulator: `initial |> HOLD state_param { body }`
+    Hold {
         state_param: StrSlice,
         body: Box<Spanned<Self>>,
     },
@@ -340,7 +340,7 @@ impl ExpressionConverter {
             parser::Expression::Latest { inputs } => Expression::Latest {
                 inputs: inputs.iter().map(|i| self.convert_spanned(i)).collect(),
             },
-            parser::Expression::LatestWithState { state_param, body } => Expression::LatestWithState {
+            parser::Expression::Hold { state_param, body } => Expression::Hold {
                 state_param: self.str_to_slice(state_param),
                 body: Box::new(self.convert_spanned(body)),
             },

@@ -438,11 +438,11 @@ BLOCK {
             [address: write_ptr, data: audio_sample]
         })
 
-    write_ptr: 0 |> LATEST wr {
+    write_ptr: 0 |> HOLD wr {
         push_event |> THEN { (wr + 1) % 4096 }
     }
 
-    read_ptr: 0 |> LATEST rd {
+    read_ptr: 0 |> HOLD rd {
         pop_event |> THEN { (rd + 1) % 4096 }
     }
 
@@ -582,12 +582,12 @@ FUNCTION fifo(push, pop, push_data) {
             })
 
         // Write pointer
-        write_ptr: 0 |> LATEST wr {
+        write_ptr: 0 |> HOLD wr {
             push |> THEN { (wr + 1) % 16 }
         }
 
         // Read pointer
-        read_ptr: 0 |> LATEST rd {
+        read_ptr: 0 |> HOLD rd {
             pop |> THEN { (rd + 1) % 16 }
         }
 
@@ -632,7 +632,7 @@ FUNCTION cache_memory(addr, write_data, write) {
 
 **Before (with LATEST):**
 ```boon
-mem: ARRAY[16] { BITS[8] { 2u0  } } |> LATEST mem {
+mem: ARRAY[16] { BITS[8] { 2u0  } } |> HOLD mem {
     write_enable |> WHEN {
         True => mem |> Array/set(index: wraddr, value: wrdata)
         False => mem
@@ -680,8 +680,8 @@ mem: MEMORY[16] { BITS[8] { 2u0   } }
 data: MEMORY[16] { BITS[8] { 2u0   } }
 
 // LATEST for pointers
-write_ptr: 0 |> LATEST wr { ... }
-read_ptr: 0 |> LATEST rd { ... }
+write_ptr: 0 |> HOLD wr { ... }
+read_ptr: 0 |> HOLD rd { ... }
 ```
 
 ---
@@ -859,8 +859,8 @@ data_b: mem |> Memory/read(address: addr_b)
 data: MEMORY[size] { default  }
     |> Memory/write(address: write_ptr, data: input)
 
-write_ptr: 0 |> LATEST wr { ... }
-read_ptr: 0 |> LATEST rd { ... }
+write_ptr: 0 |> HOLD wr { ... }
+read_ptr: 0 |> HOLD rd { ... }
 ```
 
 ---

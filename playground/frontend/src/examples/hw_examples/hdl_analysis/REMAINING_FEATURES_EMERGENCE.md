@@ -36,14 +36,14 @@ From the hardware examples and `CLOCK_SEMANTICS.md`:
 FUNCTION dual_clock_fifo(write_clk, read_clk, data_in) {
     BLOCK {
         // Write domain (write_clk)
-        write_ptr: BITS[4] { 10u0 } |> LATEST wr {
+        write_ptr: BITS[4] { 10u0 } |> HOLD wr {
             PASSED.clk[write_clk] |> THEN {
                 wr |> Bits/increment()
             }
         }
 
         // Read domain (read_clk)
-        read_ptr: BITS[4] { 10u0 } |> LATEST rd {
+        read_ptr: BITS[4] { 10u0 } |> HOLD rd {
             PASSED.clk[read_clk] |> THEN {
                 rd |> Bits/increment()
             }
@@ -65,14 +65,14 @@ FUNCTION dual_clock_fifo(write_clk, read_clk, data_in) {
 FUNCTION safe_dual_clock_fifo(write_clk, read_clk, data_in) {
     BLOCK {
         // Write domain
-        write_ptr: BITS[4] { 10u0 } |> LATEST wr {
+        write_ptr: BITS[4] { 10u0 } |> HOLD wr {
             PASSED.clk[write_clk] |> THEN {
                 wr |> Bits/increment()
             }
         }
 
         // Read domain
-        read_ptr: BITS[4] { 10u0 } |> LATEST rd {
+        read_ptr: BITS[4] { 10u0 } |> HOLD rd {
             PASSED.clk[read_clk] |> THEN {
                 rd |> Bits/increment()
             }
@@ -104,11 +104,11 @@ FUNCTION safe_dual_clock_fifo(write_clk, read_clk, data_in) {
 ```boon
 FUNCTION CDC/synchronize(signal, from: from_clk, to: to_clk, stages: 2) {
     // Chain of LATEST blocks in target domain
-    stage1: signal |> LATEST s1 {
+    stage1: signal |> HOLD s1 {
         PASSED.clk[to_clk] |> THEN { signal }  // First register
     }
 
-    stage2: stage1 |> LATEST s2 {
+    stage2: stage1 |> HOLD s2 {
         PASSED.clk[to_clk] |> THEN { stage1 }  // Second register
     }
 
@@ -122,7 +122,7 @@ FUNCTION CDC/synchronize(signal, from: from_clk, to: to_clk, stages: 2) {
 FUNCTION CDC/async_fifo(depth, write_clk, read_clk) {
     BLOCK {
         // Write domain
-        write_ptr: BITS[4] { 10u0 } |> LATEST wr {
+        write_ptr: BITS[4] { 10u0 } |> HOLD wr {
             PASSED.clk[write_clk] |> THEN {
                 wr |> Bits/increment()
             }
@@ -136,7 +136,7 @@ FUNCTION CDC/async_fifo(depth, write_clk, read_clk) {
             |> CDC/synchronize(from: write_clk, to: read_clk)
 
         // Read domain
-        read_ptr: BITS[4] { 10u0 } |> LATEST rd {
+        read_ptr: BITS[4] { 10u0 } |> HOLD rd {
             PASSED.clk[read_clk] |> THEN {
                 rd |> Bits/increment()
             }
@@ -313,7 +313,7 @@ state: input |> WHEN {
 ```boon
 FUNCTION counter(rst, en) {
     BLOCK {
-        count: BITS[8] { 10u0 } |> LATEST count {
+        count: BITS[8] { 10u0 } |> HOLD count {
             PASSED.clk |> THEN {
                 rst |> WHEN {
                     True => BITS[8] { 10u0 }
@@ -345,7 +345,7 @@ FUNCTION counter(rst, en) {
 
 ```boon
 FUNCTION counter(rst, en) {
-    count: BITS[8] { 10u0 } |> LATEST count {
+    count: BITS[8] { 10u0 } |> HOLD count {
         PASSED.clk |> THEN {
             next: rst |> WHEN {
                 True => BITS[8] { 10u0 }
@@ -402,7 +402,7 @@ fibonacci: LATEST {
 
 **THEN already triggers on events:**
 ```boon
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     increment |> THEN { count + 1 }
 }
 ```
@@ -417,7 +417,7 @@ TEST counter_basic {
     dut: counter(rst: test_rst, en: test_en)
 
     // Test stimulus using PULSES
-    test_sequence: PULSES { 20 } |> LATEST cycle {
+    test_sequence: PULSES { 20 } |> HOLD cycle {
         cycle |> WHEN {
             // Cycle 0-2: Reset
             0 => BLOCK {
@@ -812,7 +812,7 @@ FUNCTION top_module() {
 
 FUNCTION cpu_core() {
     // Access parent's clock
-    registers: BITS[32] { 10u0 } |> LATEST reg {
+    registers: BITS[32] { 10u0 } |> HOLD reg {
         PASSED.clk |> THEN {
             // Access parent's reset
             PASSED.rst |> WHEN {
@@ -951,12 +951,12 @@ store.elements.button.event.press |> THEN { action }
 **Annotate values for waveform viewers:**
 ```boon
 #[debug(name: "Program Counter", radix: hex)]
-pc: BITS[32] { 10u0 } |> LATEST pc {
+pc: BITS[32] { 10u0 } |> HOLD pc {
     PASSED.clk |> THEN { pc + 4 }
 }
 
 #[debug(name: "CPU State", enum: [Fetch, Decode, Execute, Writeback])]
-state: Fetch |> LATEST state { ... }
+state: Fetch |> HOLD state { ... }
 ```
 
 **Generate dependency graphs:**

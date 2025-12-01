@@ -273,7 +273,7 @@ result: apply_twice(increment, 5)  // 7
 
 **Boon code:**
 ```boon
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     increment_event |> THEN { count + 1 }
 }
 ```
@@ -306,7 +306,7 @@ button.event.press |> THEN {
 
 **Boon code:**
 ```boon
-register: 0 |> LATEST reg {
+register: 0 |> HOLD reg {
     PASSED.clk |> THEN { reg + 1 }
 }
 ```
@@ -335,7 +335,7 @@ store.elements.button.event.press |> THEN { ... }
 
 **Boon code:**
 ```boon
-result: 0 |> LATEST value {
+result: 0 |> HOLD value {
     PULSES { 10 } |> THEN { value + 1 }
 }
 // Counts to 10 via temporal pulses

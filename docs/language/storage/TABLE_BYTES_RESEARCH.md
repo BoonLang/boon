@@ -831,11 +831,11 @@ FUNCTION stream_processor(data_stream) {
             })
 
         -- Pointers
-        write_ptr: 0 |> LATEST wr {
+        write_ptr: 0 |> HOLD wr {
             data_stream |> THEN { (wr + 1) % 1024 }
         }
 
-        read_ptr: 0 |> LATEST rd {
+        read_ptr: 0 |> HOLD rd {
             process_complete |> THEN { (rd + 1) % 1024 }
         }
 
@@ -1021,7 +1021,7 @@ FUNCTION instruction_dispatch(opcode, operands) {
 
 ```boon
 -- v1: LocalStorage backend
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     increment_button.event.press |> THEN { count + 1 }
 }
 ```
@@ -1054,7 +1054,7 @@ counter_v2: LATEST count {
 ```boon
 -- v3: Clean up
 #[backend: postgres]
-counter_v2: 0 |> LATEST count {
+counter_v2: 0 |> HOLD count {
     increment_button.event.press |> THEN { count + 2 }
 }
 ```

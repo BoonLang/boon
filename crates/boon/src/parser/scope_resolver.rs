@@ -455,7 +455,7 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
         Expression::Link => (),
         Expression::Skip => (),
         Expression::TextLiteral { .. } => (),
-        Expression::LatestWithState { state_param, body } => {
+        Expression::Hold { state_param, body } => {
             // Add state_param to reachable referenceables so it can be referenced in the body
             // Note: The span of state_param is part of the overall expression span
             set_is_referenced_and_alias_referenceables(

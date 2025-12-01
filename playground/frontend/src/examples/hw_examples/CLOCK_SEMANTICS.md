@@ -73,7 +73,7 @@ This triggers the next state logic **only when a clock impulse occurs**.
 ### Syntax
 
 ```boon
-state: initial_value |> LATEST state {
+state: initial_value |> HOLD state {
     PASSED.clk |> THEN {
         -- Expression that computes next value
         -- Can reference `state` (previous value)
@@ -87,7 +87,7 @@ state: initial_value |> LATEST state {
 
 ```boon
 FUNCTION register(d) {
-    q: False |> LATEST q {
+    q: False |> HOLD q {
         PASSED.clk |> THEN { d }
     }
     [q: q]
@@ -98,7 +98,7 @@ FUNCTION register(d) {
 
 ```boon
 FUNCTION register_with_reset(rst, d) {
-    q: False |> LATEST q {
+    q: False |> HOLD q {
         PASSED.clk |> THEN {
             rst |> WHILE {
                 True => False    -- Reset to initial value
@@ -114,7 +114,7 @@ FUNCTION register_with_reset(rst, d) {
 
 ```boon
 FUNCTION fsm(rst, input) {
-    state: IDLE |> LATEST state {
+    state: IDLE |> HOLD state {
         PASSED.clk |> THEN {
             rst |> WHILE {
                 True => IDLE
@@ -141,7 +141,7 @@ FUNCTION fsm(rst, input) {
 **Translation to HDL:**
 ```boon
 -- Boon code (PASSED.clk provided by hardware module context)
-state: init |> LATEST state {
+state: init |> HOLD state {
     PASSED.clk |> THEN { next_value }
 }
 ```
@@ -202,11 +202,11 @@ You can have multiple clock signals in the same module via PASSED context:
 HARDWARE multi_clock_module(clk1_input, clk2_input, data1, data2) {
     PASSED: [clk1: clk1_input, clk2: clk2_input]
 
-    reg1: 0 |> LATEST reg1 {
+    reg1: 0 |> HOLD reg1 {
         PASSED.clk1 |> THEN { data1 }
     }
 
-    reg2: 0 |> LATEST reg2 {
+    reg2: 0 |> HOLD reg2 {
         PASSED.clk2 |> THEN { data2 }
     }
 
@@ -219,7 +219,7 @@ HARDWARE multi_clock_module(clk1_input, clk2_input, data1, data2) {
 **⚠️ Warning:** Multiple clocks updating the same register is problematic in hardware!
 
 ```boon
-x: 0 |> LATEST x {
+x: 0 |> HOLD x {
     PASSED.clk1 |> THEN { expr1 }
     PASSED.clk2 |> THEN { expr2 }  -- Last one wins if both trigger
 }
@@ -243,7 +243,7 @@ x: 0 |> LATEST x {
 
 ```boon
 FUNCTION counter(rst, en) {
-    count: 0 |> LATEST count {
+    count: 0 |> HOLD count {
         PASSED.clk |> THEN {
             rst |> WHILE {
                 True => 0
@@ -262,7 +262,7 @@ FUNCTION counter(rst, en) {
 
 ```boon
 FUNCTION shift_register(rst, shift_in) {
-    reg: 0 |> LATEST reg {
+    reg: 0 |> HOLD reg {
         PASSED.clk |> THEN {
             rst |> WHILE {
                 True => 0
@@ -278,7 +278,7 @@ FUNCTION shift_register(rst, shift_in) {
 
 ```boon
 FUNCTION accumulator(rst, en, value) {
-    acc: 0 |> LATEST acc {
+    acc: 0 |> HOLD acc {
         PASSED.clk |> THEN {
             rst |> WHILE {
                 True => 0

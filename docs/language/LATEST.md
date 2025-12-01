@@ -8,13 +8,16 @@
 
 ## Overview
 
-LATEST provides reactive state management in Boon, working seamlessly across software (event-driven) and hardware (clock-driven) contexts.
+LATEST provides event merging in Boon, working seamlessly across software (event-driven) and hardware (clock-driven) contexts.
 
-**Two forms:**
-1. **Simple LATEST** - Event merging without self-reference
-2. **Piped LATEST** - Stateful with self-reference parameter
+**Note:** For stateful constructs with self-reference, see **HOLD**:
+```boon
+initial |> HOLD state { event |> THEN { state + 1 } }
+```
 
-**Key principle:** Non-self-reactive - LATEST doesn't react to its own state changes, preventing infinite loops naturally.
+**LATEST** merges multiple event sources without self-reference.
+
+**Key principle:** Non-self-reactive - neither LATEST nor HOLD react to their own state changes.
 
 ---
 
@@ -26,21 +29,21 @@ LATEST manages state for specific types. Understanding what LATEST supports is c
 
 **1. Scalars** - Simple primitive values
 - `Number`, `Text`
-- Example: `counter: 0 |> LATEST count { count + 1 }`
+- Example: `counter: 0 |> HOLD count { count + 1 }`
 
 **2. Tags/Enums** - Enumeration values
 - Built-in tags like `True`, `False`
 - User-defined state types for state machines
-- Example: `state: Idle |> LATEST state { state |> next_state() }`
-- Example: `flag: True |> LATEST flag { toggle |> THEN { flag |> Bool/not() } }`
+- Example: `state: Idle |> HOLD state { state |> next_state() }`
+- Example: `flag: True |> HOLD flag { toggle |> THEN { flag |> Bool/not() } }`
 
 **3. BITS** - Hardware bit vectors
 - Fixed-width bit patterns for hardware
-- Example: `reg: BITS[8] { 10u0  } |> LATEST reg { reg + 1 }`
+- Example: `reg: BITS[8] { 10u0  } |> HOLD reg { reg + 1 }`
 
 **4. Objects** - Structured data with named fields
 - Composite values like `[x: 0, y: 0]`, `[counter: 5, enabled: True]`
-- Example: `pos: [x: 0, y: 0] |> LATEST pos { [x: pos.x + 1, y: pos.y] }`
+- Example: `pos: [x: 0, y: 0] |> HOLD pos { [x: pos.x + 1, y: pos.y] }`
 
 ### ❌ NOT Supported - Use Alternatives Instead
 
@@ -48,7 +51,7 @@ LATEST manages state for specific types. Understanding what LATEST supports is c
 
 ```boon
 // ❌ DON'T: LIST in LATEST (anti-pattern)
-items: LIST {} |> LATEST list {
+items: LIST {} |> HOLD list {
     event |> THEN { list |> List/push(item) }
 }
 
@@ -62,7 +65,7 @@ items: LIST {}
 
 ```boon
 // ❌ DON'T: Collections for indexed storage
-mem: List/range(0, 16) |> LATEST mem {
+mem: List/range(0, 16) |> HOLD mem {
     mem |> List/set(index: addr, value: data)
 }
 
@@ -104,10 +107,12 @@ mode: LATEST {
     stop_button.click |> THEN { Stopped }
 }
 
-// Stateful counter (with self-reference)
-counter: 0 |> LATEST count {
-    increment |> THEN { count + 1 }
-    decrement |> THEN { count - 1 }
+// Stateful counter (with self-reference) - uses HOLD
+counter: 0 |> HOLD count {
+    LATEST {
+        increment |> THEN { count + 1 }
+        decrement |> THEN { count - 1 }
+    }
 }
 ```
 
@@ -120,8 +125,8 @@ flag: LATEST {
     clear_signal |> WHEN { True => False, False => SKIP }
 }
 
-// Stateful register (compute from current)
-counter: 0 |> LATEST count {
+// Stateful register (compute from current) - uses HOLD
+counter: 0 |> HOLD count {
     control |> WHEN {
         [inc: True] => count + 1
         [dec: True] => count - 1
@@ -171,12 +176,14 @@ mode: LATEST {
 
 ---
 
-### Form 2: Piped LATEST (Stateful with Self-Reference)
+### Form 2: HOLD (Stateful with Self-Reference)
+
+**Note:** The stateful form is now a separate construct called **HOLD**.
 
 **Syntax:**
 ```boon
-initial_value |> LATEST parameter_name {
-    next_value_expression
+initial_value |> HOLD parameter_name {
+    single_expression
 }
 ```
 
@@ -185,25 +192,30 @@ initial_value |> LATEST parameter_name {
 - ✅ Can compute from current value
 - ✅ Initial value explicit (piped in)
 - ✅ User-chosen parameter name
+- ✅ Single-arm body (compose with LATEST for multiple events)
 
 **Software example:**
 ```boon
-counter: 0 |> LATEST count {
-    increment |> THEN { count + 1 }
-    decrement |> THEN { count - 1 }
+counter: 0 |> HOLD count {
+    LATEST {
+        increment |> THEN { count + 1 }
+        decrement |> THEN { count - 1 }
+    }
 }
 ```
 
 **Hardware example:**
 ```boon
-state: B |> LATEST current {
-    rst |> WHEN {
-        True => B
-        False => current |> WHEN {
-            A => C
-            B => D
-            C => a |> WHEN { True => D, False => B }
-            D => A
+state: B |> HOLD current {
+    PASSED.clk |> THEN {
+        rst |> WHEN {
+            True => B
+            False => current |> WHEN {
+                A => C
+                B => D
+                C => a |> WHEN { True => D, False => B }
+                D => A
+            }
         }
     }
 }
@@ -224,7 +236,7 @@ state: B |> LATEST current {
 
 ```boon
 // ✅ SAFE - evaluates once, no infinite loop
-value: 0 |> LATEST v { v + 1 }
+value: 0 |> HOLD v { v + 1 }
 
 // Execution:
 // 1. v = 0 (piped value)
@@ -249,13 +261,13 @@ value: 0 |> LATEST v { v + 1 }
 
 **Constant input (evaluates once):**
 ```boon
-value: 0 |> LATEST v { v + 1 }
+value: 0 |> HOLD v { v + 1 }
 // Result: v = 1 (evaluates once, no re-trigger)
 ```
 
 **Event input (evaluates when event fires):**
 ```boon
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     increment |> THEN { count + 1 }
 }
 // When increment fires → count + 1 → stays until next increment
@@ -263,7 +275,7 @@ counter: 0 |> LATEST count {
 
 **Reactive input (evaluates when input changes):**
 ```boon
-counter: reset_value |> LATEST count { count + 1 }
+counter: reset_value |> HOLD count { count + 1 }
 // When reset_value changes → count = reset_value + 1 → stays
 ```
 
@@ -311,7 +323,7 @@ mode: LATEST {
 ### Wildcard Alternative
 
 ```boon
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     control |> WHEN {
         [inc: True, dec: False] => count + 1
         [inc: False, dec: True] => count - 1
@@ -347,7 +359,7 @@ mode: LATEST {
 ### Piped LATEST
 
 ```boon
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     increment |> THEN { count + 1 }
     decrement |> THEN { count - 1 }
 }
@@ -364,14 +376,14 @@ counter: 0 |> LATEST count {
 
 **Accumulator:**
 ```boon
-total: 0 |> LATEST sum {
+total: 0 |> HOLD sum {
     new_value |> THEN { sum + new_value }
 }
 ```
 
 **State machine:**
 ```boon
-mode: Idle |> LATEST state {
+mode: Idle |> HOLD state {
     start_event |> THEN { Running }
     state |> WHEN {
         Running => pause_event |> THEN { Paused }
@@ -422,7 +434,7 @@ end
 ### Piped LATEST (Register With Self-Reference)
 
 ```boon
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     control |> WHEN {
         [inc: True, dec: False] => count + 1
         [inc: False, dec: True] => count - 1
@@ -459,7 +471,7 @@ end
 
 **FSM:**
 ```boon
-state: B |> LATEST current {
+state: B |> HOLD current {
     rst |> WHEN {
         True => B
         False => current |> WHEN {
@@ -474,7 +486,7 @@ state: B |> LATEST current {
 
 **LFSR:**
 ```boon
-lfsr: BITS[8] { 10u0  } |> LATEST current {
+lfsr: BITS[8] { 10u0  } |> HOLD current {
     rst |> WHEN {
         True => BITS[8] { 10u0  }
         False => BLOCK {
@@ -493,7 +505,7 @@ lfsr: BITS[8] { 10u0  } |> LATEST current {
 
 ```boon
 FUNCTION Math/sum(stream) {
-    0 |> LATEST accumulator {
+    0 |> HOLD accumulator {
         stream |> THEN { value =>
             accumulator + value
         }
@@ -504,7 +516,7 @@ FUNCTION Math/sum(stream) {
 sum: value |> Math/sum()
 
 // Expands to
-sum: 0 |> LATEST accumulator {
+sum: 0 |> HOLD accumulator {
     value |> THEN { v => accumulator + v }
 }
 ```
@@ -514,14 +526,14 @@ sum: 0 |> LATEST accumulator {
 ```boon
 // Math/product
 FUNCTION Math/product(stream) {
-    1 |> LATEST accumulator {
+    1 |> HOLD accumulator {
         stream |> THEN { v => accumulator * v }
     }
 }
 
 // Bool/toggle
 FUNCTION Bool/toggle(stream, event) {
-    False |> LATEST state {
+    False |> HOLD state {
         event |> THEN { state |> Bool/not() }
     }
 }
@@ -541,7 +553,7 @@ FUNCTION Bool/toggle(stream, event) {
 1. **Non-self-reactive** - Prevents infinite loops
    - Reacts to inputs (piped value, events)
    - Doesn't react to output (its own state)
-   - Makes `v |> LATEST v { v + 1 }` safe!
+   - Makes `v |> HOLD v { v + 1 }` safe!
 
 2. **Exhaustive WHEN** - Explicit control flow
    - Use `SKIP` to mean "stay at current"
@@ -562,7 +574,7 @@ latest: LATEST {
 }
 
 // ✅ Piped LATEST - stateful
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     increment |> THEN { count + 1 }
 }
 ```
@@ -581,7 +593,7 @@ flag: LATEST {
 }
 
 // ✅ Piped LATEST - register with self-ref
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     control |> WHEN { [inc: True] => count + 1, __ => count }
 }
 ```
@@ -619,13 +631,13 @@ counter: 0 |> LATEST count {
 
 ```boon
 // LATEST - reactive counter (event-driven)
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     increment |> THEN { count + 1 }
 }
 // Updates when increment event fires
 
 // LATEST + PULSES - counted iteration
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     PULSES { 10 } |> THEN { count + 1 }
 }
 // Counts to 10 automatically
@@ -638,7 +650,7 @@ counter: 0 |> LATEST count {
 ### Software: Todo Counter
 
 ```boon
-todo_count: 0 |> LATEST count {
+todo_count: 0 |> HOLD count {
     add_todo_event |> THEN { count + 1 }
     remove_todo_event |> THEN { count - 1 }
     clear_all_event |> THEN { 0 }
@@ -648,7 +660,7 @@ todo_count: 0 |> LATEST count {
 ### Software: State Machine
 
 ```boon
-app_state: Idle |> LATEST state {
+app_state: Idle |> HOLD state {
     start_event |> THEN { Loading }
     state |> WHEN {
         Loading => data_loaded_event |> THEN { Ready }
@@ -668,7 +680,7 @@ FUNCTION counter(rst, load, load_value, en) {
         default: BITS[8] { 10u0  }
         control: [reset: rst, load: load, enabled: en]
 
-        count: default |> LATEST current {
+        count: default |> HOLD current {
             control |> WHEN {
                 [reset: True, load: __, enabled: __] => default
                 [reset: False, load: True, enabled: True] => load_value
@@ -687,7 +699,7 @@ FUNCTION counter(rst, load, load_value, en) {
 ```boon
 FUNCTION fsm(rst, a) {
     BLOCK {
-        state: B |> LATEST current {
+        state: B |> HOLD current {
             rst |> WHEN {
                 True => B
                 False => current |> WHEN {
@@ -723,7 +735,7 @@ While LATEST is designed with safety in mind (non-self-reactive semantics preven
 **Problem:**
 ```boon
 // ⚠️ WARNING: No external trigger - evaluates once then stays
-x: 0 |> LATEST x { x + 1 }
+x: 0 |> HOLD x { x + 1 }
 // Result: x = 1 (evaluates once on init, no re-trigger)
 ```
 
@@ -735,7 +747,7 @@ x: 0 |> LATEST x { x + 1 }
 **Solution:**
 ```boon
 // ✅ Add explicit trigger
-x: 0 |> LATEST x {
+x: 0 |> HOLD x {
     timer_event |> THEN { x + 1 }
 }
 ```
@@ -745,7 +757,7 @@ x: 0 |> LATEST x {
 Warning: LATEST has no external trigger
   --> example.bn:1:4
    |
- 1 | x: 0 |> LATEST x { x + 1 }
+ 1 | x: 0 |> HOLD x { x + 1 }
    |    ^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = Note: This will evaluate once on initialization and never update
@@ -757,7 +769,7 @@ Warning: LATEST has no external trigger
 **Problem:**
 ```boon
 // ❌ ERROR: Pure function call, but result not used
-value: 0 |> LATEST v {
+value: 0 |> HOLD v {
     event |> THEN {
         some_pure_function(v)  // Returns new value
         v                       // Returns old value! BUG!
@@ -773,14 +785,14 @@ value: 0 |> LATEST v {
 **Solution:**
 ```boon
 // ✅ Use the returned value
-value: 0 |> LATEST v {
+value: 0 |> HOLD v {
     event |> THEN {
         v |> some_pure_function()  // Pipe to use result
     }
 }
 
 // OR bind it
-value: 0 |> LATEST v {
+value: 0 |> HOLD v {
     event |> THEN {
         new_value: some_pure_function(v)
         new_value
@@ -807,7 +819,7 @@ Error: Pure function return value unused
 **Problem:**
 ```boon
 // ⚠️ WARNING: Confusing evaluation order
-a: 0 |> LATEST a {
+a: 0 |> HOLD a {
     event |> THEN { a + b }
 }
 b: a * 2  // Depends on 'a'
@@ -821,14 +833,14 @@ b: a * 2  // Depends on 'a'
 **Solution:**
 ```boon
 // ✅ Make dependencies explicit and one-way
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     event |> THEN { count + 1 }
 }
 double: counter * 2  // Clear one-way dependency
 
 // OR use shared state
 [
-    counter: 0 |> LATEST count {
+    counter: 0 |> HOLD count {
         event |> THEN { count + 1 }
     }
     double: counter * 2
@@ -840,7 +852,7 @@ double: counter * 2  // Clear one-way dependency
 Warning: Circular dependency detected
   --> example.bn:1:4
    |
- 1 | a: 0 |> LATEST a { event |> THEN { a + b } }
+ 1 | a: 0 |> HOLD a { event |> THEN { a + b } }
    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
  2 | b: a * 2
    |    -----
@@ -853,7 +865,7 @@ Warning: Circular dependency detected
 
 **Common concern:**
 ```boon
-counter: 0 |> LATEST counter { counter + 1 }
+counter: 0 |> HOLD counter { counter + 1 }
 //       ^            ^         ^
 //       |            |         |
 //       Variable   Parameter  Parameter reference
@@ -868,13 +880,13 @@ counter: 0 |> LATEST counter { counter + 1 }
 **Recommended pattern:**
 ```boon
 // ✅ Same name is idiomatic - no need for generic names
-counter: 0 |> LATEST counter { event |> THEN { counter + 1 } }
-sum: 0 |> LATEST sum { value |> THEN { sum + value } }
-state: Idle |> LATEST state { event |> THEN { next_state(state) } }
+counter: 0 |> HOLD counter { event |> THEN { counter + 1 } }
+sum: 0 |> HOLD sum { value |> THEN { sum + value } }
+state: Idle |> HOLD state { event |> THEN { next_state(state) } }
 
 // ❌ Avoid generic/confusing names
-counter: 0 |> LATEST x { event |> THEN { x + 1 } }        // What is 'x'?
-counter: 0 |> LATEST current { event |> THEN { current + 1 } }  // Verbose
+counter: 0 |> HOLD x { event |> THEN { x + 1 } }        // What is 'x'?
+counter: 0 |> HOLD current { event |> THEN { current + 1 } }  // Verbose
 ```
 
 ### Compiler Rules Summary
@@ -899,7 +911,7 @@ The Boon compiler implements static analysis at three strictness levels:
 ```boon
 // Suppress specific warning
 #[allow(no_external_trigger)]
-counter: 0 |> LATEST counter { counter + 1 }
+counter: 0 |> HOLD counter { counter + 1 }
 
 // Suppress at module level
 #![allow(circular_dependencies)]
@@ -943,7 +955,7 @@ See `LATEST_COMPILER_RULES.md` for complete rule specification.
 **Problem with self-reactive:**
 ```boon
 // Would cause infinite loop in software
-counter: 0 |> LATEST count { count + 1 }
+counter: 0 |> HOLD count { count + 1 }
 // Without non-self-reactive: 0 → 1 → 2 → 3 → ... ∞
 ```
 
@@ -984,8 +996,8 @@ flag: LATEST {
    - Or always use piped LATEST when initial value needed?
 
 2. **Syntax for parameter?**
-   - Current: `initial |> LATEST param { ... }`
-   - Alternative: `initial |> LATEST (param) { ... }` (parens?)
+   - Current: `initial |> HOLD param { ... }`
+   - Alternative: `initial |> HOLD (param) { ... }` (parens?)
    - Keep current (cleaner)?
 
 3. **Should simple LATEST allow default value?**

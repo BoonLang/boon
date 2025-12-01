@@ -129,7 +129,7 @@ Little
 Big
 ```
 
-**Important:** SCREAM_CASE is reserved for Boon keywords only (FUNCTION, BLOCK, LATEST, etc.). User-defined tags MUST use PascalCase.
+**Important:** SCREAM_CASE is reserved for Boon keywords only (FUNCTION, BLOCK, LATEST, HOLD, etc.). User-defined tags MUST use PascalCase.
 
 ✅ **Correct - Tags use PascalCase:**
 ```boon
@@ -149,13 +149,13 @@ endian: BIG             -- WRONG: Reserved for keywords
 
 **Variable shadowing is permitted in Boon.**
 
-You can reuse the same name in nested scopes, including LATEST parameter names:
+You can reuse the same name in nested scopes, including HOLD parameter names:
 
-✅ **Correct - Shadowing in LATEST:**
+✅ **Correct - Shadowing in HOLD:**
 ```boon
-state: initial_state |> LATEST state {
+state: initial_state |> HOLD state {
     event |> THEN {
-        transform(state)  // 'state' refers to LATEST parameter, shadows outer binding
+        transform(state)  // 'state' refers to HOLD parameter, shadows outer binding
     }
 }
 ```
@@ -172,7 +172,7 @@ value: config.value? |> WHEN {
 ```boon
 FUNCTION fibonacci(position) {
     BLOCK {
-        state: [previous: 0, current: 1, iteration: 0] |> LATEST state {
+        state: [previous: 0, current: 1, iteration: 0] |> HOLD state {
             PULSES { position } |> THEN {
                 [
                     previous: state.current,    // Refers to LATEST parameter
@@ -1237,7 +1237,7 @@ PULSES { 10 }  // Generates 10 pulses: [], [], [], ...
 **Used with LATEST for stateful iteration:**
 
 ```boon
-result: initial_value |> LATEST state {
+result: initial_value |> HOLD state {
     PULSES { 10 } |> THEN {
         transform(state)
     }
@@ -1251,7 +1251,7 @@ result: initial_value |> LATEST state {
 ```boon
 FUNCTION fibonacci(position) {
     BLOCK {
-        state: [previous: 0, current: 1] |> LATEST state {
+        state: [previous: 0, current: 1] |> HOLD state {
             PULSES { position } |> THEN {
                 [previous: state.current, current: state.previous + state.current]
             }
@@ -1265,7 +1265,7 @@ FUNCTION fibonacci(position) {
 ```boon
 FUNCTION factorial(count) {
     BLOCK {
-        state: [index: 1, product: 1] |> LATEST state {
+        state: [index: 1, product: 1] |> HOLD state {
             PULSES { count } |> THEN {
                 [index: state.index + 1, product: state.product * state.index]
             }
@@ -1277,7 +1277,7 @@ FUNCTION factorial(count) {
 
 ✅ **Correct - Count to N:**
 ```boon
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     PULSES { 10 } |> THEN { count + 1 }
 }
 // Result: 10
@@ -1288,7 +1288,7 @@ counter: 0 |> LATEST count {
 In hardware, LATEST must be driven by clock:
 
 ```boon
-counter: BITS[8] { 0 } |> LATEST count {
+counter: BITS[8] { 0 } |> HOLD count {
     clk |> THEN {
         PULSES { 10 } |> THEN { count + 1 }
     }
@@ -1306,7 +1306,7 @@ counter: BITS[8] { 0 } |> LATEST count {
 Use SKIP to stop iterating early:
 
 ```boon
-result: initial |> LATEST state {
+result: initial |> HOLD state {
     PULSES { max_iterations } |> THEN {
         converged(state) |> WHEN {
             True => SKIP              // Stop processing
@@ -1321,7 +1321,7 @@ result: initial |> LATEST state {
 PULSES composes naturally with other event sources:
 
 ```boon
-state: initial |> LATEST state {
+state: initial |> HOLD state {
     // Automatic iteration
     PULSES { 100 } |> THEN {
         auto_update(state)
@@ -1764,7 +1764,7 @@ style: [
 |------|-------------|---------|
 | **Function/variable naming** | snake_case ONLY | `new_todo`, `selected_filter`, `title_to_save` |
 | **Tag naming** | PascalCase | `Active`, `Light`, `InputInterior`, `TodoId` |
-| **Shadowing** | Allowed | `state: init \|> LATEST state { ... }` ✅ |
+| **Shadowing** | Allowed | `state: init \|> HOLD state { ... }` ✅ |
 | **Comparison operator** | Double `==` for equality, `=/=` for inequality | `count == 0 \|> WHEN { True => ..., False => ... }` ✅ |
 | **Function arguments** | Must be named (except first when piped) | `f(x: 1)` ✅, `f(1)` ❌, `1 \|> f()` ✅ |
 | **Function parameters** | All required, no defaults | Use `Default` tag or `with: []` record |
@@ -1804,7 +1804,7 @@ When proposing new Boon APIs, remember:
    - `InputInterior`, `Round`, `Header`
 
 3. ✅ **Shadowing is allowed - use clear names**
-   - `state: init |> LATEST state { ... }` is preferred over abbreviated parameter names
+   - `state: init |> HOLD state { ... }` is preferred over abbreviated parameter names
    - Makes code more readable when transforming the same conceptual value
 
 4. ✅ **Use `==` for equality comparison, `=/=` for inequality**

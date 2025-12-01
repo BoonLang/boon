@@ -17,11 +17,11 @@ counter:
     }
     |> Math/sum()
 
--- Alternative: LATEST with self-reference (explicit current value)
+-- Alternative: HOLD with self-reference (explicit current value)
 -- This pattern directly computes next value from current value
 -- Commented out: For educational comparison
 --
--- counter: 0 |> LATEST count {
+-- counter: 0 |> HOLD count {
 --     increment_button.event.press |> THEN { count + 1 }
 -- }
 

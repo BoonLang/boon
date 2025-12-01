@@ -7,14 +7,14 @@
 --   - Clock accessed via PASSED.clk (ambient context from hardware module)
 --   - PASSED.clk: [] = impulse, SKIP = no impulse
 --   - THEN triggers when PASSED.clk = [] (clock tick/impulse occurs)
---   - LATEST allows access to current register value for feedback computation
+--   - HOLD allows access to current register value for feedback computation
 --   - Next value is transformation of current value (shift + feedback)
 
 FUNCTION lfsr(reset) {
     -- reset: Bool - synchronous reset
     -- Returns: BITS[8] { ...  } - current LFSR state
 
-    out: BITS[8] { 10u0  } |> LATEST out {
+    out: BITS[8] { 10u0  } |> HOLD out {
         PASSED.clk |> THEN {
             reset |> WHILE {
                 True => BITS[8] { 10u0  }

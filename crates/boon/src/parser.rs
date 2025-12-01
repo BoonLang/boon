@@ -259,9 +259,9 @@ where
                 }),
         );
 
-        // Stateful LATEST: `LATEST state_param { body }` - has identifier before body
-        // Used with pipe: `initial |> LATEST state_param { body }`
-        let latest_with_state = just(Token::Latest)
+        // HOLD: `initial |> HOLD state_param { body }` - stateful accumulator with self-reference
+        // Single-arm only (unlike old LATEST-with-state which allowed multiple arms)
+        let hold = just(Token::Hold)
             .ignore_then(snake_case_identifier)
             .then(
                 expression
@@ -271,7 +271,7 @@ where
                         newlines.then(bracket_curly_close),
                     ),
             )
-            .map(|(state_param, body)| Expression::LatestWithState {
+            .map(|(state_param, body)| Expression::Hold {
                 state_param,
                 body: Box::new(body),
             });
@@ -576,7 +576,7 @@ where
             expression_alias,
             link_setter,
             link_expression,
-            latest_with_state,  // Must come before `latest` since it has more specific pattern
+            hold,
             latest,
             then,
             when,
@@ -756,8 +756,8 @@ pub enum Expression<'code> {
     Latest {
         inputs: Vec<Spanned<Self>>,
     },
-    // Stateful LATEST - used with pipe: `initial |> LATEST state_param { body }`
-    LatestWithState {
+    // HOLD - stateful accumulator: `initial |> HOLD state_param { body }`
+    Hold {
         state_param: &'code str,
         body: Box<Spanned<Self>>,
     },

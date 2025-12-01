@@ -24,7 +24,7 @@ From `LATEST.md` and `CLOCK_SEMANTICS.md`:
 
 ```boon
 // Boon register pattern
-count: BITS[8] { 10u0 } |> LATEST count {
+count: BITS[8] { 10u0 } |> HOLD count {
     PASSED.clk |> THEN {
         rst |> WHILE {
             True => BITS[8] { 10u0 }
@@ -46,17 +46,17 @@ count: BITS[8] { 10u0 } |> LATEST count {
 FUNCTION manual_pipeline(instruction) {
     BLOCK {
         // Stage 1: Fetch
-        fetch_out: instruction |> LATEST fetch {
+        fetch_out: instruction |> HOLD fetch {
             PASSED.clk |> THEN { fetch_logic(instruction) }
         }
 
         // Stage 2: Decode
-        decode_out: fetch_out |> LATEST decode {
+        decode_out: fetch_out |> HOLD decode {
             PASSED.clk |> THEN { decode_logic(decode) }
         }
 
         // Stage 3: Execute
-        execute_out: decode_out |> LATEST execute {
+        execute_out: decode_out |> HOLD execute {
             PASSED.clk |> THEN { execute_logic(execute) }
         }
 
@@ -72,19 +72,19 @@ FUNCTION natural_pipeline(instruction) {
         // Compiler recognizes LATEST blocks as stages
         // Automatically creates PASSED.pipeline context
 
-        'fetch: instruction |> LATEST fetch {
+        'fetch: instruction |> HOLD fetch {
             PASSED.clk |> THEN {
                 fetch_logic(instruction)
             }
         }
 
-        'decode: PASSED.pipeline.fetch |> LATEST decode {
+        'decode: PASSED.pipeline.fetch |> HOLD decode {
             PASSED.clk |> THEN {
                 decode_logic(decode)
             }
         }
 
-        'execute: PASSED.pipeline.decode |> LATEST execute {
+        'execute: PASSED.pipeline.decode |> HOLD execute {
             PASSED.clk |> THEN {
                 // Forward reference for hazards!
                 hazard: PASSED.pipeline.writeback.reg_write
@@ -92,7 +92,7 @@ FUNCTION natural_pipeline(instruction) {
             }
         }
 
-        'writeback: PASSED.pipeline.execute |> LATEST writeback {
+        'writeback: PASSED.pipeline.execute |> HOLD writeback {
             PASSED.clk |> THEN {
                 writeback_logic(writeback)
             }
@@ -129,19 +129,19 @@ pipeline(4) div(clk, x, y) {
 
 // Boon style (LATEST blocks are stages, labels optional)
 PIPELINE {
-    'stage1: input |> LATEST s1 {
+    'stage1: input |> HOLD s1 {
         PASSED.clk |> THEN { compute1(input) }
     }
 
-    'stage2: PASSED.pipeline.stage1 |> LATEST s2 {
+    'stage2: PASSED.pipeline.stage1 |> HOLD s2 {
         PASSED.clk |> THEN { compute2(s2) }
     }
 
-    'stage3: PASSED.pipeline.stage2 |> LATEST s3 {
+    'stage3: PASSED.pipeline.stage2 |> HOLD s3 {
         PASSED.clk |> THEN { compute3(s3) }
     }
 
-    'stage4: PASSED.pipeline.stage3 |> LATEST s4 {
+    'stage4: PASSED.pipeline.stage3 |> HOLD s4 {
         PASSED.clk |> THEN { compute4(s4) }
     }
 
@@ -311,15 +311,15 @@ FUNCTION cpu_pipeline(instruction) {
 ```boon
 FUNCTION cpu_pipeline(instruction) {
     PIPELINE {
-        'fetch: instruction |> LATEST fetch {
+        'fetch: instruction |> HOLD fetch {
             PASSED.clk |> THEN { fetch_logic(instruction) }
         }
 
-        'decode: PASSED.pipeline.fetch |> LATEST decode {
+        'decode: PASSED.pipeline.fetch |> HOLD decode {
             PASSED.clk |> THEN { decode_logic(decode) }
         }
 
-        'execute: PASSED.pipeline.decode |> LATEST execute {
+        'execute: PASSED.pipeline.decode |> HOLD execute {
             PASSED.clk |> THEN {
                 // Forward reference works!
                 hazard: PASSED.pipeline.writeback.reg_write
@@ -327,11 +327,11 @@ FUNCTION cpu_pipeline(instruction) {
             }
         }
 
-        'memory: PASSED.pipeline.execute |> LATEST memory {
+        'memory: PASSED.pipeline.execute |> HOLD memory {
             PASSED.clk |> THEN { memory_logic(memory) }
         }
 
-        'writeback: PASSED.pipeline.memory |> LATEST writeback {
+        'writeback: PASSED.pipeline.memory |> HOLD writeback {
             PASSED.clk |> THEN { writeback_logic(writeback) }
         }
 
@@ -520,7 +520,7 @@ FLUSH in stream = backpressure
 ```boon
 FUNCTION risc_cpu(instruction) {
     PIPELINE {
-        'fetch: instruction |> LATEST fetch {
+        'fetch: instruction |> HOLD fetch {
             PASSED.clk |> THEN {
                 instr: fetch_from_memory(instruction)
                 pc_next: pc + 4
@@ -528,7 +528,7 @@ FUNCTION risc_cpu(instruction) {
             }
         }
 
-        'decode: PASSED.pipeline.fetch |> LATEST decode {
+        'decode: PASSED.pipeline.fetch |> HOLD decode {
             PASSED.clk |> THEN {
                 decoded: decode_instruction(decode.instr)
                 rs1: read_register(decoded.rs1)
@@ -537,7 +537,7 @@ FUNCTION risc_cpu(instruction) {
             }
         }
 
-        'execute: PASSED.pipeline.decode |> LATEST execute {
+        'execute: PASSED.pipeline.decode |> HOLD execute {
             PASSED.clk |> THEN {
                 // Forward reference for hazard detection
                 wb_hazard: PASSED.pipeline.writeback.reg_write
@@ -553,14 +553,14 @@ FUNCTION risc_cpu(instruction) {
             }
         }
 
-        'memory: PASSED.pipeline.execute |> LATEST memory {
+        'memory: PASSED.pipeline.execute |> HOLD memory {
             PASSED.clk |> THEN {
                 mem_result: memory_access(memory.result)
                 [result: mem_result, rd: memory.rd]
             }
         }
 
-        'writeback: PASSED.pipeline.memory |> LATEST writeback {
+        'writeback: PASSED.pipeline.memory |> HOLD writeback {
             PASSED.clk |> THEN {
                 write_register(writeback.rd, writeback.result)
                 [reg_write: [rd: writeback.rd, value: writeback.result]]
@@ -593,7 +593,7 @@ FUNCTION streaming_fifo(depth) {
         buffer: MEMORY[depth] { BITS[8] { 10u0  } }
 
         // Pointers
-        write_ptr: BITS[8] { 10u0 } |> LATEST wr {
+        write_ptr: BITS[8] { 10u0 } |> HOLD wr {
             PASSED.clk |> THEN {
                 // Write when input valid AND ready
                 input.valid |> Bool/and(ready_to_accept) |> WHEN {
@@ -603,7 +603,7 @@ FUNCTION streaming_fifo(depth) {
             }
         }
 
-        read_ptr: BITS[8] { 10u0 } |> LATEST rd {
+        read_ptr: BITS[8] { 10u0 } |> HOLD rd {
             PASSED.clk |> THEN {
                 // Read when output ready AND valid
                 output.ready |> Bool/and(data_available) |> WHEN {
@@ -673,13 +673,13 @@ FUNCTION video_pipeline(pixel_stream) {
         // Stage 3: Encoding (multi-cycle pipeline)
         encoded: store.streams.filtered
             |> PIPELINE {
-                'stage1: input |> LATEST s1 {
+                'stage1: input |> HOLD s1 {
                     PASSED.clk |> THEN { dct(input) }
                 }
-                'stage2: PASSED.pipeline.stage1 |> LATEST s2 {
+                'stage2: PASSED.pipeline.stage1 |> HOLD s2 {
                     PASSED.clk |> THEN { quantize(s2) }
                 }
-                'stage3: PASSED.pipeline.stage2 |> LATEST s3 {
+                'stage3: PASSED.pipeline.stage2 |> HOLD s3 {
                     PASSED.clk |> THEN { entropy_encode(s3) }
                 }
                 [result: PASSED.pipeline.stage3]
@@ -706,8 +706,8 @@ Document that these patterns already work:
 
 ```boon
 // Manual pipeline stages
-stage1: input |> LATEST s1 { PASSED.clk |> THEN { ... } }
-stage2: stage1 |> LATEST s2 { PASSED.clk |> THEN { ... } }
+stage1: input |> HOLD s1 { PASSED.clk |> THEN { ... } }
+stage2: stage1 |> HOLD s2 { PASSED.clk |> THEN { ... } }
 
 // Streaming with LINK
 producer() |> LINK { store.streams.data }

@@ -42,7 +42,7 @@ use zoon::{eprintln, println};
 /// - Subscriber dropped before all events are processed
 /// - ValueActor dropped while subscriptions are still active
 /// - Extra owned data not properly keeping actors alive
-const LOG_DROPS_AND_LOOP_ENDS: bool = true;
+const LOG_DROPS_AND_LOOP_ENDS: bool = false;
 
 // --- TypedStream ---
 

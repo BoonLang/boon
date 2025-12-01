@@ -318,7 +318,7 @@ FUNCTION axi_slave(axi_master: AXI4_LITE) {
 **Suggested Boon syntax:**
 ```boon
 FUNCTION counter(rst, en) {
-    count: BITS[8] { 10u0 } |> LATEST count {
+    count: BITS[8] { 10u0 } |> HOLD count {
         PASSED.clk |> THEN {
             rst |> WHILE {
                 True => BITS[8] { 10u0 }

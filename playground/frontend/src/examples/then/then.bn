@@ -8,7 +8,7 @@ input_a: sum_of_steps(step: 1, seconds: 0.5)
 input_b: sum_of_steps(step: 10, seconds: 1)
 
 FUNCTION sum_of_steps(step, seconds) {
-    0 |> LATEST sum {
+    0 |> HOLD sum {
         Duration[seconds: seconds]
         |> Timer/interval()
         |> THEN { sum + step }

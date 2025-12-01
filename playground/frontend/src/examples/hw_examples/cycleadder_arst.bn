@@ -6,7 +6,7 @@
 --   - Clock accessed via PASSED.clk (ambient context from hardware module)
 --   - PASSED.clk: [] = impulse, SKIP = no impulse
 --   - THEN triggers when PASSED.clk = [] (clock tick/impulse occurs)
---   - LATEST creates register that holds accumulator value
+--   - HOLD creates register that holds accumulator value
 --   - width parameter → module parameter: #(parameter WIDTH = 4)
 
 FUNCTION cycleadder(width, rst, en, a) {
@@ -18,7 +18,7 @@ FUNCTION cycleadder(width, rst, en, a) {
 
         -- Sequential register with clock-triggered updates
         -- Pipeline = next-state logic (accumulator register)
-        output: default |> LATEST output {
+        output: default |> HOLD output {
             PASSED.clk |> THEN {
                 output
                     |> Bits/set(control_signals |> WHILE {

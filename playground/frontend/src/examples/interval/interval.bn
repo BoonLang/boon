@@ -6,11 +6,11 @@ document:
     |> Math/sum()
     |> Document/new()
 
--- Alternative: LATEST with self-reference (explicit counter)
+-- Alternative: HOLD with self-reference (explicit counter)
 -- Separates state from view for clarity
 -- Commented out: For educational comparison
 --
--- counter: 0 |> LATEST count {
+-- counter: 0 |> HOLD count {
 --     Duration[seconds: 1]
 --     |> Timer/interval()
 --     |> THEN { count + 1 }

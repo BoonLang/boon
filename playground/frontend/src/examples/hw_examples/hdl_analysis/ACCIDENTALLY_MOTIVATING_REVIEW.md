@@ -90,11 +90,11 @@ Hardware: stall → flush signal → bypass stages → pipeline bubble
 
 ```boon
 // The compiler ALREADY KNOWS which clock domain each LATEST belongs to!
-write_ptr: BITS[4] { 10u0 } |> LATEST wr {
+write_ptr: BITS[4] { 10u0 } |> HOLD wr {
     PASSED.clk[write_clk] |> THEN { ... }  // Write domain
 }
 
-read_ptr: BITS[4] { 10u0 } |> LATEST rd {
+read_ptr: BITS[4] { 10u0 } |> HOLD rd {
     PASSED.clk[read_clk] |> THEN { ... }   // Read domain
 }
 ```
@@ -151,11 +151,11 @@ This is why the same primitives work in both domains - you found the universal a
 ```boon
 // This already works - it's a 5-stage pipeline!
 FUNCTION risc_pipeline(instruction) {
-    fetch_out: instruction |> LATEST fetch { PASSED.clk |> THEN { ... } }
-    decode_out: fetch_out |> LATEST decode { PASSED.clk |> THEN { ... } }
-    execute_out: decode_out |> LATEST execute { PASSED.clk |> THEN { ... } }
-    memory_out: execute_out |> LATEST memory { PASSED.clk |> THEN { ... } }
-    writeback: memory_out |> LATEST wb { PASSED.clk |> THEN { ... } }
+    fetch_out: instruction |> HOLD fetch { PASSED.clk |> THEN { ... } }
+    decode_out: fetch_out |> HOLD decode { PASSED.clk |> THEN { ... } }
+    execute_out: decode_out |> HOLD execute { PASSED.clk |> THEN { ... } }
+    memory_out: execute_out |> HOLD memory { PASSED.clk |> THEN { ... } }
+    writeback: memory_out |> HOLD wb { PASSED.clk |> THEN { ... } }
 }
 ```
 
@@ -172,9 +172,9 @@ Add minimal extensions to surface existing patterns:
 ```boon
 // PIPELINE block recognizes LATEST as stages
 PIPELINE {
-    'fetch: input |> LATEST fetch { PASSED.clk |> THEN { ... } }
-    'decode: PASSED.pipeline.fetch |> LATEST decode { ... }
-    'execute: PASSED.pipeline.decode |> LATEST execute {
+    'fetch: input |> HOLD fetch { PASSED.clk |> THEN { ... } }
+    'decode: PASSED.pipeline.fetch |> HOLD decode { ... }
+    'execute: PASSED.pipeline.decode |> HOLD execute {
         // Forward reference for hazards!
         hazard: PASSED.pipeline.writeback.value
         ...
@@ -194,7 +194,7 @@ PIPELINE {
 
 ```boon
 // Same reactive code
-counter: 0 |> LATEST count {
+counter: 0 |> HOLD count {
     increment |> THEN { count + 1 }
 }
 

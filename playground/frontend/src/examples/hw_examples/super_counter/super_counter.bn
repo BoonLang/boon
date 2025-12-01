@@ -59,7 +59,7 @@ FUNCTION super_counter(rst_n, btn_n, uart_rx_i) {
 FUNCTION debouncer(rst, btn_n) {
     BLOCK {
         -- CDC synchronizer (2-FF chain)
-        sync_0: True |> LATEST s0 {
+        sync_0: True |> HOLD s0 {
             PASSED.clk |> THEN {
                 rst |> WHILE {
                     True => True
@@ -68,7 +68,7 @@ FUNCTION debouncer(rst, btn_n) {
             }
         }
 
-        sync_1: True |> LATEST s1 {
+        sync_1: True |> HOLD s1 {
             PASSED.clk |> THEN {
                 rst |> WHILE {
                     True => True
@@ -82,7 +82,7 @@ FUNCTION debouncer(rst, btn_n) {
 
         -- Debounce counter and stable state
         state: [counter: BITS[20] { 10u0 }, stable: False, pressed: False]
-            |> LATEST state {
+            |> HOLD state {
                 PASSED.clk |> THEN {
                     rst |> WHILE {
                         True => [counter: BITS[20] { 10u0 }, stable: False, pressed: False]
@@ -120,7 +120,7 @@ FUNCTION debouncer(rst, btn_n) {
 FUNCTION uart_tx(rst, data, start) {
     BLOCK {
         -- Baud rate generator state
-        baud_state: [cnt: BITS[8] { 10u0 }, tick: False] |> LATEST bs {
+        baud_state: [cnt: BITS[8] { 10u0 }, tick: False] |> HOLD bs {
             PASSED.clk |> THEN {
                 rst |> WHILE {
                     True => [cnt: BITS[8] { 10u103 }, tick: False]
@@ -134,7 +134,7 @@ FUNCTION uart_tx(rst, data, start) {
 
         -- Transmit state machine
         tx_state: [busy: False, shifter: BITS[10] { 16u3FF }, bit_idx: BITS[4] { 10u0 }, tx: True]
-            |> LATEST ts {
+            |> HOLD ts {
                 PASSED.clk |> THEN {
                     rst |> WHILE {
                         True => [busy: False, shifter: BITS[10] { 16u3FF }, bit_idx: BITS[4] { 10u0 }, tx: True]
@@ -184,13 +184,13 @@ FUNCTION uart_tx(rst, data, start) {
 FUNCTION uart_rx(rst, rx) {
     BLOCK {
         -- CDC synchronizer
-        sync_0: True |> LATEST s0 {
+        sync_0: True |> HOLD s0 {
             PASSED.clk |> THEN {
                 rst |> WHILE { True => True, False => rx }
             }
         }
 
-        sync_1: True |> LATEST s1 {
+        sync_1: True |> HOLD s1 {
             PASSED.clk |> THEN {
                 rst |> WHILE { True => True, False => sync_0 }
             }
@@ -201,7 +201,7 @@ FUNCTION uart_rx(rst, rx) {
         -- Receiver state machine
         rx_state: [busy: False, baud_cnt: BITS[8] { 10u0 }, bit_idx: BITS[4] { 10u0 },
                    shifter: BITS[8] { 10u0 }, data: BITS[8] { 10u0 }, valid: False]
-            |> LATEST rs {
+            |> HOLD rs {
                 PASSED.clk |> THEN {
                     rst |> WHILE {
                         True => [busy: False, baud_cnt: BITS[8] { 10u0 }, bit_idx: BITS[4] { 10u0 },
@@ -298,7 +298,7 @@ FUNCTION btn_message(rst, btn_pressed, tx_busy) {
             msg_idx: BITS[4] { 10u0 }
             tx_data: BITS[8] { 10u0 }
             tx_start: False
-        ] |> LATEST st {
+        ] |> HOLD st {
             PASSED.clk |> THEN {
                 rst |> WHILE {
                     True => [
@@ -532,7 +532,7 @@ FUNCTION ack_parser(rst, rx_data, rx_valid) {
             duration_ms: BITS[32] { 10u0 }
             trigger: False
             pulse_cycles: BITS[32] { 10u0 }
-        ] |> LATEST ps {
+        ] |> HOLD ps {
             PASSED.clk |> THEN {
                 rst |> WHILE {
                     True => [fsm: Idle, duration_ms: BITS[32] { 10u0 }, trigger: False, pulse_cycles: BITS[32] { 10u0 }]
@@ -616,7 +616,7 @@ FUNCTION ack_parser(rst, rx_data, rx_valid) {
 
 FUNCTION led_pulse(rst, trigger, cycles) {
     BLOCK {
-        state: [counter: BITS[32] { 10u0 }, led: False] |> LATEST st {
+        state: [counter: BITS[32] { 10u0 }, led: False] |> HOLD st {
             PASSED.clk |> THEN {
                 rst |> WHILE {
                     True => [counter: BITS[32] { 10u0 }, led: False]

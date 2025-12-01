@@ -977,7 +977,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                 status: PersistenceStatus::NewOrChanged,
             });
         }
-        Expression::LatestWithState { state_param, body } => {
+        Expression::Hold { state_param, body } => {
             let old_body_and_id =
                 old_expressions
                     .iter()
@@ -985,7 +985,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                         Spanned {
                             span,
                             persistence: _,
-                            node: Expression::LatestWithState { state_param: old_state_param, body: old_body },
+                            node: Expression::Hold { state_param: old_state_param, body: old_body },
                         } if old_state_param == state_param => Some((old_body, old_span_id_pairs[span])),
                         _ => None,
                     });
