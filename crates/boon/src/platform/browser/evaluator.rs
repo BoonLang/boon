@@ -11,6 +11,22 @@ use ulid::Ulid;
 use zoon::futures_util::stream;
 use zoon::{Stream, StreamExt, println, eprintln};
 
+/// Yields control to the executor, allowing other tasks to run.
+/// This is a simple implementation that returns Pending once and schedules a wake.
+async fn yield_once() {
+    use std::task::Poll;
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }).await
+}
+
 use super::super::super::parser::{
     PersistenceId, SourceCode, Span, static_expression, lexer, parser, resolve_references, Token, Spanned,
 };
@@ -1035,6 +1051,8 @@ fn static_spanned_expression_into_value_actor(
                                 piped: None, // Clear piped - it was bound to first param
                                 passed: passed_context,
                                 parameters: param_bindings,
+                                sequential_processing: actor_context.sequential_processing,
+                                backpressure_permit: actor_context.backpressure_permit.clone(),
                             };
 
                             // Evaluate the function body with the new context
@@ -1117,6 +1135,8 @@ fn static_spanned_expression_into_value_actor(
                                     piped: None, // Clear piped - it was bound to first param
                                     passed: passed_context,
                                     parameters: param_bindings,
+                                    sequential_processing: actor_context.sequential_processing,
+                                    backpressure_permit: actor_context.backpressure_permit.clone(),
                                 };
 
                                 // Evaluate the function body with the new context
@@ -1183,6 +1203,8 @@ fn static_spanned_expression_into_value_actor(
                         piped: None, // Clear piped - it was already added as first arg
                         passed: passed_context,
                         parameters: actor_context.parameters.clone(),
+                        sequential_processing: actor_context.sequential_processing,
+                        backpressure_permit: actor_context.backpressure_permit.clone(),
                     };
 
                     // Get function definition
@@ -1463,7 +1485,20 @@ fn static_spanned_expression_into_value_actor(
 
                     // Subscribe to the piped stream and for each value, evaluate the body
                     let body_for_closure = body;
-                    let mapped_stream = piped.clone().subscribe().filter_map(move |value| {
+
+                    // Check if we need sequential processing (inside HOLD).
+                    // When sequential_processing is true, we use .then() which processes
+                    // one value at a time, waiting for the body to complete before processing next.
+                    // This prevents race conditions where parallel body evaluations all read stale state.
+                    let sequential = actor_context_for_then.sequential_processing;
+
+                    // Extract backpressure permit BEFORE creating eval_body closure
+                    // (closure moves actor_context_for_then, so we must extract first)
+                    let backpressure_permit = actor_context_for_then.backpressure_permit.clone();
+
+                    // Helper closure for evaluating a single input value
+                    // Returns Option<Value> - the body result (or None on error)
+                    let eval_body = move |value: Value| {
                         let actor_context_clone = actor_context_for_then.clone();
                         let construct_context_clone = construct_context_for_then.clone();
                         let reference_connector_clone = reference_connector_for_then.clone();
@@ -1490,11 +1525,16 @@ fn static_spanned_expression_into_value_actor(
                             );
 
                             // Evaluate the body with PASSED set to this value
+                            // Clone value_actor - we need one for the actor context and one to keep alive
                             let new_actor_context = ActorContext {
                                 output_valve_signal: actor_context_clone.output_valve_signal.clone(),
-                                piped: Some(value_actor),
+                                piped: Some(value_actor.clone()),
                                 passed: actor_context_clone.passed.clone(),
                                 parameters: actor_context_clone.parameters.clone(),
+                                // Propagate sequential_processing to nested THEN/WHEN inside body
+                                sequential_processing: actor_context_clone.sequential_processing,
+                                // Propagate backpressure_permit to nested constructs
+                                backpressure_permit: actor_context_clone.backpressure_permit.clone(),
                             };
 
                             let body_expr = static_expression::Spanned {
@@ -1514,31 +1554,61 @@ fn static_spanned_expression_into_value_actor(
                                 source_code_clone,
                             ) {
                                 Ok(result_actor) => {
-                                    // Return the first value from the result actor
-                                    Some(result_actor)
+                                    // Subscribe and get first value from body
+                                    // Keep value_actor alive while we wait for the result
+                                    let mut subscription = result_actor.subscribe();
+                                    let _keep_alive = value_actor;
+                                    if let Some(mut result_value) = subscription.next().await {
+                                        // THEN SEMANTICS: Each input pulse produces a conceptually "new" value,
+                                        // even if the body evaluates to the same content (e.g., constant `1`).
+                                        // We assign fresh idempotency keys so downstream consumers (like Math/sum)
+                                        // treat each pulse's output as unique rather than skipping "duplicates".
+                                        result_value.set_idempotency_key(ValueIdempotencyKey::new());
+                                        Some(result_value)
+                                    } else {
+                                        None
+                                    }
                                 }
                                 Err(_) => None,
                             }
                         }
-                    });
+                    };
 
-                    // Flatten the stream of actors into a stream of values
-                    // subscribe() returns Subscription which keeps the actor alive
-                    // IMPORTANT: Use .take(1) because body results use constant() streams
-                    // which never complete. Without take(1), flat_map blocks waiting for
-                    // the inner stream to finish, preventing subsequent input values from
-                    // being processed (causing interval/counter to only process first tick).
-                    //
-                    // THEN SEMANTICS: Each input pulse produces a conceptually "new" value,
-                    // even if the body evaluates to the same content (e.g., constant `1`).
-                    // We assign fresh idempotency keys so downstream consumers (like Math/sum)
-                    // treat each pulse's output as unique rather than skipping "duplicates".
-                    let flattened_stream = mapped_stream.flat_map(|actor| {
-                        actor.subscribe().take(1).map(|mut value| {
-                            value.set_idempotency_key(ValueIdempotencyKey::new());
-                            value
-                        })
-                    });
+                    // Create the flattened stream using either sequential or parallel processing
+                    let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if let Some(permit) = backpressure_permit {
+                        // Backpressure mode: HOLD controls pacing via permit.
+                        // THEN acquires permit before each body evaluation.
+                        // HOLD releases permit after updating state.
+                        // This guarantees state is updated before next body starts.
+                        let stream = piped.clone().subscribe()
+                            .then(move |value| {
+                                let permit = permit.clone();
+                                let eval = eval_body.clone();
+                                async move {
+                                    // Wait for permit - HOLD releases after state update
+                                    permit.acquire().await;
+                                    eval(value).await
+                                }
+                            })
+                            .filter_map(|opt| async { opt });
+                        Box::pin(stream)
+                    } else if sequential {
+                        // Sequential mode without backpressure (fallback).
+                        // Uses .then() to process one at a time, but no synchronization with HOLD.
+                        let stream = piped.clone().subscribe()
+                            .then(eval_body)
+                            .filter_map(|opt| async { opt });
+                        Box::pin(stream)
+                    } else {
+                        // Parallel mode (default): use filter_map which spawns concurrent tasks.
+                        // Each input value's body evaluation runs in parallel, which is faster
+                        // but can cause race conditions when reading shared state (like HOLD).
+                        //
+                        // The original two-step approach (filter_map + flat_map) is kept for
+                        // compatibility, even though eval_body now does both steps.
+                        let stream = piped.clone().subscribe().filter_map(eval_body);
+                        Box::pin(stream)
+                    };
 
                     ValueActor::new_arc(
                         ConstructInfo::new(
@@ -1573,8 +1643,14 @@ fn static_spanned_expression_into_value_actor(
                     let span_for_when = span;
                     let arms_for_closure = arms.clone();
 
-                    // For each value, try to match against arms and evaluate matching body
-                    let mapped_stream = piped.clone().subscribe().filter_map(move |value| {
+                    // Extract these BEFORE creating eval_body closure
+                    // (closure moves actor_context_for_when, so we must extract first)
+                    let sequential = actor_context_for_when.sequential_processing;
+                    let backpressure_permit = actor_context_for_when.backpressure_permit.clone();
+
+                    // Helper closure for evaluating a single input value
+                    // Returns Option<Value> - the body result (or None on error or no match)
+                    let eval_body = move |value: Value| {
                         let actor_context_clone = actor_context_for_when.clone();
                         let construct_context_clone = construct_context_for_when.clone();
                         let reference_connector_clone = reference_connector_for_when.clone();
@@ -1605,6 +1681,9 @@ fn static_spanned_expression_into_value_actor(
                                         piped: actor_context_clone.piped.clone(),
                                         passed: actor_context_clone.passed.clone(),
                                         parameters: params,
+                                        // Propagate sequential_processing to nested THEN/WHEN inside body
+                                        sequential_processing: actor_context_clone.sequential_processing,
+                                        backpressure_permit: actor_context_clone.backpressure_permit.clone(),
                                     };
 
                                     // Create a spanned expression from the body
@@ -1624,7 +1703,16 @@ fn static_spanned_expression_into_value_actor(
                                         module_loader_clone,
                                         source_code_clone,
                                     ) {
-                                        Ok(result_actor) => return Some(result_actor),
+                                        Ok(result_actor) => {
+                                            // Get first value from body before returning
+                                            let mut subscription = result_actor.subscribe();
+                                            if let Some(mut result_value) = subscription.next().await {
+                                                // WHEN SEMANTICS: Like THEN, each input pulse produces a "new" value.
+                                                result_value.set_idempotency_key(ValueIdempotencyKey::new());
+                                                return Some(result_value);
+                                            }
+                                            return None;
+                                        }
                                         Err(_) => return None,
                                     }
                                 }
@@ -1632,23 +1720,36 @@ fn static_spanned_expression_into_value_actor(
                             // No arm matched
                             None
                         }
-                    });
+                    };
 
-                    // Flatten the stream of actors into a stream of values
-                    // subscribe() returns Subscription which keeps the actor alive
-                    // IMPORTANT: Use .take(1) because body results use constant() streams
-                    // which never complete. Without take(1), flat_map blocks waiting for
-                    // the inner stream to finish, preventing subsequent input values from
-                    // being processed (causing interval/counter to only process first tick).
-                    //
-                    // WHEN SEMANTICS: Like THEN, each input pulse produces a conceptually "new" value.
-                    // We assign fresh idempotency keys so downstream consumers treat each pulse as unique.
-                    let flattened_stream = mapped_stream.flat_map(|actor| {
-                        actor.subscribe().take(1).map(|mut value| {
-                            value.set_idempotency_key(ValueIdempotencyKey::new());
-                            value
-                        })
-                    });
+                    // Create the flattened stream using either sequential or parallel processing
+                    let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if let Some(permit) = backpressure_permit {
+                        // Backpressure mode: HOLD controls pacing via permit.
+                        // WHEN acquires permit before each body evaluation.
+                        // HOLD releases permit after updating state.
+                        // This guarantees state is updated before next body starts.
+                        let stream = piped.clone().subscribe()
+                            .then(move |value| {
+                                let permit = permit.clone();
+                                let eval = eval_body.clone();
+                                async move {
+                                    // Wait for permit - HOLD releases after state update
+                                    permit.acquire().await;
+                                    eval(value).await
+                                }
+                            })
+                            .filter_map(|opt| async { opt });
+                        Box::pin(stream)
+                    } else if sequential {
+                        // Sequential mode without backpressure (fallback).
+                        // Uses .then() to process one at a time, but no synchronization with HOLD.
+                        let stream = piped.clone().subscribe().then(eval_body).filter_map(|opt| async { opt });
+                        Box::pin(stream)
+                    } else {
+                        // Parallel mode (default): use filter_map which spawns concurrent tasks.
+                        let stream = piped.clone().subscribe().filter_map(eval_body);
+                        Box::pin(stream)
+                    };
 
                     ValueActor::new_arc(
                         ConstructInfo::new(
@@ -1715,6 +1816,9 @@ fn static_spanned_expression_into_value_actor(
                                         piped: actor_context_clone.piped.clone(),
                                         passed: actor_context_clone.passed.clone(),
                                         parameters: params,
+                                        // Propagate sequential_processing to nested constructs
+                                        sequential_processing: actor_context_clone.sequential_processing,
+                                        backpressure_permit: actor_context_clone.backpressure_permit.clone(),
                                     };
 
                                     // Create a spanned expression from the body
@@ -1836,11 +1940,23 @@ fn static_spanned_expression_into_value_actor(
             let mut body_parameters = actor_context.parameters.clone();
             body_parameters.insert(state_param_string.clone(), state_actor);
 
+            // Create backpressure permit for synchronizing THEN with state updates.
+            // Initial count = 1 allows first body evaluation to start.
+            // HOLD releases permit after each state update, allowing next body to run.
+            let backpressure_permit = BackpressurePermit::new(1);
+            let permit_for_state_update = backpressure_permit.clone();
+
             let body_actor_context = ActorContext {
                 output_valve_signal: actor_context.output_valve_signal.clone(),
                 piped: None, // Clear piped - the body shouldn't re-use it
                 passed: actor_context.passed.clone(),
                 parameters: body_parameters,
+                // Force sequential processing in HOLD body to ensure state consistency.
+                // Without this, THEN/WHEN would spawn parallel body evaluations that all
+                // read stale state (e.g., PULSES {3} |> THEN { counter + 1 } would read counter=0 three times).
+                sequential_processing: true,
+                // Pass permit to body - THEN will acquire before each evaluation
+                backpressure_permit: Some(backpressure_permit),
             };
 
             // Evaluate the body with state parameter bound
@@ -1864,6 +1980,9 @@ fn static_spanned_expression_into_value_actor(
                 *current_state_for_update.borrow_mut() = Some(new_value.clone());
                 // Send to state channel so body can see it on next event
                 let _ = state_sender_for_update.borrow().unbounded_send(new_value.clone());
+                // Release permit to allow THEN to process next input.
+                // This guarantees state is updated before next body evaluation starts.
+                permit_for_state_update.release();
                 new_value
             });
 
@@ -1950,7 +2069,10 @@ fn static_spanned_expression_into_value_actor(
             let construct_context_for_pulses = construct_context.clone();
 
             // When count changes, emit that many pulses
-            let pulses_stream = count_actor.subscribe().flat_map(move |count_value| {
+            // Clone count_actor before moving into closure - we need to keep it alive
+            // Use stream::unfold instead of stream::iter to yield between emissions,
+            // ensuring downstream subscribers have a chance to process each pulse
+            let pulses_stream = count_actor.clone().subscribe().flat_map(move |count_value| {
                 let n = match &count_value {
                     Value::Number(num, _) => num.number() as i64,
                     _ => 0,
@@ -1958,25 +2080,40 @@ fn static_spanned_expression_into_value_actor(
 
                 let construct_context_inner = construct_context_for_pulses.clone();
 
-                stream::iter((0..n.max(0)).map(move |i| {
-                    Value::Number(
-                        Arc::new(Number::new(
-                            ConstructInfo::new(
-                                format!("PULSES iteration {i}"),
-                                None,
-                                format!("PULSES iteration {i}"),
-                            ),
-                            construct_context_inner.clone(),
-                            i as f64,
-                        )),
-                        ValueMetadata {
-                            idempotency_key: Ulid::new(),
-                        },
-                    )
-                }))
+                // Use unfold to emit pulses one at a time with async yield points
+                // Yield BEFORE each pulse to ensure sequential processing:
+                // - First yield lets downstream subscribe
+                // - Subsequent yields let downstream (like HOLD) process the previous pulse
+                //   before the next one arrives
+                stream::unfold(0i64, move |i| {
+                    let construct_context_for_iter = construct_context_inner.clone();
+                    async move {
+                        if i >= n.max(0) {
+                            return None;
+                        }
+                        // Yield before each pulse emission to allow sequential processing
+                        yield_once().await;
+                        let value = Value::Number(
+                            Arc::new(Number::new(
+                                ConstructInfo::new(
+                                    format!("PULSES iteration {i}"),
+                                    None,
+                                    format!("PULSES iteration {i}"),
+                                ),
+                                construct_context_for_iter,
+                                i as f64,
+                            )),
+                            ValueMetadata {
+                                idempotency_key: Ulid::new(),
+                            },
+                        );
+                        Some((value, i + 1))
+                    }
+                })
             });
 
-            ValueActor::new_arc(
+            // Keep count_actor alive by passing it as an input dependency
+            ValueActor::new_arc_with_inputs(
                 ConstructInfo::new(
                     format!("PersistenceId: {persistence_id}"),
                     persistence,
@@ -1985,6 +2122,7 @@ fn static_spanned_expression_into_value_actor(
                 actor_context,
                 TypedStream::infinite(pulses_stream),
                 Some(persistence_id),
+                vec![count_actor],
             )
         }
         static_expression::Expression::Spread { value } => {
@@ -2023,6 +2161,8 @@ fn static_spanned_expression_into_value_actor(
                 piped: Some(from_actor),
                 passed: actor_context.passed.clone(),
                 parameters: actor_context.parameters.clone(),
+                sequential_processing: actor_context.sequential_processing,
+                backpressure_permit: actor_context.backpressure_permit.clone(),
             };
 
             // Evaluate the 'to' expression with the new actor context
@@ -2056,6 +2196,8 @@ fn static_spanned_expression_into_value_actor(
                         piped: actor_context.piped.clone(),
                         passed: actor_context.passed.clone(),
                         parameters: local_parameters.clone(),
+                        sequential_processing: actor_context.sequential_processing,
+                        backpressure_permit: actor_context.backpressure_permit.clone(),
                     },
                     reference_connector.clone(),
                     link_connector.clone(),
@@ -2075,6 +2217,8 @@ fn static_spanned_expression_into_value_actor(
                     piped: actor_context.piped.clone(),
                     passed: actor_context.passed.clone(),
                     parameters: local_parameters,
+                    sequential_processing: actor_context.sequential_processing,
+                    backpressure_permit: actor_context.backpressure_permit.clone(),
                 },
                 reference_connector,
                 link_connector,

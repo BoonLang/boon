@@ -143,6 +143,140 @@ pub fn constant<T>(item: T) -> TypedStream<impl Stream<Item = T>, Infinite> {
     TypedStream::infinite(stream::once(future::ready(item)).chain(stream::once(future::pending())))
 }
 
+// --- BackpressuredStream ---
+
+/// Stream combinator with demand-based backpressure.
+/// Consumer controls pace by signaling readiness via the demand channel.
+/// Inner stream is only polled when demand signal is received.
+///
+/// # Usage
+/// ```ignore
+/// let backpressured = BackpressuredStream::new(source_stream);
+/// let demand_tx = backpressured.demand_sender();
+/// backpressured.signal_initial_demand(); // Allow first value
+///
+/// // In processing loop, after handling each value:
+/// let _ = demand_tx.unbounded_send(()); // Signal ready for next
+/// ```
+#[pin_project::pin_project]
+pub struct BackpressuredStream<S> {
+    #[pin]
+    inner: S,
+    #[pin]
+    demand_rx: mpsc::UnboundedReceiver<()>,
+    demand_tx: mpsc::UnboundedSender<()>,
+    awaiting_demand: bool,
+}
+
+impl<S> BackpressuredStream<S> {
+    pub fn new(inner: S) -> Self {
+        let (demand_tx, demand_rx) = mpsc::unbounded();
+        Self {
+            inner,
+            demand_rx,
+            demand_tx,
+            awaiting_demand: true,
+        }
+    }
+
+    /// Get a cloneable sender to signal demand.
+    /// Call `demand_sender.unbounded_send(())` to allow next value through.
+    pub fn demand_sender(&self) -> mpsc::UnboundedSender<()> {
+        self.demand_tx.clone()
+    }
+
+    /// Signal initial demand (call once after creation to start flow).
+    pub fn signal_initial_demand(&self) {
+        let _ = self.demand_tx.unbounded_send(());
+    }
+}
+
+impl<S: Stream> Stream for BackpressuredStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+
+        // Wait for demand signal before polling inner
+        if *this.awaiting_demand {
+            match this.demand_rx.poll_next(cx) {
+                Poll::Ready(Some(())) => *this.awaiting_demand = false,
+                Poll::Ready(None) => return Poll::Ready(None), // Demand channel closed
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        // Poll inner stream
+        match this.inner.poll_next(cx) {
+            Poll::Ready(Some(value)) => {
+                *this.awaiting_demand = true; // Need demand for next value
+                Poll::Ready(Some(value))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+// --- BackpressurePermit ---
+
+use std::cell::{Cell, RefCell};
+use std::task::Waker;
+
+/// A permit-based synchronization primitive for backpressure between producer and consumer.
+///
+/// Used by HOLD to ensure THEN processes one value at a time AND waits for state update.
+///
+/// # How it works:
+/// 1. HOLD creates permit with initial count = 1
+/// 2. THEN acquires permit before each body evaluation (blocks if count = 0)
+/// 3. THEN evaluates body and emits result (permit count stays at 0)
+/// 4. HOLD receives result, updates state, releases permit (count = 0 → 1)
+/// 5. THEN can now acquire for next body evaluation
+///
+/// This guarantees that HOLD's state update completes before THEN's next body starts.
+#[derive(Clone)]
+pub struct BackpressurePermit {
+    available: Rc<Cell<usize>>,
+    waker: Rc<RefCell<Option<Waker>>>,
+}
+
+impl BackpressurePermit {
+    /// Create a new permit with the given initial count.
+    /// For HOLD/THEN synchronization, use initial = 1.
+    pub fn new(initial: usize) -> Self {
+        BackpressurePermit {
+            available: Rc::new(Cell::new(initial)),
+            waker: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    /// Release a permit, incrementing the available count.
+    /// Wakes the waiting task if one exists.
+    /// Called by HOLD after updating state.
+    pub fn release(&self) {
+        self.available.set(self.available.get() + 1);
+        if let Some(waker) = self.waker.borrow_mut().take() {
+            waker.wake();
+        }
+    }
+
+    /// Acquire a permit asynchronously.
+    /// If no permit is available (count = 0), waits until one is released.
+    /// Called by THEN before each body evaluation.
+    pub async fn acquire(&self) {
+        std::future::poll_fn(|cx| {
+            if self.available.get() > 0 {
+                self.available.set(self.available.get() - 1);
+                Poll::Ready(())
+            } else {
+                *self.waker.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }).await
+    }
+}
+
 // --- SubscriberId ---
 
 /// Unique identifier for a subscription.
@@ -479,6 +613,15 @@ pub struct ActorContext {
     /// Set when calling a user-defined function.
     /// e.g., `fn(param: x)` binds "param" -> x's ValueActor
     pub parameters: HashMap<String, Arc<ValueActor>>,
+    /// When true, THEN/WHEN process events sequentially (one body completes before next starts).
+    /// Set by HOLD to ensure state consistency in accumulator patterns.
+    /// This prevents race conditions where multiple parallel body evaluations read stale state.
+    pub sequential_processing: bool,
+    /// Backpressure permit for HOLD/THEN synchronization.
+    /// When set, THEN must acquire permit before each body evaluation,
+    /// and HOLD releases permit after updating state.
+    /// This ensures state is updated before next body starts.
+    pub backpressure_permit: Option<BackpressurePermit>,
 }
 
 // --- ActorOutputValveSignal ---
