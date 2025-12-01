@@ -803,7 +803,7 @@ pub fn function_math_sum(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    #[derive(Default, Clone, Copy, Serialize, Deserialize)]
+    #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
     #[serde(crate = "serde")]
     struct State {
         input_value_idempotency_key: Option<ValueIdempotencyKey>,
@@ -815,7 +815,18 @@ pub fn function_math_sum(
         panic!("Unexpected argument count")
     };
     let storage = construct_context.construct_storage.clone();
-    stream::once(storage.clone().load_state(function_call_persistence_id))
+
+    // DEBUG: Log persistence ID being used
+    zoon::println!("[Math/sum] Using PersistenceId: {function_call_persistence_id}");
+
+    stream::once({
+        let storage = storage.clone();
+        async move {
+            let loaded: Option<State> = storage.load_state(function_call_persistence_id).await;
+            zoon::println!("[Math/sum] Loaded state: {:?}", loaded);
+            loaded
+        }
+    })
         .filter_map(future::ready)
         .chain(argument_increment.clone().subscribe().map(|value| State {
             input_value_idempotency_key: Some(value.idempotency_key()),
@@ -846,6 +857,7 @@ pub fn function_math_sum(
                     if skip_value {
                         Some(None)
                     } else {
+                        zoon::println!("[Math/sum] Saving state: {:?}", state);
                         storage
                             .save_state(function_call_persistence_id, &state)
                             .await;

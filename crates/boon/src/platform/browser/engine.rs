@@ -341,56 +341,6 @@ impl VirtualFilesystem {
     }
 }
 
-// --- PreviousActors ---
-
-/// Lookup table for actors and variables from a previous evaluation.
-/// Used to reuse unchanged actors across hot-reloads.
-#[derive(Clone, Default)]
-pub struct PreviousActors {
-    actors: Arc<HashMap<parser::PersistenceId, Arc<ValueActor>>>,
-    variables: Arc<HashMap<parser::PersistenceId, Arc<Variable>>>,
-}
-
-impl PreviousActors {
-    /// Create a PreviousActors lookup from a previous evaluation result.
-    pub fn from_object(obj: Option<&Arc<Object>>) -> Self {
-        let mut actors = HashMap::new();
-        let mut variables = HashMap::new();
-        if let Some(obj) = obj {
-            Self::collect_recursive(obj, &mut actors, &mut variables);
-        }
-        Self {
-            actors: Arc::new(actors),
-            variables: Arc::new(variables),
-        }
-    }
-
-    fn collect_recursive(
-        obj: &Object,
-        actors: &mut HashMap<parser::PersistenceId, Arc<ValueActor>>,
-        variables: &mut HashMap<parser::PersistenceId, Arc<Variable>>,
-    ) {
-        for var in &obj.variables {
-            // Collect the variable itself
-            if let Some(id) = var.persistence_id() {
-                variables.insert(id, var.clone());
-            }
-            // Collect the actor inside the variable
-            if let Some(id) = var.value_actor().persistence_id() {
-                actors.insert(id, var.value_actor().clone());
-            }
-        }
-    }
-
-    pub fn get_actor(&self, id: parser::PersistenceId) -> Option<Arc<ValueActor>> {
-        self.actors.get(&id).cloned()
-    }
-
-    pub fn get_variable(&self, id: parser::PersistenceId) -> Option<Arc<Variable>> {
-        self.variables.get(&id).cloned()
-    }
-}
-
 // --- ConstructContext ---
 
 #[derive(Clone)]
@@ -747,9 +697,10 @@ impl Variable {
             variable_description,
         );
         let actor_construct_info =
-            ConstructInfo::new(actor_id, persistence, "Link variable value actor")
+            ConstructInfo::new(actor_id.clone(), persistence, "Link variable value actor")
                 .complete(ConstructType::ValueActor);
         let (link_value_sender, link_value_receiver) = mpsc::unbounded();
+        zoon::println!("[LINK] Created LINK variable: {actor_id:?}");
         // UnboundedReceiver is infinite - it never terminates unless sender is dropped
         let value_actor =
             ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_value_receiver), persistence_id);
@@ -2577,6 +2528,24 @@ impl Value {
     }
 }
 
+/// Recursively checks if a JSON value contains a `_link` marker.
+/// LINK variables are event channels that shouldn't be deserialized -
+/// they need fresh channels from code evaluation.
+fn json_contains_link(json: &serde_json::Value) -> bool {
+    match json {
+        serde_json::Value::Object(obj) => {
+            // Check for direct _link marker
+            if obj.get("_link") == Some(&serde_json::Value::Bool(true)) {
+                return true;
+            }
+            // Check nested values
+            obj.values().any(json_contains_link)
+        }
+        serde_json::Value::Array(arr) => arr.iter().any(json_contains_link),
+        _ => false,
+    }
+}
+
 /// Creates a ValueActor from a JSON value.
 pub fn value_actor_from_json(
     json: &serde_json::Value,
@@ -3408,18 +3377,33 @@ impl List {
                 .await;
 
             let initial_items = if let Some(json_items) = loaded_items {
-                // Deserialize items from JSON
+                // Always prefer code_items when available - they have:
+                // 1. Fresh LINK channels (required for event flow)
+                // 2. Fresh values from proper evaluation/persistence (e.g., Math/sum)
+                // 3. Proper subscriptions to reactive data sources
+                //
+                // Only use JSON for dynamic items that don't have code equivalents
+                // (items added at runtime that weren't defined in code)
+                let code_items_len = code_items.len();
                 json_items
                     .iter()
                     .enumerate()
                     .map(|(i, json)| {
-                        value_actor_from_json(
-                            json,
-                            actor_id_for_load.with_child_id(format!("loaded_item_{i}")),
-                            construct_context_for_load.clone(),
-                            Ulid::new(),
-                            actor_context_for_load.clone(),
-                        )
+                        if i < code_items_len {
+                            // Use code item - it has fresh values from proper evaluation
+                            zoon::println!("[LIST] Item {i} using code_item (preferred)");
+                            code_items[i].clone()
+                        } else {
+                            // Dynamic item not in code - load from JSON
+                            zoon::println!("[LIST] Item {i} loading from JSON (no code_item)");
+                            value_actor_from_json(
+                                json,
+                                actor_id_for_load.with_child_id(format!("loaded_item_{i}")),
+                                construct_context_for_load.clone(),
+                                Ulid::new(),
+                                actor_context_for_load.clone(),
+                            )
+                        }
                     })
                     .collect()
             } else {

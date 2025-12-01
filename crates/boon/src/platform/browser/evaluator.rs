@@ -12,7 +12,7 @@ use zoon::futures_util::stream;
 use zoon::{Stream, StreamExt, println, eprintln};
 
 use super::super::super::parser::{
-    PersistenceId, PersistenceStatus, SourceCode, Span, static_expression, lexer, parser, resolve_references, Token, Spanned,
+    PersistenceId, SourceCode, Span, static_expression, lexer, parser, resolve_references, Token, Spanned,
 };
 use super::api;
 use super::engine::*;
@@ -227,7 +227,6 @@ pub fn evaluate(
         virtual_fs,
         function_registry,
         module_loader,
-        None, // No previous evaluation for simple entry point
     )?;
     Ok((obj, ctx))
 }
@@ -241,12 +240,7 @@ pub fn evaluate_with_registry(
     virtual_fs: VirtualFilesystem,
     function_registry: StaticFunctionRegistry,
     module_loader: ModuleLoader,
-    previous_evaluation: Option<Arc<Object>>,
 ) -> Result<(Arc<Object>, ConstructContext, StaticFunctionRegistry, ModuleLoader), String> {
-    // NOTE: previous_actors is kept separate from ConstructContext intentionally.
-    // It should NOT be in ConstructContext because it would leak into stream closures.
-    // For now, actor reuse is disabled until we implement a proper actor registry.
-    let _previous_actors = PreviousActors::from_object(previous_evaluation.as_ref());
     let construct_context = ConstructContext {
         construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
         virtual_fs,
@@ -1469,7 +1463,9 @@ fn static_spanned_expression_into_value_actor(
 
                     // Subscribe to the piped stream and for each value, evaluate the body
                     let body_for_closure = body;
+                    println!("[THEN] Subscribing to piped input at {span_for_then}");
                     let mapped_stream = piped.clone().subscribe().filter_map(move |value| {
+                        println!("[THEN] Received value from piped input at {span_for_then}");
                         let actor_context_clone = actor_context_for_then.clone();
                         let construct_context_clone = construct_context_for_then.clone();
                         let reference_connector_clone = reference_connector_for_then.clone();

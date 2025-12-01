@@ -8,9 +8,8 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use boon::platform::browser::{
-    bridge::object_with_document_to_element_signal, engine::{Object, VirtualFilesystem}, interpreter,
+    bridge::object_with_document_to_element_signal, engine::VirtualFilesystem, interpreter,
 };
-use std::sync::Arc;
 
 mod code_editor;
 use code_editor::CodeEditor;
@@ -97,8 +96,6 @@ struct Playground {
     panel_split_ratio: Mutable<f64>,
     panel_container_width: Mutable<u32>,
     is_dragging_panel_split: Mutable<bool>,
-    /// Previous evaluation result for actor reuse on hot-reload
-    previous_evaluation: Mutable<Option<Arc<Object>>>,
     _store_files_task: Rc<TaskHandle>,
     _store_current_file_task: Rc<TaskHandle>,
     _store_panel_split_task: Rc<TaskHandle>,
@@ -204,7 +201,6 @@ impl Playground {
             panel_split_ratio,
             panel_container_width: Mutable::new(0),
             is_dragging_panel_split: Mutable::new(false),
-            previous_evaluation: Mutable::new(None),
             _store_files_task,
             _store_current_file_task,
             _store_panel_split_task,
@@ -1034,13 +1030,10 @@ impl Playground {
                 let files = self.files.clone();
                 let current_file = self.current_file.clone();
                 let source_code = self.source_code.clone();
-                let previous_evaluation = self.previous_evaluation.clone();
                 move || {
                     // Switch to this file
                     let files_ref = files.lock_ref();
                     if let Some(content) = files_ref.get(&filename_for_click) {
-                        // Clear previous evaluation to drop old actors when switching files
-                        previous_evaluation.set(None);
                         source_code.set(Rc::new(Cow::from(content.clone())));
                         current_file.set(filename_for_click.clone());
                     }
@@ -1070,7 +1063,6 @@ impl Playground {
                 let files = self.files.clone();
                 let current_file = self.current_file.clone();
                 let source_code = self.source_code.clone();
-                let previous_evaluation = self.previous_evaluation.clone();
                 move || {
                     // Find a unique filename
                     let files_ref = files.lock_ref();
@@ -1081,9 +1073,6 @@ impl Playground {
                         counter += 1;
                     }
                     drop(files_ref);
-
-                    // Clear previous evaluation to drop old actors when creating new file
-                    previous_evaluation.set(None);
 
                     // Create new file
                     let mut new_files = (**files.lock_ref()).clone();
@@ -1278,13 +1267,9 @@ impl Playground {
                 "boon-playground-build-span-id-pairs",
                 virtual_fs.clone(),
                 None,
-                None, // previous_evaluation - BUILD.bn doesn't need actor reuse
             );
             println!("BUILD.bn completed");
         }
-
-        // Get previous evaluation for actor reuse on hot-reload
-        let previous_eval = self.previous_evaluation.lock_ref().clone();
 
         // Run the main file (uses ModuleLoader for imports, no shared registry)
         let object_and_construct_context = interpreter::run_with_registry(
@@ -1295,12 +1280,9 @@ impl Playground {
             OLD_SPAN_ID_PAIRS_STORAGE_KEY,
             virtual_fs,
             None,
-            previous_eval, // Pass previous evaluation for actor reuse on hot-reload
         ).map(|(obj, ctx, _, _)| (obj, ctx));
         drop(source_code);
         if let Some((object, construct_context)) = object_and_construct_context {
-            // Store this evaluation for next hot-reload
-            self.previous_evaluation.set(Some(object.clone()));
             El::new()
                 .child_signal(object_with_document_to_element_signal(
                     object.clone(),
@@ -1360,10 +1342,7 @@ impl Playground {
                 let current_file = self.current_file.clone();
                 let source_code = self.source_code.clone();
                 let run_command = self.run_command.clone();
-                let previous_evaluation = self.previous_evaluation.clone();
                 move || {
-                    // Clear previous evaluation to drop old actors when switching examples
-                    previous_evaluation.set(None);
                     // Replace project files with just this example
                     let mut new_files = BTreeMap::new();
                     new_files.insert(

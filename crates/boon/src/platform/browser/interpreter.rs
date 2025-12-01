@@ -161,7 +161,6 @@ pub fn run_with_registry(
     old_span_id_pairs_local_storage_key: impl Into<Cow<'static, str>>,
     virtual_fs: VirtualFilesystem,
     function_registry: Option<StaticFunctionRegistry>,
-    previous_evaluation: Option<Arc<Object>>,
 ) -> Option<(Arc<Object>, ConstructContext, StaticFunctionRegistry, ModuleLoader)> {
     let states_local_storage_key = states_local_storage_key.into();
     let old_code_local_storage_key = old_code_local_storage_key.into();
@@ -247,7 +246,6 @@ pub fn run_with_registry(
         virtual_fs,
         registry,
         module_loader,
-        previous_evaluation,
     ) {
         Ok(result) => Some(result),
         Err(error) => {
