@@ -1779,24 +1779,21 @@ fn static_spanned_expression_into_value_actor(
             }
         }
         static_expression::Expression::Hold { state_param, body } => {
-            // HOLD: `initial |> HOLD state_param { body }`
-            // The piped value is the initial state.
+            // HOLD: `input |> HOLD state_param { body }`
+            // The piped value sets/resets the state (not just initial - any emission).
             // The body can reference `state_param` to get the current state.
             // The body expression's result becomes the new state value.
             // CRITICAL: The state is NOT self-reactive - changes to state don't
             // trigger re-evaluation of body. Only external events trigger updates.
             //
-            // Example:
+            // Example with reset:
             // ```boon
-            // counter: 0 |> HOLD count {
-            //     LATEST {
-            //         increment |> THEN { count + 1 }
-            //         decrement |> THEN { count - 1 }
-            //     }
+            // counter: LATEST { 0, reset } |> HOLD counter {
+            //     increment |> THEN { counter + 1 }
             // }
             // ```
-            // Here, `count` is bound to the current state value. When `increment`
-            // fires, `count + 1` is computed using current state, result becomes new state.
+            // Here, `counter` starts at 0. When `increment` fires, `counter + 1`
+            // becomes new state. When `reset` emits, state resets to that value.
 
             let initial_actor = actor_context.piped.clone()
                 .ok_or("HOLD requires a piped initial value")?;
@@ -1875,10 +1872,10 @@ fn static_spanned_expression_into_value_actor(
                 initial
             });
 
-            // Combine: first emit initial, then emit body updates
-            // Use select to merge both streams - initial will emit once, body emits on events
+            // Combine: input stream sets/resets state, body updates state
+            // Use select to merge both streams - any emission from input resets state
             let combined_stream = stream::select(
-                initial_stream.take(1), // Only take initial value once
+                initial_stream, // Any emission from input resets the state
                 state_update_stream
             );
 
