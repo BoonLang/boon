@@ -14,7 +14,7 @@ pub struct Persistence {
     pub status: PersistenceStatus,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PersistenceStatus {
     NewOrChanged,
     Unchanged,

@@ -72,6 +72,7 @@ pub fn function_document_new(
             construct_context,
             "root_element",
             argument_root.clone(),
+            None,
         )],
     )
 }
@@ -136,6 +137,7 @@ pub fn function_element_stripe(
                         construct_context.clone(),
                         "direction",
                         argument_direction.clone(),
+                        None,
                     ),
                     Variable::new_arc(
                         ConstructInfo::new(
@@ -146,6 +148,7 @@ pub fn function_element_stripe(
                         construct_context.clone(),
                         "style",
                         argument_style.clone(),
+                        None,
                     ),
                     Variable::new_arc(
                         ConstructInfo::new(
@@ -156,9 +159,11 @@ pub fn function_element_stripe(
                         construct_context,
                         "items",
                         argument_items.clone(),
+                        None,
                     ),
                 ],
             ),
+            None,
         )],
     )
 }
@@ -215,7 +220,9 @@ pub fn function_element_button(
                         .subscribe()
                         .filter_map(|value| future::ready(value.expect_object().variable("event")))
                         .flat_map(|variable| variable.subscribe_keeping_alive())),
+                    None,
                 ),
+                None,
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -244,6 +251,7 @@ pub fn function_element_button(
                             construct_context.clone(),
                             "style",
                             argument_style.clone(),
+                            None,
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -254,9 +262,11 @@ pub fn function_element_button(
                             construct_context,
                             "label",
                             argument_label.clone(),
+                            None,
                         ),
                     ],
                 ),
+                None,
             ),
         ],
     )
@@ -303,6 +313,7 @@ pub fn function_element_text_input(
                 construct_context.clone(),
                 "element",
                 argument_element.clone(),
+                None,
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -331,6 +342,7 @@ pub fn function_element_text_input(
                             construct_context.clone(),
                             "style",
                             argument_style.clone(),
+                            None,
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -341,6 +353,7 @@ pub fn function_element_text_input(
                             construct_context.clone(),
                             "label",
                             argument_label.clone(),
+                            None,
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -351,6 +364,7 @@ pub fn function_element_text_input(
                             construct_context.clone(),
                             "text",
                             argument_text.clone(),
+                            None,
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -361,6 +375,7 @@ pub fn function_element_text_input(
                             construct_context.clone(),
                             "placeholder",
                             argument_placeholder.clone(),
+                            None,
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -371,9 +386,11 @@ pub fn function_element_text_input(
                             construct_context,
                             "focus",
                             argument_focus.clone(),
+                            None,
                         ),
                     ],
                 ),
+                None,
             ),
         ],
     )
@@ -419,6 +436,7 @@ pub fn function_element_checkbox(
                 construct_context.clone(),
                 "element",
                 argument_element.clone(),
+                None,
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -447,6 +465,7 @@ pub fn function_element_checkbox(
                             construct_context.clone(),
                             "style",
                             argument_style.clone(),
+                            None,
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -457,6 +476,7 @@ pub fn function_element_checkbox(
                             construct_context.clone(),
                             "label",
                             argument_label.clone(),
+                            None,
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -467,6 +487,7 @@ pub fn function_element_checkbox(
                             construct_context.clone(),
                             "checked",
                             argument_checked.clone(),
+                            None,
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -477,9 +498,11 @@ pub fn function_element_checkbox(
                             construct_context,
                             "icon",
                             argument_icon.clone(),
+                            None,
                         ),
                     ],
                 ),
+                None,
             ),
         ],
     )
@@ -521,6 +544,7 @@ pub fn function_element_label(
                 construct_context.clone(),
                 "element",
                 argument_element.clone(),
+                None,
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -549,6 +573,7 @@ pub fn function_element_label(
                             construct_context.clone(),
                             "style",
                             argument_style.clone(),
+                            None,
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -559,9 +584,11 @@ pub fn function_element_label(
                             construct_context,
                             "label",
                             argument_label.clone(),
+                            None,
                         ),
                     ],
                 ),
+                None,
             ),
         ],
     )
@@ -603,6 +630,7 @@ pub fn function_element_paragraph(
                 construct_context.clone(),
                 "element",
                 argument_element.clone(),
+                None,
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -631,6 +659,7 @@ pub fn function_element_paragraph(
                             construct_context.clone(),
                             "style",
                             argument_style.clone(),
+                            None,
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -641,9 +670,11 @@ pub fn function_element_paragraph(
                             construct_context,
                             "contents",
                             argument_contents.clone(),
+                            None,
                         ),
                     ],
                 ),
+                None,
             ),
         ],
     )
@@ -689,6 +720,7 @@ pub fn function_element_link(
                 construct_context.clone(),
                 "element",
                 argument_element.clone(),
+                None,
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -717,6 +749,7 @@ pub fn function_element_link(
                             construct_context.clone(),
                             "style",
                             argument_style.clone(),
+                            None,
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -727,6 +760,7 @@ pub fn function_element_link(
                             construct_context.clone(),
                             "label",
                             argument_label.clone(),
+                            None,
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -737,6 +771,7 @@ pub fn function_element_link(
                             construct_context.clone(),
                             "to",
                             argument_to.clone(),
+                            None,
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -747,9 +782,11 @@ pub fn function_element_link(
                             construct_context,
                             "new_tab",
                             argument_new_tab.clone(),
+                            None,
                         ),
                     ],
                 ),
+                None,
             ),
         ],
     )
@@ -1246,6 +1283,7 @@ pub fn function_list_append(
                 ),
                 actor_context_for_append.clone(),
                 constant(value),
+                None,
             );
             ListChange::Push { item: new_item_actor }
         });
@@ -1559,6 +1597,7 @@ pub fn function_scene_new(
             construct_context,
             "root_element",
             argument_root.clone(),
+            None,
         )],
     )
 }

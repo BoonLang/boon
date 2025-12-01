@@ -260,7 +260,9 @@ fn element_text_input(
                                             ValueIdempotencyKey::new(),
                                             text,
                                         ))).chain(stream::pending())),
+                                        None,
                                     ),
+                                    None,
                                 )],
                             );
                             let _ = sender.unbounded_send(event_value);
@@ -286,7 +288,9 @@ fn element_text_input(
                                             ValueIdempotencyKey::new(),
                                             key,
                                         ))).chain(stream::pending())),
+                                        None,
                                     ),
+                                    None,
                                 )],
                             );
                             let _ = sender.unbounded_send(event_value);

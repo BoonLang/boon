@@ -2,13 +2,16 @@
 #![allow(dead_code)]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::{pin, Pin};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
+
+use arc_swap::ArcSwap;
 
 use crate::parser;
 use crate::parser::SourceCode;
@@ -140,6 +143,113 @@ pub fn constant<T>(item: T) -> TypedStream<impl Stream<Item = T>, Infinite> {
     TypedStream::infinite(stream::once(future::ready(item)).chain(stream::once(future::pending())))
 }
 
+// --- SubscriberId ---
+
+/// Unique identifier for a subscription.
+/// Generated atomically to ensure uniqueness within a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubscriberId(u64);
+
+impl SubscriberId {
+    /// Generate a new unique subscriber ID.
+    pub fn new() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        Self(COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for SubscriberId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// --- ActorMessage ---
+
+/// Messages that can be sent to a ValueActor.
+/// All actor communication happens via these typed messages.
+pub enum ActorMessage {
+    // === Subscription Management ===
+    /// Request to subscribe to this actor's values
+    Subscribe {
+        subscriber_id: SubscriberId,
+        /// Channel to send values to the subscriber
+        value_sender: mpsc::UnboundedSender<Value>,
+    },
+    /// Request to unsubscribe from this actor
+    Unsubscribe {
+        subscriber_id: SubscriberId,
+    },
+
+    // === Value Updates ===
+    /// New value from the input stream (used during migration forwarding)
+    StreamValue(Value),
+
+    // === Migration Protocol (Phase 3) ===
+    /// Request to migrate state to a new actor
+    MigrateTo {
+        target: Arc<ValueActor>,
+        /// Optional transform to apply to values during migration
+        transform: Option<Box<dyn Fn(Value) -> Value + Send>>,
+    },
+    /// Batch of migrated data (for streaming large datasets)
+    MigrationBatch {
+        batch_id: u64,
+        items: Vec<Value>,
+        is_final: bool,
+    },
+    /// Acknowledgment of batch receipt (backpressure)
+    BatchAck {
+        batch_id: u64,
+    },
+    /// Migration complete, ready to receive new subscribers
+    MigrationComplete,
+    /// Redirect all subscribers to a new actor
+    RedirectSubscribers {
+        target: Arc<ValueActor>,
+    },
+
+    // === Lifecycle ===
+    /// Graceful shutdown request
+    Shutdown,
+}
+
+// --- MigrationState ---
+
+/// State machine for actor migration.
+/// Tracks the progress of streaming state to a new actor.
+pub enum MigrationState {
+    /// Normal operation - no migration in progress
+    Normal,
+
+    /// Sending state to new actor
+    Migrating {
+        target: Arc<ValueActor>,
+        /// Optional transform to apply to values
+        transform: Option<Box<dyn Fn(Value) -> Value + Send>>,
+        /// IDs of batches that haven't been acknowledged yet
+        pending_batches: HashSet<u64>,
+        /// Values received during migration that need forwarding
+        buffered_writes: Vec<Value>,
+    },
+
+    /// Receiving state from old actor
+    Receiving {
+        source: Arc<ValueActor>,
+        /// Batches received, keyed by batch_id for ordering
+        received_batches: BTreeMap<u64, Vec<Value>>,
+    },
+
+    /// Shutting down after migration complete
+    ShuttingDown,
+}
+
+impl Default for MigrationState {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
 // --- VirtualFilesystem ---
 
 /// In-memory filesystem for WASM environment
@@ -231,12 +341,70 @@ impl VirtualFilesystem {
     }
 }
 
+// --- PreviousActors ---
+
+/// Lookup table for actors and variables from a previous evaluation.
+/// Used to reuse unchanged actors across hot-reloads.
+#[derive(Clone, Default)]
+pub struct PreviousActors {
+    actors: Arc<HashMap<parser::PersistenceId, Arc<ValueActor>>>,
+    variables: Arc<HashMap<parser::PersistenceId, Arc<Variable>>>,
+}
+
+impl PreviousActors {
+    /// Create a PreviousActors lookup from a previous evaluation result.
+    pub fn from_object(obj: Option<&Arc<Object>>) -> Self {
+        let mut actors = HashMap::new();
+        let mut variables = HashMap::new();
+        if let Some(obj) = obj {
+            Self::collect_recursive(obj, &mut actors, &mut variables);
+        }
+        Self {
+            actors: Arc::new(actors),
+            variables: Arc::new(variables),
+        }
+    }
+
+    fn collect_recursive(
+        obj: &Object,
+        actors: &mut HashMap<parser::PersistenceId, Arc<ValueActor>>,
+        variables: &mut HashMap<parser::PersistenceId, Arc<Variable>>,
+    ) {
+        for var in &obj.variables {
+            // Collect the variable itself
+            if let Some(id) = var.persistence_id() {
+                variables.insert(id, var.clone());
+            }
+            // Collect the actor inside the variable
+            if let Some(id) = var.value_actor().persistence_id() {
+                actors.insert(id, var.value_actor().clone());
+            }
+        }
+    }
+
+    pub fn get_actor(&self, id: parser::PersistenceId) -> Option<Arc<ValueActor>> {
+        self.actors.get(&id).cloned()
+    }
+
+    pub fn get_variable(&self, id: parser::PersistenceId) -> Option<Arc<Variable>> {
+        self.variables.get(&id).cloned()
+    }
+}
+
 // --- ConstructContext ---
 
 #[derive(Clone)]
 pub struct ConstructContext {
     pub construct_storage: Arc<ConstructStorage>,
     pub virtual_fs: VirtualFilesystem,
+    // NOTE: `previous_actors` was intentionally REMOVED from here.
+    // It should NOT be part of ConstructContext because:
+    // 1. It gets captured in stream closures, causing memory leaks
+    // 2. It's not scalable (can't send huge actor maps to web workers/nodes)
+    // 3. Actors should be addressable by ID via a registry, not passed around
+    //
+    // For actor reuse during hot-reload, use the evaluator's separate
+    // `previous_actors` parameter instead.
 }
 
 // --- ConstructStorage ---
@@ -518,6 +686,7 @@ impl<T: IntoCowStr<'static>> From<T> for ConstructId {
 
 pub struct Variable {
     construct_info: ConstructInfoComplete,
+    persistence_id: Option<parser::PersistenceId>,
     name: Cow<'static, str>,
     value_actor: Arc<ValueActor>,
     link_value_sender: Option<mpsc::UnboundedSender<Value>>,
@@ -529,9 +698,11 @@ impl Variable {
         construct_context: ConstructContext,
         name: impl Into<Cow<'static, str>>,
         value_actor: Arc<ValueActor>,
+        persistence_id: Option<parser::PersistenceId>,
     ) -> Self {
         Self {
             construct_info: construct_info.complete(ConstructType::Variable),
+            persistence_id,
             name: name.into(),
             value_actor,
             link_value_sender: None,
@@ -543,13 +714,19 @@ impl Variable {
         construct_context: ConstructContext,
         name: impl Into<Cow<'static, str>>,
         value_actor: Arc<ValueActor>,
+        persistence_id: Option<parser::PersistenceId>,
     ) -> Arc<Self> {
         Arc::new(Self::new(
             construct_info,
             construct_context,
             name,
             value_actor,
+            persistence_id,
         ))
+    }
+
+    pub fn persistence_id(&self) -> Option<parser::PersistenceId> {
+        self.persistence_id
     }
 
     pub fn new_link_arc(
@@ -557,6 +734,7 @@ impl Variable {
         construct_context: ConstructContext,
         name: impl Into<Cow<'static, str>>,
         actor_context: ActorContext,
+        persistence_id: Option<parser::PersistenceId>,
     ) -> Arc<Self> {
         let ConstructInfo {
             id: actor_id,
@@ -574,9 +752,10 @@ impl Variable {
         let (link_value_sender, link_value_receiver) = mpsc::unbounded();
         // UnboundedReceiver is infinite - it never terminates unless sender is dropped
         let value_actor =
-            ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_value_receiver));
+            ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_value_receiver), persistence_id);
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
+            persistence_id,
             name: name.into(),
             value_actor: Arc::new(value_actor),
             link_value_sender: Some(link_value_sender),
@@ -704,6 +883,7 @@ impl VariableOrArgumentReference {
             construct_info,
             actor_context,
             TypedStream::infinite(value_stream),
+            None,
         ))
     }
 }
@@ -932,10 +1112,14 @@ impl FunctionCall {
         );
 
         // Combined stream is infinite (subscriptions never terminate first)
-        Arc::new(ValueActor::new(
+        // Keep arguments alive as explicit dependencies
+        let inputs: Vec<Arc<ValueActor>> = arguments.iter().cloned().collect();
+        Arc::new(ValueActor::new_with_inputs(
             construct_info,
             actor_context,
             TypedStream::infinite(combined_stream),
+            None,
+            inputs,
         ))
     }
 }
@@ -1014,10 +1198,13 @@ impl LatestCombinator {
             .filter_map(future::ready);
 
         // Subscription-based streams are infinite (subscriptions never terminate first)
-        Arc::new(ValueActor::new(
+        // Pass inputs as explicit dependencies to keep them alive
+        Arc::new(ValueActor::new_with_inputs(
             construct_info,
             actor_context,
             TypedStream::infinite(value_stream),
+            None,
+            inputs,
         ))
     }
 }
@@ -1048,8 +1235,9 @@ impl ThenCombinator {
             .id;
         let storage = construct_context.construct_storage.clone();
 
+        let observed_for_subscribe = observed.clone();
         let send_impulse_task = Task::start_droppable(
-            observed
+            observed_for_subscribe
                 .subscribe()
                 .scan(true, {
                     let storage = storage.clone();
@@ -1102,15 +1290,25 @@ impl ThenCombinator {
                     }
                 }),
         );
-        let value_stream = body.subscribe().map(|mut value| {
+        let value_stream = body.clone().subscribe().map(|mut value| {
             value.set_idempotency_key(ValueIdempotencyKey::new());
             value
         });
         // Subscription-based streams are infinite (subscriptions never terminate first)
-        Arc::new(ValueActor::new(
+        // Keep both observed and body alive as explicit dependencies
+        // Also leak the impulse task handle into the stream closure to keep it alive
+        let value_stream = stream::unfold(
+            (value_stream, send_impulse_task, observed.clone()),
+            |(mut inner_stream, task, observed)| async move {
+                inner_stream.next().await.map(|value| (value, (inner_stream, task, observed)))
+            }
+        );
+        Arc::new(ValueActor::new_with_inputs(
             construct_info,
             actor_context,
             TypedStream::infinite(value_stream),
+            None,
+            vec![observed, body],
         ))
     }
 }
@@ -1139,8 +1337,8 @@ impl BinaryOperatorCombinator {
 
         // Merge both operand streams, tracking which operand changed
         let value_stream = stream::select_all([
-            operand_a.subscribe().map(|v| (0usize, v)).boxed_local(),
-            operand_b.subscribe().map(|v| (1usize, v)).boxed_local(),
+            operand_a.clone().subscribe().map(|v| (0usize, v)).boxed_local(),
+            operand_b.clone().subscribe().map(|v| (1usize, v)).boxed_local(),
         ])
         .scan(
             (None::<Value>, None::<Value>),
@@ -1167,10 +1365,13 @@ impl BinaryOperatorCombinator {
         });
 
         // Subscription-based streams are infinite (subscriptions never terminate first)
-        Arc::new(ValueActor::new(
+        // Keep both operands alive as explicit dependencies
+        Arc::new(ValueActor::new_with_inputs(
             construct_info,
             actor_context,
             TypedStream::infinite(value_stream),
+            None,
+            vec![operand_a, operand_b],
         ))
     }
 }
@@ -1492,10 +1693,14 @@ impl WhenCombinator {
         arms: Vec<CompiledArm>,
     ) -> Arc<ValueActor> {
         let construct_info = construct_info.complete(ConstructType::ValueActor);
+
+        // Collect all arm bodies as dependencies to keep them alive
+        let arm_bodies: Vec<Arc<ValueActor>> = arms.iter().map(|arm| arm.body.clone()).collect();
         let arms = Arc::new(arms);
 
         // For each input value, find the matching arm and emit its body's value
         let value_stream = input
+            .clone()
             .subscribe()
             .flat_map({
                 let arms = arms.clone();
@@ -1517,10 +1722,15 @@ impl WhenCombinator {
             });
 
         // Subscription-based streams are infinite (subscriptions never terminate first)
-        Arc::new(ValueActor::new(
+        // Keep input and all arm bodies alive as explicit dependencies
+        let mut inputs = vec![input];
+        inputs.extend(arm_bodies);
+        Arc::new(ValueActor::new_with_inputs(
             construct_info,
             actor_context,
             TypedStream::infinite(value_stream),
+            None,
+            inputs,
         ))
     }
 }
@@ -1579,48 +1789,87 @@ pub fn pattern_to_matcher(pattern: &crate::parser::Pattern) -> Box<dyn Fn(&Value
 
 // --- ValueActor ---
 
+/// A message-based actor that manages a reactive value stream.
+///
+/// ValueActor uses explicit message passing for all communication:
+/// - Subscriptions are managed via Subscribe/Unsubscribe messages
+/// - Values flow from the input stream to subscribers
+/// - Input actors are explicitly tracked in the `inputs` field
+///
+/// This design prevents "receiver is gone" errors by:
+/// 1. Keeping input actors alive via explicit `inputs` Vec
+/// 2. Never terminating the internal loop when input stream ends
+/// 3. Only shutting down via explicit Shutdown message
 pub struct ValueActor {
     construct_info: Arc<ConstructInfoComplete>,
+    persistence_id: Option<parser::PersistenceId>,
+
+    /// Message channel for actor communication.
+    /// All subscription management happens via messages.
+    message_sender: mpsc::UnboundedSender<ActorMessage>,
+
+    /// Explicit dependency tracking - keeps input actors alive.
+    /// This replaces the old `extra_owned_data` pattern.
+    inputs: Vec<Arc<ValueActor>>,
+
+    /// Lock-free access to current value for efficient reads.
+    current_value: Arc<ArcSwap<Option<Value>>>,
+
+    /// The actor's internal task.
     loop_task: TaskHandle,
-    value_sender_sender: mpsc::UnboundedSender<mpsc::UnboundedSender<Value>>,
 }
 
 impl ValueActor {
     /// Create a new ValueActor from a stream.
     ///
-    /// # Warning
-    /// The stream MUST be infinite (never terminate). If the stream terminates,
-    /// the actor's internal loop will exit, dropping all sender channels and causing
-    /// "receiver is gone" errors for active subscribers.
+    /// # Arguments
+    /// - `construct_info`: Metadata about this construct
+    /// - `actor_context`: Context including output valve signal
+    /// - `value_stream`: The input stream of values (should be infinite)
+    /// - `persistence_id`: Optional ID for state persistence
     ///
-    /// For compile-time safety, prefer using `constant(value)` for constant values,
-    /// which is guaranteed to be infinite.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Safe: constant() returns an infinite stream
-    /// ValueActor::new(info, context, constant(value));
-    ///
-    /// // Safe: unfold patterns are infinite by design
-    /// ValueActor::new(info, context, stream::unfold(...));
-    ///
-    /// // UNSAFE: stream::once() terminates - will cause "receiver is gone" errors!
-    /// ValueActor::new(info, context, stream::once(...)); // BUG!
-    /// ```
+    /// # Notes
+    /// The stream SHOULD be infinite for best results, but the actor will
+    /// NOT terminate when the stream ends - it continues waiting for messages.
     pub fn new<S: Stream<Item = Value> + 'static>(
         construct_info: ConstructInfoComplete,
         actor_context: ActorContext,
         value_stream: TypedStream<S, Infinite>,
+        persistence_id: Option<parser::PersistenceId>,
+    ) -> Self {
+        Self::new_with_inputs(
+            construct_info,
+            actor_context,
+            value_stream,
+            persistence_id,
+            Vec::new(),
+        )
+    }
+
+    /// Create a new ValueActor with explicit input dependencies.
+    ///
+    /// The `inputs` Vec keeps the input actors alive for the lifetime of this actor.
+    /// This is the primary mechanism for preventing "receiver is gone" errors.
+    pub fn new_with_inputs<S: Stream<Item = Value> + 'static>(
+        construct_info: ConstructInfoComplete,
+        actor_context: ActorContext,
+        value_stream: TypedStream<S, Infinite>,
+        persistence_id: Option<parser::PersistenceId>,
+        inputs: Vec<Arc<ValueActor>>,
     ) -> Self {
         let value_stream = value_stream.inner;
         let construct_info = Arc::new(construct_info);
-        let (value_sender_sender, mut value_sender_receiver) =
-            mpsc::unbounded::<mpsc::UnboundedSender<Value>>();
+        let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
+        let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(None));
+
         let loop_task = Task::start_droppable({
             let construct_info = construct_info.clone();
+            let current_value = current_value.clone();
             let output_valve_signal = actor_context.output_valve_signal;
+            // Keep inputs alive in the spawned task
+            let _inputs = inputs.clone();
+
             async move {
-                let output_valve_signal = output_valve_signal;
                 let mut output_valve_impulse_stream =
                     if let Some(output_valve_signal) = &output_valve_signal {
                         output_valve_signal.subscribe().left_stream()
@@ -1629,96 +1878,229 @@ impl ValueActor {
                     }
                     .fuse();
                 let mut value_stream = pin!(value_stream.fuse());
-                let mut value = None;
-                let mut value_senders = Vec::<mpsc::UnboundedSender<Value>>::new();
+                let mut message_receiver = pin!(message_receiver.fuse());
+                let mut subscribers: HashMap<SubscriberId, mpsc::UnboundedSender<Value>> = HashMap::new();
+                let mut migration_state = MigrationState::Normal;
+
                 loop {
                     select! {
-                        new_value = value_stream.next() => {
-                            let Some(new_value) = new_value else { break };
-                            if output_valve_signal.is_none() {
-                                value_senders.retain(|value_sender| {
-                                    if let Err(error) = value_sender.unbounded_send(new_value.clone()) {
-                                        eprintln!("Failed to send new {construct_info} value to subscriber: {error:#}");
-                                        false
+                        // Handle messages from the message channel
+                        // When message_sender is dropped (ValueActor dropped), this returns None
+                        msg = message_receiver.next() => {
+                            let Some(msg) = msg else {
+                                // Channel closed - ValueActor was dropped, exit the loop
+                                break;
+                            };
+                            match msg {
+                                ActorMessage::Subscribe { subscriber_id, value_sender } => {
+                                    // Send current value immediately if available
+                                    if let Some(value) = current_value.load().as_ref() {
+                                        if value_sender.unbounded_send(value.clone()).is_ok() {
+                                            subscribers.insert(subscriber_id, value_sender);
+                                        }
                                     } else {
-                                        true
+                                        subscribers.insert(subscriber_id, value_sender);
                                     }
-                                });
-                            }
-                            value = Some(new_value);
-                        }
-                        value_sender = value_sender_receiver.select_next_some() => {
-                            if output_valve_signal.is_none() {
-                                if let Some(value) = value.as_ref() {
-                                    if let Err(error) = value_sender.unbounded_send(value.clone()) {
-                                        eprintln!("Failed to send {construct_info} value to subscriber: {error:#}");
-                                    } else {
-                                        value_senders.push(value_sender);
-                                    }
-                                } else {
-                                    value_senders.push(value_sender);
                                 }
-                            } else {
-                                value_senders.push(value_sender);
+                                ActorMessage::Unsubscribe { subscriber_id } => {
+                                    subscribers.remove(&subscriber_id);
+                                }
+                                ActorMessage::StreamValue(value) => {
+                                    // Value received from migration source - treat as new value
+                                    current_value.store(Arc::new(Some(value.clone())));
+                                    if output_valve_signal.is_none() {
+                                        Self::broadcast_to_subscribers(&mut subscribers, &value, &construct_info);
+                                    }
+                                }
+                                ActorMessage::MigrateTo { target, transform } => {
+                                    // Phase 3: Migration - not implemented yet
+                                    migration_state = MigrationState::Migrating {
+                                        target,
+                                        transform,
+                                        pending_batches: HashSet::new(),
+                                        buffered_writes: Vec::new(),
+                                    };
+                                }
+                                ActorMessage::MigrationBatch { batch_id, items, is_final: _ } => {
+                                    // Phase 3: Receiving migration data
+                                    if let MigrationState::Receiving { received_batches, source: _ } = &mut migration_state {
+                                        received_batches.insert(batch_id, items);
+                                        // TODO: Send BatchAck, rebuild state when complete
+                                    }
+                                }
+                                ActorMessage::BatchAck { batch_id } => {
+                                    // Phase 3: Batch acknowledged
+                                    if let MigrationState::Migrating { pending_batches, .. } = &mut migration_state {
+                                        pending_batches.remove(&batch_id);
+                                    }
+                                }
+                                ActorMessage::MigrationComplete => {
+                                    // Phase 3: Migration complete
+                                    migration_state = MigrationState::Normal;
+                                }
+                                ActorMessage::RedirectSubscribers { target } => {
+                                    // Phase 3: Redirect all subscribers to new actor
+                                    for (id, sender) in subscribers.drain() {
+                                        let _ = target.send_message(ActorMessage::Subscribe {
+                                            subscriber_id: id,
+                                            value_sender: sender,
+                                        });
+                                    }
+                                    migration_state = MigrationState::ShuttingDown;
+                                }
+                                ActorMessage::Shutdown => {
+                                    break;
+                                }
                             }
                         }
+
+                        // Handle values from the input stream
+                        new_value = value_stream.next() => {
+                            // Stream ended - but we DON'T break!
+                            // Actors stay alive until explicit Shutdown.
+                            // This prevents "receiver is gone" errors.
+                            let Some(new_value) = new_value else {
+                                // Stream ended, but we continue listening for messages
+                                // This is the key difference from the old implementation
+                                continue;
+                            };
+
+                            current_value.store(Arc::new(Some(new_value.clone())));
+
+                            match &mut migration_state {
+                                MigrationState::Normal => {
+                                    if output_valve_signal.is_none() {
+                                        Self::broadcast_to_subscribers(&mut subscribers, &new_value, &construct_info);
+                                    }
+                                }
+                                MigrationState::Migrating { buffered_writes, target, .. } => {
+                                    // Double-write: local + forward to target
+                                    if output_valve_signal.is_none() {
+                                        Self::broadcast_to_subscribers(&mut subscribers, &new_value, &construct_info);
+                                    }
+                                    buffered_writes.push(new_value.clone());
+                                    let _ = target.send_message(ActorMessage::StreamValue(new_value));
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        // Handle output valve impulses
                         impulse = output_valve_impulse_stream.next() => {
                             if impulse.is_none() {
-                                break
+                                // Valve closed - but we DON'T break!
+                                continue;
                             }
-                            if let Some(value) = value.as_ref() {
-                                value_senders.retain(|value_sender| {
-                                    if let Err(error) = value_sender.unbounded_send(value.clone()) {
-                                        eprintln!("Failed to send {construct_info} value to subscriber on impulse: {error:#}");
-                                        false
-                                    } else {
-                                        true
-                                    }
-                                });
+                            if let Some(value) = current_value.load().as_ref() {
+                                Self::broadcast_to_subscribers(&mut subscribers, value, &construct_info);
                             }
                         }
                     }
                 }
+
+                // Explicit cleanup - inputs dropped when task ends
+                drop(_inputs);
+
                 if LOG_DROPS_AND_LOOP_ENDS {
                     println!("Loop ended {construct_info}");
                 }
             }
         });
+
         Self {
             construct_info,
+            persistence_id,
+            message_sender,
+            inputs,
+            current_value,
             loop_task,
-            value_sender_sender,
         }
+    }
+
+    /// Helper to broadcast a value to all subscribers, removing dead channels.
+    fn broadcast_to_subscribers(
+        subscribers: &mut HashMap<SubscriberId, mpsc::UnboundedSender<Value>>,
+        value: &Value,
+        construct_info: &ConstructInfoComplete,
+    ) {
+        subscribers.retain(|_, sender| {
+            if let Err(error) = sender.unbounded_send(value.clone()) {
+                eprintln!("Failed to send {construct_info} value to subscriber: {error:#}");
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Send a message to this actor.
+    pub fn send_message(&self, msg: ActorMessage) -> Result<(), mpsc::TrySendError<ActorMessage>> {
+        self.message_sender.unbounded_send(msg)
     }
 
     pub fn new_arc<S: Stream<Item = Value> + 'static>(
         construct_info: ConstructInfo,
         actor_context: ActorContext,
         value_stream: TypedStream<S, Infinite>,
+        persistence_id: Option<parser::PersistenceId>,
     ) -> Arc<Self> {
         Arc::new(Self::new(
             construct_info.complete(ConstructType::ValueActor),
             actor_context,
             value_stream,
+            persistence_id,
         ))
+    }
+
+    /// Create a new Arc<ValueActor> with explicit input dependencies.
+    pub fn new_arc_with_inputs<S: Stream<Item = Value> + 'static>(
+        construct_info: ConstructInfo,
+        actor_context: ActorContext,
+        value_stream: TypedStream<S, Infinite>,
+        persistence_id: Option<parser::PersistenceId>,
+        inputs: Vec<Arc<ValueActor>>,
+    ) -> Arc<Self> {
+        Arc::new(Self::new_with_inputs(
+            construct_info.complete(ConstructType::ValueActor),
+            actor_context,
+            value_stream,
+            persistence_id,
+            inputs,
+        ))
+    }
+
+    pub fn persistence_id(&self) -> Option<parser::PersistenceId> {
+        self.persistence_id
+    }
+
+    /// Get the current value without subscribing.
+    /// This is a lock-free read operation.
+    pub fn current_value(&self) -> Option<Value> {
+        self.current_value.load().as_ref().clone()
     }
 
     /// Subscribe to this actor's values.
     ///
     /// The returned `Subscription` stream keeps the actor alive for the
-    /// duration of the subscription. When the stream is dropped, the
-    /// actor reference is released.
+    /// duration of the subscription. When the subscription is dropped,
+    /// an Unsubscribe message is sent to the actor.
     pub fn subscribe(self: Arc<Self>) -> Subscription {
+        let subscriber_id = SubscriberId::new();
         let (value_sender, value_receiver) = mpsc::unbounded();
-        if let Err(error) = self.value_sender_sender.unbounded_send(value_sender) {
+
+        if let Err(error) = self.send_message(ActorMessage::Subscribe {
+            subscriber_id,
+            value_sender,
+        }) {
             eprintln!("Failed to subscribe to {}: {error:#}", self.construct_info);
         }
+
         Subscription {
+            subscriber_id,
             receiver: value_receiver,
-            _actor: self,
+            actor: self,
         }
     }
-
 }
 
 impl Drop for ValueActor {
@@ -1732,11 +2114,13 @@ impl Drop for ValueActor {
 // --- Subscription ---
 
 /// A subscription stream that keeps its source ValueActor alive.
-/// The `_actor` field holds an `Arc<ValueActor>` reference that is automatically
-/// dropped when the subscription stream is dropped, ensuring proper lifecycle management.
+///
+/// When dropped, automatically sends an Unsubscribe message to the actor
+/// to clean up the subscriber entry.
 pub struct Subscription {
+    subscriber_id: SubscriberId,
     receiver: mpsc::UnboundedReceiver<Value>,
-    _actor: Arc<ValueActor>,
+    actor: Arc<ValueActor>,
 }
 
 impl Stream for Subscription {
@@ -1744,6 +2128,15 @@ impl Stream for Subscription {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.receiver).poll_next(cx)
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        // Send unsubscribe message - ignore errors since actor might be gone
+        let _ = self.actor.send_message(ActorMessage::Unsubscribe {
+            subscriber_id: self.subscriber_id,
+        });
     }
 }
 
@@ -2053,6 +2446,7 @@ impl Value {
                                         construct_context.clone(),
                                         (*name).clone(),
                                         actor_context.clone(),
+                                        None,
                                     )
                                 } else {
                                     let value_actor = value_actor_from_json(
@@ -2067,6 +2461,7 @@ impl Value {
                                         construct_context.clone(),
                                         (*name).clone(),
                                         value_actor,
+                                        None,
                                     )
                                 }
                             })
@@ -2116,6 +2511,7 @@ impl Value {
                                     construct_context.clone(),
                                     name.clone(),
                                     actor_context.clone(),
+                                    None,
                                 )
                             } else {
                                 let value_actor = value_actor_from_json(
@@ -2130,6 +2526,7 @@ impl Value {
                                     construct_context.clone(),
                                     name.clone(),
                                     value_actor,
+                                    None,
                                 )
                             }
                         })
@@ -2204,6 +2601,7 @@ pub fn value_actor_from_json(
         actor_construct_info,
         actor_context,
         constant(value),
+        None,
     ))
 }
 
@@ -2290,6 +2688,7 @@ impl Object {
             actor_construct_info,
             actor_context,
             value_stream,
+            None,
         ))
     }
 
@@ -2414,6 +2813,7 @@ impl TaggedObject {
             actor_construct_info,
             actor_context,
             value_stream,
+            None,
         ))
     }
 
@@ -2533,6 +2933,7 @@ impl Text {
             actor_construct_info,
             actor_context,
             value_stream,
+            None,
         ))
     }
 
@@ -2632,6 +3033,7 @@ impl Tag {
             actor_construct_info,
             actor_context,
             value_stream,
+            None,
         ))
     }
 
@@ -2731,6 +3133,7 @@ impl Number {
             actor_construct_info,
             actor_context,
             value_stream,
+            None,
         ))
     }
 
@@ -2937,6 +3340,7 @@ impl List {
             actor_construct_info,
             actor_context,
             value_stream,
+            None,
         ))
     }
 
@@ -3081,6 +3485,7 @@ impl List {
             actor_construct_info,
             actor_context,
             TypedStream::infinite(value_stream),
+            None,
         ))
     }
 }
@@ -3398,6 +3803,7 @@ impl ListBindingFunction {
                 Arc::new(list),
                 ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
             )),
+            None,
         ))
     }
 
@@ -3559,6 +3965,7 @@ impl ListBindingFunction {
                 Arc::new(list),
                 ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
             )),
+            None,
         ))
     }
 
@@ -3709,6 +4116,7 @@ impl ListBindingFunction {
             construct_info,
             actor_context_for_result,
             TypedStream::infinite(value_stream),
+            None,
         ))
     }
 
@@ -3871,6 +4279,7 @@ impl ListBindingFunction {
                 Arc::new(list),
                 ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
             )),
+            None,
         ))
     }
 

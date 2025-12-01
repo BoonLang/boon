@@ -12,7 +12,7 @@ use zoon::futures_util::stream;
 use zoon::{Stream, StreamExt, println, eprintln};
 
 use super::super::super::parser::{
-    PersistenceId, SourceCode, Span, static_expression, lexer, parser, resolve_references, Token, Spanned,
+    PersistenceId, PersistenceStatus, SourceCode, Span, static_expression, lexer, parser, resolve_references, Token, Spanned,
 };
 use super::api;
 use super::engine::*;
@@ -227,6 +227,7 @@ pub fn evaluate(
         virtual_fs,
         function_registry,
         module_loader,
+        None, // No previous evaluation for simple entry point
     )?;
     Ok((obj, ctx))
 }
@@ -240,7 +241,12 @@ pub fn evaluate_with_registry(
     virtual_fs: VirtualFilesystem,
     function_registry: StaticFunctionRegistry,
     module_loader: ModuleLoader,
+    previous_evaluation: Option<Arc<Object>>,
 ) -> Result<(Arc<Object>, ConstructContext, StaticFunctionRegistry, ModuleLoader), String> {
+    // NOTE: previous_actors is kept separate from ConstructContext intentionally.
+    // It should NOT be in ConstructContext because it would leak into stream closures.
+    // For now, actor reuse is disabled until we implement a proper actor registry.
+    let _previous_actors = PreviousActors::from_object(previous_evaluation.as_ref());
     let construct_context = ConstructContext {
         construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
         virtual_fs,
@@ -346,7 +352,7 @@ fn static_spanned_variable_into_variable(
     let is_link = matches!(&value.node, static_expression::Expression::Link);
 
     let variable = if is_link {
-        Variable::new_link_arc(construct_info, construct_context, name_string, actor_context)
+        Variable::new_link_arc(construct_info, construct_context, name_string, actor_context, Some(persistence_id))
     } else {
         Variable::new_arc(
             construct_info,
@@ -362,6 +368,7 @@ fn static_spanned_variable_into_variable(
                 module_loader,
                 source_code,
             )?,
+            Some(persistence_id),
         )
     };
     if is_referenced {
@@ -421,8 +428,25 @@ fn static_spanned_expression_into_value_actor(
         persistence,
     } = expression;
 
-    let persistence_id = persistence.clone().ok_or("Failed to get Persistence")?.id;
+    let persistence_info = persistence.clone().ok_or("Failed to get Persistence")?;
+    let persistence_id = persistence_info.id;
     let idempotency_key = persistence_id;
+
+    // NOTE: Actor reuse is disabled because it creates broken subscription graphs.
+    // Reused actors keep OLD subscriptions to OLD actors, which fail when other
+    // parts of the graph are recreated. The proper solution is STATE persistence
+    // (saving/restoring values to localStorage), not actor instance reuse.
+    //
+    // TODO: Implement proper state persistence for stateful constructs like:
+    // - LATEST with state (the accumulated value)
+    // - Math/sum (the running total)
+    // - User-defined stateful functions
+    //
+    // if persistence_info.status == PersistenceStatus::Unchanged {
+    //     if let Some(existing_actor) = construct_context.previous_actors.get_actor(persistence_id) {
+    //         return Ok(existing_actor);
+    //     }
+    // }
 
     let actor = match expression {
         static_expression::Expression::Variable(_) => {
@@ -1195,6 +1219,7 @@ fn static_spanned_expression_into_value_actor(
                 construct_info,
                 actor_context,
                 TypedStream::infinite(stream::empty()),
+                Some(persistence_id),
             )
         }
         // Object expressions - [key: value, ...]
@@ -1216,6 +1241,7 @@ fn static_spanned_expression_into_value_actor(
                             construct_context.clone(),
                             var_name,
                             actor_context.clone(),
+                            None,
                         )
                     } else {
                         let value_actor = static_spanned_expression_into_value_actor(
@@ -1237,6 +1263,7 @@ fn static_spanned_expression_into_value_actor(
                             construct_context.clone(),
                             var_name,
                             value_actor,
+                            None,
                         )
                     };
 
@@ -1282,6 +1309,7 @@ fn static_spanned_expression_into_value_actor(
                             construct_context.clone(),
                             var_name,
                             actor_context.clone(),
+                            None,
                         )
                     } else {
                         let value_actor = static_spanned_expression_into_value_actor(
@@ -1303,6 +1331,7 @@ fn static_spanned_expression_into_value_actor(
                             construct_context.clone(),
                             var_name,
                             value_actor,
+                            None,
                         )
                     };
 
@@ -1374,6 +1403,7 @@ fn static_spanned_expression_into_value_actor(
                         ),
                         actor_context,
                         TypedStream::infinite(sending_stream),
+                        Some(persistence_id),
                     )
                 }
                 None => {
@@ -1418,6 +1448,7 @@ fn static_spanned_expression_into_value_actor(
                 ),
                 actor_context,
                 TypedStream::infinite(merged_stream),
+                Some(persistence_id),
             )
         }
         static_expression::Expression::Then { body } => {
@@ -1461,6 +1492,7 @@ fn static_spanned_expression_into_value_actor(
                                 ),
                                 actor_context_clone.clone(),
                                 constant(value),
+                                None,
                             );
 
                             // Evaluate the body with PASSED set to this value
@@ -1522,6 +1554,7 @@ fn static_spanned_expression_into_value_actor(
                         ),
                         actor_context,
                         TypedStream::infinite(flattened_stream),
+                        Some(persistence_id),
                     )
                 }
                 None => {
@@ -1631,6 +1664,7 @@ fn static_spanned_expression_into_value_actor(
                         ),
                         actor_context,
                         TypedStream::infinite(flattened_stream),
+                        Some(persistence_id),
                     )
                 }
                 None => {
@@ -1742,6 +1776,7 @@ fn static_spanned_expression_into_value_actor(
                         ),
                         actor_context,
                         TypedStream::infinite(flattened_stream),
+                        Some(persistence_id),
                     )
                 }
                 None => {
@@ -1797,6 +1832,7 @@ fn static_spanned_expression_into_value_actor(
                 ),
                 actor_context.clone(),
                 TypedStream::infinite(state_receiver),
+                None,
             );
 
             // Bind the state parameter in the context so body can reference it
@@ -1858,6 +1894,7 @@ fn static_spanned_expression_into_value_actor(
                 ),
                 actor_context,
                 TypedStream::infinite(combined_stream),
+                Some(persistence_id),
             )
         }
         static_expression::Expression::Flush { value } => {
@@ -1895,6 +1932,7 @@ fn static_spanned_expression_into_value_actor(
                 ),
                 actor_context,
                 TypedStream::infinite(flushed_stream),
+                Some(persistence_id),
             )
         }
         static_expression::Expression::Pulses { count } => {
@@ -1949,6 +1987,7 @@ fn static_spanned_expression_into_value_actor(
                 ),
                 actor_context,
                 TypedStream::infinite(pulses_stream),
+                Some(persistence_id),
             )
         }
         static_expression::Expression::Spread { value } => {
@@ -2174,6 +2213,7 @@ fn static_spanned_expression_into_value_actor(
                     ),
                     actor_context,
                     TypedStream::infinite(flattened),
+                    Some(persistence_id),
                 )
             }
         }
@@ -2381,6 +2421,7 @@ fn match_pattern(
                 ),
                 actor_context.clone(),
                 constant(value.clone()),
+                None,
             );
             bindings.insert(name_string, value_actor);
             Some(bindings)
