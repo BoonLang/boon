@@ -31,10 +31,7 @@ pub fn object_with_document_to_element_signal(
 fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElOrText {
     match value {
         Value::Text(text, _) => zoon::Text::new(text.text()).unify(),
-        Value::Number(number, _) => {
-            zoon::println!("[Bridge] value_to_element: Number = {}", number.number());
-            zoon::Text::new(number.number()).unify()
-        }
+        Value::Number(number, _) => zoon::Text::new(number.number()).unify(),
         Value::Tag(tag, _) => {
             // Handle special tags like NoElement
             match tag.tag() {
@@ -111,8 +108,6 @@ fn element_button(
 ) -> impl Element {
     type PressEvent = ();
 
-    zoon::println!("[Bridge] element_button called");
-
     let (press_event_sender, mut press_event_receiver) = mpsc::unbounded::<PressEvent>();
 
     let event_stream =
@@ -132,16 +127,13 @@ fn element_button(
                 select! {
                     new_press_link_value_sender = press_stream.next() => {
                         if let Some(new_press_link_value_sender) = new_press_link_value_sender {
-                            zoon::println!("[Bridge] Got press_link_value_sender");
                             press_link_value_sender = Some(new_press_link_value_sender);
                         } else {
-                            zoon::println!("[Bridge] press_stream ended");
                             break
                         }
                     }
                     press_event = press_event_receiver.select_next_some() => {
                         if let Some(press_link_value_sender) = press_link_value_sender.as_ref() {
-                            zoon::println!("[Bridge] Sending press event v.{press_event_object_value_version}");
                             let press_event_object_value = Object::new_value(
                                 ConstructInfo::new(format!("bridge::element_button::press_event, version: {press_event_object_value_version}"), None, "Button press event"),
                                 construct_context.clone(),
@@ -152,8 +144,6 @@ fn element_button(
                             if let Err(error) = press_link_value_sender.unbounded_send(press_event_object_value) {
                                 eprintln!("Failed to send button press event to event press link variable: {error}");
                             }
-                        } else {
-                            zoon::println!("[Bridge] Click received but no press_link_value_sender yet!");
                         }
                     }
                 }
@@ -166,10 +156,7 @@ fn element_button(
     let label_stream = settings_variable
         .subscribe()
         .flat_map(|value| value.expect_object().expect_variable("label").subscribe())
-        .map(move |value| {
-            zoon::println!("[Bridge] Button label received: {}", value.construct_info());
-            value_to_element(value, construct_context.clone())
-        });
+        .map(move |value| value_to_element(value, construct_context.clone()));
 
     Button::new()
         .label_signal(signal::from_stream(label_stream).map(|label| {

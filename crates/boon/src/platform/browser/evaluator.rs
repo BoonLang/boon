@@ -1463,9 +1463,7 @@ fn static_spanned_expression_into_value_actor(
 
                     // Subscribe to the piped stream and for each value, evaluate the body
                     let body_for_closure = body;
-                    println!("[THEN] Subscribing to piped input at {span_for_then}");
                     let mapped_stream = piped.clone().subscribe().filter_map(move |value| {
-                        println!("[THEN] Received value from piped input at {span_for_then}");
                         let actor_context_clone = actor_context_for_then.clone();
                         let construct_context_clone = construct_context_for_then.clone();
                         let reference_connector_clone = reference_connector_for_then.clone();

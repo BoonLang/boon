@@ -700,7 +700,6 @@ impl Variable {
             ConstructInfo::new(actor_id.clone(), persistence, "Link variable value actor")
                 .complete(ConstructType::ValueActor);
         let (link_value_sender, link_value_receiver) = mpsc::unbounded();
-        zoon::println!("[LINK] Created LINK variable: {actor_id:?}");
         // UnboundedReceiver is infinite - it never terminates unless sender is dropped
         let value_actor =
             ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_value_receiver), persistence_id);
@@ -2256,15 +2255,6 @@ impl Value {
                     let value = variable.value_actor().subscribe().next().await;
                     if let Some(value) = value {
                         let json_value = Box::pin(value.to_json()).await;
-                        // Mark LINK variables so they can be restored with their channel
-                        let json_value = if variable.link_value_sender().is_some() {
-                            let mut link_wrapper = serde_json::Map::new();
-                            link_wrapper.insert("_link".to_string(), serde_json::Value::Bool(true));
-                            link_wrapper.insert("value".to_string(), json_value);
-                            serde_json::Value::Object(link_wrapper)
-                        } else {
-                            json_value
-                        };
                         obj.insert(variable.name().to_string(), json_value);
                     }
                 }
@@ -2277,15 +2267,6 @@ impl Value {
                     let value = variable.value_actor().subscribe().next().await;
                     if let Some(value) = value {
                         let json_value = Box::pin(value.to_json()).await;
-                        // Mark LINK variables so they can be restored with their channel
-                        let json_value = if variable.link_value_sender().is_some() {
-                            let mut link_wrapper = serde_json::Map::new();
-                            link_wrapper.insert("_link".to_string(), serde_json::Value::Bool(true));
-                            link_wrapper.insert("value".to_string(), json_value);
-                            serde_json::Value::Object(link_wrapper)
-                        } else {
-                            json_value
-                        };
                         obj.insert(variable.name().to_string(), json_value);
                     }
                 }
@@ -2367,54 +2348,26 @@ impl Value {
                             "TaggedObject from JSON",
                         );
                         let variables: Vec<Arc<Variable>> = other_fields.iter()
-                            .enumerate()
-                            .map(|(i, (name, value))| {
-                                // Check if this is a LINK variable (wrapped with _link marker)
-                                let (is_link, actual_value) = if let serde_json::Value::Object(wrapper) = value {
-                                    if wrapper.get("_link") == Some(&serde_json::Value::Bool(true)) {
-                                        if let Some(inner_value) = wrapper.get("value") {
-                                            (true, inner_value)
-                                        } else {
-                                            (false, *value)
-                                        }
-                                    } else {
-                                        (false, *value)
-                                    }
-                                } else {
-                                    (false, *value)
-                                };
-
+                            .map(|(name, value)| {
                                 let var_construct_info = ConstructInfo::new(
                                     construct_id.with_child_id(format!("var_{name}")),
                                     None,
-                                    if is_link { "LINK Variable from JSON" } else { "Variable from JSON" },
+                                    "Variable from JSON",
                                 );
-
-                                if is_link {
-                                    // Create LINK variable with channel
-                                    Variable::new_link_arc(
-                                        var_construct_info,
-                                        construct_context.clone(),
-                                        (*name).clone(),
-                                        actor_context.clone(),
-                                        None,
-                                    )
-                                } else {
-                                    let value_actor = value_actor_from_json(
-                                        actual_value,
-                                        construct_id.with_child_id(format!("value_{name}")),
-                                        construct_context.clone(),
-                                        Ulid::new(),
-                                        actor_context.clone(),
-                                    );
-                                    Variable::new_arc(
-                                        var_construct_info,
-                                        construct_context.clone(),
-                                        (*name).clone(),
-                                        value_actor,
-                                        None,
-                                    )
-                                }
+                                let value_actor = value_actor_from_json(
+                                    value,
+                                    construct_id.with_child_id(format!("value_{name}")),
+                                    construct_context.clone(),
+                                    Ulid::new(),
+                                    actor_context.clone(),
+                                );
+                                Variable::new_arc(
+                                    var_construct_info,
+                                    construct_context.clone(),
+                                    (*name).clone(),
+                                    value_actor,
+                                    None,
+                                )
                             })
                             .collect();
                         TaggedObject::new_value(
@@ -2434,52 +2387,25 @@ impl Value {
                     );
                     let variables: Vec<Arc<Variable>> = obj.iter()
                         .map(|(name, value)| {
-                            // Check if this is a LINK variable (wrapped with _link marker)
-                            let (is_link, actual_value) = if let serde_json::Value::Object(wrapper) = value {
-                                if wrapper.get("_link") == Some(&serde_json::Value::Bool(true)) {
-                                    if let Some(inner_value) = wrapper.get("value") {
-                                        (true, inner_value)
-                                    } else {
-                                        (false, value)
-                                    }
-                                } else {
-                                    (false, value)
-                                }
-                            } else {
-                                (false, value)
-                            };
-
                             let var_construct_info = ConstructInfo::new(
                                 construct_id.with_child_id(format!("var_{name}")),
                                 None,
-                                if is_link { "LINK Variable from JSON" } else { "Variable from JSON" },
+                                "Variable from JSON",
                             );
-
-                            if is_link {
-                                // Create LINK variable with channel
-                                Variable::new_link_arc(
-                                    var_construct_info,
-                                    construct_context.clone(),
-                                    name.clone(),
-                                    actor_context.clone(),
-                                    None,
-                                )
-                            } else {
-                                let value_actor = value_actor_from_json(
-                                    actual_value,
-                                    construct_id.with_child_id(format!("value_{name}")),
-                                    construct_context.clone(),
-                                    Ulid::new(),
-                                    actor_context.clone(),
-                                );
-                                Variable::new_arc(
-                                    var_construct_info,
-                                    construct_context.clone(),
-                                    name.clone(),
-                                    value_actor,
-                                    None,
-                                )
-                            }
+                            let value_actor = value_actor_from_json(
+                                value,
+                                construct_id.with_child_id(format!("value_{name}")),
+                                construct_context.clone(),
+                                Ulid::new(),
+                                actor_context.clone(),
+                            );
+                            Variable::new_arc(
+                                var_construct_info,
+                                construct_context.clone(),
+                                name.clone(),
+                                value_actor,
+                                None,
+                            )
                         })
                         .collect();
                     Object::new_value(construct_info, construct_context, idempotency_key, variables)
@@ -2525,24 +2451,6 @@ impl Value {
                 Tag::new_value(construct_info, construct_context, idempotency_key, "None")
             }
         }
-    }
-}
-
-/// Recursively checks if a JSON value contains a `_link` marker.
-/// LINK variables are event channels that shouldn't be deserialized -
-/// they need fresh channels from code evaluation.
-fn json_contains_link(json: &serde_json::Value) -> bool {
-    match json {
-        serde_json::Value::Object(obj) => {
-            // Check for direct _link marker
-            if obj.get("_link") == Some(&serde_json::Value::Bool(true)) {
-                return true;
-            }
-            // Check nested values
-            obj.values().any(json_contains_link)
-        }
-        serde_json::Value::Array(arr) => arr.iter().any(json_contains_link),
-        _ => false,
     }
 }
 
@@ -3377,25 +3285,15 @@ impl List {
                 .await;
 
             let initial_items = if let Some(json_items) = loaded_items {
-                // Always prefer code_items when available - they have:
-                // 1. Fresh LINK channels (required for event flow)
-                // 2. Fresh values from proper evaluation/persistence (e.g., Math/sum)
-                // 3. Proper subscriptions to reactive data sources
-                //
-                // Only use JSON for dynamic items that don't have code equivalents
-                // (items added at runtime that weren't defined in code)
+                // Use code_items for reactivity; JSON only for items beyond code_items length
                 let code_items_len = code_items.len();
                 json_items
                     .iter()
                     .enumerate()
                     .map(|(i, json)| {
                         if i < code_items_len {
-                            // Use code item - it has fresh values from proper evaluation
-                            zoon::println!("[LIST] Item {i} using code_item (preferred)");
                             code_items[i].clone()
                         } else {
-                            // Dynamic item not in code - load from JSON
-                            zoon::println!("[LIST] Item {i} loading from JSON (no code_item)");
                             value_actor_from_json(
                                 json,
                                 actor_id_for_load.with_child_id(format!("loaded_item_{i}")),

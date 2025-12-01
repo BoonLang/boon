@@ -816,14 +816,10 @@ pub fn function_math_sum(
     };
     let storage = construct_context.construct_storage.clone();
 
-    // DEBUG: Log persistence ID being used
-    zoon::println!("[Math/sum] Using PersistenceId: {function_call_persistence_id}");
-
     stream::once({
         let storage = storage.clone();
         async move {
             let loaded: Option<State> = storage.load_state(function_call_persistence_id).await;
-            zoon::println!("[Math/sum] Loaded state: {:?}", loaded);
             loaded
         }
     })
@@ -857,7 +853,6 @@ pub fn function_math_sum(
                     if skip_value {
                         Some(None)
                     } else {
-                        zoon::println!("[Math/sum] Saving state: {:?}", state);
                         storage
                             .save_state(function_call_persistence_id, &state)
                             .await;
