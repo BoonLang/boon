@@ -2272,7 +2272,8 @@ pub enum ValueUpdate {
     Current,
     /// Full current value (always for scalars, fallback for collections when gap too large)
     Snapshot(Value),
-    // Future: Diffs(Vec<Arc<ListDiff>>) for collections when gap is small
+    /// Incremental diffs for collections (more efficient when subscriber is close to current)
+    Diffs(Vec<Arc<ListDiff>>),
 }
 
 // --- Subscription ---
@@ -2336,6 +2337,69 @@ impl Stream for Subscription {
             if let Some(value) = self.actor.current_value() {
                 return Poll::Ready(Some(value));
             }
+        }
+
+        // Register waker for version change
+        self.version_receiver.notifier.wakers.borrow_mut().push(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+// --- ListDiffSubscription ---
+
+/// Version-based subscription for List that returns diffs.
+///
+/// Unlike the legacy ListSubscription which queues ListChange in unbounded channels,
+/// this pulls data on demand and returns efficient diffs.
+pub struct ListDiffSubscription {
+    list: Arc<List>,
+    last_seen_version: u64,
+    version_receiver: VersionReceiver,
+}
+
+impl ListDiffSubscription {
+    /// Wait for next update and return optimal data (diffs or snapshot).
+    pub async fn next_update(&mut self) -> ValueUpdate {
+        // Wait for version to change
+        loop {
+            let current = self.list.version();
+            if current > self.last_seen_version {
+                break;
+            }
+            // Wait for change notification
+            self.version_receiver.changed().await;
+        }
+
+        let update = self.list.get_update_since(self.last_seen_version);
+        self.last_seen_version = self.list.version();
+        update
+    }
+
+    /// Get current snapshot immediately without waiting.
+    pub fn snapshot(&self) -> Vec<(ItemId, Arc<ValueActor>)> {
+        self.list.snapshot()
+    }
+
+    /// Check if there are pending updates without consuming them.
+    pub fn has_pending(&self) -> bool {
+        self.list.version() > self.last_seen_version
+    }
+
+    /// Get the list being subscribed to.
+    pub fn list(&self) -> &Arc<List> {
+        &self.list
+    }
+}
+
+impl Stream for ListDiffSubscription {
+    type Item = ValueUpdate;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let current = self.list.version();
+        if current > self.last_seen_version {
+            let update = self.list.get_update_since(self.last_seen_version);
+            self.last_seen_version = current;
+            return Poll::Ready(Some(update));
         }
 
         // Register waker for version change
@@ -3291,6 +3355,8 @@ pub struct List {
     current_version: Arc<AtomicU64>,
     /// Version notifier for efficient change detection
     version_notifier: VersionNotifier,
+    /// Diff history for efficient incremental updates
+    diff_history: Arc<RefCell<DiffHistory>>,
 }
 
 impl List {
@@ -3322,6 +3388,10 @@ impl List {
         let current_version_for_loop = current_version.clone();
         let version_notifier_for_loop = version_notifier.clone();
 
+        // Diff history for efficient incremental updates
+        let diff_history = Arc::new(RefCell::new(DiffHistory::new(DiffHistoryConfig::default())));
+        let diff_history_for_loop = diff_history.clone();
+
         let loop_task = Task::start_droppable({
             let construct_info = construct_info.clone();
             let output_valve_signal = actor_context.output_valve_signal;
@@ -3351,6 +3421,14 @@ impl List {
                                     }
                                 });
                             }
+
+                            // Convert to diff and add to history (before modifying list)
+                            {
+                                let mut history = diff_history_for_loop.borrow_mut();
+                                let diff = change.to_diff(history.snapshot());
+                                history.add(diff);
+                            }
+
                             if let Some(list) = &mut list {
                                 change.clone().apply_to_vec(list);
                             } else {
@@ -3410,6 +3488,7 @@ impl List {
             change_sender_sender,
             current_version,
             version_notifier,
+            diff_history,
         }
     }
 
@@ -3421,6 +3500,26 @@ impl List {
     /// Get a version receiver for efficient change detection.
     pub fn version_receiver(&self) -> VersionReceiver {
         self.version_notifier.subscribe()
+    }
+
+    /// Get optimal update for subscriber at given version.
+    /// Returns diffs if subscriber is close, snapshot if too far behind.
+    pub fn get_update_since(&self, subscriber_version: u64) -> ValueUpdate {
+        self.diff_history.borrow().get_update_since(subscriber_version)
+    }
+
+    /// Get current snapshot of items with their stable IDs.
+    pub fn snapshot(&self) -> Vec<(ItemId, Arc<ValueActor>)> {
+        self.diff_history.borrow().snapshot().to_vec()
+    }
+
+    /// Subscribe to list updates with diff support.
+    pub fn subscribe_diffs(self: Arc<Self>) -> ListDiffSubscription {
+        ListDiffSubscription {
+            last_seen_version: 0,
+            version_receiver: self.version_receiver(),
+            list: self,
+        }
     }
 
     pub fn new_arc(
@@ -3831,16 +3930,21 @@ impl DiffHistory {
             return self.snapshot_update();
         }
 
-        // Future: return ValueUpdate::Diffs(diffs_needed)
-        // For now, always return snapshot since ValueUpdate doesn't have Diffs variant yet
-        self.snapshot_update()
+        // Return diffs if we have any, otherwise current
+        if diffs_needed.is_empty() {
+            ValueUpdate::Current
+        } else {
+            ValueUpdate::Diffs(diffs_needed)
+        }
     }
 
     fn snapshot_update(&self) -> ValueUpdate {
-        // Convert snapshot to Value (list of items)
-        // This is a simplified implementation - full implementation would
-        // create a proper List value from the snapshot
-        ValueUpdate::Current // Placeholder until List->Value conversion is implemented
+        // Return a Replace diff containing the full snapshot
+        let items: Vec<_> = self.current_snapshot
+            .iter()
+            .map(|(id, actor)| (*id, actor.clone()))
+            .collect();
+        ValueUpdate::Diffs(vec![Arc::new(ListDiff::Replace { items })])
     }
 
     /// Get current version.
@@ -3898,6 +4002,84 @@ impl ListChange {
             }
             Self::Clear => {
                 vec.clear();
+            }
+        }
+    }
+
+    /// Convert to ListDiff using current snapshot for index-to-ItemId translation.
+    /// Returns the diff and a new ItemId for inserted items.
+    pub fn to_diff(&self, snapshot: &[(ItemId, Arc<ValueActor>)]) -> ListDiff {
+        match self {
+            Self::Replace { items } => {
+                // Assign new ItemIds to all items
+                let items_with_ids: Vec<_> = items
+                    .iter()
+                    .map(|actor| (ItemId::new(), actor.clone()))
+                    .collect();
+                ListDiff::Replace { items: items_with_ids }
+            }
+            Self::InsertAt { index, item } => {
+                let new_id = ItemId::new();
+                let after = if *index == 0 {
+                    None
+                } else {
+                    snapshot.get(index - 1).map(|(id, _)| *id)
+                };
+                ListDiff::Insert {
+                    id: new_id,
+                    after,
+                    value: item.clone(),
+                }
+            }
+            Self::UpdateAt { index, item } => {
+                let id = snapshot.get(*index).map(|(id, _)| *id).unwrap_or_else(ItemId::new);
+                ListDiff::Update {
+                    id,
+                    value: item.clone(),
+                }
+            }
+            Self::Push { item } => {
+                let new_id = ItemId::new();
+                let after = snapshot.last().map(|(id, _)| *id);
+                ListDiff::Insert {
+                    id: new_id,
+                    after,
+                    value: item.clone(),
+                }
+            }
+            Self::RemoveAt { index } => {
+                let id = snapshot.get(*index).map(|(id, _)| *id).unwrap_or_else(ItemId::new);
+                ListDiff::Remove { id }
+            }
+            Self::Move { old_index, new_index } => {
+                // Move is Remove + Insert
+                // For simplicity, we model it as Remove followed by Insert
+                // The caller should handle this as two separate diffs if needed
+                let id = snapshot.get(*old_index).map(|(id, _)| *id).unwrap_or_else(ItemId::new);
+                let value = snapshot.get(*old_index).map(|(_, v)| v.clone()).unwrap_or_else(|| {
+                    panic!("Move operation with invalid old_index")
+                });
+                let after = if *new_index == 0 {
+                    None
+                } else {
+                    // Account for removal when calculating position
+                    let adjusted_index = if *new_index > *old_index {
+                        new_index - 1
+                    } else {
+                        *new_index - 1
+                    };
+                    snapshot.get(adjusted_index).map(|(id, _)| *id)
+                };
+                // Return as Insert with same ID (effectively a move)
+                ListDiff::Insert { id, after, value }
+            }
+            Self::Pop => {
+                let id = snapshot.last().map(|(id, _)| *id).unwrap_or_else(ItemId::new);
+                ListDiff::Remove { id }
+            }
+            Self::Clear => {
+                // Clear is a Replace with empty list
+                ListDiff::Replace { items: Vec::new() }
             }
         }
     }
