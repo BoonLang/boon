@@ -421,7 +421,34 @@ Each emission from LATEST sets state, no permit control.
 
 **Mitigation:** LATEST already deduplicates by idempotency key.
 
-### 4. ~~Subscriber Leak Risk~~ (SOLVED)
+### 4. ~~Subscription Race Condition~~ (SOLVED)
+
+**Previous problem:** Subscriber called `subscribe()` which sent sender via async channel to actor loop. But `poll_next()` could be called before the actor loop processed the registration. If a value arrived during this window, the notification was lost and the subscriber never woke up.
+
+**Solution:** Two-part fix:
+
+1. **Immediate notification on registration**: When actor loop receives a new sender, it immediately sends a notification:
+```rust
+if let Some(mut sender) = sender {
+    let _ = sender.try_send(());  // Wake subscriber to check version
+    notify_senders.push(sender);
+}
+```
+
+2. **Loop in poll_next**: When notification received, loop back to check version again:
+```rust
+Poll::Ready(Some(())) => {
+    continue;  // Loop to check version, re-register waker if no value
+}
+```
+
+**Why both parts are needed:**
+- Immediate notification ensures subscriber wakes up after registration
+- Loop ensures if value isn't ready yet, waker is re-registered for next notification
+
+**Result:** Subscriptions now reliably receive initial values and all subsequent updates.
+
+### 5. ~~Subscriber Leak Risk~~ (SOLVED)
 
 **Previous problem:** Subscribers stored in HashMap, only cleaned when send fails.
 
@@ -437,7 +464,7 @@ notify_senders.retain_mut(|sender| !sender.try_send(()).is_disconnected());
 
 **Result:** No HashMap, no shared state, pure dataflow cleanup.
 
-### 5. Backpressure Blocking Normal Functionality
+### 6. Backpressure Blocking Normal Functionality
 
 **Scenario:**
 ```boon
@@ -456,7 +483,7 @@ This is correct behavior for state consistency - we WANT both to wait because th
 
 **For truly independent operations:** Don't put them in the same HOLD.
 
-### 6. Backpressure Deadlock Risk
+### 7. Backpressure Deadlock Risk
 
 **Scenario:**
 ```boon
@@ -833,6 +860,20 @@ pub fn subscribe(self: Arc<Self>) -> Subscription {
 }
 ```
 
+**Immediate notification on registration (race condition fix):**
+
+When the actor loop receives a new subscriber sender, it immediately sends a notification:
+
+```rust
+sender = notify_sender_receiver.next() => {
+    if let Some(mut sender) = sender {
+        // Immediately notify - subscriber checks version on wake
+        let _ = sender.try_send(());
+        notify_senders.push(sender);
+    }
+}
+```
+
 **Why this design:**
 - No RefCell/Mutex for subscriber storage
 - Loop-local Vec cleaned automatically via `retain_mut`
@@ -853,39 +894,37 @@ impl Stream for Subscription {
     type Item = Value;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Check if we have a pending update (version changed)
-        let current = self.actor.version();
-        if current > self.last_seen_version {
-            self.last_seen_version = current;
-            if let Some(value) = self.actor.current_value() {
-                return Poll::Ready(Some(value));
-            }
-        }
-
-        // Wait for notification via bounded channel
-        match Pin::new(&mut self.notify_receiver).poll_next(cx) {
-            Poll::Ready(Some(())) => {
-                // Notification received - pull current value
-                let current = self.actor.version();
+        loop {
+            // Check if we have a pending update (version changed)
+            let current = self.actor.version();
+            if current > self.last_seen_version {
                 self.last_seen_version = current;
                 if let Some(value) = self.actor.current_value() {
-                    Poll::Ready(Some(value))
-                } else {
-                    Poll::Pending
+                    return Poll::Ready(Some(value));
                 }
             }
-            Poll::Ready(None) => Poll::Ready(None),  // Actor dropped
-            Poll::Pending => Poll::Pending,
+
+            // Wait for notification via bounded channel
+            match Pin::new(&mut self.notify_receiver).poll_next(cx) {
+                Poll::Ready(Some(())) => {
+                    // Got notification, loop to check version again
+                    continue;
+                }
+                Poll::Ready(None) => return Poll::Ready(None),  // Actor dropped
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }
 ```
 
-**Key differences from watch-based design:**
+**Key design elements:**
 - Uses `mpsc::Receiver<()>` instead of `watch::Receiver<u64>`
 - Returns `Value` directly instead of `ValueUpdate` enum
 - Waker registration handled by mpsc channel internals
-- No `.borrow()` or `.changed()` - just `poll_next()`
+- **Loop pattern**: When notification received, loop back to check version again
+  - This ensures waker is re-registered if no value ready yet
+  - Fixes race condition with immediate notification on registration
 
 ---
 
