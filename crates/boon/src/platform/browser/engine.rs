@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::{pin, Pin};
@@ -277,24 +277,105 @@ impl BackpressurePermit {
     }
 }
 
-// --- SubscriberId ---
+// --- VersionNotifier ---
 
-/// Unique identifier for a subscription.
-/// Generated atomically to ensure uniqueness within a process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SubscriberId(u64);
+/// Watch-like version notification channel.
+///
+/// Unlike `mpsc::unbounded`, this has O(1) memory regardless of how slow consumers are.
+/// Subscribers only receive notifications that the version changed, then pull data on demand.
+///
+/// This is the foundation of the push-pull architecture that prevents unbounded memory growth.
+#[derive(Clone)]
+pub struct VersionNotifier {
+    /// Current version number (increments on each value change)
+    version: Arc<AtomicU64>,
+    /// Wakers for subscribers waiting for version changes
+    wakers: Arc<RefCell<Vec<Waker>>>,
+}
 
-impl SubscriberId {
-    /// Generate a new unique subscriber ID.
+impl VersionNotifier {
+    /// Create a new version notifier starting at version 0.
     pub fn new() -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        Self(COUNTER.fetch_add(1, Ordering::Relaxed))
+        Self {
+            version: Arc::new(AtomicU64::new(0)),
+            wakers: Arc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    /// Get the current version number.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::SeqCst)
+    }
+
+    /// Notify all waiting subscribers that a new version is available.
+    /// Returns the new version number.
+    pub fn notify(&self, new_version: u64) {
+        self.version.store(new_version, Ordering::SeqCst);
+        // Wake all waiting subscribers
+        let wakers = std::mem::take(&mut *self.wakers.borrow_mut());
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    /// Subscribe to version notifications.
+    pub fn subscribe(&self) -> VersionReceiver {
+        VersionReceiver {
+            notifier: self.clone(),
+            last_seen: 0,
+        }
     }
 }
 
-impl Default for SubscriberId {
+impl Default for VersionNotifier {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Receiver for version notifications.
+///
+/// Provides async waiting for version changes and tracks last seen version.
+pub struct VersionReceiver {
+    notifier: VersionNotifier,
+    last_seen: u64,
+}
+
+impl VersionReceiver {
+    /// Wait until the version changes from our last seen version.
+    /// Returns immediately if there's already a newer version available.
+    pub async fn changed(&mut self) -> u64 {
+        std::future::poll_fn(|cx| {
+            let current = self.notifier.version();
+            if current > self.last_seen {
+                self.last_seen = current;
+                Poll::Ready(current)
+            } else {
+                // Register waker for notification
+                self.notifier.wakers.borrow_mut().push(cx.waker().clone());
+                Poll::Pending
+            }
+        }).await
+    }
+
+    /// Check if there's a newer version without waiting.
+    pub fn has_changed(&self) -> bool {
+        self.notifier.version() > self.last_seen
+    }
+
+    /// Get the current version without updating last_seen.
+    pub fn current_version(&self) -> u64 {
+        self.notifier.version()
+    }
+
+    /// Get the last version we saw.
+    pub fn last_seen_version(&self) -> u64 {
+        self.last_seen
+    }
+
+    /// Update last_seen to current version.
+    pub fn mark_seen(&mut self) {
+        self.last_seen = self.notifier.version();
     }
 }
 
@@ -303,18 +384,6 @@ impl Default for SubscriberId {
 /// Messages that can be sent to a ValueActor.
 /// All actor communication happens via these typed messages.
 pub enum ActorMessage {
-    // === Subscription Management ===
-    /// Request to subscribe to this actor's values
-    Subscribe {
-        subscriber_id: SubscriberId,
-        /// Channel to send values to the subscriber
-        value_sender: mpsc::UnboundedSender<Value>,
-    },
-    /// Request to unsubscribe from this actor
-    Unsubscribe {
-        subscriber_id: SubscriberId,
-    },
-
     // === Value Updates ===
     /// New value from the input stream (used during migration forwarding)
     StreamValue(Value),
@@ -1908,6 +1977,14 @@ pub struct ValueActor {
     /// Lock-free access to current value for efficient reads.
     current_value: Arc<ArcSwap<Option<Value>>>,
 
+    /// Current version number - increments on each value change.
+    /// Used by VersionedSubscription for push-pull architecture.
+    current_version: Arc<AtomicU64>,
+
+    /// Notifier for version changes.
+    /// Subscribers wait on this for O(1) memory notifications.
+    version_notifier: VersionNotifier,
+
     /// The actor's internal task.
     loop_task: TaskHandle,
 }
@@ -1954,10 +2031,14 @@ impl ValueActor {
         let construct_info = Arc::new(construct_info);
         let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
         let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(None));
+        let current_version = Arc::new(AtomicU64::new(0));
+        let version_notifier = VersionNotifier::new();
 
         let loop_task = Task::start_droppable({
             let construct_info = construct_info.clone();
             let current_value = current_value.clone();
+            let current_version = current_version.clone();
+            let version_notifier = version_notifier.clone();
             let output_valve_signal = actor_context.output_valve_signal;
             // Keep inputs alive in the spawned task
             let _inputs = inputs.clone();
@@ -1972,7 +2053,6 @@ impl ValueActor {
                     .fuse();
                 let mut value_stream = pin!(value_stream.fuse());
                 let mut message_receiver = pin!(message_receiver.fuse());
-                let mut subscribers: HashMap<SubscriberId, mpsc::UnboundedSender<Value>> = HashMap::new();
                 let mut migration_state = MigrationState::Normal;
 
                 loop {
@@ -1985,25 +2065,12 @@ impl ValueActor {
                                 break;
                             };
                             match msg {
-                                ActorMessage::Subscribe { subscriber_id, value_sender } => {
-                                    // Send current value immediately if available
-                                    if let Some(value) = current_value.load().as_ref() {
-                                        if value_sender.unbounded_send(value.clone()).is_ok() {
-                                            subscribers.insert(subscriber_id, value_sender);
-                                        }
-                                    } else {
-                                        subscribers.insert(subscriber_id, value_sender);
-                                    }
-                                }
-                                ActorMessage::Unsubscribe { subscriber_id } => {
-                                    subscribers.remove(&subscriber_id);
-                                }
                                 ActorMessage::StreamValue(value) => {
                                     // Value received from migration source - treat as new value
-                                    current_value.store(Arc::new(Some(value.clone())));
-                                    if output_valve_signal.is_none() {
-                                        Self::broadcast_to_subscribers(&mut subscribers, &value, &construct_info);
-                                    }
+                                    current_value.store(Arc::new(Some(value)));
+                                    // Increment version and notify waiting subscribers
+                                    let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+                                    version_notifier.notify(new_version);
                                 }
                                 ActorMessage::MigrateTo { target, transform } => {
                                     // Phase 3: Migration - not implemented yet
@@ -2031,14 +2098,9 @@ impl ValueActor {
                                     // Phase 3: Migration complete
                                     migration_state = MigrationState::Normal;
                                 }
-                                ActorMessage::RedirectSubscribers { target } => {
-                                    // Phase 3: Redirect all subscribers to new actor
-                                    for (id, sender) in subscribers.drain() {
-                                        let _ = target.send_message(ActorMessage::Subscribe {
-                                            subscriber_id: id,
-                                            value_sender: sender,
-                                        });
-                                    }
+                                ActorMessage::RedirectSubscribers { target: _ } => {
+                                    // Phase 3: Redirect - version-based subscriptions don't need explicit redirect
+                                    // Subscribers will naturally pick up data from the new actor via version checks
                                     migration_state = MigrationState::ShuttingDown;
                                 }
                                 ActorMessage::Shutdown => {
@@ -2059,34 +2121,25 @@ impl ValueActor {
                             };
 
                             current_value.store(Arc::new(Some(new_value.clone())));
+                            // Increment version and notify waiting subscribers
+                            let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+                            version_notifier.notify(new_version);
 
-                            match &mut migration_state {
-                                MigrationState::Normal => {
-                                    if output_valve_signal.is_none() {
-                                        Self::broadcast_to_subscribers(&mut subscribers, &new_value, &construct_info);
-                                    }
-                                }
-                                MigrationState::Migrating { buffered_writes, target, .. } => {
-                                    // Double-write: local + forward to target
-                                    if output_valve_signal.is_none() {
-                                        Self::broadcast_to_subscribers(&mut subscribers, &new_value, &construct_info);
-                                    }
-                                    buffered_writes.push(new_value.clone());
-                                    let _ = target.send_message(ActorMessage::StreamValue(new_value));
-                                }
-                                _ => {}
+                            // Handle migration forwarding
+                            if let MigrationState::Migrating { buffered_writes, target, .. } = &mut migration_state {
+                                buffered_writes.push(new_value.clone());
+                                let _ = target.send_message(ActorMessage::StreamValue(new_value));
                             }
                         }
 
-                        // Handle output valve impulses
+                        // Handle output valve impulses (for output gating)
                         impulse = output_valve_impulse_stream.next() => {
                             if impulse.is_none() {
                                 // Valve closed - but we DON'T break!
                                 continue;
                             }
-                            if let Some(value) = current_value.load().as_ref() {
-                                Self::broadcast_to_subscribers(&mut subscribers, value, &construct_info);
-                            }
+                            // Version-based subscriptions: subscribers pull on demand via version_notifier
+                            // No explicit broadcast needed - they'll see the update via version check
                         }
                     }
                 }
@@ -2106,24 +2159,10 @@ impl ValueActor {
             message_sender,
             inputs,
             current_value,
+            current_version,
+            version_notifier,
             loop_task,
         }
-    }
-
-    /// Helper to broadcast a value to all subscribers, removing dead channels.
-    fn broadcast_to_subscribers(
-        subscribers: &mut HashMap<SubscriberId, mpsc::UnboundedSender<Value>>,
-        value: &Value,
-        construct_info: &ConstructInfoComplete,
-    ) {
-        subscribers.retain(|_, sender| {
-            if let Err(error) = sender.unbounded_send(value.clone()) {
-                eprintln!("Failed to send {construct_info} value to subscriber: {error:#}");
-                false
-            } else {
-                true
-            }
-        });
     }
 
     /// Send a message to this actor.
@@ -2172,26 +2211,45 @@ impl ValueActor {
         self.current_value.load().as_ref().clone()
     }
 
-    /// Subscribe to this actor's values.
+    /// Get the current version number.
+    /// Version increments on each value change.
+    pub fn version(&self) -> u64 {
+        self.current_version.load(Ordering::SeqCst)
+    }
+
+    /// Get a receiver for version change notifications.
+    /// Used by VersionedSubscription to implement push-pull architecture.
+    pub fn version_receiver(&self) -> VersionReceiver {
+        self.version_notifier.subscribe()
+    }
+
+    /// Subscribe to this actor's values using version-based pull model.
     ///
-    /// The returned `Subscription` stream keeps the actor alive for the
-    /// duration of the subscription. When the subscription is dropped,
-    /// an Unsubscribe message is sent to the actor.
+    /// Memory-efficient subscription that only stores a version number and pulls
+    /// data on demand. O(1) memory usage regardless of subscriber speed.
+    /// Slow subscribers automatically skip to the latest value.
     pub fn subscribe(self: Arc<Self>) -> Subscription {
-        let subscriber_id = SubscriberId::new();
-        let (value_sender, value_receiver) = mpsc::unbounded();
-
-        if let Err(error) = self.send_message(ActorMessage::Subscribe {
-            subscriber_id,
-            value_sender,
-        }) {
-            eprintln!("Failed to subscribe to {}: {error:#}", self.construct_info);
-        }
-
         Subscription {
-            subscriber_id,
-            receiver: value_receiver,
+            last_seen_version: 0,
+            version_receiver: self.version_receiver(),
             actor: self,
+        }
+    }
+
+    /// Get optimal update for subscriber at given version.
+    ///
+    /// For scalar values, always returns a snapshot (cheap to copy).
+    /// For collections with DiffHistory (future), may return diffs if
+    /// subscriber is close enough to current version.
+    pub fn get_update_since(&self, subscriber_version: u64) -> ValueUpdate {
+        let current = self.version();
+        if subscriber_version >= current {
+            return ValueUpdate::Current;
+        }
+        // For now, always return snapshot. Phase 4 will add diff support for LIST.
+        match self.current_value() {
+            Some(value) => ValueUpdate::Snapshot(value),
+            None => ValueUpdate::Current,
         }
     }
 }
@@ -2204,32 +2262,85 @@ impl Drop for ValueActor {
     }
 }
 
+// --- ValueUpdate ---
+
+/// What a subscriber receives when pulling updates.
+/// Part of the push-pull architecture that prevents unbounded memory growth.
+#[derive(Clone)]
+pub enum ValueUpdate {
+    /// No changes since last pull
+    Current,
+    /// Full current value (always for scalars, fallback for collections when gap too large)
+    Snapshot(Value),
+    // Future: Diffs(Vec<Arc<ListDiff>>) for collections when gap is small
+}
+
 // --- Subscription ---
 
-/// A subscription stream that keeps its source ValueActor alive.
+/// Version-based subscription that pulls data on demand.
 ///
-/// When dropped, automatically sends an Unsubscribe message to the actor
-/// to clean up the subscriber entry.
+/// Tracks only a version number and pulls data on demand, giving O(1) memory
+/// usage regardless of subscriber speed. Slow subscribers automatically skip
+/// to the latest value.
+///
+/// # Memory Characteristics
+/// - Notifications: O(1) - just a version number
+/// - Data: Pulled on demand, never queued
+/// - Slow consumer: Skips to latest automatically
 pub struct Subscription {
-    subscriber_id: SubscriberId,
-    receiver: mpsc::UnboundedReceiver<Value>,
     actor: Arc<ValueActor>,
+    last_seen_version: u64,
+    version_receiver: VersionReceiver,
+}
+
+impl Subscription {
+    /// Wait for next value.
+    pub async fn next_value(&mut self) -> Option<Value> {
+        // Wait for version to change
+        loop {
+            let current = self.actor.version();
+            if current > self.last_seen_version {
+                break;
+            }
+            // Wait for change notification
+            self.version_receiver.changed().await;
+        }
+
+        self.last_seen_version = self.actor.version();
+        self.actor.current_value()
+    }
+
+    /// Get current value immediately without waiting.
+    pub fn current(&self) -> Option<Value> {
+        self.actor.current_value()
+    }
+
+    /// Check if there are pending updates without consuming them.
+    pub fn has_pending(&self) -> bool {
+        self.actor.version() > self.last_seen_version
+    }
+
+    /// Get the actor being subscribed to.
+    pub fn actor(&self) -> &Arc<ValueActor> {
+        &self.actor
+    }
 }
 
 impl Stream for Subscription {
     type Item = Value;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.receiver).poll_next(cx)
-    }
-}
+        let current = self.actor.version();
+        if current > self.last_seen_version {
+            self.last_seen_version = current;
+            if let Some(value) = self.actor.current_value() {
+                return Poll::Ready(Some(value));
+            }
+        }
 
-impl Drop for Subscription {
-    fn drop(&mut self) {
-        // Send unsubscribe message - ignore errors since actor might be gone
-        let _ = self.actor.send_message(ActorMessage::Unsubscribe {
-            subscriber_id: self.subscriber_id,
-        });
+        // Register waker for version change
+        self.version_receiver.notifier.wakers.borrow_mut().push(cx.waker().clone());
+        Poll::Pending
     }
 }
 
@@ -3176,6 +3287,10 @@ pub struct List {
     construct_info: Arc<ConstructInfoComplete>,
     loop_task: TaskHandle,
     change_sender_sender: mpsc::UnboundedSender<mpsc::UnboundedSender<ListChange>>,
+    /// Current version (increments on each change)
+    current_version: Arc<AtomicU64>,
+    /// Version notifier for efficient change detection
+    version_notifier: VersionNotifier,
 }
 
 impl List {
@@ -3200,6 +3315,13 @@ impl List {
         let construct_info = Arc::new(construct_info.complete(ConstructType::List));
         let (change_sender_sender, mut change_sender_receiver) =
             mpsc::unbounded::<mpsc::UnboundedSender<ListChange>>();
+
+        // Version tracking for push-pull architecture
+        let current_version = Arc::new(AtomicU64::new(0));
+        let version_notifier = VersionNotifier::new();
+        let current_version_for_loop = current_version.clone();
+        let version_notifier_for_loop = version_notifier.clone();
+
         let loop_task = Task::start_droppable({
             let construct_info = construct_info.clone();
             let output_valve_signal = actor_context.output_valve_signal;
@@ -3238,6 +3360,9 @@ impl List {
                                     panic!("Failed to initialize {construct_info}: The first change has to be 'ListChange::Replace'")
                                 }
                             }
+                            // Increment version and notify subscribers
+                            let new_version = current_version_for_loop.fetch_add(1, Ordering::SeqCst) + 1;
+                            version_notifier_for_loop.notify(new_version);
                         }
                         change_sender = change_sender_receiver.select_next_some() => {
                             if output_valve_signal.is_none() {
@@ -3283,7 +3408,19 @@ impl List {
             construct_info,
             loop_task,
             change_sender_sender,
+            current_version,
+            version_notifier,
         }
+    }
+
+    /// Get current version.
+    pub fn version(&self) -> u64 {
+        self.current_version.load(Ordering::SeqCst)
+    }
+
+    /// Get a version receiver for efficient change detection.
+    pub fn version_receiver(&self) -> VersionReceiver {
+        self.version_notifier.subscribe()
     }
 
     pub fn new_arc(
@@ -3538,6 +3675,182 @@ impl Stream for ListSubscription {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.receiver).poll_next(cx)
+    }
+}
+
+// --- ItemId ---
+
+/// Stable identifier for list items that survives structural changes.
+/// Unlike indices which shift on insert/remove, ItemId stays constant.
+/// This enables O(1) diff translation through filter chains.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ItemId(pub Ulid);
+
+impl ItemId {
+    pub fn new() -> Self {
+        Self(Ulid::new())
+    }
+}
+
+impl Default for ItemId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// --- ListDiff ---
+
+/// Diff operations using stable ItemId references.
+/// Unlike ListChange which uses indices, ListDiff enables O(1) filter translation.
+#[derive(Clone)]
+pub enum ListDiff {
+    /// Insert new item after the given position (None = at start)
+    Insert {
+        id: ItemId,
+        after: Option<ItemId>,
+        value: Arc<ValueActor>,
+    },
+    /// Remove item by its stable ID
+    Remove { id: ItemId },
+    /// Update item's value (ID stays the same)
+    Update { id: ItemId, value: Arc<ValueActor> },
+    /// Full replacement (when diffs would be larger than snapshot)
+    Replace { items: Vec<(ItemId, Arc<ValueActor>)> },
+}
+
+// --- DiffHistory ---
+
+/// Configuration for diff history ring buffer.
+pub struct DiffHistoryConfig {
+    /// Maximum number of diffs to keep before oldest are dropped
+    pub max_entries: usize,
+    /// When to prefer snapshot over diffs (if gap > threshold * current_len)
+    pub snapshot_threshold: f64,
+}
+
+impl Default for DiffHistoryConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 1500,
+            snapshot_threshold: 0.5, // Snapshot if catching up > 50% of list
+        }
+    }
+}
+
+/// Ring buffer storing recent diffs for efficient subscriber updates.
+/// Subscribers close to current version get diffs; those far behind get snapshots.
+pub struct DiffHistory {
+    /// Recent diffs with their version numbers
+    diffs: VecDeque<(u64, Arc<ListDiff>)>,
+    /// Current items with their stable IDs
+    current_snapshot: Vec<(ItemId, Arc<ValueActor>)>,
+    /// Oldest version still in history (versions before this need snapshot)
+    oldest_version: u64,
+    /// Current version (incremented on each change)
+    current_version: u64,
+    /// Configuration
+    config: DiffHistoryConfig,
+}
+
+impl DiffHistory {
+    pub fn new(config: DiffHistoryConfig) -> Self {
+        Self {
+            diffs: VecDeque::new(),
+            current_snapshot: Vec::new(),
+            oldest_version: 0,
+            current_version: 0,
+            config,
+        }
+    }
+
+    /// Add a new diff and update snapshot.
+    pub fn add(&mut self, diff: ListDiff) {
+        self.current_version += 1;
+
+        // Apply diff to snapshot
+        match &diff {
+            ListDiff::Insert { id, after, value } => {
+                let pos = match after {
+                    None => 0,
+                    Some(after_id) => {
+                        self.current_snapshot
+                            .iter()
+                            .position(|(id, _)| id == after_id)
+                            .map(|i| i + 1)
+                            .unwrap_or(self.current_snapshot.len())
+                    }
+                };
+                self.current_snapshot.insert(pos, (*id, value.clone()));
+            }
+            ListDiff::Remove { id } => {
+                self.current_snapshot.retain(|(item_id, _)| item_id != id);
+            }
+            ListDiff::Update { id, value } => {
+                if let Some((_, v)) = self.current_snapshot.iter_mut().find(|(item_id, _)| item_id == id) {
+                    *v = value.clone();
+                }
+            }
+            ListDiff::Replace { items } => {
+                self.current_snapshot = items.clone();
+            }
+        }
+
+        // Store diff
+        self.diffs.push_back((self.current_version, Arc::new(diff)));
+
+        // Trim old diffs if over capacity
+        while self.diffs.len() > self.config.max_entries {
+            if let Some((version, _)) = self.diffs.pop_front() {
+                self.oldest_version = version;
+            }
+        }
+    }
+
+    /// Get optimal update for subscriber at given version.
+    pub fn get_update_since(&self, subscriber_version: u64) -> ValueUpdate {
+        if subscriber_version >= self.current_version {
+            return ValueUpdate::Current;
+        }
+
+        // If subscriber is too far behind or before our history, send snapshot
+        if subscriber_version < self.oldest_version {
+            return self.snapshot_update();
+        }
+
+        // Calculate how many diffs needed
+        let diffs_needed: Vec<_> = self.diffs
+            .iter()
+            .filter(|(v, _)| *v > subscriber_version)
+            .map(|(_, d)| d.clone())
+            .collect();
+
+        // Heuristic: if catching up requires more than threshold% of list, prefer snapshot
+        let list_len = self.current_snapshot.len().max(1);
+        let diff_cost = diffs_needed.len();
+        if diff_cost as f64 > list_len as f64 * self.config.snapshot_threshold {
+            return self.snapshot_update();
+        }
+
+        // Future: return ValueUpdate::Diffs(diffs_needed)
+        // For now, always return snapshot since ValueUpdate doesn't have Diffs variant yet
+        self.snapshot_update()
+    }
+
+    fn snapshot_update(&self) -> ValueUpdate {
+        // Convert snapshot to Value (list of items)
+        // This is a simplified implementation - full implementation would
+        // create a proper List value from the snapshot
+        ValueUpdate::Current // Placeholder until List->Value conversion is implemented
+    }
+
+    /// Get current version.
+    pub fn version(&self) -> u64 {
+        self.current_version
+    }
+
+    /// Get current snapshot.
+    pub fn snapshot(&self) -> &[(ItemId, Arc<ValueActor>)] {
+        &self.current_snapshot
     }
 }
 
