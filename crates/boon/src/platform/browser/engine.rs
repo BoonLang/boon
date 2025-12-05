@@ -826,16 +826,15 @@ impl Variable {
         })
     }
 
-    pub fn subscribe(&self) -> Subscription {
-        self.value_actor.clone().subscribe()
-    }
-
-    /// Subscribe to this variable's values while keeping the variable alive.
-    /// This is important for LINK variables because dropping the Variable would drop
-    /// the link_value_sender, closing the channel and preventing new values from being sent.
-    /// Use this method instead of `subscribe()` when the variable might be dropped
-    /// before all values are consumed (e.g., in flat_map closures).
-    pub fn subscribe_keeping_alive(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+    /// Subscribe to this variable's value stream.
+    ///
+    /// This method keeps the Variable alive for the lifetime of the returned stream.
+    /// This is important because:
+    /// - LINK variables have a `link_value_sender` that must stay alive
+    /// - The Variable may be the only reference keeping dependent actors alive
+    ///
+    /// Takes `Arc<Self>` to ensure the Variable is kept alive during subscription.
+    pub fn subscribe(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
         let subscription = self.value_actor.clone().subscribe();
         // Subscription keeps the actor alive; we also need to keep the Variable alive
         stream::unfold(
@@ -1965,7 +1964,9 @@ impl ValueActor {
                     select! {
                         // Handle new subscriber registrations
                         sender = notify_sender_receiver.next() => {
-                            if let Some(sender) = sender {
+                            if let Some(mut sender) = sender {
+                                // Immediately notify - subscriber will check version and see current value if any
+                                let _ = sender.try_send(());
                                 notify_senders.push(sender);
                             }
                         }
@@ -2259,33 +2260,30 @@ impl Stream for Subscription {
     type Item = Value;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Check if there's a newer version
-        let current = self.actor.version();
-        if current > self.last_seen_version {
-            self.last_seen_version = current;
-            if let Some(value) = self.actor.current_value() {
-                return Poll::Ready(Some(value));
-            }
-        }
-
-        // Poll the notification receiver - this registers the waker internally
-        match Pin::new(&mut self.notify_receiver).poll_next(cx) {
-            Poll::Ready(Some(())) => {
-                // Got notification, return the current value
-                let current = self.actor.version();
+        loop {
+            // Check if there's a newer version
+            let current = self.actor.version();
+            if current > self.last_seen_version {
                 self.last_seen_version = current;
                 if let Some(value) = self.actor.current_value() {
-                    Poll::Ready(Some(value))
-                } else {
-                    // Value not yet set, keep waiting
-                    Poll::Pending
+                    return Poll::Ready(Some(value));
                 }
             }
-            Poll::Ready(None) => {
-                // Channel closed, actor dropped
-                Poll::Ready(None)
+
+            // Poll the notification receiver - this registers the waker internally
+            match Pin::new(&mut self.notify_receiver).poll_next(cx) {
+                Poll::Ready(Some(())) => {
+                    // Got notification, loop to check version again
+                    continue;
+                }
+                Poll::Ready(None) => {
+                    // Channel closed, actor dropped
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
             }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -2342,23 +2340,27 @@ impl Stream for ListDiffSubscription {
     type Item = ValueUpdate;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let current = self.list.version();
-        if current > self.last_seen_version {
-            let update = self.list.get_update_since(self.last_seen_version);
-            self.last_seen_version = current;
-            return Poll::Ready(Some(update));
-        }
-
-        // Poll the notification receiver
-        match Pin::new(&mut self.notify_receiver).poll_next(cx) {
-            Poll::Ready(Some(())) => {
-                let current = self.list.version();
+        loop {
+            let current = self.list.version();
+            if current > self.last_seen_version {
                 let update = self.list.get_update_since(self.last_seen_version);
                 self.last_seen_version = current;
-                Poll::Ready(Some(update))
+                return Poll::Ready(Some(update));
             }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+
+            // Poll the notification receiver
+            match Pin::new(&mut self.notify_receiver).poll_next(cx) {
+                Poll::Ready(Some(())) => {
+                    // Got notification, loop to check version again
+                    continue;
+                }
+                Poll::Ready(None) => {
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            }
         }
     }
 }
@@ -3370,7 +3372,9 @@ impl List {
                     select! {
                         // Handle new diff subscriber registrations
                         sender = notify_sender_receiver.next() => {
-                            if let Some(sender) = sender {
+                            if let Some(mut sender) = sender {
+                                // Immediately notify - subscriber will check version and see current diffs if any
+                                let _ = sender.try_send(());
                                 notify_senders.push(sender);
                             }
                         }

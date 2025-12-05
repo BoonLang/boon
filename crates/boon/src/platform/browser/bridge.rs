@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use zoon::futures_util::{select, stream};
+use zoon::futures_util::{select, stream, StreamExt};
 use zoon::futures_channel::mpsc;
 use zoon::{eprintln, *};
 
@@ -14,16 +14,17 @@ pub fn object_with_document_to_element_signal(
     root_object: Arc<Object>,
     construct_context: ConstructContext,
 ) -> impl Signal<Item = Option<RawElOrText>> {
-    let element_stream = root_object
-        .expect_variable("document")
-        .subscribe()
+    let document_variable = root_object.expect_variable("document").clone();
+    let doc_actor = document_variable.value_actor();
+
+    let element_stream = doc_actor.clone().subscribe()
         .flat_map(|value| {
-            value
-                .expect_object()
-                .expect_variable("root_element")
-                .subscribe()
+            let document_object = value.expect_object();
+            let root_element_var = document_object.expect_variable("root_element").clone();
+            root_element_var.value_actor().clone().subscribe()
         })
-        .map(move |value| value_to_element(value, construct_context.clone()));
+        .map(move |value| value_to_element(value, construct_context.clone()))
+        .boxed_local();
 
     signal::from_stream(element_stream)
 }
@@ -74,10 +75,28 @@ fn element_stripe(
 ) -> impl Element {
     let settings_variable = tagged_object.expect_variable("settings");
 
+    // In the flat_map closures below, the settings Object is extracted as a temporary
+    // and dropped at the end of the closure. We need to keep the Object alive to prevent
+    // its Variables (direction, style, items) from being dropped.
+    // Solution: Store the Object when we first receive it and keep it in a shared cell.
+    let settings_object: std::sync::Arc<std::sync::Mutex<Option<Arc<Object>>>> = Default::default();
+    let settings_object_for_direction = settings_object.clone();
+    let settings_object_for_items = settings_object.clone();
+
+    // Similarly, we need to keep the items List value alive to prevent the underlying
+    // ValueActor ("Persistent list wrapper") from being dropped during flat_map processing.
+    let items_list_value: std::sync::Arc<std::sync::Mutex<Option<Value>>> = Default::default();
+    let items_list_value_for_stream = items_list_value.clone();
+
     let direction_stream = settings_variable
         .clone()
         .subscribe()
-        .flat_map(|value| value.expect_object().expect_variable("direction").subscribe())
+        .flat_map(move |value| {
+            let object = value.expect_object();
+            // Keep the Object alive by storing it
+            *settings_object_for_direction.lock().unwrap() = Some(object.clone());
+            object.expect_variable("direction").subscribe()
+        })
         .map(|direction| match direction.expect_tag().tag() {
             "Column" => Direction::Column,
             "Row" => Direction::Row,
@@ -86,8 +105,17 @@ fn element_stripe(
 
     let items_vec_diff_stream = settings_variable
         .subscribe()
-        .flat_map(|value| value.expect_object().expect_variable("items").subscribe())
-        .flat_map(|value| value.expect_list().subscribe())
+        .flat_map(move |value| {
+            let object = value.expect_object();
+            // Keep the Object alive by storing it
+            *settings_object_for_items.lock().unwrap() = Some(object.clone());
+            object.expect_variable("items").subscribe()
+        })
+        .flat_map(move |value| {
+            // Keep the Value alive to prevent its underlying structures from being dropped
+            *items_list_value_for_stream.lock().unwrap() = Some(value.clone());
+            value.expect_list().subscribe()
+        })
         .map(list_change_to_vec_diff);
 
     Stripe::new()
@@ -100,6 +128,12 @@ fn element_stripe(
                 }))
             },
         ))
+        // Keep tagged_object, settings_object, and items_list_value alive for the lifetime of this element
+        .after_remove(move |_| {
+            drop(tagged_object);
+            drop(settings_object);
+            drop(items_list_value);
+        })
 }
 
 fn element_button(

@@ -219,7 +219,7 @@ pub fn function_element_button(
                         .clone()
                         .subscribe()
                         .filter_map(|value| future::ready(value.expect_object().variable("event")))
-                        .flat_map(|variable| variable.subscribe_keeping_alive())),
+                        .flat_map(|variable| variable.subscribe())),
                     None,
                 ),
                 None,
