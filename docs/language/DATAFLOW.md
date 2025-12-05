@@ -24,20 +24,23 @@ The fundamental unit of reactive computation. Every expression evaluates to a `V
 ┌─────────────────────────────────────────────────────────────┐
 │                       ValueActor                            │
 ├─────────────────────────────────────────────────────────────┤
-│ input_stream ─────► internal loop ─────► subscribers[]      │
-│                          │                                  │
-│                          ▼                                  │
-│                   current_value (ArcSwap)                   │
+│ input_stream ─────► internal loop ─────► notify_senders[]   │
+│                          │                    │             │
+│                          ▼                    ▼             │
+│                   current_value          try_send(())       │
+│                    (ArcSwap)           (bounded channels)   │
 │                                                             │
-│ message_sender ◄─── Subscribe/Unsubscribe messages          │
+│ notify_sender_sender ◄─── Register subscriber channels      │
+│ current_version (AtomicU64) ← Increments on each change     │
 │                                                             │
 │ inputs: Vec<Arc<ValueActor>> (keeps upstream alive)         │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 **Key characteristics:**
-- **Broadcast model**: All subscribers receive all values
-- **Unbounded channels**: No automatic backpressure
+- **Push-pull model**: Notify via bounded(1) channels, pull value on demand
+- **Bounded channels**: O(1) memory per subscriber regardless of speed
+- **No RefCell**: Subscriber senders stored in loop locals (pure dataflow)
 - **Keep-alive semantics**: `inputs` Vec prevents upstream drops
 - **Current value cache**: `ArcSwap` allows lock-free reads
 
@@ -45,21 +48,26 @@ The fundamental unit of reactive computation. Every expression evaluates to a `V
 
 ```rust
 pub struct Subscription {
-    subscriber_id: SubscriberId,
-    receiver: mpsc::UnboundedReceiver<Value>,
-    actor: Arc<ValueActor>,  // Keeps actor alive
+    actor: Arc<ValueActor>,
+    last_seen_version: u64,
+    notify_receiver: mpsc::Receiver<()>,  // bounded(1)
 }
 ```
 
 When you subscribe:
-1. `Subscribe` message sent to actor
-2. Actor stores sender in `subscribers` HashMap
-3. Current value (if any) sent immediately
-4. All future values broadcast to subscriber
+1. Create bounded(1) channel
+2. Send sender to actor via `notify_sender_sender`
+3. Actor loop stores sender in local `Vec<mpsc::Sender<()>>`
+4. Returns receiver as part of Subscription
 
-When subscription dropped:
-1. `Unsubscribe` message sent to actor
-2. Actor removes entry from `subscribers`
+On value change:
+1. Actor loop calls `try_send(())` on all senders
+2. If buffer full, skip (subscriber already has pending notification)
+3. If disconnected, remove sender from list via `retain_mut`
+
+When subscriber polls:
+1. Wait for notification on bounded receiver (or check version)
+2. Pull current value from `ArcSwap` on demand
 
 ---
 
@@ -363,58 +371,44 @@ items: LIST {}
 
 ## Known Issues and Considerations
 
-### 1. Unbounded Channels - Memory Risk
+### 1. ~~Unbounded Channels - Memory Risk~~ (SOLVED)
 
-**Problem:** All subscription channels are `mpsc::unbounded()`.
+**Previous problem:** All subscription channels were `mpsc::unbounded()`.
 
-```rust
-let (value_sender, value_receiver) = mpsc::unbounded();
-```
-
-**Impact:**
-- Fast producer + slow consumer = memory growth
-- No automatic backpressure
-- Can cause memory exhaustion
-
-**Where it matters:**
-- High-frequency event sources (timers, sensor data)
-- Complex pipelines with slow downstream processing
-- Long-lived subscriptions that process slowly
-
-**Mitigation (current):**
-- `BackpressurePermit` in HOLD synchronizes THEN/WHEN
-- But only for HOLD bodies, not general subscriptions
-
-**Potential fix:**
-- Bounded channels with configurable capacity
-- Drop oldest policy for real-time scenarios
-- Block producer for guaranteed delivery
-
-### 2. LIST Subscription Broadcast
-
-**Problem:** All subscribers receive cloned `ListChange`.
+**Solution:** Now using bounded(1) channels with push-pull architecture:
 
 ```rust
-change_senders.retain(|change_sender| {
-    change_sender.unbounded_send(change.clone())  // Clone for each!
+// Actor loop stores bounded senders
+let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
+
+// On value change - try_send, skip if full
+notify_senders.retain_mut(|sender| {
+    match sender.try_send(()) {
+        Ok(()) => true,
+        Err(e) => !e.is_disconnected(),
+    }
 });
 ```
 
-**Impact:**
-- N subscribers = N clones of `ListChange::Replace { items }`
-- For large lists, significant memory
+**Result:**
+- O(1) memory per subscriber regardless of speed
+- Slow consumers automatically skip to latest value
+- No memory exhaustion from queue buildup
 
-**Potential fix:**
-- Structural sharing (immutable data structures)
-- Reference counting for shared list snapshots
+### 2. LIST Subscription - Legacy vs Diff
 
-### 3. State Channel in HOLD
+**Legacy model:** `ListSubscription` still uses unbounded channels for `ListChange` broadcast.
 
-**Problem:** `state_sender` is unbounded.
+**New model:** `ListDiffSubscription` uses bounded(1) channels with pull-based diffs.
 
 ```rust
-let (state_sender, state_receiver) = mpsc::unbounded::<Value>();
+// Use subscribe_diffs() for memory-efficient subscription
+let subscription = list.subscribe_diffs();  // Returns ListDiffSubscription
 ```
+
+**Recommendation:** Prefer `subscribe_diffs()` for memory-efficient list handling.
+
+### 3. State Channel in HOLD
 
 **Analysis:**
 With `BackpressurePermit`, the body can only emit one value before HOLD processes it. This effectively bounds the channel at 1 message.
@@ -425,20 +419,23 @@ LATEST { fast_stream1, fast_stream2, ... } |> HOLD state { ... }
 ```
 Each emission from LATEST sets state, no permit control.
 
-### 4. Subscriber Leak Risk
+**Mitigation:** LATEST already deduplicates by idempotency key.
 
-**Problem:** Subscribers stored in HashMap, only cleaned when send fails.
+### 4. ~~Subscriber Leak Risk~~ (SOLVED)
+
+**Previous problem:** Subscribers stored in HashMap, only cleaned when send fails.
+
+**Solution:** Subscriber senders now stored in loop-local Vec, cleaned via `retain_mut`:
 
 ```rust
-subscribers.retain(|_, sender| {
-    sender.unbounded_send(value.clone()).is_ok()
-});
+// In actor loop - stored in local variable, not shared state
+let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
+
+// Automatic cleanup when sender disconnects
+notify_senders.retain_mut(|sender| !sender.try_send(()).is_disconnected());
 ```
 
-**Scenario:**
-If a subscriber task panics or is cancelled without dropping the `Subscription`, the sender entry might remain until next emission reveals it's disconnected.
-
-**Impact:** Minor - entries cleaned on next value.
+**Result:** No HashMap, no shared state, pure dataflow cleanup.
 
 ### 5. Backpressure Blocking Normal Functionality
 
@@ -506,15 +503,15 @@ But complex cyclic dependencies could theoretically cause issues.
 
 ---
 
-## Future: Universal Version + Push-Pull Architecture
+## Version + Push-Pull Architecture (IMPLEMENTED)
 
-The current push-based model with unbounded channels has fundamental issues. This section describes a unified architecture that solves them.
+This section documents the version-based push-pull architecture that replaces unbounded channels.
 
 ---
 
-### 1. Problem Statement
+### 1. Problem Statement (SOLVED)
 
-**Current architecture:**
+**Previous architecture:**
 ```rust
 struct Subscription {
     receiver: mpsc::UnboundedReceiver<Value>,  // Full values queue up!
@@ -524,33 +521,37 @@ struct Subscription {
 **Failure scenario:** 10MB Text changes 100 times, slow consumer:
 - Queue: 100 × 10MB = **1GB memory**
 
-**Root cause:** Notification and data delivery are coupled.
+**Root cause:** Notification and data delivery were coupled.
 
 ---
 
-### 2. Solution Overview
+### 2. Solution Overview (IMPLEMENTED)
 
 **Core insight:** Separate notification (tiny) from data delivery (on-demand).
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                     ValueActor (New Architecture)                       │
+│                     ValueActor (Current Implementation)                  │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  current_value: Arc<ArcSwap<Value>>     ← Lock-free current state       │
-│  current_version: AtomicU64             ← Increments on every change    │
-│  version_sender: watch::Sender<u64>     ← Notifies subscribers          │
-│  diff_history: Option<DiffHistory>      ← For collections only          │
+│  current_version: Arc<AtomicU64>        ← Increments on every change    │
+│  notify_sender_sender: mpsc::Unbounded  ← Register subscriber channels  │
+│                                                                         │
+│  Actor loop stores locally:                                             │
+│    notify_senders: Vec<mpsc::Sender<()>> ← Bounded(1) per subscriber    │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
-                    Subscribers receive: just version number (8 bytes)
-                    Subscribers pull: optimal update when ready
+                    Subscribers receive: () notification (0 bytes payload)
+                    Subscribers pull: current value when ready
 ```
+
+**Key difference from original plan:** Uses bounded mpsc channels stored in actor loop locals instead of `watch::Sender`. This avoids RefCell/Mutex entirely - pure dataflow.
 
 ---
 
-### 3. Complete Type Definitions
+### 3. Complete Type Definitions (IMPLEMENTED)
 
 #### 3.1 Why ItemId Instead of Index-Based Diffs
 
@@ -650,22 +651,23 @@ Boon targets scenarios where indices become bottleneck:
 
 ---
 
-#### 3.2 Core Types
+#### 3.2 Core Types (IMPLEMENTED)
 
 ```rust
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::collections::VecDeque;
+use std::cell::RefCell;
 use arc_swap::ArcSwap;
-use tokio::sync::watch;
+use futures::channel::mpsc;
 
 /// Unique identifier for list items. Stable across transformations.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ItemId(pub u64);
+pub struct ItemId(pub Ulid);
 
 impl ItemId {
     pub fn new() -> Self {
-        Self(ulid::Ulid::new().0)
+        Self(Ulid::new())
     }
 }
 
@@ -676,98 +678,45 @@ pub enum ListDiff {
     Insert {
         id: ItemId,
         after: Option<ItemId>,
-        value: Arc<Value>,
+        value: Arc<ValueActor>,
     },
     /// Remove item by ID
     Remove { id: ItemId },
     /// Update item's value
-    Update { id: ItemId, value: Arc<Value> },
+    Update { id: ItemId, value: Arc<ValueActor> },
     /// Replace entire list (checkpoint/reset)
-    Replace { items: Arc<Vec<(ItemId, Arc<Value>)>> },
-}
-
-impl ListDiff {
-    pub fn is_replace(&self) -> bool {
-        matches!(self, Self::Replace { .. })
-    }
-
-    /// Estimate serialization cost (for diff vs snapshot decision)
-    pub fn cost(&self) -> usize {
-        match self {
-            Self::Insert { value, .. } => 24 + value.estimated_size(),
-            Self::Remove { .. } => 8,
-            Self::Update { value, .. } => 16 + value.estimated_size(),
-            Self::Replace { items } => items.iter().map(|(_, v)| 8 + v.estimated_size()).sum(),
-        }
-    }
-}
-
-/// What subscriber receives when pulling updates
-#[derive(Clone, Debug)]
-pub enum ValueUpdate {
-    /// No changes since last pull
-    Current,
-    /// Full current value (scalars always, collections when gap too large)
-    Snapshot(Arc<Value>),
-    /// Incremental diffs (collections only, when gap is small)
-    Diffs(Vec<Arc<ListDiff>>),
+    Replace { items: Vec<(ItemId, Arc<ValueActor>)> },
 }
 ```
 
-#### 3.3 DiffHistory
+**Note:** The actual implementation stores `Arc<ValueActor>` in diffs, not `Arc<Value>`. ValueActors are the reactive units.
+
+#### 3.3 DiffHistory (IMPLEMENTED)
 
 ```rust
-/// Configuration for diff history
-pub struct DiffHistoryConfig {
-    /// Maximum diffs to retain
-    pub max_entries: usize,
-    /// If diff count exceeds this, prefer snapshot
-    pub snapshot_threshold: usize,
-    /// If total diff cost exceeds snapshot cost * this factor, use snapshot
-    pub cost_factor: f64,
-}
-
-impl Default for DiffHistoryConfig {
-    fn default() -> Self {
-        Self {
-            max_entries: 1000,
-            snapshot_threshold: 100,
-            cost_factor: 0.8,  // Use snapshot if diffs cost > 80% of snapshot
-        }
-    }
-}
-
-/// Maintains diff history for collections
+/// Maintains diff history for LIST. Stored in List via Arc<RefCell<DiffHistory>>.
 pub struct DiffHistory {
     /// Ring buffer: (version, diff)
     diffs: VecDeque<(u64, Arc<ListDiff>)>,
-    /// Current snapshot (always available)
-    current_snapshot: Arc<Vec<(ItemId, Arc<Value>)>>,
     /// Oldest version we can serve diffs from
     oldest_version: u64,
-    /// Configuration
-    config: DiffHistoryConfig,
+    /// Maximum diffs to retain (default: 1500)
+    max_entries: usize,
 }
 
 impl DiffHistory {
-    pub fn new(initial_items: Vec<(ItemId, Arc<Value>)>) -> Self {
+    pub fn new() -> Self {
         Self {
             diffs: VecDeque::new(),
-            current_snapshot: Arc::new(initial_items),
             oldest_version: 0,
-            config: DiffHistoryConfig::default(),
+            max_entries: 1500,
         }
     }
 
-    /// Add a new diff and update snapshot
-    pub fn add(&mut self, version: u64, diff: ListDiff) {
-        let diff = Arc::new(diff);
-
-        // Apply diff to snapshot
-        self.apply_to_snapshot(&diff);
-
+    /// Add a new diff
+    pub fn add(&mut self, version: u64, diff: Arc<ListDiff>) {
         // If Replace, it supersedes everything
-        if diff.is_replace() {
+        if matches!(diff.as_ref(), ListDiff::Replace { .. }) {
             self.diffs.clear();
             self.oldest_version = version;
         }
@@ -775,408 +724,212 @@ impl DiffHistory {
         self.diffs.push_back((version, diff));
 
         // Trim old entries
-        while self.diffs.len() > self.config.max_entries {
+        while self.diffs.len() > self.max_entries {
             if let Some((old_version, _)) = self.diffs.pop_front() {
                 self.oldest_version = old_version + 1;
             }
         }
     }
 
-    /// Apply diff to current snapshot
-    fn apply_to_snapshot(&mut self, diff: &ListDiff) {
-        let snapshot = Arc::make_mut(&mut self.current_snapshot);
-        match diff {
-            ListDiff::Insert { id, after, value } => {
-                let pos = match after {
-                    None => 0,
-                    Some(after_id) => {
-                        snapshot.iter().position(|(id, _)| id == after_id)
-                            .map(|p| p + 1)
-                            .unwrap_or(snapshot.len())
-                    }
-                };
-                snapshot.insert(pos, (*id, value.clone()));
-            }
-            ListDiff::Remove { id } => {
-                snapshot.retain(|(item_id, _)| item_id != id);
-            }
-            ListDiff::Update { id, value } => {
-                if let Some((_, v)) = snapshot.iter_mut().find(|(item_id, _)| item_id == id) {
-                    *v = value.clone();
-                }
-            }
-            ListDiff::Replace { items } => {
-                *snapshot = items.as_ref().clone();
-            }
-        }
-    }
-
-    /// Get optimal update for subscriber at given version
-    pub fn get_update_since(&self, subscriber_version: u64) -> ValueUpdate {
-        // Already up to date?
-        let current_version = self.oldest_version + self.diffs.len() as u64;
-        if subscriber_version >= current_version {
-            return ValueUpdate::Current;
+    /// Get diffs since a version
+    pub fn get_diffs_since(&self, subscriber_version: u64) -> Option<Vec<Arc<ListDiff>>> {
+        if subscriber_version < self.oldest_version {
+            // Too far behind - subscriber needs full snapshot
+            return None;
         }
 
-        // Can we serve diffs?
-        if subscriber_version >= self.oldest_version {
-            let diffs: Vec<Arc<ListDiff>> = self.diffs.iter()
-                .filter(|(v, _)| *v > subscriber_version)
-                .map(|(_, d)| d.clone())
-                .collect();
+        let diffs: Vec<Arc<ListDiff>> = self.diffs.iter()
+            .filter(|(v, _)| *v > subscriber_version)
+            .map(|(_, d)| d.clone())
+            .collect();
 
-            // Should we use diffs or snapshot?
-            if self.should_use_diffs(&diffs) {
-                return ValueUpdate::Diffs(diffs);
-            }
-        }
-
-        // Fall back to snapshot
-        ValueUpdate::Snapshot(Arc::new(Value::List(
-            self.current_snapshot.clone(),
-            ValueMetadata::new(),
-        )))
-    }
-
-    /// Decide: diffs or snapshot?
-    fn should_use_diffs(&self, diffs: &[Arc<ListDiff>]) -> bool {
-        // Too many diffs?
-        if diffs.len() > self.config.snapshot_threshold {
-            return false;
-        }
-
-        // Cost comparison
-        let diff_cost: usize = diffs.iter().map(|d| d.cost()).sum();
-        let snapshot_cost = self.current_snapshot.iter()
-            .map(|(_, v)| 8 + v.estimated_size())
-            .sum::<usize>();
-
-        (diff_cost as f64) < (snapshot_cost as f64 * self.config.cost_factor)
-    }
-
-    pub fn current_version(&self) -> u64 {
-        self.oldest_version + self.diffs.len() as u64
-    }
-
-    pub fn snapshot(&self) -> Arc<Vec<(ItemId, Arc<Value>)>> {
-        self.current_snapshot.clone()
+        Some(diffs)
     }
 }
 ```
 
-#### 3.4 ValueActor (New)
+**Note:** Actual implementation stores `Arc<RefCell<DiffHistory>>` in List, not `Mutex`. This is safe because the List's actor loop is the only writer, and subscribers only read via bounded channel notifications.
+
+#### 3.4 ValueActor (IMPLEMENTED)
 
 ```rust
 pub struct ValueActor {
     construct_info: Arc<ConstructInfoComplete>,
-
-    // Core state
-    current_value: Arc<ArcSwap<Value>>,
-    current_version: AtomicU64,
-
-    // Notification channel (O(1) memory, just latest version)
-    version_sender: watch::Sender<u64>,
-
-    // For collections only
-    diff_history: Option<Mutex<DiffHistory>>,
-
-    // Keep inputs alive
+    persistence_id: Option<parser::PersistenceId>,
+    message_sender: mpsc::UnboundedSender<ActorMessage>,
     inputs: Vec<Arc<ValueActor>>,
 
-    // Actor task
+    // Lock-free current value
+    current_value: Arc<ArcSwap<Option<Value>>>,
+    current_version: Arc<AtomicU64>,
+
+    // Channel for registering new subscriber notification senders
+    notify_sender_sender: mpsc::UnboundedSender<mpsc::Sender<()>>,
+
     loop_task: TaskHandle,
 }
+```
 
-impl ValueActor {
-    /// Create for scalar types (Number, Text, Tag, Object)
-    pub fn new_scalar(
-        construct_info: ConstructInfoComplete,
-        initial_value: Value,
-        input_stream: impl Stream<Item = Value> + 'static,
-        inputs: Vec<Arc<ValueActor>>,
-    ) -> Arc<Self> {
-        let (version_sender, _) = watch::channel(0u64);
-        let current_value = Arc::new(ArcSwap::from_pointee(initial_value));
-        let current_version = AtomicU64::new(0);
+**Key: Loop-local subscriber storage (no RefCell/Mutex)**
 
-        let actor = Arc::new(Self {
-            construct_info: Arc::new(construct_info),
-            current_value: current_value.clone(),
-            current_version,
-            version_sender: version_sender.clone(),
-            diff_history: None,
-            inputs,
-            loop_task: TaskHandle::empty(),
-        });
+```rust
+// Inside ValueActor::new_with_inputs()
+let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
 
-        // Start processing loop
-        let actor_weak = Arc::downgrade(&actor);
-        let loop_task = Task::start_droppable(async move {
-            let mut stream = pin!(input_stream);
-            while let Some(value) = stream.next().await {
-                if let Some(actor) = actor_weak.upgrade() {
-                    actor.current_value.store(Arc::new(value));
-                    let new_version = actor.current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                    let _ = actor.version_sender.send(new_version);
-                } else {
-                    break;
+async move {
+    let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
+
+    // Subscriber senders stored LOCALLY in this loop (no shared state!)
+    let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
+
+    loop {
+        select! {
+            // Handle new subscriber registrations
+            sender = notify_sender_receiver.next() => {
+                if let Some(sender) = sender {
+                    notify_senders.push(sender);
                 }
             }
-        });
 
-        // Set loop_task (requires interior mutability pattern)
-        actor
-    }
+            // Handle value stream updates
+            new_value = value_stream.next() => {
+                if let Some(value) = new_value {
+                    // Store value
+                    current_value.store(Arc::new(Some(value)));
+                    // Increment version
+                    let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
 
-    /// Create for LIST type
-    pub fn new_list(
-        construct_info: ConstructInfoComplete,
-        initial_items: Vec<(ItemId, Arc<Value>)>,
-        diff_stream: impl Stream<Item = ListDiff> + 'static,
-        inputs: Vec<Arc<ValueActor>>,
-    ) -> Arc<Self> {
-        let (version_sender, _) = watch::channel(0u64);
-        let diff_history = DiffHistory::new(initial_items.clone());
-        let initial_value = Value::List(Arc::new(initial_items), ValueMetadata::new());
-        let current_value = Arc::new(ArcSwap::from_pointee(initial_value));
-        let current_version = AtomicU64::new(0);
-
-        let actor = Arc::new(Self {
-            construct_info: Arc::new(construct_info),
-            current_value: current_value.clone(),
-            current_version,
-            version_sender: version_sender.clone(),
-            diff_history: Some(Mutex::new(diff_history)),
-            inputs,
-            loop_task: TaskHandle::empty(),
-        });
-
-        // Start processing loop
-        let actor_weak = Arc::downgrade(&actor);
-        let loop_task = Task::start_droppable(async move {
-            let mut stream = pin!(diff_stream);
-            while let Some(diff) = stream.next().await {
-                if let Some(actor) = actor_weak.upgrade() {
-                    if let Some(history) = &actor.diff_history {
-                        let mut history = history.lock().unwrap();
-                        let new_version = actor.current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                        history.add(new_version, diff);
-                        // Update current_value from history snapshot
-                        let snapshot = history.snapshot();
-                        actor.current_value.store(Arc::new(Value::List(snapshot, ValueMetadata::new())));
-                        let _ = actor.version_sender.send(new_version);
-                    }
-                } else {
-                    break;
+                    // Notify all subscribers via bounded channels
+                    notify_senders.retain_mut(|sender| {
+                        match sender.try_send(()) {
+                            Ok(()) => true,  // Keep sender
+                            Err(e) => !e.is_disconnected(),  // Keep if just full
+                        }
+                    });
                 }
             }
-        });
-
-        actor
-    }
-
-    /// Subscribe to this actor
-    pub fn subscribe(self: &Arc<Self>) -> Subscription {
-        Subscription {
-            actor: self.clone(),
-            last_seen_version: 0,
-            version_receiver: self.version_sender.subscribe(),
         }
-    }
-
-    /// Get current value without subscribing (one-shot read)
-    pub fn current_value(&self) -> Arc<Value> {
-        self.current_value.load_full()
-    }
-
-    /// Get current version
-    pub fn version(&self) -> u64 {
-        self.current_version.load(Ordering::SeqCst)
-    }
-
-    /// Get optimal update for subscriber
-    pub fn get_update_since(&self, subscriber_version: u64) -> ValueUpdate {
-        let current = self.version();
-        if subscriber_version >= current {
-            return ValueUpdate::Current;
-        }
-
-        // For collections with diff history
-        if let Some(history) = &self.diff_history {
-            return history.lock().unwrap().get_update_since(subscriber_version);
-        }
-
-        // For scalars: always snapshot
-        ValueUpdate::Snapshot(self.current_value.load_full())
     }
 }
 ```
 
-#### 3.5 Subscription
+**Subscribe creates bounded(1) channel:**
+
+```rust
+pub fn subscribe(self: Arc<Self>) -> Subscription {
+    // Create bounded(1) channel - at most 1 pending notification
+    let (sender, receiver) = mpsc::channel::<()>(1);
+
+    // Register sender with actor loop (unbounded send - just registration)
+    if let Err(e) = self.notify_sender_sender.unbounded_send(sender) {
+        eprintln!("Failed to register subscriber: {e:#}");
+    }
+
+    Subscription {
+        last_seen_version: 0,
+        notify_receiver: receiver,  // bounded(1)
+        actor: self,
+    }
+}
+```
+
+**Why this design:**
+- No RefCell/Mutex for subscriber storage
+- Loop-local Vec cleaned automatically via `retain_mut`
+- `try_send(())` skips if buffer full (subscriber already notified)
+- Disconnected senders removed on next notify attempt
+- Pure dataflow - waker management delegated to channel internals
+
+#### 3.5 Subscription (IMPLEMENTED)
 
 ```rust
 pub struct Subscription {
     actor: Arc<ValueActor>,
     last_seen_version: u64,
-    version_receiver: watch::Receiver<u64>,
+    notify_receiver: mpsc::Receiver<()>,  // bounded(1)
 }
 
-impl Subscription {
-    /// Wait for next update and return optimal data
-    pub async fn next(&mut self) -> ValueUpdate {
-        // Wait for version to change
-        loop {
-            let current = *self.version_receiver.borrow();
-            if current > self.last_seen_version {
-                break;
-            }
-            // Wait for change notification
-            if self.version_receiver.changed().await.is_err() {
-                // Sender dropped - actor gone
-                return ValueUpdate::Current;
-            }
-        }
-
-        // Pull optimal update
-        let update = self.actor.get_update_since(self.last_seen_version);
-        self.last_seen_version = self.actor.version();
-        update
-    }
-
-    /// Get current value immediately (no wait)
-    pub fn current(&self) -> Arc<Value> {
-        self.actor.current_value()
-    }
-
-    /// Check if there are pending updates
-    pub fn has_pending(&self) -> bool {
-        *self.version_receiver.borrow() > self.last_seen_version
-    }
-}
-
-/// Make Subscription a Stream for compatibility
 impl Stream for Subscription {
-    type Item = ValueUpdate;
+    type Item = Value;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Check if already have pending update
-        let current = *self.version_receiver.borrow();
+        // Check if we have a pending update (version changed)
+        let current = self.actor.version();
         if current > self.last_seen_version {
-            let update = self.actor.get_update_since(self.last_seen_version);
-            self.last_seen_version = self.actor.version();
-            return Poll::Ready(Some(update));
+            self.last_seen_version = current;
+            if let Some(value) = self.actor.current_value() {
+                return Poll::Ready(Some(value));
+            }
         }
 
-        // Wait for change
-        match Pin::new(&mut self.version_receiver).poll_changed(cx) {
-            Poll::Ready(Ok(())) => {
-                let update = self.actor.get_update_since(self.last_seen_version);
-                self.last_seen_version = self.actor.version();
-                Poll::Ready(Some(update))
+        // Wait for notification via bounded channel
+        match Pin::new(&mut self.notify_receiver).poll_next(cx) {
+            Poll::Ready(Some(())) => {
+                // Notification received - pull current value
+                let current = self.actor.version();
+                self.last_seen_version = current;
+                if let Some(value) = self.actor.current_value() {
+                    Poll::Ready(Some(value))
+                } else {
+                    Poll::Pending
+                }
             }
-            Poll::Ready(Err(_)) => Poll::Ready(None), // Actor dropped
+            Poll::Ready(None) => Poll::Ready(None),  // Actor dropped
             Poll::Pending => Poll::Pending,
         }
     }
 }
 ```
 
+**Key differences from watch-based design:**
+- Uses `mpsc::Receiver<()>` instead of `watch::Receiver<u64>`
+- Returns `Value` directly instead of `ValueUpdate` enum
+- Waker registration handled by mpsc channel internals
+- No `.borrow()` or `.changed()` - just `poll_next()`
+
 ---
 
-### 4. Combinator Integration
+### 4. Combinator Integration (IMPLEMENTED)
 
-#### 4.1 THEN with New Architecture
+The combinators (THEN, WHEN, WHILE, HOLD) work unchanged with the new subscription model.
 
-```rust
-// THEN: Evaluate body on each trigger, reading dependencies as snapshots
+#### 4.1 THEN/WHEN Behavior
 
-async fn evaluate_then(
-    trigger_subscription: &mut Subscription,
-    body: &Expression,
-    dependencies: &[Arc<ValueActor>],
-) {
-    loop {
-        // Wait for trigger
-        let trigger_update = trigger_subscription.next().await;
-        if matches!(trigger_update, ValueUpdate::Current) {
-            continue;
-        }
+THEN and WHEN use `constant(value)` for their piped input, creating a stream that emits once then hangs forever. Dependencies in the body use snapshot reads via `current_value()`.
 
-        // Read dependencies as SNAPSHOTS (not subscribing!)
-        // This is key: no queue buildup for slow THEN
-        let dep_values: Vec<Arc<Value>> = dependencies
-            .iter()
-            .map(|dep| dep.current_value())  // One-shot read
-            .collect();
+#### 4.2 WHILE Behavior
 
-        // Evaluate body with snapshot values
-        let result = evaluate_body(body, &dep_values).await;
-
-        // Emit result...
-    }
-}
-```
-
-#### 4.2 WHILE with New Architecture
-
-```rust
-// WHILE: Subscribe to body, forward all updates
-
-async fn evaluate_while(
-    condition_subscription: &mut Subscription,
-    body_actor: &Arc<ValueActor>,
-    output_sender: &watch::Sender<u64>,
-) {
-    let mut body_subscription: Option<Subscription> = None;
-
-    loop {
-        if let Some(body_sub) = &mut body_subscription {
-            // Forward body updates
-            tokio::select! {
-                update = body_sub.next() => {
-                    // Forward update to our subscribers
-                    // ...
-                }
-                condition_update = condition_subscription.next() => {
-                    // Re-evaluate condition
-                    if !condition_matches(&condition_update) {
-                        body_subscription = None;
-                    }
-                }
-            }
-        } else {
-            // Wait for condition to become true
-            let update = condition_subscription.next().await;
-            if condition_matches(&update) {
-                body_subscription = Some(body_actor.subscribe());
-            }
-        }
-    }
-}
-```
+WHILE uses `subscribe()` to stream all body emissions while pattern matches. This is correct - WHILE needs continuous streaming, not snapshots.
 
 #### 4.3 HOLD Integration
 
-HOLD's `BackpressurePermit` still works - it controls evaluation pacing.
-The new architecture just changes how values are delivered.
+HOLD's `BackpressurePermit` continues to work as before - it controls evaluation pacing for state consistency. The bounded channel notification just replaces how subscribers are notified:
 
 ```rust
-// HOLD body still uses permit for state consistency
-// But now subscribers get version notifications instead of queued values
+// In actor loop after state update:
+current_value.store(Arc::new(Some(value)));
+let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
 
-// In HOLD's state update:
-fn update_state(&mut self, new_value: Value) {
-    self.current_value.store(Arc::new(new_value));
-    let new_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
-    let _ = self.version_sender.send(new_version);
-    self.permit.release();  // Allow next body evaluation
-}
+// Notify subscribers via bounded channels (replaces unbounded send)
+notify_senders.retain_mut(|sender| {
+    match sender.try_send(()) {
+        Ok(()) => true,
+        Err(e) => !e.is_disconnected(),
+    }
+});
+
+permit.release();  // Allow next body evaluation
 ```
 
 ---
 
-### 5. Transformation Chain Implementation
+## Future Work
+
+The following sections describe planned features that are NOT yet implemented.
+
+---
+
+### 5. Transformation Chain Implementation (FUTURE)
 
 #### 5.1 FilteredList
 
@@ -1303,7 +1056,7 @@ impl FilteredList {
 
 ---
 
-### 6. Network Sync Protocol
+### 6. Network Sync Protocol (FUTURE)
 
 #### 6.1 Message Types
 
@@ -1382,7 +1135,7 @@ impl LocalReplica {
 
 ---
 
-### 7. Test Cases
+### 7. Test Cases (FUTURE)
 
 #### 7.1 Basic Version + Pull
 
@@ -1529,7 +1282,7 @@ async fn test_filter_chain_diff_translation() {
 
 ---
 
-### 8. Configuration Constants
+### 8. Configuration Constants (FUTURE)
 
 ```rust
 /// Default configuration values
@@ -1553,41 +1306,35 @@ pub mod config {
 
 ---
 
-### 9. Migration Strategy
+### 9. Migration Strategy (COMPLETED)
 
-#### Phase 1: Add versioning to ValueActor (non-breaking)
-- Add `current_version: AtomicU64`
-- Add `version_sender: watch::Sender<u64>`
-- Keep existing subscription mechanism working
+The migration was completed using bounded mpsc channels instead of watch channels.
 
-#### Phase 2: New Subscription type (parallel)
-- Create `VersionedSubscription` alongside existing `Subscription`
-- Test with specific use cases
+#### What was implemented:
 
-#### Phase 3: Migrate combinators
-- Update THEN to use snapshot reads for dependencies
-- Update WHILE to use versioned subscription
-- Update HOLD state management
+1. **Version tracking** - `current_version: Arc<AtomicU64>` added to ValueActor and List
+2. **Bounded notifications** - `notify_sender_sender` channel for subscriber registration
+3. **Loop-local storage** - Subscriber senders stored in actor loop local variables (no RefCell/Mutex)
+4. **DiffHistory** - `Arc<RefCell<DiffHistory>>` for LIST diff tracking
+5. **ListDiff types** - ItemId-based diff operations for O(1) filter translation
 
-#### Phase 4: Add DiffHistory to LIST
-- Implement `DiffHistory`
-- Add `ItemId` to list items
-- Convert existing `ListChange` to `ListDiff`
+#### Key design change from original plan:
 
-#### Phase 5: Remove old subscription (breaking)
-- Remove `mpsc::unbounded` subscription channels
-- All subscriptions use version + pull
+- **Original**: `watch::Sender<u64>` for notifications (requires RefCell for wakers)
+- **Actual**: Bounded(1) mpsc channels per subscriber (pure dataflow, no RefCell)
+
+This change was made to avoid RefCell/Mutex in the runtime, as they caused debugging issues.
 
 ---
 
-### 10. Edge Cases
+### 10. Edge Cases (REFERENCE)
 
 | Scenario | Behavior |
 |----------|----------|
-| Subscriber never polls | Version notifications overwrite (O(1) memory) |
-| Actor dropped while subscriber waiting | `watch::Receiver::changed()` returns `Err`, subscription ends |
-| Concurrent updates during pull | Subscriber gets version at time of pull, may need another pull |
-| DiffHistory full during burst | Old diffs dropped, slow subscriber gets snapshot |
+| Subscriber never polls | Bounded(1) channel full, `try_send` skips notification (O(1) memory) |
+| Actor dropped while subscriber waiting | `poll_next` returns `Poll::Ready(None)`, subscription ends |
+| Concurrent updates during pull | Subscriber gets version at time of poll, may see newer value |
+| DiffHistory full during burst | Old diffs dropped, slow subscriber may need full list |
 | Replace diff received | Clears history, becomes new checkpoint |
 | Network disconnect | Local replica keeps working, re-syncs on reconnect |
 | Empty list | Works normally, snapshot is empty vec |

@@ -277,107 +277,9 @@ impl BackpressurePermit {
     }
 }
 
-// --- VersionNotifier ---
-
-/// Watch-like version notification channel.
-///
-/// Unlike `mpsc::unbounded`, this has O(1) memory regardless of how slow consumers are.
-/// Subscribers only receive notifications that the version changed, then pull data on demand.
-///
-/// This is the foundation of the push-pull architecture that prevents unbounded memory growth.
-#[derive(Clone)]
-pub struct VersionNotifier {
-    /// Current version number (increments on each value change)
-    version: Arc<AtomicU64>,
-    /// Wakers for subscribers waiting for version changes
-    wakers: Arc<RefCell<Vec<Waker>>>,
-}
-
-impl VersionNotifier {
-    /// Create a new version notifier starting at version 0.
-    pub fn new() -> Self {
-        Self {
-            version: Arc::new(AtomicU64::new(0)),
-            wakers: Arc::new(RefCell::new(Vec::new())),
-        }
-    }
-
-    /// Get the current version number.
-    pub fn version(&self) -> u64 {
-        self.version.load(Ordering::SeqCst)
-    }
-
-    /// Notify all waiting subscribers that a new version is available.
-    /// Returns the new version number.
-    pub fn notify(&self, new_version: u64) {
-        self.version.store(new_version, Ordering::SeqCst);
-        // Wake all waiting subscribers
-        let wakers = std::mem::take(&mut *self.wakers.borrow_mut());
-        for waker in wakers {
-            waker.wake();
-        }
-    }
-
-    /// Subscribe to version notifications.
-    pub fn subscribe(&self) -> VersionReceiver {
-        VersionReceiver {
-            notifier: self.clone(),
-            last_seen: 0,
-        }
-    }
-}
-
-impl Default for VersionNotifier {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Receiver for version notifications.
-///
-/// Provides async waiting for version changes and tracks last seen version.
-pub struct VersionReceiver {
-    notifier: VersionNotifier,
-    last_seen: u64,
-}
-
-impl VersionReceiver {
-    /// Wait until the version changes from our last seen version.
-    /// Returns immediately if there's already a newer version available.
-    pub async fn changed(&mut self) -> u64 {
-        std::future::poll_fn(|cx| {
-            let current = self.notifier.version();
-            if current > self.last_seen {
-                self.last_seen = current;
-                Poll::Ready(current)
-            } else {
-                // Register waker for notification
-                self.notifier.wakers.borrow_mut().push(cx.waker().clone());
-                Poll::Pending
-            }
-        }).await
-    }
-
-    /// Check if there's a newer version without waiting.
-    pub fn has_changed(&self) -> bool {
-        self.notifier.version() > self.last_seen
-    }
-
-    /// Get the current version without updating last_seen.
-    pub fn current_version(&self) -> u64 {
-        self.notifier.version()
-    }
-
-    /// Get the last version we saw.
-    pub fn last_seen_version(&self) -> u64 {
-        self.last_seen
-    }
-
-    /// Update last_seen to current version.
-    pub fn mark_seen(&mut self) {
-        self.last_seen = self.notifier.version();
-    }
-}
+// --- Subscription Notification ---
+// Version notifications use bounded channels in the actor loop (no RefCell).
+// See ActorMessage::Subscribe and ValueActor.notify_sender_sender
 
 // --- ActorMessage ---
 
@@ -1978,12 +1880,13 @@ pub struct ValueActor {
     current_value: Arc<ArcSwap<Option<Value>>>,
 
     /// Current version number - increments on each value change.
-    /// Used by VersionedSubscription for push-pull architecture.
+    /// Used by Subscription for push-pull architecture.
     current_version: Arc<AtomicU64>,
 
-    /// Notifier for version changes.
-    /// Subscribers wait on this for O(1) memory notifications.
-    version_notifier: VersionNotifier,
+    /// Channel for registering new subscribers.
+    /// Subscribers send their bounded sender here, actor loop stores them locally.
+    /// Using bounded(1) channels prevents unbounded memory growth for slow consumers.
+    notify_sender_sender: mpsc::UnboundedSender<mpsc::Sender<()>>,
 
     /// The actor's internal task.
     loop_task: TaskHandle,
@@ -2032,13 +1935,13 @@ impl ValueActor {
         let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
         let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(None));
         let current_version = Arc::new(AtomicU64::new(0));
-        let version_notifier = VersionNotifier::new();
+        // Channel for subscribers to register their notification senders
+        let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
 
         let loop_task = Task::start_droppable({
             let construct_info = construct_info.clone();
             let current_value = current_value.clone();
             let current_version = current_version.clone();
-            let version_notifier = version_notifier.clone();
             let output_valve_signal = actor_context.output_valve_signal;
             // Keep inputs alive in the spawned task
             let _inputs = inputs.clone();
@@ -2053,10 +1956,20 @@ impl ValueActor {
                     .fuse();
                 let mut value_stream = pin!(value_stream.fuse());
                 let mut message_receiver = pin!(message_receiver.fuse());
+                let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
                 let mut migration_state = MigrationState::Normal;
+                // Subscriber notification senders - stored locally in this loop (no RefCell)
+                let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
 
                 loop {
                     select! {
+                        // Handle new subscriber registrations
+                        sender = notify_sender_receiver.next() => {
+                            if let Some(sender) = sender {
+                                notify_senders.push(sender);
+                            }
+                        }
+
                         // Handle messages from the message channel
                         // When message_sender is dropped (ValueActor dropped), this returns None
                         msg = message_receiver.next() => {
@@ -2068,9 +1981,17 @@ impl ValueActor {
                                 ActorMessage::StreamValue(value) => {
                                     // Value received from migration source - treat as new value
                                     current_value.store(Arc::new(Some(value)));
-                                    // Increment version and notify waiting subscribers
-                                    let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                                    version_notifier.notify(new_version);
+                                    // Increment version
+                                    current_version.fetch_add(1, Ordering::SeqCst);
+                                    // Notify subscribers via bounded channels (try_send - if full, skip)
+                                    notify_senders.retain_mut(|sender| {
+                                        // try_send returns Err if receiver dropped or buffer full
+                                        // If dropped, remove from list. If full, keep (subscriber has pending notification)
+                                        match sender.try_send(()) {
+                                            Ok(()) => true,
+                                            Err(e) => !e.is_disconnected(),
+                                        }
+                                    });
                                 }
                                 ActorMessage::MigrateTo { target, transform } => {
                                     // Phase 3: Migration - not implemented yet
@@ -2099,8 +2020,7 @@ impl ValueActor {
                                     migration_state = MigrationState::Normal;
                                 }
                                 ActorMessage::RedirectSubscribers { target: _ } => {
-                                    // Phase 3: Redirect - version-based subscriptions don't need explicit redirect
-                                    // Subscribers will naturally pick up data from the new actor via version checks
+                                    // Phase 3: Redirect - subscribers will pick up data via version checks
                                     migration_state = MigrationState::ShuttingDown;
                                 }
                                 ActorMessage::Shutdown => {
@@ -2121,9 +2041,15 @@ impl ValueActor {
                             };
 
                             current_value.store(Arc::new(Some(new_value.clone())));
-                            // Increment version and notify waiting subscribers
-                            let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                            version_notifier.notify(new_version);
+                            // Increment version
+                            current_version.fetch_add(1, Ordering::SeqCst);
+                            // Notify subscribers via bounded channels
+                            notify_senders.retain_mut(|sender| {
+                                match sender.try_send(()) {
+                                    Ok(()) => true,
+                                    Err(e) => !e.is_disconnected(),
+                                }
+                            });
 
                             // Handle migration forwarding
                             if let MigrationState::Migrating { buffered_writes, target, .. } = &mut migration_state {
@@ -2138,8 +2064,7 @@ impl ValueActor {
                                 // Valve closed - but we DON'T break!
                                 continue;
                             }
-                            // Version-based subscriptions: subscribers pull on demand via version_notifier
-                            // No explicit broadcast needed - they'll see the update via version check
+                            // Subscribers pull on demand - no explicit broadcast needed
                         }
                     }
                 }
@@ -2160,7 +2085,7 @@ impl ValueActor {
             inputs,
             current_value,
             current_version,
-            version_notifier,
+            notify_sender_sender,
             loop_task,
         }
     }
@@ -2217,21 +2142,22 @@ impl ValueActor {
         self.current_version.load(Ordering::SeqCst)
     }
 
-    /// Get a receiver for version change notifications.
-    /// Used by VersionedSubscription to implement push-pull architecture.
-    pub fn version_receiver(&self) -> VersionReceiver {
-        self.version_notifier.subscribe()
-    }
-
-    /// Subscribe to this actor's values using version-based pull model.
+    /// Subscribe to this actor's values using bounded channel notifications.
     ///
-    /// Memory-efficient subscription that only stores a version number and pulls
-    /// data on demand. O(1) memory usage regardless of subscriber speed.
-    /// Slow subscribers automatically skip to the latest value.
+    /// Memory-efficient subscription using bounded(1) channels.
+    /// - O(1) memory per subscriber regardless of speed
+    /// - Slow subscribers automatically skip to latest value
+    /// - No RefCell or internal mutability - pure dataflow
     pub fn subscribe(self: Arc<Self>) -> Subscription {
+        // Create bounded(1) channel - at most 1 pending notification
+        let (sender, receiver) = mpsc::channel::<()>(1);
+        // Register with actor loop
+        if let Err(e) = self.notify_sender_sender.unbounded_send(sender) {
+            eprintln!("Failed to register subscriber: {e:#}");
+        }
         Subscription {
             last_seen_version: 0,
-            version_receiver: self.version_receiver(),
+            notify_receiver: receiver,
             actor: self,
         }
     }
@@ -2278,20 +2204,19 @@ pub enum ValueUpdate {
 
 // --- Subscription ---
 
-/// Version-based subscription that pulls data on demand.
+/// Bounded-channel subscription that pulls data on demand.
 ///
-/// Tracks only a version number and pulls data on demand, giving O(1) memory
-/// usage regardless of subscriber speed. Slow subscribers automatically skip
-/// to the latest value.
+/// Uses bounded(1) channels for notifications - pure dataflow, no RefCell.
+/// O(1) memory per subscriber regardless of speed.
 ///
 /// # Memory Characteristics
-/// - Notifications: O(1) - just a version number
-/// - Data: Pulled on demand, never queued
+/// - Notifications: bounded(1) channel - at most 1 pending signal
+/// - Data: Pulled on demand from ArcSwap, never queued
 /// - Slow consumer: Skips to latest automatically
 pub struct Subscription {
     actor: Arc<ValueActor>,
     last_seen_version: u64,
-    version_receiver: VersionReceiver,
+    notify_receiver: mpsc::Receiver<()>,
 }
 
 impl Subscription {
@@ -2303,8 +2228,11 @@ impl Subscription {
             if current > self.last_seen_version {
                 break;
             }
-            // Wait for change notification
-            self.version_receiver.changed().await;
+            // Wait for notification from actor loop
+            if self.notify_receiver.next().await.is_none() {
+                // Actor dropped - no more values
+                return None;
+            }
         }
 
         self.last_seen_version = self.actor.version();
@@ -2331,6 +2259,7 @@ impl Stream for Subscription {
     type Item = Value;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Check if there's a newer version
         let current = self.actor.version();
         if current > self.last_seen_version {
             self.last_seen_version = current;
@@ -2339,40 +2268,58 @@ impl Stream for Subscription {
             }
         }
 
-        // Register waker for version change
-        self.version_receiver.notifier.wakers.borrow_mut().push(cx.waker().clone());
-        Poll::Pending
+        // Poll the notification receiver - this registers the waker internally
+        match Pin::new(&mut self.notify_receiver).poll_next(cx) {
+            Poll::Ready(Some(())) => {
+                // Got notification, return the current value
+                let current = self.actor.version();
+                self.last_seen_version = current;
+                if let Some(value) = self.actor.current_value() {
+                    Poll::Ready(Some(value))
+                } else {
+                    // Value not yet set, keep waiting
+                    Poll::Pending
+                }
+            }
+            Poll::Ready(None) => {
+                // Channel closed, actor dropped
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
 // --- ListDiffSubscription ---
 
-/// Version-based subscription for List that returns diffs.
+/// Bounded-channel subscription for List that returns diffs.
 ///
 /// Unlike the legacy ListSubscription which queues ListChange in unbounded channels,
-/// this pulls data on demand and returns efficient diffs.
+/// this uses bounded(1) channels and pulls data on demand.
 pub struct ListDiffSubscription {
     list: Arc<List>,
     last_seen_version: u64,
-    version_receiver: VersionReceiver,
+    notify_receiver: mpsc::Receiver<()>,
 }
 
 impl ListDiffSubscription {
     /// Wait for next update and return optimal data (diffs or snapshot).
-    pub async fn next_update(&mut self) -> ValueUpdate {
+    pub async fn next_update(&mut self) -> Option<ValueUpdate> {
         // Wait for version to change
         loop {
             let current = self.list.version();
             if current > self.last_seen_version {
                 break;
             }
-            // Wait for change notification
-            self.version_receiver.changed().await;
+            // Wait for notification
+            if self.notify_receiver.next().await.is_none() {
+                return None;
+            }
         }
 
         let update = self.list.get_update_since(self.last_seen_version);
         self.last_seen_version = self.list.version();
-        update
+        Some(update)
     }
 
     /// Get current snapshot immediately without waiting.
@@ -2402,9 +2349,17 @@ impl Stream for ListDiffSubscription {
             return Poll::Ready(Some(update));
         }
 
-        // Register waker for version change
-        self.version_receiver.notifier.wakers.borrow_mut().push(cx.waker().clone());
-        Poll::Pending
+        // Poll the notification receiver
+        match Pin::new(&mut self.notify_receiver).poll_next(cx) {
+            Poll::Ready(Some(())) => {
+                let current = self.list.version();
+                let update = self.list.get_update_since(self.last_seen_version);
+                self.last_seen_version = current;
+                Poll::Ready(Some(update))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -3353,8 +3308,8 @@ pub struct List {
     change_sender_sender: mpsc::UnboundedSender<mpsc::UnboundedSender<ListChange>>,
     /// Current version (increments on each change)
     current_version: Arc<AtomicU64>,
-    /// Version notifier for efficient change detection
-    version_notifier: VersionNotifier,
+    /// Channel for registering diff subscribers (bounded channels)
+    notify_sender_sender: mpsc::UnboundedSender<mpsc::Sender<()>>,
     /// Diff history for efficient incremental updates
     diff_history: Arc<RefCell<DiffHistory>>,
 }
@@ -3384,9 +3339,10 @@ impl List {
 
         // Version tracking for push-pull architecture
         let current_version = Arc::new(AtomicU64::new(0));
-        let version_notifier = VersionNotifier::new();
         let current_version_for_loop = current_version.clone();
-        let version_notifier_for_loop = version_notifier.clone();
+
+        // Channel for diff subscriber registration (bounded channels)
+        let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
 
         // Diff history for efficient incremental updates
         let diff_history = Arc::new(RefCell::new(DiffHistory::new(DiffHistoryConfig::default())));
@@ -3405,10 +3361,20 @@ impl List {
                     }
                     .fuse();
                 let mut change_stream = pin!(change_stream.fuse());
+                let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
                 let mut change_senders = Vec::<mpsc::UnboundedSender<ListChange>>::new();
+                // Diff subscriber notification senders (bounded channels)
+                let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
                 let mut list = None;
                 loop {
                     select! {
+                        // Handle new diff subscriber registrations
+                        sender = notify_sender_receiver.next() => {
+                            if let Some(sender) = sender {
+                                notify_senders.push(sender);
+                            }
+                        }
+
                         change = change_stream.next() => {
                             let Some(change) = change else { break };
                             if output_valve_signal.is_none() {
@@ -3438,9 +3404,15 @@ impl List {
                                     panic!("Failed to initialize {construct_info}: The first change has to be 'ListChange::Replace'")
                                 }
                             }
-                            // Increment version and notify subscribers
-                            let new_version = current_version_for_loop.fetch_add(1, Ordering::SeqCst) + 1;
-                            version_notifier_for_loop.notify(new_version);
+                            // Increment version
+                            current_version_for_loop.fetch_add(1, Ordering::SeqCst);
+                            // Notify diff subscribers via bounded channels
+                            notify_senders.retain_mut(|sender| {
+                                match sender.try_send(()) {
+                                    Ok(()) => true,
+                                    Err(e) => !e.is_disconnected(),
+                                }
+                            });
                         }
                         change_sender = change_sender_receiver.select_next_some() => {
                             if output_valve_signal.is_none() {
@@ -3487,7 +3459,7 @@ impl List {
             loop_task,
             change_sender_sender,
             current_version,
-            version_notifier,
+            notify_sender_sender,
             diff_history,
         }
     }
@@ -3495,11 +3467,6 @@ impl List {
     /// Get current version.
     pub fn version(&self) -> u64 {
         self.current_version.load(Ordering::SeqCst)
-    }
-
-    /// Get a version receiver for efficient change detection.
-    pub fn version_receiver(&self) -> VersionReceiver {
-        self.version_notifier.subscribe()
     }
 
     /// Get optimal update for subscriber at given version.
@@ -3514,10 +3481,18 @@ impl List {
     }
 
     /// Subscribe to list updates with diff support.
+    ///
+    /// Uses bounded(1) channels - pure dataflow, no RefCell.
     pub fn subscribe_diffs(self: Arc<Self>) -> ListDiffSubscription {
+        // Create bounded(1) channel
+        let (sender, receiver) = mpsc::channel::<()>(1);
+        // Register with list loop
+        if let Err(e) = self.notify_sender_sender.unbounded_send(sender) {
+            eprintln!("Failed to register diff subscriber: {e:#}");
+        }
         ListDiffSubscription {
             last_seen_version: 0,
-            version_receiver: self.version_receiver(),
+            notify_receiver: receiver,
             list: self,
         }
     }
