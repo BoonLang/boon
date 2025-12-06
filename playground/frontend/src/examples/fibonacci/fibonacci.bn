@@ -9,8 +9,8 @@ FUNCTION fibonacci(position) {
                 ]
             }
         }
-        state.iteration |> WHEN {
-            position => state.current
+        state.iteration == position |> WHEN {
+            True => state.current
             __ => SKIP
         }
     }
