@@ -52,6 +52,7 @@ signals |> WHILE {
 | **WHILE** | Bool signals (level-sensitive) | `reset \|> WHILE { True => ..., False => ... }` |
 | **WHILE** | Tag matching with dependencies | `filter \|> WHILE { Active => item.completed \|> Bool/not() }` |
 | **WHEN** | Pure value matching (no dependencies) | `state \|> WHEN { StateA => StateB, StateB => StateC }` |
+| **WHEN** | Outer scope variable comparison | `iteration \|> WHEN { target => result, __ => SKIP }` |
 
 ---
 
@@ -64,6 +65,7 @@ signals |> WHILE {
 - ✅ Tagged union variants
 - ✅ Discrete value matching (constants, enums without accessing outer scope)
 - ✅ Pattern decomposition (when not accessing dependencies)
+- ✅ Comparing against outer scope variables (iteration termination, equality guards)
 
 **Examples:**
 
@@ -94,6 +96,29 @@ point \|> WHEN {
     [x: x, y: y] => cartesian(x, y)
 }
 ```
+
+### Outer Scope Variable Comparison
+
+When a pattern alias matches an existing variable name from outer scope, WHEN **compares** against that variable's value instead of creating a new binding:
+
+```boon
+-- Fibonacci: emit result when iteration equals position
+position: 5
+state: [iteration: 0, current: 1, ...] |> HOLD state { ... }
+
+state.iteration |> WHEN {
+    position => state.current  -- Compares iteration against position (5)
+    __ => SKIP                 -- Skip until they match
+}
+```
+
+**How it works:**
+1. Pattern `position` matches the outer scope variable name
+2. Instead of binding `state.iteration` to a new `position`, it compares values
+3. When `state.iteration == 5`, the pattern matches → emits `state.current`
+4. When values differ, pattern fails → falls through to wildcard `__`
+
+This enables iteration termination, equality guards, and comparing computed values against targets without explicit comparison operators in patterns.
 
 ---
 
@@ -264,6 +289,7 @@ Does pattern matching access dependencies (record fields or outer scope)?
    │
    ├─ Pure state transitions? (StateA => StateB)
    ├─ Constant mapping? (Red => 0xFF0000)
+   ├─ Compare against outer scope variable? (iteration |> WHEN { target => ... })
    └─ No external dependencies in branches
 ```
 
@@ -409,6 +435,8 @@ endcase
    - Pattern matching and branches **evaluated once** when input value changes
    - Use for: Pure state transitions, constant mappings, no external dependencies
    - Example: `state \|> WHEN { StateA => StateB }` - pure mapping
+   - **Outer scope comparison**: Pattern aliases matching existing variable names compare values
+   - Example: `iteration \|> WHEN { target => result, __ => SKIP }` - matches when `iteration == target`
 
 3. **Critical rule for records**: Always use WHILE for record pattern matching
    - Record fields are dependencies that need to flow
