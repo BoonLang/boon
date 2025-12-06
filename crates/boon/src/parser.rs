@@ -386,6 +386,8 @@ where
 
             let pattern_literal_number = select! { Token::Number(number) => Pattern::Literal(Literal::Number(number)) };
             let pattern_literal_tag = pascal_case_identifier.map(|tag| Pattern::Literal(Literal::Tag(tag)));
+            // TEXT { content } pattern - only allows literal text without interpolation
+            let pattern_literal_text = select! { Token::TextContent(content, _) => Pattern::Literal(Literal::Text(content)) };
 
             let pattern_alias = snake_case_identifier.map(|name| Pattern::Alias { name });
 
@@ -438,6 +440,7 @@ where
                 pattern_object,
                 pattern_literal_number,
                 pattern_literal_tag,
+                pattern_literal_text,
                 pattern_alias,
             ))
         });
@@ -884,6 +887,7 @@ pub struct Variable<'code> {
 pub enum Literal<'code> {
     Number(f64),
     Tag(&'code str),
+    Text(&'code str),
 }
 
 #[derive(Debug, Clone)]
@@ -1118,5 +1122,41 @@ mod tests {
         parse_and_test!("2 * 3", |expr: &Expression| {
             assert!(matches!(expr, Expression::ArithmeticOperator(ArithmeticOperator::Multiply { .. })));
         });
+    }
+
+    #[test]
+    fn test_when_with_text_pattern() {
+        parse_and_test!("WHEN { TEXT { /active } => Active, __ => All }", |expr: &Expression| {
+            if let Expression::When { arms } = expr {
+                assert_eq!(arms.len(), 2);
+                // First arm should have TEXT literal pattern
+                assert!(matches!(arms[0].pattern, Pattern::Literal(Literal::Text("/active"))));
+                // Second arm should have wildcard pattern
+                assert!(matches!(arms[1].pattern, Pattern::WildCard));
+            } else {
+                panic!("Expected When, got {:?}", expr);
+            }
+        });
+    }
+
+    #[test]
+    fn test_parse_todo_mvc_file() {
+        // Test parsing a complex file with many TEXT patterns
+        let source = include_str!("../../../playground/frontend/src/examples/todo_mvc/todo_mvc.bn");
+        let (tokens, errors) = lexer::lexer().parse(source).into_output_errors();
+        assert!(errors.is_empty(), "Lexer errors: {:?}", errors);
+
+        let mut tokens = tokens.unwrap();
+        tokens.retain(|t| !matches!(t.node, lexer::Token::Comment(_)));
+
+        let input = tokens.map(
+            Span::splat(source.len()),
+            |Spanned { node, span, persistence: _ }| (node, span)
+        );
+
+        let (ast, errors) = parser().parse(input).into_output_errors();
+
+        assert!(errors.is_empty(), "Parser errors: {:?}", errors);
+        assert!(ast.is_some(), "AST should be produced");
     }
 }

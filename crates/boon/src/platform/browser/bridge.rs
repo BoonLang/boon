@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use zoon::futures_util::{select, stream, StreamExt};
+use zoon::futures_util::{future, select, stream, StreamExt};
 use zoon::futures_channel::mpsc;
 use zoon::{eprintln, *};
 
@@ -73,6 +73,44 @@ fn element_stripe(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
+    let (hovered_sender, mut hovered_receiver) = mpsc::unbounded::<bool>();
+
+    // Set up hovered link if element field exists with hovered property
+    let element_variable = tagged_object.variable("element");
+    let hovered_stream = stream::iter(element_variable)
+        .flat_map(|variable| variable.subscribe())
+        .filter_map(|value| future::ready(value.expect_object().variable("hovered")))
+        .map(|variable| variable.expect_link_value_sender());
+
+    let hovered_handler_task = Task::start_droppable({
+        let construct_context = construct_context.clone();
+        async move {
+            let mut hovered_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
+            let mut hovered_stream = hovered_stream.fuse();
+            loop {
+                select! {
+                    new_sender = hovered_stream.next() => {
+                        if let Some(sender) = new_sender {
+                            hovered_link_value_sender = Some(sender);
+                        }
+                    }
+                    is_hovered = hovered_receiver.select_next_some() => {
+                        if let Some(sender) = hovered_link_value_sender.as_ref() {
+                            let hover_tag = if is_hovered { "True" } else { "False" };
+                            let event_value = EngineTag::new_value(
+                                ConstructInfo::new("stripe::hovered", None, "Stripe hovered state"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                hover_tag,
+                            );
+                            let _ = sender.unbounded_send(event_value);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     let settings_variable = tagged_object.expect_variable("settings");
 
     // In the flat_map closures below, the settings Object is extracted as a temporary
@@ -128,11 +166,15 @@ fn element_stripe(
                 }))
             },
         ))
+        .on_hovered_change(move |is_hovered| {
+            let _ = hovered_sender.unbounded_send(is_hovered);
+        })
         // Keep tagged_object, settings_object, and items_list_value alive for the lifetime of this element
         .after_remove(move |_| {
             drop(tagged_object);
             drop(settings_object);
             drop(items_list_value);
+            drop(hovered_handler_task);
         })
 }
 

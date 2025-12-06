@@ -900,6 +900,14 @@ fn set_persistence<'a, 'code, 'old_code>(
                         } if old_tag == tag => Some(old_span_id_pairs[span]),
                         _ => None,
                     },
+                    Literal::Text(text) => match old_expression {
+                        Spanned {
+                            span,
+                            persistence: _,
+                            node: Expression::Literal(Literal::Text(old_text)),
+                        } if old_text == text => Some(old_span_id_pairs[span]),
+                        _ => None,
+                    },
                 });
             if let Some(id) = id {
                 new_span_id_pairs.insert(*span, id);

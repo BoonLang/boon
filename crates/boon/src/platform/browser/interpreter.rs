@@ -9,6 +9,9 @@ use chumsky::input::Stream;
 use serde_json_any_key::MapIterToJson;
 use zoon::{UnwrapThrowExt, WebStorage, eprintln, local_storage, println, serde_json};
 
+/// Set to false to disable verbose source code and AST logging in console
+const LOG_SOURCE_AND_AST: bool = false;
+
 use crate::parser::{
     Expression, Input, ParseError, Parser, SourceCode, Span, Spanned, Token, lexer, parser,
     resolve_persistence, resolve_references, static_expression,
@@ -44,8 +47,10 @@ pub fn run(
         None
     };
 
-    println!("[Source Code ({filename})]");
-    println!("{source_code}");
+    if LOG_SOURCE_AND_AST {
+        println!("[Source Code ({filename})]");
+        println!("{source_code}");
+    }
 
     let (tokens, errors) = lexer().parse(source_code).into_output_errors();
     if let Some(tokens) = tokens.as_ref() {
@@ -104,8 +109,10 @@ pub fn run(
                 return None;
             }
         };
-    println!("[Abstract Syntax Tree with Reference Data and Persistence]");
-    println!("{ast:#?}");
+    if LOG_SOURCE_AND_AST {
+        println!("[Abstract Syntax Tree with Reference Data and Persistence]");
+        println!("{ast:#?}");
+    }
 
     // Convert to static expressions (owned, 'static, no lifetimes)
     // Note: source_code_arc was created at the start of this function
@@ -180,8 +187,10 @@ pub fn run_with_registry(
         None
     };
 
-    println!("[Source Code ({filename})]");
-    println!("{source_code}");
+    if LOG_SOURCE_AND_AST {
+        println!("[Source Code ({filename})]");
+        println!("{source_code}");
+    }
 
     let (tokens, errors) = lexer().parse(source_code).into_output_errors();
     if !errors.is_empty() {
@@ -230,8 +239,10 @@ pub fn run_with_registry(
                 return None;
             }
         };
-    println!("[Abstract Syntax Tree with Reference Data and Persistence]");
-    println!("{ast:#?}");
+    if LOG_SOURCE_AND_AST {
+        println!("[Abstract Syntax Tree with Reference Data and Persistence]");
+        println!("{ast:#?}");
+    }
 
     // Convert to static expressions (owned, 'static, no lifetimes)
     // Note: source_code_arc was created at the start of this function

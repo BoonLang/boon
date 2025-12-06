@@ -488,6 +488,20 @@ fn static_spanned_expression_into_value_actor(
                     tag,
                 )
             }
+            static_expression::Literal::Text(text) => {
+                let text = text.to_string();
+                Text::new_arc_value_actor(
+                    ConstructInfo::new(
+                        format!("PersistenceId: {persistence_id}"),
+                        persistence,
+                        format!("{span}; Text {text}"),
+                    ),
+                    construct_context,
+                    idempotency_key,
+                    actor_context,
+                    text,
+                )
+            }
         },
         static_expression::Expression::List { items } => {
             let evaluated_items: Result<Vec<_>, _> = items
@@ -2633,6 +2647,13 @@ fn match_pattern(
                 }
                 (static_expression::Literal::Tag(pattern_tag), Value::Tag(tag, _)) => {
                     if tag.tag() == pattern_tag.as_ref() {
+                        Some(bindings)
+                    } else {
+                        None
+                    }
+                }
+                (static_expression::Literal::Text(pattern_text), Value::Text(text, _)) => {
+                    if text.text() == pattern_text.as_ref() {
                         Some(bindings)
                     } else {
                         None

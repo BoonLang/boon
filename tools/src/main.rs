@@ -190,6 +190,12 @@ enum ExecAction {
     /// Clear saved states (reset localStorage for tests)
     ClearStates,
 
+    /// Select an example by name (e.g., "todo_mvc.bn")
+    Select {
+        /// Example name (e.g., "todo_mvc.bn" or "todo_mvc")
+        name: String,
+    },
+
     /// Run all example tests (examples with .expected files)
     TestExamples {
         /// Only run examples matching pattern (e.g., "counter", "todo")
@@ -508,6 +514,20 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
         ExecAction::ClearStates => {
             println!("Clearing saved states...");
             let response = send_command_to_server(port, WsCommand::ClearStates).await?;
+            print_response(response);
+        }
+
+        ExecAction::Select { name } => {
+            // Add .bn suffix if not present
+            let example_name = if name.ends_with(".bn") {
+                name
+            } else {
+                format!("{}.bn", name)
+            };
+            println!("Selecting example: {}", example_name);
+            let response =
+                send_command_to_server(port, WsCommand::SelectExample { name: example_name })
+                    .await?;
             print_response(response);
         }
 

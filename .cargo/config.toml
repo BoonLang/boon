@@ -6,4 +6,6 @@ FRONTEND_BUILD_ID = "dev"
 CACHE_BUSTING = "false"
 
 [target.wasm32-unknown-unknown]
-rustflags = ["--cfg", 'getrandom_backend="wasm_js"']
+# Increase WASM stack size to 8MB (default is ~1MB) for parsing complex files
+# The -z stack-size flag is passed to the linker
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"', "-C", "link-arg=-zstack-size=8388608"]

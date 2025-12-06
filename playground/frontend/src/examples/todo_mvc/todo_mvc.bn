@@ -1,9 +1,9 @@
 store: [
     elements: [
-        filter_buttons: [ 
+        filter_buttons: [
             all: LINK
             active: LINK
-            completed: LINK 
+            completed: LINK
         ]
         remove_completed_button: LINK
         toggle_all_checkbox: LINK
@@ -236,33 +236,43 @@ FUNCTION new_todo_title_text_input() {
 }
 
 FUNCTION todos_element() {
-    Element/stripe(
-        element: [
-            nearby_element: [
-                position: Above
-                element: toggle_all_checkbox() 
+    Element/stack(
+        element: []
+        style: [width: Fill]
+        layers: LIST {
+            Element/stripe(
+                element: []
+                direction: Column
+                gap: 1
+                style: [
+                    borders: [top: [color: Oklch[lightness: 0.915]]]
+                    background: [color: Oklch[lightness: 0.946]]
+                ]
+                items: PASSED.store.todos
+                    |> List/retain(item, if: PASSED.store.selected_filter |> WHILE {
+                        All => True
+                        Active => item.completed |> Bool/not()
+                        Completed => item.completed
+                    })
+                    |> List/map(old, new: old |> todo_element())
+            )
+            Element/container(
+                element: []
+                style: [
+                    width: 60
+                    height: Fill
+                    align: [row: Left, column: Top]
+                ]
+                child: toggle_all_checkbox()
                     |> LINK { PASSED.store.elements.toggle_all_checkbox }
-            ]
-        ]
-        direction: Column
-        gap: 1
-        style: [
-            borders: [top: [color: Oklch[lightness: 0.915]]]
-            background: [color: Oklch[lightness: 0.946]]
-        ]
-        items: PASSED.store.todos
-            |> List/retain(item, if: PASSED.store.selected_filter |> WHILE {
-                All => True
-                Active => item.completed |> Bool/not()
-                Completed => item.completed
-            })
-            |> List/map(old, new: old |> todo_element())
+            )
+        }
     )
 }
 
 FUNCTION todo_element(todo) {
     Element/stripe(
-        element: []
+        element: [hovered: LINK]
         direction: Row
         gap: 5
         style: [
@@ -271,15 +281,20 @@ FUNCTION todo_element(todo) {
             font: [size: 24]
         ]
         items: PASSED.store.selected_todo_id == todo.id |> WHILE {
-            True => LIST { 
-                editing_todo_title_element(todo: todo) 
+            True => LIST {
+                editing_todo_title_element(todo: todo)
                     |> LINK { todo.todo_elements.editing_todo_title_element }
             }
             False => LIST {
-                todo_checkbox(todo: todo) 
+                todo_checkbox(todo: todo)
                     |> LINK { todo.todo_elements.todo_checkbox }
-                todo_title_element(todo: todo) 
+                todo_title_element(todo: todo)
                     |> LINK { todo.todo_elements.todo_title_element }
+                element.hovered |> WHILE {
+                    True => remove_todo_button()
+                        |> LINK { todo.todo_elements.remove_todo_button }
+                    False => NoElement
+                }
             }
         }
     )
@@ -360,26 +375,15 @@ FUNCTION todo_checkbox(todo) {
 
 FUNCTION todo_title_element(todo) {
     Element/label(
-        element: [
-            event: [double_click: LINK]
-            hovered: LINK
-            nearby_element: [
-                position: Right
-                element: hovered |> WHILE {
-                    True => remove_todo_button()
-                        |> LINK { todo.todo_elements.remove_todo_button }
-                    False => NoElement
-                }
-            ]
-        ]
+        element: [event: [double_click: LINK]]
         style: [
             width: Fill
             font: [
                 size: 24
                 line: [strike: todo.completed]
-                color: Oklch[lightness: todo.completed |> WHEN { 
+                color: Oklch[lightness: todo.completed |> WHEN {
                     True => 0.885
-                    False => 0.42 
+                    False => 0.42
                 }]
             ]
             padding: [column: 15, left: 15, right: 60]

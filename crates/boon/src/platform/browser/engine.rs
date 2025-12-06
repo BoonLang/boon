@@ -1609,8 +1609,72 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Number(n1, _), Value::Number(n2, _)) => n1.number() == n2.number(),
         (Value::Text(t1, _), Value::Text(t2, _)) => t1.text() == t2.text(),
         (Value::Tag(tag1, _), Value::Tag(tag2, _)) => tag1.tag() == tag2.tag(),
+        (Value::TaggedObject(to1, _), Value::TaggedObject(to2, _)) => {
+            tagged_objects_equal(to1, to2)
+        }
+        (Value::Object(o1, _), Value::Object(o2, _)) => objects_equal(o1, o2),
         _ => false, // Different types are not equal
     }
+}
+
+/// Deep comparison of two TaggedObjects using current field values
+fn tagged_objects_equal(a: &TaggedObject, b: &TaggedObject) -> bool {
+    // Tags must match
+    if a.tag != b.tag {
+        return false;
+    }
+    // Number of fields must match
+    if a.variables.len() != b.variables.len() {
+        return false;
+    }
+    // Compare each field by name and value
+    for var_a in &a.variables {
+        match b.variable(&var_a.name) {
+            Some(var_b) => {
+                let val_a = var_a.value_actor().current_value();
+                let val_b = var_b.value_actor().current_value();
+                match (val_a, val_b) {
+                    (Some(v_a), Some(v_b)) => {
+                        if !values_equal(&v_a, &v_b) {
+                            return false;
+                        }
+                    }
+                    (None, None) => {} // Both have no value yet - considered equal
+                    _ => return false,
+                }
+            }
+            None => return false, // Field not found in b
+        }
+    }
+    true
+}
+
+/// Deep comparison of two Objects using current field values
+fn objects_equal(a: &Object, b: &Object) -> bool {
+    // Number of fields must match
+    if a.variables.len() != b.variables.len() {
+        return false;
+    }
+    // Compare each field by name and value
+    for var_a in &a.variables {
+        match b.variable(&var_a.name) {
+            Some(var_b) => {
+                let val_a = var_a.value_actor().current_value();
+                let val_b = var_b.value_actor().current_value();
+                match (val_a, val_b) {
+                    (Some(v_a), Some(v_b)) => {
+                        if !values_equal(&v_a, &v_b) {
+                            return false;
+                        }
+                    }
+                    (None, None) => {} // Both have no value yet - considered equal
+                    _ => return false,
+                }
+            }
+            None => return false, // Field not found in b
+        }
+    }
+    true
 }
 
 /// Compare two Values for ordering. Returns None if types are incompatible.
@@ -1827,6 +1891,12 @@ pub fn pattern_to_matcher(pattern: &crate::parser::Pattern) -> Box<dyn Fn(&Value
                             Value::TaggedObject(to, _) => to.tag == tag,
                             _ => false,
                         }
+                    })
+                }
+                crate::parser::Literal::Text(text) => {
+                    let text = text.to_string();
+                    Box::new(move |v| {
+                        matches!(v, Value::Text(t, _) if t.text() == text)
                     })
                 }
             }

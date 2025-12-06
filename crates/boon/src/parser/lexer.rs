@@ -348,4 +348,25 @@ mod tests {
         let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
         assert_eq!(tokens, vec![&Token::TextContent("", 1)]);
     }
+
+    #[test]
+    fn test_text_content_with_slash() {
+        let result = lexer().parse("TEXT { /active }");
+        let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
+        assert_eq!(tokens, vec![&Token::TextContent("/active", 0)]);
+    }
+
+    #[test]
+    fn test_text_pattern_in_when() {
+        let result = lexer().parse("WHEN { TEXT { /active } => Active }");
+        let tokens: Vec<_> = result.output().unwrap().iter().map(|t| &t.node).collect();
+        assert_eq!(tokens, vec![
+            &Token::When,
+            &Token::BracketCurlyOpen,
+            &Token::TextContent("/active", 0),
+            &Token::Implies,
+            &Token::PascalCaseIdentifier("Active"),
+            &Token::BracketCurlyClose,
+        ]);
+    }
 }

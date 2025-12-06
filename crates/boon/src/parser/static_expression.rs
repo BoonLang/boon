@@ -183,6 +183,7 @@ pub struct Variable {
 pub enum Literal {
     Number(f64),
     Tag(StrSlice),
+    Text(StrSlice),
 }
 
 #[derive(Debug, Clone)]
@@ -412,6 +413,7 @@ impl ExpressionConverter {
         match lit {
             parser::Literal::Number(n) => Literal::Number(*n),
             parser::Literal::Tag(s) => Literal::Tag(self.str_to_slice(s)),
+            parser::Literal::Text(s) => Literal::Text(self.str_to_slice(s)),
         }
     }
 

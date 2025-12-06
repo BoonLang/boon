@@ -50,7 +50,7 @@ async function attachDebugger(tabId) {
   }
 }
 
-// Handle debugger events (console messages)
+// Handle debugger events (console messages and exceptions)
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (method === 'Runtime.consoleAPICalled') {
     const messages = cdpConsoleMessages.get(source.tabId) || [];
@@ -62,12 +62,39 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     if (messages.length > 100) messages.shift();
     cdpConsoleMessages.set(source.tabId, messages);
   }
+  // Capture uncaught exceptions (e.g., "Maximum call stack size exceeded")
+  if (method === 'Runtime.exceptionThrown') {
+    const messages = cdpConsoleMessages.get(source.tabId) || [];
+    const exception = params.exceptionDetails;
+    const text = exception.exception?.description ||
+                 exception.text ||
+                 'Unknown exception';
+    messages.push({
+      level: 'error',
+      text: `[EXCEPTION] ${text}`,
+      timestamp: Date.now()
+    });
+    if (messages.length > 100) messages.shift();
+    cdpConsoleMessages.set(source.tabId, messages);
+  }
 });
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   console.log(`[Boon] CDP: Debugger detached from tab ${source.tabId}, reason: ${reason}`);
   debuggerAttached.delete(source.tabId);
   cdpConsoleMessages.delete(source.tabId);
+});
+
+// Listen for tab updates (navigation, refresh) to clear stale debugger state
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  // When a tab starts loading (navigation/refresh), the debugger session becomes invalid
+  if (changeInfo.status === 'loading') {
+    if (debuggerAttached.has(tabId)) {
+      console.log(`[Boon] CDP: Tab ${tabId} navigating, clearing debugger state`);
+      debuggerAttached.delete(tabId);
+      cdpConsoleMessages.delete(tabId);
+    }
+  }
 });
 
 // ============ CDP OPERATIONS ============
@@ -230,18 +257,34 @@ function cdpGetConsole(tabId) {
 }
 
 // Execute JavaScript via CDP (only when CDP doesn't have equivalent)
-async function cdpEvaluate(tabId, expression) {
+// Includes retry logic for stale sessions
+async function cdpEvaluate(tabId, expression, retryCount = 0) {
   await attachDebugger(tabId);
 
-  const { result, exceptionDetails } = await chrome.debugger.sendCommand(
-    { tabId }, 'Runtime.evaluate', { expression, returnByValue: true }
-  );
+  try {
+    const { result, exceptionDetails } = await chrome.debugger.sendCommand(
+      { tabId }, 'Runtime.evaluate', { expression, returnByValue: true }
+    );
 
-  if (exceptionDetails) {
-    throw new Error(exceptionDetails.exception?.description || 'Evaluation failed');
+    if (exceptionDetails) {
+      throw new Error(exceptionDetails.exception?.description || 'Evaluation failed');
+    }
+
+    return result.value;
+  } catch (e) {
+    // Handle stale debugger session - clear state and retry once
+    if (retryCount === 0 && (
+      e.message?.includes('Target closed') ||
+      e.message?.includes('Cannot find context') ||
+      e.message?.includes('Debugger is not attached') ||
+      e.message?.includes('No tab with given id')
+    )) {
+      console.log(`[Boon] CDP: Stale session detected, re-attaching...`);
+      debuggerAttached.delete(tabId);
+      return cdpEvaluate(tabId, expression, retryCount + 1);
+    }
+    throw e;
   }
-
-  return result.value;
 }
 
 // Focus element via CDP
@@ -523,6 +566,53 @@ async function handleCommand(id, command) {
           return { type: 'error', message: e.message };
         }
 
+      case 'selectExample':
+        // Select an example by name (e.g., "todo_mvc.bn", "counter.bn")
+        // Uses CDP Runtime.evaluate to find and click the tab reliably
+        try {
+          const exampleName = command.name;
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              // Find all example tabs in the header
+              const tabs = document.querySelectorAll('[role="button"], button');
+              for (const tab of tabs) {
+                const text = (tab.textContent || '').trim();
+                if (text === '${exampleName}' || text === '${exampleName.replace('.bn', '')}') {
+                  // Found the tab - dispatch pointer events (Zoon uses pointer events)
+                  const rect = tab.getBoundingClientRect();
+                  const x = rect.left + rect.width / 2;
+                  const y = rect.top + rect.height / 2;
+
+                  ['pointerdown', 'pointerup'].forEach(type => {
+                    tab.dispatchEvent(new PointerEvent(type, {
+                      bubbles: true, cancelable: true, view: window,
+                      clientX: x, clientY: y,
+                      pointerId: 1, pointerType: 'mouse', isPrimary: true
+                    }));
+                  });
+
+                  tab.dispatchEvent(new MouseEvent('click', {
+                    bubbles: true, cancelable: true, view: window,
+                    clientX: x, clientY: y
+                  }));
+
+                  return { found: true, text: text };
+                }
+              }
+              return { found: false, available: Array.from(tabs).map(t => (t.textContent || '').trim()).filter(t => t.endsWith('.bn')) };
+            })()
+          `);
+
+          if (result && result.found) {
+            return { type: 'success', data: { selected: result.text } };
+          } else {
+            const available = result?.available?.join(', ') || 'unknown';
+            return { type: 'error', message: `Example '${exampleName}' not found. Available: ${available}` };
+          }
+        } catch (e) {
+          return { type: 'error', message: e.message };
+        }
+
       // ============ Legacy commands still using executeScript ============
 
       case 'getDOM':
@@ -548,12 +638,22 @@ async function handleCommand(id, command) {
       case 'refresh':
         // Refresh the tab WITHOUT reloading the extension (safer than reload)
         console.log('[Boon] Refreshing page...');
+        // Clear debugger state BEFORE refresh (tab listener also does this but be explicit)
+        debuggerAttached.delete(tab.id);
+        cdpConsoleMessages.delete(tab.id);
         await chrome.tabs.reload(tab.id);
         // Wait for page to load and API to be ready
         let attempts = 0;
         while (attempts < 30) {
           await new Promise(r => setTimeout(r, 500));
           if (await checkApiReady(tab.id)) {
+            // Pre-attach debugger so subsequent commands work immediately
+            try {
+              await attachDebugger(tab.id);
+              console.log('[Boon] CDP: Pre-attached debugger after refresh');
+            } catch (e) {
+              console.log('[Boon] CDP: Could not pre-attach debugger:', e.message);
+            }
             return { type: 'success', data: 'Page refreshed, API ready' };
           }
           attempts++;

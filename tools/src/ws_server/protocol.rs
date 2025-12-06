@@ -69,6 +69,9 @@ pub enum Command {
 
     /// Clear saved states (reset localStorage for Boon playground)
     ClearStates,
+
+    /// Select an example by name (e.g., "todo_mvc.bn", "counter.bn")
+    SelectExample { name: String },
 }
 
 /// Response from Extension to CLI via Server
