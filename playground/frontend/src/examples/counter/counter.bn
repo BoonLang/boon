@@ -1,6 +1,7 @@
 document: Document/new(root: Element/stripe(
     element: []
     direction: Column
+    gap: 0
     style: []
     items: LIST {
         counter

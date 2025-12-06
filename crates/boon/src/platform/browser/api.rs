@@ -81,6 +81,7 @@ pub fn function_document_new(
 /// Element/stripe(
 ///     element<[]>
 ///     direction<Column | Row>
+///     gap<Number>
 ///     style<[]>
 ///     items<List<INTO_ELEMENT>>
 /// ) -> ELEMENT_STRIPE
@@ -92,15 +93,10 @@ pub fn function_element_stripe(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let [
-        _argument_element,
-        argument_direction,
-        argument_style,
-        argument_items,
-    ] = arguments.as_slice()
-    else {
-        panic!("Unexpected argument count")
-    };
+    let [_argument_element, argument_direction, _argument_gap, argument_style, argument_items] =
+        arguments.as_slice() else {
+            panic!("Element/stripe requires 5 arguments, got {}", arguments.len());
+        };
     TaggedObject::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -1329,16 +1325,27 @@ pub fn function_list_append(
     // Create a change stream that:
     // 1. Forwards all changes from the original list
     // 2. Adds Push changes when the item stream produces values
+    //
+    // IMPORTANT: The first change MUST be a Replace from the original list.
+    // We use scan to ensure proper ordering: buffer append changes until
+    // after the first list change arrives.
     let change_stream = {
+        let function_call_id_for_append = function_call_id.clone();
+        let actor_context_for_append = actor_context.clone();
+
+        // Tag changes with their source so we can ensure proper ordering
+        enum TaggedChange {
+            FromList(ListChange),
+            FromAppend(ListChange),
+        }
+
         let list_changes = list_actor.clone().subscribe().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
                 _ => None,
             })
-        }).flat_map(|list| list.subscribe());
+        }).flat_map(|list| list.subscribe()).map(TaggedChange::FromList);
 
-        let function_call_id_for_append = function_call_id.clone();
-        let actor_context_for_append = actor_context.clone();
         let append_changes = item_actor.clone().subscribe().map(move |value| {
             // When item stream produces a value, create a new constant ValueActor
             // containing that specific value and push it
@@ -1352,11 +1359,45 @@ pub fn function_list_append(
                 constant(value),
                 None,
             );
-            ListChange::Push { item: new_item_actor }
+            TaggedChange::FromAppend(ListChange::Push { item: new_item_actor })
         });
 
-        // Merge both change streams
+        // Merge both change streams, then use scan to ensure proper ordering
         stream::select(list_changes, append_changes)
+            .scan(
+                (false, Vec::<ListChange>::new()), // (has_received_first_list_change, buffered_appends)
+                |state, tagged_change| {
+                    let (has_received_first, buffered) = state;
+
+                    let changes_to_emit = match tagged_change {
+                        TaggedChange::FromList(change) => {
+                            if !*has_received_first {
+                                // First list change - emit it plus any buffered appends
+                                *has_received_first = true;
+                                let mut all = vec![change];
+                                all.append(buffered);
+                                all
+                            } else {
+                                // Subsequent list change - emit directly
+                                vec![change]
+                            }
+                        }
+                        TaggedChange::FromAppend(change) => {
+                            if *has_received_first {
+                                // Already received first list change - emit directly
+                                vec![change]
+                            } else {
+                                // Buffer until first list change arrives
+                                buffered.push(change);
+                                vec![]
+                            }
+                        }
+                    };
+
+                    future::ready(Some(changes_to_emit))
+                }
+            )
+            .flat_map(|changes| stream::iter(changes))
     };
 
     let list = List::new_with_change_stream(
