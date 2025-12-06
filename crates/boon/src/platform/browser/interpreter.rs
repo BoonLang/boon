@@ -14,7 +14,7 @@ const LOG_SOURCE_AND_AST: bool = false;
 
 use crate::parser::{
     Expression, Input, ParseError, Parser, SourceCode, Spanned, Token, lexer, parser,
-    resolve_persistence, resolve_references, span_at, static_expression,
+    reset_expression_depth, resolve_persistence, resolve_references, span_at, static_expression,
 };
 use crate::platform::browser::{
     engine::{ConstructContext, Object, VirtualFilesystem},
@@ -67,6 +67,7 @@ pub fn run(
 
     tokens.retain(|spanned_token| !matches!(spanned_token.node, Token::Comment(_)));
 
+    reset_expression_depth();
     let (ast, errors) = parser()
         .parse(tokens.map(
             span_at(source_code.len()),
@@ -203,6 +204,7 @@ pub fn run_with_registry(
 
     tokens.retain(|spanned_token| !matches!(spanned_token.node, Token::Comment(_)));
 
+    reset_expression_depth();
     let (ast, errors) = parser()
         .parse(tokens.map(
             span_at(source_code.len()),
@@ -311,6 +313,7 @@ fn parse_old<'filename, 'old_code>(
 
     tokens.retain(|spanned_token| !matches!(spanned_token.node, Token::Comment(_)));
 
+    reset_expression_depth();
     let (ast, errors) = parser()
         .parse(Stream::from_iter(tokens).map(
             span_at(source_code.len()),

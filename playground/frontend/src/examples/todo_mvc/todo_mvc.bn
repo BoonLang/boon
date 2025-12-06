@@ -312,7 +312,7 @@ FUNCTION toggle_all_checkbox() {
                 height: 34
                 padding: [row: 27, column: 6]
                 font: [
-                    size: 22,
+                    size: 22
                     color: Oklch[lightness: checked |> WHEN { 
                         True => 0.555
                         False => 0.92
@@ -424,13 +424,13 @@ FUNCTION panel_footer() {
             padding: [row: 15, column: 8]
             font: [color: Oklch[lightness: 0.57]]
             borders: [top: [color: Oklch[lightness: 0.925]]]
-            shadows: [
+            shadows: LIST {
                 [y: 1, blur: 1, color: Oklch[alpha: 0.2]]
                 [y: 8, spread: -3, color: Oklch[lightness: 0.973]]
                 [y: 9, blur: 1, spread: -3, color: Oklch[alpha: 0.2]]
                 [y: 16, spread: -6, color: Oklch[lightness: 0.973]]
                 [y: 17, blur: 2, spread: -6, color: Oklch[alpha: 0.2]]
-            ]
+            }
         ]
         items: LIST {
             active_items_count_text

@@ -2,7 +2,27 @@
 #![allow(dead_code)]
 
 use chumsky::{input::ValueInput, pratt::*, prelude::*};
+use std::cell::Cell;
 use std::fmt;
+
+// Depth tracking for preventing stack overflow on deeply nested expressions.
+// This provides a helpful error message instead of crashing.
+thread_local! {
+    static EXPRESSION_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Maximum allowed nesting depth for expressions.
+/// This limit prevents stack overflow in WASM where stack space is limited (~256KB).
+/// If you hit this limit, consider:
+/// - Breaking deeply nested objects into separate variables
+/// - Using BLOCK to create intermediate bindings
+/// - Extracting complex WHEN/WHILE arms into functions
+const MAX_EXPRESSION_DEPTH: usize = 50;
+
+/// Reset the expression depth counter. Call before starting a new parse.
+pub fn reset_expression_depth() {
+    EXPRESSION_DEPTH.with(|d| d.set(0));
+}
 
 mod lexer;
 pub use lexer::{Token, lexer};
@@ -59,8 +79,37 @@ where
         let pascal_case_identifier =
             select! { Token::PascalCaseIdentifier(identifier) => identifier };
 
+        // Depth-tracked expression: checks nesting limit before recursing.
+        // This prevents stack overflow and gives a helpful error message.
+        let tracked_expr = empty()
+            .try_map(|_, span| {
+                EXPRESSION_DEPTH.with(|d| {
+                    let depth = d.get();
+                    if depth >= MAX_EXPRESSION_DEPTH {
+                        Err(Rich::custom(
+                            span,
+                            format!(
+                                "Expression nesting too deep ({} levels, max {}). \
+                                Consider breaking into smaller functions or using BLOCK for intermediate bindings. \
+                                If you believe this limit is too restrictive, please report it to Boon compiler maintainers.",
+                                depth, MAX_EXPRESSION_DEPTH
+                            ),
+                        ))
+                    } else {
+                        d.set(depth + 1);
+                        Ok(())
+                    }
+                })
+            })
+            .ignore_then(expression.clone())
+            .map(|result| {
+                // Decrement depth after successful parse
+                EXPRESSION_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+                result
+            });
+
         let variable =
-            group((snake_case_identifier, colon, expression.clone())).map(|(name, _, value)| {
+            group((snake_case_identifier, colon, tracked_expr.clone())).map(|(name, _, value)| {
                 Variable {
                     name,
                     is_referenced: false,
@@ -85,7 +134,7 @@ where
 
             // Regular argument: name: value or just name
             let regular_argument = snake_case_identifier
-                .then(group((colon.clone(), expression.clone())).or_not())
+                .then(group((colon.clone(), tracked_expr.clone())).or_not())
                 .map_with(|(name, value), extra| {
                     let value = value.map(|(_, value)| value);
                     Spanned {
@@ -102,7 +151,7 @@ where
             // PASS: value - special argument for implicit context
             let pass_argument = just(Token::Pass)
                 .ignore_then(colon.clone())
-                .ignore_then(expression.clone())
+                .ignore_then(tracked_expr.clone())
                 .map_with(|value, extra| {
                     Spanned {
                         node: Argument {
@@ -202,7 +251,7 @@ where
                     persistence: None,
                 });
 
-            let key_value_pair = group((key, colon, expression.clone()))
+            let key_value_pair = group((key, colon, tracked_expr.clone()))
                 .map(|(key, _, value)| MapEntry { key, value });
 
             just(Token::Map)
@@ -235,7 +284,7 @@ where
             just(Token::Function)
                 .ignore_then(snake_case_identifier)
                 .then(parameters)
-                .then(expression.clone().delimited_by(
+                .then(tracked_expr.clone().delimited_by(
                     bracket_curly_open.then(newlines),
                     newlines.then(bracket_curly_close),
                 ))
@@ -325,7 +374,7 @@ where
 
         // Spread operator: `...expression`
         let spread = just(Token::Spread)
-            .ignore_then(expression.clone())
+            .ignore_then(tracked_expr.clone())
             .map(|value| Expression::Spread {
                 value: Box::new(value),
             });
@@ -453,7 +502,7 @@ where
         // Arm parser: pattern => body
         let arm = pattern
             .then_ignore(just(Token::Implies))
-            .then(expression.clone())
+            .then(tracked_expr.clone())
             .map(|(pattern, body)| Arm { pattern, body: body.node });
 
         let when = just(Token::When)
@@ -531,7 +580,7 @@ where
 
         // BLOCK { var: value, var2: value2, output_expression }
         // Variables are bindings, the last expression without colon is the output
-        let variable_for_block = group((snake_case_identifier, colon.clone(), expression.clone())).map(|(name, _, value)| {
+        let variable_for_block = group((snake_case_identifier, colon.clone(), tracked_expr.clone())).map(|(name, _, value)| {
             Variable {
                 name,
                 is_referenced: false,
@@ -550,7 +599,7 @@ where
                 block_variable
                     .separated_by(comma.clone().ignored().or(newlines.clone()))
                     .collect::<Vec<_>>()
-                    .then(expression.clone())
+                    .then(tracked_expr.clone())
                     .delimited_by(
                         bracket_curly_open.clone().then(newlines.clone()),
                         newlines.clone().then(bracket_curly_close.clone()),
