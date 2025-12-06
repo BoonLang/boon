@@ -28,7 +28,7 @@ async fn yield_once() {
 }
 
 use super::super::super::parser::{
-    PersistenceId, SourceCode, Span, static_expression, lexer, parser, resolve_references, Token, Spanned,
+    PersistenceId, SourceCode, Span, span_at, static_expression, lexer, parser, resolve_references, Token, Spanned,
 };
 use super::api;
 use super::engine::*;
@@ -152,7 +152,7 @@ impl ModuleLoader {
         // Parser
         let (ast, errors) = parser()
             .parse(ChumskyStream::from_iter(tokens).map(
-                Span::splat(source_code.len()),
+                span_at(source_code.len()),
                 |Spanned { node, span, persistence: _ }| (node, span),
             ))
             .into_output_errors();

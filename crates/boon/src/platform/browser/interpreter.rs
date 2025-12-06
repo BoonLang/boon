@@ -13,8 +13,8 @@ use zoon::{UnwrapThrowExt, WebStorage, eprintln, local_storage, println, serde_j
 const LOG_SOURCE_AND_AST: bool = false;
 
 use crate::parser::{
-    Expression, Input, ParseError, Parser, SourceCode, Span, Spanned, Token, lexer, parser,
-    resolve_persistence, resolve_references, static_expression,
+    Expression, Input, ParseError, Parser, SourceCode, Spanned, Token, lexer, parser,
+    resolve_persistence, resolve_references, span_at, static_expression,
 };
 use crate::platform::browser::{
     engine::{ConstructContext, Object, VirtualFilesystem},
@@ -69,7 +69,7 @@ pub fn run(
 
     let (ast, errors) = parser()
         .parse(tokens.map(
-            Span::splat(source_code.len()),
+            span_at(source_code.len()),
             |Spanned {
                  node,
                  span,
@@ -205,7 +205,7 @@ pub fn run_with_registry(
 
     let (ast, errors) = parser()
         .parse(tokens.map(
-            Span::splat(source_code.len()),
+            span_at(source_code.len()),
             |Spanned {
                  node,
                  span,
@@ -313,7 +313,7 @@ fn parse_old<'filename, 'old_code>(
 
     let (ast, errors) = parser()
         .parse(Stream::from_iter(tokens).map(
-            Span::splat(source_code.len()),
+            span_at(source_code.len()),
             |Spanned {
                  node,
                  span,

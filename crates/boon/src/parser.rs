@@ -23,6 +23,11 @@ pub use chumsky::prelude::{Input, Parser};
 pub type Span = SimpleSpan;
 pub type ParseError<'code, T> = Rich<'code, T, Span>;
 
+/// Create a zero-width span at the given position (replacement for alpha's splat)
+pub fn span_at(pos: usize) -> Span {
+    SimpleSpan::new((), pos..pos)
+}
+
 #[derive(Debug, Clone)]
 pub struct Spanned<T> {
     pub span: Span,
@@ -990,7 +995,7 @@ mod tests {
         ($code:expr, $test:expr) => {{
             let tokens = lexer().parse($code).unwrap();
             let input = tokens.map(
-                Span::splat($code.len()),
+                span_at($code.len()),
                 |Spanned { node, span, persistence: _ }| (node, span),
             );
             let expressions = parser().parse(input).unwrap();
@@ -1150,7 +1155,7 @@ mod tests {
         tokens.retain(|t| !matches!(t.node, lexer::Token::Comment(_)));
 
         let input = tokens.map(
-            Span::splat(source.len()),
+            span_at(source.len()),
             |Spanned { node, span, persistence: _ }| (node, span)
         );
 
