@@ -352,16 +352,17 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
         }
         Expression::When { arms } => {
             for arm in arms {
-                // Resolve pattern references
-                resolve_pattern_references(
-                    &arm.pattern,
-                    *span,
-                    &reachable_referenceables,
-                    parent_name,
-                    errors,
-                    all_referenced,
-                );
-                // Resolve body references
+                // Collect pattern bindings to add to scope for the body
+                let body_level = level + 1;
+                let bindings = collect_pattern_bindings(&arm.pattern, *span, body_level);
+
+                // Create scope with pattern bindings for the body
+                let mut body_reachables = reachable_referenceables.clone();
+                for (name, referenceable) in bindings {
+                    body_reachables.entry(name).or_default().push(referenceable);
+                }
+
+                // Resolve body references with pattern bindings in scope
                 // Note: We must create a temporary Spanned, resolve it, then copy back
                 // because arm.body is Expression not Spanned<Expression>
                 let mut body_spanned = Spanned {
@@ -371,8 +372,8 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                 };
                 set_is_referenced_and_alias_referenceables(
                     &mut body_spanned,
-                    reachable_referenceables.clone(),
-                    level,
+                    body_reachables,
+                    body_level,
                     parent_name,
                     errors,
                     all_referenced,
@@ -382,16 +383,17 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
         }
         Expression::While { arms } => {
             for arm in arms {
-                // Resolve pattern references
-                resolve_pattern_references(
-                    &arm.pattern,
-                    *span,
-                    &reachable_referenceables,
-                    parent_name,
-                    errors,
-                    all_referenced,
-                );
-                // Resolve body references
+                // Collect pattern bindings to add to scope for the body
+                let body_level = level + 1;
+                let bindings = collect_pattern_bindings(&arm.pattern, *span, body_level);
+
+                // Create scope with pattern bindings for the body
+                let mut body_reachables = reachable_referenceables.clone();
+                for (name, referenceable) in bindings {
+                    body_reachables.entry(name).or_default().push(referenceable);
+                }
+
+                // Resolve body references with pattern bindings in scope
                 // Note: We must create a temporary Spanned, resolve it, then copy back
                 // because arm.body is Expression not Spanned<Expression>
                 let mut body_spanned = Spanned {
@@ -401,8 +403,8 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                 };
                 set_is_referenced_and_alias_referenceables(
                     &mut body_spanned,
-                    reachable_referenceables.clone(),
-                    level,
+                    body_reachables,
+                    body_level,
                     parent_name,
                     errors,
                     all_referenced,
@@ -770,4 +772,58 @@ fn resolve_pattern_references<'code>(
             // No references to resolve
         }
     }
+}
+
+/// Collect all pattern bindings (variable names introduced by the pattern).
+/// Pattern::Alias always creates a binding - it binds the matched value to the name.
+fn collect_pattern_bindings<'code>(
+    pattern: &Pattern<'code>,
+    span: Span,
+    level: usize,
+) -> Vec<(&'code str, Referenceable<'code>)> {
+    let mut bindings = Vec::new();
+    match pattern {
+        Pattern::Alias { name } => {
+            // Pattern::Alias binds the matched value to this name
+            bindings.push((*name, Referenceable { name, span, level }));
+        }
+        Pattern::List { items } => {
+            for item in items {
+                bindings.extend(collect_pattern_bindings(item, span, level));
+            }
+        }
+        Pattern::Object { variables } => {
+            for var in variables {
+                // The variable name itself is a binding
+                bindings.push((var.name, Referenceable { name: var.name, span, level }));
+                // If there's a nested pattern, collect its bindings too
+                if let Some(ref value) = var.value {
+                    bindings.extend(collect_pattern_bindings(value, span, level));
+                }
+            }
+        }
+        Pattern::TaggedObject { variables, .. } => {
+            for var in variables {
+                // The variable name itself is a binding
+                bindings.push((var.name, Referenceable { name: var.name, span, level }));
+                // If there's a nested pattern, collect its bindings too
+                if let Some(ref value) = var.value {
+                    bindings.extend(collect_pattern_bindings(value, span, level));
+                }
+            }
+        }
+        Pattern::Map { entries } => {
+            for entry in entries {
+                // Keys in map patterns could be bindings
+                bindings.extend(collect_pattern_bindings(&entry.key, span, level));
+                if let Some(ref value) = entry.value {
+                    bindings.extend(collect_pattern_bindings(value, span, level));
+                }
+            }
+        }
+        Pattern::Literal(_) | Pattern::WildCard => {
+            // Literals and wildcards don't create bindings
+        }
+    }
+    bindings
 }

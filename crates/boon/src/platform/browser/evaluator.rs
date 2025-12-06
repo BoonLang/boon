@@ -2524,6 +2524,10 @@ fn static_function_call_path_to_definition(
             api::function_element_stripe(arguments, id, persistence_id, construct_context, actor_context)
                 .boxed_local()
         },
+        ["Element", "container"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_element_container(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
         ["Element", "button"] => |arguments, id, persistence_id, construct_context, actor_context| {
             api::function_element_button(arguments, id, persistence_id, construct_context, actor_context)
                 .boxed_local()

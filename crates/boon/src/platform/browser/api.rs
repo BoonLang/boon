@@ -169,6 +169,66 @@ pub fn function_element_stripe(
 }
 
 /// ```text
+/// Element/container(
+///     element<[tag?: Tag]>
+///     style<[]>
+///     child<INTO_ELEMENT>
+/// ) -> ELEMENT_CONTAINER
+/// ```
+pub fn function_element_container(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [_argument_element, _argument_style, argument_child] = arguments.as_slice() else {
+        panic!("Element/container expects 3 arguments")
+    };
+    TaggedObject::new_constant(
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Element/container(..) -> ElementContainer[..]",
+        ),
+        construct_context.clone(),
+        ValueIdempotencyKey::new(),
+        "ElementContainer",
+        [Variable::new_arc(
+            ConstructInfo::new(
+                function_call_id.with_child_id(1),
+                None,
+                "Element/container(..) -> ElementContainer[settings]",
+            ),
+            construct_context.clone(),
+            "settings",
+            Object::new_arc_value_actor(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(2),
+                    None,
+                    "Element/container(..) -> ElementContainer[settings: [..]]",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                actor_context,
+                [Variable::new_arc(
+                    ConstructInfo::new(
+                        function_call_id.with_child_id(3),
+                        None,
+                        "Element/container(..) -> ElementContainer[settings: [child]]",
+                    ),
+                    construct_context,
+                    "child",
+                    argument_child.clone(),
+                    None,
+                )],
+            ),
+            None,
+        )],
+    )
+}
+
+/// ```text
 /// Element/button(
 ///     element<[
 ///         event?<[

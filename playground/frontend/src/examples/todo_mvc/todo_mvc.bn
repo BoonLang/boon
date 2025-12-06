@@ -16,9 +16,9 @@ store: [
     }
     go_to_result:
         LATEST {
-            filter_buttons.all.event.press |> THEN { TEXT { / } }
-            filter_buttons.active.event.press |> THEN { TEXT { /active } }
-            filter_buttons.completed.event.press |> THEN { TEXT { /completed } }
+            elements.filter_buttons.all.event.press |> THEN { TEXT { / } }
+            elements.filter_buttons.active.event.press |> THEN { TEXT { /active } }
+            elements.filter_buttons.completed.event.press |> THEN { TEXT { /completed } }
         }
         |> Router/go_to()
     title_to_save: elements.new_todo_title_text_input.event.key_down.key |> WHEN {
@@ -87,9 +87,9 @@ FUNCTION new_todo(title) {
             |> Bool/toggle(when: todo_elements.todo_checkbox.event.click)
         edited_title: BLOCK {
             edited_title: LATEST {
-                Text/empty
+                Text/empty()
                 todo_elements.editing_todo_title_element.event.change.text
-                title_to_update |> THEN { Text/empty }
+                title_to_update |> THEN { Text/empty() }
             }
             LATEST {
                 edited_title
@@ -222,9 +222,9 @@ FUNCTION new_todo_title_text_input() {
         ]
         label: Hidden[text: TEXT { What needs to be done? }]
         text: LATEST {
-            Text/empty
+            Text/empty()
             element.event.change.text
-            PASSED.store.title_to_save |> THEN { Text/empty }
+            PASSED.store.title_to_save |> THEN { Text/empty() }
         }
         placeholder: [
             style: [font: [style: Italic, color: Oklch[lightness: 0.925]]]
@@ -433,8 +433,8 @@ FUNCTION panel_footer() {
             }
         ]
         items: LIST {
-            active_items_count_text
-            filters_element
+            active_items_count_text()
+            filters_element()
             PASSED.store.todos |> List/any(item, if: item.completed) |> WHILE {
                 True => remove_completed_button() 
                     |> LINK { PASSED.store.elements.remove_completed_button }
@@ -449,11 +449,11 @@ FUNCTION panel_footer() {
 }
 
 FUNCTION active_items_count_text() {
-    PASSED.store.todos 
-        |> List/retain(item, if: item.completed |> Bool/not()) 
-        |> List/count
+    PASSED.store.todos
+        |> List/retain(item, if: item.completed |> Bool/not())
+        |> List/count()
         |> WHEN { count => BLOCK {
-            maybe_s: count > 1 |> WHEN { True => TEXT { s }, False => Text/empty }
+            maybe_s: count > 1 |> WHEN { True => TEXT { s }, False => Text/empty() }
             TEXT { {count} item{maybe_s} left }
         }}
 }
@@ -465,11 +465,11 @@ FUNCTION filters_element() {
         gap: 10
         style: []
         items: LIST {
-            filter_button(All) 
+            filter_button(filter: All)
                 |> LINK { PASSED.store.elements.filter_buttons.all }
-            filter_button(Active) 
+            filter_button(filter: Active)
                 |> LINK { PASSED.store.elements.filter_buttons.active }
-            filter_button(Completed) 
+            filter_button(filter: Completed)
                 |> LINK { PASSED.store.elements.filter_buttons.completed }
         }
     )

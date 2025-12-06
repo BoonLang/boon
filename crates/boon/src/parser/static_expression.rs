@@ -455,7 +455,13 @@ impl ExpressionConverter {
 
     fn convert_argument(&self, arg: &parser::Argument) -> Argument {
         Argument {
-            name: self.str_to_slice(arg.name),
+            // PASS is a synthetic name from the parser (Token::Pass keyword),
+            // not a slice from the source code. Use the dedicated helper.
+            name: if arg.name == "PASS" {
+                super::source::pass_str_slice()
+            } else {
+                self.str_to_slice(arg.name)
+            },
             is_referenced: arg.is_referenced,
             value: arg.value.as_ref().map(|v| self.convert_spanned(v)),
         }

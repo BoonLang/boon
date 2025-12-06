@@ -220,6 +220,17 @@ impl std::borrow::Borrow<str> for StrSlice {
     }
 }
 
+/// Create a StrSlice for the synthetic "PASS" argument name.
+/// This is used when the parser creates a PASS argument from the Token::Pass keyword,
+/// which doesn't have a string payload from the source code.
+pub fn pass_str_slice() -> StrSlice {
+    use std::sync::OnceLock;
+    static PASS_SOURCE: OnceLock<SourceCode> = OnceLock::new();
+    PASS_SOURCE
+        .get_or_init(|| SourceCode::new("PASS".to_string()))
+        .slice(0, 4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
