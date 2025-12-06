@@ -571,32 +571,63 @@ where
             .ignore_then(expression)
             .then_ignore(bracket_round_close);
 
-        let expression = choice((
-            expression_variable,
-            function_call,
-            list,
-            expression_object,
-            tagged_object,
-            map,
-            expression_literal,
-            text_literal,
+        // Split choice into smaller groups to reduce stack frame size.
+        // Large Choice tuples create big stack frames that contribute to stack overflow.
+        // IMPORTANT: Order matters! expression_variable must come before expression_alias
+        // because alias matches any snake_case identifier, but variable matches `name: value`.
+
+        // Group 1: Definitions and calls (expression_variable FIRST - has `name:` pattern)
+        let definitions = choice((
+            expression_variable,  // name: value - MUST be before expression_alias
             function,
-            expression_alias,
+            function_call,
             link_setter,
-            link_expression,
-            hold,
-            latest,
-            then,
+            spread,
+        ));
+
+        // Group 2: Container expressions (recurse into expression for values)
+        let containers = choice((
+            expression_object,   // [a: ..., b: ...]
+            list,                // LIST { ..., ... }
+            tagged_object,       // Tag[...]
+            map,                 // MAP { ... }
+        ));
+
+        // Group 3: Control flow (WHEN, WHILE, THEN, etc.)
+        let control_flow = choice((
             when,
             while_,
-            skip,
+            latest,
+            hold,
+            then,
             block,
             flush,
             pulses,
-            spread,
+        ));
+
+        // Group 4: Terminal expressions (expression_alias last since it matches any identifier)
+        let terminals = choice((
+            expression_literal,  // Numbers, tags
+            link_expression,     // LINK
+            skip,                // SKIP
+            text_literal,        // TEXT { ... }
+            expression_alias,    // element.property - LAST because it matches any identifier
+        ));
+
+        // Group 5: Hardware types
+        let hardware = choice((
             bits,
             memory,
             bytes,
+        ));
+
+        // Outer choice - definitions first (has variable parser), terminals last (has alias)
+        let expression = choice((
+            definitions,
+            containers,
+            control_flow,
+            terminals,
+            hardware,
         ));
 
         expression
