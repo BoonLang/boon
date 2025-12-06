@@ -267,14 +267,7 @@ pub fn lexer<'code>()
         .then(text_content_inner)
         .then_ignore(just('}'))
         .map(|(hashes, content): (Vec<_>, &str)| {
-            let trimmed = content.trim();
-            // Strip surrounding double quotes if present (TEXT { "Hello" } -> Hello)
-            let stripped = if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-                &trimmed[1..trimmed.len()-1]
-            } else {
-                trimmed
-            };
-            Token::TextContent(stripped, hashes.len())
+            Token::TextContent(content.trim(), hashes.len())
         });
 
     let token = choice((

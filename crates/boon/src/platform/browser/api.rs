@@ -1483,25 +1483,21 @@ fn value_to_log_string(value: &Value) -> String {
     }
 }
 
-/// Log/info(message) -> []
-/// Logs an info message to the console (placeholder - actual logging to be implemented)
+/// Log/info(message) -> message
+/// Logs an info message to the console and passes through the input value
 pub fn function_log_info(
     arguments: Arc<Vec<Arc<ValueActor>>>,
-    function_call_id: ConstructId,
+    _function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
-    construct_context: ConstructContext,
+    _construct_context: ConstructContext,
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let message_actor = arguments[0].clone();
     message_actor.subscribe().map(move |value| {
-        // @TODO: Add proper console logging when web_sys console feature is available
-        let _message = value_to_log_string(&value);
-        Object::new_value(
-            ConstructInfo::new(function_call_id.with_child_id(0), None, "Log/info result"),
-            construct_context.clone(),
-            ValueIdempotencyKey::new(),
-            [],
-        )
+        let message = value_to_log_string(&value);
+        zoon::println!("[INFO] {}", message);
+        // Pass through the input value for chaining
+        value
     })
 }
 

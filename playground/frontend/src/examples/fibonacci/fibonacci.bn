@@ -19,4 +19,4 @@ FUNCTION fibonacci(position) {
 position: 5
 result: position |> fibonacci()
 message: TEXT { "{position}. Fibonacci number is {result}" }
-document: message |> Document/new()
+document: message |> Log/info() |> Document/new()
