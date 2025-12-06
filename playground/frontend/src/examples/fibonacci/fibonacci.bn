@@ -9,8 +9,8 @@ FUNCTION fibonacci(position) {
                 ]
             }
         }
-        (state.iteration == position) |> WHILE {
-            True => state.current
+        state.iteration |> WHEN {
+            position => state.current
             __ => SKIP
         }
     }
@@ -18,5 +18,5 @@ FUNCTION fibonacci(position) {
 
 position: 5
 result: position |> fibonacci()
-message: TEXT { "{position}. Fibonacci number is {result}" }
+message: TEXT { {position}. Fibonacci number is {result} }
 document: message |> Log/info() |> Document/new()

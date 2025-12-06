@@ -1673,7 +1673,7 @@ fn static_spanned_expression_into_value_actor(
                                     &value,
                                     &construct_context_clone,
                                     &actor_context_clone,
-                                ) {
+                                ).await {
                                     // Pattern matched! Evaluate the body with bindings
                                     let mut params = actor_context_clone.parameters.clone();
                                     for (name, actor) in bindings {
@@ -1808,7 +1808,7 @@ fn static_spanned_expression_into_value_actor(
                                     &value,
                                     &construct_context_clone,
                                     &actor_context_clone,
-                                ) {
+                                ).await {
                                     // Pattern matched! Evaluate the body with bindings
                                     let mut params = actor_context_clone.parameters.clone();
                                     for (name, actor) in bindings {
@@ -2592,7 +2592,10 @@ type PatternBindings = HashMap<String, Arc<ValueActor>>;
 
 /// Try to match a Value against a Pattern.
 /// Returns Some(bindings) if match succeeds, None otherwise.
-fn match_pattern(
+///
+/// If a pattern alias (like `position`) refers to an existing variable in scope,
+/// it compares against that variable's value instead of creating a new binding.
+async fn match_pattern(
     pattern: &static_expression::Pattern,
     value: &Value,
     construct_context: &ConstructContext,
@@ -2606,8 +2609,26 @@ fn match_pattern(
             Some(bindings)
         }
         static_expression::Pattern::Alias { name } => {
-            // Alias binds the value to a name
             let name_string = name.to_string();
+
+            // Check if this name exists in outer scope
+            // If so, compare against that value instead of binding
+            if let Some(existing_actor) = actor_context.parameters.get(&name_string) {
+                // Get the current value from the existing variable
+                let mut subscription = existing_actor.clone().subscribe();
+                if let Some(existing_value) = subscription.next().await {
+                    // Compare values - if equal, pattern matches (no new binding)
+                    if values_equal(value, &existing_value) {
+                        return Some(bindings);
+                    } else {
+                        return None; // Values don't match
+                    }
+                }
+                // Couldn't get value, pattern doesn't match
+                return None;
+            }
+
+            // Name doesn't exist in scope - bind the value to a new name
             let value_actor = ValueActor::new_arc(
                 ConstructInfo::new(
                     format!("pattern_binding_{name_string}"),

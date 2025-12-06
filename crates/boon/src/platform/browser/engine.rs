@@ -1604,7 +1604,7 @@ impl ComparatorCombinator {
 }
 
 /// Compare two Values for equality.
-fn values_equal(a: &Value, b: &Value) -> bool {
+pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(n1, _), Value::Number(n2, _)) => n1.number() == n2.number(),
         (Value::Text(t1, _), Value::Text(t2, _)) => t1.text() == t2.text(),
