@@ -503,7 +503,7 @@ where
                         let var_end = var_start + close_pos;
                         let var_name = content[var_start..var_end].trim();
                         if !var_name.is_empty() {
-                            parts.push(TextPart::Interpolation { var: var_name });
+                            parts.push(TextPart::Interpolation { var: var_name, referenced_span: None });
                         }
                         current_text_start = var_end + 1;
                         search_start = current_text_start;
@@ -865,7 +865,7 @@ pub enum TextPart<'code> {
     // Plain text content
     Text(&'code str),
     // Interpolated variable: {var_name}
-    Interpolation { var: &'code str },
+    Interpolation { var: &'code str, referenced_span: Option<SimpleSpan> },
 }
 
 #[derive(Debug, Clone)]
@@ -1013,7 +1013,7 @@ mod tests {
             if let Expression::TextLiteral { parts } = expr {
                 assert_eq!(parts.len(), 2);
                 assert!(matches!(parts[0], TextPart::Text("hello ")));
-                assert!(matches!(parts[1], TextPart::Interpolation { var: "name" }));
+                assert!(matches!(parts[1], TextPart::Interpolation { var: "name", .. }));
             } else {
                 panic!("Expected TextLiteral, got {:?}", expr);
             }
@@ -1026,9 +1026,9 @@ mod tests {
             if let Expression::TextLiteral { parts } = expr {
                 assert_eq!(parts.len(), 5);
                 assert!(matches!(parts[0], TextPart::Text("Hello ")));
-                assert!(matches!(parts[1], TextPart::Interpolation { var: "name" }));
+                assert!(matches!(parts[1], TextPart::Interpolation { var: "name", .. }));
                 assert!(matches!(parts[2], TextPart::Text("! You have ")));
-                assert!(matches!(parts[3], TextPart::Interpolation { var: "count" }));
+                assert!(matches!(parts[3], TextPart::Interpolation { var: "count", .. }));
                 assert!(matches!(parts[4], TextPart::Text(" messages.")));
             } else {
                 panic!("Expected TextLiteral, got {:?}", expr);

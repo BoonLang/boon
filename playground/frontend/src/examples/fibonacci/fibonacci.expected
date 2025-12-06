@@ -1,0 +1,11 @@
+# Fibonacci example - computes 5th Fibonacci number
+
+[test]
+category = "computation"
+description = "Computes and displays the 5th Fibonacci number"
+
+[output]
+text = "5. Fibonacci number is 8"
+
+[timing]
+timeout = 5000

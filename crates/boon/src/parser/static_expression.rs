@@ -14,7 +14,7 @@
 //! conversion.
 
 use super::source::{SourceCode, StrSlice};
-use super::{Persistence, Span};
+use super::{Persistence, SimpleSpan, Span};
 use crate::parser;
 
 /// Spanned wrapper for static expressions.
@@ -164,7 +164,7 @@ pub enum ArithmeticOperator {
 #[derive(Debug, Clone)]
 pub enum TextPart {
     Text(StrSlice),
-    Interpolation { var: StrSlice },
+    Interpolation { var: StrSlice, referenced_span: Option<SimpleSpan> },
 }
 
 #[derive(Debug, Clone)]
@@ -571,8 +571,9 @@ impl ExpressionConverter {
     fn convert_text_part(&self, part: &parser::TextPart) -> TextPart {
         match part {
             parser::TextPart::Text(s) => TextPart::Text(self.str_to_slice(s)),
-            parser::TextPart::Interpolation { var } => TextPart::Interpolation {
+            parser::TextPart::Interpolation { var, referenced_span } => TextPart::Interpolation {
                 var: self.str_to_slice(var),
+                referenced_span: *referenced_span,
             },
         }
     }

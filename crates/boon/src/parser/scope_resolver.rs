@@ -1,4 +1,4 @@
-use super::{Alias, ArithmeticOperator, Comparator, Expression, ParseError, Span, Spanned, Token};
+use super::{Alias, ArithmeticOperator, Comparator, Expression, ParseError, Pattern, Span, Spanned, TextPart, Token};
 use std::collections::{BTreeMap, HashSet};
 
 // @TODO Immutables or different tree traversal algorithm?
@@ -351,20 +351,64 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
             );
         }
         Expression::When { arms } => {
-            // @TODO implement, see the error message below
-            errors.push(ResolveError::custom(
-                *span,
-                "Scope resolver cannot resolve references in Expression::When yet, sorry"
-                    .to_owned(),
-            ))
+            for arm in arms {
+                // Resolve pattern references
+                resolve_pattern_references(
+                    &arm.pattern,
+                    *span,
+                    &reachable_referenceables,
+                    parent_name,
+                    errors,
+                    all_referenced,
+                );
+                // Resolve body references
+                // Note: We must create a temporary Spanned, resolve it, then copy back
+                // because arm.body is Expression not Spanned<Expression>
+                let mut body_spanned = Spanned {
+                    span: *span,
+                    node: arm.body.clone(),
+                    persistence: None,
+                };
+                set_is_referenced_and_alias_referenceables(
+                    &mut body_spanned,
+                    reachable_referenceables.clone(),
+                    level,
+                    parent_name,
+                    errors,
+                    all_referenced,
+                );
+                arm.body = body_spanned.node;
+            }
         }
         Expression::While { arms } => {
-            // @TODO implement, see the error message below
-            errors.push(ResolveError::custom(
-                *span,
-                "Scope resolver cannot resolve references in Expression::While yet, sorry"
-                    .to_owned(),
-            ))
+            for arm in arms {
+                // Resolve pattern references
+                resolve_pattern_references(
+                    &arm.pattern,
+                    *span,
+                    &reachable_referenceables,
+                    parent_name,
+                    errors,
+                    all_referenced,
+                );
+                // Resolve body references
+                // Note: We must create a temporary Spanned, resolve it, then copy back
+                // because arm.body is Expression not Spanned<Expression>
+                let mut body_spanned = Spanned {
+                    span: *span,
+                    node: arm.body.clone(),
+                    persistence: None,
+                };
+                set_is_referenced_and_alias_referenceables(
+                    &mut body_spanned,
+                    reachable_referenceables.clone(),
+                    level,
+                    parent_name,
+                    errors,
+                    all_referenced,
+                );
+                arm.body = body_spanned.node;
+            }
         }
         Expression::Pipe { from, to } => {
             set_is_referenced_and_alias_referenceables(
@@ -500,7 +544,36 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
         Expression::Literal(_) => (),
         Expression::Link => (),
         Expression::Skip => (),
-        Expression::TextLiteral { .. } => (),
+        Expression::TextLiteral { parts } => {
+            // Resolve interpolation variables in the text literal
+            for part in parts.iter_mut() {
+                if let TextPart::Interpolation { var, referenced_span } = part {
+                    // Look up the variable in reachable referenceables
+                    let reachable_map: BTreeMap<&str, Referenceable> = reachable_referenceables
+                        .iter()
+                        .filter_map(|(name, referenceables)| {
+                            referenceables.iter().rev().enumerate().find_map(
+                                |(index, referenceable)| {
+                                    if index == 0 && Some(referenceable.name) == parent_name {
+                                        None
+                                    } else {
+                                        Some((referenceable.name, referenceable.clone()))
+                                    }
+                                },
+                            )
+                        })
+                        .collect();
+
+                    if let Some(referenceable) = reachable_map.get(*var) {
+                        *referenced_span = Some(referenceable.span);
+                        all_referenced.insert(*referenceable);
+                    } else {
+                        let reachable_names: Vec<_> = reachable_map.keys().collect();
+                        errors.push(ResolveError::custom(*span, format!("Cannot find variable '{}' for text interpolation. Available: {:?}", var, reachable_names)));
+                    }
+                }
+            }
+        }
         Expression::Hold { state_param, body } => {
             // Add state_param to reachable referenceables so it can be referenced in the body
             level += 1;
@@ -630,6 +703,71 @@ fn set_referenced_referenceable<'code>(
             }
             let referenceables = Referenceables { referenced };
             *unset_referenceables = Some(referenceables);
+        }
+    }
+}
+
+/// Resolve references in patterns (for WHEN/WHILE arms)
+fn resolve_pattern_references<'code>(
+    pattern: &Pattern<'code>,
+    span: Span,
+    reachable_referenceables: &ReachableReferenceables<'code>,
+    parent_name: Option<&str>,
+    errors: &mut Vec<ResolveError>,
+    all_referenced: &mut HashSet<Referenceable<'code>>,
+) {
+    match pattern {
+        Pattern::Alias { name } => {
+            // Pattern::Alias in WHEN/WHILE references an existing variable for comparison
+            let reachable: BTreeMap<&str, Referenceable> = reachable_referenceables
+                .iter()
+                .filter_map(|(name, referenceables)| {
+                    referenceables.iter().rev().enumerate().find_map(
+                        |(index, referenceable)| {
+                            if index == 0 && Some(referenceable.name) == parent_name {
+                                None
+                            } else {
+                                Some((referenceable.name, *referenceable))
+                            }
+                        },
+                    )
+                })
+                .collect();
+            if let Some(referenced) = reachable.get(name).copied() {
+                all_referenced.insert(referenced);
+            }
+            // Note: We don't emit an error here if the variable is not found,
+            // because Pattern::Alias can also be used for pattern matching literals
+        }
+        Pattern::List { items } => {
+            for item in items {
+                resolve_pattern_references(item, span, reachable_referenceables, parent_name, errors, all_referenced);
+            }
+        }
+        Pattern::Object { variables } => {
+            for var in variables {
+                if let Some(ref value) = var.value {
+                    resolve_pattern_references(value, span, reachable_referenceables, parent_name, errors, all_referenced);
+                }
+            }
+        }
+        Pattern::TaggedObject { variables, .. } => {
+            for var in variables {
+                if let Some(ref value) = var.value {
+                    resolve_pattern_references(value, span, reachable_referenceables, parent_name, errors, all_referenced);
+                }
+            }
+        }
+        Pattern::Map { entries } => {
+            for entry in entries {
+                resolve_pattern_references(&entry.key, span, reachable_referenceables, parent_name, errors, all_referenced);
+                if let Some(ref value) = entry.value {
+                    resolve_pattern_references(value, span, reachable_referenceables, parent_name, errors, all_referenced);
+                }
+            }
+        }
+        Pattern::Literal(_) | Pattern::WildCard => {
+            // No references to resolve
         }
     }
 }

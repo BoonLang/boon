@@ -1,0 +1,4 @@
+# Hello world example - displays text
+
+[output]
+text = "Hello world!"

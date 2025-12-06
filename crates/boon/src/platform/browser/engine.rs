@@ -908,8 +908,14 @@ impl VariableOrArgumentReference {
             .boxed_local();
         for alias_part in alias_parts.into_iter().skip(skip_alias_parts) {
             let alias_part = alias_part.to_string();
+            // IMPORTANT: Use map + flatten_unordered instead of flat_map!
+            // flat_map uses flatten which waits for each inner stream to complete
+            // before processing the next. Since Object field streams are infinite
+            // (constant streams that emit once then pending forever), flatten
+            // would block on the first Object and never process subsequent Objects.
+            // flatten_unordered processes all inner streams concurrently.
             value_stream = value_stream
-                .flat_map(move |value| {
+                .map(move |value| {
                     match value {
                         Value::Object(object, _) => {
                             let variable_actor = object.expect_variable(&alias_part).value_actor();
@@ -939,6 +945,7 @@ impl VariableOrArgumentReference {
                         ),
                     }
                 })
+                .flatten_unordered(None)  // Process all Object field streams concurrently
                 .boxed_local();
         }
         // Subscription-based streams are infinite (subscriptions never terminate first)
@@ -1959,15 +1966,26 @@ impl ValueActor {
                 let mut migration_state = MigrationState::Normal;
                 // Subscriber notification senders - stored locally in this loop (no RefCell)
                 let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
+                // Track if stream ever produced a value (for SKIP detection)
+                let mut stream_ever_produced = false;
+                // Track if stream has ended
+                let mut stream_ended = false;
 
                 loop {
                     select! {
                         // Handle new subscriber registrations
                         sender = notify_sender_receiver.next() => {
                             if let Some(mut sender) = sender {
-                                // Immediately notify - subscriber will check version and see current value if any
-                                let _ = sender.try_send(());
-                                notify_senders.push(sender);
+                                // If stream ended without producing any value (SKIP case),
+                                // don't register subscriber - just drop sender to signal completion
+                                if stream_ended && !stream_ever_produced {
+                                    // Drop sender - subscriber will see channel closed
+                                    drop(sender);
+                                } else {
+                                    // Immediately notify - subscriber will check version and see current value if any
+                                    let _ = sender.try_send(());
+                                    notify_senders.push(sender);
+                                }
                             }
                         }
 
@@ -2036,11 +2054,20 @@ impl ValueActor {
                             // Actors stay alive until explicit Shutdown.
                             // This prevents "receiver is gone" errors.
                             let Some(new_value) = new_value else {
-                                // Stream ended, but we continue listening for messages
-                                // This is the key difference from the old implementation
+                                // Stream ended
+                                stream_ended = true;
+                                // If stream ended without ever producing a value (SKIP case),
+                                // close all notify channels so subscribers see completion
+                                if !stream_ever_produced {
+                                    // Clear senders - this drops them, closing channels
+                                    // Subscribers will receive Poll::Ready(None)
+                                    notify_senders.clear();
+                                }
+                                // Continue listening for messages
                                 continue;
                             };
 
+                            stream_ever_produced = true;
                             current_value.store(Arc::new(Some(new_value.clone())));
                             // Increment version
                             current_version.fetch_add(1, Ordering::SeqCst);
@@ -2755,6 +2782,125 @@ pub fn value_actor_from_json(
         constant(value),
         None,
     ))
+}
+
+/// Materialize a Value by eagerly evaluating all lazy variable streams.
+///
+/// This is essential for HOLD with Object state. When THEN body produces an Object,
+/// its variables contain lazy ValueActors that reference the state stream. If we
+/// don't materialize, future state accesses will try to subscribe to old lazy actors
+/// that depend on previous state, creating circular dependencies.
+///
+/// This function:
+/// - For Object/TaggedObject: awaits each variable's value, recursively materializes,
+///   and creates new Variables with constant ValueActors holding the materialized values
+/// - For List: materializes each item
+/// - For Flushed: materializes inner value
+/// - For scalars (Number, Text, Tag): returns as-is
+pub async fn materialize_value(
+    value: Value,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> Value {
+    match value {
+        Value::Object(object, metadata) => {
+            let mut materialized_vars: Vec<Arc<Variable>> = Vec::new();
+            for variable in object.variables() {
+                // Await the variable's current value
+                let var_value = variable.value_actor().subscribe().next().await;
+                if let Some(var_value) = var_value {
+                    // Recursively materialize nested values
+                    let materialized = Box::pin(materialize_value(
+                        var_value,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                    )).await;
+                    // Create a constant ValueActor for the materialized value
+                    let value_actor = Arc::new(ValueActor::new(
+                        ConstructInfo::new(
+                            format!("materialized_{}", variable.name()),
+                            None,
+                            format!("Materialized variable {}", variable.name()),
+                        ).complete(ConstructType::ValueActor),
+                        actor_context.clone(),
+                        constant(materialized),
+                        None,
+                    ));
+                    // Create new Variable with the constant actor
+                    let new_var = Variable::new_arc(
+                        ConstructInfo::new(
+                            format!("materialized_var_{}", variable.name()),
+                            None,
+                            format!("Materialized variable {}", variable.name()),
+                        ),
+                        construct_context.clone(),
+                        variable.name().to_string(),
+                        value_actor,
+                        None,
+                    );
+                    materialized_vars.push(new_var);
+                }
+            }
+            let new_object = Object::new_arc(
+                ConstructInfo::new("materialized_object", None, "Materialized object"),
+                construct_context,
+                materialized_vars,
+            );
+            Value::Object(new_object, metadata)
+        }
+        Value::TaggedObject(tagged_object, metadata) => {
+            let mut materialized_vars: Vec<Arc<Variable>> = Vec::new();
+            for variable in tagged_object.variables() {
+                let var_value = variable.value_actor().subscribe().next().await;
+                if let Some(var_value) = var_value {
+                    let materialized = Box::pin(materialize_value(
+                        var_value,
+                        construct_context.clone(),
+                        actor_context.clone(),
+                    )).await;
+                    let value_actor = Arc::new(ValueActor::new(
+                        ConstructInfo::new(
+                            format!("materialized_{}", variable.name()),
+                            None,
+                            format!("Materialized variable {}", variable.name()),
+                        ).complete(ConstructType::ValueActor),
+                        actor_context.clone(),
+                        constant(materialized),
+                        None,
+                    ));
+                    let new_var = Variable::new_arc(
+                        ConstructInfo::new(
+                            format!("materialized_var_{}", variable.name()),
+                            None,
+                            format!("Materialized variable {}", variable.name()),
+                        ),
+                        construct_context.clone(),
+                        variable.name().to_string(),
+                        value_actor,
+                        None,
+                    );
+                    materialized_vars.push(new_var);
+                }
+            }
+            let new_tagged_object = TaggedObject::new_arc(
+                ConstructInfo::new("materialized_tagged_object", None, "Materialized tagged object"),
+                construct_context,
+                tagged_object.tag().to_string(),
+                materialized_vars,
+            );
+            Value::TaggedObject(new_tagged_object, metadata)
+        }
+        Value::Flushed(inner, metadata) => {
+            let materialized_inner = Box::pin(materialize_value(
+                *inner,
+                construct_context,
+                actor_context,
+            )).await;
+            Value::Flushed(Box::new(materialized_inner), metadata)
+        }
+        // Scalars don't need materialization
+        other => other,
+    }
 }
 
 // --- Object ---

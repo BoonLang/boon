@@ -1,0 +1,4 @@
+# Minimal example - displays number 123
+
+[output]
+text = "123"

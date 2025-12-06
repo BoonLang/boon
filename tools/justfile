@@ -29,8 +29,8 @@ console:
     {{boon_tools}} exec console
 
 # Take screenshot of playground
-screenshot name="screenshot":
-    {{boon_tools}} exec screenshot {{name}}
+screenshot name="screenshot.png":
+    {{boon_tools}} exec screenshot -o {{name}}
 
 # Get preview panel text
 preview:
@@ -84,6 +84,26 @@ elements:
 # Click at absolute coordinates
 click-at x y:
     {{boon_tools}} exec click-at {{x}} {{y}}
+
+# Run all example tests
+test-examples *args:
+    {{boon_tools}} exec test-examples {{args}}
+
+# Test single example by name (use test-examples for all)
+test-one name:
+    {{boon_tools}} exec test-examples --filter {{name}} --verbose
+
+# Refresh page (keeps extension connected)
+refresh:
+    {{boon_tools}} exec refresh
+
+# Detach debugger (use when "debugger already attached" errors occur)
+detach:
+    {{boon_tools}} exec detach
+
+# Clear saved states
+clear:
+    {{boon_tools}} exec clear-states
 
 # Chrome profile directory (gitignored)
 chrome_profile := ".chrome-profile"

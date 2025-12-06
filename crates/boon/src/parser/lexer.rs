@@ -169,8 +169,12 @@ pub fn lexer<'code>()
         .unwrapped()
         .map(Token::Number);
 
+    // Allow identifiers starting with underscore (like _log) but not just "_" alone
+    // Note: "__" is the Wildcard token, handled separately
     let snake_case_identifier = any()
-        .filter(char::is_ascii_lowercase)
+        .filter(|character: &char| {
+            *character == '_' || character.is_ascii_lowercase()
+        })
         .then(
             any()
                 .filter(|character: &char| {
@@ -178,9 +182,17 @@ pub fn lexer<'code>()
                         || character.is_ascii_lowercase()
                         || character.is_ascii_digit()
                 })
-                .repeated(),
+                .repeated()
+                .at_least(
+                    // If starts with '_', must have at least one more character
+                    // to distinguish from potential wildcards
+                    0  // Actually 0 for regular identifiers, _foo is fine
+                ),
         )
         .to_slice()
+        // Filter out single underscore (that would conflict with partial wildcard)
+        // and double underscore (that's the wildcard token)
+        .filter(|s: &&str| *s != "_" && *s != "__")
         .map(Token::SnakeCaseIdentifier);
 
     let pascal_case_identifier = any()
@@ -254,7 +266,16 @@ pub fn lexer<'code>()
         .then_ignore(just('{'))
         .then(text_content_inner)
         .then_ignore(just('}'))
-        .map(|(hashes, content): (Vec<_>, &str)| Token::TextContent(content.trim(), hashes.len()));
+        .map(|(hashes, content): (Vec<_>, &str)| {
+            let trimmed = content.trim();
+            // Strip surrounding double quotes if present (TEXT { "Hello" } -> Hello)
+            let stripped = if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+                &trimmed[1..trimmed.len()-1]
+            } else {
+                trimmed
+            };
+            Token::TextContent(stripped, hashes.len())
+        });
 
     let token = choice((
         bracket,

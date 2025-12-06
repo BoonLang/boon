@@ -189,6 +189,29 @@ enum ExecAction {
 
     /// Clear saved states (reset localStorage for tests)
     ClearStates,
+
+    /// Run all example tests (examples with .expected files)
+    TestExamples {
+        /// Only run examples matching pattern (e.g., "counter", "todo")
+        #[arg(short, long)]
+        filter: Option<String>,
+
+        /// Pause and wait for user input on test failure
+        #[arg(short, long)]
+        interactive: bool,
+
+        /// Save screenshots on failure
+        #[arg(long)]
+        screenshot_on_fail: bool,
+
+        /// Show detailed output including step results
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Path to examples directory (default: auto-detect)
+        #[arg(long)]
+        examples_dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -486,6 +509,33 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
             println!("Clearing saved states...");
             let response = send_command_to_server(port, WsCommand::ClearStates).await?;
             print_response(response);
+        }
+
+        ExecAction::TestExamples {
+            filter,
+            interactive,
+            screenshot_on_fail,
+            verbose,
+            examples_dir,
+        } => {
+            use commands::test_examples::{run_tests, TestOptions};
+
+            let opts = TestOptions {
+                port,
+                filter,
+                interactive,
+                screenshot_on_fail,
+                verbose,
+                examples_dir,
+            };
+
+            let results = run_tests(opts).await?;
+
+            // Exit with error code if any tests failed
+            let all_passed = results.iter().all(|r| r.passed);
+            if !all_passed {
+                std::process::exit(1);
+            }
         }
     }
 

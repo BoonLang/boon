@@ -1496,6 +1496,10 @@ fn static_spanned_expression_into_value_actor(
                     // (closure moves actor_context_for_then, so we must extract first)
                     let backpressure_permit = actor_context_for_then.backpressure_permit.clone();
 
+                    // When inside HOLD (has backpressure), we need to materialize Object values
+                    // to prevent circular dependencies from lazy ValueActors referencing state
+                    let should_materialize = backpressure_permit.is_some();
+
                     // Helper closure for evaluating a single input value
                     // Returns Option<Value> - the body result (or None on error)
                     let eval_body = move |value: Value| {
@@ -1543,10 +1547,13 @@ fn static_spanned_expression_into_value_actor(
                                 node: body_clone.node.clone(),
                             };
 
+                            // Clone construct_context for potential materialization use
+                            let construct_context_for_materialize = construct_context_clone.clone();
+
                             match static_spanned_expression_into_value_actor(
                                 body_expr,
                                 construct_context_clone,
-                                new_actor_context,
+                                new_actor_context.clone(),
                                 reference_connector_clone,
                                 link_connector_clone,
                                 function_registry_clone,
@@ -1564,6 +1571,17 @@ fn static_spanned_expression_into_value_actor(
                                         // We assign fresh idempotency keys so downstream consumers (like Math/sum)
                                         // treat each pulse's output as unique rather than skipping "duplicates".
                                         result_value.set_idempotency_key(ValueIdempotencyKey::new());
+
+                                        // When inside HOLD, materialize Object values to break circular
+                                        // dependencies from lazy ValueActors that reference state
+                                        if should_materialize {
+                                            result_value = materialize_value(
+                                                result_value,
+                                                construct_context_for_materialize,
+                                                new_actor_context.clone(),
+                                            ).await;
+                                        }
+
                                         Some(result_value)
                                     } else {
                                         None
@@ -1575,26 +1593,12 @@ fn static_spanned_expression_into_value_actor(
                     };
 
                     // Create the flattened stream using either sequential or parallel processing
-                    let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if let Some(permit) = backpressure_permit {
-                        // Backpressure mode: HOLD controls pacing via permit.
-                        // THEN acquires permit before each body evaluation.
-                        // HOLD releases permit after updating state.
-                        // This guarantees state is updated before next body starts.
-                        let stream = piped.clone().subscribe()
-                            .then(move |value| {
-                                let permit = permit.clone();
-                                let eval = eval_body.clone();
-                                async move {
-                                    // Wait for permit - HOLD releases after state update
-                                    permit.acquire().await;
-                                    eval(value).await
-                                }
-                            })
-                            .filter_map(|opt| async { opt });
-                        Box::pin(stream)
-                    } else if sequential {
-                        // Sequential mode without backpressure (fallback).
-                        // Uses .then() to process one at a time, but no synchronization with HOLD.
+                    let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if backpressure_permit.is_some() || sequential {
+                        // Backpressure or sequential mode: process one at a time.
+                        // When backpressure permit exists (inside HOLD), PULSES has already
+                        // acquired the permit before emitting each value. THEN just processes
+                        // sequentially, and HOLD releases permit after state update.
+                        // This guarantees state is updated before next pulse arrives.
                         let stream = piped.clone().subscribe()
                             .then(eval_body)
                             .filter_map(|opt| async { opt });
@@ -1925,6 +1929,23 @@ fn static_spanned_expression_into_value_actor(
 
             // Create a ValueActor that provides the current state to the body
             // This is what the state_param references
+            //
+            // CRITICAL: state_actor's stream MUST first get the initial value directly
+            // from initial_actor (using take(1)), then listen to state_receiver for updates.
+            // This ensures the initial value is available BEFORE body evaluation starts.
+            // Without this, there's a race condition:
+            // 1. Body evaluates, creating PULSES/THEN actors
+            // 2. PULSES emits, THEN evaluates, needs state.field
+            // 3. But state_actor hasn't received initial value yet (it comes from combined_stream)
+            // 4. Deadlock: body waits for state, state waits for combined_stream to run
+            //
+            // The fix: state_actor first subscribes to initial_actor directly, getting
+            // the initial value immediately. Then it chains with state_receiver for:
+            // - Body updates (from state_update_stream → state_sender_for_update)
+            // - Reset values (from initial_stream → state_sender_for_body)
+            let state_stream = initial_actor.clone().subscribe()
+                .take(1)  // Get the first initial value directly
+                .chain(state_receiver);  // Then listen for updates and resets
             let state_actor = ValueActor::new_arc(
                 ConstructInfo::new(
                     format!("Hold state actor for {state_param_string}"),
@@ -1932,7 +1953,7 @@ fn static_spanned_expression_into_value_actor(
                     format!("{span}; HOLD state parameter"),
                 ),
                 actor_context.clone(),
-                TypedStream::infinite(state_receiver),
+                TypedStream::infinite(state_stream),
                 None,
             );
 
@@ -2068,6 +2089,11 @@ fn static_spanned_expression_into_value_actor(
 
             let construct_context_for_pulses = construct_context.clone();
 
+            // Get backpressure permit from HOLD context if available.
+            // When inside HOLD, PULSES will acquire permit before each emission,
+            // ensuring consumer (THEN) processes each value before next is emitted.
+            let backpressure_permit = actor_context.backpressure_permit.clone();
+
             // When count changes, emit that many pulses
             // Clone count_actor before moving into closure - we need to keep it alive
             // Use stream::unfold instead of stream::iter to yield between emissions,
@@ -2079,20 +2105,29 @@ fn static_spanned_expression_into_value_actor(
                 };
 
                 let construct_context_inner = construct_context_for_pulses.clone();
+                let permit_for_iteration = backpressure_permit.clone();
 
                 // Use unfold to emit pulses one at a time with async yield points
-                // Yield BEFORE each pulse to ensure sequential processing:
-                // - First yield lets downstream subscribe
-                // - Subsequent yields let downstream (like HOLD) process the previous pulse
-                //   before the next one arrives
+                // When backpressure permit exists (inside HOLD), acquire it before
+                // each emission to ensure THEN processes the value before next pulse.
                 stream::unfold(0i64, move |i| {
                     let construct_context_for_iter = construct_context_inner.clone();
+                    let permit = permit_for_iteration.clone();
                     async move {
                         if i >= n.max(0) {
                             return None;
                         }
-                        // Yield before each pulse emission to allow sequential processing
-                        yield_once().await;
+
+                        // If backpressure permit exists, acquire before emitting.
+                        // This ensures previous value was processed by consumer (THEN/HOLD).
+                        // HOLD releases permit after state update, so next pulse can emit.
+                        if let Some(ref permit) = permit {
+                            permit.acquire().await;
+                        } else {
+                            // No backpressure: yield to allow downstream to process
+                            yield_once().await;
+                        }
+
                         let value = Value::Number(
                             Arc::new(Number::new(
                                 ConstructInfo::new(
@@ -2252,11 +2287,30 @@ fn static_spanned_expression_into_value_actor(
                         );
                         part_actors.push((true, text_actor));
                     }
-                    static_expression::TextPart::Interpolation { var } => {
+                    static_expression::TextPart::Interpolation { var, referenced_span } => {
                         // Interpolation - look up the variable
                         let var_name = var.to_string();
                         if let Some(var_actor) = actor_context.parameters.get(&var_name) {
                             part_actors.push((false, var_actor.clone()));
+                        } else if let Some(ref_span) = referenced_span {
+                            // Use reference_connector to get the variable from outer scope
+                            // Create a wrapper actor that resolves the reference asynchronously
+                            let ref_connector = reference_connector.clone();
+                            let ref_span_copy = *ref_span;
+                            let value_stream = stream::once(ref_connector.referenceable(ref_span_copy))
+                                .flat_map(|actor| actor.subscribe())
+                                .boxed_local();
+                            let ref_actor = Arc::new(ValueActor::new(
+                                ConstructInfo::new(
+                                    format!("TextInterpolation:{}", var_name),
+                                    None,
+                                    format!("{span}; TextInterpolation for '{}'", var_name),
+                                ).complete(ConstructType::ValueActor),
+                                actor_context.clone(),
+                                TypedStream::infinite(value_stream),
+                                None,
+                            ));
+                            part_actors.push((false, ref_actor));
                         } else {
                             return Err(format!("Variable '{}' not found for text interpolation", var_name));
                         }
