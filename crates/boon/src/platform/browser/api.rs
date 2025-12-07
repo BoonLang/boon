@@ -1604,25 +1604,21 @@ pub fn function_log_info(
     .chain(stream::pending())
 }
 
-/// Log/error(message) -> []
-/// Logs an error message to the console (placeholder - actual logging to be implemented)
+/// Log/error(message) -> message
+/// Logs an error message to the console and passes through the input value
 pub fn function_log_error(
     arguments: Arc<Vec<Arc<ValueActor>>>,
-    function_call_id: ConstructId,
+    _function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
-    construct_context: ConstructContext,
+    _construct_context: ConstructContext,
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let message_actor = arguments[0].clone();
     message_actor.subscribe().map(move |value| {
-        // @TODO: Add proper console logging when web_sys console feature is available
-        let _message = value_to_log_string(&value);
-        Object::new_value(
-            ConstructInfo::new(function_call_id.with_child_id(0), None, "Log/error result"),
-            construct_context.clone(),
-            ValueIdempotencyKey::new(),
-            [],
-        )
+        let message = value_to_log_string(&value);
+        zoon::eprintln!("[ERROR] {}", message);
+        // Pass through the input value for chaining
+        value
     })
     // Chain with pending() to keep stream alive forever - prevents actor termination
     .chain(stream::pending())

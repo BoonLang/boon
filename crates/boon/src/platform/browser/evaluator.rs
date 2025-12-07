@@ -365,11 +365,12 @@ impl EvaluationState {
 
 /// Stack-safe expression evaluation using a work queue.
 /// This is the main entry point that replaces the recursive `static_spanned_expression_into_value_actor`.
+/// Returns `Ok(None)` for SKIP expressions - callers must handle this case appropriately.
 #[allow(dead_code)]
 pub fn evaluate_expression_stacksafe(
     expression: static_expression::Spanned<static_expression::Expression>,
     ctx: EvaluationContext,
-) -> Result<Arc<ValueActor>, String> {
+) -> Result<Option<Arc<ValueActor>>, String> {
     let mut state = EvaluationState::new();
     let final_slot = state.alloc_slot();
 
@@ -390,9 +391,18 @@ pub fn evaluate_expression_stacksafe(
         zoon::println!("[DEBUG] After processing: results_len={}", state.results.len());
     }
 
-    // Get the final result (top-level expression cannot be SKIP)
+    // Get the final result - SKIP returns None (no actor)
     zoon::println!("[DEBUG] Getting final result from slot {}", final_slot);
-    state.get(final_slot).ok_or_else(|| "Top-level expression evaluated to SKIP".to_string())
+    match state.get(final_slot) {
+        Some(actor) => Ok(Some(actor)),
+        None => {
+            // SKIP evaluated - return None to signal "no value"
+            // Callers handle this by returning stream::empty() (for THEN/WHEN/WHILE)
+            // or by not updating state (for HOLD), etc.
+            zoon::println!("[DEBUG] Expression evaluated to SKIP - returning None");
+            Ok(None)
+        }
+    }
 }
 
 /// Schedule an expression for evaluation.
@@ -853,15 +863,16 @@ fn schedule_expression(
             match path_strs_ref.as_slice() {
                 ["List", "map"] | ["List", "retain"] | ["List", "every"] | ["List", "any"] | ["List", "sort_by"] => {
                     // Handle List binding functions specially - don't pre-evaluate transform expression
-                    let actor = build_list_binding_function(
+                    if let Some(actor) = build_list_binding_function(
                         &path_strs,
                         arguments,
                         span,
                         persistence,
                         persistence_id,
                         ctx,
-                    )?;
-                    state.store(result_slot, actor);
+                    )? {
+                        state.store(result_slot, actor);
+                    }
                 }
                 _ => {
                     // Normal function call - pre-evaluate all arguments
@@ -991,14 +1002,15 @@ fn schedule_expression(
         // ============================================================
 
         static_expression::Expression::Pulses { count } => {
-            let actor = build_pulses_actor(
+            if let Some(actor) = build_pulses_actor(
                 *count,
                 span,
                 persistence,
                 persistence_id,
                 ctx,
-            )?;
-            state.store(result_slot, actor);
+            )? {
+                state.store(result_slot, actor);
+            }
         }
 
         // ============================================================
@@ -1373,9 +1385,10 @@ fn process_work_item(
                 return Ok(());
             };
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
-            let actor = build_hold_actor(initial_actor, state_param, *body, span, persistence, persistence_id, ctx)?;
-            zoon::println!("[DEBUG] BuildHold: stored to slot {:?}", result_slot);
-            state.store(result_slot, actor);
+            if let Some(actor) = build_hold_actor(initial_actor, state_param, *body, span, persistence, persistence_id, ctx)? {
+                zoon::println!("[DEBUG] BuildHold: stored to slot {:?}", result_slot);
+                state.store(result_slot, actor);
+            }
         }
 
         WorkItem::BuildBlock { variable_slots, output_slot, result_slot } => {
@@ -1531,7 +1544,7 @@ fn process_work_item(
             }
 
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
-            let actor = call_function_stacksafe(
+            let actor_opt = call_function_stacksafe(
                 path,
                 args,
                 span,
@@ -1540,7 +1553,10 @@ fn process_work_item(
                 ctx,
                 use_piped_for_builtin,
             )?;
-            state.store(result_slot, actor);
+            // If function returns SKIP (None), don't store anything
+            if let Some(actor) = actor_opt {
+                state.store(result_slot, actor);
+            }
         }
     }
 
@@ -1639,7 +1655,6 @@ fn build_then_actor(
 
     let sequential = ctx.actor_context.sequential_processing;
     let backpressure_permit = ctx.actor_context.backpressure_permit.clone();
-    let should_materialize = backpressure_permit.is_some();
 
     // Clone context components for the async closure
     let construct_context_for_then = ctx.construct_context.clone();
@@ -1652,7 +1667,9 @@ fn build_then_actor(
     let persistence_for_then = persistence.clone();
     let span_for_then = span;
 
-    let eval_body = move |value: Value| {
+    // eval_body now returns a Stream instead of Option<Value>
+    // This avoids blocking on .next().await which would hang if body returns SKIP
+    let eval_body = move |value: Value| -> Pin<Box<dyn Future<Output = Pin<Box<dyn Stream<Item = Value>>>>>> {
         let actor_context_clone = actor_context_for_then.clone();
         let construct_context_clone = construct_context_for_then.clone();
         let reference_connector_clone = reference_connector_for_then.clone();
@@ -1663,13 +1680,7 @@ fn build_then_actor(
         let persistence_clone = persistence_for_then.clone();
         let body_clone = body.clone();
 
-        async move {
-            // SKIP body means "no value for this input" - return None immediately
-            // to avoid hanging on the subscription.next().await (SKIP never emits)
-            if matches!(body_clone.node, static_expression::Expression::Skip) {
-                return None;
-            }
-
+        Box::pin(async move {
             let value_actor = ValueActor::new_arc(
                 ConstructInfo::new(
                     "THEN input value".to_string(),
@@ -1707,46 +1718,47 @@ fn build_then_actor(
             };
 
             match evaluate_expression_stacksafe(body_expr, new_ctx) {
-                Ok(result_actor) => {
-                    println!("[DEBUG] THEN eval_body: body evaluated, result_actor version={}",
-                        result_actor.version());
-                    let mut subscription = result_actor.subscribe();
-                    let _keep_alive = value_actor;
-                    println!("[DEBUG] THEN eval_body: awaiting subscription.next()...");
-                    if let Some(mut result_value) = subscription.next().await {
-                        println!("[DEBUG] THEN eval_body: got result_value!");
+                Ok(Some(result_actor)) => {
+                    // IMPORTANT: Use .take(1) because the body may be a reactive expression
+                    // (e.g., `counter + 1`) that re-emits whenever its dependencies change.
+                    // Without take(1), when used inside HOLD, the body would re-emit on each
+                    // state update, causing infinite loops. Each THEN body evaluation should
+                    // produce exactly ONE value per input.
+                    let result_actor_keepalive = result_actor.clone();
+                    let result_stream = result_actor.subscribe().take(1).map(move |mut result_value| {
+                        // Keep value_actor and result_actor alive while stream is consumed
+                        let _ = &value_actor;
+                        let _ = &result_actor_keepalive;
                         result_value.set_idempotency_key(ValueIdempotencyKey::new());
-
-                        if should_materialize {
-                            result_value = materialize_value(
-                                result_value,
-                                construct_context_clone,
-                                new_actor_context.clone(),
-                            ).await;
-                        }
-
-                        println!("[DEBUG] THEN eval_body: returning Some(result_value)");
-                        Some(result_value)
-                    } else {
-                        println!("[DEBUG] THEN eval_body: got None from subscription");
-                        None
-                    }
+                        result_value
+                    });
+                    Box::pin(result_stream) as Pin<Box<dyn Stream<Item = Value>>>
                 }
-                Err(e) => {
-                    println!("[DEBUG] THEN eval_body: error: {e}");
-                    None
-                },
+                Ok(None) => {
+                    // SKIP - return finite empty stream (flatten_unordered removes it cleanly)
+                    Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>
+                }
+                Err(_e) => {
+                    Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>
+                }
             }
-        }
+        })
     };
 
+    // Use then + flatten_unordered instead of then + filter_map
+    // flatten_unordered processes inner streams concurrently, so even if one stream
+    // never emits (SKIP case), others can still produce values
     let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if backpressure_permit.is_some() || sequential {
+        // For sequential mode, use regular flatten (processes one stream at a time)
         let stream = piped.clone().subscribe()
             .then(eval_body)
-            .filter_map(|opt| async { opt });
+            .flatten();
         Box::pin(stream)
     } else {
-        let stream = piped.clone().subscribe().filter_map(eval_body);
+        // For non-sequential mode, use flatten_unordered for concurrent processing
+        let stream = piped.clone().subscribe()
+            .then(eval_body)
+            .flatten_unordered(None);
         Box::pin(stream)
     };
 
@@ -1811,11 +1823,6 @@ fn build_when_actor(
             for arm in &arms_clone {
                 // Use async pattern matching to properly extract bindings from Objects
                 if let Some(bindings) = match_pattern_async(&arm.pattern, &value).await {
-                    // SKIP body means "no value for this input" - return empty stream
-                    if matches!(arm.body, static_expression::Expression::Skip) {
-                        return Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>;
-                    }
-
                     let value_actor = ValueActor::new_arc(
                         ConstructInfo::new(
                             "WHEN input value".to_string(),
@@ -1871,14 +1878,14 @@ fn build_when_actor(
                     };
 
                     match evaluate_expression_stacksafe(body_expr, new_ctx) {
-                        Ok(result_actor) => {
-                            // Return the body's stream directly - no .next().await!
-                            // This is the key fix: nested WHEN that returns SKIP will have an empty stream,
-                            // and flatten_unordered will naturally handle it without blocking.
-                            // Don't use take(1) - body naturally emits once per input, and take(1)
-                            // would block forever on infinite streams that never emit (SKIP case).
+                        Ok(Some(result_actor)) => {
+                            // IMPORTANT: Use .take(1) because the body may be a reactive expression
+                            // (e.g., `counter + 1`) that re-emits whenever its dependencies change.
+                            // Without take(1), when used inside HOLD, the body would re-emit on each
+                            // state update, causing infinite loops. Each WHEN body evaluation should
+                            // produce exactly ONE value per input.
                             let result_actor_keepalive = result_actor.clone();
-                            let result_stream = result_actor.subscribe().map(move |mut result_value| {
+                            let result_stream = result_actor.subscribe().take(1).map(move |mut result_value| {
                                 // Keep value_actor and result_actor alive while stream is consumed
                                 let _ = &value_actor;
                                 let _ = &result_actor_keepalive;
@@ -1886,6 +1893,10 @@ fn build_when_actor(
                                 result_value
                             });
                             return Box::pin(result_stream) as Pin<Box<dyn Stream<Item = Value>>>;
+                        }
+                        Ok(None) => {
+                            // SKIP - return finite empty stream (flatten_unordered removes it cleanly)
+                            return Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>;
                         }
                         Err(_e) => {
                             return Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>;
@@ -1973,12 +1984,6 @@ fn build_while_actor(
             }
 
             if let Some((arm, bindings)) = matched_arm_with_bindings {
-                // SKIP body means "no value for this input" - return empty stream immediately
-                // to avoid subscribing to SKIP (which never emits)
-                if matches!(arm.body, static_expression::Expression::Skip) {
-                    return Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>;
-                }
-
                 let value_actor = ValueActor::new_arc(
                     ConstructInfo::new(
                         "WHILE input value".to_string(),
@@ -2033,9 +2038,13 @@ fn build_while_actor(
                 };
 
                 match evaluate_expression_stacksafe(body_expr, new_ctx) {
-                    Ok(result_actor) => {
+                    Ok(Some(result_actor)) => {
                         let stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(result_actor.subscribe());
                         stream
+                    }
+                    Ok(None) => {
+                        // SKIP - return finite empty stream (flatten removes it cleanly)
+                        Box::pin(stream::empty())
                     }
                     Err(_) => {
                         Box::pin(stream::empty())
@@ -2076,7 +2085,7 @@ fn build_hold_actor(
     persistence: Option<Persistence>,
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
-) -> Result<Arc<ValueActor>, String> {
+) -> Result<Option<Arc<ValueActor>>, String> {
     println!("[DEBUG] build_hold_actor: state_param={state_param}, span={span:?}");
     // Use a channel to hold current state value and broadcast updates
     let (state_sender, state_receiver) = zoon::futures_channel::mpsc::unbounded::<Value>();
@@ -2147,7 +2156,13 @@ fn build_hold_actor(
     };
 
     // Evaluate the body with state parameter bound
-    let body_result = evaluate_expression_stacksafe(body, body_ctx)?;
+    let body_result = match evaluate_expression_stacksafe(body, body_ctx)? {
+        Some(actor) => actor,
+        None => {
+            // Body is SKIP - HOLD produces no values (propagate SKIP)
+            return Ok(None);
+        }
+    };
 
     // When body produces new values, update the state
     // Note: We avoid self-reactivity by not triggering body re-evaluation
@@ -2186,7 +2201,7 @@ fn build_hold_actor(
         state_update_stream
     );
 
-    Ok(ValueActor::new_arc(
+    Ok(Some(ValueActor::new_arc(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -2195,7 +2210,7 @@ fn build_hold_actor(
         ctx.actor_context,
         TypedStream::infinite(combined_stream),
         Some(persistence_id),
-    ))
+    )))
 }
 
 /// Build a PULSES actor for iteration.
@@ -2207,10 +2222,16 @@ fn build_pulses_actor(
     persistence: Option<Persistence>,
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
-) -> Result<Arc<ValueActor>, String> {
+) -> Result<Option<Arc<ValueActor>>, String> {
     println!("[DEBUG] build_pulses_actor: span={span:?}, has_backpressure_permit={}", ctx.actor_context.backpressure_permit.is_some());
     // Evaluate the count expression
-    let count_actor = evaluate_expression_stacksafe(count_expr, ctx.clone())?;
+    let count_actor = match evaluate_expression_stacksafe(count_expr, ctx.clone())? {
+        Some(actor) => actor,
+        None => {
+            // Count is SKIP - PULSES produces no values (propagate SKIP)
+            return Ok(None);
+        }
+    };
 
     // Debug: check if count_actor has an immediate value
     println!("[DEBUG] PULSES: count_actor version={}",
@@ -2287,7 +2308,7 @@ fn build_pulses_actor(
     });
 
     // Keep count_actor alive by passing it as an input dependency
-    Ok(ValueActor::new_arc_with_inputs(
+    Ok(Some(ValueActor::new_arc_with_inputs(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -2297,7 +2318,7 @@ fn build_pulses_actor(
         TypedStream::infinite(pulses_stream),
         Some(persistence_id),
         vec![count_actor],
-    ))
+    )))
 }
 
 /// Build a TEXT { ... } literal actor with interpolation support.
@@ -2502,7 +2523,7 @@ fn build_list_binding_function(
     persistence: Option<Persistence>,
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
-) -> Result<Arc<ValueActor>, String> {
+) -> Result<Option<Arc<ValueActor>>, String> {
     let operation = match path_strs[1].as_str() {
         "map" => ListBindingOperation::Map,
         "retain" => ListBindingOperation::Retain,
@@ -2525,7 +2546,13 @@ fn build_list_binding_function(
     // Get the list - either from first argument's value or from piped
     let list_actor = if let Some(ref list_value) = arguments[0].node.value {
         // Evaluate list expression using stack-safe evaluator
-        evaluate_expression_stacksafe(list_value.clone(), ctx.clone())?
+        match evaluate_expression_stacksafe(list_value.clone(), ctx.clone())? {
+            Some(actor) => actor,
+            None => {
+                // List is SKIP - result is SKIP
+                return Ok(None);
+            }
+        }
     } else if let Some(ref piped) = ctx.actor_context.piped {
         piped.clone()
     } else {
@@ -2545,7 +2572,7 @@ fn build_list_binding_function(
         source_code: ctx.source_code.clone(),
     };
 
-    Ok(ListBindingFunction::new_arc_value_actor(
+    Ok(Some(ListBindingFunction::new_arc_value_actor(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -2555,11 +2582,12 @@ fn build_list_binding_function(
         ctx.actor_context,
         list_actor,
         config,
-    ))
+    )))
 }
 
 /// Call a function with stack-safe evaluation.
 /// Supports both user-defined functions and builtin functions.
+/// Returns `Ok(None)` if the function body is SKIP.
 fn call_function_stacksafe(
     path: Vec<String>,
     args: Vec<(String, Arc<ValueActor>)>,
@@ -2568,7 +2596,7 @@ fn call_function_stacksafe(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
     use_piped_for_builtin: bool,
-) -> Result<Arc<ValueActor>, String> {
+) -> Result<Option<Arc<ValueActor>>, String> {
     let full_path = path.join("/");
 
     // Convert args to a map (for user-defined functions)
@@ -2624,6 +2652,7 @@ fn call_function_stacksafe(
         zoon::println!("[DEBUG] call_function_stacksafe: evaluating function body type={:?}", std::mem::discriminant(&func_def.body.node));
         let result = evaluate_expression_stacksafe(func_def.body, new_ctx);
         zoon::println!("[DEBUG] call_function_stacksafe: function returned, is_ok={}", result.is_ok());
+        // Propagate None (SKIP) from function body
         return result;
     }
 
@@ -2657,13 +2686,13 @@ fn call_function_stacksafe(
                 backpressure_permit: ctx.actor_context.backpressure_permit.clone(),
             };
 
-            Ok(FunctionCall::new_arc_value_actor(
+            Ok(Some(FunctionCall::new_arc_value_actor(
                 construct_info,
                 ctx.construct_context,
                 call_actor_context,
                 definition,
                 builtin_args,
-            ))
+            )))
         }
         Err(_) => {
             Err(format!("Function '{}' not found", full_path))
@@ -3384,7 +3413,8 @@ fn static_spanned_expression_into_value_actor(
 
     // Delegate to the stack-safe evaluator
     zoon::println!("[DEBUG] static_spanned_expression_into_value_actor: entering, expr_type={:?}", std::mem::discriminant(&expression.node));
-    evaluate_expression_stacksafe(expression, ctx)
+    evaluate_expression_stacksafe(expression, ctx)?
+        .ok_or_else(|| "Top-level expression cannot be SKIP".to_string())
 }
 
 /// OLD RECURSIVE IMPLEMENTATION - kept for reference during migration
