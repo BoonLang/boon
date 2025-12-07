@@ -945,7 +945,12 @@ impl VariableOrArgumentReference {
                         ),
                     }
                 })
-                .flatten_unordered(None)  // Process all Object field streams concurrently
+                // IMPORTANT: Use flatten_unordered(Some(1)) to limit concurrency!
+                // With None (unlimited), each root emission creates a new concurrent
+                // subscription to the field, and these never terminate. This causes
+                // exponential growth in active subscriptions when state updates frequently
+                // (e.g., `state.current` in THEN body inside HOLD).
+                .flatten_unordered(Some(1))
                 .boxed_local();
         }
         // Subscription-based streams are infinite (subscriptions never terminate first)
