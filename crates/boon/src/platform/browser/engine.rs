@@ -3250,8 +3250,10 @@ impl Object {
             variables.into(),
         );
 
-        // Create stream from the value
-        let value_stream = constant(initial_value.clone());
+        // Use pending() stream - initial value is already set, no need for stream to emit
+        // Using constant() here would cause duplicate emissions (version 1 from initial,
+        // version 2 from stream)
+        let value_stream = TypedStream::infinite(stream::pending());
 
         // Use new_arc_with_initial_value so the value is immediately available
         // This is critical for WASM single-threaded runtime where spawned tasks
@@ -3386,8 +3388,10 @@ impl TaggedObject {
             variables.into(),
         );
 
-        // Create stream from the value
-        let value_stream = constant(initial_value.clone());
+        // Use pending() stream - initial value is already set, no need for stream to emit
+        // Using constant() here would cause duplicate emissions (version 1 from initial,
+        // version 2 from stream)
+        let value_stream = TypedStream::infinite(stream::pending());
 
         // Use new_arc_with_initial_value so the value is immediately available
         // This is critical for WASM single-threaded runtime where spawned tasks
@@ -3512,8 +3516,10 @@ impl Text {
             Self::new_arc(construct_info, construct_context, text.clone()),
             ValueMetadata { idempotency_key },
         );
-        // Create the constant stream from initial value (stream will emit same value)
-        let value_stream = constant(initial_value.clone());
+        // Use pending() stream - initial value is already set, no need for stream to emit
+        // Using constant() here would cause duplicate emissions (version 1 from initial,
+        // version 2 from stream)
+        let value_stream = TypedStream::infinite(stream::pending());
         // Use the new method that pre-sets initial value
         ValueActor::new_arc_with_initial_value(
             actor_construct_info,
@@ -3615,8 +3621,10 @@ impl Tag {
             Self::new_arc(construct_info, construct_context, tag.clone()),
             ValueMetadata { idempotency_key },
         );
-        // Create the constant stream from initial value (stream will emit same value)
-        let value_stream = constant(initial_value.clone());
+        // Use pending() stream - initial value is already set, no need for stream to emit
+        // Using constant() here would cause duplicate emissions (version 1 from initial,
+        // version 2 from stream)
+        let value_stream = TypedStream::infinite(stream::pending());
         // Use the new method that pre-sets initial value
         ValueActor::new_arc_with_initial_value(
             actor_construct_info,
@@ -3718,8 +3726,10 @@ impl Number {
             Self::new_arc(construct_info, construct_context, number),
             ValueMetadata { idempotency_key },
         );
-        // Create the constant stream from initial value (stream will emit same value)
-        let value_stream = constant(initial_value.clone());
+        // Use pending() stream - initial value is already set, no need for stream to emit
+        // Using constant() here would cause duplicate emissions (version 1 from initial,
+        // version 2 from stream)
+        let value_stream = TypedStream::infinite(stream::pending());
         // Use the new method that pre-sets initial value
         ValueActor::new_arc_with_initial_value(
             actor_construct_info,
