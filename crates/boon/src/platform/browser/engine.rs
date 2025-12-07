@@ -42,7 +42,7 @@ use zoon::{eprintln, println};
 /// - Subscriber dropped before all events are processed
 /// - ValueActor dropped while subscriptions are still active
 /// - Extra owned data not properly keeping actors alive
-const LOG_DROPS_AND_LOOP_ENDS: bool = false;
+const LOG_DROPS_AND_LOOP_ENDS: bool = true;
 
 // --- TypedStream ---
 
@@ -1604,77 +1604,20 @@ impl ComparatorCombinator {
 }
 
 /// Compare two Values for equality.
+/// NOTE: Object/TaggedObject comparison currently compares by identity only (Arc pointer).
+/// Deep comparison would require async access to variable values.
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(n1, _), Value::Number(n2, _)) => n1.number() == n2.number(),
         (Value::Text(t1, _), Value::Text(t2, _)) => t1.text() == t2.text(),
         (Value::Tag(tag1, _), Value::Tag(tag2, _)) => tag1.tag() == tag2.tag(),
+        // For objects, we can only do identity comparison without async
         (Value::TaggedObject(to1, _), Value::TaggedObject(to2, _)) => {
-            tagged_objects_equal(to1, to2)
+            Arc::ptr_eq(to1, to2)
         }
-        (Value::Object(o1, _), Value::Object(o2, _)) => objects_equal(o1, o2),
+        (Value::Object(o1, _), Value::Object(o2, _)) => Arc::ptr_eq(o1, o2),
         _ => false, // Different types are not equal
     }
-}
-
-/// Deep comparison of two TaggedObjects using current field values
-fn tagged_objects_equal(a: &TaggedObject, b: &TaggedObject) -> bool {
-    // Tags must match
-    if a.tag != b.tag {
-        return false;
-    }
-    // Number of fields must match
-    if a.variables.len() != b.variables.len() {
-        return false;
-    }
-    // Compare each field by name and value
-    for var_a in &a.variables {
-        match b.variable(&var_a.name) {
-            Some(var_b) => {
-                let val_a = var_a.value_actor().current_value();
-                let val_b = var_b.value_actor().current_value();
-                match (val_a, val_b) {
-                    (Some(v_a), Some(v_b)) => {
-                        if !values_equal(&v_a, &v_b) {
-                            return false;
-                        }
-                    }
-                    (None, None) => {} // Both have no value yet - considered equal
-                    _ => return false,
-                }
-            }
-            None => return false, // Field not found in b
-        }
-    }
-    true
-}
-
-/// Deep comparison of two Objects using current field values
-fn objects_equal(a: &Object, b: &Object) -> bool {
-    // Number of fields must match
-    if a.variables.len() != b.variables.len() {
-        return false;
-    }
-    // Compare each field by name and value
-    for var_a in &a.variables {
-        match b.variable(&var_a.name) {
-            Some(var_b) => {
-                let val_a = var_a.value_actor().current_value();
-                let val_b = var_b.value_actor().current_value();
-                match (val_a, val_b) {
-                    (Some(v_a), Some(v_b)) => {
-                        if !values_equal(&v_a, &v_b) {
-                            return false;
-                        }
-                    }
-                    (None, None) => {} // Both have no value yet - considered equal
-                    _ => return false,
-                }
-            }
-            None => return false, // Field not found in b
-        }
-    }
-    true
 }
 
 /// Compare two Values for ordering. Returns None if types are incompatible.
@@ -2224,20 +2167,263 @@ impl ValueActor {
         ))
     }
 
+    /// Create a new ValueActor with both an initial value and input dependencies.
+    /// Combines the benefits of `new_with_inputs` (keeps inputs alive) and
+    /// `new_arc_with_initial_value` (immediate value availability).
+    ///
+    /// Use this for combinators that have both:
+    /// - Input dependencies that must stay alive
+    /// - An initial value that can be computed synchronously
+    pub fn new_with_initial_value_and_inputs<S: Stream<Item = Value> + 'static>(
+        construct_info: ConstructInfoComplete,
+        actor_context: ActorContext,
+        value_stream: TypedStream<S, Infinite>,
+        persistence_id: Option<parser::PersistenceId>,
+        initial_value: Value,
+        inputs: Vec<Arc<ValueActor>>,
+    ) -> Self {
+        let value_stream = value_stream.inner;
+        let construct_info = Arc::new(construct_info);
+        let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
+        // Pre-set the initial value
+        let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(Some(initial_value)));
+        // Start at version 1 since we have an initial value
+        let current_version = Arc::new(AtomicU64::new(1));
+        let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
+
+        let loop_task = Task::start_droppable({
+            let construct_info = construct_info.clone();
+            let current_value = current_value.clone();
+            let current_version = current_version.clone();
+            let output_valve_signal = actor_context.output_valve_signal;
+            // Keep inputs alive in the spawned task
+            let _inputs = inputs.clone();
+
+            async move {
+                let mut output_valve_impulse_stream =
+                    if let Some(output_valve_signal) = &output_valve_signal {
+                        output_valve_signal.subscribe().left_stream()
+                    } else {
+                        stream::pending().right_stream()
+                    }
+                    .fuse();
+                let mut value_stream = pin!(value_stream.fuse());
+                let mut message_receiver = pin!(message_receiver.fuse());
+                let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
+                let migration_state = MigrationState::Normal;
+                let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
+                let mut stream_ever_produced = true; // We have initial value
+                let mut stream_ended = false;
+
+                loop {
+                    select! {
+                        sender = notify_sender_receiver.next() => {
+                            if let Some(mut sender) = sender {
+                                if stream_ended && !stream_ever_produced {
+                                    drop(sender);
+                                } else {
+                                    let _ = sender.try_send(());
+                                    notify_senders.push(sender);
+                                }
+                            }
+                        }
+
+                        msg = message_receiver.next() => {
+                            let Some(msg) = msg else {
+                                break;
+                            };
+                            match msg {
+                                ActorMessage::StreamValue(value) => {
+                                    current_value.store(Arc::new(Some(value)));
+                                    current_version.fetch_add(1, Ordering::SeqCst);
+                                    notify_senders.retain_mut(|sender| {
+                                        match sender.try_send(()) {
+                                            Ok(()) => true,
+                                            Err(e) => !e.is_disconnected(),
+                                        }
+                                    });
+                                }
+                                _ => {} // Ignore other messages for simplicity
+                            }
+                        }
+
+                        new_value = value_stream.next() => {
+                            let Some(new_value) = new_value else {
+                                stream_ended = true;
+                                if !stream_ever_produced && let MigrationState::Normal = migration_state {
+                                    break;
+                                }
+                                continue;
+                            };
+
+                            stream_ever_produced = true;
+                            current_value.store(Arc::new(Some(new_value)));
+                            current_version.fetch_add(1, Ordering::SeqCst);
+                            notify_senders.retain_mut(|sender| {
+                                match sender.try_send(()) {
+                                    Ok(()) => true,
+                                    Err(e) => !e.is_disconnected(),
+                                }
+                            });
+                        }
+
+                        impulse = output_valve_impulse_stream.next() => {
+                            if impulse.is_none() {
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                drop(_inputs);
+
+                if LOG_DROPS_AND_LOOP_ENDS {
+                    println!("Loop ended {construct_info}");
+                }
+            }
+        });
+
+        Self {
+            construct_info,
+            persistence_id,
+            message_sender,
+            inputs,
+            current_value,
+            current_version,
+            notify_sender_sender,
+            loop_task,
+        }
+    }
+
     pub fn persistence_id(&self) -> Option<parser::PersistenceId> {
         self.persistence_id
     }
 
-    /// Get the current value without subscribing.
-    /// This is a lock-free read operation.
-    pub fn current_value(&self) -> Option<Value> {
-        self.current_value.load().as_ref().clone()
+    /// Create a new Arc<ValueActor> with an initial value pre-set.
+    /// This ensures the value is immediately available to subscribers without
+    /// waiting for the async task to poll the stream.
+    ///
+    /// Use this for constant values where the initial value is known synchronously.
+    pub fn new_arc_with_initial_value<S: Stream<Item = Value> + 'static>(
+        construct_info: ConstructInfo,
+        actor_context: ActorContext,
+        value_stream: TypedStream<S, Infinite>,
+        persistence_id: Option<parser::PersistenceId>,
+        initial_value: Value,
+    ) -> Arc<Self> {
+        let construct_info = construct_info.complete(ConstructType::ValueActor);
+        let value_stream = value_stream.inner;
+        let construct_info = Arc::new(construct_info);
+        let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
+        // Pre-set the initial value
+        let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(Some(initial_value)));
+        // Start at version 1 since we have an initial value
+        let current_version = Arc::new(AtomicU64::new(1));
+        let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
+
+        let loop_task = Task::start_droppable({
+            let construct_info = construct_info.clone();
+            let current_value = current_value.clone();
+            let current_version = current_version.clone();
+            let output_valve_signal = actor_context.output_valve_signal.clone();
+
+            async move {
+                let mut output_valve_impulse_stream =
+                    if let Some(output_valve_signal) = &output_valve_signal {
+                        output_valve_signal.subscribe().left_stream()
+                    } else {
+                        stream::pending().right_stream()
+                    }
+                    .fuse();
+                let mut value_stream = pin!(value_stream.fuse());
+                let mut message_receiver = pin!(message_receiver.fuse());
+                let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
+                let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
+                let stream_ever_produced = true; // We have an initial value
+                let mut stream_ended = false;
+
+                loop {
+                    select! {
+                        sender = notify_sender_receiver.next() => {
+                            if let Some(mut sender) = sender {
+                                if stream_ended && !stream_ever_produced {
+                                    drop(sender);
+                                } else {
+                                    let _ = sender.try_send(());
+                                    notify_senders.push(sender);
+                                }
+                            }
+                        }
+
+                        msg = message_receiver.next() => {
+                            let Some(msg) = msg else {
+                                break;
+                            };
+                            match msg {
+                                ActorMessage::StreamValue(value) => {
+                                    current_value.store(Arc::new(Some(value)));
+                                    current_version.fetch_add(1, Ordering::SeqCst);
+                                    notify_senders.retain_mut(|sender| {
+                                        match sender.try_send(()) {
+                                            Ok(()) => true,
+                                            Err(e) => !e.is_disconnected(),
+                                        }
+                                    });
+                                }
+                                ActorMessage::Shutdown => break,
+                                _ => {}
+                            }
+                        }
+
+                        _ = output_valve_impulse_stream.next() => {
+                            break;
+                        }
+
+                        value = value_stream.next() => {
+                            if let Some(value) = value {
+                                current_value.store(Arc::new(Some(value)));
+                                current_version.fetch_add(1, Ordering::SeqCst);
+                                notify_senders.retain_mut(|sender| {
+                                    match sender.try_send(()) {
+                                        Ok(()) => true,
+                                        Err(e) => !e.is_disconnected(),
+                                    }
+                                });
+                            } else {
+                                stream_ended = true;
+                            }
+                        }
+                    }
+                }
+                if LOG_DROPS_AND_LOOP_ENDS {
+                    println!("Loop ended {construct_info}");
+                }
+            }
+        });
+
+        Arc::new(Self {
+            construct_info,
+            persistence_id,
+            message_sender,
+            inputs: Vec::new(),
+            current_value,
+            current_version,
+            notify_sender_sender,
+            loop_task,
+        })
     }
 
     /// Get the current version number.
     /// Version increments on each value change.
     pub fn version(&self) -> u64 {
         self.current_version.load(Ordering::SeqCst)
+    }
+
+    /// Read stored value from ArcSwap.
+    /// INTERNAL USE ONLY - for Subscription within engine.rs.
+    /// External code MUST use subscribe().next().await for async reactive semantics.
+    fn stored_value(&self) -> Option<Value> {
+        self.current_value.load().as_ref().clone()
     }
 
     /// Subscribe to this actor's values using bounded channel notifications.
@@ -2271,7 +2457,7 @@ impl ValueActor {
             return ValueUpdate::Current;
         }
         // For now, always return snapshot. Phase 4 will add diff support for LIST.
-        match self.current_value() {
+        match self.stored_value() {
             Some(value) => ValueUpdate::Snapshot(value),
             None => ValueUpdate::Current,
         }
@@ -2334,12 +2520,12 @@ impl Subscription {
         }
 
         self.last_seen_version = self.actor.version();
-        self.actor.current_value()
+        self.actor.stored_value()
     }
 
     /// Get current value immediately without waiting.
     pub fn current(&self) -> Option<Value> {
-        self.actor.current_value()
+        self.actor.stored_value()
     }
 
     /// Check if there are pending updates without consuming them.
@@ -2362,7 +2548,7 @@ impl Stream for Subscription {
             let current = self.actor.version();
             if current > self.last_seen_version {
                 self.last_seen_version = current;
-                if let Some(value) = self.actor.current_value() {
+                if let Some(value) = self.actor.stored_value() {
                     return Poll::Ready(Some(value));
                 }
             }
@@ -2876,7 +3062,7 @@ pub async fn materialize_value(
         Value::Object(object, metadata) => {
             let mut materialized_vars: Vec<Arc<Variable>> = Vec::new();
             for variable in object.variables() {
-                // Await the variable's current value
+                // Await the variable's current value through subscription (proper async)
                 let var_value = variable.value_actor().subscribe().next().await;
                 if let Some(var_value) = var_value {
                     // Recursively materialize nested values
@@ -3038,26 +3224,37 @@ impl Object {
             persistence,
             description: object_description,
         } = construct_info;
-        let construct_info = ConstructInfo::new(
+
+        // Create the wrapped Object construct_info
+        let object_construct_info = ConstructInfo::new(
             actor_id.with_child_id("wrapped Object"),
-            persistence,
+            persistence.clone(),
             object_description,
         );
         let actor_construct_info =
-            ConstructInfo::new(actor_id, persistence, "Constant object wrapper")
-                .complete(ConstructType::ValueActor);
-        let value_stream = Self::new_constant(
-            construct_info,
+            ConstructInfo::new(actor_id, persistence, "Constant object wrapper");
+
+        // Create the initial value first
+        let initial_value = Self::new_value(
+            object_construct_info,
             construct_context,
             idempotency_key,
             variables.into(),
         );
-        Arc::new(ValueActor::new(
+
+        // Create stream from the value
+        let value_stream = constant(initial_value.clone());
+
+        // Use new_arc_with_initial_value so the value is immediately available
+        // This is critical for WASM single-threaded runtime where spawned tasks
+        // don't run until we yield - subscriptions need immediate access to values.
+        ValueActor::new_arc_with_initial_value(
             actor_construct_info,
             actor_context,
             value_stream,
             None,
-        ))
+            initial_value,
+        )
     }
 
     pub fn variable(&self, name: &str) -> Option<Arc<Variable>> {
@@ -3162,27 +3359,38 @@ impl TaggedObject {
             persistence,
             description: tagged_object_description,
         } = construct_info;
-        let construct_info = ConstructInfo::new(
+
+        // Create the wrapped TaggedObject construct_info
+        let tagged_object_construct_info = ConstructInfo::new(
             actor_id.with_child_id("wrapped TaggedObject"),
-            persistence,
+            persistence.clone(),
             tagged_object_description,
         );
         let actor_construct_info =
-            ConstructInfo::new(actor_id, persistence, "Tagged object wrapper")
-                .complete(ConstructType::ValueActor);
-        let value_stream = Self::new_constant(
-            construct_info,
+            ConstructInfo::new(actor_id, persistence, "Tagged object wrapper");
+
+        // Create the initial value first
+        let initial_value = Self::new_value(
+            tagged_object_construct_info,
             construct_context,
             idempotency_key,
             tag.into(),
             variables.into(),
         );
-        Arc::new(ValueActor::new(
+
+        // Create stream from the value
+        let value_stream = constant(initial_value.clone());
+
+        // Use new_arc_with_initial_value so the value is immediately available
+        // This is critical for WASM single-threaded runtime where spawned tasks
+        // don't run until we yield - subscriptions need immediate access to values.
+        ValueActor::new_arc_with_initial_value(
             actor_construct_info,
             actor_context,
             value_stream,
             None,
-        ))
+            initial_value,
+        )
     }
 
     pub fn variable(&self, name: &str) -> Option<Arc<Variable>> {
@@ -3278,6 +3486,7 @@ impl Text {
         actor_context: ActorContext,
         text: impl Into<Cow<'static, str>>,
     ) -> Arc<ValueActor> {
+        let text: Cow<'static, str> = text.into();
         let ConstructInfo {
             id: actor_id,
             persistence,
@@ -3289,20 +3498,22 @@ impl Text {
             text_description,
         );
         let actor_construct_info =
-            ConstructInfo::new(actor_id, persistence, "Constant text wrapper")
-                .complete(ConstructType::ValueActor);
-        let value_stream = Self::new_constant(
-            construct_info,
-            construct_context,
-            idempotency_key,
-            text.into(),
+            ConstructInfo::new(actor_id, persistence, "Constant text wrapper");
+        // Create the initial value directly (avoid cloning ConstructInfo)
+        let initial_value = Value::Text(
+            Self::new_arc(construct_info, construct_context, text.clone()),
+            ValueMetadata { idempotency_key },
         );
-        Arc::new(ValueActor::new(
+        // Create the constant stream from initial value (stream will emit same value)
+        let value_stream = constant(initial_value.clone());
+        // Use the new method that pre-sets initial value
+        ValueActor::new_arc_with_initial_value(
             actor_construct_info,
             actor_context,
             value_stream,
             None,
-        ))
+            initial_value,
+        )
     }
 
     pub fn text(&self) -> &str {
@@ -3378,6 +3589,7 @@ impl Tag {
         actor_context: ActorContext,
         tag: impl Into<Cow<'static, str>>,
     ) -> Arc<ValueActor> {
+        let tag: Cow<'static, str> = tag.into();
         let ConstructInfo {
             id: actor_id,
             persistence,
@@ -3389,20 +3601,22 @@ impl Tag {
             tag_description,
         );
         let actor_construct_info =
-            ConstructInfo::new(actor_id, persistence, "Constant tag wrapper")
-                .complete(ConstructType::ValueActor);
-        let value_stream = Self::new_constant(
-            construct_info,
-            construct_context,
-            idempotency_key,
-            tag.into(),
+            ConstructInfo::new(actor_id, persistence, "Constant tag wrapper");
+        // Create the initial value directly (avoid cloning ConstructInfo)
+        let initial_value = Value::Tag(
+            Self::new_arc(construct_info, construct_context, tag.clone()),
+            ValueMetadata { idempotency_key },
         );
-        Arc::new(ValueActor::new(
+        // Create the constant stream from initial value (stream will emit same value)
+        let value_stream = constant(initial_value.clone());
+        // Use the new method that pre-sets initial value
+        ValueActor::new_arc_with_initial_value(
             actor_construct_info,
             actor_context,
             value_stream,
             None,
-        ))
+            initial_value,
+        )
     }
 
     pub fn tag(&self) -> &str {
@@ -3478,6 +3692,7 @@ impl Number {
         actor_context: ActorContext,
         number: impl Into<f64>,
     ) -> Arc<ValueActor> {
+        let number = number.into();
         let ConstructInfo {
             id: actor_id,
             persistence,
@@ -3489,20 +3704,22 @@ impl Number {
             number_description,
         );
         let actor_construct_info =
-            ConstructInfo::new(actor_id, persistence, "Constant number wrapper)")
-                .complete(ConstructType::ValueActor);
-        let value_stream = Self::new_constant(
-            construct_info,
-            construct_context,
-            idempotency_key,
-            number.into(),
+            ConstructInfo::new(actor_id, persistence, "Constant number wrapper)");
+        // Create the initial value directly (avoid cloning ConstructInfo)
+        let initial_value = Value::Number(
+            Self::new_arc(construct_info, construct_context, number),
+            ValueMetadata { idempotency_key },
         );
-        Arc::new(ValueActor::new(
+        // Create the constant stream from initial value (stream will emit same value)
+        let value_stream = constant(initial_value.clone());
+        // Use the new method that pre-sets initial value
+        ValueActor::new_arc_with_initial_value(
             actor_construct_info,
             actor_context,
             value_stream,
             None,
-        ))
+            initial_value,
+        )
     }
 
     pub fn number(&self) -> f64 {

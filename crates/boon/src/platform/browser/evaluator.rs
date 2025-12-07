@@ -9,6 +9,7 @@ use chumsky::Parser as ChumskyParser;
 use chumsky::input::{Input as ChumskyInput, Stream as ChumskyStream};
 use ulid::Ulid;
 use zoon::futures_util::stream;
+use zoon::futures_util::FutureExt;
 use zoon::{Stream, StreamExt, println, eprintln};
 
 /// Yields control to the executor, allowing other tasks to run.
@@ -244,7 +245,9 @@ pub enum WorkItem {
     },
 
     /// Build Block after variables and output are evaluated.
+    /// The variable_slots contain all the block's variable actors which must be kept alive.
     BuildBlock {
+        variable_slots: Vec<SlotId>,
         output_slot: SlotId,
         result_slot: SlotId,
     },
@@ -300,6 +303,7 @@ pub struct ObjectVariableData {
     pub name: String,
     pub value_slot: SlotId,
     pub is_link: bool,
+    pub is_referenced: bool,
     pub span: Span,
     pub persistence: Option<Persistence>,
 }
@@ -310,6 +314,7 @@ pub struct EvaluationState {
     work_queue: Vec<WorkItem>,
 
     /// Results storage - maps slot IDs to completed ValueActors.
+    /// If a slot is not in the map, it means SKIP (no value).
     results: HashMap<SlotId, Arc<ValueActor>>,
 
     /// Next available slot ID.
@@ -338,12 +343,9 @@ impl EvaluationState {
         self.results.insert(slot, actor);
     }
 
-    /// Get a result from a slot.
-    pub fn get(&self, slot: SlotId) -> Result<Arc<ValueActor>, String> {
-        self.results
-            .get(&slot)
-            .cloned()
-            .ok_or_else(|| format!("Missing result for slot {}", slot))
+    /// Get a result from a slot. Returns None if the slot was SKIP (not stored).
+    pub fn get(&self, slot: SlotId) -> Option<Arc<ValueActor>> {
+        self.results.get(&slot).cloned()
     }
 
     /// Push work item onto the queue.
@@ -388,9 +390,9 @@ pub fn evaluate_expression_stacksafe(
         zoon::println!("[DEBUG] After processing: results_len={}", state.results.len());
     }
 
-    // Get the final result
+    // Get the final result (top-level expression cannot be SKIP)
     zoon::println!("[DEBUG] Getting final result from slot {}", final_slot);
-    state.get(final_slot)
+    state.get(final_slot).ok_or_else(|| "Top-level expression evaluated to SKIP".to_string())
 }
 
 /// Schedule an expression for evaluation.
@@ -475,18 +477,8 @@ fn schedule_expression(
         }
 
         static_expression::Expression::Skip => {
-            // SKIP creates an empty stream (no values emitted)
-            let actor = ValueActor::new_arc(
-                ConstructInfo::new(
-                    format!("PersistenceId: {persistence_id}"),
-                    persistence,
-                    format!("{span}; SKIP"),
-                ),
-                ctx.actor_context,
-                TypedStream::infinite(stream::pending::<Value>()),
-                Some(persistence_id),
-            );
-            state.store(result_slot, actor);
+            // SKIP means "no value" - don't store anything in the slot.
+            // Work items that depend on this slot will see None and propagate SKIP.
         }
 
         // ============================================================
@@ -653,16 +645,20 @@ fn schedule_expression(
 
         static_expression::Expression::Block { variables, output } => {
             // Build object from variables first, then evaluate output
-            let output_slot = state.alloc_slot();
+            // Use separate slots for the object and the output expression
+            let object_slot = state.alloc_slot();
+            let output_expr_slot = state.alloc_slot();
 
             // First pass: collect variable data and allocate slots (don't schedule yet)
             let mut variable_data = Vec::new();
             let mut vars_to_schedule = Vec::new();
+            let mut variable_slots = Vec::new();
 
             for var in variables {
                 let var_slot = state.alloc_slot();
                 let name = var.node.name.to_string();
                 let is_link = matches!(&var.node.value.node, static_expression::Expression::Link);
+                let is_referenced = var.node.is_referenced;
                 let var_span = var.span;
                 let var_persistence = var.persistence.clone();
 
@@ -670,9 +666,13 @@ fn schedule_expression(
                     name,
                     value_slot: var_slot,
                     is_link,
+                    is_referenced,
                     span: var_span,
                     persistence: var_persistence.clone(),
                 });
+
+                // Collect all variable slots (for keeping them alive)
+                variable_slots.push(var_slot);
 
                 // Collect for later scheduling (skip Link)
                 if !is_link {
@@ -681,22 +681,27 @@ fn schedule_expression(
             }
 
             // Push BuildBlock first (will be processed last due to LIFO)
+            // BuildBlock takes the output expression result and keeps variables alive
             state.push(WorkItem::BuildBlock {
-                output_slot,
+                variable_slots,
+                output_slot: output_expr_slot,
                 result_slot,
             });
 
-            // Push BuildObject second (will be processed after variable expressions)
+            // Schedule output expression second - these work items will be processed AFTER BuildObject
+            // This is important because the output may reference block variables (like `state.iteration`)
+            // which need to be registered with the reference_connector by BuildObject first
+            schedule_expression(state, *output, ctx.clone(), output_expr_slot)?;
+
+            // Push BuildObject third - will be processed AFTER variable expressions but BEFORE output
+            // This registers variables with reference_connector so output can resolve them
             state.push(WorkItem::BuildObject {
                 variable_data,
                 span,
                 persistence,
                 ctx: ctx.clone(),
-                result_slot: output_slot, // Object goes to output_slot temporarily
+                result_slot: object_slot,
             });
-
-            // Schedule output expression third
-            schedule_expression(state, *output, ctx.clone(), output_slot)?;
 
             // Schedule variable expressions last (will be processed first due to LIFO)
             for (var_expr, var_slot) in vars_to_schedule {
@@ -717,6 +722,7 @@ fn schedule_expression(
                 let var_slot = state.alloc_slot();
                 let name = var.node.name.to_string();
                 let is_link = matches!(&var.node.value.node, static_expression::Expression::Link);
+                let is_referenced = var.node.is_referenced;
                 let var_span = var.span;
                 let var_persistence = var.persistence.clone();
 
@@ -724,6 +730,7 @@ fn schedule_expression(
                     name,
                     value_slot: var_slot,
                     is_link,
+                    is_referenced,
                     span: var_span,
                     persistence: var_persistence.clone(),
                 });
@@ -759,6 +766,7 @@ fn schedule_expression(
                 let var_slot = state.alloc_slot();
                 let name = var.node.name.to_string();
                 let is_link = matches!(&var.node.value.node, static_expression::Expression::Link);
+                let is_referenced = var.node.is_referenced;
                 let var_span = var.span;
                 let var_persistence = var.persistence.clone();
 
@@ -766,6 +774,7 @@ fn schedule_expression(
                     name,
                     value_slot: var_slot,
                     is_link,
+                    is_referenced,
                     span: var_span,
                     persistence: var_persistence.clone(),
                 });
@@ -959,6 +968,21 @@ fn schedule_expression(
         }
 
         // ============================================================
+        // PULSES (iteration)
+        // ============================================================
+
+        static_expression::Expression::Pulses { count } => {
+            let actor = build_pulses_actor(
+                *count,
+                span,
+                persistence,
+                persistence_id,
+                ctx,
+            )?;
+            state.store(result_slot, actor);
+        }
+
+        // ============================================================
         // TODO: More expression types to be added
         // ============================================================
 
@@ -1117,8 +1141,9 @@ fn process_work_item(
         }
 
         WorkItem::BinaryOp { op, operand_a_slot, operand_b_slot, span, persistence, ctx, result_slot } => {
-            let a = state.get(operand_a_slot)?;
-            let b = state.get(operand_b_slot)?;
+            // If either operand slot is empty, produce nothing
+            let Some(a) = state.get(operand_a_slot) else { return Ok(()); };
+            let Some(b) = state.get(operand_b_slot) else { return Ok(()); };
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
 
             let construct_info = ConstructInfo::new(
@@ -1132,8 +1157,9 @@ fn process_work_item(
         }
 
         WorkItem::BuildList { item_slots, span, persistence, ctx, result_slot } => {
-            let items: Result<Vec<_>, _> = item_slots.iter()
-                .map(|slot| state.get(*slot))
+            // Collect items that have values (empty slots are ignored)
+            let items: Vec<_> = item_slots.iter()
+                .filter_map(|slot| state.get(*slot))
                 .collect();
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
 
@@ -1146,7 +1172,7 @@ fn process_work_item(
                 ctx.construct_context,
                 persistence_id,
                 ctx.actor_context,
-                items?,
+                items,
             );
             state.store(result_slot, actor);
         }
@@ -1154,38 +1180,53 @@ fn process_work_item(
         WorkItem::BuildObject { variable_data, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
 
-            let variables: Result<Vec<Arc<Variable>>, String> = variable_data.iter()
-                .map(|vd| {
-                    let var_persistence_id = vd.persistence.as_ref().map(|p| p.id);
-                    if vd.is_link {
-                        // LINK variables don't have pre-evaluated values
-                        Ok(Variable::new_link_arc(
-                            ConstructInfo::new(
-                                format!("PersistenceId: {:?}", var_persistence_id),
-                                vd.persistence.clone(),
-                                format!("{}: (link variable)", vd.name),
-                            ),
-                            ctx.construct_context.clone(),
-                            vd.name.clone(),
-                            ctx.actor_context.clone(),
-                            var_persistence_id,
-                        ))
-                    } else {
-                        let value_actor = state.get(vd.value_slot)?;
-                        Ok(Variable::new_arc(
-                            ConstructInfo::new(
-                                format!("PersistenceId: {:?}", var_persistence_id),
-                                vd.persistence.clone(),
-                                format!("{}: (variable)", vd.name),
-                            ),
-                            ctx.construct_context.clone(),
-                            vd.name.clone(),
-                            value_actor,
-                            var_persistence_id,
-                        ))
+            // Build variables and register referenced ones with the reference connector
+            let mut variables = Vec::new();
+            for vd in variable_data.iter() {
+                let var_persistence_id = vd.persistence.as_ref().map(|p| p.id);
+                let variable = if vd.is_link {
+                    // LINK variables don't have pre-evaluated values
+                    Variable::new_link_arc(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {:?}", var_persistence_id),
+                            vd.persistence.clone(),
+                            format!("{}: (link variable)", vd.name),
+                        ),
+                        ctx.construct_context.clone(),
+                        vd.name.clone(),
+                        ctx.actor_context.clone(),
+                        var_persistence_id,
+                    )
+                } else {
+                    // If value slot is empty, skip this variable
+                    let Some(value_actor) = state.get(vd.value_slot) else { continue; };
+                    Variable::new_arc(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {:?}", var_persistence_id),
+                            vd.persistence.clone(),
+                            format!("{}: (variable)", vd.name),
+                        ),
+                        ctx.construct_context.clone(),
+                        vd.name.clone(),
+                        value_actor,
+                        var_persistence_id,
+                    )
+                };
+
+                // Register with reference connector if this variable is referenced elsewhere
+                if vd.is_referenced {
+                    ctx.reference_connector.register_referenceable(vd.span, variable.value_actor());
+                }
+
+                // Register LINK variable senders with LinkConnector
+                if vd.is_link {
+                    if let Some(sender) = variable.link_value_sender() {
+                        ctx.link_connector.register_link(vd.span, sender);
                     }
-                })
-                .collect();
+                }
+
+                variables.push(variable);
+            }
 
             let actor = Object::new_arc_value_actor(
                 ConstructInfo::new(
@@ -1196,7 +1237,7 @@ fn process_work_item(
                 ctx.construct_context,
                 persistence_id,
                 ctx.actor_context,
-                variables?,
+                variables,
             );
             state.store(result_slot, actor);
         }
@@ -1204,37 +1245,52 @@ fn process_work_item(
         WorkItem::BuildTaggedObject { tag, variable_data, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
 
-            let variables: Result<Vec<Arc<Variable>>, String> = variable_data.iter()
-                .map(|vd| {
-                    let var_persistence_id = vd.persistence.as_ref().map(|p| p.id);
-                    if vd.is_link {
-                        Ok(Variable::new_link_arc(
-                            ConstructInfo::new(
-                                format!("PersistenceId: {:?}", var_persistence_id),
-                                vd.persistence.clone(),
-                                format!("{}: (link variable)", vd.name),
-                            ),
-                            ctx.construct_context.clone(),
-                            vd.name.clone(),
-                            ctx.actor_context.clone(),
-                            var_persistence_id,
-                        ))
-                    } else {
-                        let value_actor = state.get(vd.value_slot)?;
-                        Ok(Variable::new_arc(
-                            ConstructInfo::new(
-                                format!("PersistenceId: {:?}", var_persistence_id),
-                                vd.persistence.clone(),
-                                format!("{}: (variable)", vd.name),
-                            ),
-                            ctx.construct_context.clone(),
-                            vd.name.clone(),
-                            value_actor,
-                            var_persistence_id,
-                        ))
+            // Build variables and register referenced ones with the reference connector
+            let mut variables = Vec::new();
+            for vd in variable_data.iter() {
+                let var_persistence_id = vd.persistence.as_ref().map(|p| p.id);
+                let variable = if vd.is_link {
+                    Variable::new_link_arc(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {:?}", var_persistence_id),
+                            vd.persistence.clone(),
+                            format!("{}: (link variable)", vd.name),
+                        ),
+                        ctx.construct_context.clone(),
+                        vd.name.clone(),
+                        ctx.actor_context.clone(),
+                        var_persistence_id,
+                    )
+                } else {
+                    // If value slot is empty, skip this variable
+                    let Some(value_actor) = state.get(vd.value_slot) else { continue; };
+                    Variable::new_arc(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {:?}", var_persistence_id),
+                            vd.persistence.clone(),
+                            format!("{}: (variable)", vd.name),
+                        ),
+                        ctx.construct_context.clone(),
+                        vd.name.clone(),
+                        value_actor,
+                        var_persistence_id,
+                    )
+                };
+
+                // Register with reference connector if this variable is referenced elsewhere
+                if vd.is_referenced {
+                    ctx.reference_connector.register_referenceable(vd.span, variable.value_actor());
+                }
+
+                // Register LINK variable senders with LinkConnector
+                if vd.is_link {
+                    if let Some(sender) = variable.link_value_sender() {
+                        ctx.link_connector.register_link(vd.span, sender);
                     }
-                })
-                .collect();
+                }
+
+                variables.push(variable);
+            }
 
             let actor = TaggedObject::new_arc_value_actor(
                 ConstructInfo::new(
@@ -1246,14 +1302,15 @@ fn process_work_item(
                 persistence_id,
                 ctx.actor_context,
                 tag,
-                variables?,
+                variables,
             );
             state.store(result_slot, actor);
         }
 
         WorkItem::BuildLatest { input_slots, span, persistence, ctx, result_slot } => {
-            let inputs: Result<Vec<_>, _> = input_slots.iter()
-                .map(|slot| state.get(*slot))
+            // Collect inputs that have values (empty slots are ignored)
+            let inputs: Vec<_> = input_slots.iter()
+                .filter_map(|slot| state.get(*slot))
                 .collect();
             let _persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
 
@@ -1265,7 +1322,7 @@ fn process_work_item(
                 ),
                 ctx.construct_context,
                 ctx.actor_context,
-                inputs?,
+                inputs,
             );
             state.store(result_slot, actor);
         }
@@ -1289,20 +1346,53 @@ fn process_work_item(
         }
 
         WorkItem::BuildHold { initial_slot, state_param, body, span, persistence, ctx, result_slot } => {
-            let initial_actor = state.get(initial_slot)?;
+            // If initial value slot is empty, produce nothing
+            let Some(initial_actor) = state.get(initial_slot) else { return Ok(()); };
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
             let actor = build_hold_actor(initial_actor, state_param, *body, span, persistence, persistence_id, ctx)?;
             state.store(result_slot, actor);
         }
 
-        WorkItem::BuildBlock { output_slot, result_slot } => {
-            // The output has already been evaluated and stored in output_slot
-            let output_actor = state.get(output_slot)?;
-            state.store(result_slot, output_actor);
+        WorkItem::BuildBlock { variable_slots, output_slot, result_slot } => {
+            // If output slot is empty, this block produces nothing
+            let Some(output_actor) = state.get(output_slot) else { return Ok(()); };
+
+            // Collect variable actors to keep them alive (empty slots are ignored)
+            let variable_actors: Vec<Arc<ValueActor>> = variable_slots
+                .iter()
+                .filter_map(|slot| state.get(*slot))
+                .collect();
+
+            // If there are variables, create a wrapper actor that keeps them alive
+            // by capturing them in the stream closure
+            if variable_actors.is_empty() {
+                state.store(result_slot, output_actor);
+            } else {
+                // Create a wrapper actor that subscribes to output and holds variable actors
+                // The stream::unfold keeps variable_actors alive in its closure
+                let value_stream = stream::unfold(
+                    (output_actor.subscribe(), variable_actors),
+                    |(mut subscription, vars)| async move {
+                        subscription.next().await.map(|value| (value, (subscription, vars)))
+                    },
+                );
+                let wrapper = Arc::new(ValueActor::new(
+                    ConstructInfo::new(
+                        "Block wrapper".to_string(),
+                        None,
+                        "Block wrapper keeping variables alive".to_string(),
+                    ).complete(ConstructType::ValueActor),
+                    ActorContext::default(),
+                    TypedStream::infinite(value_stream),
+                    None,
+                ));
+                state.store(result_slot, wrapper);
+            }
         }
 
         WorkItem::EvaluateWithPiped { expr, prev_slot, ctx, result_slot } => {
-            let prev_actor = state.get(prev_slot)?;
+            // If piped value slot is empty, produce nothing
+            let Some(prev_actor) = state.get(prev_slot) else { return Ok(()); };
             let new_ctx = ctx.with_piped(prev_actor);
 
             // Check if expression is a FunctionCall - these should consume the piped value
@@ -1380,34 +1470,33 @@ fn process_work_item(
         }
 
         WorkItem::CallFunction { path, arg_slots, passed_slot: _, passed_context, use_piped_for_builtin, span, persistence, mut ctx, result_slot } => {
-            // Get argument actors
-            let args: Result<Vec<(String, Arc<ValueActor>)>, String> = arg_slots.iter()
-                .map(|(name, slot)| {
-                    let actor = state.get(*slot)?;
-                    Ok((name.clone(), actor))
+            // Collect arguments that have values (empty slots are ignored)
+            let args: Vec<(String, Arc<ValueActor>)> = arg_slots.iter()
+                .filter_map(|(name, slot)| {
+                    state.get(*slot).map(|actor| (name.clone(), actor))
                 })
                 .collect();
-            let args = args?;
 
             // Update passed context if PASS argument was provided
             if let Some(passed_slot) = passed_context {
-                let passed_actor = state.get(passed_slot)?;
-                ctx = EvaluationContext {
-                    construct_context: ctx.construct_context,
-                    actor_context: ActorContext {
-                        output_valve_signal: ctx.actor_context.output_valve_signal,
-                        piped: ctx.actor_context.piped,
-                        passed: Some(passed_actor),
-                        parameters: ctx.actor_context.parameters,
-                        sequential_processing: ctx.actor_context.sequential_processing,
-                        backpressure_permit: ctx.actor_context.backpressure_permit,
-                    },
-                    reference_connector: ctx.reference_connector,
-                    link_connector: ctx.link_connector,
-                    function_registry: ctx.function_registry,
-                    module_loader: ctx.module_loader,
-                    source_code: ctx.source_code,
-                };
+                if let Some(passed_actor) = state.get(passed_slot) {
+                    ctx = EvaluationContext {
+                        construct_context: ctx.construct_context,
+                        actor_context: ActorContext {
+                            output_valve_signal: ctx.actor_context.output_valve_signal,
+                            piped: ctx.actor_context.piped,
+                            passed: Some(passed_actor),
+                            parameters: ctx.actor_context.parameters,
+                            sequential_processing: ctx.actor_context.sequential_processing,
+                            backpressure_permit: ctx.actor_context.backpressure_permit,
+                        },
+                        reference_connector: ctx.reference_connector,
+                        link_connector: ctx.link_connector,
+                        function_registry: ctx.function_registry,
+                        module_loader: ctx.module_loader,
+                        source_code: ctx.source_code,
+                    };
+                }
             }
 
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
@@ -1474,14 +1563,18 @@ fn evaluate_alias_immediate(
         }
         static_expression::Alias::WithoutPassed { parts, referenced_span } => {
             let first_part = parts.first().map(|s| s.to_string()).unwrap_or_default();
-            if let Some(param_actor) = ctx.actor_context.parameters.get(&first_part) {
-                let param_actor = param_actor.clone();
+            if let Some(param_actor) = ctx.actor_context.parameters.get(&first_part).cloned() {
+                // For simple parameter references (no field accesses), return directly
+                if parts.len() == 1 {
+                    return Ok(param_actor);
+                }
+                // For multi-part aliases (e.g., state.current), wrap in async Future
                 Box::pin(async move { param_actor })
             } else if let Some(ref_span) = referenced_span {
-                Box::pin(ctx.reference_connector.referenceable(*ref_span))
+                // Use async lookup via ReferenceConnector
+                Box::pin(ctx.reference_connector.clone().referenceable(*ref_span))
             } else if parts.len() >= 2 {
                 // Module variable access - for now fall back to returning an error
-                // This will be handled properly when we integrate with the old code
                 return Err(format!("Module variable access '{}' not yet supported in stack-safe evaluator", first_part));
             } else {
                 return Err(format!("Failed to get aliased variable '{}'", first_part));
@@ -1540,6 +1633,12 @@ fn build_then_actor(
         let body_clone = body.clone();
 
         async move {
+            // SKIP body means "no value for this input" - return None immediately
+            // to avoid hanging on the subscription.next().await (SKIP never emits)
+            if matches!(body_clone.node, static_expression::Expression::Skip) {
+                return None;
+            }
+
             let value_actor = ValueActor::new_arc(
                 ConstructInfo::new(
                     "THEN input value".to_string(),
@@ -1578,9 +1677,13 @@ fn build_then_actor(
 
             match evaluate_expression_stacksafe(body_expr, new_ctx) {
                 Ok(result_actor) => {
+                    println!("[DEBUG] THEN eval_body: body evaluated, result_actor version={}",
+                        result_actor.version());
                     let mut subscription = result_actor.subscribe();
                     let _keep_alive = value_actor;
+                    println!("[DEBUG] THEN eval_body: awaiting subscription.next()...");
                     if let Some(mut result_value) = subscription.next().await {
+                        println!("[DEBUG] THEN eval_body: got result_value!");
                         result_value.set_idempotency_key(ValueIdempotencyKey::new());
 
                         if should_materialize {
@@ -1591,12 +1694,17 @@ fn build_then_actor(
                             ).await;
                         }
 
+                        println!("[DEBUG] THEN eval_body: returning Some(result_value)");
                         Some(result_value)
                     } else {
+                        println!("[DEBUG] THEN eval_body: got None from subscription");
                         None
                     }
                 }
-                Err(_) => None,
+                Err(e) => {
+                    println!("[DEBUG] THEN eval_body: error: {e}");
+                    None
+                },
             }
         }
     };
@@ -1611,7 +1719,8 @@ fn build_then_actor(
         Box::pin(stream)
     };
 
-    Ok(ValueActor::new_arc(
+    // Keep the piped actor alive by including it in inputs
+    Ok(ValueActor::new_arc_with_inputs(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -1620,6 +1729,7 @@ fn build_then_actor(
         ctx.actor_context,
         TypedStream::infinite(flattened_stream),
         Some(persistence_id),
+        vec![piped],  // Keep piped actor alive
     ))
 }
 
@@ -1663,6 +1773,12 @@ fn build_when_actor(
             // Try to match against each arm
             for arm in &arms_clone {
                 if let Some(bindings) = match_pattern_simple(&arm.pattern, &value) {
+                    // SKIP body means "no value for this input" - return None immediately
+                    // to avoid hanging on the subscription.next().await (SKIP never emits)
+                    if matches!(arm.body, static_expression::Expression::Skip) {
+                        return None;
+                    }
+
                     let value_actor = ValueActor::new_arc(
                         ConstructInfo::new(
                             "WHEN input value".to_string(),
@@ -1753,7 +1869,8 @@ fn build_when_actor(
         Box::pin(stream)
     };
 
-    Ok(ValueActor::new_arc(
+    // Keep the piped actor alive by including it in inputs
+    Ok(ValueActor::new_arc_with_inputs(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -1762,6 +1879,7 @@ fn build_when_actor(
         ctx.actor_context,
         TypedStream::infinite(flattened_stream),
         Some(persistence_id),
+        vec![piped],  // Keep piped actor alive
     ))
 }
 
@@ -1803,6 +1921,12 @@ fn build_while_actor(
         });
 
         if let Some(arm) = matched_arm {
+            // SKIP body means "no value for this input" - return empty stream immediately
+            // to avoid subscribing to SKIP (which never emits)
+            if matches!(arm.body, static_expression::Expression::Skip) {
+                return Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>;
+            }
+
             let bindings = match_pattern_simple(&arm.pattern, &value).unwrap_or_default();
 
             let value_actor = ValueActor::new_arc(
@@ -1872,7 +1996,8 @@ fn build_while_actor(
         }
     });
 
-    Ok(ValueActor::new_arc(
+    // Keep the piped actor alive by including it in inputs
+    Ok(ValueActor::new_arc_with_inputs(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -1881,32 +2006,245 @@ fn build_while_actor(
         ctx.actor_context,
         TypedStream::infinite(stream),
         Some(persistence_id),
+        vec![piped],  // Keep piped actor alive
     ))
 }
 
 /// Build a HOLD actor (stateful accumulator).
-/// NOTE: HOLD is complex and requires special handling for the feedback loop.
-/// For now, this returns an error - full HOLD support will be added later.
+/// HOLD: `input |> HOLD state_param { body }`
+/// The piped value sets/resets the state (not just initial - any emission).
+/// The body can reference `state_param` to get the current state.
+/// The body expression's result becomes the new state value.
+/// CRITICAL: The state is NOT self-reactive - changes to state don't
+/// trigger re-evaluation of body. Only external events trigger updates.
 fn build_hold_actor(
-    _initial_actor: Arc<ValueActor>,
-    _state_param: String,
-    _body: static_expression::Spanned<static_expression::Expression>,
+    initial_actor: Arc<ValueActor>,
+    state_param: String,
+    body: static_expression::Spanned<static_expression::Expression>,
     span: Span,
-    _persistence: Option<Persistence>,
-    _persistence_id: PersistenceId,
-    _ctx: EvaluationContext,
+    persistence: Option<Persistence>,
+    persistence_id: PersistenceId,
+    ctx: EvaluationContext,
 ) -> Result<Arc<ValueActor>, String> {
-    // HOLD requires a feedback loop where:
-    // 1. Initial value comes from the piped input
-    // 2. Body is evaluated with state_param bound to current state
-    // 3. Body's output becomes the new state
+    println!("[DEBUG] build_hold_actor: state_param={state_param}, span={span:?}");
+    // Use a channel to hold current state value and broadcast updates
+    let (state_sender, state_receiver) = zoon::futures_channel::mpsc::unbounded::<Value>();
+    let state_sender = Rc::new(RefCell::new(state_sender));
+    let state_sender_for_body = state_sender.clone();
+    let state_sender_for_update = state_sender.clone();
+
+    // Current state holder (starts with None, will be set when initial emits)
+    let current_state: Rc<RefCell<Option<Value>>> = Rc::new(RefCell::new(None));
+    let current_state_for_body = current_state.clone();
+    let current_state_for_update = current_state.clone();
+
+    // Create a ValueActor that provides the current state to the body
+    // This is what the state_param references
     //
-    // This is complex and requires backpressure handling.
-    // The existing evaluator handles this inline without a separate combinator.
-    // For the stack-safe version, we need to implement this carefully.
-    //
-    // TODO: Implement stack-safe HOLD support
-    Err(format!("HOLD not yet supported in stack-safe evaluator at {:?}", span))
+    // State stream: first value from initial_actor, then updates from state_receiver
+    let state_stream = initial_actor.clone().subscribe()
+        .take(1)  // Get the first initial value
+        .chain(state_receiver);  // Then listen for updates and resets
+
+    println!("[DEBUG] build_hold_actor: initial_actor version={}",
+        initial_actor.version());
+
+    // Create state actor - initial value will come through the stream asynchronously
+    let state_actor = ValueActor::new_arc(
+        ConstructInfo::new(
+            format!("Hold state actor for {state_param}"),
+            None,
+            format!("{span}; HOLD state parameter"),
+        ),
+        ctx.actor_context.clone(),
+        TypedStream::infinite(state_stream),
+        None,
+    );
+
+    // Bind the state parameter in the context so body can reference it
+    let mut body_parameters = ctx.actor_context.parameters.clone();
+    body_parameters.insert(state_param.clone(), state_actor);
+
+    // Create backpressure permit for synchronizing THEN with state updates.
+    // Initial count = 1 allows first body evaluation to start.
+    // HOLD releases permit after each state update, allowing next body to run.
+    let backpressure_permit = BackpressurePermit::new(1);
+    let permit_for_state_update = backpressure_permit.clone();
+
+    let body_actor_context = ActorContext {
+        output_valve_signal: ctx.actor_context.output_valve_signal.clone(),
+        piped: None, // Clear piped - the body shouldn't re-use it
+        passed: ctx.actor_context.passed.clone(),
+        parameters: body_parameters,
+        // Force sequential processing in HOLD body to ensure state consistency.
+        // Without this, THEN/WHEN would spawn parallel body evaluations that all
+        // read stale state (e.g., PULSES {3} |> THEN { counter + 1 } would read counter=0 three times).
+        sequential_processing: true,
+        // Pass permit to body - THEN will acquire before each evaluation
+        backpressure_permit: Some(backpressure_permit),
+    };
+
+    // Create new context for body evaluation
+    let body_ctx = EvaluationContext {
+        construct_context: ctx.construct_context.clone(),
+        actor_context: body_actor_context,
+        reference_connector: ctx.reference_connector.clone(),
+        link_connector: ctx.link_connector.clone(),
+        function_registry: ctx.function_registry.clone(),
+        module_loader: ctx.module_loader.clone(),
+        source_code: ctx.source_code.clone(),
+    };
+
+    // Evaluate the body with state parameter bound
+    let body_result = evaluate_expression_stacksafe(body, body_ctx)?;
+
+    // When body produces new values, update the state
+    // Note: We avoid self-reactivity by not triggering body re-evaluation
+    // from state changes. Body only evaluates when its event sources fire.
+    let body_subscription = body_result.subscribe();
+    println!("[DEBUG] HOLD: created body_subscription");
+    let state_update_stream = body_subscription.map(move |new_value| {
+        println!("[DEBUG] HOLD state_update_stream: received new_value from body!");
+        // Update current state
+        *current_state_for_update.borrow_mut() = Some(new_value.clone());
+        // Send to state channel so body can see it on next event
+        let _ = state_sender_for_update.borrow().unbounded_send(new_value.clone());
+        // Release permit to allow THEN to process next input.
+        // This guarantees state is updated before next body evaluation starts.
+        println!("[DEBUG] HOLD state_update_stream: releasing permit");
+        permit_for_state_update.release();
+        println!("[DEBUG] HOLD state_update_stream: permit released");
+        new_value
+    });
+
+    // When initial value emits, set up initial state
+    let initial_stream = initial_actor.subscribe().map(move |initial| {
+        // Set current state
+        *current_state_for_body.borrow_mut() = Some(initial.clone());
+        // Send initial state to the state channel
+        let _ = state_sender_for_body.borrow().unbounded_send(initial.clone());
+        initial
+    });
+
+    // Combine: input stream sets/resets state, body updates state
+    // Use select to merge both streams - any emission from input resets state
+    let combined_stream = stream::select(
+        initial_stream, // Any emission from input resets the state
+        state_update_stream
+    );
+
+    Ok(ValueActor::new_arc(
+        ConstructInfo::new(
+            format!("PersistenceId: {persistence_id}"),
+            persistence,
+            format!("{span}; HOLD {state_param} {{..}}"),
+        ),
+        ctx.actor_context,
+        TypedStream::infinite(combined_stream),
+        Some(persistence_id),
+    ))
+}
+
+/// Build a PULSES actor for iteration.
+/// PULSES { count } emits count values (0 to count-1).
+/// Can be used with THEN for iteration: `PULSES { 10 } |> THEN { ... }`
+fn build_pulses_actor(
+    count_expr: static_expression::Spanned<static_expression::Expression>,
+    span: Span,
+    persistence: Option<Persistence>,
+    persistence_id: PersistenceId,
+    ctx: EvaluationContext,
+) -> Result<Arc<ValueActor>, String> {
+    println!("[DEBUG] build_pulses_actor: span={span:?}, has_backpressure_permit={}", ctx.actor_context.backpressure_permit.is_some());
+    // Evaluate the count expression
+    let count_actor = evaluate_expression_stacksafe(count_expr, ctx.clone())?;
+
+    // Debug: check if count_actor has an immediate value
+    println!("[DEBUG] PULSES: count_actor version={}",
+        count_actor.version());
+
+    let construct_context_for_pulses = ctx.construct_context.clone();
+
+    // Get backpressure permit from HOLD context if available.
+    // When inside HOLD, PULSES will acquire permit before each emission,
+    // ensuring consumer (THEN) processes each value before next is emitted.
+    let backpressure_permit = ctx.actor_context.backpressure_permit.clone();
+
+    // When count changes, emit that many pulses
+    // Use stream::unfold instead of stream::iter to yield between emissions,
+    // ensuring downstream subscribers have a chance to process each pulse
+    println!("[DEBUG] PULSES: setting up stream");
+    let pulses_stream = count_actor.clone().subscribe()
+        .inspect(|v| {
+            let info = match v {
+                Value::Number(n, _) => format!("Number({})", n.number()),
+                _ => "other".to_string(),
+            };
+            println!("[DEBUG] PULSES: count_actor emitted value: {}", info);
+        })
+        .flat_map(move |count_value| {
+        let n = match &count_value {
+            Value::Number(num, _) => num.number() as i64,
+            _ => 0,
+        };
+
+        let construct_context_inner = construct_context_for_pulses.clone();
+        let permit_for_iteration = backpressure_permit.clone();
+
+        // Use unfold to emit pulses one at a time with async yield points.
+        // Boon uses 1-based indexing, so PULSES { 5 } emits 1, 2, 3, 4, 5.
+        stream::unfold(1i64, move |i| {
+            let construct_context_for_iter = construct_context_inner.clone();
+            let permit = permit_for_iteration.clone();
+            async move {
+                if i > n.max(0) {
+                    println!("[DEBUG] PULSES: done emitting (i={i} > n={n})");
+                    return None;
+                }
+
+                println!("[DEBUG] PULSES: about to emit i={i}, n={n}, has_permit={}", permit.is_some());
+
+                // Yield/wait before emitting to allow downstream to process
+                if let Some(ref permit) = permit {
+                    println!("[DEBUG] PULSES: acquiring permit for i={i}...");
+                    permit.acquire().await;
+                    println!("[DEBUG] PULSES: acquired permit for i={i}");
+                } else {
+                    yield_once().await;
+                }
+
+                println!("[DEBUG] PULSES: emitting value {i}");
+                let value = Value::Number(
+                    Arc::new(Number::new(
+                        ConstructInfo::new(
+                            format!("PULSES iteration {i}"),
+                            None,
+                            format!("PULSES iteration {i}"),
+                        ),
+                        construct_context_for_iter,
+                        i as f64,
+                    )),
+                    ValueMetadata {
+                        idempotency_key: Ulid::new(),
+                    },
+                );
+                Some((value, i + 1))
+            }
+        })
+    });
+
+    // Keep count_actor alive by passing it as an input dependency
+    Ok(ValueActor::new_arc_with_inputs(
+        ConstructInfo::new(
+            format!("PersistenceId: {persistence_id}"),
+            persistence,
+            format!("{span}; PULSES {{..}}"),
+        ),
+        ctx.actor_context,
+        TypedStream::infinite(pulses_stream),
+        Some(persistence_id),
+        vec![count_actor],
+    ))
 }
 
 /// Build a TEXT { ... } literal actor with interpolation support.
@@ -2197,6 +2535,17 @@ fn call_function_stacksafe(
         let mut parameters = ctx.actor_context.parameters.clone();
         for (param_name, arg_actor) in arg_map {
             parameters.insert(param_name, arg_actor);
+        }
+
+        // Bind piped value to unbound function parameters.
+        // For `position |> fibonacci()`, bind `position` to the first parameter of `fibonacci`.
+        if let Some(piped) = &ctx.actor_context.piped {
+            for param_name in &func_def.parameters {
+                if !parameters.contains_key(param_name) {
+                    parameters.insert(param_name.clone(), piped.clone());
+                    break; // Only bind to the first unbound parameter
+                }
+            }
         }
 
         let new_actor_context = ActorContext {
@@ -4498,13 +4847,14 @@ fn static_spanned_expression_into_value_actor_OLD(
                 let permit_for_iteration = backpressure_permit.clone();
 
                 // Use unfold to emit pulses one at a time with async yield points
+                // Boon uses 1-based indexing, so PULSES { 5 } emits 1, 2, 3, 4, 5.
                 // When backpressure permit exists (inside HOLD), acquire it before
                 // each emission to ensure THEN processes the value before next pulse.
-                stream::unfold(0i64, move |i| {
+                stream::unfold(1i64, move |i| {
                     let construct_context_for_iter = construct_context_inner.clone();
                     let permit = permit_for_iteration.clone();
                     async move {
-                        if i >= n.max(0) {
+                        if i > n.max(0) {
                             return None;
                         }
 

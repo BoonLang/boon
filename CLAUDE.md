@@ -192,9 +192,11 @@ This helps trace the lifecycle of actors and identify premature drops.
 
 When debugging with browser automation (`boon-tools exec`):
 
-1. **Never use `exec reload`** - it disconnects the extension. Use `exec refresh` instead.
+1. **Prefer console/preview over screenshots** - Use `exec console` and `exec preview` for debugging instead of screenshots. Screenshots should only be used when visual inspection is absolutely necessary.
 
-2. **When "debugger already attached" error occurs**:
+2. **Never use `exec reload`** - it disconnects the extension. Use `exec refresh` instead.
+
+3. **When "debugger already attached" error occurs**:
    - Run `exec detach` FIRST - this is mandatory before retrying
    - Then retry the original command
    - Do NOT use `exec reload`
