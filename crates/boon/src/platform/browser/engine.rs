@@ -1142,13 +1142,17 @@ impl FunctionCall {
         // - Wrap the result stream to also listen to arguments for FLUSHED values
         // - If any argument emits FLUSHED before/during function processing, bypass
 
+        // If persistence is None (e.g., for dynamically evaluated expressions),
+        // generate a fresh persistence ID at runtime
+        let persistence_id = construct_info
+            .persistence
+            .map(|p| p.id)
+            .unwrap_or_else(Ulid::new);
+
         let value_stream = definition(
             arguments.clone(),
             construct_info.id(),
-            construct_info
-                .persistence
-                .expect("Failed to get FunctionCall Persistence")
-                .id,
+            persistence_id,
             construct_context,
             actor_context.clone(),
         );
@@ -1213,10 +1217,12 @@ impl LatestCombinator {
 
         let construct_info = construct_info.complete(ConstructType::LatestCombinator);
         let inputs: Vec<Arc<ValueActor>> = inputs.into();
+        // If persistence is None (e.g., for dynamically evaluated expressions),
+        // generate a fresh persistence ID at runtime
         let persistent_id = construct_info
             .persistence
-            .expect("Failed to get Persistence in LatestCombinator")
-            .id;
+            .map(|p| p.id)
+            .unwrap_or_else(Ulid::new);
         let storage = construct_context.construct_storage.clone();
 
         let value_stream =
@@ -1299,10 +1305,12 @@ impl ThenCombinator {
         }
 
         let construct_info = construct_info.complete(ConstructType::ThenCombinator);
+        // If persistence is None (e.g., for dynamically evaluated expressions),
+        // generate a fresh persistence ID at runtime
         let persistent_id = construct_info
             .persistence
-            .expect("Failed to get Persistence in ThenCombinator")
-            .id;
+            .map(|p| p.id)
+            .unwrap_or_else(Ulid::new);
         let storage = construct_context.construct_storage.clone();
 
         let observed_for_subscribe = observed.clone();

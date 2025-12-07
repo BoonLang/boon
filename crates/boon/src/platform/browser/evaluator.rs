@@ -411,8 +411,15 @@ fn schedule_expression(
         persistence,
     } = expression;
 
-    let persistence_info = persistence.clone().ok_or("Failed to get Persistence")?;
-    let persistence_id = persistence_info.id;
+    // If persistence is None (e.g., for expressions inside arm bodies that weren't
+    // assigned persistence during parsing), generate a fresh ID at runtime.
+    let (persistence, persistence_id) = match persistence {
+        Some(p) => (Some(p), p.id),
+        None => {
+            let fresh_id = Ulid::new();
+            (None, fresh_id)
+        }
+    };
     let idempotency_key = persistence_id;
 
     match expr {
@@ -1770,12 +1777,15 @@ fn build_when_actor(
         let arms_clone = arms.clone();
 
         async move {
+            zoon::println!("[DEBUG] WHEN eval_body: starting");
             // Try to match against each arm
             for arm in &arms_clone {
                 if let Some(bindings) = match_pattern_simple(&arm.pattern, &value) {
+                    zoon::println!("[DEBUG] WHEN eval_body: pattern matched, num_bindings={}", bindings.len());
                     // SKIP body means "no value for this input" - return None immediately
                     // to avoid hanging on the subscription.next().await (SKIP never emits)
                     if matches!(arm.body, static_expression::Expression::Skip) {
+                        zoon::println!("[DEBUG] WHEN eval_body: body is SKIP, returning None");
                         return None;
                     }
 
@@ -1833,11 +1843,15 @@ fn build_when_actor(
                         node: arm.body.clone(),
                     };
 
+                    zoon::println!("[DEBUG] WHEN eval_body: about to evaluate body expression, persistence_clone.is_some()={}", persistence_clone.is_some());
                     match evaluate_expression_stacksafe(body_expr, new_ctx) {
                         Ok(result_actor) => {
+                            zoon::println!("[DEBUG] WHEN eval_body: body eval OK, subscribing to result");
                             let mut subscription = result_actor.subscribe();
                             let _keep_alive = value_actor;
+                            zoon::println!("[DEBUG] WHEN eval_body: waiting for subscription.next()");
                             if let Some(mut result_value) = subscription.next().await {
+                                zoon::println!("[DEBUG] WHEN eval_body: got result_value, returning Some");
                                 result_value.set_idempotency_key(ValueIdempotencyKey::new());
 
                                 if should_materialize {
@@ -1849,9 +1863,13 @@ fn build_when_actor(
                                 }
 
                                 return Some(result_value);
+                            } else {
+                                zoon::println!("[DEBUG] WHEN eval_body: subscription.next() returned None!");
                             }
                         }
-                        Err(_) => {}
+                        Err(e) => {
+                            zoon::println!("[DEBUG] WHEN eval_body: body eval ERROR: {}", e);
+                        }
                     }
                 }
             }
@@ -2030,7 +2048,6 @@ fn build_hold_actor(
     // Use a channel to hold current state value and broadcast updates
     let (state_sender, state_receiver) = zoon::futures_channel::mpsc::unbounded::<Value>();
     let state_sender = Rc::new(RefCell::new(state_sender));
-    let state_sender_for_body = state_sender.clone();
     let state_sender_for_update = state_sender.clone();
 
     // Current state holder (starts with None, will be set when initial emits)
@@ -2118,11 +2135,13 @@ fn build_hold_actor(
     });
 
     // When initial value emits, set up initial state
+    // Note: We only update current_state here, NOT send to state_receiver.
+    // The state_actor already gets the initial value via take(1) at line 2045.
+    // Sending to state_receiver would cause state_actor to emit the initial value twice!
     let initial_stream = initial_actor.subscribe().map(move |initial| {
-        // Set current state
+        // Set current state (for body to read synchronously if needed)
         *current_state_for_body.borrow_mut() = Some(initial.clone());
-        // Send initial state to the state channel
-        let _ = state_sender_for_body.borrow().unbounded_send(initial.clone());
+        // Do NOT send to state channel - take(1) already handles initial value
         initial
     });
 

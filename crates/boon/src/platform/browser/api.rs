@@ -1600,6 +1600,8 @@ pub fn function_log_info(
         // Pass through the input value for chaining
         value
     })
+    // Chain with pending() to keep stream alive forever - prevents actor termination
+    .chain(stream::pending())
 }
 
 /// Log/error(message) -> []
@@ -1622,6 +1624,8 @@ pub fn function_log_error(
             [],
         )
     })
+    // Chain with pending() to keep stream alive forever - prevents actor termination
+    .chain(stream::pending())
 }
 
 // --- Build functions ---
