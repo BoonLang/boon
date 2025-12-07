@@ -422,6 +422,9 @@ fn schedule_expression(
     };
     let idempotency_key = persistence_id;
 
+    // Debug: log every expression type being scheduled
+    zoon::println!("[DEBUG] schedule_expression: {:?}", std::mem::discriminant(&expr));
+
     match expr {
         // ============================================================
         // IMMEDIATE VALUES (no sub-expressions to evaluate)
@@ -559,6 +562,7 @@ fn schedule_expression(
         }
 
         static_expression::Expression::When { arms } => {
+            zoon::println!("[DEBUG] schedule_expression: WHEN - about to call build_when_actor, arms.len()={}", arms.len());
             let actor = build_when_actor(
                 arms,
                 span,
@@ -566,6 +570,7 @@ fn schedule_expression(
                 persistence_id,
                 ctx,
             )?;
+            zoon::println!("[DEBUG] schedule_expression: WHEN - build_when_actor succeeded, storing result");
             state.store(result_slot, actor);
         }
 
@@ -606,10 +611,12 @@ fn schedule_expression(
         // ============================================================
 
         static_expression::Expression::Pipe { from, to } => {
+            zoon::println!("[DEBUG] PIPE: handling Pipe expression");
             // Flatten nested pipes into a chain
             let mut steps = Vec::new();
             collect_pipe_steps(*from, &mut steps);
             steps.push(*to);
+            zoon::println!("[DEBUG] PIPE: steps.len()={}", steps.len());
 
             if steps.is_empty() {
                 return Err("Empty pipe chain".to_string());
@@ -618,6 +625,7 @@ fn schedule_expression(
             // Extract first step (to be scheduled last for LIFO)
             let first_step = steps.remove(0);
             let first_slot = state.alloc_slot();
+            zoon::println!("[DEBUG] PIPE: first_slot={:?}, remaining steps={}", first_slot, steps.len());
 
             // First pass: allocate slots and collect EvaluateWithPiped items
             let mut pipe_items = Vec::new();
@@ -626,6 +634,7 @@ fn schedule_expression(
             for (i, step) in steps.into_iter().enumerate() {
                 let is_last = i == steps_len - 1;
                 let step_slot = if is_last { result_slot } else { state.alloc_slot() };
+                zoon::println!("[DEBUG] PIPE: step[{}] type={:?}, prev_slot={:?}, step_slot={:?}", i, std::mem::discriminant(&step.node), prev_slot, step_slot);
 
                 pipe_items.push((step, prev_slot, step_slot));
                 prev_slot = step_slot;
@@ -633,6 +642,7 @@ fn schedule_expression(
 
             // Push EvaluateWithPiped items in REVERSE order (last step first)
             // so LIFO processes them in correct order
+            zoon::println!("[DEBUG] PIPE: pushing {} EvaluateWithPiped items", pipe_items.len());
             for (step, prev, step_slot) in pipe_items.into_iter().rev() {
                 state.push(WorkItem::EvaluateWithPiped {
                     expr: step,
@@ -643,6 +653,7 @@ fn schedule_expression(
             }
 
             // Schedule first step LAST (will be processed first due to LIFO)
+            zoon::println!("[DEBUG] PIPE: scheduling first_step");
             schedule_expression(state, first_step, ctx.clone(), first_slot)?;
         }
 
@@ -651,6 +662,7 @@ fn schedule_expression(
         // ============================================================
 
         static_expression::Expression::Block { variables, output } => {
+            zoon::println!("[DEBUG] BLOCK: handling Block expression, variables.len()={}, output type={:?}", variables.len(), std::mem::discriminant(&output.node));
             // Build object from variables first, then evaluate output
             // Use separate slots for the object and the output expression
             let object_slot = state.alloc_slot();
@@ -1246,6 +1258,7 @@ fn process_work_item(
                 ctx.actor_context,
                 variables,
             );
+            zoon::println!("[DEBUG] BuildObject: stored to slot {:?}", result_slot);
             state.store(result_slot, actor);
         }
 
@@ -1353,10 +1366,15 @@ fn process_work_item(
         }
 
         WorkItem::BuildHold { initial_slot, state_param, body, span, persistence, ctx, result_slot } => {
+            zoon::println!("[DEBUG] BuildHold: initial_slot={:?}, result_slot={:?}", initial_slot, result_slot);
             // If initial value slot is empty, produce nothing
-            let Some(initial_actor) = state.get(initial_slot) else { return Ok(()); };
+            let Some(initial_actor) = state.get(initial_slot) else {
+                zoon::println!("[DEBUG] BuildHold: initial_slot EMPTY, skipping!");
+                return Ok(());
+            };
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
             let actor = build_hold_actor(initial_actor, state_param, *body, span, persistence, persistence_id, ctx)?;
+            zoon::println!("[DEBUG] BuildHold: stored to slot {:?}", result_slot);
             state.store(result_slot, actor);
         }
 
@@ -1398,8 +1416,14 @@ fn process_work_item(
         }
 
         WorkItem::EvaluateWithPiped { expr, prev_slot, ctx, result_slot } => {
+            zoon::println!("[DEBUG] EvaluateWithPiped: prev_slot={:?}, has_value={}", prev_slot, state.get(prev_slot).is_some());
+            zoon::println!("[DEBUG] EvaluateWithPiped: expr type={:?}", std::mem::discriminant(&expr.node));
             // If piped value slot is empty, produce nothing
-            let Some(prev_actor) = state.get(prev_slot) else { return Ok(()); };
+            let Some(prev_actor) = state.get(prev_slot) else {
+                zoon::println!("[DEBUG] EvaluateWithPiped: prev_slot EMPTY, skipping!");
+                return Ok(());
+            };
+            zoon::println!("[DEBUG] EvaluateWithPiped: prev_slot has actor, proceeding");
             let new_ctx = ctx.with_piped(prev_actor);
 
             // Check if expression is a FunctionCall - these should consume the piped value
@@ -1748,6 +1772,7 @@ fn build_when_actor(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
 ) -> Result<Arc<ValueActor>, String> {
+    zoon::println!("[DEBUG] build_when_actor CALLED");
     let piped = ctx.actor_context.piped.clone()
         .ok_or("WHEN requires a piped value")?;
 
@@ -1765,7 +1790,12 @@ fn build_when_actor(
     let persistence_for_when = persistence.clone();
     let span_for_when = span;
 
-    let eval_body = move |value: Value| {
+    // eval_body returns a Stream instead of Option<Value>
+    // This allows nested WHENs that return SKIP to work correctly:
+    // - SKIP returns empty stream (no blocking)
+    // - Regular values return stream with one item
+    // - flat_map naturally handles empty streams
+    let eval_body = move |value: Value| -> Pin<Box<dyn Future<Output = Pin<Box<dyn Stream<Item = Value>>>>>> {
         let actor_context_clone = actor_context_for_when.clone();
         let construct_context_clone = construct_context_for_when.clone();
         let reference_connector_clone = reference_connector_for_when.clone();
@@ -1776,17 +1806,14 @@ fn build_when_actor(
         let persistence_clone = persistence_for_when.clone();
         let arms_clone = arms.clone();
 
-        async move {
-            zoon::println!("[DEBUG] WHEN eval_body: starting");
+        Box::pin(async move {
             // Try to match against each arm
             for arm in &arms_clone {
-                if let Some(bindings) = match_pattern_simple(&arm.pattern, &value) {
-                    zoon::println!("[DEBUG] WHEN eval_body: pattern matched, num_bindings={}", bindings.len());
-                    // SKIP body means "no value for this input" - return None immediately
-                    // to avoid hanging on the subscription.next().await (SKIP never emits)
+                // Use async pattern matching to properly extract bindings from Objects
+                if let Some(bindings) = match_pattern_async(&arm.pattern, &value).await {
+                    // SKIP body means "no value for this input" - return empty stream
                     if matches!(arm.body, static_expression::Expression::Skip) {
-                        zoon::println!("[DEBUG] WHEN eval_body: body is SKIP, returning None");
-                        return None;
+                        return Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>;
                     }
 
                     let value_actor = ValueActor::new_arc(
@@ -1843,47 +1870,48 @@ fn build_when_actor(
                         node: arm.body.clone(),
                     };
 
-                    zoon::println!("[DEBUG] WHEN eval_body: about to evaluate body expression, persistence_clone.is_some()={}", persistence_clone.is_some());
                     match evaluate_expression_stacksafe(body_expr, new_ctx) {
                         Ok(result_actor) => {
-                            zoon::println!("[DEBUG] WHEN eval_body: body eval OK, subscribing to result");
-                            let mut subscription = result_actor.subscribe();
-                            let _keep_alive = value_actor;
-                            zoon::println!("[DEBUG] WHEN eval_body: waiting for subscription.next()");
-                            if let Some(mut result_value) = subscription.next().await {
-                                zoon::println!("[DEBUG] WHEN eval_body: got result_value, returning Some");
+                            // Return the body's stream directly - no .next().await!
+                            // This is the key fix: nested WHEN that returns SKIP will have an empty stream,
+                            // and flatten_unordered will naturally handle it without blocking.
+                            // Don't use take(1) - body naturally emits once per input, and take(1)
+                            // would block forever on infinite streams that never emit (SKIP case).
+                            let result_actor_keepalive = result_actor.clone();
+                            let result_stream = result_actor.subscribe().map(move |mut result_value| {
+                                // Keep value_actor and result_actor alive while stream is consumed
+                                let _ = &value_actor;
+                                let _ = &result_actor_keepalive;
                                 result_value.set_idempotency_key(ValueIdempotencyKey::new());
-
-                                if should_materialize {
-                                    result_value = materialize_value(
-                                        result_value,
-                                        construct_context_clone,
-                                        new_actor_context.clone(),
-                                    ).await;
-                                }
-
-                                return Some(result_value);
-                            } else {
-                                zoon::println!("[DEBUG] WHEN eval_body: subscription.next() returned None!");
-                            }
+                                result_value
+                            });
+                            return Box::pin(result_stream) as Pin<Box<dyn Stream<Item = Value>>>;
                         }
-                        Err(e) => {
-                            zoon::println!("[DEBUG] WHEN eval_body: body eval ERROR: {}", e);
+                        Err(_e) => {
+                            return Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>;
                         }
                     }
                 }
             }
-            None
-        }
+            Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>
+        })
     };
 
+    // Use then + flatten_unordered instead of then + filter_map
+    // flatten_unordered processes inner streams concurrently, so even if one stream
+    // never emits (SKIP case), others can still produce values
     let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if backpressure_permit.is_some() || sequential {
+        // For sequential mode, use regular flatten (processes one stream at a time)
         let stream = piped.clone().subscribe()
             .then(eval_body)
-            .filter_map(|opt| async { opt });
+            .flatten();
         Box::pin(stream)
     } else {
-        let stream = piped.clone().subscribe().filter_map(eval_body);
+        // For non-sequential mode, use flatten_unordered for concurrent processing
+        // None = unlimited concurrency
+        let stream = piped.clone().subscribe()
+            .then(eval_body)
+            .flatten_unordered(None);
         Box::pin(stream)
     };
 
@@ -1922,7 +1950,8 @@ fn build_while_actor(
     let persistence_for_while = persistence.clone();
     let span_for_while = span;
 
-    let stream = piped.clone().subscribe().flat_map(move |value| {
+    // Use then().flatten() pattern to allow async pattern matching
+    let stream = piped.clone().subscribe().then(move |value| {
         let actor_context_clone = actor_context_for_while.clone();
         let construct_context_clone = construct_context_for_while.clone();
         let reference_connector_clone = reference_connector_for_while.clone();
@@ -1933,86 +1962,90 @@ fn build_while_actor(
         let persistence_clone = persistence_for_while.clone();
         let arms_clone = arms.clone();
 
-        // Find matching arm
-        let matched_arm = arms_clone.iter().find(|arm| {
-            match_pattern_simple(&arm.pattern, &value).is_some()
-        });
-
-        if let Some(arm) = matched_arm {
-            // SKIP body means "no value for this input" - return empty stream immediately
-            // to avoid subscribing to SKIP (which never emits)
-            if matches!(arm.body, static_expression::Expression::Skip) {
-                return Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>;
+        async move {
+            // Find matching arm using async pattern matching
+            let mut matched_arm_with_bindings: Option<(&static_expression::Arm, HashMap<String, Value>)> = None;
+            for arm in &arms_clone {
+                if let Some(bindings) = match_pattern_async(&arm.pattern, &value).await {
+                    matched_arm_with_bindings = Some((arm, bindings));
+                    break;
+                }
             }
 
-            let bindings = match_pattern_simple(&arm.pattern, &value).unwrap_or_default();
+            if let Some((arm, bindings)) = matched_arm_with_bindings {
+                // SKIP body means "no value for this input" - return empty stream immediately
+                // to avoid subscribing to SKIP (which never emits)
+                if matches!(arm.body, static_expression::Expression::Skip) {
+                    return Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>;
+                }
 
-            let value_actor = ValueActor::new_arc(
-                ConstructInfo::new(
-                    "WHILE input value".to_string(),
-                    None,
-                    format!("{span_for_while}; WHILE input"),
-                ),
-                actor_context_clone.clone(),
-                constant(value),
-                None,
-            );
-
-            let mut parameters = actor_context_clone.parameters.clone();
-            for (name, bound_value) in bindings {
-                let bound_actor = ValueActor::new_arc(
+                let value_actor = ValueActor::new_arc(
                     ConstructInfo::new(
-                        format!("WHILE binding: {}", name),
+                        "WHILE input value".to_string(),
                         None,
-                        format!("{span_for_while}; WHILE binding"),
+                        format!("{span_for_while}; WHILE input"),
                     ),
                     actor_context_clone.clone(),
-                    constant(bound_value),
+                    constant(value),
                     None,
                 );
-                parameters.insert(name, bound_actor);
-            }
 
-            let new_actor_context = ActorContext {
-                output_valve_signal: actor_context_clone.output_valve_signal.clone(),
-                piped: Some(value_actor),
-                passed: actor_context_clone.passed.clone(),
-                parameters,
-                sequential_processing: actor_context_clone.sequential_processing,
-                backpressure_permit: actor_context_clone.backpressure_permit.clone(),
-            };
-
-            let new_ctx = EvaluationContext {
-                construct_context: construct_context_clone,
-                actor_context: new_actor_context,
-                reference_connector: reference_connector_clone,
-                link_connector: link_connector_clone,
-                function_registry: function_registry_clone,
-                module_loader: module_loader_clone,
-                source_code: source_code_clone,
-            };
-
-            // arm.body is Expression, not Spanned<Expression>
-            // We wrap it with the parent's span/persistence
-            let body_expr = static_expression::Spanned {
-                span: span.clone(),
-                persistence: persistence_clone,
-                node: arm.body.clone(),
-            };
-
-            match evaluate_expression_stacksafe(body_expr, new_ctx) {
-                Ok(result_actor) => {
-                    let stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(result_actor.subscribe());
-                    stream
+                let mut parameters = actor_context_clone.parameters.clone();
+                for (name, bound_value) in bindings {
+                    let bound_actor = ValueActor::new_arc(
+                        ConstructInfo::new(
+                            format!("WHILE binding: {}", name),
+                            None,
+                            format!("{span_for_while}; WHILE binding"),
+                        ),
+                        actor_context_clone.clone(),
+                        constant(bound_value),
+                        None,
+                    );
+                    parameters.insert(name, bound_actor);
                 }
-                Err(_) => {
-                    Box::pin(stream::empty())
+
+                let new_actor_context = ActorContext {
+                    output_valve_signal: actor_context_clone.output_valve_signal.clone(),
+                    piped: Some(value_actor),
+                    passed: actor_context_clone.passed.clone(),
+                    parameters,
+                    sequential_processing: actor_context_clone.sequential_processing,
+                    backpressure_permit: actor_context_clone.backpressure_permit.clone(),
+                };
+
+                let new_ctx = EvaluationContext {
+                    construct_context: construct_context_clone,
+                    actor_context: new_actor_context,
+                    reference_connector: reference_connector_clone,
+                    link_connector: link_connector_clone,
+                    function_registry: function_registry_clone,
+                    module_loader: module_loader_clone,
+                    source_code: source_code_clone,
+                };
+
+                // arm.body is Expression, not Spanned<Expression>
+                // We wrap it with the parent's span/persistence
+                let body_expr = static_expression::Spanned {
+                    span: span.clone(),
+                    persistence: persistence_clone,
+                    node: arm.body.clone(),
+                };
+
+                match evaluate_expression_stacksafe(body_expr, new_ctx) {
+                    Ok(result_actor) => {
+                        let stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(result_actor.subscribe());
+                        stream
+                    }
+                    Err(_) => {
+                        Box::pin(stream::empty())
+                    }
                 }
+            } else {
+                Box::pin(stream::empty())
             }
-        } else {
-            Box::pin(stream::empty())
         }
-    });
+    }).flatten();
 
     // Keep the piped actor alive by including it in inputs
     Ok(ValueActor::new_arc_with_inputs(
@@ -2061,7 +2094,8 @@ fn build_hold_actor(
     // State stream: first value from initial_actor, then updates from state_receiver
     let state_stream = initial_actor.clone().subscribe()
         .take(1)  // Get the first initial value
-        .chain(state_receiver);  // Then listen for updates and resets
+        .chain(state_receiver)  // Then listen for updates and resets
+        .inspect(|val| zoon::println!("[DEBUG] state_actor stream: emitting value"));  // Debug log
 
     println!("[DEBUG] build_hold_actor: initial_actor version={}",
         initial_actor.version());
@@ -2550,6 +2584,7 @@ fn call_function_stacksafe(
     let func_def_opt = ctx.function_registry.functions.borrow().get(&full_path).cloned();
 
     if let Some(func_def) = func_def_opt {
+        zoon::println!("[DEBUG] call_function_stacksafe: found user-defined function '{}', body type={:?}", full_path, std::mem::discriminant(&func_def.body.node));
         // Create parameters from arguments
         let mut parameters = ctx.actor_context.parameters.clone();
         for (param_name, arg_actor) in arg_map {
@@ -2586,7 +2621,10 @@ fn call_function_stacksafe(
             source_code: ctx.source_code,
         };
 
-        return evaluate_expression_stacksafe(func_def.body, new_ctx);
+        zoon::println!("[DEBUG] call_function_stacksafe: evaluating function body type={:?}", std::mem::discriminant(&func_def.body.node));
+        let result = evaluate_expression_stacksafe(func_def.body, new_ctx);
+        zoon::println!("[DEBUG] call_function_stacksafe: function returned, is_ok={}", result.is_ok());
+        return result;
     }
 
     // Try builtin functions
@@ -2633,7 +2671,10 @@ fn call_function_stacksafe(
     }
 }
 
-/// Pattern matching helper for stack-safe evaluator - returns bindings if pattern matches.
+/// DEPRECATED: This function is dead code. Use `match_pattern_async` instead.
+/// This was the broken sync version that ignored Object/TaggedObject variables.
+/// Kept temporarily for reference - should be deleted once cleanup is complete.
+#[allow(dead_code)]
 fn match_pattern_simple(
     pattern: &static_expression::Pattern,
     value: &Value,
@@ -2708,6 +2749,188 @@ fn match_pattern_simple(
             // List pattern matching - simplified for now
             let _ = items;
             Some(bindings)
+        }
+
+        static_expression::Pattern::Map { entries } => {
+            // Map pattern matching - simplified for now
+            let _ = entries;
+            Some(bindings)
+        }
+    }
+}
+
+/// Async version of pattern matching that properly extracts bindings from Objects.
+/// Unlike match_pattern_simple, this can handle reactive Object values by awaiting
+/// subscriptions to get current field values.
+async fn match_pattern_async(
+    pattern: &static_expression::Pattern,
+    value: &Value,
+) -> Option<HashMap<String, Value>> {
+    use zoon::futures_util::StreamExt;
+
+    let mut bindings = HashMap::new();
+
+    // Debug: log pattern and value types
+    let pattern_type = match pattern {
+        static_expression::Pattern::WildCard => "WildCard".to_string(),
+        static_expression::Pattern::Alias { name } => format!("Alias({})", name.as_str()),
+        static_expression::Pattern::Literal(lit) => match lit {
+            static_expression::Literal::Number(n) => format!("Literal::Number({})", n),
+            static_expression::Literal::Tag(t) => format!("Literal::Tag({})", t.as_str()),
+            static_expression::Literal::Text(t) => format!("Literal::Text({})", t.as_str()),
+        },
+        static_expression::Pattern::TaggedObject { tag, .. } => format!("TaggedObject({})", tag.as_str()),
+        static_expression::Pattern::Object { .. } => "Object".to_string(),
+        static_expression::Pattern::List { .. } => "List".to_string(),
+        static_expression::Pattern::Map { .. } => "Map".to_string(),
+    };
+    let value_type = match value {
+        Value::Number(n, _) => format!("Number({})", n.number()),
+        Value::Text(t, _) => format!("Text({})", t.text()),
+        Value::Tag(t, _) => format!("Tag({})", t.tag()),
+        Value::TaggedObject(to, _) => format!("TaggedObject({})", to.tag()),
+        Value::Object(_, _) => "Object".to_string(),
+        Value::List(_, _) => "List".to_string(),
+        Value::Flushed(_, _) => "Flushed".to_string(),
+    };
+    zoon::println!("[DEBUG] match_pattern_async: pattern={}, value={}", pattern_type, value_type);
+
+    match pattern {
+        static_expression::Pattern::WildCard => Some(bindings),
+
+        static_expression::Pattern::Alias { name } => {
+            bindings.insert(name.to_string(), value.clone());
+            Some(bindings)
+        }
+
+        static_expression::Pattern::Literal(lit) => {
+            match (lit, value) {
+                (static_expression::Literal::Number(n), Value::Number(v, _)) => {
+                    if (*n - v.number()).abs() < f64::EPSILON {
+                        Some(bindings)
+                    } else {
+                        None
+                    }
+                }
+                (static_expression::Literal::Tag(t), Value::Tag(v, _)) => {
+                    if t.as_str() == v.tag() {
+                        Some(bindings)
+                    } else {
+                        None
+                    }
+                }
+                (static_expression::Literal::Text(t), Value::Text(v, _)) => {
+                    if t.as_str() == v.text() {
+                        Some(bindings)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+
+        static_expression::Pattern::TaggedObject { tag, variables } => {
+            if let Value::TaggedObject(to, _) = value {
+                if to.tag() == tag.as_str() {
+                    // Extract field values from the tagged object
+                    for pattern_var in variables {
+                        let var_name = pattern_var.name.as_str();
+                        // Find the variable in the tagged object by name
+                        if let Some(variable) = to.variables().iter().find(|v| v.name() == var_name) {
+                            // Await the current value from the reactive actor
+                            if let Some(field_value) = variable.value_actor().subscribe().next().await {
+                                // Handle nested patterns if present
+                                if let Some(ref nested_pattern) = pattern_var.value {
+                                    // Recursively match nested pattern
+                                    if let Some(nested_bindings) = Box::pin(match_pattern_async(nested_pattern, &field_value)).await {
+                                        bindings.extend(nested_bindings);
+                                    } else {
+                                        return None; // Nested pattern didn't match
+                                    }
+                                } else {
+                                    // Simple binding - just bind the value to the name
+                                    bindings.insert(var_name.to_string(), field_value);
+                                }
+                            } else {
+                                return None; // Field value not available
+                            }
+                        } else {
+                            return None; // Field not found in object
+                        }
+                    }
+                    Some(bindings)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+
+        static_expression::Pattern::Object { variables } => {
+            // Helper to extract bindings from object variables
+            async fn extract_object_bindings(
+                variables: &[Arc<Variable>],
+                pattern_vars: &[static_expression::PatternVariable],
+                bindings: &mut HashMap<String, Value>,
+            ) -> bool {
+                for pattern_var in pattern_vars {
+                    let var_name = pattern_var.name.as_str();
+                    // Find the variable in the object by name
+                    if let Some(variable) = variables.iter().find(|v| v.name() == var_name) {
+                        // Await the current value from the reactive actor
+                        if let Some(field_value) = variable.value_actor().subscribe().next().await {
+                            // Handle nested patterns if present
+                            if let Some(ref nested_pattern) = pattern_var.value {
+                                // Recursively match nested pattern
+                                if let Some(nested_bindings) = Box::pin(match_pattern_async(nested_pattern, &field_value)).await {
+                                    bindings.extend(nested_bindings);
+                                } else {
+                                    return false; // Nested pattern didn't match
+                                }
+                            } else {
+                                // Simple binding - just bind the value to the name
+                                bindings.insert(var_name.to_string(), field_value);
+                            }
+                        } else {
+                            return false; // Field value not available
+                        }
+                    } else {
+                        return false; // Field not found in object
+                    }
+                }
+                true
+            }
+
+            if let Value::Object(obj, _) = value {
+                if extract_object_bindings(obj.variables(), variables, &mut bindings).await {
+                    Some(bindings)
+                } else {
+                    None
+                }
+            } else if let Value::TaggedObject(to, _) = value {
+                if extract_object_bindings(to.variables(), variables, &mut bindings).await {
+                    Some(bindings)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+
+        static_expression::Pattern::List { items } => {
+            // TODO: List pattern matching needs special handling since List is a complex
+            // reactive type with diff-based updates. For now, we don't support extracting
+            // individual items from List patterns.
+            // SLEEPING BOMB: This will silently match Lists without extracting bindings!
+            if let Value::List(_list, _) = value {
+                let _ = items;
+                Some(bindings)
+            } else {
+                None
+            }
         }
 
         static_expression::Pattern::Map { entries } => {
@@ -3160,6 +3383,7 @@ fn static_spanned_expression_into_value_actor(
     };
 
     // Delegate to the stack-safe evaluator
+    zoon::println!("[DEBUG] static_spanned_expression_into_value_actor: entering, expr_type={:?}", std::mem::discriminant(&expression.node));
     evaluate_expression_stacksafe(expression, ctx)
 }
 
@@ -5364,6 +5588,15 @@ type PatternBindings = HashMap<String, Arc<ValueActor>>;
 
 /// Try to match a Value against a Pattern.
 /// Returns Some(bindings) if match succeeds, None otherwise.
+///
+/// WARNING: This function is used by the OLD RECURSIVE evaluator (lines ~4590, ~4727).
+/// It has several SLEEPING BOMBS:
+/// - TaggedObject: Ignores sub_pattern, always just binds the actor (line ~5599)
+/// - Object: Ignores sub_pattern values entirely (line ~5621)
+/// - List: Always returns None, pattern matching fails silently
+/// - Map: Always returns None, pattern matching fails silently
+///
+/// The stack-safe evaluator uses `match_pattern_async` which properly handles Object patterns.
 fn match_pattern(
     pattern: &static_expression::Pattern,
     value: &Value,
@@ -5430,8 +5663,10 @@ fn match_pattern(
                         // Find the variable in the object
                         if let Some(obj_var) = tagged_obj.variables().iter().find(|v| v.name() == var_name) {
                             if let Some(sub_pattern) = &pattern_var.value {
-                                // TODO: Would need to get a value from obj_var.value_actor() to match
-                                // For now, just bind the variable
+                                // SLEEPING BOMB: Sub-pattern is IGNORED! We should recursively
+                                // match sub_pattern against the field's current value, but instead
+                                // we just bind the actor. Nested patterns like [foo: [bar]] won't work.
+                                let _ = sub_pattern;
                                 bindings.insert(var_name, obj_var.value_actor());
                             } else {
                                 // No sub-pattern, just bind the variable
@@ -5451,9 +5686,12 @@ fn match_pattern(
         }
         static_expression::Pattern::Object { variables: pattern_vars } => {
             // Match objects
+            // SLEEPING BOMB: pattern_var.value (sub-patterns) are IGNORED!
+            // Nested patterns like [foo: [bar, baz]] won't verify the structure.
             if let Value::Object(obj, _) = value {
                 for pattern_var in pattern_vars {
                     let var_name = pattern_var.name.to_string();
+                    let _ = &pattern_var.value; // SLEEPING BOMB: sub-pattern ignored!
                     if let Some(obj_var) = obj.variables().iter().find(|v| v.name() == var_name) {
                         bindings.insert(var_name, obj_var.value_actor());
                     } else {
@@ -5466,11 +5704,13 @@ fn match_pattern(
             }
         }
         static_expression::Pattern::List { items: _ } => {
-            // TODO: Implement list pattern matching
+            // SLEEPING BOMB: List pattern matching not implemented!
+            // Patterns like [a, b, c] will silently fail to match.
             None
         }
         static_expression::Pattern::Map { entries: _ } => {
-            // TODO: Implement map pattern matching
+            // SLEEPING BOMB: Map pattern matching not implemented!
+            // Patterns like { key => value } will silently fail to match.
             None
         }
     }
