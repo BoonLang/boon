@@ -1,0 +1,18 @@
+# Counter (HOLD) example - button click increments display
+
+[test]
+category = "interactive"
+description = "Counter button increments display using HOLD pattern"
+
+[output]
+text = "0"
+
+[[sequence]]
+description = "Click increment button"
+actions = [["click", "[role='button']"]]
+expect = "1"
+
+[[sequence]]
+description = "Click again"
+actions = [["click", "[role='button']"]]
+expect = "2"

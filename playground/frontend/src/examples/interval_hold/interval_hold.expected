@@ -1,0 +1,14 @@
+# Interval (HOLD) example - counter that increments every second
+# Using regex to match any number since timing varies
+
+[test]
+category = "timer"
+description = "Counter increments every second using HOLD pattern"
+
+[output]
+match = "regex"
+pattern = "^\\d+$"
+
+[timing]
+timeout = 3000
+initial_delay = 500

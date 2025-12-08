@@ -9,12 +9,9 @@ document: Document/new(root: Element/stripe(
     }
 ))
 
-counter:
-    LATEST {
-        0
-        increment_button.event.press |> THEN { 1 }
-    }
-    |> Math/sum()
+counter: 0 |> HOLD counter {
+    increment_button.event.press |> THEN { counter + 1 }
+}
 
 increment_button: Element/button(
     element: [event: [press: LINK]]

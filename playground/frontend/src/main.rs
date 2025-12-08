@@ -63,11 +63,13 @@ macro_rules! make_example_data {
     }};
 }
 
-static EXAMPLE_DATAS: [ExampleData; 6] = [
+static EXAMPLE_DATAS: [ExampleData; 8] = [
     make_example_data!("minimal"),
     make_example_data!("hello_world"),
     make_example_data!("interval"),
+    make_example_data!("interval_hold"),
     make_example_data!("counter"),
+    make_example_data!("counter_hold"),
     make_example_data!("fibonacci"),
     make_example_data!("todo_mvc"),
 ];
