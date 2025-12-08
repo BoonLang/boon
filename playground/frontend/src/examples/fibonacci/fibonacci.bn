@@ -1,6 +1,6 @@
 FUNCTION fibonacci(position) {
-    [previous: 0, current: 1, iteration: 0] |> HOLD state {
-        PULSES { position } |> THEN {
+    [previous: 0, current: 1, iteration: 1] |> HOLD state {
+        PULSES { position - 1 } |> THEN {
             [
                 previous: state.current
                 current: state.previous + state.current
@@ -8,15 +8,15 @@ FUNCTION fibonacci(position) {
             ]
         }
     }
-    |> WHEN {
-          state => state.iteration == position |> WHEN {
-                True => state.current
-                __ => SKIP
-          }
+    |> WHEN { state =>
+        state.iteration == position |> WHEN {
+            True => state.current
+            __ => SKIP
+        }
     }
 }
 
-position: 5
+position: 10
 result: position |> fibonacci()
 message: TEXT { {position}. Fibonacci number is {result} }
 document: message |> Log/info() |> Document/new()
