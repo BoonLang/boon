@@ -10,7 +10,7 @@ use chumsky::input::{Input as ChumskyInput, Stream as ChumskyStream};
 use ulid::Ulid;
 use zoon::futures_util::stream;
 use zoon::futures_util::FutureExt;
-use zoon::{Stream, StreamExt, println, eprintln};
+use zoon::{Stream, StreamExt, println, eprintln, Task, mpsc};
 
 /// Yields control to the executor, allowing other tasks to run.
 /// This is a simple implementation that returns Pending once and schedules a wake.
@@ -323,6 +323,10 @@ pub struct ObjectVariableData {
     pub is_referenced: bool,
     pub span: Span,
     pub persistence: Option<Persistence>,
+    /// For referenced fields, holds a pre-created forwarding actor and its sender.
+    /// This allows the actor to be registered with ReferenceConnector before
+    /// the field expression is evaluated, fixing forward reference race conditions.
+    pub forwarding_actor: Option<(Arc<ValueActor>, mpsc::UnboundedSender<Value>)>,
 }
 
 /// Holds the state of an ongoing work queue evaluation.
@@ -708,6 +712,28 @@ fn schedule_expression(
                 let var_span = var.span;
                 let var_persistence = var.persistence.clone();
 
+                // For referenced fields, create a forwarding actor BEFORE scheduling expressions
+                // This allows sibling fields to look up this field's actor immediately
+                let forwarding_actor = if is_referenced && !is_link {
+                    let var_persistence_id = var_persistence.as_ref().map(|p| p.id);
+                    let (actor, sender) = ValueActor::new_arc_forwarding(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {:?}", var_persistence_id),
+                            var_persistence.clone(),
+                            format!("{}: (forwarding field)", name),
+                        ),
+                        ctx.actor_context.clone(),
+                        var_persistence_id,
+                    );
+                    // Register with ReferenceConnector immediately
+                    if let Some(ref_connector) = ctx.try_reference_connector() {
+                        ref_connector.register_referenceable(var_span, actor.clone());
+                    }
+                    Some((actor, sender))
+                } else {
+                    None
+                };
+
                 variable_data.push(ObjectVariableData {
                     name,
                     value_slot: var_slot,
@@ -715,6 +741,7 @@ fn schedule_expression(
                     is_referenced,
                     span: var_span,
                     persistence: var_persistence.clone(),
+                    forwarding_actor,
                 });
 
                 // Collect all variable slots (for keeping them alive)
@@ -772,6 +799,28 @@ fn schedule_expression(
                 let var_span = var.span;
                 let var_persistence = var.persistence.clone();
 
+                // For referenced fields, create a forwarding actor BEFORE scheduling expressions
+                // This allows sibling fields to look up this field's actor immediately
+                let forwarding_actor = if is_referenced && !is_link {
+                    let var_persistence_id = var_persistence.as_ref().map(|p| p.id);
+                    let (actor, sender) = ValueActor::new_arc_forwarding(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {:?}", var_persistence_id),
+                            var_persistence.clone(),
+                            format!("{}: (forwarding field)", name),
+                        ),
+                        ctx.actor_context.clone(),
+                        var_persistence_id,
+                    );
+                    // Register with ReferenceConnector immediately
+                    if let Some(ref_connector) = ctx.try_reference_connector() {
+                        ref_connector.register_referenceable(var_span, actor.clone());
+                    }
+                    Some((actor, sender))
+                } else {
+                    None
+                };
+
                 variable_data.push(ObjectVariableData {
                     name,
                     value_slot: var_slot,
@@ -779,6 +828,7 @@ fn schedule_expression(
                     is_referenced,
                     span: var_span,
                     persistence: var_persistence.clone(),
+                    forwarding_actor,
                 });
 
                 // Collect for later scheduling (skip Link)
@@ -816,6 +866,28 @@ fn schedule_expression(
                 let var_span = var.span;
                 let var_persistence = var.persistence.clone();
 
+                // For referenced fields, create a forwarding actor BEFORE scheduling expressions
+                // This allows sibling fields to look up this field's actor immediately
+                let forwarding_actor = if is_referenced && !is_link {
+                    let var_persistence_id = var_persistence.as_ref().map(|p| p.id);
+                    let (actor, sender) = ValueActor::new_arc_forwarding(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {:?}", var_persistence_id),
+                            var_persistence.clone(),
+                            format!("{}: (forwarding field)", name),
+                        ),
+                        ctx.actor_context.clone(),
+                        var_persistence_id,
+                    );
+                    // Register with ReferenceConnector immediately
+                    if let Some(ref_connector) = ctx.try_reference_connector() {
+                        ref_connector.register_referenceable(var_span, actor.clone());
+                    }
+                    Some((actor, sender))
+                } else {
+                    None
+                };
+
                 variable_data.push(ObjectVariableData {
                     name,
                     value_slot: var_slot,
@@ -823,6 +895,7 @@ fn schedule_expression(
                     is_referenced,
                     span: var_span,
                     persistence: var_persistence.clone(),
+                    forwarding_actor,
                 });
 
                 // Collect for later scheduling (skip Link)
@@ -1228,7 +1301,7 @@ fn process_work_item(
         WorkItem::BuildObject { variable_data, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
 
-            // Build variables and register referenced ones with the reference connector
+            // Build variables
             let mut variables = Vec::new();
             for vd in variable_data.iter() {
                 let var_persistence_id = vd.persistence.as_ref().map(|p| p.id);
@@ -1244,6 +1317,32 @@ fn process_work_item(
                         vd.name.clone(),
                         ctx.actor_context.clone(),
                         var_persistence_id,
+                    )
+                } else if let Some((forwarding_actor, sender)) = &vd.forwarding_actor {
+                    // Use the pre-created forwarding actor for referenced fields
+                    // Spawn a task to forward values from the expression's actor to the channel
+                    let Some(source_actor) = state.get(vd.value_slot) else { continue; };
+                    let sender = sender.clone();
+                    let source_actor_clone = source_actor.clone();
+                    let forwarding_task = Task::start_droppable(async move {
+                        let mut subscription = source_actor_clone.subscribe();
+                        while let Some(value) = subscription.next().await {
+                            if sender.unbounded_send(value).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    Variable::new_arc_with_forwarding_task(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {:?}", var_persistence_id),
+                            vd.persistence.clone(),
+                            format!("{}: (variable)", vd.name),
+                        ),
+                        ctx.construct_context.clone(),
+                        vd.name.clone(),
+                        forwarding_actor.clone(),
+                        var_persistence_id,
+                        forwarding_task,
                     )
                 } else {
                     // If value slot is empty, skip this variable
@@ -1261,8 +1360,9 @@ fn process_work_item(
                     )
                 };
 
-                // Register with reference connector if this variable is referenced elsewhere
-                if vd.is_referenced {
+                // Note: For referenced fields with forwarding actors, registration
+                // already happened in schedule_expression, so we skip it here
+                if vd.is_referenced && vd.forwarding_actor.is_none() {
                     if let Some(ref_connector) = ctx.try_reference_connector() {
                         ref_connector.register_referenceable(vd.span, variable.value_actor());
                     }
@@ -1298,7 +1398,7 @@ fn process_work_item(
         WorkItem::BuildTaggedObject { tag, variable_data, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
 
-            // Build variables and register referenced ones with the reference connector
+            // Build variables
             let mut variables = Vec::new();
             for vd in variable_data.iter() {
                 let var_persistence_id = vd.persistence.as_ref().map(|p| p.id);
@@ -1313,6 +1413,32 @@ fn process_work_item(
                         vd.name.clone(),
                         ctx.actor_context.clone(),
                         var_persistence_id,
+                    )
+                } else if let Some((forwarding_actor, sender)) = &vd.forwarding_actor {
+                    // Use the pre-created forwarding actor for referenced fields
+                    // Spawn a task to forward values from the expression's actor to the channel
+                    let Some(source_actor) = state.get(vd.value_slot) else { continue; };
+                    let sender = sender.clone();
+                    let source_actor_clone = source_actor.clone();
+                    let forwarding_task = Task::start_droppable(async move {
+                        let mut subscription = source_actor_clone.subscribe();
+                        while let Some(value) = subscription.next().await {
+                            if sender.unbounded_send(value).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    Variable::new_arc_with_forwarding_task(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {:?}", var_persistence_id),
+                            vd.persistence.clone(),
+                            format!("{}: (variable)", vd.name),
+                        ),
+                        ctx.construct_context.clone(),
+                        vd.name.clone(),
+                        forwarding_actor.clone(),
+                        var_persistence_id,
+                        forwarding_task,
                     )
                 } else {
                     // If value slot is empty, skip this variable
@@ -1330,8 +1456,9 @@ fn process_work_item(
                     )
                 };
 
-                // Register with reference connector if this variable is referenced elsewhere
-                if vd.is_referenced {
+                // Note: For referenced fields with forwarding actors, registration
+                // already happened in schedule_expression, so we skip it here
+                if vd.is_referenced && vd.forwarding_actor.is_none() {
                     if let Some(ref_connector) = ctx.try_reference_connector() {
                         ref_connector.register_referenceable(vd.span, variable.value_actor());
                     }

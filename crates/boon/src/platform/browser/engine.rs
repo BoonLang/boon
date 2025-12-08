@@ -754,6 +754,9 @@ pub struct Variable {
     name: Cow<'static, str>,
     value_actor: Arc<ValueActor>,
     link_value_sender: Option<mpsc::UnboundedSender<Value>>,
+    /// Holds the forwarding task for referenced fields (fixes forward reference race).
+    /// The TaskHandle must be kept alive to prevent the forwarding task from being cancelled.
+    forwarding_task: Option<TaskHandle>,
 }
 
 impl Variable {
@@ -770,6 +773,7 @@ impl Variable {
             name: name.into(),
             value_actor,
             link_value_sender: None,
+            forwarding_task: None,
         }
     }
 
@@ -787,6 +791,26 @@ impl Variable {
             value_actor,
             persistence_id,
         ))
+    }
+
+    /// Create a new Arc<Variable> with a forwarding task.
+    /// The task will be kept alive as long as the Variable exists.
+    pub fn new_arc_with_forwarding_task(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        name: impl Into<Cow<'static, str>>,
+        value_actor: Arc<ValueActor>,
+        persistence_id: Option<parser::PersistenceId>,
+        forwarding_task: TaskHandle,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            construct_info: construct_info.complete(ConstructType::Variable),
+            persistence_id,
+            name: name.into(),
+            value_actor,
+            link_value_sender: None,
+            forwarding_task: Some(forwarding_task),
+        })
     }
 
     pub fn persistence_id(&self) -> Option<parser::PersistenceId> {
@@ -823,6 +847,7 @@ impl Variable {
             name: name.into(),
             value_actor: Arc::new(value_actor),
             link_value_sender: Some(link_value_sender),
+            forwarding_task: None,
         })
     }
 
@@ -2376,6 +2401,33 @@ impl ValueActor {
 
     pub fn persistence_id(&self) -> Option<parser::PersistenceId> {
         self.persistence_id
+    }
+
+    /// Create a new ValueActor with a channel-based stream for forwarding values.
+    /// Returns the actor and a sender that can be used to forward values to it.
+    ///
+    /// This is useful when you need to register an actor with ReferenceConnector
+    /// before the actual value-producing expression is evaluated. The sender
+    /// can then be used to forward values from the evaluated expression.
+    ///
+    /// # Usage Pattern
+    /// 1. Create the forwarding actor and register it immediately
+    /// 2. Evaluate the source expression to get its actor
+    /// 3. Subscribe to the source actor and forward values through the sender
+    pub fn new_arc_forwarding(
+        construct_info: ConstructInfo,
+        actor_context: ActorContext,
+        persistence_id: Option<parser::PersistenceId>,
+    ) -> (Arc<Self>, mpsc::UnboundedSender<Value>) {
+        let (sender, receiver) = mpsc::unbounded::<Value>();
+        let stream = TypedStream::infinite(receiver);
+        let actor = Self::new_arc(
+            construct_info,
+            actor_context,
+            stream,
+            persistence_id,
+        );
+        (actor, sender)
     }
 
     /// Create a new Arc<ValueActor> with an initial value pre-set.
