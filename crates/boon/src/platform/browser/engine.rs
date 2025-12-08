@@ -974,9 +974,9 @@ pub struct ReferenceConnector {
 
 impl ReferenceConnector {
     pub fn new() -> Self {
-        let (referenceable_inserter_sender, mut referenceable_inserter_receiver) =
+        let (referenceable_inserter_sender, referenceable_inserter_receiver) =
             mpsc::unbounded();
-        let (referenceable_getter_sender, mut referenceable_getter_receiver) = mpsc::unbounded();
+        let (referenceable_getter_sender, referenceable_getter_receiver) = mpsc::unbounded();
         Self {
             referenceable_inserter_sender,
             referenceable_getter_sender,
@@ -984,28 +984,61 @@ impl ReferenceConnector {
                 let mut referenceables = HashMap::<parser::Span, Arc<ValueActor>>::new();
                 let mut referenceable_senders =
                     HashMap::<parser::Span, Vec<oneshot::Sender<Arc<ValueActor>>>>::new();
+                // Track whether channels are closed
+                let mut inserter_closed = false;
+                let mut getter_closed = false;
+                // Fuse the receivers so they don't poll after returning None
+                let mut referenceable_inserter_receiver = referenceable_inserter_receiver.fuse();
+                let mut referenceable_getter_receiver = referenceable_getter_receiver.fuse();
                 loop {
                     select! {
-                        (span, actor) = referenceable_inserter_receiver.select_next_some() => {
-                            if let Some(senders) = referenceable_senders.remove(&span) {
-                                for sender in senders {
-                                    if sender.send(actor.clone()).is_err() {
-                                        eprintln!("Failed to send referenceable actor from reference connector");
+                        result = referenceable_inserter_receiver.next() => {
+                            match result {
+                                Some((span, actor)) => {
+                                    if let Some(senders) = referenceable_senders.remove(&span) {
+                                        for sender in senders {
+                                            if sender.send(actor.clone()).is_err() {
+                                                eprintln!("Failed to send referenceable actor from reference connector");
+                                            }
+                                        }
+                                    }
+                                    referenceables.insert(span, actor);
+                                }
+                                None => {
+                                    inserter_closed = true;
+                                    if getter_closed {
+                                        // Both channels closed - exit loop to drop actors
+                                        break;
                                     }
                                 }
                             }
-                            referenceables.insert(span, actor);
                         },
-                        (span, referenceable_sender) = referenceable_getter_receiver.select_next_some() => {
-                            if let Some(actor) = referenceables.get(&span) {
-                                if referenceable_sender.send(actor.clone()).is_err() {
-                                    eprintln!("Failed to send referenceable actor from reference connector");
+                        result = referenceable_getter_receiver.next() => {
+                            match result {
+                                Some((span, referenceable_sender)) => {
+                                    if let Some(actor) = referenceables.get(&span) {
+                                        if referenceable_sender.send(actor.clone()).is_err() {
+                                            eprintln!("Failed to send referenceable actor from reference connector");
+                                        }
+                                    } else {
+                                        referenceable_senders.entry(span).or_default().push(referenceable_sender);
+                                    }
                                 }
-                            } else {
-                                referenceable_senders.entry(span).or_default().push(referenceable_sender);
+                                None => {
+                                    getter_closed = true;
+                                    if inserter_closed {
+                                        // Both channels closed - exit loop to drop actors
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
+                }
+                // Explicitly drop the referenceables to ensure actors are cleaned up
+                drop(referenceables);
+                if LOG_DROPS_AND_LOOP_ENDS {
+                    println!("ReferenceConnector loop ended - all actors dropped");
                 }
             }),
         }
@@ -1048,8 +1081,8 @@ pub struct LinkConnector {
 
 impl LinkConnector {
     pub fn new() -> Self {
-        let (link_inserter_sender, mut link_inserter_receiver) = mpsc::unbounded();
-        let (link_getter_sender, mut link_getter_receiver) = mpsc::unbounded();
+        let (link_inserter_sender, link_inserter_receiver) = mpsc::unbounded();
+        let (link_getter_sender, link_getter_receiver) = mpsc::unbounded();
         Self {
             link_inserter_sender,
             link_getter_sender,
@@ -1057,28 +1090,61 @@ impl LinkConnector {
                 let mut links = HashMap::<parser::Span, mpsc::UnboundedSender<Value>>::new();
                 let mut link_senders =
                     HashMap::<parser::Span, Vec<oneshot::Sender<mpsc::UnboundedSender<Value>>>>::new();
+                // Track whether channels are closed
+                let mut inserter_closed = false;
+                let mut getter_closed = false;
+                // Fuse the receivers so they don't poll after returning None
+                let mut link_inserter_receiver = link_inserter_receiver.fuse();
+                let mut link_getter_receiver = link_getter_receiver.fuse();
                 loop {
                     select! {
-                        (span, sender) = link_inserter_receiver.select_next_some() => {
-                            if let Some(senders) = link_senders.remove(&span) {
-                                for link_sender in senders {
-                                    if link_sender.send(sender.clone()).is_err() {
-                                        eprintln!("Failed to send link sender from link connector");
+                        result = link_inserter_receiver.next() => {
+                            match result {
+                                Some((span, sender)) => {
+                                    if let Some(senders) = link_senders.remove(&span) {
+                                        for link_sender in senders {
+                                            if link_sender.send(sender.clone()).is_err() {
+                                                eprintln!("Failed to send link sender from link connector");
+                                            }
+                                        }
+                                    }
+                                    links.insert(span, sender);
+                                }
+                                None => {
+                                    inserter_closed = true;
+                                    if getter_closed {
+                                        // Both channels closed - exit loop
+                                        break;
                                     }
                                 }
                             }
-                            links.insert(span, sender);
                         },
-                        (span, link_sender) = link_getter_receiver.select_next_some() => {
-                            if let Some(sender) = links.get(&span) {
-                                if link_sender.send(sender.clone()).is_err() {
-                                    eprintln!("Failed to send link sender from link connector");
+                        result = link_getter_receiver.next() => {
+                            match result {
+                                Some((span, link_sender)) => {
+                                    if let Some(sender) = links.get(&span) {
+                                        if link_sender.send(sender.clone()).is_err() {
+                                            eprintln!("Failed to send link sender from link connector");
+                                        }
+                                    } else {
+                                        link_senders.entry(span).or_default().push(link_sender);
+                                    }
                                 }
-                            } else {
-                                link_senders.entry(span).or_default().push(link_sender);
+                                None => {
+                                    getter_closed = true;
+                                    if inserter_closed {
+                                        // Both channels closed - exit loop
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
+                }
+                // Explicitly drop the links to ensure channels are cleaned up
+                drop(links);
+                if LOG_DROPS_AND_LOOP_ENDS {
+                    println!("LinkConnector loop ended - all links dropped");
                 }
             }),
         }

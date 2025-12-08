@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use chumsky::Parser as ChumskyParser;
 use chumsky::input::{Input as ChumskyInput, Stream as ChumskyStream};
@@ -40,12 +40,17 @@ use super::engine::*;
 
 /// Bundles all evaluation parameters into one struct.
 /// This replaces passing 8 separate parameters through recursive calls.
+///
+/// NOTE: reference_connector and link_connector are stored as Weak to break
+/// reference cycles. The playground/caller must hold the strong Arc references,
+/// and when those are dropped, the connectors will be freed, causing all actors
+/// to be cleaned up.
 #[derive(Clone)]
 pub struct EvaluationContext {
     pub construct_context: ConstructContext,
     pub actor_context: ActorContext,
-    pub reference_connector: Arc<ReferenceConnector>,
-    pub link_connector: Arc<LinkConnector>,
+    pub reference_connector: Weak<ReferenceConnector>,
+    pub link_connector: Weak<LinkConnector>,
     pub function_registry: StaticFunctionRegistry,
     pub module_loader: ModuleLoader,
     pub source_code: SourceCode,
@@ -65,8 +70,8 @@ impl EvaluationContext {
         Self {
             construct_context,
             actor_context,
-            reference_connector,
-            link_connector,
+            reference_connector: Arc::downgrade(&reference_connector),
+            link_connector: Arc::downgrade(&link_connector),
             function_registry,
             module_loader,
             source_code,
@@ -121,6 +126,18 @@ impl EvaluationContext {
             backpressure_permit: permit,
             ..self.actor_context.clone()
         })
+    }
+
+    /// Try to upgrade the weak reference_connector to a strong Arc.
+    /// Returns None if the connector has been dropped (program shutting down).
+    pub fn try_reference_connector(&self) -> Option<Arc<ReferenceConnector>> {
+        self.reference_connector.upgrade()
+    }
+
+    /// Try to upgrade the weak link_connector to a strong Arc.
+    /// Returns None if the connector has been dropped (program shutting down).
+    pub fn try_link_connector(&self) -> Option<Arc<LinkConnector>> {
+        self.link_connector.upgrade()
     }
 }
 
@@ -1246,13 +1263,17 @@ fn process_work_item(
 
                 // Register with reference connector if this variable is referenced elsewhere
                 if vd.is_referenced {
-                    ctx.reference_connector.register_referenceable(vd.span, variable.value_actor());
+                    if let Some(ref_connector) = ctx.try_reference_connector() {
+                        ref_connector.register_referenceable(vd.span, variable.value_actor());
+                    }
                 }
 
                 // Register LINK variable senders with LinkConnector
                 if vd.is_link {
                     if let Some(sender) = variable.link_value_sender() {
-                        ctx.link_connector.register_link(vd.span, sender);
+                        if let Some(link_connector) = ctx.try_link_connector() {
+                            link_connector.register_link(vd.span, sender);
+                        }
                     }
                 }
 
@@ -1311,13 +1332,17 @@ fn process_work_item(
 
                 // Register with reference connector if this variable is referenced elsewhere
                 if vd.is_referenced {
-                    ctx.reference_connector.register_referenceable(vd.span, variable.value_actor());
+                    if let Some(ref_connector) = ctx.try_reference_connector() {
+                        ref_connector.register_referenceable(vd.span, variable.value_actor());
+                    }
                 }
 
                 // Register LINK variable senders with LinkConnector
                 if vd.is_link {
                     if let Some(sender) = variable.link_value_sender() {
-                        ctx.link_connector.register_link(vd.span, sender);
+                        if let Some(link_connector) = ctx.try_link_connector() {
+                            link_connector.register_link(vd.span, sender);
+                        }
                     }
                 }
 
@@ -1619,7 +1644,9 @@ fn evaluate_alias_immediate(
                 Box::pin(async move { param_actor })
             } else if let Some(ref_span) = referenced_span {
                 // Use async lookup via ReferenceConnector
-                Box::pin(ctx.reference_connector.clone().referenceable(*ref_span))
+                let ref_connector = ctx.try_reference_connector()
+                    .ok_or_else(|| "ReferenceConnector dropped - program shutting down".to_string())?;
+                Box::pin(ref_connector.referenceable(*ref_span))
             } else if parts.len() >= 2 {
                 // Module variable access - for now fall back to returning an error
                 return Err(format!("Module variable access '{}' not yet supported in stack-safe evaluator", first_part));
@@ -2358,7 +2385,8 @@ fn build_text_literal_actor(
                 } else if let Some(ref_span) = referenced_span {
                     // Use reference_connector to get the variable from outer scope
                     // Create a wrapper actor that resolves the reference asynchronously
-                    let ref_connector = ctx.reference_connector.clone();
+                    let ref_connector = ctx.try_reference_connector()
+                        .ok_or_else(|| "ReferenceConnector dropped - program shutting down".to_string())?;
                     let ref_span_copy = *ref_span;
                     let value_stream = stream::once(ref_connector.referenceable(ref_span_copy))
                         .flat_map(|actor| actor.subscribe())
@@ -2563,12 +2591,16 @@ fn build_list_binding_function(
     let transform_expr = arguments[1].node.value.clone()
         .ok_or_else(|| format!("List/{} requires a transform expression", path_strs[1]))?;
 
+    let reference_connector = ctx.try_reference_connector()
+        .ok_or_else(|| "ReferenceConnector dropped - program shutting down".to_string())?;
+    let link_connector = ctx.try_link_connector()
+        .ok_or_else(|| "LinkConnector dropped - program shutting down".to_string())?;
     let config = ListBindingConfig {
         binding_name,
         transform_expr,
         operation,
-        reference_connector: ctx.reference_connector.clone(),
-        link_connector: ctx.link_connector.clone(),
+        reference_connector,
+        link_connector,
         source_code: ctx.source_code.clone(),
     };
 
@@ -3177,7 +3209,7 @@ pub fn evaluate(
 ) -> Result<(Arc<Object>, ConstructContext), String> {
     let function_registry = StaticFunctionRegistry::default();
     let module_loader = ModuleLoader::default();
-    let (obj, ctx, _, _) = evaluate_with_registry(
+    let (obj, ctx, _, _, _, _) = evaluate_with_registry(
         source_code,
         expressions,
         states_local_storage_key,
@@ -3190,6 +3222,18 @@ pub fn evaluate(
 
 /// Evaluation function that accepts and returns a function registry and module loader.
 /// This enables sharing function definitions across multiple files.
+///
+/// Returns a tuple containing:
+/// - `Arc<Object>`: The root object containing all top-level variables
+/// - `ConstructContext`: Context for construct storage and virtual filesystem
+/// - `StaticFunctionRegistry`: Registry of function definitions
+/// - `ModuleLoader`: Module loader for imports
+/// - `Arc<ReferenceConnector>`: Connector for variable references (MUST be dropped when done!)
+/// - `Arc<LinkConnector>`: Connector for LINK variables (MUST be dropped when done!)
+///
+/// IMPORTANT: The ReferenceConnector and LinkConnector MUST be dropped when the program
+/// is finished (e.g., when switching examples) to allow actors to be cleaned up.
+/// These connectors hold strong references to all top-level actors.
 pub fn evaluate_with_registry(
     source_code: SourceCode,
     expressions: Vec<static_expression::Spanned<static_expression::Expression>>,
@@ -3197,7 +3241,7 @@ pub fn evaluate_with_registry(
     virtual_fs: VirtualFilesystem,
     function_registry: StaticFunctionRegistry,
     module_loader: ModuleLoader,
-) -> Result<(Arc<Object>, ConstructContext, StaticFunctionRegistry, ModuleLoader), String> {
+) -> Result<(Arc<Object>, ConstructContext, StaticFunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>), String> {
     let construct_context = ConstructContext {
         construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
         virtual_fs,
@@ -3266,7 +3310,7 @@ pub fn evaluate_with_registry(
         construct_context.clone(),
         evaluated_variables?,
     );
-    Ok((root_object, construct_context, function_registry, module_loader))
+    Ok((root_object, construct_context, function_registry, module_loader, reference_connector, link_connector))
 }
 
 /// Evaluates a static variable into a Variable.
@@ -3404,8 +3448,8 @@ fn static_spanned_expression_into_value_actor(
     let ctx = EvaluationContext {
         construct_context,
         actor_context,
-        reference_connector,
-        link_connector,
+        reference_connector: Arc::downgrade(&reference_connector),
+        link_connector: Arc::downgrade(&link_connector),
         function_registry,
         module_loader,
         source_code,

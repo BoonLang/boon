@@ -1272,7 +1272,9 @@ impl Playground {
         }
 
         // Run the main file (uses ModuleLoader for imports, no shared registry)
-        let object_and_construct_context = interpreter::run_with_registry(
+        // We keep reference_connector and link_connector alive to preserve all actors.
+        // Dropping them (via after_remove) will trigger cleanup of all actors.
+        let evaluation_result = interpreter::run_with_registry(
             filename,
             &source_code,
             STATES_STORAGE_KEY,
@@ -1280,15 +1282,20 @@ impl Playground {
             OLD_SPAN_ID_PAIRS_STORAGE_KEY,
             virtual_fs,
             None,
-        ).map(|(obj, ctx, _, _)| (obj, ctx));
+        );
         drop(source_code);
-        if let Some((object, construct_context)) = object_and_construct_context {
+        if let Some((object, construct_context, _registry, _module_loader, reference_connector, link_connector)) = evaluation_result {
             El::new()
                 .child_signal(object_with_document_to_element_signal(
                     object.clone(),
                     construct_context,
                 ))
-                .after_remove(move |_| drop(object))
+                .after_remove(move |_| {
+                    // Drop object first, then drop connectors to trigger actor cleanup
+                    drop(object);
+                    drop(reference_connector);
+                    drop(link_connector);
+                })
                 .unify()
         } else {
             El::new()

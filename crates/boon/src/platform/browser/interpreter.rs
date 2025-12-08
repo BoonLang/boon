@@ -17,10 +17,15 @@ use crate::parser::{
     reset_expression_depth, resolve_persistence, resolve_references, span_at, static_expression,
 };
 use crate::platform::browser::{
-    engine::{ConstructContext, Object, VirtualFilesystem},
-    evaluator::{evaluate, evaluate_with_registry, ModuleLoader, StaticFunctionRegistry},
+    engine::{ConstructContext, LinkConnector, Object, ReferenceConnector, VirtualFilesystem},
+    evaluator::{evaluate_with_registry, ModuleLoader, StaticFunctionRegistry},
 };
 
+/// Run a Boon program and return the result.
+///
+/// IMPORTANT: The returned `ReferenceConnector` and `LinkConnector` MUST be dropped
+/// when the program is finished (e.g., when switching examples) to allow all actors
+/// to be cleaned up. These connectors hold references to all top-level actors.
 pub fn run(
     filename: &str,
     source_code: &str,
@@ -28,7 +33,7 @@ pub fn run(
     old_code_local_storage_key: impl Into<Cow<'static, str>>,
     old_span_id_pairs_local_storage_key: impl Into<Cow<'static, str>>,
     virtual_fs: VirtualFilesystem,
-) -> Option<(Arc<Object>, ConstructContext)> {
+) -> Option<(Arc<Object>, ConstructContext, Arc<ReferenceConnector>, Arc<LinkConnector>)> {
     let states_local_storage_key = states_local_storage_key.into();
     let old_code_local_storage_key = old_code_local_storage_key.into();
     let old_span_id_pairs_local_storage_key = old_span_id_pairs_local_storage_key.into();
@@ -119,8 +124,19 @@ pub fn run(
     // Note: source_code_arc was created at the start of this function
     let static_ast = static_expression::convert_expressions(source_code_arc.clone(), ast);
 
-    let evaluation_result = match evaluate(source_code_arc.clone(), static_ast, states_local_storage_key.clone(), virtual_fs) {
-        Ok(result) => Some(result),
+    let function_registry = StaticFunctionRegistry::default();
+    let module_loader = ModuleLoader::default();
+    let evaluation_result = match evaluate_with_registry(
+        source_code_arc.clone(),
+        static_ast,
+        states_local_storage_key.clone(),
+        virtual_fs,
+        function_registry,
+        module_loader,
+    ) {
+        Ok((root_object, construct_context, _registry, _module_loader, reference_connector, link_connector)) => {
+            Some((root_object, construct_context, reference_connector, link_connector))
+        }
         Err(error) => {
             println!("[Evaluation Error]");
             eprintln!("{error}");
@@ -161,6 +177,10 @@ pub fn run(
 /// Run with function registry support for sharing functions across files.
 /// Accepts an optional function registry and returns it along with the result.
 /// This enables patterns like: run BUILD.bn, get its functions, pass to RUN.bn.
+///
+/// IMPORTANT: The returned `ReferenceConnector` and `LinkConnector` MUST be dropped
+/// when the program is finished (e.g., when switching examples) to allow all actors
+/// to be cleaned up. These connectors hold references to all top-level actors.
 pub fn run_with_registry(
     filename: &str,
     source_code: &str,
@@ -169,7 +189,7 @@ pub fn run_with_registry(
     old_span_id_pairs_local_storage_key: impl Into<Cow<'static, str>>,
     virtual_fs: VirtualFilesystem,
     function_registry: Option<StaticFunctionRegistry>,
-) -> Option<(Arc<Object>, ConstructContext, StaticFunctionRegistry, ModuleLoader)> {
+) -> Option<(Arc<Object>, ConstructContext, StaticFunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>)> {
     let states_local_storage_key = states_local_storage_key.into();
     let old_code_local_storage_key = old_code_local_storage_key.into();
     let old_span_id_pairs_local_storage_key = old_span_id_pairs_local_storage_key.into();
@@ -260,7 +280,9 @@ pub fn run_with_registry(
         registry,
         module_loader,
     ) {
-        Ok(result) => Some(result),
+        Ok((root_object, construct_context, registry, module_loader, reference_connector, link_connector)) => {
+            Some((root_object, construct_context, registry, module_loader, reference_connector, link_connector))
+        }
         Err(error) => {
             println!("[Evaluation Error]");
             eprintln!("{error}");
