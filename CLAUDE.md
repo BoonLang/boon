@@ -188,6 +188,31 @@ This helps trace the lifecycle of actors and identify premature drops.
 
 3. **`output_valve_signal`** - If this stream ends, the ValueActor's loop breaks (see line ~1522 in engine.rs).
 
+### Debugging Best Practice: Simplify Test Cases
+
+When debugging complex issues, **always create simplified test cases first** to isolate the problem:
+
+1. **Don't debug the full complex example** - Start with the smallest code that reproduces the issue
+2. **Isolate components one by one** - Test each piece (HOLD, Stream/pulses, TEXT, etc.) separately
+3. **Compare working vs broken cases** - e.g., if `10 |> Stream/pulses() |> Document/new()` works but `result: 10 |> Stream/pulses()` followed by `TEXT { {result} }` doesn't, the issue is in the latter pattern
+4. **Eliminate variables** - Remove functions, simplify data, use constants instead of expressions
+
+Example: Instead of debugging a full fibonacci implementation, first test:
+```boon
+// Test 1: Does Stream/pulses work directly?
+document: 5 |> Stream/pulses() |> Document/new()
+
+// Test 2: Does assignment + reference work?
+x: 5 |> Stream/pulses()
+document: x |> Document/new()
+
+// Test 3: Does TEXT interpolation work?
+x: 5 |> Stream/pulses()
+document: TEXT { Value: {x} } |> Document/new()
+```
+
+This approach saves hours of debugging by quickly pinpointing the exact failing component.
+
 ### Browser Automation Rules
 
 When debugging with browser automation (`boon-tools exec`):

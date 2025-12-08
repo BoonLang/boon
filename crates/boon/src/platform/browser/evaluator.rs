@@ -9,7 +9,7 @@ use chumsky::Parser as ChumskyParser;
 use chumsky::input::{Input as ChumskyInput, Stream as ChumskyStream};
 use ulid::Ulid;
 use zoon::futures_util::stream;
-use zoon::{Stream, StreamExt, println, eprintln, Task, mpsc};
+use zoon::{Stream, StreamExt, println, eprintln, Task, TaskHandle, mpsc};
 
 /// Yields control to the executor, allowing other tasks to run.
 /// This is a simple implementation that returns Pending once and schedules a wake.
@@ -1084,20 +1084,23 @@ fn schedule_expression(
             state.store(result_slot, actor);
         }
 
+
         // ============================================================
-        // PULSES (iteration)
+        // FIELD ACCESS (.field.subfield at pipe position)
+        // Equivalent to WHILE { value => value.field.subfield }
         // ============================================================
 
-        static_expression::Expression::Pulses { count } => {
-            if let Some(actor) = build_pulses_actor(
-                *count,
+        static_expression::Expression::FieldAccess { path } => {
+            // Convert StrSlice path to Vec<String> for the function
+            let path_strings: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+            let actor = build_field_access_actor(
+                path_strings,
                 span,
                 persistence,
                 persistence_id,
                 ctx,
-            )? {
-                state.store(result_slot, actor);
-            }
+            )?;
+            state.store(result_slot, actor);
         }
 
         // ============================================================
@@ -1818,6 +1821,9 @@ fn build_then_actor(
     let persistence_for_then = persistence.clone();
     let span_for_then = span;
 
+    // Clone backpressure_permit for the closure
+    let backpressure_permit_for_then = backpressure_permit.clone();
+
     // eval_body now returns a Stream instead of Option<Value>
     // This avoids blocking on .next().await which would hang if body returns SKIP
     let eval_body = move |value: Value| -> Pin<Box<dyn Future<Output = Pin<Box<dyn Stream<Item = Value>>>>>> {
@@ -1830,8 +1836,18 @@ fn build_then_actor(
         let source_code_clone = source_code_for_then.clone();
         let persistence_clone = persistence_for_then.clone();
         let body_clone = body.clone();
+        let permit_clone = backpressure_permit_for_then.clone();
 
         Box::pin(async move {
+            // Acquire permit BEFORE body evaluation - this ensures HOLD's state update
+            // completes before we read state for the next iteration. Without this,
+            // all pulses would run in parallel reading the same initial state.
+            if let Some(ref permit) = permit_clone {
+                zoon::println!("[DEBUG] THEN: acquiring backpressure permit...");
+                permit.acquire().await;
+                zoon::println!("[DEBUG] THEN: backpressure permit acquired!");
+            }
+
             let value_actor = ValueActor::new_arc(
                 ConstructInfo::new(
                     "THEN input value".to_string(),
@@ -1843,11 +1859,52 @@ fn build_then_actor(
                 None,
             );
 
+            // CRITICAL FIX: Freeze parameters for SNAPSHOT semantics.
+            // When THEN body references `state` (from HOLD), we want the CURRENT value at the
+            // time of body evaluation, not all historical values from the reactive subscription.
+            //
+            // Without this fix:
+            // - Body creates BinaryOpCombinator for `state + 1`
+            // - BinaryOpCombinator subscribes to state_actor starting at version 0
+            // - Subscription returns ALL historical values: [{value:0}, {value:1}, ...]
+            // - First poll returns {value:0} (OLD value!) instead of current {value:1}
+            // - Result is 1 instead of 2
+            //
+            // With this fix:
+            // - We create a "frozen" actor for each parameter with just the current value
+            // - Body subscribes to this frozen actor, gets only the current value
+            // - Computation uses the correct current state
+            let frozen_parameters: HashMap<String, Arc<ValueActor>> = actor_context_clone.parameters
+                .iter()
+                .filter_map(|(name, actor)| {
+                    // Create a constant actor from the current stored value
+                    if let Some(current_value) = actor.stored_value() {
+                        zoon::println!("[DEBUG] THEN: freezing parameter '{}' with value at version {}",
+                            name, actor.version());
+                        let frozen_actor = ValueActor::new_arc(
+                            ConstructInfo::new(
+                                format!("frozen param: {name}"),
+                                None,
+                                format!("frozen parameter {name}"),
+                            ),
+                            actor_context_clone.clone(),
+                            constant(current_value),
+                            None,
+                        );
+                        Some((name.clone(), frozen_actor))
+                    } else {
+                        // No value yet, keep original actor
+                        zoon::println!("[DEBUG] THEN: parameter '{}' has no value, keeping original", name);
+                        Some((name.clone(), actor.clone()))
+                    }
+                })
+                .collect();
+
             let new_actor_context = ActorContext {
                 output_valve_signal: actor_context_clone.output_valve_signal.clone(),
                 piped: Some(value_actor.clone()),
                 passed: actor_context_clone.passed.clone(),
-                parameters: actor_context_clone.parameters.clone(),
+                parameters: frozen_parameters,
                 sequential_processing: actor_context_clone.sequential_processing,
                 backpressure_permit: actor_context_clone.backpressure_permit.clone(),
             };
@@ -1985,8 +2042,32 @@ fn build_when_actor(
                         None,
                     );
 
-                    // Create parameter actors for the bindings
-                    let mut parameters = actor_context_clone.parameters.clone();
+                    // CRITICAL FIX: Freeze parameters for SNAPSHOT semantics (same as THEN).
+                    // When WHEN body references `state` (from HOLD), we want the CURRENT value at the
+                    // time of body evaluation, not all historical values from the reactive subscription.
+                    let frozen_parameters: HashMap<String, Arc<ValueActor>> = actor_context_clone.parameters
+                        .iter()
+                        .filter_map(|(name, actor)| {
+                            if let Some(current_value) = actor.stored_value() {
+                                let frozen_actor = ValueActor::new_arc(
+                                    ConstructInfo::new(
+                                        format!("frozen param: {name}"),
+                                        None,
+                                        format!("frozen parameter {name}"),
+                                    ),
+                                    actor_context_clone.clone(),
+                                    constant(current_value),
+                                    None,
+                                );
+                                Some((name.clone(), frozen_actor))
+                            } else {
+                                Some((name.clone(), actor.clone()))
+                            }
+                        })
+                        .collect();
+
+                    // Create parameter actors for the pattern bindings
+                    let mut parameters = frozen_parameters;
                     for (name, bound_value) in bindings {
                         let bound_actor = ValueActor::new_arc(
                             ConstructInfo::new(
@@ -2221,6 +2302,85 @@ fn build_while_actor(
     ))
 }
 
+/// Build a FieldAccess actor (.field.subfield at pipe position).
+/// FieldAccess: `stream |> .field.subfield`
+/// Equivalent to: `stream |> WHILE { value => value.field.subfield }`
+/// For each value from the piped stream, navigates through the field path
+/// and emits the extracted field value.
+fn build_field_access_actor(
+    path: Vec<String>,
+    span: Span,
+    persistence: Option<Persistence>,
+    persistence_id: PersistenceId,
+    ctx: EvaluationContext,
+) -> Result<Arc<ValueActor>, String> {
+    let piped = ctx.actor_context.piped.clone()
+        .ok_or("FieldAccess requires a piped value")?;
+
+    // Keep path for display in ConstructInfo
+    let path_display = path.join(".");
+    let path_strings = path;
+
+    // Start with the piped value's subscription
+    let mut value_stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(piped.clone().subscribe());
+
+    // For each field in the path, transform the stream to extract that field
+    for field_name in path_strings {
+        value_stream = Box::pin(
+            value_stream
+                .map(move |value| {
+                    let field_name = field_name.clone();
+                    match value {
+                        Value::Object(object, _) => {
+                            let variable_actor = object.expect_variable(&field_name).value_actor();
+                            // Use unfold to keep the parent object alive while subscribed
+                            stream::unfold(
+                                (variable_actor.subscribe(), object),
+                                |(mut subscription, object)| async move {
+                                    subscription.next().await.map(|value| (value, (subscription, object)))
+                                }
+                            ).boxed_local()
+                        }
+                        Value::TaggedObject(tagged_object, _) => {
+                            let variable_actor = tagged_object.expect_variable(&field_name).value_actor();
+                            // Use unfold to keep the parent tagged_object alive while subscribed
+                            stream::unfold(
+                                (variable_actor.subscribe(), tagged_object),
+                                |(mut subscription, tagged_object)| async move {
+                                    subscription.next().await.map(|value| (value, (subscription, tagged_object)))
+                                }
+                            ).boxed_local()
+                        }
+                        other => {
+                            // Not an object - emit an error value or panic
+                            panic!(
+                                "FieldAccess: Cannot access field '{}' on non-object value: {}",
+                                field_name, other.construct_info()
+                            );
+                        }
+                    }
+                })
+                // Use flatten_unordered(Some(1)) to limit concurrency - each value creates
+                // a subscription to the field, and with unlimited concurrency these would
+                // grow exponentially for frequently-updating sources
+                .flatten_unordered(Some(1))
+        );
+    }
+
+    // Keep the piped actor alive by including it in inputs
+    Ok(ValueActor::new_arc_with_inputs(
+        ConstructInfo::new(
+            format!("PersistenceId: {persistence_id}"),
+            persistence,
+            format!("{span}; .{path_display}"),
+        ),
+        ctx.actor_context,
+        TypedStream::infinite(value_stream),
+        Some(persistence_id),
+        vec![piped],  // Keep piped actor alive
+    ))
+}
+
 /// Build a HOLD actor (stateful accumulator).
 /// HOLD: `input |> HOLD state_param { body }`
 /// The piped value sets/resets the state (not just initial - any emission).
@@ -2237,11 +2397,12 @@ fn build_hold_actor(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
 ) -> Result<Option<Arc<ValueActor>>, String> {
-    println!("[DEBUG] build_hold_actor: state_param={state_param}, span={span:?}");
+    zoon::println!("[DEBUG] build_hold_actor: state_param={state_param}, span={span:?}");
     // Use a channel to hold current state value and broadcast updates
     let (state_sender, state_receiver) = zoon::futures_channel::mpsc::unbounded::<Value>();
     let state_sender = Rc::new(RefCell::new(state_sender));
     let state_sender_for_update = state_sender.clone();
+    let state_sender_for_reset = state_sender.clone();
 
     // Current state holder (starts with None, will be set when initial emits)
     let current_state: Rc<RefCell<Option<Value>>> = Rc::new(RefCell::new(None));
@@ -2257,7 +2418,7 @@ fn build_hold_actor(
         .chain(state_receiver)  // Then listen for updates and resets
         .inspect(|val| zoon::println!("[DEBUG] state_actor stream: emitting value"));  // Debug log
 
-    println!("[DEBUG] build_hold_actor: initial_actor version={}",
+    zoon::println!("[DEBUG] build_hold_actor: initial_actor version={}",
         initial_actor.version());
 
     // Create state actor - initial value will come through the stream asynchronously
@@ -2274,7 +2435,10 @@ fn build_hold_actor(
 
     // Bind the state parameter in the context so body can reference it
     let mut body_parameters = ctx.actor_context.parameters.clone();
-    body_parameters.insert(state_param.clone(), state_actor);
+    body_parameters.insert(state_param.clone(), state_actor.clone());
+
+    // Clone state_actor for use in state_update_stream to directly update its stored value
+    let state_actor_for_update = state_actor;
 
     // Create backpressure permit for synchronizing THEN with state updates.
     // Initial count = 1 allows first body evaluation to start.
@@ -2289,7 +2453,7 @@ fn build_hold_actor(
         parameters: body_parameters,
         // Force sequential processing in HOLD body to ensure state consistency.
         // Without this, THEN/WHEN would spawn parallel body evaluations that all
-        // read stale state (e.g., PULSES {3} |> THEN { counter + 1 } would read counter=0 three times).
+        // read stale state (e.g., Stream/pulses(3) |> THEN { counter + 1 } would read counter=0 three times).
         sequential_processing: true,
         // Pass permit to body - THEN will acquire before each evaluation
         backpressure_permit: Some(backpressure_permit),
@@ -2318,31 +2482,81 @@ fn build_hold_actor(
     // When body produces new values, update the state
     // Note: We avoid self-reactivity by not triggering body re-evaluation
     // from state changes. Body only evaluates when its event sources fire.
-    let body_subscription = body_result.subscribe();
-    println!("[DEBUG] HOLD: created body_subscription");
+    let body_subscription = body_result.clone().subscribe();
+    zoon::println!("[DEBUG] HOLD: created body_subscription");
     let state_update_stream = body_subscription.map(move |new_value| {
-        println!("[DEBUG] HOLD state_update_stream: received new_value from body!");
+        zoon::println!("[DEBUG] HOLD state_update_stream: received new_value from body!");
         // Update current state
         *current_state_for_update.borrow_mut() = Some(new_value.clone());
         // Send to state channel so body can see it on next event
         let _ = state_sender_for_update.borrow().unbounded_send(new_value.clone());
+        // DIRECTLY update state_actor's stored value - bypass async channel delay.
+        // This ensures the next THEN body evaluation reads the fresh state value.
+        state_actor_for_update.store_value_directly(new_value.clone());
         // Release permit to allow THEN to process next input.
         // This guarantees state is updated before next body evaluation starts.
-        println!("[DEBUG] HOLD state_update_stream: releasing permit");
+        zoon::println!("[DEBUG] HOLD state_update_stream: releasing permit");
         permit_for_state_update.release();
-        println!("[DEBUG] HOLD state_update_stream: permit released");
+        zoon::println!("[DEBUG] HOLD state_update_stream: permit released");
         new_value
     });
 
-    // When initial value emits, set up initial state
-    // Note: We only update current_state here, NOT send to state_receiver.
-    // The state_actor already gets the initial value via take(1) at line 2045.
-    // Sending to state_receiver would cause state_actor to emit the initial value twice!
-    let initial_stream = initial_actor.subscribe().map(move |initial| {
-        // Set current state (for body to read synchronously if needed)
-        *current_state_for_body.borrow_mut() = Some(initial.clone());
-        // Do NOT send to state channel - take(1) already handles initial value
-        initial
+    // Create output actor FIRST with a pending stream (stays alive, no async stream processing).
+    // Values will be stored directly via store_value_directly() from the stream closures below.
+    // This ensures values are available in history immediately when Stream/skip subscribes.
+    let output = ValueActor::new_arc_with_inputs(
+        ConstructInfo::new(
+            format!("PersistenceId: {persistence_id}"),
+            persistence,
+            format!("{span}; HOLD {state_param} {{..}}"),
+        ),
+        ctx.actor_context,
+        TypedStream::infinite(stream::pending::<Value>()),
+        Some(persistence_id),
+        vec![body_result.clone(), initial_actor.clone()],
+    );
+
+    // CRITICAL: Store initial value SYNCHRONOUSLY before returning.
+    // This ensures downstream subscribers (like Stream/skip) see the initial value immediately,
+    // even before the Task that drives combined_stream runs.
+    // Without this, Stream/skip's task may run before HOLD's task, seeing no values.
+    if let Some(initial_value) = initial_actor.stored_value() {
+        zoon::println!("[DEBUG] HOLD: storing initial value synchronously to output");
+        output.store_value_directly(initial_value);
+    }
+
+    // Reset/passthrough behavior: ALL emissions from input pass through as HOLD output.
+    // First emission: state_actor gets it via take(1), so we don't send to state_receiver.
+    // Subsequent emissions: send to state_receiver so body sees the reset value.
+    // NOTE: First value is already stored synchronously above, so we skip storing it here.
+    let is_first_input = Rc::new(RefCell::new(true));
+    let output_for_initial = output.clone();
+    let initial_stream = initial_actor.clone().subscribe().map(move |value| {
+        let is_first = *is_first_input.borrow();
+        if is_first {
+            *is_first_input.borrow_mut() = false;
+            // First value: just update current_state, don't send to state_receiver
+            // (take(1) in state_stream already handles state_actor for first value)
+            // NOTE: Don't store to output here - it was already stored synchronously above.
+            zoon::println!("[DEBUG] HOLD: first input value, updating current_state only (already stored sync)");
+            *current_state_for_body.borrow_mut() = Some(value.clone());
+        } else {
+            // Subsequent values (reset): update current_state AND send to state_receiver
+            zoon::println!("[DEBUG] HOLD reset: received reset_value from input");
+            *current_state_for_body.borrow_mut() = Some(value.clone());
+            let _ = state_sender_for_reset.borrow().unbounded_send(value.clone());
+            // Store value directly to output - only for reset values, not initial
+            output_for_initial.store_value_directly(value.clone());
+        }
+        // Always pass through as HOLD output
+        value
+    });
+
+    // Modify state_update_stream to also store values directly to output
+    let output_for_update = output.clone();
+    let state_update_stream = state_update_stream.map(move |value| {
+        output_for_update.store_value_directly(value.clone());
+        value
     });
 
     // Combine: input stream sets/resets state, body updates state
@@ -2352,124 +2566,17 @@ fn build_hold_actor(
         state_update_stream
     );
 
-    Ok(Some(ValueActor::new_arc(
-        ConstructInfo::new(
-            format!("PersistenceId: {persistence_id}"),
-            persistence,
-            format!("{span}; HOLD {state_param} {{..}}"),
-        ),
-        ctx.actor_context,
-        TypedStream::infinite(combined_stream),
-        Some(persistence_id),
-    )))
-}
-
-/// Build a PULSES actor for iteration.
-/// PULSES { count } emits count values (0 to count-1).
-/// Can be used with THEN for iteration: `PULSES { 10 } |> THEN { ... }`
-fn build_pulses_actor(
-    count_expr: static_expression::Spanned<static_expression::Expression>,
-    span: Span,
-    persistence: Option<Persistence>,
-    persistence_id: PersistenceId,
-    ctx: EvaluationContext,
-) -> Result<Option<Arc<ValueActor>>, String> {
-    println!("[DEBUG] build_pulses_actor: span={span:?}, has_backpressure_permit={}", ctx.actor_context.backpressure_permit.is_some());
-    // Evaluate the count expression
-    let count_actor = match evaluate_expression(count_expr, ctx.clone())? {
-        Some(actor) => actor,
-        None => {
-            // Count is SKIP - PULSES produces no values (propagate SKIP)
-            return Ok(None);
+    // Start a task to drive the combined stream (poll it so closures execute).
+    // The output actor stays alive via its pending stream, and values are stored
+    // directly via store_value_directly() in the stream closures above.
+    Task::start(async move {
+        let mut stream = combined_stream;
+        while stream.next().await.is_some() {
+            // Values are already stored via store_value_directly in the map closures
         }
-    };
-
-    // Debug: check if count_actor has an immediate value
-    println!("[DEBUG] PULSES: count_actor version={}",
-        count_actor.version());
-
-    let construct_context_for_pulses = ctx.construct_context.clone();
-
-    // Get backpressure permit from HOLD context if available.
-    // When inside HOLD, PULSES will acquire permit before each emission,
-    // ensuring consumer (THEN) processes each value before next is emitted.
-    let backpressure_permit = ctx.actor_context.backpressure_permit.clone();
-
-    // When count changes, emit that many pulses
-    // Use stream::unfold instead of stream::iter to yield between emissions,
-    // ensuring downstream subscribers have a chance to process each pulse
-    println!("[DEBUG] PULSES: setting up stream");
-    let pulses_stream = count_actor.clone().subscribe()
-        .inspect(|v| {
-            let info = match v {
-                Value::Number(n, _) => format!("Number({})", n.number()),
-                _ => "other".to_string(),
-            };
-            println!("[DEBUG] PULSES: count_actor emitted value: {}", info);
-        })
-        .flat_map(move |count_value| {
-        let n = match &count_value {
-            Value::Number(num, _) => num.number() as i64,
-            _ => 0,
-        };
-
-        let construct_context_inner = construct_context_for_pulses.clone();
-        let permit_for_iteration = backpressure_permit.clone();
-
-        // Use unfold to emit pulses one at a time with async yield points.
-        // Boon uses 1-based indexing, so PULSES { 5 } emits 1, 2, 3, 4, 5.
-        stream::unfold(1i64, move |i| {
-            let construct_context_for_iter = construct_context_inner.clone();
-            let permit = permit_for_iteration.clone();
-            async move {
-                if i > n.max(0) {
-                    println!("[DEBUG] PULSES: done emitting (i={i} > n={n})");
-                    return None;
-                }
-
-                println!("[DEBUG] PULSES: about to emit i={i}, n={n}, has_permit={}", permit.is_some());
-
-                // Yield/wait before emitting to allow downstream to process
-                if let Some(ref permit) = permit {
-                    println!("[DEBUG] PULSES: acquiring permit for i={i}...");
-                    permit.acquire().await;
-                    println!("[DEBUG] PULSES: acquired permit for i={i}");
-                } else {
-                    yield_once().await;
-                }
-
-                println!("[DEBUG] PULSES: emitting value {i}");
-                let value = Value::Number(
-                    Arc::new(Number::new(
-                        ConstructInfo::new(
-                            format!("PULSES iteration {i}"),
-                            None,
-                            format!("PULSES iteration {i}"),
-                        ),
-                        construct_context_for_iter,
-                        i as f64,
-                    )),
-                    ValueMetadata {
-                        idempotency_key: Ulid::new(),
-                    },
-                );
-                Some((value, i + 1))
-            }
-        })
     });
 
-    // Keep count_actor alive by passing it as an input dependency
-    Ok(Some(ValueActor::new_arc_with_inputs(
-        ConstructInfo::new(
-            format!("PersistenceId: {persistence_id}"),
-            persistence,
-            format!("{span}; PULSES {{..}}"),
-        ),
-        ctx.actor_context,
-        TypedStream::infinite(pulses_stream),
-        Some(persistence_id),
-        vec![count_actor],
-    )))
+    Ok(Some(output))
 }
 
 /// Build a TEXT { ... } literal actor with interpolation support.
@@ -2482,6 +2589,8 @@ fn build_text_literal_actor(
 ) -> Result<Arc<ValueActor>, String> {
     // Collect all parts - literals as constant streams, interpolations as variable lookups
     let mut part_actors: Vec<(bool, Arc<ValueActor>)> = Vec::new();
+    // Collect task handles to keep forwarding tasks alive
+    let mut forwarding_tasks: Vec<TaskHandle> = Vec::new();
 
     for part in &parts {
         match part {
@@ -2508,23 +2617,37 @@ fn build_text_literal_actor(
                     part_actors.push((false, var_actor.clone()));
                 } else if let Some(ref_span) = referenced_span {
                     // Use reference_connector to get the variable from outer scope
-                    // Create a wrapper actor that resolves the reference asynchronously
+                    // Create a forwarding actor that immediately starts forwarding values
+                    // from the referenced actor via a dedicated task.
+                    // This avoids timing issues with the lazy stream approach.
                     let ref_connector = ctx.try_reference_connector()
                         .ok_or_else(|| "ReferenceConnector dropped - program shutting down".to_string())?;
                     let ref_span_copy = *ref_span;
-                    let value_stream = stream::once(ref_connector.referenceable(ref_span_copy))
-                        .flat_map(|actor| actor.subscribe())
-                        .boxed_local();
-                    let ref_actor = Arc::new(ValueActor::new(
+
+                    // Create forwarding actor with unbounded channel
+                    let (ref_actor, sender) = ValueActor::new_arc_forwarding(
                         ConstructInfo::new(
                             format!("TextInterpolation:{}", var_name),
                             None,
                             format!("{span}; TextInterpolation for '{}'", var_name),
-                        ).complete(ConstructType::ValueActor),
+                        ),
                         ctx.actor_context.clone(),
-                        TypedStream::infinite(value_stream),
                         None,
-                    ));
+                    );
+
+                    // Spawn task to resolve reference and forward values
+                    let task_handle = Task::start_droppable(async move {
+                        let actor = ref_connector.referenceable(ref_span_copy).await;
+                        let mut subscription = actor.subscribe();
+                        while let Some(value) = subscription.next().await {
+                            if sender.unbounded_send(value).is_err() {
+                                // Receiver dropped, stop forwarding
+                                break;
+                            }
+                        }
+                    });
+                    forwarding_tasks.push(task_handle);
+
                     part_actors.push((false, ref_actor));
                 } else {
                     return Err(format!("Variable '{}' not found for text interpolation", var_name));
@@ -2551,7 +2674,6 @@ fn build_text_literal_actor(
         Ok(part_actors.into_iter().next().unwrap().1)
     } else {
         // Multiple parts or interpolations - combine with combineLatest-like behavior
-        let actor_context_for_combine = ctx.actor_context.clone();
         let construct_context_for_combine = ctx.construct_context.clone();
         let span_for_combine = span;
 
@@ -2568,9 +2690,10 @@ fn build_text_literal_actor(
         }));
 
         let part_count = part_actors.len();
+        // Move forwarding_tasks into scan state to keep them alive
         let combined_stream = merged.scan(
-            vec![None; part_count],
-            move |latest_values, (idx, value)| {
+            (vec![None; part_count], forwarding_tasks),
+            move |(latest_values, _forwarding_tasks), (idx, value)| {
                 latest_values[idx] = Some(value);
 
                 // Check if all parts have values
@@ -2598,21 +2721,26 @@ fn build_text_literal_actor(
         )
         .filter_map(|opt| async move { opt });
 
-        // Create a value actor for the combined text
-        // We'll use flat_map to create each combined text value
-        let flattened = combined_stream.flat_map(move |combined_text| {
-            let text_actor = Text::new_arc_value_actor(
-                ConstructInfo::new(
-                    format!("TextLiteral combined"),
-                    None,
-                    format!("{span_for_combine}; TextLiteral combined"),
-                ),
-                construct_context_for_combine.clone(),
-                Ulid::new(),
-                actor_context_for_combine.clone(),
-                combined_text,
-            );
-            text_actor.subscribe()
+        // Map combined strings directly to Text Values.
+        // IMPORTANT: Do NOT use flat_map with Text actors here!
+        // flat_map waits for inner streams to complete, but constant Text actor
+        // subscriptions never complete - they emit once then return Pending forever.
+        // This would cause flat_map to wait forever after the first value.
+        let text_value_stream = combined_stream.map(move |combined_text| {
+            Value::Text(
+                Arc::new(Text::new(
+                    ConstructInfo::new(
+                        format!("TextLiteral combined"),
+                        None,
+                        format!("{span_for_combine}; TextLiteral combined"),
+                    ),
+                    construct_context_for_combine.clone(),
+                    combined_text,
+                )),
+                ValueMetadata {
+                    idempotency_key: ValueIdempotencyKey::new(),
+                },
+            )
         });
 
         Ok(ValueActor::new_arc(
@@ -2622,7 +2750,7 @@ fn build_text_literal_actor(
                 format!("{span}; TextLiteral {{..}}"),
             ),
             ctx.actor_context,
-            TypedStream::infinite(flattened),
+            TypedStream::infinite(text_value_stream),
             Some(persistence_id),
         ))
     }
@@ -3659,6 +3787,26 @@ fn static_function_call_path_to_definition(
         },
         ["Directory", "entries"] => |arguments, id, persistence_id, construct_context, actor_context| {
             api::function_directory_entries(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Stream", "skip"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_stream_skip(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Stream", "take"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_stream_take(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Stream", "distinct"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_stream_distinct(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Stream", "pulses"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_stream_pulses(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Stream", "debounce"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_stream_debounce(arguments, id, persistence_id, construct_context, actor_context)
                 .boxed_local()
         },
         _ => return Err(format!("Unknown function '{}(..)' in static context", path.join("/"))),

@@ -255,8 +255,12 @@ impl BackpressurePermit {
     /// Wakes the waiting task if one exists.
     /// Called by HOLD after updating state.
     pub fn release(&self) {
-        self.available.set(self.available.get() + 1);
+        use zoon::println;
+        let old = self.available.get();
+        self.available.set(old + 1);
+        println!("[DEBUG] Permit released: {} -> {}", old, self.available.get());
         if let Some(waker) = self.waker.borrow_mut().take() {
+            println!("[DEBUG] Permit waking blocked task");
             waker.wake();
         }
     }
@@ -265,11 +269,15 @@ impl BackpressurePermit {
     /// If no permit is available (count = 0), waits until one is released.
     /// Called by THEN before each body evaluation.
     pub async fn acquire(&self) {
+        use zoon::println;
         std::future::poll_fn(|cx| {
-            if self.available.get() > 0 {
-                self.available.set(self.available.get() - 1);
+            let available = self.available.get();
+            if available > 0 {
+                self.available.set(available - 1);
+                println!("[DEBUG] Permit acquired: {} -> {}", available, self.available.get());
                 Poll::Ready(())
             } else {
+                println!("[DEBUG] Permit BLOCKED: available = 0, storing waker");
                 *self.waker.borrow_mut() = Some(cx.waker().clone());
                 Poll::Pending
             }
@@ -1974,6 +1982,64 @@ pub fn pattern_to_matcher(pattern: &crate::parser::Pattern) -> Box<dyn Fn(&Value
     }
 }
 
+// --- ValueHistory ---
+
+/// Ring buffer for storing recent values with their versions.
+/// This enables subscriptions to retrieve all values since a given version,
+/// preventing message loss when values emit faster than subscribers poll.
+///
+/// # Design
+/// - Stores up to `max_entries` (version, value) pairs
+/// - When buffer is full, oldest entries are dropped
+/// - Subscribers can pull all values since their `last_seen_version`
+/// - If subscriber is too far behind (version not in buffer), falls back to snapshot
+///
+/// # Memory
+/// Default 64 entries × sizeof(Value) per ValueActor
+#[derive(Default)]
+pub struct ValueHistory {
+    values: VecDeque<(u64, Value)>,
+    max_entries: usize,
+}
+
+impl ValueHistory {
+    /// Create a new ValueHistory with specified capacity.
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            values: VecDeque::with_capacity(max_entries),
+            max_entries,
+        }
+    }
+
+    /// Add a value at the given version.
+    pub fn add(&mut self, version: u64, value: Value) {
+        self.values.push_back((version, value));
+        // Trim old entries if over capacity
+        while self.values.len() > self.max_entries {
+            self.values.pop_front();
+        }
+    }
+
+    /// Get all values since the given version.
+    /// Returns (values, oldest_available_version).
+    /// If the requested version is too old (not in buffer), returns empty vec
+    /// and the caller should fall back to snapshot.
+    pub fn get_values_since(&self, since_version: u64) -> (Vec<Value>, Option<u64>) {
+        let oldest = self.values.front().map(|(v, _)| *v);
+        let values: Vec<Value> = self.values
+            .iter()
+            .filter(|(v, _)| *v > since_version)
+            .map(|(_, val)| val.clone())
+            .collect();
+        (values, oldest)
+    }
+
+    /// Check if a version is available in the history.
+    pub fn has_version(&self, version: u64) -> bool {
+        self.values.front().map(|(v, _)| *v <= version).unwrap_or(false)
+    }
+}
+
 // --- ValueActor ---
 
 /// A message-based actor that manages a reactive value stream.
@@ -2006,10 +2072,18 @@ pub struct ValueActor {
     /// Used by Subscription for push-pull architecture.
     current_version: Arc<AtomicU64>,
 
+    /// History of recent values for preventing message loss.
+    /// Subscribers can pull all values since their last_seen_version.
+    value_history: Arc<std::sync::Mutex<ValueHistory>>,
+
     /// Channel for registering new subscribers.
     /// Subscribers send their bounded sender here, actor loop stores them locally.
     /// Using bounded(1) channels prevents unbounded memory growth for slow consumers.
     notify_sender_sender: mpsc::UnboundedSender<mpsc::Sender<()>>,
+
+    /// Shared notify senders for use by store_value_directly.
+    /// This allows synchronous notification when values are stored directly.
+    notify_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<()>>>>,
 
     /// The actor's internal task.
     loop_task: TaskHandle,
@@ -2058,13 +2132,20 @@ impl ValueActor {
         let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
         let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(None));
         let current_version = Arc::new(AtomicU64::new(0));
+        // History of recent values for preventing message loss
+        let value_history = Arc::new(std::sync::Mutex::new(ValueHistory::new(64)));
         // Channel for subscribers to register their notification senders
         let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
+        // Shared notify senders - used by both main loop and store_value_directly
+        let notify_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<()>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let loop_task = Task::start_droppable({
             let construct_info = construct_info.clone();
             let current_value = current_value.clone();
             let current_version = current_version.clone();
+            let value_history = value_history.clone();
+            let notify_senders = notify_senders.clone();
             let output_valve_signal = actor_context.output_valve_signal;
             // Keep inputs alive in the spawned task
             let _inputs = inputs.clone();
@@ -2081,8 +2162,6 @@ impl ValueActor {
                 let mut message_receiver = pin!(message_receiver.fuse());
                 let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
                 let mut migration_state = MigrationState::Normal;
-                // Subscriber notification senders - stored locally in this loop (no RefCell)
-                let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
                 // Track if stream ever produced a value (for SKIP detection)
                 let mut stream_ever_produced = false;
                 // Track if stream has ended
@@ -2101,7 +2180,7 @@ impl ValueActor {
                                 } else {
                                     // Immediately notify - subscriber will check version and see current value if any
                                     let _ = sender.try_send(());
-                                    notify_senders.push(sender);
+                                    notify_senders.lock().unwrap().push(sender);
                                 }
                             }
                         }
@@ -2116,11 +2195,14 @@ impl ValueActor {
                             match msg {
                                 ActorMessage::StreamValue(value) => {
                                     // Value received from migration source - treat as new value
-                                    current_value.store(Arc::new(Some(value)));
-                                    // Increment version
-                                    current_version.fetch_add(1, Ordering::SeqCst);
+                                    current_value.store(Arc::new(Some(value.clone())));
+                                    // Increment version and store in history
+                                    let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if let Ok(mut history) = value_history.lock() {
+                                        history.add(new_version, value);
+                                    }
                                     // Notify subscribers via bounded channels (try_send - if full, skip)
-                                    notify_senders.retain_mut(|sender| {
+                                    notify_senders.lock().unwrap().retain_mut(|sender| {
                                         // try_send returns Err if receiver dropped or buffer full
                                         // If dropped, remove from list. If full, keep (subscriber has pending notification)
                                         match sender.try_send(()) {
@@ -2178,7 +2260,7 @@ impl ValueActor {
                                 if !stream_ever_produced {
                                     // Clear senders - this drops them, closing channels
                                     // Subscribers will receive Poll::Ready(None)
-                                    notify_senders.clear();
+                                    notify_senders.lock().unwrap().clear();
                                 }
                                 // Continue listening for messages
                                 continue;
@@ -2186,10 +2268,13 @@ impl ValueActor {
 
                             stream_ever_produced = true;
                             current_value.store(Arc::new(Some(new_value.clone())));
-                            // Increment version
-                            current_version.fetch_add(1, Ordering::SeqCst);
+                            // Increment version and store in history
+                            let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+                            if let Ok(mut history) = value_history.lock() {
+                                history.add(new_version, new_value.clone());
+                            }
                             // Notify subscribers via bounded channels
-                            notify_senders.retain_mut(|sender| {
+                            notify_senders.lock().unwrap().retain_mut(|sender| {
                                 match sender.try_send(()) {
                                     Ok(()) => true,
                                     Err(e) => !e.is_disconnected(),
@@ -2230,7 +2315,9 @@ impl ValueActor {
             inputs,
             current_value,
             current_version,
+            value_history,
             notify_sender_sender,
+            notify_senders,
             loop_task,
         }
     }
@@ -2290,15 +2377,26 @@ impl ValueActor {
         let construct_info = Arc::new(construct_info);
         let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
         // Pre-set the initial value
-        let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(Some(initial_value)));
+        let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(Some(initial_value.clone())));
         // Start at version 1 since we have an initial value
         let current_version = Arc::new(AtomicU64::new(1));
         let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
+        // History of recent values for preventing message loss (start with initial value at version 1)
+        let value_history = Arc::new(std::sync::Mutex::new({
+            let mut history = ValueHistory::new(64);
+            history.add(1, initial_value);
+            history
+        }));
+        // Shared notify senders - used by both main loop and store_value_directly
+        let notify_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<()>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let loop_task = Task::start_droppable({
             let construct_info = construct_info.clone();
             let current_value = current_value.clone();
             let current_version = current_version.clone();
+            let value_history = value_history.clone();
+            let notify_senders = notify_senders.clone();
             let output_valve_signal = actor_context.output_valve_signal;
             // Keep inputs alive in the spawned task
             let _inputs = inputs.clone();
@@ -2315,7 +2413,6 @@ impl ValueActor {
                 let mut message_receiver = pin!(message_receiver.fuse());
                 let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
                 let migration_state = MigrationState::Normal;
-                let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
                 let mut stream_ever_produced = true; // We have initial value
                 let mut stream_ended = false;
 
@@ -2327,7 +2424,7 @@ impl ValueActor {
                                     drop(sender);
                                 } else {
                                     let _ = sender.try_send(());
-                                    notify_senders.push(sender);
+                                    notify_senders.lock().unwrap().push(sender);
                                 }
                             }
                         }
@@ -2338,9 +2435,13 @@ impl ValueActor {
                             };
                             match msg {
                                 ActorMessage::StreamValue(value) => {
-                                    current_value.store(Arc::new(Some(value)));
-                                    current_version.fetch_add(1, Ordering::SeqCst);
-                                    notify_senders.retain_mut(|sender| {
+                                    current_value.store(Arc::new(Some(value.clone())));
+                                    // Increment version and store in history
+                                    let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if let Ok(mut history) = value_history.lock() {
+                                        history.add(new_version, value);
+                                    }
+                                    notify_senders.lock().unwrap().retain_mut(|sender| {
                                         match sender.try_send(()) {
                                             Ok(()) => true,
                                             Err(e) => !e.is_disconnected(),
@@ -2361,9 +2462,13 @@ impl ValueActor {
                             };
 
                             stream_ever_produced = true;
-                            current_value.store(Arc::new(Some(new_value)));
-                            current_version.fetch_add(1, Ordering::SeqCst);
-                            notify_senders.retain_mut(|sender| {
+                            current_value.store(Arc::new(Some(new_value.clone())));
+                            // Increment version and store in history
+                            let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+                            if let Ok(mut history) = value_history.lock() {
+                                history.add(new_version, new_value);
+                            }
+                            notify_senders.lock().unwrap().retain_mut(|sender| {
                                 match sender.try_send(()) {
                                     Ok(()) => true,
                                     Err(e) => !e.is_disconnected(),
@@ -2394,13 +2499,35 @@ impl ValueActor {
             inputs,
             current_value,
             current_version,
+            value_history,
             notify_sender_sender,
+            notify_senders,
             loop_task,
         }
     }
 
     pub fn persistence_id(&self) -> Option<parser::PersistenceId> {
         self.persistence_id
+    }
+
+    /// Get the current version of this actor's value.
+    pub fn version(&self) -> u64 {
+        self.current_version.load(Ordering::SeqCst)
+    }
+
+    /// Get all values since a given version from the history buffer.
+    /// Returns (values, oldest_available_version).
+    /// If the requested version is older than the oldest in history,
+    /// the caller should fall back to the current snapshot.
+    pub fn get_values_since(&self, since_version: u64) -> (Vec<Value>, Option<u64>) {
+        if let Ok(history) = self.value_history.lock() {
+            let result = history.get_values_since(since_version);
+            println!("[DEBUG] get_values_since: since_version={}, returned {} values, construct={}",
+                since_version, result.0.len(), self.construct_info.description);
+            result
+        } else {
+            (Vec::new(), None)
+        }
     }
 
     /// Create a new ValueActor with a channel-based stream for forwarding values.
@@ -2447,16 +2574,28 @@ impl ValueActor {
         let construct_info = Arc::new(construct_info);
         let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
         // Pre-set the initial value
-        let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(Some(initial_value)));
+        let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(Some(initial_value.clone())));
         // Start at version 1 since we have an initial value
         let current_version = Arc::new(AtomicU64::new(1));
         let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
+        // History of recent values for preventing message loss (start with initial value at version 1)
+        let value_history = Arc::new(std::sync::Mutex::new({
+            let mut history = ValueHistory::new(64);
+            history.add(1, initial_value);
+            history
+        }));
+
+        // Shared notify_senders for use by store_value_directly
+        let notify_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<()>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let loop_task = Task::start_droppable({
             let construct_info = construct_info.clone();
             let current_value = current_value.clone();
             let current_version = current_version.clone();
+            let value_history = value_history.clone();
             let output_valve_signal = actor_context.output_valve_signal.clone();
+            let notify_senders = notify_senders.clone();
 
             async move {
                 let mut output_valve_impulse_stream =
@@ -2469,7 +2608,6 @@ impl ValueActor {
                 let mut value_stream = pin!(value_stream.fuse());
                 let mut message_receiver = pin!(message_receiver.fuse());
                 let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
-                let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
                 let stream_ever_produced = true; // We have an initial value
                 let mut stream_ended = false;
 
@@ -2481,7 +2619,7 @@ impl ValueActor {
                                     drop(sender);
                                 } else {
                                     let _ = sender.try_send(());
-                                    notify_senders.push(sender);
+                                    notify_senders.lock().unwrap().push(sender);
                                 }
                             }
                         }
@@ -2491,10 +2629,13 @@ impl ValueActor {
                                 break;
                             };
                             match msg {
-                                ActorMessage::StreamValue(value) => {
-                                    current_value.store(Arc::new(Some(value)));
-                                    current_version.fetch_add(1, Ordering::SeqCst);
-                                    notify_senders.retain_mut(|sender| {
+                                ActorMessage::StreamValue(new_value) => {
+                                    let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if let Ok(mut history) = value_history.lock() {
+                                        history.add(new_version, new_value.clone());
+                                    }
+                                    current_value.store(Arc::new(Some(new_value)));
+                                    notify_senders.lock().unwrap().retain_mut(|sender| {
                                         match sender.try_send(()) {
                                             Ok(()) => true,
                                             Err(e) => !e.is_disconnected(),
@@ -2510,11 +2651,14 @@ impl ValueActor {
                             break;
                         }
 
-                        value = value_stream.next() => {
-                            if let Some(value) = value {
-                                current_value.store(Arc::new(Some(value)));
-                                current_version.fetch_add(1, Ordering::SeqCst);
-                                notify_senders.retain_mut(|sender| {
+                        new_value = value_stream.next() => {
+                            if let Some(new_value) = new_value {
+                                let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+                                if let Ok(mut history) = value_history.lock() {
+                                    history.add(new_version, new_value.clone());
+                                }
+                                current_value.store(Arc::new(Some(new_value)));
+                                notify_senders.lock().unwrap().retain_mut(|sender| {
                                     match sender.try_send(()) {
                                         Ok(()) => true,
                                         Err(e) => !e.is_disconnected(),
@@ -2539,22 +2683,42 @@ impl ValueActor {
             inputs: Vec::new(),
             current_value,
             current_version,
+            value_history,
             notify_sender_sender,
+            notify_senders,
             loop_task,
         })
     }
 
-    /// Get the current version number.
-    /// Version increments on each value change.
-    pub fn version(&self) -> u64 {
-        self.current_version.load(Ordering::SeqCst)
+    /// Read stored value from ArcSwap.
+    /// Used by Subscription within engine.rs and for synchronous initial value storage.
+    /// Prefer subscribe().next().await for async reactive semantics.
+    pub fn stored_value(&self) -> Option<Value> {
+        self.current_value.load().as_ref().clone()
     }
 
-    /// Read stored value from ArcSwap.
-    /// INTERNAL USE ONLY - for Subscription within engine.rs.
-    /// External code MUST use subscribe().next().await for async reactive semantics.
-    fn stored_value(&self) -> Option<Value> {
-        self.current_value.load().as_ref().clone()
+    /// Directly store a value, bypassing the async stream.
+    /// Used by HOLD to ensure state is visible before next body evaluation.
+    /// This also increments the version so subscribers can see the new value.
+    pub fn store_value_directly(&self, value: Value) {
+        zoon::println!("*** STORE_VALUE_DIRECTLY CALLED ***");
+        // Increment version
+        let new_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
+        // Store in history
+        self.value_history.lock().unwrap().add(new_version, value.clone());
+        // Store as current value
+        self.current_value.store(Arc::new(Some(value)));
+        // Notify subscribers
+        let mut senders = self.notify_senders.lock().unwrap();
+        let num_subscribers = senders.len();
+        zoon::println!("[DEBUG] store_value_directly: version={}, num_subscribers={}, construct={}",
+            new_version, num_subscribers, self.construct_info.description);
+        senders.retain_mut(|sender| {
+            match sender.try_send(()) {
+                Ok(()) => true,
+                Err(e) => !e.is_disconnected(),
+            }
+        });
     }
 
     /// Subscribe to this actor's values using bounded channel notifications.
@@ -2565,15 +2729,35 @@ impl ValueActor {
     /// - No RefCell or internal mutability - pure dataflow
     pub fn subscribe(self: Arc<Self>) -> Subscription {
         // Create bounded(1) channel - at most 1 pending notification
-        let (sender, receiver) = mpsc::channel::<()>(1);
-        // Register with actor loop
-        if let Err(e) = self.notify_sender_sender.unbounded_send(sender) {
-            eprintln!("Failed to register subscriber: {e:#}");
-        }
+        let (mut sender, receiver) = mpsc::channel::<()>(1);
+
+        // CRITICAL: Add sender directly to notify_senders for IMMEDIATE registration.
+        // This ensures store_value_directly() can notify this subscriber right away,
+        // even before the main loop has a chance to poll and process the registration.
+        // This is essential for synchronous value delivery (e.g., HOLD with Stream/pulses).
+        //
+        // Send an immediate notification so subscriber can check current version.
+        let _ = sender.try_send(());
+        self.notify_senders.lock().unwrap().push(sender);
+
+        let current_version = self.version();
+        zoon::println!("[DEBUG] subscribe: current_version={}, construct={}",
+            current_version, self.construct_info.description);
+
+        // NOTE: We no longer send to notify_sender_sender because we're registering directly.
+        // The main loop's registration logic is now only for actors that don't use
+        // store_value_directly() (i.e., actors that receive values through their stream).
+
+        // Start at version 0 so subscriber can pull ALL historical values from the buffer.
+        // This gives STREAM semantics: new subscriptions see all values from history.
+        // Combined with the ValueHistory ring buffer (64 entries), this prevents message loss
+        // for synchronous event streams like Stream/pulses().
+        // If subscriber is too far behind (history full), it falls back to snapshot.
         Subscription {
             last_seen_version: 0,
             notify_receiver: receiver,
             actor: self,
+            pending_values: VecDeque::new(),
         }
     }
 
@@ -2626,12 +2810,14 @@ pub enum ValueUpdate {
 ///
 /// # Memory Characteristics
 /// - Notifications: bounded(1) channel - at most 1 pending signal
-/// - Data: Pulled on demand from ArcSwap, never queued
-/// - Slow consumer: Skips to latest automatically
+/// - Data: Pulled from history buffer, then from ArcSwap if history exhausted
+/// - Slow consumer: Falls back to latest if too far behind
 pub struct Subscription {
     actor: Arc<ValueActor>,
     last_seen_version: u64,
     notify_receiver: mpsc::Receiver<()>,
+    /// Local buffer for values pulled from history, yielded one at a time.
+    pending_values: VecDeque<Value>,
 }
 
 impl Subscription {
@@ -2674,17 +2860,41 @@ impl Stream for Subscription {
     type Item = Value;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // 1. First yield from local buffer if we have pending values
+        if let Some(value) = self.pending_values.pop_front() {
+            return Poll::Ready(Some(value));
+        }
+
         loop {
-            // Check if there's a newer version
-            let current = self.actor.version();
-            if current > self.last_seen_version {
-                self.last_seen_version = current;
-                if let Some(value) = self.actor.stored_value() {
-                    return Poll::Ready(Some(value));
+            let current_version = self.actor.version();
+
+            // 2. Check if new values are available
+            if current_version > self.last_seen_version {
+                let (values, _oldest_available) = self.actor.get_values_since(self.last_seen_version);
+
+                if values.is_empty() {
+                    // History exhausted or subscriber too far behind - fall back to snapshot
+                    self.last_seen_version = current_version;
+                    if let Some(value) = self.actor.stored_value() {
+                        return Poll::Ready(Some(value));
+                    }
+                } else {
+                    // Got values from history - buffer them and yield first one
+                    // Update last_seen_version based on how many values we got, not current_version
+                    // This prevents skipping values if the actor is still processing more
+                    let values_count = values.len() as u64;
+                    self.last_seen_version = self.last_seen_version.saturating_add(values_count);
+                    let mut iter = values.into_iter();
+                    let first = iter.next();
+                    self.pending_values.extend(iter);
+
+                    if let Some(value) = first {
+                        return Poll::Ready(Some(value));
+                    }
                 }
             }
 
-            // Poll the notification receiver - this registers the waker internally
+            // 3. Wait for notification
             match Pin::new(&mut self.notify_receiver).poll_next(cx) {
                 Poll::Ready(Some(())) => {
                     // Got notification, loop to check version again

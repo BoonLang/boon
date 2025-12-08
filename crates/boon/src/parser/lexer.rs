@@ -47,7 +47,6 @@ pub enum Token<'code> {
     Pass,
     Passed,
     Flush,
-    Pulses,
     Spread,
     // TEXT literal content: TEXT { content with {var} interpolation }
     // or TEXT #{ content with #{var} interpolation } for hash escaping
@@ -104,7 +103,6 @@ impl<'code> Token<'code> {
             Self::Pass => "PASS".into(),
             Self::Passed => "PASSED".into(),
             Self::Flush => "FLUSH".into(),
-            Self::Pulses => "PULSES".into(),
             Self::Spread => "...".into(),
             Self::TextContent(content, hash_count) => {
                 let hashes = "#".repeat(hash_count);
@@ -229,7 +227,6 @@ pub fn lexer<'code>()
             "PASS" => Ok(Token::Pass),
             "PASSED" => Ok(Token::Passed),
             "FLUSH" => Ok(Token::Flush),
-            "PULSES" => Ok(Token::Pulses),
             // Hardware types (parse-only for now)
             "BITS" => Ok(Token::Bits),
             "MEMORY" => Ok(Token::Memory),

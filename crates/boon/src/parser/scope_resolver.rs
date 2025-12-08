@@ -606,16 +606,6 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                 all_referenced,
             );
         }
-        Expression::Pulses { count } => {
-            set_is_referenced_and_alias_referenceables(
-                count,
-                reachable_referenceables,
-                level,
-                parent_name,
-                errors,
-                all_referenced,
-            );
-        }
         Expression::Spread { value } => {
             set_is_referenced_and_alias_referenceables(
                 value,
@@ -659,6 +649,8 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                 );
             }
         }
+        // FieldAccess has no sub-expressions to recurse into
+        Expression::FieldAccess { .. } => {}
     }
 }
 

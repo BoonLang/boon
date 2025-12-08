@@ -1,18 +1,13 @@
 FUNCTION fibonacci(position) {
-    [current: 0, next: 1, done: position == 0] |> HOLD state {
-        PULSES { position } |> WHEN { pulse_number =>
-            [
-              current: state.next
-              next: state.current + current
-              done: pulse_number == position
-            ]
+    [current: 0, next: 1] |> HOLD state {
+        position |> Stream/pulses() |> THEN {
+            [current: state.next, next: state.current + state.next]
         }
     }
-    |> WHEN {
-        [current, next, done: True] => current
-        __ => SKIP
-    }
+    |> Stream/skip(count: position)
+    |> .current
 }
+
 position: 10
 result: position |> fibonacci()
 message: TEXT { {position}. Fibonacci number is {result} }

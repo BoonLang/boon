@@ -1276,6 +1276,7 @@ impl Playground {
         // Run the main file (uses ModuleLoader for imports, no shared registry)
         // We keep reference_connector and link_connector alive to preserve all actors.
         // Dropping them (via after_remove) will trigger cleanup of all actors.
+        println!("*** FRONTEND VERSION 2025-12-08-C ***");
         let evaluation_result = interpreter::run_with_registry(
             filename,
             &source_code,

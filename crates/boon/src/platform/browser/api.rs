@@ -2,7 +2,8 @@ use std::future;
 use std::sync::Arc;
 
 use zoon::Timer;
-use zoon::futures_util::stream::{self, Stream, StreamExt};
+use zoon::Task;
+use zoon::futures_util::{select, stream::{self, Stream, StreamExt}, FutureExt};
 use zoon::futures_channel::mpsc;
 use zoon::{Deserialize, Serialize, serde};
 use zoon::{window, history, Closure, JsValue, UnwrapThrowExt, JsCast, SendWrapper};
@@ -1823,6 +1824,374 @@ pub fn function_file_write_text(
             )
         })
     })
+}
+
+// --- Stream functions ---
+
+/// Stream/skip(count) -> Stream<Value>
+/// Skips the first N values from the piped stream.
+/// When `count` changes, the skip counter resets and starts skipping again.
+pub fn function_stream_skip(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let stream_actor = arguments[0].clone();
+    let count_actor = arguments[1].clone();
+
+    // Create a channel for output
+    let (tx, rx) = mpsc::unbounded::<Value>();
+
+    // Subscribe to both streams IMMEDIATELY to not miss synchronous values
+    let mut stream_sub = stream_actor.subscribe().fuse();
+    let mut count_sub = count_actor.subscribe().fuse();
+
+    // State
+    let mut current_skip_count: usize = 0;
+    let mut skipped: usize = 0;
+    let mut count_received = false;
+    let mut buffered_values: Vec<Value> = Vec::new();
+
+    Task::start(async move {
+        zoon::println!("[DEBUG] Stream/skip: Task started");
+        loop {
+            select! {
+                count_value = count_sub.next() => {
+                    match count_value {
+                        Some(value) => {
+                            current_skip_count = match &value {
+                                Value::Number(num, _) => num.number() as usize,
+                                _ => 0,
+                            };
+                            zoon::println!("[DEBUG] Stream/skip: received count={}, buffered_values={}", current_skip_count, buffered_values.len());
+
+                            if count_received {
+                                // Count changed - reset skip counter
+                                skipped = 0;
+                            } else {
+                                // First count received - process buffered values
+                                count_received = true;
+                                zoon::println!("[DEBUG] Stream/skip: processing {} buffered values", buffered_values.len());
+                                for buffered in buffered_values.drain(..) {
+                                    if skipped < current_skip_count {
+                                        skipped += 1;
+                                        zoon::println!("[DEBUG] Stream/skip: skipping buffered value, skipped={}", skipped);
+                                    } else {
+                                        zoon::println!("[DEBUG] Stream/skip: sending buffered value");
+                                        let _ = tx.unbounded_send(buffered);
+                                    }
+                                }
+                            }
+                        }
+                        None => break, // Count stream ended
+                    }
+                }
+                stream_value = stream_sub.next() => {
+                    match stream_value {
+                        Some(value) => {
+                            zoon::println!("[DEBUG] Stream/skip: received stream value, count_received={}, skipped={}", count_received, skipped);
+                            if !count_received {
+                                // Buffer values until we know the count
+                                buffered_values.push(value);
+                            } else {
+                                if skipped < current_skip_count {
+                                    skipped += 1;
+                                    zoon::println!("[DEBUG] Stream/skip: skipping value, skipped={}", skipped);
+                                } else {
+                                    // Debug: print value construct_info
+                                    zoon::println!("[DEBUG] Stream/skip: sending value with construct_info: {}", value.construct_info());
+                                    let _ = tx.unbounded_send(value);
+                                }
+                            }
+                        }
+                        None => break, // Stream ended
+                    }
+                }
+                complete => break,
+            }
+        }
+        zoon::println!("[DEBUG] Stream/skip: Task ended");
+    });
+
+    rx
+}
+
+/// Stream/take(count) -> Stream<Value>
+/// Takes only the first N values from the piped stream.
+/// When `count` changes, the take counter resets.
+pub fn function_stream_take(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let stream_actor = arguments[0].clone();
+    let count_actor = arguments[1].clone();
+
+    // Create a channel for output
+    let (tx, rx) = mpsc::unbounded::<Value>();
+
+    // Subscribe to both streams IMMEDIATELY to not miss synchronous values
+    let mut stream_sub = stream_actor.subscribe().fuse();
+    let mut count_sub = count_actor.subscribe().fuse();
+
+    // State
+    let mut current_take_count: usize = 0;
+    let mut taken: usize = 0;
+    let mut count_received = false;
+    let mut buffered_values: Vec<Value> = Vec::new();
+
+    Task::start(async move {
+        loop {
+            select! {
+                count_value = count_sub.next() => {
+                    match count_value {
+                        Some(value) => {
+                            current_take_count = match &value {
+                                Value::Number(num, _) => num.number() as usize,
+                                _ => 0,
+                            };
+
+                            if count_received {
+                                // Count changed - reset take counter
+                                taken = 0;
+                            } else {
+                                // First count received - process buffered values
+                                count_received = true;
+                                for buffered in buffered_values.drain(..) {
+                                    if taken < current_take_count {
+                                        taken += 1;
+                                        let _ = tx.unbounded_send(buffered);
+                                    }
+                                }
+                            }
+                        }
+                        None => break, // Count stream ended
+                    }
+                }
+                stream_value = stream_sub.next() => {
+                    match stream_value {
+                        Some(value) => {
+                            if !count_received {
+                                // Buffer values until we know the count
+                                buffered_values.push(value);
+                            } else {
+                                if taken < current_take_count {
+                                    taken += 1;
+                                    let _ = tx.unbounded_send(value);
+                                }
+                                // After taking enough, just drop subsequent values
+                            }
+                        }
+                        None => break, // Stream ended
+                    }
+                }
+                complete => break,
+            }
+        }
+    });
+
+    rx
+}
+
+/// Stream/distinct() -> Stream<Value>
+/// Suppresses consecutive duplicate values.
+pub fn function_stream_distinct(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let stream_actor = arguments[0].clone();
+
+    stream_actor.subscribe().scan(None::<ValueIdempotencyKey>, move |last_key, value| {
+        let current_key = value.idempotency_key();
+        let should_emit = last_key.map_or(true, |k| k != current_key);
+        *last_key = Some(current_key);
+        if should_emit {
+            future::ready(Some(Some(value)))
+        } else {
+            future::ready(Some(None))
+        }
+    })
+    .filter_map(future::ready)
+}
+
+/// Stream/pulses() -> Stream<Number>
+/// Generates N pulses (1, 2, 3, ..., N) from the piped count.
+/// When the count changes, restarts pulse generation from 1.
+///
+/// Pulses are emitted synchronously. The ValueActor's history buffer ensures
+/// all values are preserved for subscribers even if they poll slower than emission.
+pub fn function_stream_pulses(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let count_actor = arguments[0].clone();
+
+    // Create channel for output
+    let (tx, rx) = mpsc::unbounded::<Value>();
+
+    // Spawn task to emit pulses
+    Task::start({
+        let function_call_id = function_call_id.clone();
+        let construct_context = construct_context.clone();
+
+        async move {
+            let mut count_sub = count_actor.subscribe();
+
+            while let Some(count_value) = count_sub.next().await {
+                let pulse_count = match &count_value {
+                    Value::Number(num, _) => num.number() as u64,
+                    _ => 0,
+                };
+
+                // Generate pulses 1 through pulse_count
+                // No yield needed - ValueHistory preserves all values for subscribers
+                for pulse_number in 1..=pulse_count {
+                    let value = Number::new_value(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(format!("pulse_{}", pulse_number)),
+                            None,
+                            "Stream/pulses result",
+                        ),
+                        construct_context.clone(),
+                        ValueIdempotencyKey::new(),
+                        pulse_number as f64,
+                    );
+
+                    if tx.unbounded_send(value).is_err() {
+                        // Receiver dropped, stop emitting
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    rx
+}
+
+/// Stream/debounce(duration) -> Stream<Value>
+/// Emits the most recent value after the input stream stops emitting for the specified duration.
+/// When a new value arrives, it resets the timer. Only when the timer expires (no new values
+/// for `duration`), the most recent value is emitted.
+/// When `duration` changes, the debounce timer is updated with the new duration.
+pub fn function_stream_debounce(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    _function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let stream_actor = arguments[0].clone();
+    let duration_actor = arguments[1].clone();
+
+    // Create a channel to send debounced values
+    let (sender, receiver) = mpsc::unbounded::<Value>();
+
+    // Spawn a task that handles the debounce logic
+    let _debounce_task = Task::start_droppable({
+        async move {
+            let mut input_stream = stream_actor.subscribe().fuse();
+            let mut duration_stream = duration_actor.subscribe().fuse();
+
+            let mut pending_value: Option<Value> = None;
+            let mut current_duration_ms: f64 = 0.0;
+
+            // Helper to extract milliseconds from Duration tagged object
+            fn extract_duration_ms(value: &Value) -> f64 {
+                let duration_object = value.clone().expect_tagged_object("Duration");
+                if let Some(seconds) = duration_object.variable("seconds") {
+                    // Subscribe to get the first value
+                    // Note: This is synchronous because duration values typically emit immediately
+                    let mut sub = seconds.value_actor().subscribe();
+                    if let Some(value) = sub.next().now_or_never().flatten() {
+                        return value.expect_number().number() * 1000.0;
+                    }
+                }
+                if let Some(ms) = duration_object.variable("ms") {
+                    let mut sub = ms.value_actor().subscribe();
+                    if let Some(value) = sub.next().now_or_never().flatten() {
+                        return value.expect_number().number();
+                    }
+                }
+                if let Some(milliseconds) = duration_object.variable("milliseconds") {
+                    let mut sub = milliseconds.value_actor().subscribe();
+                    if let Some(value) = sub.next().now_or_never().flatten() {
+                        return value.expect_number().number();
+                    }
+                }
+                0.0
+            }
+
+            loop {
+                if pending_value.is_some() && current_duration_ms > 0.0 {
+                    // We have a pending value and a valid duration - race between timer and new input
+                    let mut timer = Box::pin(Timer::sleep(current_duration_ms.round() as u32).fuse());
+
+                    select! {
+                        new_value = input_stream.next() => {
+                            match new_value {
+                                Some(value) => {
+                                    // New value arrived - update pending and restart timer
+                                    pending_value = Some(value);
+                                }
+                                None => {
+                                    // Input stream ended - emit pending and exit
+                                    if let Some(value) = pending_value.take() {
+                                        let _ = sender.unbounded_send(value);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        new_duration = duration_stream.next() => {
+                            if let Some(duration_value) = new_duration {
+                                current_duration_ms = extract_duration_ms(&duration_value);
+                            }
+                            // Continue loop with updated duration
+                        }
+                        _ = timer.as_mut() => {
+                            // Timer expired - emit the pending value
+                            if let Some(value) = pending_value.take() {
+                                let _ = sender.unbounded_send(value);
+                            }
+                        }
+                    }
+                } else {
+                    // No pending value or no duration yet - wait for input or duration
+                    select! {
+                        new_value = input_stream.next() => {
+                            match new_value {
+                                Some(value) => {
+                                    pending_value = Some(value);
+                                }
+                                None => {
+                                    // Input stream ended
+                                    break;
+                                }
+                            }
+                        }
+                        new_duration = duration_stream.next() => {
+                            if let Some(duration_value) = new_duration {
+                                current_duration_ms = extract_duration_ms(&duration_value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    receiver
 }
 
 // --- Directory functions ---

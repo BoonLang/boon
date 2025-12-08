@@ -1055,41 +1055,6 @@ fn set_persistence<'a, 'code, 'old_code>(
                 set_persistence(value, &[], &old_span_id_pairs, new_span_id_pairs, errors)
             }
         }
-        Expression::Pulses { count } => {
-            let old_count_and_id =
-                old_expressions
-                    .iter()
-                    .find_map(|old_expression| match old_expression {
-                        Spanned {
-                            span,
-                            persistence: _,
-                            node: Expression::Pulses { count: old_count },
-                        } => Some((old_count, old_span_id_pairs[span])),
-                        _ => None,
-                    });
-            if let Some((old_count, id)) = old_count_and_id {
-                new_span_id_pairs.insert(*span, id);
-                *persistence = Some(Persistence {
-                    id,
-                    status: PersistenceStatus::Unchanged,
-                });
-                set_persistence(
-                    count,
-                    &[old_count],
-                    &old_span_id_pairs,
-                    new_span_id_pairs,
-                    errors,
-                );
-            } else {
-                let id: Ulid = PersistenceId::new();
-                new_span_id_pairs.insert(*span, id);
-                *persistence = Some(Persistence {
-                    id,
-                    status: PersistenceStatus::NewOrChanged,
-                });
-                set_persistence(count, &[], &old_span_id_pairs, new_span_id_pairs, errors)
-            }
-        }
         Expression::Spread { value } => {
             let old_value_and_id =
                 old_expressions
@@ -1243,6 +1208,15 @@ fn set_persistence<'a, 'code, 'old_code>(
                     set_persistence(item, &[], &old_span_id_pairs, new_span_id_pairs, errors);
                 }
             }
+        }
+        // FieldAccess is a terminal expression - just assign a new ID
+        Expression::FieldAccess { .. } => {
+            let id: Ulid = PersistenceId::new();
+            new_span_id_pairs.insert(*span, id);
+            *persistence = Some(Persistence {
+                id,
+                status: PersistenceStatus::NewOrChanged,
+            });
         }
     }
 }

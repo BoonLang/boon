@@ -1,7 +1,7 @@
 tick: Duration[seconds: 1] |> Timer/interval()
 
-counter: 0 |> HOLD counter {
-    tick |> THEN { counter + 1 }
-}
+counter: 0
+    |> HOLD counter { tick |> THEN { counter + 1 } }
+    |> Stream/skip(count: 1)
 
 document: counter |> Document/new()

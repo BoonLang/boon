@@ -70,10 +70,6 @@ pub enum Expression {
     Flush {
         value: Box<Spanned<Self>>,
     },
-    // PULSES for iteration
-    Pulses {
-        count: Box<Spanned<Self>>,
-    },
     // Spread operator: ...expression (in objects)
     Spread {
         value: Box<Spanned<Self>>,
@@ -107,6 +103,11 @@ pub enum Expression {
     },
     Bytes {
         data: Vec<Spanned<Self>>,
+    },
+    // Field access: .field.subfield - equivalent to WHILE { value => value.field.subfield }
+    // Only valid at pipe position
+    FieldAccess {
+        path: Vec<StrSlice>,
     },
 }
 
@@ -351,9 +352,6 @@ impl ExpressionConverter {
             parser::Expression::Flush { value } => Expression::Flush {
                 value: Box::new(self.convert_spanned(value)),
             },
-            parser::Expression::Pulses { count } => Expression::Pulses {
-                count: Box::new(self.convert_spanned(count)),
-            },
             parser::Expression::Spread { value } => Expression::Spread {
                 value: Box::new(self.convert_spanned(value)),
             },
@@ -397,6 +395,10 @@ impl ExpressionConverter {
             },
             parser::Expression::Bytes { data } => Expression::Bytes {
                 data: data.iter().map(|item| self.convert_spanned(item)).collect(),
+            },
+            // Field access: .field.subfield - pass through as native construct
+            parser::Expression::FieldAccess { path } => Expression::FieldAccess {
+                path: path.iter().map(|s| self.str_to_slice(s)).collect(),
             },
         }
     }

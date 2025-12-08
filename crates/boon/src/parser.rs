@@ -358,20 +358,6 @@ where
                 value: Box::new(value),
             });
 
-        // PULSES for iteration: `PULSES { count }`
-        let pulses = just(Token::Pulses)
-            .ignore_then(
-                expression
-                    .clone()
-                    .delimited_by(
-                        bracket_curly_open.then(newlines),
-                        newlines.then(bracket_curly_close),
-                    ),
-            )
-            .map(|count| Expression::Pulses {
-                count: Box::new(count),
-            });
-
         // Spread operator: `...expression`
         let spread = just(Token::Spread)
             .ignore_then(tracked_expr.clone())
@@ -531,6 +517,17 @@ where
 
         let skip = select! { Token::Skip => Expression::Skip };
 
+        // Field access: .field.subfield - parses leading dot followed by identifiers
+        // This is only valid at pipe position and is equivalent to WHILE { value => value.field.subfield }
+        let field_access = dot
+            .ignore_then(
+                snake_case_identifier
+                    .separated_by(dot)
+                    .at_least(1)
+                    .collect::<Vec<_>>()
+            )
+            .map(|path| Expression::FieldAccess { path });
+
         // TEXT { content with {var} interpolation } or TEXT #{ content with #{var} interpolation }
         let text_literal = select! { Token::TextContent(content, hash_count) => (content, hash_count) }
             .map(|(content, hash_count): (&str, usize)| {
@@ -651,7 +648,6 @@ where
             then,
             block,
             flush,
-            pulses,
         ));
 
         // Group 4: Terminal expressions (expression_alias last since it matches any identifier)
@@ -660,6 +656,7 @@ where
             link_expression,     // LINK
             skip,                // SKIP
             text_literal,        // TEXT { ... }
+            field_access,        // .field.subfield - before expression_alias (specific leading dot)
             expression_alias,    // element.property - LAST because it matches any identifier
         ));
 
@@ -856,10 +853,6 @@ pub enum Expression<'code> {
     Flush {
         value: Box<Spanned<Self>>,
     },
-    // PULSES for iteration
-    Pulses {
-        count: Box<Spanned<Self>>,
-    },
     // Spread operator: ...expression (in objects)
     Spread {
         value: Box<Spanned<Self>>,
@@ -894,6 +887,11 @@ pub enum Expression<'code> {
     },
     Bytes {
         data: Vec<Spanned<Self>>,
+    },
+    // Field access: .field.subfield - equivalent to WHILE { value => value.field.subfield }
+    // Only valid at pipe position
+    FieldAccess {
+        path: Vec<&'code str>,
     },
 }
 
