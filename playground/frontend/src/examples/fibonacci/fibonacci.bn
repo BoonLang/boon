@@ -1,12 +1,20 @@
 FUNCTION fibonacci(position) {
-    [current: 0, next: 1] |> HOLD state {
-        position |> Stream/pulses() |> THEN {
-            [current: state.next, next: state.current + current]
-        }
+    position |> WHILE {
+        0 => 0
+        1 => 1
+        n =>
+            [previous: 0, current: 1] |> HOLD state {
+                n - 1 |> Stream/pulses() |> THEN {
+                    [
+                        previous: state.current
+                        current: state.previous + previous
+                    ]
+                }
+            }
+            |> Stream/skip(count: n - 1)
+            |> Log/info(with: [label: TEXT { Final state }])
+            |> .current
     }
-    |> Stream/skip(count: position)
-    |> Log/info(with: [label: TEXT { Final state }])
-    |> .current
 }
 
 position: 10
