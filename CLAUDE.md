@@ -227,7 +227,7 @@ When debugging with browser automation (`boon-tools exec`):
    - Do NOT use `exec reload`
    - Do NOT try non-CDP fallbacks - always resolve debugger issues first
 
-3. **Always use CDP commands** - they emulate real human interaction:
+4. **Always use CDP commands** - they emulate real human interaction:
    - CDP creates trusted events (`isTrusted: true`)
    - Results are consistent and reproducible
    - Never mix CDP and non-CDP approaches in the same workflow
@@ -289,11 +289,6 @@ While not fully enforced on `ValueActor::new()` yet, these types serve as docume
 | Subscription stream | Already infinite (receiver never closes first) |
 | `stream::unfold()` | Usually infinite if the closure never returns `None` |
 | Finite stream from external source | `TypedStream::finite(stream).keep_alive()` |
-
-### Known Bug Locations (Fixed)
-
-- `evaluator.rs:1463` - THEN input value: Changed from `stream::once()` to `constant()`
-- `evaluator.rs:2349` - Pattern bindings: Changed from `stream::once()` to `constant()`
 
 ## Key Dependencies
 - **chumsky** - Parser combinator library (with pratt parsing for operators)
@@ -367,3 +362,5 @@ With eager evaluation, all 3 THEN bodies see `state.count = 0` because they're e
 
 **State Reference in HOLD Body**:
 The `state` variable is a regular eager ValueActor - it reads current stored value. HOLD updates it after each lazy pull from body. This is why lazy body + eager state reference works correctly.
+
+**HOLD Value Flow**: Initial value stored via `store_value_directly()`, then body values flow through `state_update_stream`. The `hold_state_update_callback` only updates `state_actor` and releases backpressure permit - it does NOT store to output (that's `state_update_stream`'s job). This separation ensures each value emits exactly once.
