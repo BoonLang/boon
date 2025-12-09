@@ -1,8 +1,11 @@
+use std::cell::RefCell;
 use std::future;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
 
 use zoon::Timer;
-use zoon::Task;
+use zoon::{Task, TaskHandle};
 use zoon::futures_util::{select, stream::{self, Stream, StreamExt}, FutureExt};
 use zoon::futures_channel::mpsc;
 use zoon::{Deserialize, Serialize, serde};
@@ -1572,78 +1575,108 @@ pub fn function_ulid_generate(
 
 // --- Log functions ---
 
-/// Helper function to convert a Value to a string for logging.
-/// Uses get_values_since(0) to get the latest value from history,
-/// falls back to stored_value(), only shows ? if truly no value exists.
-fn value_to_log_string(value: &Value) -> String {
-    match value {
-        Value::Text(text, _) => text.text().to_string(),
-        Value::Number(num, _) => num.number().to_string(),
-        Value::Tag(tag, _) => tag.tag().to_string(),
-        Value::Object(object, _) => {
-            let fields: Vec<String> = object.variables()
-                .iter()
-                .map(|variable| {
-                    let name = variable.name();
-                    let field_value = get_actor_value_for_log(&variable.value_actor());
-                    format!("{}: {}", name, field_value)
-                })
-                .collect();
-            // Use Boon syntax: [] for objects
-            format!("[{}]", fields.join(", "))
+use std::pin::Pin;
+use std::future::Future;
+
+/// Timeout in milliseconds for waiting on nested actor values
+const LOG_VALUE_TIMEOUT_MS: u32 = 100;
+
+/// Async function to resolve a Value to string for logging.
+/// Awaits nested actors with timeout - shows `?` for values that don't arrive in time.
+/// Uses Pin<Box<...>> for recursive calls to break infinite type recursion.
+fn resolve_value_for_log(value: Value) -> Pin<Box<dyn Future<Output = String>>> {
+    Box::pin(async move {
+        match value {
+            Value::Text(text, _) => text.text().to_string(),
+            Value::Number(num, _) => num.number().to_string(),
+            Value::Tag(tag, _) => tag.tag().to_string(),
+            Value::Object(object, _) => {
+                let mut fields = Vec::new();
+                for variable in object.variables() {
+                    let name = variable.name().to_string();
+                    let field_value = resolve_actor_value_for_log(variable.value_actor()).await;
+                    fields.push(format!("{}: {}", name, field_value));
+                }
+                format!("[{}]", fields.join(", "))
+            }
+            Value::TaggedObject(tagged, _) => {
+                let mut fields = Vec::new();
+                for variable in tagged.variables() {
+                    let name = variable.name().to_string();
+                    let field_value = resolve_actor_value_for_log(variable.value_actor()).await;
+                    fields.push(format!("{}: {}", name, field_value));
+                }
+                format!("{}[{}]", tagged.tag(), fields.join(", "))
+            }
+            Value::List(list, _) => {
+                let mut items = Vec::new();
+                for (_item_id, item_actor) in list.snapshot() {
+                    let item_value = resolve_actor_value_for_log(item_actor).await;
+                    items.push(item_value);
+                }
+                if items.is_empty() {
+                    "LIST { }".to_string()
+                } else {
+                    format!("LIST {{ {} }}", items.join(", "))
+                }
+            }
+            Value::Flushed(inner, _) => format!("Flushed[{}]", resolve_value_for_log(*inner).await),
         }
-        Value::TaggedObject(tagged, _) => {
-            let fields: Vec<String> = tagged.variables()
-                .iter()
-                .map(|variable| {
-                    let name = variable.name();
-                    let field_value = get_actor_value_for_log(&variable.value_actor());
-                    format!("{}: {}", name, field_value)
-                })
-                .collect();
-            // Tagged objects: Tag[fields]
-            format!("{}[{}]", tagged.tag(), fields.join(", "))
-        }
-        Value::List(list, _) => {
-            let items: Vec<String> = list.snapshot()
-                .iter()
-                .map(|(_item_id, item_actor)| {
-                    get_actor_value_for_log(item_actor)
-                })
-                .collect();
-            // Use Boon syntax: LIST { items } for lists
-            if items.is_empty() {
-                "LIST { }".to_string()
-            } else {
-                format!("LIST {{ {} }}", items.join(", "))
+    })
+}
+
+/// Async function to get value from a ValueActor for logging with timeout.
+/// Returns `?` if no value arrives within the timeout.
+fn resolve_actor_value_for_log(actor: Arc<ValueActor>) -> Pin<Box<dyn Future<Output = String>>> {
+    Box::pin(async move {
+        use zoon::futures_util::StreamExt;
+
+        // Race subscription against timeout
+        let get_value = async {
+            actor.subscribe().next().await
+        };
+        let timeout = Timer::sleep(LOG_VALUE_TIMEOUT_MS);
+
+        select! {
+            value = get_value.fuse() => {
+                if let Some(value) = value {
+                    resolve_value_for_log(value).await
+                } else {
+                    "?".to_string()
+                }
+            }
+            _ = timeout.fuse() => {
+                "?".to_string()
             }
         }
-        Value::Flushed(inner, _) => format!("Flushed[{}]", value_to_log_string(inner)),
-    }
+    })
 }
 
-/// Get value from a ValueActor for logging purposes.
-/// Tries get_values_since(0) first for the latest historical value,
-/// falls back to stored_value(), shows ? only if truly no value.
-fn get_actor_value_for_log(actor: &Arc<ValueActor>) -> String {
-    // First, try to get from history buffer (most reliable)
-    let (values, _) = actor.get_values_since(0);
-    if let Some(latest) = values.last() {
-        return value_to_log_string(latest);
+/// Helper to extract optional label from a 'with' object parameter.
+/// The 'with' object can contain a 'label' field.
+/// Returns None if no 'with' argument or no 'label' field.
+async fn extract_label_from_with(with_actor: Arc<ValueActor>) -> Option<String> {
+    use zoon::futures_util::StreamExt;
+
+    // Get the 'with' object value
+    let with_value = with_actor.subscribe().next().await?;
+
+    // Check if it's an Object and extract the 'label' field
+    if let Value::Object(obj, _) = with_value {
+        if let Some(label_var) = obj.variable("label") {
+            let label_value = label_var.value_actor().subscribe().next().await?;
+            // Resolve the label value to a string
+            return Some(resolve_value_for_log(label_value).await);
+        }
     }
 
-    // Fall back to stored_value
-    if let Some(value) = actor.stored_value() {
-        return value_to_log_string(&value);
-    }
-
-    // Only show ? if truly no value exists
-    "?".to_string()
+    None
 }
 
-/// Log/info(value: T, label: Text) -> T
+/// Log/info(value: T) -> T
+/// Log/info(value: T, with: [label: Text]) -> T
 /// Logs an info message to the console and passes through the input value.
-/// Output format: `[INFO] {label}: {value}`
+/// Output format: `[INFO] {label}: {value}` or `[INFO] {value}`
 pub fn function_log_info(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     _function_call_id: ConstructId,
@@ -1652,23 +1685,37 @@ pub fn function_log_info(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let value_actor = arguments[0].clone();
-    let label_actor = arguments[1].clone();
+    let with_actor = arguments.get(1).cloned();
 
     value_actor.subscribe().map(move |value| {
-        let value_str = value_to_log_string(&value);
-        let label_str = get_actor_value_for_log(&label_actor);
-
-        zoon::println!("[INFO] {}: {}", label_str, value_str);
-        // Pass through the input value for chaining
+        let with_actor = with_actor.clone();
+        let value_clone = value.clone();
+        // Spawn async task to resolve all nested values and log
+        zoon::Task::start(async move {
+            let value_str = resolve_value_for_log(value_clone).await;
+            // Extract optional label from 'with' object
+            let label_str = if let Some(with) = with_actor {
+                extract_label_from_with(with).await.unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if label_str.is_empty() {
+                zoon::println!("[INFO] {}", value_str);
+            } else {
+                zoon::println!("[INFO] {}: {}", label_str, value_str);
+            }
+        });
+        // Pass through the input value immediately for chaining
         value
     })
     // Chain with pending() to keep stream alive forever - prevents actor termination
     .chain(stream::pending())
 }
 
-/// Log/error(value: T, label: Text) -> T
+/// Log/error(value: T) -> T
+/// Log/error(value: T, with: [label: Text]) -> T
 /// Logs an error message to the console and passes through the input value.
-/// Output format: `[ERROR] {label}: {value}`
+/// Output format: `[ERROR] {label}: {value}` or `[ERROR] {value}`
 pub fn function_log_error(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     _function_call_id: ConstructId,
@@ -1677,14 +1724,27 @@ pub fn function_log_error(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let value_actor = arguments[0].clone();
-    let label_actor = arguments[1].clone();
+    let with_actor = arguments.get(1).cloned();
 
     value_actor.subscribe().map(move |value| {
-        let value_str = value_to_log_string(&value);
-        let label_str = get_actor_value_for_log(&label_actor);
-
-        zoon::eprintln!("[ERROR] {}: {}", label_str, value_str);
-        // Pass through the input value for chaining
+        let with_actor = with_actor.clone();
+        let value_clone = value.clone();
+        // Spawn async task to resolve all nested values and log
+        zoon::Task::start(async move {
+            let value_str = resolve_value_for_log(value_clone).await;
+            // Extract optional label from 'with' object
+            let label_str = if let Some(with) = with_actor {
+                extract_label_from_with(with).await.unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if label_str.is_empty() {
+                zoon::eprintln!("[ERROR] {}", value_str);
+            } else {
+                zoon::eprintln!("[ERROR] {}: {}", label_str, value_str);
+            }
+        });
+        // Pass through the input value immediately for chaining
         value
     })
     // Chain with pending() to keep stream alive forever - prevents actor termination
@@ -1920,7 +1980,10 @@ pub fn function_stream_skip(
     let mut count_received = false;
     let mut buffered_values: Vec<Value> = Vec::new();
 
-    Task::start(async move {
+    // Use Task::start_droppable and store handle so it's cancelled when the output stream is dropped.
+    // This ensures the task stops running when switching examples.
+    let task_handle_cell: Rc<RefCell<Option<TaskHandle>>> = Rc::new(RefCell::new(None));
+    let task_handle = Task::start_droppable(async move {
         zoon::println!("[DEBUG] Stream/skip: Task started");
         loop {
             select! {
@@ -1980,8 +2043,16 @@ pub fn function_stream_skip(
         }
         zoon::println!("[DEBUG] Stream/skip: Task ended");
     });
+    *task_handle_cell.borrow_mut() = Some(task_handle);
 
-    rx
+    // Return a wrapper stream that keeps the TaskHandle alive via the Rc.
+    // When this stream is dropped, the Rc refcount drops, dropping the TaskHandle, cancelling the task.
+    let task_handle_cell_for_stream = task_handle_cell.clone();
+    rx.chain(stream::poll_fn(move |_cx| {
+        // Keep the Rc alive - this holds the TaskHandle
+        let _keep_alive = task_handle_cell_for_stream.borrow();
+        Poll::Pending::<Option<Value>>
+    }))
 }
 
 /// Stream/take(count) -> Stream<Value>
@@ -2010,7 +2081,9 @@ pub fn function_stream_take(
     let mut count_received = false;
     let mut buffered_values: Vec<Value> = Vec::new();
 
-    Task::start(async move {
+    // Use Task::start_droppable and store handle so it's cancelled when the output stream is dropped.
+    let task_handle_cell: Rc<RefCell<Option<TaskHandle>>> = Rc::new(RefCell::new(None));
+    let task_handle = Task::start_droppable(async move {
         loop {
             select! {
                 count_value = count_sub.next() => {
@@ -2059,8 +2132,14 @@ pub fn function_stream_take(
             }
         }
     });
+    *task_handle_cell.borrow_mut() = Some(task_handle);
 
-    rx
+    // Return a wrapper stream that keeps the TaskHandle alive via the Rc.
+    let task_handle_cell_for_stream = task_handle_cell.clone();
+    rx.chain(stream::poll_fn(move |_cx| {
+        let _keep_alive = task_handle_cell_for_stream.borrow();
+        Poll::Pending::<Option<Value>>
+    }))
 }
 
 /// Stream/distinct() -> Stream<Value>
@@ -2105,8 +2184,9 @@ pub fn function_stream_pulses(
     // Create channel for output
     let (tx, rx) = mpsc::unbounded::<Value>();
 
-    // Spawn task to emit pulses
-    Task::start({
+    // Use Task::start_droppable and store handle so it's cancelled when the output stream is dropped.
+    let task_handle_cell: Rc<RefCell<Option<TaskHandle>>> = Rc::new(RefCell::new(None));
+    let task_handle = Task::start_droppable({
         let function_call_id = function_call_id.clone();
         let construct_context = construct_context.clone();
 
@@ -2141,8 +2221,14 @@ pub fn function_stream_pulses(
             }
         }
     });
+    *task_handle_cell.borrow_mut() = Some(task_handle);
 
-    rx
+    // Return a wrapper stream that keeps the TaskHandle alive via the Rc.
+    let task_handle_cell_for_stream = task_handle_cell.clone();
+    rx.chain(stream::poll_fn(move |_cx| {
+        let _keep_alive = task_handle_cell_for_stream.borrow();
+        Poll::Pending::<Option<Value>>
+    }))
 }
 
 /// Stream/debounce(duration) -> Stream<Value>

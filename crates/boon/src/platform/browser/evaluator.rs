@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
+use std::task::Poll;
 
 use chumsky::Parser as ChumskyParser;
 use chumsky::input::{Input as ChumskyInput, Stream as ChumskyStream};
@@ -2504,6 +2505,17 @@ fn build_hold_actor(
     // Create output actor FIRST with a pending stream (stays alive, no async stream processing).
     // Values will be stored directly via store_value_directly() from the stream closures below.
     // This ensures values are available in history immediately when Stream/skip subscribes.
+    //
+    // The task_handle_cell holds the TaskHandle for the driver task. When the output actor
+    // is dropped, the stream is dropped, which drops the Rc, which drops the TaskHandle,
+    // which cancels the driver task. This ensures Timer/interval stops when switching examples.
+    let task_handle_cell: Rc<RefCell<Option<TaskHandle>>> = Rc::new(RefCell::new(None));
+    let task_handle_cell_for_stream = task_handle_cell.clone();
+    let output_stream = stream::poll_fn(move |_cx| {
+        // Keep the RefCell alive - this holds the TaskHandle when set
+        let _keep_alive = task_handle_cell_for_stream.borrow();
+        Poll::Pending::<Option<Value>>
+    });
     let output = ValueActor::new_arc_with_inputs(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
@@ -2511,7 +2523,7 @@ fn build_hold_actor(
             format!("{span}; HOLD {state_param} {{..}}"),
         ),
         ctx.actor_context,
-        TypedStream::infinite(stream::pending::<Value>()),
+        TypedStream::infinite(output_stream),
         Some(persistence_id),
         vec![body_result.clone(), initial_actor.clone()],
     );
@@ -2529,8 +2541,12 @@ fn build_hold_actor(
     // First emission: state_actor gets it via take(1), so we don't send to state_receiver.
     // Subsequent emissions: send to state_receiver so body sees the reset value.
     // NOTE: First value is already stored synchronously above, so we skip storing it here.
+    //
+    // IMPORTANT: Use Weak<ValueActor> instead of Arc to avoid circular reference!
+    // The output actor holds (via Rc chain) the driver task, which holds combined_stream,
+    // which holds these closures. Using Arc would create a cycle preventing cleanup.
     let is_first_input = Rc::new(RefCell::new(true));
-    let output_for_initial = output.clone();
+    let output_weak_for_initial = Arc::downgrade(&output);
     let initial_stream = initial_actor.clone().subscribe().map(move |value| {
         let is_first = *is_first_input.borrow();
         if is_first {
@@ -2546,16 +2562,23 @@ fn build_hold_actor(
             *current_state_for_body.borrow_mut() = Some(value.clone());
             let _ = state_sender_for_reset.borrow().unbounded_send(value.clone());
             // Store value directly to output - only for reset values, not initial
-            output_for_initial.store_value_directly(value.clone());
+            // Use weak reference to avoid circular reference
+            if let Some(output) = output_weak_for_initial.upgrade() {
+                output.store_value_directly(value.clone());
+            }
         }
         // Always pass through as HOLD output
         value
     });
 
     // Modify state_update_stream to also store values directly to output
-    let output_for_update = output.clone();
+    // IMPORTANT: Use Weak<ValueActor> to avoid circular reference!
+    let output_weak_for_update = Arc::downgrade(&output);
     let state_update_stream = state_update_stream.map(move |value| {
-        output_for_update.store_value_directly(value.clone());
+        // Use weak reference to avoid circular reference
+        if let Some(output) = output_weak_for_update.upgrade() {
+            output.store_value_directly(value.clone());
+        }
         value
     });
 
@@ -2566,15 +2589,17 @@ fn build_hold_actor(
         state_update_stream
     );
 
-    // Start a task to drive the combined stream (poll it so closures execute).
+    // Start a droppable task to drive the combined stream (poll it so closures execute).
     // The output actor stays alive via its pending stream, and values are stored
     // directly via store_value_directly() in the stream closures above.
-    Task::start(async move {
+    // The TaskHandle is stored in task_handle_cell so it's dropped when the output is dropped.
+    let task_handle = Task::start_droppable(async move {
         let mut stream = combined_stream;
         while stream.next().await.is_some() {
             // Values are already stored via store_value_directly in the map closures
         }
     });
+    *task_handle_cell.borrow_mut() = Some(task_handle);
 
     Ok(Some(output))
 }

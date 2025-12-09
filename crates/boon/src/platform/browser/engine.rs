@@ -2756,6 +2756,8 @@ impl ValueActor {
         Subscription {
             last_seen_version: 0,
             notify_receiver: receiver,
+            // Strong reference keeps actor alive as long as subscription exists.
+            // Circular reference chains in HOLD are broken via Weak in HOLD closures (evaluator.rs).
             actor: self,
             pending_values: VecDeque::new(),
         }
@@ -2813,6 +2815,8 @@ pub enum ValueUpdate {
 /// - Data: Pulled from history buffer, then from ArcSwap if history exhausted
 /// - Slow consumer: Falls back to latest if too far behind
 pub struct Subscription {
+    /// Strong reference to the subscribed actor.
+    /// This keeps the actor alive as long as the subscription exists.
     actor: Arc<ValueActor>,
     last_seen_version: u64,
     notify_receiver: mpsc::Receiver<()>,
