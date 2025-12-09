@@ -1686,6 +1686,7 @@ fn process_work_item(
                             parameters: ctx.actor_context.parameters,
                             sequential_processing: ctx.actor_context.sequential_processing,
                             backpressure_permit: ctx.actor_context.backpressure_permit,
+                            hold_state_update_callback: ctx.actor_context.hold_state_update_callback,
                         },
                         reference_connector: ctx.reference_connector,
                         link_connector: ctx.link_connector,
@@ -1825,6 +1826,13 @@ fn build_then_actor(
     // Clone backpressure_permit for the closure
     let backpressure_permit_for_then = backpressure_permit.clone();
 
+    // Clone HOLD callback for synchronous state updates during eager polling
+    let hold_callback_for_then = actor_context_for_then.hold_state_update_callback.clone();
+
+    // Clone body and callback for synchronous processing before eval_body closure captures them
+    let body_for_sync = body.clone();
+    let hold_callback_for_sync = hold_callback_for_then.clone();
+
     // eval_body now returns a Stream instead of Option<Value>
     // This avoids blocking on .next().await which would hang if body returns SKIP
     let eval_body = move |value: Value| -> Pin<Box<dyn Future<Output = Pin<Box<dyn Stream<Item = Value>>>>>> {
@@ -1838,6 +1846,7 @@ fn build_then_actor(
         let persistence_clone = persistence_for_then.clone();
         let body_clone = body.clone();
         let permit_clone = backpressure_permit_for_then.clone();
+        let hold_callback_clone = hold_callback_for_then.clone();
 
         Box::pin(async move {
             // Acquire permit BEFORE body evaluation - this ensures HOLD's state update
@@ -1908,6 +1917,8 @@ fn build_then_actor(
                 parameters: frozen_parameters,
                 sequential_processing: actor_context_clone.sequential_processing,
                 backpressure_permit: actor_context_clone.backpressure_permit.clone(),
+                // Don't propagate callback to body - body evaluation is internal
+                hold_state_update_callback: None,
             };
 
             let new_ctx = EvaluationContext {
@@ -1934,11 +1945,19 @@ fn build_then_actor(
                     // state update, causing infinite loops. Each THEN body evaluation should
                     // produce exactly ONE value per input.
                     let result_actor_keepalive = result_actor.clone();
+                    let hold_callback_for_map = hold_callback_clone.clone();
                     let result_stream = result_actor.subscribe().take(1).map(move |mut result_value| {
                         // Keep value_actor and result_actor alive while stream is consumed
                         let _ = &value_actor;
                         let _ = &result_actor_keepalive;
                         result_value.set_idempotency_key(ValueIdempotencyKey::new());
+                        // CRITICAL: Call HOLD's callback synchronously if present.
+                        // This updates state_actor and releases the permit BEFORE this stream yields,
+                        // enabling the next pulse to be processed synchronously during eager polling.
+                        if let Some(ref callback) = hold_callback_for_map {
+                            zoon::println!("[DEBUG] THEN: calling hold_state_update_callback synchronously");
+                            callback(result_value.clone());
+                        }
                         result_value
                     });
                     Box::pin(result_stream) as Pin<Box<dyn Stream<Item = Value>>>
@@ -1954,21 +1973,148 @@ fn build_then_actor(
         })
     };
 
+    // =========================================================================
+    // SYNCHRONOUS INITIAL PROCESSING
+    // =========================================================================
+    // Process piped's historical values synchronously during construction.
+    // This is critical for HOLD + Stream/pulses patterns where:
+    // 1. Stream/pulses emits N pulses synchronously (via stream::iter())
+    // 2. Those pulses are stored in piped's ValueActor (due to eager polling)
+    // 3. THEN must process those pulses synchronously so HOLD sees all updates
+    // 4. Document/new then sees the final computed value, not initial value
+    //
+    // Without this fix, .then(eval_body) makes processing async because
+    // eval_body awaits permit.acquire(), causing Poll::Pending on first poll.
+
+    let initial_version = piped.version();
+    let (initial_piped_values, _oldest) = piped.get_values_since(0);
+    zoon::println!("[DEBUG] THEN: processing {} initial piped values synchronously (version {})",
+        initial_piped_values.len(), initial_version);
+
+    // Evaluate body for each initial piped value synchronously
+    let mut initial_results: Vec<Value> = Vec::new();
+    for (idx, input_value) in initial_piped_values.into_iter().enumerate() {
+        zoon::println!("[DEBUG] THEN: evaluating body for initial value {}", idx);
+
+        // Create frozen parameters for SNAPSHOT semantics
+        let frozen_parameters: HashMap<String, Arc<ValueActor>> = ctx.actor_context.parameters
+            .iter()
+            .filter_map(|(name, actor)| {
+                if let Some(current_value) = actor.stored_value() {
+                    let frozen_actor = ValueActor::new_arc(
+                        ConstructInfo::new(
+                            format!("frozen param: {name} (sync)"),
+                            None,
+                            format!("frozen parameter {name} (sync)"),
+                        ),
+                        ctx.actor_context.clone(),
+                        constant(current_value),
+                        None,
+                    );
+                    Some((name.clone(), frozen_actor))
+                } else {
+                    Some((name.clone(), actor.clone()))
+                }
+            })
+            .collect();
+
+        // Create piped value actor for body evaluation
+        let value_actor = ValueActor::new_arc(
+            ConstructInfo::new(
+                "THEN input value (sync)".to_string(),
+                None,
+                format!("{span_for_then}; THEN input (sync)"),
+            ),
+            ctx.actor_context.clone(),
+            constant(input_value),
+            None,
+        );
+
+        let sync_actor_context = ActorContext {
+            output_valve_signal: ctx.actor_context.output_valve_signal.clone(),
+            piped: Some(value_actor.clone()),
+            passed: ctx.actor_context.passed.clone(),
+            parameters: frozen_parameters,
+            sequential_processing: ctx.actor_context.sequential_processing,
+            backpressure_permit: ctx.actor_context.backpressure_permit.clone(),
+            hold_state_update_callback: None,
+        };
+
+        let sync_ctx = EvaluationContext {
+            construct_context: ctx.construct_context.clone(),
+            actor_context: sync_actor_context,
+            reference_connector: ctx.reference_connector.clone(),
+            link_connector: ctx.link_connector.clone(),
+            function_registry: ctx.function_registry.clone(),
+            module_loader: ctx.module_loader.clone(),
+            source_code: ctx.source_code.clone(),
+        };
+
+        let body_expr = static_expression::Spanned {
+            span: body_for_sync.span,
+            persistence: persistence.clone(),
+            node: body_for_sync.node.clone(),
+        };
+
+        // Evaluate body synchronously
+        match evaluate_expression(body_expr, sync_ctx) {
+            Ok(Some(result_actor)) => {
+                // Due to ValueActor's eager polling, result_actor should have stored value
+                if let Some(mut result_value) = result_actor.stored_value() {
+                    zoon::println!("[DEBUG] THEN: got synchronous result for initial value {}", idx);
+                    result_value.set_idempotency_key(ValueIdempotencyKey::new());
+
+                    // Call HOLD's callback if present (for state updates)
+                    if let Some(ref callback) = hold_callback_for_sync {
+                        zoon::println!("[DEBUG] THEN: calling hold_state_update_callback for initial value {}", idx);
+                        callback(result_value.clone());
+                    }
+
+                    initial_results.push(result_value);
+                } else {
+                    zoon::println!("[DEBUG] THEN: no stored value for initial value {} - body may be async", idx);
+                }
+            }
+            Ok(None) => {
+                zoon::println!("[DEBUG] THEN: SKIP for initial value {}", idx);
+            }
+            Err(e) => {
+                zoon::println!("[DEBUG] THEN: error for initial value {}: {}", idx, e);
+            }
+        }
+    }
+
+    zoon::println!("[DEBUG] THEN: produced {} initial results synchronously", initial_results.len());
+
+    // =========================================================================
+    // REACTIVE SUBSCRIPTION (for future values)
+    // =========================================================================
     // Use then + flatten_unordered instead of then + filter_map
     // flatten_unordered processes inner streams concurrently, so even if one stream
     // never emits (SKIP case), others can still produce values
+
+    // Clone piped for the filter closure
+    let piped_for_filter = piped.clone();
+
     let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if backpressure_permit.is_some() || sequential {
         // For sequential mode, use regular flatten (processes one stream at a time)
+        // Skip values we already processed synchronously
         let stream = piped.clone().subscribe()
+            .filter(move |_| zoon::future::ready(piped_for_filter.version() > initial_version))
             .then(eval_body)
             .flatten();
-        Box::pin(stream)
+        // Chain initial synchronous results with reactive subscription
+        Box::pin(stream::iter(initial_results).chain(stream))
     } else {
+        // Clone piped_for_filter for the concurrent branch
+        let piped_for_filter_concurrent = piped.clone();
         // For non-sequential mode, use flatten_unordered for concurrent processing
         let stream = piped.clone().subscribe()
+            .filter(move |_| zoon::future::ready(piped_for_filter_concurrent.version() > initial_version))
             .then(eval_body)
             .flatten_unordered(None);
-        Box::pin(stream)
+        // Chain initial synchronous results with reactive subscription
+        Box::pin(stream::iter(initial_results).chain(stream))
     };
 
     // Keep the piped actor alive by including it in inputs
@@ -2090,6 +2236,8 @@ fn build_when_actor(
                         parameters,
                         sequential_processing: actor_context_clone.sequential_processing,
                         backpressure_permit: actor_context_clone.backpressure_permit.clone(),
+                        // Don't propagate HOLD callback into WHEN arms - each arm is a separate evaluation
+                        hold_state_update_callback: None,
                     };
 
                     let new_ctx = EvaluationContext {
@@ -2250,6 +2398,8 @@ fn build_while_actor(
                     parameters,
                     sequential_processing: actor_context_clone.sequential_processing,
                     backpressure_permit: actor_context_clone.backpressure_permit.clone(),
+                    // Propagate HOLD callback through WHILE arms - body might need it
+                    hold_state_update_callback: actor_context_clone.hold_state_update_callback.clone(),
                 };
 
                 let new_ctx = EvaluationContext {
@@ -2329,42 +2479,33 @@ fn build_field_access_actor(
     for field_name in path_strings {
         value_stream = Box::pin(
             value_stream
-                .map(move |value| {
+                .filter_map(move |value| {
                     let field_name = field_name.clone();
-                    match value {
-                        Value::Object(object, _) => {
-                            let variable_actor = object.expect_variable(&field_name).value_actor();
-                            // Use unfold to keep the parent object alive while subscribed
-                            stream::unfold(
-                                (variable_actor.subscribe(), object),
-                                |(mut subscription, object)| async move {
-                                    subscription.next().await.map(|value| (value, (subscription, object)))
-                                }
-                            ).boxed_local()
-                        }
-                        Value::TaggedObject(tagged_object, _) => {
-                            let variable_actor = tagged_object.expect_variable(&field_name).value_actor();
-                            // Use unfold to keep the parent tagged_object alive while subscribed
-                            stream::unfold(
-                                (variable_actor.subscribe(), tagged_object),
-                                |(mut subscription, tagged_object)| async move {
-                                    subscription.next().await.map(|value| (value, (subscription, tagged_object)))
-                                }
-                            ).boxed_local()
-                        }
-                        other => {
-                            // Not an object - emit an error value or panic
-                            panic!(
-                                "FieldAccess: Cannot access field '{}' on non-object value: {}",
-                                field_name, other.construct_info()
-                            );
+                    async move {
+                        match value {
+                            Value::Object(object, _) => {
+                                let variable_actor = object.expect_variable(&field_name).value_actor();
+                                // Get the stored value directly - object fields are typically constants
+                                // and we want to process each incoming object, not subscribe indefinitely
+                                // to one object's field (which would block processing subsequent objects)
+                                variable_actor.stored_value()
+                            }
+                            Value::TaggedObject(tagged_object, _) => {
+                                let variable_actor = tagged_object.expect_variable(&field_name).value_actor();
+                                // Get the stored value directly - same reasoning as above
+                                variable_actor.stored_value()
+                            }
+                            other => {
+                                // Not an object - log error and skip
+                                zoon::println!(
+                                    "FieldAccess: Cannot access field '{}' on non-object value: {}",
+                                    field_name, other.construct_info()
+                                );
+                                None
+                            }
                         }
                     }
                 })
-                // Use flatten_unordered(Some(1)) to limit concurrency - each value creates
-                // a subscription to the field, and with unlimited concurrency these would
-                // grow exponentially for frequently-updating sources
-                .flatten_unordered(Some(1))
         );
     }
 
@@ -2439,13 +2580,40 @@ fn build_hold_actor(
     body_parameters.insert(state_param.clone(), state_actor.clone());
 
     // Clone state_actor for use in state_update_stream to directly update its stored value
-    let state_actor_for_update = state_actor;
+    let state_actor_for_update = state_actor.clone();
+    // Clone for the synchronous callback that THEN will use
+    let state_actor_for_callback = state_actor;
 
     // Create backpressure permit for synchronizing THEN with state updates.
     // Initial count = 1 allows first body evaluation to start.
     // HOLD releases permit after each state update, allowing next body to run.
     let backpressure_permit = BackpressurePermit::new(1);
     let permit_for_state_update = backpressure_permit.clone();
+    let permit_for_callback = backpressure_permit.clone();
+
+    // Deferred output reference - will be populated after output is created.
+    // This allows the callback to update both state_actor AND output_actor synchronously.
+    let output_weak_for_callback: Rc<RefCell<Option<Weak<ValueActor>>>> = Rc::new(RefCell::new(None));
+    let output_weak_for_callback_clone = output_weak_for_callback.clone();
+
+    // Create callback for THEN to update HOLD's state AND output synchronously.
+    // This enables all pulses to be processed during eager polling in construction,
+    // without waiting for the async Task that normally drives state_update_stream.
+    let hold_state_update_callback: Rc<dyn Fn(Value)> = Rc::new(move |new_value: Value| {
+        zoon::println!("[DEBUG] hold_state_update_callback: updating state synchronously");
+        // Update state_actor's stored value directly - THEN will read from here
+        state_actor_for_callback.store_value_directly(new_value.clone());
+        // CRITICAL: Also update output_actor so downstream subscribers see the value immediately
+        if let Some(ref output_weak) = *output_weak_for_callback_clone.borrow() {
+            if let Some(output) = output_weak.upgrade() {
+                zoon::println!("[DEBUG] hold_state_update_callback: updating output synchronously");
+                output.store_value_directly(new_value);
+            }
+        }
+        // Release permit to allow THEN to process next input
+        permit_for_callback.release();
+        zoon::println!("[DEBUG] hold_state_update_callback: permit released");
+    });
 
     let body_actor_context = ActorContext {
         output_valve_signal: ctx.actor_context.output_valve_signal.clone(),
@@ -2458,6 +2626,8 @@ fn build_hold_actor(
         sequential_processing: true,
         // Pass permit to body - THEN will acquire before each evaluation
         backpressure_permit: Some(backpressure_permit),
+        // Pass callback to THEN for synchronous state updates during eager polling
+        hold_state_update_callback: Some(hold_state_update_callback),
     };
 
     // Create new context for body evaluation
@@ -2535,6 +2705,20 @@ fn build_hold_actor(
     if let Some(initial_value) = initial_actor.stored_value() {
         zoon::println!("[DEBUG] HOLD: storing initial value synchronously to output");
         output.store_value_directly(initial_value);
+    }
+
+    // NOW populate the deferred output reference for the callback.
+    // This enables future THEN callbacks (during eager polling) to update output synchronously.
+    *output_weak_for_callback.borrow_mut() = Some(Arc::downgrade(&output));
+
+    // CRITICAL: Copy any values that body_result already emitted during construction.
+    // During body evaluation, Stream/pulses emits synchronously and THEN processes those pulses.
+    // Those values are now in body_result's history. We need to copy them to output so
+    // downstream subscribers (like Document/new) see them immediately.
+    let (body_values, _version) = body_result.get_values_since(0);
+    zoon::println!("[DEBUG] HOLD: copying {} body values to output synchronously", body_values.len());
+    for value in body_values {
+        output.store_value_directly(value);
     }
 
     // Reset/passthrough behavior: ALL emissions from input pass through as HOLD output.
@@ -2946,6 +3130,8 @@ fn call_function(
             parameters,
             sequential_processing: ctx.actor_context.sequential_processing,
             backpressure_permit: ctx.actor_context.backpressure_permit.clone(),
+            // Don't propagate HOLD callback into user-defined functions - they have their own scope
+            hold_state_update_callback: None,
         };
 
         let new_ctx = EvaluationContext {
@@ -2993,6 +3179,8 @@ fn call_function(
                 parameters: ctx.actor_context.parameters.clone(),
                 sequential_processing: ctx.actor_context.sequential_processing,
                 backpressure_permit: ctx.actor_context.backpressure_permit.clone(),
+                // Don't propagate HOLD callback into builtin function calls
+                hold_state_update_callback: None,
             };
 
             Ok(Some(FunctionCall::new_arc_value_actor(

@@ -2239,8 +2239,9 @@ pub fn function_stream_distinct(
 /// Generates N pulses (1, 2, 3, ..., N) from the piped count.
 /// When the count changes, restarts pulse generation from 1.
 ///
-/// Pulses are emitted synchronously. The ValueActor's history buffer ensures
-/// all values are preserved for subscribers even if they poll slower than emission.
+/// Uses pure stream combinators (no Task, no Rc<RefCell>) per Engine Architecture Rules.
+/// Initial pulses are emitted synchronously via stream::iter() to ensure HOLD + Stream/pulses
+/// patterns work correctly without race conditions.
 pub fn function_stream_pulses(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     function_call_id: ConstructId,
@@ -2250,54 +2251,53 @@ pub fn function_stream_pulses(
 ) -> impl Stream<Item = Value> {
     let count_actor = arguments[0].clone();
 
-    // Create channel for output
-    let (tx, rx) = mpsc::unbounded::<Value>();
-
-    // Use Task::start_droppable and store handle so it's cancelled when the output stream is dropped.
-    let task_handle_cell: Rc<RefCell<Option<TaskHandle>>> = Rc::new(RefCell::new(None));
-    let task_handle = Task::start_droppable({
+    // Helper to generate pulses from a count value
+    let make_pulses = {
         let function_call_id = function_call_id.clone();
         let construct_context = construct_context.clone();
-
-        async move {
-            let mut count_sub = count_actor.subscribe();
-
-            while let Some(count_value) = count_sub.next().await {
-                let pulse_count = match &count_value {
-                    Value::Number(num, _) => num.number() as u64,
-                    _ => 0,
-                };
-
-                // Generate pulses 1 through pulse_count
-                // No yield needed - ValueHistory preserves all values for subscribers
-                for pulse_number in 1..=pulse_count {
-                    let value = Number::new_value(
+        move |count_value: &Value| -> Vec<Value> {
+            let pulse_count = match count_value {
+                Value::Number(num, _) => num.number() as u64,
+                _ => 0,
+            };
+            (1..=pulse_count)
+                .map(|n| {
+                    Number::new_value(
                         ConstructInfo::new(
-                            function_call_id.with_child_id(format!("pulse_{}", pulse_number)),
+                            function_call_id.with_child_id(format!("pulse_{}", n)),
                             None,
                             "Stream/pulses result",
                         ),
                         construct_context.clone(),
                         ValueIdempotencyKey::new(),
-                        pulse_number as f64,
-                    );
-
-                    if tx.unbounded_send(value).is_err() {
-                        // Receiver dropped, stop emitting
-                        return;
-                    }
-                }
-            }
+                        n as f64,
+                    )
+                })
+                .collect()
         }
-    });
-    *task_handle_cell.borrow_mut() = Some(task_handle);
+    };
 
-    // Return a wrapper stream that keeps the TaskHandle alive via the Rc.
-    let task_handle_cell_for_stream = task_handle_cell.clone();
-    rx.chain(stream::poll_fn(move |_cx| {
-        let _keep_alive = task_handle_cell_for_stream.borrow();
-        Poll::Pending::<Option<Value>>
-    }))
+    // 1. SYNCHRONOUS: Emit pulses immediately if input has stored value
+    // This fixes race conditions in HOLD + Stream/pulses patterns.
+    let initial_version = count_actor.version();
+    let initial_pulses = count_actor
+        .stored_value()
+        .map(|v| make_pulses(&v))
+        .unwrap_or_default();
+
+    // 2. REACTIVE: Subscribe for future count changes
+    // Clone what we need for the closures
+    let make_pulses_for_reactive = make_pulses.clone();
+    let count_actor_for_filter = count_actor.clone();
+
+    // Pure stream combinator approach - no Task, no Rc<RefCell>
+    stream::iter(initial_pulses).chain(
+        count_actor
+            .subscribe()
+            // Skip versions we already processed synchronously
+            .filter(move |_| future::ready(count_actor_for_filter.version() > initial_version))
+            .flat_map(move |v| stream::iter(make_pulses_for_reactive(&v))),
+    )
 }
 
 /// Stream/debounce(duration) -> Stream<Value>

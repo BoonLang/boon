@@ -220,7 +220,7 @@ impl<S: Stream> Stream for BackpressuredStream<S> {
 
 // --- BackpressurePermit ---
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::task::Waker;
 
 /// A permit-based synchronization primitive for backpressure between producer and consumer.
@@ -235,19 +235,23 @@ use std::task::Waker;
 /// 5. THEN can now acquire for next body evaluation
 ///
 /// This guarantees that HOLD's state update completes before THEN's next body starts.
+///
+/// Uses thread-safe primitives (Arc + AtomicUsize + Mutex) instead of Rc<Cell>/Rc<RefCell>
+/// to support WebWorkers and to allow callbacks in Arc<dyn Fn>.
 #[derive(Clone)]
 pub struct BackpressurePermit {
-    available: Rc<Cell<usize>>,
-    waker: Rc<RefCell<Option<Waker>>>,
+    available: Arc<std::sync::atomic::AtomicUsize>,
+    waker: Arc<std::sync::Mutex<Option<Waker>>>,
 }
 
 impl BackpressurePermit {
     /// Create a new permit with the given initial count.
     /// For HOLD/THEN synchronization, use initial = 1.
     pub fn new(initial: usize) -> Self {
+        use std::sync::atomic::AtomicUsize;
         BackpressurePermit {
-            available: Rc::new(Cell::new(initial)),
-            waker: Rc::new(RefCell::new(None)),
+            available: Arc::new(AtomicUsize::new(initial)),
+            waker: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -256,12 +260,14 @@ impl BackpressurePermit {
     /// Called by HOLD after updating state.
     pub fn release(&self) {
         use zoon::println;
-        let old = self.available.get();
-        self.available.set(old + 1);
-        println!("[DEBUG] Permit released: {} -> {}", old, self.available.get());
-        if let Some(waker) = self.waker.borrow_mut().take() {
-            println!("[DEBUG] Permit waking blocked task");
-            waker.wake();
+        use std::sync::atomic::Ordering;
+        let old = self.available.fetch_add(1, Ordering::SeqCst);
+        println!("[DEBUG] Permit released: {} -> {}", old, old + 1);
+        if let Ok(mut guard) = self.waker.lock() {
+            if let Some(waker) = guard.take() {
+                println!("[DEBUG] Permit waking blocked task");
+                waker.wake();
+            }
         }
     }
 
@@ -270,16 +276,31 @@ impl BackpressurePermit {
     /// Called by THEN before each body evaluation.
     pub async fn acquire(&self) {
         use zoon::println;
+        use std::sync::atomic::Ordering;
         std::future::poll_fn(|cx| {
-            let available = self.available.get();
-            if available > 0 {
-                self.available.set(available - 1);
-                println!("[DEBUG] Permit acquired: {} -> {}", available, self.available.get());
-                Poll::Ready(())
-            } else {
-                println!("[DEBUG] Permit BLOCKED: available = 0, storing waker");
-                *self.waker.borrow_mut() = Some(cx.waker().clone());
-                Poll::Pending
+            // Try to decrement if available > 0
+            loop {
+                let available = self.available.load(Ordering::SeqCst);
+                if available > 0 {
+                    // Try to atomically decrement
+                    if self.available.compare_exchange(
+                        available,
+                        available - 1,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ).is_ok() {
+                        println!("[DEBUG] Permit acquired: {} -> {}", available, available - 1);
+                        return Poll::Ready(());
+                    }
+                    // CAS failed, retry
+                    continue;
+                } else {
+                    println!("[DEBUG] Permit BLOCKED: available = 0, storing waker");
+                    if let Ok(mut guard) = self.waker.lock() {
+                        *guard = Some(cx.waker().clone());
+                    }
+                    return Poll::Pending;
+                }
             }
         }).await
     }
@@ -601,6 +622,16 @@ pub struct ActorContext {
     /// and HOLD releases permit after updating state.
     /// This ensures state is updated before next body starts.
     pub backpressure_permit: Option<BackpressurePermit>,
+    /// Callback for THEN to update HOLD's state synchronously after body evaluation.
+    /// This enables synchronous processing of all pulses during eager polling.
+    /// The callback receives the body result and:
+    /// 1. Updates state_actor.store_value_directly()
+    /// 2. Releases the backpressure permit
+    /// Without this, THEN would block on permit.acquire() for the second pulse
+    /// because permit release normally happens in HOLD's Task which hasn't run yet.
+    /// Uses Rc (not Arc) since the engine runs single-threaded in WASM.
+    /// This allows capturing non-Send/Sync types like ValueActor.
+    pub hold_state_update_callback: Option<Rc<dyn Fn(Value)>>,
 }
 
 // --- ActorOutputValveSignal ---
@@ -2127,7 +2158,6 @@ impl ValueActor {
         persistence_id: Option<parser::PersistenceId>,
         inputs: Vec<Arc<ValueActor>>,
     ) -> Self {
-        let value_stream = value_stream.inner;
         let construct_info = Arc::new(construct_info);
         let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
         let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(None));
@@ -2139,6 +2169,51 @@ impl ValueActor {
         // Shared notify senders - used by both main loop and store_value_directly
         let notify_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<()>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // EAGER SYNCHRONOUS POLLING: Poll the stream synchronously until Pending.
+        // This ensures that stream::iter values are processed immediately, fixing race
+        // conditions in patterns like HOLD + Stream/pulses where values from stream::iter
+        // would otherwise arrive asynchronously after downstream actors have subscribed.
+        let mut boxed_stream: std::pin::Pin<Box<dyn Stream<Item = Value>>> =
+            Box::pin(value_stream.inner);
+        // Create a noop waker for synchronous polling
+        fn noop_waker() -> Waker {
+            use std::task::{RawWaker, RawWakerVTable};
+            const NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(
+                |_| RawWaker::new(std::ptr::null(), &NOOP_VTABLE),
+                |_| {},
+                |_| {},
+                |_| {},
+            );
+            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &NOOP_VTABLE)) }
+        }
+        let waker = noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut stream_ended_sync = false;
+        let mut stream_ever_produced_sync = false;
+
+        loop {
+            match boxed_stream.as_mut().poll_next(&mut cx) {
+                std::task::Poll::Ready(Some(value)) => {
+                    stream_ever_produced_sync = true;
+                    current_value.store(Arc::new(Some(value.clone())));
+                    let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+                    if let Ok(mut history) = value_history.lock() {
+                        history.add(new_version, value);
+                    }
+                    // Note: no subscribers yet at construction time, so no need to notify
+                }
+                std::task::Poll::Ready(None) => {
+                    // Stream ended synchronously - unusual but possible
+                    stream_ended_sync = true;
+                    break;
+                }
+                std::task::Poll::Pending => {
+                    // No more synchronous values, break out of loop
+                    break;
+                }
+            }
+        }
 
         let loop_task = Task::start_droppable({
             let construct_info = construct_info.clone();
@@ -2158,14 +2233,17 @@ impl ValueActor {
                         stream::pending().right_stream()
                     }
                     .fuse();
-                let mut value_stream = pin!(value_stream.fuse());
+                // Use the boxed stream that was already polled synchronously
+                let mut value_stream = boxed_stream.fuse();
                 let mut message_receiver = pin!(message_receiver.fuse());
                 let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
                 let mut migration_state = MigrationState::Normal;
                 // Track if stream ever produced a value (for SKIP detection)
-                let mut stream_ever_produced = false;
+                // Initialize from sync polling phase
+                let mut stream_ever_produced = stream_ever_produced_sync;
                 // Track if stream has ended
-                let mut stream_ended = false;
+                // Initialize from sync polling phase
+                let mut stream_ended = stream_ended_sync;
 
                 loop {
                     select! {

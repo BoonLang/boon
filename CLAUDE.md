@@ -300,3 +300,29 @@ While not fully enforced on `ValueActor::new()` yet, these types serve as docume
 - **ariadne** - Error reporting
 - **zoon/moon** - MoonZoon framework (frontend/backend)
 - **ulid** - Unique IDs for persistence
+
+## Engine Architecture Rules
+
+### Parallel Processing
+- **Only Actors (ValueActor) should be parallel processing units** in the Boon engine
+- API functions should return **pure streams** that get wrapped into actors by the evaluator
+- Never spawn `Task::start_droppable` outside of actor/engine infrastructure (e.g., not in api.rs stream functions)
+
+### Interior Mutability
+- **No `Rc<RefCell>`** in engine code - it fails in multi-threaded environments (WebWorkers)
+- Actor-local state should be owned by the actor's async loop
+- Use channels (mpsc) for communication between actors
+
+### Stream Functions Pattern
+API functions that return streams should:
+1. Return `impl Stream<Item = Value>` (a pure stream)
+2. Use `stream::iter()` for synchronous initial values, `stream::unfold()` for stateful iteration
+3. Let the caller (evaluator) wrap the stream in a ValueActor
+4. Keep input actors alive via the stream's closure (Arc<ValueActor> is Clone), NOT via Rc
+
+### No Synchronous Operations (Async-Only Architecture)
+- **Everything must be async** - Boon actors may live in different WebWorkers, clusters, or distributed systems
+- **Never block or poll synchronously** - Use `.await` for all waiting, never spin-loops or blocking calls
+- **No "sync processing" hacks** - Don't try to process initial values synchronously before returning a stream
+- **Use channels for synchronous-like behavior** - If you need to ensure ordering or immediate processing, use mpsc channels and let the async runtime handle scheduling
+- **Reason**: Sync operations assume single-threaded execution. Boon's actor model must work across threads, processes, and network boundaries
