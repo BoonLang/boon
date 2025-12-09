@@ -7,7 +7,7 @@ FUNCTION fibonacci(position) {
                 n - 1 |> Stream/pulses() |> THEN {
                     [
                         previous: state.current
-                        current: state.previous + previous
+                        current: state.previous + state.current
                     ]
                 }
             }

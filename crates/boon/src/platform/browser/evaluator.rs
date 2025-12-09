@@ -2485,15 +2485,24 @@ fn build_field_access_actor(
                         match value {
                             Value::Object(object, _) => {
                                 let variable_actor = object.expect_variable(&field_name).value_actor();
-                                // Get the stored value directly - object fields are typically constants
-                                // and we want to process each incoming object, not subscribe indefinitely
-                                // to one object's field (which would block processing subsequent objects)
-                                variable_actor.stored_value()
+                                // Try stored value first, fall back to subscription if not available yet
+                                // This handles the race condition where the value might not be computed yet
+                                if let Some(val) = variable_actor.stored_value() {
+                                    Some(val)
+                                } else {
+                                    // Value not stored yet - wait for it via subscription
+                                    variable_actor.subscribe().next().await
+                                }
                             }
                             Value::TaggedObject(tagged_object, _) => {
                                 let variable_actor = tagged_object.expect_variable(&field_name).value_actor();
-                                // Get the stored value directly - same reasoning as above
-                                variable_actor.stored_value()
+                                // Try stored value first, fall back to subscription if not available yet
+                                if let Some(val) = variable_actor.stored_value() {
+                                    Some(val)
+                                } else {
+                                    // Value not stored yet - wait for it via subscription
+                                    variable_actor.subscribe().next().await
+                                }
                             }
                             other => {
                                 // Not an object - log error and skip
