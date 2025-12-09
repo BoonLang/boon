@@ -5,7 +5,7 @@ FUNCTION fibonacci(position) {
         }
     }
     |> Stream/skip(count: position)
-    |> Log/info(label: TEXT { Final state })
+    |> Log/info(with: [label: TEXT { Final state }])
     |> .current
 }
 

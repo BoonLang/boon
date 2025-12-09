@@ -1578,8 +1578,31 @@ pub fn function_ulid_generate(
 use std::pin::Pin;
 use std::future::Future;
 
-/// Timeout in milliseconds for waiting on nested actor values
-const LOG_VALUE_TIMEOUT_MS: u32 = 100;
+/// Default timeout in milliseconds for waiting on nested actor values
+const LOG_VALUE_DEFAULT_TIMEOUT_MS: u32 = 100;
+
+/// Options extracted from the 'with' parameter for Log functions.
+/// Contains optional label and timeout for resolving nested values.
+struct LogOptions {
+    label: Option<String>,
+    timeout_ms: u32,
+}
+
+impl Default for LogOptions {
+    fn default() -> Self {
+        Self {
+            label: None,
+            timeout_ms: LOG_VALUE_DEFAULT_TIMEOUT_MS,
+        }
+    }
+}
+
+use std::cell::Cell;
+
+thread_local! {
+    /// Current timeout for log value resolution (used by recursive resolve functions)
+    static LOG_TIMEOUT_MS: Cell<u32> = const { Cell::new(LOG_VALUE_DEFAULT_TIMEOUT_MS) };
+}
 
 /// Async function to resolve a Value to string for logging.
 /// Awaits nested actors with timeout - shows `?` for values that don't arrive in time.
@@ -1627,7 +1650,9 @@ fn resolve_value_for_log(value: Value) -> Pin<Box<dyn Future<Output = String>>> 
 
 /// Async function to get value from a ValueActor for logging with timeout.
 /// Returns `?` if no value arrives within the timeout.
+/// Uses the timeout from LOG_TIMEOUT_MS thread-local.
 fn resolve_actor_value_for_log(actor: Arc<ValueActor>) -> Pin<Box<dyn Future<Output = String>>> {
+    let timeout_ms = LOG_TIMEOUT_MS.get();
     Box::pin(async move {
         use zoon::futures_util::StreamExt;
 
@@ -1635,7 +1660,7 @@ fn resolve_actor_value_for_log(actor: Arc<ValueActor>) -> Pin<Box<dyn Future<Out
         let get_value = async {
             actor.subscribe().next().await
         };
-        let timeout = Timer::sleep(LOG_VALUE_TIMEOUT_MS);
+        let timeout = Timer::sleep(timeout_ms);
 
         select! {
             value = get_value.fuse() => {
@@ -1652,31 +1677,70 @@ fn resolve_actor_value_for_log(actor: Arc<ValueActor>) -> Pin<Box<dyn Future<Out
     })
 }
 
-/// Helper to extract optional label from a 'with' object parameter.
-/// The 'with' object can contain a 'label' field.
-/// Returns None if no 'with' argument or no 'label' field.
-async fn extract_label_from_with(with_actor: Arc<ValueActor>) -> Option<String> {
+/// Resolve a value for logging with a specific timeout.
+/// Sets the thread-local timeout before resolving.
+async fn resolve_value_for_log_with_timeout(value: Value, timeout_ms: u32) -> String {
+    LOG_TIMEOUT_MS.set(timeout_ms);
+    let result = resolve_value_for_log(value).await;
+    LOG_TIMEOUT_MS.set(LOG_VALUE_DEFAULT_TIMEOUT_MS); // Reset to default
+    result
+}
+
+/// Helper to extract log options from a 'with' object parameter.
+/// The 'with' object can contain:
+/// - 'label': Text label for the log message
+/// - 'timeout': Duration[seconds: N] or Duration[milliseconds: N] for nested value resolution
+/// Returns LogOptions with defaults if fields are not present.
+async fn extract_log_options_from_with(with_actor: Arc<ValueActor>) -> LogOptions {
     use zoon::futures_util::StreamExt;
 
-    // Get the 'with' object value
-    let with_value = with_actor.subscribe().next().await?;
+    let mut options = LogOptions::default();
 
-    // Check if it's an Object and extract the 'label' field
+    // Get the 'with' object value
+    let with_value = match with_actor.subscribe().next().await {
+        Some(v) => v,
+        None => return options,
+    };
+
+    // Check if it's an Object and extract the fields
     if let Value::Object(obj, _) = with_value {
+        // Extract label
         if let Some(label_var) = obj.variable("label") {
-            let label_value = label_var.value_actor().subscribe().next().await?;
-            // Resolve the label value to a string
-            return Some(resolve_value_for_log(label_value).await);
+            if let Some(label_value) = label_var.value_actor().subscribe().next().await {
+                options.label = Some(resolve_value_for_log(label_value).await);
+            }
+        }
+
+        // Extract timeout from Duration[seconds: N] or Duration[milliseconds: N]
+        if let Some(timeout_var) = obj.variable("timeout") {
+            if let Some(timeout_value) = timeout_var.value_actor().subscribe().next().await {
+                if let Value::TaggedObject(tagged, _) = timeout_value {
+                    if tagged.tag() == "Duration" {
+                        if let Some(seconds_var) = tagged.variable("seconds") {
+                            if let Some(Value::Number(num, _)) = seconds_var.value_actor().subscribe().next().await {
+                                options.timeout_ms = (num.number() * 1000.0) as u32;
+                            }
+                        } else if let Some(milliseconds_var) = tagged.variable("milliseconds") {
+                            if let Some(Value::Number(num, _)) = milliseconds_var.value_actor().subscribe().next().await {
+                                options.timeout_ms = num.number() as u32;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-    None
+    options
 }
 
 /// Log/info(value: T) -> T
-/// Log/info(value: T, with: [label: Text]) -> T
+/// Log/info(value: T, with: [label: Text, timeout: Duration]) -> T
 /// Logs an info message to the console and passes through the input value.
 /// Output format: `[INFO] {label}: {value}` or `[INFO] {value}`
+/// The 'with' parameter accepts:
+/// - label: Text label for the log message
+/// - timeout: Duration[milliseconds: N] or Duration[seconds: N] for nested value resolution
 pub fn function_log_info(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     _function_call_id: ConstructId,
@@ -1692,17 +1756,18 @@ pub fn function_log_info(
         let value_clone = value.clone();
         // Spawn async task to resolve all nested values and log
         zoon::Task::start(async move {
-            let value_str = resolve_value_for_log(value_clone).await;
-            // Extract optional label from 'with' object
-            let label_str = if let Some(with) = with_actor {
-                extract_label_from_with(with).await.unwrap_or_default()
+            // Extract options (label and timeout) from 'with' object
+            let options = if let Some(with) = with_actor {
+                extract_log_options_from_with(with).await
             } else {
-                String::new()
+                LogOptions::default()
             };
-            if label_str.is_empty() {
-                zoon::println!("[INFO] {}", value_str);
-            } else {
-                zoon::println!("[INFO] {}: {}", label_str, value_str);
+            // Resolve value with the configured timeout
+            let value_str = resolve_value_for_log_with_timeout(value_clone, options.timeout_ms).await;
+            // Log with or without label
+            match options.label {
+                Some(label) if !label.is_empty() => zoon::println!("[INFO] {}: {}", label, value_str),
+                _ => zoon::println!("[INFO] {}", value_str),
             }
         });
         // Pass through the input value immediately for chaining
@@ -1713,9 +1778,12 @@ pub fn function_log_info(
 }
 
 /// Log/error(value: T) -> T
-/// Log/error(value: T, with: [label: Text]) -> T
+/// Log/error(value: T, with: [label: Text, timeout: Duration]) -> T
 /// Logs an error message to the console and passes through the input value.
 /// Output format: `[ERROR] {label}: {value}` or `[ERROR] {value}`
+/// The 'with' parameter accepts:
+/// - label: Text label for the error message
+/// - timeout: Duration[milliseconds: N] or Duration[seconds: N] for nested value resolution
 pub fn function_log_error(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     _function_call_id: ConstructId,
@@ -1731,17 +1799,18 @@ pub fn function_log_error(
         let value_clone = value.clone();
         // Spawn async task to resolve all nested values and log
         zoon::Task::start(async move {
-            let value_str = resolve_value_for_log(value_clone).await;
-            // Extract optional label from 'with' object
-            let label_str = if let Some(with) = with_actor {
-                extract_label_from_with(with).await.unwrap_or_default()
+            // Extract options (label and timeout) from 'with' object
+            let options = if let Some(with) = with_actor {
+                extract_log_options_from_with(with).await
             } else {
-                String::new()
+                LogOptions::default()
             };
-            if label_str.is_empty() {
-                zoon::eprintln!("[ERROR] {}", value_str);
-            } else {
-                zoon::eprintln!("[ERROR] {}: {}", label_str, value_str);
+            // Resolve value with the configured timeout
+            let value_str = resolve_value_for_log_with_timeout(value_clone, options.timeout_ms).await;
+            // Log with or without label
+            match options.label {
+                Some(label) if !label.is_empty() => zoon::eprintln!("[ERROR] {}: {}", label, value_str),
+                _ => zoon::eprintln!("[ERROR] {}", value_str),
             }
         });
         // Pass through the input value immediately for chaining
