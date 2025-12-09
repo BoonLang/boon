@@ -259,13 +259,10 @@ impl BackpressurePermit {
     /// Wakes the waiting task if one exists.
     /// Called by HOLD after updating state.
     pub fn release(&self) {
-        use zoon::println;
         use std::sync::atomic::Ordering;
         let old = self.available.fetch_add(1, Ordering::SeqCst);
-        println!("[DEBUG] Permit released: {} -> {}", old, old + 1);
         if let Ok(mut guard) = self.waker.lock() {
             if let Some(waker) = guard.take() {
-                println!("[DEBUG] Permit waking blocked task");
                 waker.wake();
             }
         }
@@ -275,7 +272,6 @@ impl BackpressurePermit {
     /// If no permit is available (count = 0), waits until one is released.
     /// Called by THEN before each body evaluation.
     pub async fn acquire(&self) {
-        use zoon::println;
         use std::sync::atomic::Ordering;
         std::future::poll_fn(|cx| {
             // Try to decrement if available > 0
@@ -289,13 +285,11 @@ impl BackpressurePermit {
                         Ordering::SeqCst,
                         Ordering::SeqCst,
                     ).is_ok() {
-                        println!("[DEBUG] Permit acquired: {} -> {}", available, available - 1);
                         return Poll::Ready(());
                     }
                     // CAS failed, retry
                     continue;
                 } else {
-                    println!("[DEBUG] Permit BLOCKED: available = 0, storing waker");
                     if let Ok(mut guard) = self.waker.lock() {
                         *guard = Some(cx.waker().clone());
                     }
@@ -303,6 +297,264 @@ impl BackpressurePermit {
                 }
             }
         }).await
+    }
+}
+
+// --- LazyValueActor ---
+
+/// Request from subscriber to LazyValueActor for the next value.
+struct LazyValueRequest {
+    subscriber_id: usize,
+    response_tx: oneshot::Sender<Option<Value>>,
+}
+
+/// A demand-driven actor that only polls its source stream when subscribers request values.
+///
+/// Unlike the regular ValueActor which eagerly polls its source stream and broadcasts values,
+/// LazyValueActor only pulls values from the source when a subscriber asks for one.
+///
+/// This is essential for sequential state updates in HOLD bodies:
+/// ```boon
+/// [count: 0] |> HOLD state {
+///     3 |> Stream/pulses() |> THEN { [count: state.count + 1] }
+/// }
+/// ```
+/// With lazy actors, HOLD pulls one value at a time, updates state, then pulls the next.
+/// Each THEN evaluation sees the updated state from the previous iteration.
+///
+/// # Architecture
+/// - Internal loop handles requests via channel (no Mutex/RwLock)
+/// - Buffer + cursor enables multiple subscribers to replay values
+/// - Threshold-based cleanup prevents unbounded memory growth
+pub struct LazyValueActor {
+    construct_info: Arc<ConstructInfoComplete>,
+    /// Channel for subscribers to request the next value
+    request_tx: mpsc::UnboundedSender<LazyValueRequest>,
+    /// Counter for unique subscriber IDs
+    subscriber_counter: std::sync::atomic::AtomicUsize,
+    /// Keep input actors alive
+    inputs: Vec<Arc<ValueActor>>,
+    /// The actor's internal task
+    _task_handle: TaskHandle,
+}
+
+impl LazyValueActor {
+    /// Create a new LazyValueActor from a stream.
+    ///
+    /// The stream will only be polled when subscribers request values.
+    /// This is the key difference from regular ValueActor.
+    pub fn new<S: Stream<Item = Value> + 'static>(
+        construct_info: ConstructInfoComplete,
+        source_stream: S,
+        inputs: Vec<Arc<ValueActor>>,
+    ) -> Self {
+        let construct_info = Arc::new(construct_info);
+        let (request_tx, request_rx) = mpsc::unbounded::<LazyValueRequest>();
+
+        let task_handle = Task::start_droppable({
+            let construct_info = construct_info.clone();
+            // Keep inputs alive in the task
+            let _inputs = inputs.clone();
+            Self::actor_loop(construct_info, source_stream, request_rx)
+        });
+
+        Self {
+            construct_info,
+            request_tx,
+            subscriber_counter: std::sync::atomic::AtomicUsize::new(0),
+            inputs,
+            _task_handle: task_handle,
+        }
+    }
+
+    /// Create a new Arc<LazyValueActor>.
+    pub fn new_arc<S: Stream<Item = Value> + 'static>(
+        construct_info: ConstructInfo,
+        source_stream: S,
+        inputs: Vec<Arc<ValueActor>>,
+    ) -> Arc<Self> {
+        Arc::new(Self::new(
+            construct_info.complete(ConstructType::LazyValueActor),
+            source_stream,
+            inputs,
+        ))
+    }
+
+    /// The internal actor loop that handles demand-driven value delivery.
+    ///
+    /// This loop owns all state (buffer, cursors) - no locks needed.
+    /// Values are only pulled from the source when a subscriber requests one.
+    async fn actor_loop<S: Stream<Item = Value> + 'static>(
+        construct_info: Arc<ConstructInfoComplete>,
+        source_stream: S,
+        mut request_rx: mpsc::UnboundedReceiver<LazyValueRequest>,
+    ) {
+        let mut source = Box::pin(source_stream);
+        let mut buffer: Vec<Value> = Vec::new();
+        let mut cursors: HashMap<usize, usize> = HashMap::new();
+        let mut source_exhausted = false;
+        const CLEANUP_THRESHOLD: usize = 100;
+
+        println!("[DEBUG LazyValueActor] Loop started: {}", construct_info.description);
+
+        while let Some(request) = request_rx.next().await {
+            let cursor = cursors.entry(request.subscriber_id).or_insert(0);
+
+            let value = if *cursor < buffer.len() {
+                // Return buffered value (replay for this subscriber)
+                println!("[DEBUG LazyValueActor] Returning buffered value at cursor {} for subscriber {}",
+                    *cursor, request.subscriber_id);
+                Some(buffer[*cursor].clone())
+            } else if source_exhausted {
+                // Source is exhausted, no more values
+                println!("[DEBUG LazyValueActor] Source exhausted for subscriber {}",
+                    request.subscriber_id);
+                None
+            } else {
+                // Poll source for next value (demand-driven pull!)
+                println!("[DEBUG LazyValueActor] Pulling from source for subscriber {}",
+                    request.subscriber_id);
+                match source.next().await {
+                    Some(value) => {
+                        println!("[DEBUG LazyValueActor] Got value from source, buffering");
+                        buffer.push(value.clone());
+                        Some(value)
+                    }
+                    None => {
+                        println!("[DEBUG LazyValueActor] Source exhausted");
+                        source_exhausted = true;
+                        None
+                    }
+                }
+            };
+
+            if value.is_some() {
+                *cursor += 1;
+            }
+
+            // Buffer cleanup when all subscribers have advanced past threshold
+            if !cursors.is_empty() {
+                let min_cursor = *cursors.values().min().unwrap_or(&0);
+                if min_cursor >= CLEANUP_THRESHOLD {
+                    println!("[DEBUG LazyValueActor] Cleaning buffer, min_cursor={}", min_cursor);
+                    // Remove consumed values from buffer
+                    buffer.drain(0..min_cursor);
+                    // Adjust all cursors
+                    for c in cursors.values_mut() {
+                        *c -= min_cursor;
+                    }
+                }
+            }
+
+            // Send response to subscriber
+            let _ = request.response_tx.send(value);
+        }
+
+        if LOG_DROPS_AND_LOOP_ENDS {
+            println!("LazyValueActor loop ended: {}", construct_info);
+        }
+    }
+
+    /// Subscribe to this lazy actor's values.
+    ///
+    /// Returns a stream that pulls values on demand.
+    /// Each call to .next() on the stream will request the next value from the actor.
+    pub fn subscribe(self: Arc<Self>) -> LazySubscription {
+        let subscriber_id = self.subscriber_counter.fetch_add(1, Ordering::SeqCst);
+        println!("[DEBUG LazyValueActor] New subscription, subscriber_id={}, construct={}",
+            subscriber_id, self.construct_info.description);
+        LazySubscription {
+            actor: self,
+            subscriber_id,
+            pending_response: None,
+        }
+    }
+
+    /// Get construct info for debugging.
+    pub fn construct_info(&self) -> &ConstructInfoComplete {
+        &self.construct_info
+    }
+}
+
+impl Drop for LazyValueActor {
+    fn drop(&mut self) {
+        if LOG_DROPS_AND_LOOP_ENDS {
+            println!("Dropped LazyValueActor: {}", self.construct_info);
+        }
+    }
+}
+
+/// Subscription to a LazyValueActor.
+///
+/// Each .next() call sends a request to the actor and awaits the response.
+/// This implements pull-based (demand-driven) semantics.
+pub struct LazySubscription {
+    actor: Arc<LazyValueActor>,
+    subscriber_id: usize,
+    /// Stores the pending response receiver when a request is in-flight.
+    /// This prevents creating duplicate requests on repeated polls.
+    pending_response: Option<oneshot::Receiver<Option<Value>>>,
+}
+
+impl Stream for LazySubscription {
+    type Item = Value;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // We need to send a request and poll the response.
+        // We store the pending receiver to avoid creating duplicate requests on repeated polls.
+        let this = self.get_mut();
+
+        // If we have a pending response, poll it first
+        if let Some(ref mut response_rx) = this.pending_response {
+            match Pin::new(response_rx).poll(cx) {
+                Poll::Ready(Ok(value)) => {
+                    this.pending_response = None; // Clear the pending response
+                    return Poll::Ready(value);
+                }
+                Poll::Ready(Err(_)) => {
+                    this.pending_response = None;
+                    return Poll::Ready(None); // Channel closed
+                }
+                Poll::Pending => {
+                    // Keep the pending response for the next poll
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        // No pending response, create a new request
+        let (response_tx, response_rx) = oneshot::channel();
+        let request = LazyValueRequest {
+            subscriber_id: this.subscriber_id,
+            response_tx,
+        };
+
+        // Try to send the request
+        if this.actor.request_tx.unbounded_send(request).is_err() {
+            // Actor dropped
+            return Poll::Ready(None);
+        }
+
+        // Store the pending response and poll it
+        this.pending_response = Some(response_rx);
+
+        // Poll the newly created response receiver
+        if let Some(ref mut response_rx) = this.pending_response {
+            match Pin::new(response_rx).poll(cx) {
+                Poll::Ready(Ok(value)) => {
+                    this.pending_response = None;
+                    Poll::Ready(value)
+                }
+                Poll::Ready(Err(_)) => {
+                    this.pending_response = None;
+                    Poll::Ready(None) // Channel closed
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            // Should never happen since we just set it
+            Poll::Pending
+        }
     }
 }
 
@@ -632,6 +884,12 @@ pub struct ActorContext {
     /// Uses Rc (not Arc) since the engine runs single-threaded in WASM.
     /// This allows capturing non-Send/Sync types like ValueActor.
     pub hold_state_update_callback: Option<Rc<dyn Fn(Value)>>,
+    /// When true, expression evaluation creates LazyValueActors instead of eager ValueActors.
+    /// Lazy actors only poll their source stream when a subscriber requests values (demand-driven).
+    /// This is set by HOLD for body evaluation to ensure sequential state updates:
+    /// each pulse from Stream/pulses is pulled one at a time, state is updated between each.
+    /// Default: false (normal eager evaluation).
+    pub use_lazy_actors: bool,
 }
 
 // --- ActorOutputValveSignal ---
@@ -749,6 +1007,7 @@ pub enum ConstructType {
     LatestCombinator,
     ThenCombinator,
     ValueActor,
+    LazyValueActor,
     Object,
     TaggedObject,
     Text,
@@ -1323,13 +1582,25 @@ impl FunctionCall {
         // Combined stream is infinite (subscriptions never terminate first)
         // Keep arguments alive as explicit dependencies
         let inputs: Vec<Arc<ValueActor>> = arguments.iter().cloned().collect();
-        Arc::new(ValueActor::new_with_inputs(
-            construct_info,
-            actor_context,
-            TypedStream::infinite(combined_stream),
-            None,
-            inputs,
-        ))
+
+        // In lazy mode, use LazyValueActor for demand-driven evaluation.
+        // This is critical for HOLD body context where sequential state updates are needed.
+        if actor_context.use_lazy_actors {
+            ValueActor::new_arc_lazy(
+                construct_info,
+                combined_stream,
+                None,
+                inputs,
+            )
+        } else {
+            Arc::new(ValueActor::new_with_inputs(
+                construct_info,
+                actor_context,
+                TypedStream::infinite(combined_stream),
+                None,
+                inputs,
+            ))
+        }
     }
 }
 
@@ -2118,6 +2389,11 @@ pub struct ValueActor {
 
     /// The actor's internal task.
     loop_task: TaskHandle,
+
+    /// Optional lazy delegate for demand-driven evaluation.
+    /// When Some, subscribe() delegates to this lazy actor instead of the normal subscription.
+    /// Used in HOLD body context where lazy evaluation is needed for sequential state updates.
+    lazy_delegate: Option<Arc<LazyValueActor>>,
 }
 
 impl ValueActor {
@@ -2397,6 +2673,7 @@ impl ValueActor {
             notify_sender_sender,
             notify_senders,
             loop_task,
+            lazy_delegate: None,
         }
     }
 
@@ -2434,6 +2711,54 @@ impl ValueActor {
             persistence_id,
             inputs,
         ))
+    }
+
+    /// Create a ValueActor that delegates to a LazyValueActor for demand-driven evaluation.
+    ///
+    /// Used in HOLD body context where lazy evaluation is needed for sequential state updates.
+    /// The returned ValueActor is a shell that forwards subscribe_boxed() calls to the lazy actor.
+    ///
+    /// Note: The shell actor doesn't have its own loop - all subscription happens through
+    /// the lazy delegate. The shell exists so the return type is Arc<ValueActor>.
+    pub fn new_arc_lazy<S: Stream<Item = Value> + 'static>(
+        construct_info: ConstructInfoComplete,
+        value_stream: S,
+        persistence_id: Option<parser::PersistenceId>,
+        inputs: Vec<Arc<ValueActor>>,
+    ) -> Arc<Self> {
+        // Create the lazy actor that does the actual work
+        let lazy_actor = Arc::new(LazyValueActor::new(
+            construct_info.clone(),
+            value_stream,
+            inputs.clone(),
+        ));
+
+        // Create a shell ValueActor with a constant empty stream (it won't be used)
+        // The lazy_delegate will handle all subscriptions
+        let construct_info = Arc::new(construct_info);
+        let (message_sender, _message_receiver) = mpsc::unbounded::<ActorMessage>();
+        let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(None));
+        let current_version = Arc::new(AtomicU64::new(0));
+        let (notify_sender_sender, _notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
+        let value_history = Arc::new(std::sync::Mutex::new(ValueHistory::new(64)));
+        let notify_senders = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Create a no-op task (the lazy delegate owns the real processing)
+        let loop_task = Task::start_droppable(async {});
+
+        Arc::new(Self {
+            construct_info,
+            persistence_id,
+            message_sender,
+            inputs,
+            current_value,
+            current_version,
+            value_history,
+            notify_sender_sender,
+            notify_senders,
+            loop_task,
+            lazy_delegate: Some(lazy_actor),
+        })
     }
 
     /// Create a new ValueActor with both an initial value and input dependencies.
@@ -2581,6 +2906,7 @@ impl ValueActor {
             notify_sender_sender,
             notify_senders,
             loop_task,
+            lazy_delegate: None,
         }
     }
 
@@ -2600,8 +2926,6 @@ impl ValueActor {
     pub fn get_values_since(&self, since_version: u64) -> (Vec<Value>, Option<u64>) {
         if let Ok(history) = self.value_history.lock() {
             let result = history.get_values_since(since_version);
-            println!("[DEBUG] get_values_since: since_version={}, returned {} values, construct={}",
-                since_version, result.0.len(), self.construct_info.description);
             result
         } else {
             (Vec::new(), None)
@@ -2765,6 +3089,7 @@ impl ValueActor {
             notify_sender_sender,
             notify_senders,
             loop_task,
+            lazy_delegate: None,
         })
     }
 
@@ -2779,7 +3104,6 @@ impl ValueActor {
     /// Used by HOLD to ensure state is visible before next body evaluation.
     /// This also increments the version so subscribers can see the new value.
     pub fn store_value_directly(&self, value: Value) {
-        zoon::println!("*** STORE_VALUE_DIRECTLY CALLED ***");
         // Increment version
         let new_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
         // Store in history
@@ -2788,9 +3112,6 @@ impl ValueActor {
         self.current_value.store(Arc::new(Some(value)));
         // Notify subscribers
         let mut senders = self.notify_senders.lock().unwrap();
-        let num_subscribers = senders.len();
-        zoon::println!("[DEBUG] store_value_directly: version={}, num_subscribers={}, construct={}",
-            new_version, num_subscribers, self.construct_info.description);
         senders.retain_mut(|sender| {
             match sender.try_send(()) {
                 Ok(()) => true,
@@ -2818,9 +3139,7 @@ impl ValueActor {
         let _ = sender.try_send(());
         self.notify_senders.lock().unwrap().push(sender);
 
-        let current_version = self.version();
-        zoon::println!("[DEBUG] subscribe: current_version={}, construct={}",
-            current_version, self.construct_info.description);
+        let _current_version = self.version();
 
         // NOTE: We no longer send to notify_sender_sender because we're registering directly.
         // The main loop's registration logic is now only for actors that don't use
@@ -2839,6 +3158,25 @@ impl ValueActor {
             actor: self,
             pending_values: VecDeque::new(),
         }
+    }
+
+    /// Subscribe and return a boxed stream.
+    ///
+    /// If this ValueActor has a lazy_delegate, returns a demand-driven lazy stream.
+    /// Otherwise returns the normal eager subscription.
+    ///
+    /// Used in HOLD body context where lazy evaluation is needed for sequential state updates.
+    pub fn subscribe_boxed(self: Arc<Self>) -> Pin<Box<dyn Stream<Item = Value>>> {
+        if let Some(ref lazy_delegate) = self.lazy_delegate {
+            Box::pin(lazy_delegate.clone().subscribe())
+        } else {
+            Box::pin(self.subscribe())
+        }
+    }
+
+    /// Check if this actor has a lazy delegate.
+    pub fn has_lazy_delegate(&self) -> bool {
+        self.lazy_delegate.is_some()
     }
 
     /// Get optimal update for subscriber at given version.

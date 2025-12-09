@@ -326,3 +326,44 @@ API functions that return streams should:
 - **No "sync processing" hacks** - Don't try to process initial values synchronously before returning a stream
 - **Use channels for synchronous-like behavior** - If you need to ensure ordering or immediate processing, use mpsc channels and let the async runtime handle scheduling
 - **Reason**: Sync operations assume single-threaded execution. Boon's actor model must work across threads, processes, and network boundaries
+
+### Lazy vs Eager Evaluation (LazyValueActor)
+
+**The Problem**: ValueActor eagerly polls its source stream in an internal loop, decoupling producers from consumers. This breaks sequential state updates in HOLD:
+
+```boon
+[count: 0] |> HOLD state {
+    3 |> Stream/pulses() |> THEN { [count: state.count + 1] }
+}
+```
+
+With eager evaluation, all 3 THEN bodies see `state.count = 0` because they're evaluated before HOLD updates state.
+
+**The Solution**: LazyValueActor provides demand-driven evaluation:
+- Only polls source stream when a subscriber requests a value
+- Uses channels for subscriber ↔ actor communication
+- Buffers values for multiple subscribers with cursor tracking
+
+**When to Use Each Mode**:
+
+| Context | Mode | Reason |
+|---------|------|--------|
+| HOLD body | **Lazy** | Sequential state updates |
+| THEN/WHEN/WHILE body | Lazy | Only evaluate when needed |
+| Top-level variables | Eager | Reactive updates |
+| LATEST inputs | Eager | Must detect any change |
+| Stream/interval | Eager | Time-driven |
+
+**Implementation Details**:
+
+1. **`use_lazy_actors` flag** in `ActorContext` - signals lazy evaluation mode
+2. **`new_arc_lazy()`** constructor - creates ValueActor with lazy delegate
+3. **`subscribe_boxed()`** method - returns lazy subscription if delegate exists
+4. **HOLD sets `use_lazy_actors: true`** for body evaluation (evaluator.rs ~line 2756)
+
+**Key Files**:
+- `engine.rs`: `LazyValueActor` struct, `subscribe_boxed()` method
+- `evaluator.rs`: `build_hold_actor()` uses `subscribe_boxed()` for body
+
+**State Reference in HOLD Body**:
+The `state` variable is a regular eager ValueActor - it reads current stored value. HOLD updates it after each lazy pull from body. This is why lazy body + eager state reference works correctly.

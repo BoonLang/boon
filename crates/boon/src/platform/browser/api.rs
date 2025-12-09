@@ -2053,7 +2053,6 @@ pub fn function_stream_skip(
     // This ensures the task stops running when switching examples.
     let task_handle_cell: Rc<RefCell<Option<TaskHandle>>> = Rc::new(RefCell::new(None));
     let task_handle = Task::start_droppable(async move {
-        zoon::println!("[DEBUG] Stream/skip: Task started");
         loop {
             select! {
                 count_value = count_sub.next() => {
@@ -2063,7 +2062,6 @@ pub fn function_stream_skip(
                                 Value::Number(num, _) => num.number() as usize,
                                 _ => 0,
                             };
-                            zoon::println!("[DEBUG] Stream/skip: received count={}, buffered_values={}", current_skip_count, buffered_values.len());
 
                             if count_received {
                                 // Count changed - reset skip counter
@@ -2071,13 +2069,10 @@ pub fn function_stream_skip(
                             } else {
                                 // First count received - process buffered values
                                 count_received = true;
-                                zoon::println!("[DEBUG] Stream/skip: processing {} buffered values", buffered_values.len());
                                 for buffered in buffered_values.drain(..) {
                                     if skipped < current_skip_count {
                                         skipped += 1;
-                                        zoon::println!("[DEBUG] Stream/skip: skipping buffered value, skipped={}", skipped);
                                     } else {
-                                        zoon::println!("[DEBUG] Stream/skip: sending buffered value");
                                         let _ = tx.unbounded_send(buffered);
                                     }
                                 }
@@ -2089,17 +2084,14 @@ pub fn function_stream_skip(
                 stream_value = stream_sub.next() => {
                     match stream_value {
                         Some(value) => {
-                            zoon::println!("[DEBUG] Stream/skip: received stream value, count_received={}, skipped={}", count_received, skipped);
                             if !count_received {
                                 // Buffer values until we know the count
                                 buffered_values.push(value);
                             } else {
                                 if skipped < current_skip_count {
                                     skipped += 1;
-                                    zoon::println!("[DEBUG] Stream/skip: skipping value, skipped={}", skipped);
                                 } else {
                                     // Debug: print value construct_info
-                                    zoon::println!("[DEBUG] Stream/skip: sending value with construct_info: {}", value.construct_info());
                                     let _ = tx.unbounded_send(value);
                                 }
                             }
@@ -2110,7 +2102,6 @@ pub fn function_stream_skip(
                 complete => break,
             }
         }
-        zoon::println!("[DEBUG] Stream/skip: Task ended");
     });
     *task_handle_cell.borrow_mut() = Some(task_handle);
 

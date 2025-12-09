@@ -128,6 +128,17 @@ impl EvaluationContext {
         })
     }
 
+    /// Create a derived context with lazy actor mode.
+    /// When use_lazy_actors is true, expression evaluation creates LazyValueActors
+    /// instead of eager ValueActors. Lazy actors only poll their source stream
+    /// when a subscriber requests values (demand-driven).
+    pub fn with_lazy_actors(&self, use_lazy_actors: bool) -> Self {
+        self.with_actor_context(ActorContext {
+            use_lazy_actors,
+            ..self.actor_context.clone()
+        })
+    }
+
     /// Try to upgrade the weak reference_connector to a strong Arc.
     /// Returns None if the connector has been dropped (program shutting down).
     pub fn try_reference_connector(&self) -> Option<Arc<ReferenceConnector>> {
@@ -394,31 +405,22 @@ pub fn evaluate_expression(
     let final_slot = state.alloc_slot();
 
     // Debug: log the expression type
-    zoon::println!("[DEBUG] evaluate_expression: {:?}", std::mem::discriminant(&expression.node));
 
     // Schedule the root expression
     schedule_expression(&mut state, expression, ctx, final_slot)?;
 
-    // Debug: log state after scheduling
-    zoon::println!("[DEBUG] After scheduling: queue_len={}, results_len={}, next_slot={}",
-        state.work_queue.len(), state.results.len(), state.next_slot);
-
     // Process work items until the queue is empty
     while let Some(item) = state.pop() {
-        zoon::println!("[DEBUG] Processing work item: {}", item.debug_name());
         process_work_item(&mut state, item)?;
-        zoon::println!("[DEBUG] After processing: results_len={}", state.results.len());
     }
 
     // Get the final result - SKIP returns None (no actor)
-    zoon::println!("[DEBUG] Getting final result from slot {}", final_slot);
     match state.get(final_slot) {
         Some(actor) => Ok(Some(actor)),
         None => {
             // SKIP evaluated - return None to signal "no value"
             // Callers handle this by returning stream::empty() (for THEN/WHEN/WHILE)
             // or by not updating state (for HOLD), etc.
-            zoon::println!("[DEBUG] Expression evaluated to SKIP - returning None");
             Ok(None)
         }
     }
@@ -452,7 +454,6 @@ fn schedule_expression(
     let idempotency_key = persistence_id;
 
     // Debug: log every expression type being scheduled
-    zoon::println!("[DEBUG] schedule_expression: {:?}", std::mem::discriminant(&expr));
 
     match expr {
         // ============================================================
@@ -591,7 +592,6 @@ fn schedule_expression(
         }
 
         static_expression::Expression::When { arms } => {
-            zoon::println!("[DEBUG] schedule_expression: WHEN - about to call build_when_actor, arms.len()={}", arms.len());
             let actor = build_when_actor(
                 arms,
                 span,
@@ -599,7 +599,6 @@ fn schedule_expression(
                 persistence_id,
                 ctx,
             )?;
-            zoon::println!("[DEBUG] schedule_expression: WHEN - build_when_actor succeeded, storing result");
             state.store(result_slot, actor);
         }
 
@@ -640,12 +639,10 @@ fn schedule_expression(
         // ============================================================
 
         static_expression::Expression::Pipe { from, to } => {
-            zoon::println!("[DEBUG] PIPE: handling Pipe expression");
             // Flatten nested pipes into a chain
             let mut steps = Vec::new();
             collect_pipe_steps(*from, &mut steps);
             steps.push(*to);
-            zoon::println!("[DEBUG] PIPE: steps.len()={}", steps.len());
 
             if steps.is_empty() {
                 return Err("Empty pipe chain".to_string());
@@ -654,7 +651,6 @@ fn schedule_expression(
             // Extract first step (to be scheduled last for LIFO)
             let first_step = steps.remove(0);
             let first_slot = state.alloc_slot();
-            zoon::println!("[DEBUG] PIPE: first_slot={:?}, remaining steps={}", first_slot, steps.len());
 
             // First pass: allocate slots and collect EvaluateWithPiped items
             let mut pipe_items = Vec::new();
@@ -663,7 +659,6 @@ fn schedule_expression(
             for (i, step) in steps.into_iter().enumerate() {
                 let is_last = i == steps_len - 1;
                 let step_slot = if is_last { result_slot } else { state.alloc_slot() };
-                zoon::println!("[DEBUG] PIPE: step[{}] type={:?}, prev_slot={:?}, step_slot={:?}", i, std::mem::discriminant(&step.node), prev_slot, step_slot);
 
                 pipe_items.push((step, prev_slot, step_slot));
                 prev_slot = step_slot;
@@ -671,7 +666,6 @@ fn schedule_expression(
 
             // Push EvaluateWithPiped items in REVERSE order (last step first)
             // so LIFO processes them in correct order
-            zoon::println!("[DEBUG] PIPE: pushing {} EvaluateWithPiped items", pipe_items.len());
             for (step, prev, step_slot) in pipe_items.into_iter().rev() {
                 state.push(WorkItem::EvaluateWithPiped {
                     expr: step,
@@ -682,7 +676,6 @@ fn schedule_expression(
             }
 
             // Schedule first step LAST (will be processed first due to LIFO)
-            zoon::println!("[DEBUG] PIPE: scheduling first_step");
             schedule_expression(state, first_step, ctx.clone(), first_slot)?;
         }
 
@@ -691,7 +684,6 @@ fn schedule_expression(
         // ============================================================
 
         static_expression::Expression::Block { variables, output } => {
-            zoon::println!("[DEBUG] BLOCK: handling Block expression, variables.len()={}, output type={:?}", variables.len(), std::mem::discriminant(&output.node));
             // Build object from variables first, then evaluate output
             // Use separate slots for the object and the output expression
             let object_slot = state.alloc_slot();
@@ -831,7 +823,7 @@ fn schedule_expression(
 
                 // Collect for later scheduling (skip Link)
                 if !is_link {
-                    vars_to_schedule.push((var.node.value, var_slot));
+                    vars_to_schedule.push((var.node.value, var_slot, is_referenced));
                 }
             }
 
@@ -844,9 +836,21 @@ fn schedule_expression(
                 result_slot,
             });
 
-            // Schedule variable expressions last (will be processed first due to LIFO)
-            for (var_expr, var_slot) in vars_to_schedule {
-                schedule_expression(state, var_expr, ctx.clone(), var_slot)?;
+            // Schedule variable expressions: referenced fields LAST so they're processed FIRST (LIFO).
+            // This ensures that when `count: prev + 1` is evaluated, the `prev` field's forwarding
+            // actor already has its value, because `prev: state.count` was processed first.
+
+            // First: schedule NON-referenced fields (processed last due to LIFO)
+            for (var_expr, var_slot, is_referenced) in vars_to_schedule.iter() {
+                if !*is_referenced {
+                    schedule_expression(state, var_expr.clone(), ctx.clone(), *var_slot)?;
+                }
+            }
+            // Last: schedule referenced fields (processed first due to LIFO)
+            for (var_expr, var_slot, is_referenced) in vars_to_schedule {
+                if is_referenced {
+                    schedule_expression(state, var_expr, ctx.clone(), var_slot)?;
+                }
             }
         }
 
@@ -898,7 +902,7 @@ fn schedule_expression(
 
                 // Collect for later scheduling (skip Link)
                 if !is_link {
-                    vars_to_schedule.push((var.node.value, var_slot));
+                    vars_to_schedule.push((var.node.value, var_slot, is_referenced));
                 }
             }
 
@@ -912,9 +916,21 @@ fn schedule_expression(
                 result_slot,
             });
 
-            // Schedule variable expressions last (will be processed first due to LIFO)
-            for (var_expr, var_slot) in vars_to_schedule {
-                schedule_expression(state, var_expr, ctx.clone(), var_slot)?;
+            // Schedule variable expressions: referenced fields LAST so they're processed FIRST (LIFO).
+            // This ensures that when `count: prev + 1` is evaluated, the `prev` field's forwarding
+            // actor already has its value, because `prev: state.count` was processed first.
+
+            // First: schedule NON-referenced fields (processed last due to LIFO)
+            for (var_expr, var_slot, is_referenced) in vars_to_schedule.iter() {
+                if !*is_referenced {
+                    schedule_expression(state, var_expr.clone(), ctx.clone(), *var_slot)?;
+                }
+            }
+            // Last: schedule referenced fields (processed first due to LIFO)
+            for (var_expr, var_slot, is_referenced) in vars_to_schedule {
+                if is_referenced {
+                    schedule_expression(state, var_expr, ctx.clone(), var_slot)?;
+                }
             }
         }
 
@@ -1324,6 +1340,15 @@ fn process_work_item(
                     // Spawn a task to forward values from the expression's actor to the channel
                     let Some(source_actor) = state.get(vd.value_slot) else { continue; };
                     let sender = sender.clone();
+
+                    // CRITICAL: Send initial value synchronously BEFORE starting the async task.
+                    // This ensures intra-object field references (e.g., `[a: 1, b: a + 1]`) work
+                    // correctly, because the forwarding actor needs to have a value before
+                    // other field expressions try to subscribe to it.
+                    if let Some(initial_value) = source_actor.stored_value() {
+                        let _ = sender.unbounded_send(initial_value);
+                    }
+
                     let source_actor_clone = source_actor.clone();
                     let forwarding_task = Task::start_droppable(async move {
                         let mut subscription = source_actor_clone.subscribe();
@@ -1392,7 +1417,6 @@ fn process_work_item(
                 ctx.actor_context,
                 variables,
             );
-            zoon::println!("[DEBUG] BuildObject: stored to slot {:?}", result_slot);
             state.store(result_slot, actor);
         }
 
@@ -1420,6 +1444,15 @@ fn process_work_item(
                     // Spawn a task to forward values from the expression's actor to the channel
                     let Some(source_actor) = state.get(vd.value_slot) else { continue; };
                     let sender = sender.clone();
+
+                    // CRITICAL: Send initial value synchronously BEFORE starting the async task.
+                    // This ensures intra-object field references (e.g., `[a: 1, b: a + 1]`) work
+                    // correctly, because the forwarding actor needs to have a value before
+                    // other field expressions try to subscribe to it.
+                    if let Some(initial_value) = source_actor.stored_value() {
+                        let _ = sender.unbounded_send(initial_value);
+                    }
+
                     let source_actor_clone = source_actor.clone();
                     let forwarding_task = Task::start_droppable(async move {
                         let mut subscription = source_actor_clone.subscribe();
@@ -1531,15 +1564,12 @@ fn process_work_item(
         }
 
         WorkItem::BuildHold { initial_slot, state_param, body, span, persistence, ctx, result_slot } => {
-            zoon::println!("[DEBUG] BuildHold: initial_slot={:?}, result_slot={:?}", initial_slot, result_slot);
             // If initial value slot is empty, produce nothing
             let Some(initial_actor) = state.get(initial_slot) else {
-                zoon::println!("[DEBUG] BuildHold: initial_slot EMPTY, skipping!");
                 return Ok(());
             };
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
             if let Some(actor) = build_hold_actor(initial_actor, state_param, *body, span, persistence, persistence_id, ctx)? {
-                zoon::println!("[DEBUG] BuildHold: stored to slot {:?}", result_slot);
                 state.store(result_slot, actor);
             }
         }
@@ -1582,14 +1612,10 @@ fn process_work_item(
         }
 
         WorkItem::EvaluateWithPiped { expr, prev_slot, ctx, result_slot } => {
-            zoon::println!("[DEBUG] EvaluateWithPiped: prev_slot={:?}, has_value={}", prev_slot, state.get(prev_slot).is_some());
-            zoon::println!("[DEBUG] EvaluateWithPiped: expr type={:?}", std::mem::discriminant(&expr.node));
             // If piped value slot is empty, produce nothing
             let Some(prev_actor) = state.get(prev_slot) else {
-                zoon::println!("[DEBUG] EvaluateWithPiped: prev_slot EMPTY, skipping!");
                 return Ok(());
             };
-            zoon::println!("[DEBUG] EvaluateWithPiped: prev_slot has actor, proceeding");
             let new_ctx = ctx.with_piped(prev_actor);
 
             // Check if expression is a FunctionCall - these should consume the piped value
@@ -1687,6 +1713,7 @@ fn process_work_item(
                             sequential_processing: ctx.actor_context.sequential_processing,
                             backpressure_permit: ctx.actor_context.backpressure_permit,
                             hold_state_update_callback: ctx.actor_context.hold_state_update_callback,
+                            use_lazy_actors: ctx.actor_context.use_lazy_actors,
                         },
                         reference_connector: ctx.reference_connector,
                         link_connector: ctx.link_connector,
@@ -1853,9 +1880,7 @@ fn build_then_actor(
             // completes before we read state for the next iteration. Without this,
             // all pulses would run in parallel reading the same initial state.
             if let Some(ref permit) = permit_clone {
-                zoon::println!("[DEBUG] THEN: acquiring backpressure permit...");
                 permit.acquire().await;
-                zoon::println!("[DEBUG] THEN: backpressure permit acquired!");
             }
 
             let value_actor = ValueActor::new_arc(
@@ -1889,8 +1914,6 @@ fn build_then_actor(
                 .filter_map(|(name, actor)| {
                     // Create a constant actor from the current stored value
                     if let Some(current_value) = actor.stored_value() {
-                        zoon::println!("[DEBUG] THEN: freezing parameter '{}' with value at version {}",
-                            name, actor.version());
                         let frozen_actor = ValueActor::new_arc(
                             ConstructInfo::new(
                                 format!("frozen param: {name}"),
@@ -1904,7 +1927,6 @@ fn build_then_actor(
                         Some((name.clone(), frozen_actor))
                     } else {
                         // No value yet, keep original actor
-                        zoon::println!("[DEBUG] THEN: parameter '{}' has no value, keeping original", name);
                         Some((name.clone(), actor.clone()))
                     }
                 })
@@ -1919,6 +1941,7 @@ fn build_then_actor(
                 backpressure_permit: actor_context_clone.backpressure_permit.clone(),
                 // Don't propagate callback to body - body evaluation is internal
                 hold_state_update_callback: None,
+                use_lazy_actors: actor_context_clone.use_lazy_actors,
             };
 
             let new_ctx = EvaluationContext {
@@ -1955,7 +1978,6 @@ fn build_then_actor(
                         // This updates state_actor and releases the permit BEFORE this stream yields,
                         // enabling the next pulse to be processed synchronously during eager polling.
                         if let Some(ref callback) = hold_callback_for_map {
-                            zoon::println!("[DEBUG] THEN: calling hold_state_update_callback synchronously");
                             callback(result_value.clone());
                         }
                         result_value
@@ -1988,13 +2010,10 @@ fn build_then_actor(
 
     let initial_version = piped.version();
     let (initial_piped_values, _oldest) = piped.get_values_since(0);
-    zoon::println!("[DEBUG] THEN: processing {} initial piped values synchronously (version {})",
-        initial_piped_values.len(), initial_version);
 
     // Evaluate body for each initial piped value synchronously
     let mut initial_results: Vec<Value> = Vec::new();
     for (idx, input_value) in initial_piped_values.into_iter().enumerate() {
-        zoon::println!("[DEBUG] THEN: evaluating body for initial value {}", idx);
 
         // Create frozen parameters for SNAPSHOT semantics
         let frozen_parameters: HashMap<String, Arc<ValueActor>> = ctx.actor_context.parameters
@@ -2038,6 +2057,7 @@ fn build_then_actor(
             sequential_processing: ctx.actor_context.sequential_processing,
             backpressure_permit: ctx.actor_context.backpressure_permit.clone(),
             hold_state_update_callback: None,
+            use_lazy_actors: ctx.actor_context.use_lazy_actors,
         };
 
         let sync_ctx = EvaluationContext {
@@ -2061,30 +2081,24 @@ fn build_then_actor(
             Ok(Some(result_actor)) => {
                 // Due to ValueActor's eager polling, result_actor should have stored value
                 if let Some(mut result_value) = result_actor.stored_value() {
-                    zoon::println!("[DEBUG] THEN: got synchronous result for initial value {}", idx);
                     result_value.set_idempotency_key(ValueIdempotencyKey::new());
 
                     // Call HOLD's callback if present (for state updates)
                     if let Some(ref callback) = hold_callback_for_sync {
-                        zoon::println!("[DEBUG] THEN: calling hold_state_update_callback for initial value {}", idx);
                         callback(result_value.clone());
                     }
 
                     initial_results.push(result_value);
                 } else {
-                    zoon::println!("[DEBUG] THEN: no stored value for initial value {} - body may be async", idx);
                 }
             }
             Ok(None) => {
-                zoon::println!("[DEBUG] THEN: SKIP for initial value {}", idx);
             }
             Err(e) => {
-                zoon::println!("[DEBUG] THEN: error for initial value {}: {}", idx, e);
             }
         }
     }
 
-    zoon::println!("[DEBUG] THEN: produced {} initial results synchronously", initial_results.len());
 
     // =========================================================================
     // REACTIVE SUBSCRIPTION (for future values)
@@ -2096,39 +2110,77 @@ fn build_then_actor(
     // Clone piped for the filter closure
     let piped_for_filter = piped.clone();
 
+    // When use_lazy_actors is true and piped has a lazy delegate, use subscribe_boxed()
+    // to get lazy subscription (pull-based). Otherwise use regular subscribe() (eager).
+    let use_lazy_subscription = ctx.actor_context.use_lazy_actors && piped.has_lazy_delegate();
+
     let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if backpressure_permit.is_some() || sequential {
         // For sequential mode, use regular flatten (processes one stream at a time)
         // Skip values we already processed synchronously
-        let stream = piped.clone().subscribe()
-            .filter(move |_| zoon::future::ready(piped_for_filter.version() > initial_version))
-            .then(eval_body)
-            .flatten();
-        // Chain initial synchronous results with reactive subscription
-        Box::pin(stream::iter(initial_results).chain(stream))
+        if use_lazy_subscription {
+            // For LAZY subscription: NO filter needed!
+            // LazyValueActor doesn't eagerly buffer values, so there are no "initial values"
+            // to skip. The filter `version > initial_version` would ALWAYS fail because
+            // LazyValueActor's shell ValueActor has version=0 (never updated).
+            // All values will be pulled on demand.
+            let stream = piped.clone().subscribe_boxed()
+                .then(eval_body)
+                .flatten();
+            Box::pin(stream)
+        } else {
+            let stream = piped.clone().subscribe()
+                .filter(move |_| zoon::future::ready(piped_for_filter.version() > initial_version))
+                .then(eval_body)
+                .flatten();
+            // Chain initial synchronous results with reactive subscription
+            Box::pin(stream::iter(initial_results).chain(stream))
+        }
     } else {
         // Clone piped_for_filter for the concurrent branch
         let piped_for_filter_concurrent = piped.clone();
         // For non-sequential mode, use flatten_unordered for concurrent processing
-        let stream = piped.clone().subscribe()
-            .filter(move |_| zoon::future::ready(piped_for_filter_concurrent.version() > initial_version))
-            .then(eval_body)
-            .flatten_unordered(None);
-        // Chain initial synchronous results with reactive subscription
-        Box::pin(stream::iter(initial_results).chain(stream))
+        if use_lazy_subscription {
+            // For LAZY subscription: NO filter needed (see comment above)
+            let stream = piped.clone().subscribe_boxed()
+                .then(eval_body)
+                .flatten_unordered(None);
+            Box::pin(stream)
+        } else {
+            let stream = piped.clone().subscribe()
+                .filter(move |_| zoon::future::ready(piped_for_filter_concurrent.version() > initial_version))
+                .then(eval_body)
+                .flatten_unordered(None);
+            // Chain initial synchronous results with reactive subscription
+            Box::pin(stream::iter(initial_results).chain(stream))
+        }
     };
 
     // Keep the piped actor alive by including it in inputs
-    Ok(ValueActor::new_arc_with_inputs(
-        ConstructInfo::new(
-            format!("PersistenceId: {persistence_id}"),
-            persistence,
-            format!("{span}; THEN {{..}}"),
-        ),
-        ctx.actor_context,
-        TypedStream::infinite(flattened_stream),
-        Some(persistence_id),
-        vec![piped],  // Keep piped actor alive
-    ))
+    // Use lazy actor construction when in HOLD body context for sequential state updates
+    if ctx.actor_context.use_lazy_actors {
+        Ok(ValueActor::new_arc_lazy(
+            ConstructInfo::new(
+                format!("PersistenceId: {persistence_id}"),
+                persistence,
+                format!("{span}; THEN {{..}}"),
+            ).complete(ConstructType::ValueActor),
+            flattened_stream,
+            Some(persistence_id),
+            vec![piped],  // Keep piped actor alive
+        ))
+    } else {
+        Ok(ValueActor::new_arc_with_inputs(
+            ConstructInfo::new(
+                format!("PersistenceId: {persistence_id}"),
+                persistence,
+                format!("{span}; THEN {{..}}"),
+            ),
+            ctx.actor_context,
+            TypedStream::infinite(flattened_stream),
+            Some(persistence_id),
+            vec![piped],  // Keep piped actor alive
+        ))
+    }
 }
 
 /// Build a WHEN actor (pattern matching on piped values).
@@ -2139,7 +2191,6 @@ fn build_when_actor(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
 ) -> Result<Arc<ValueActor>, String> {
-    zoon::println!("[DEBUG] build_when_actor CALLED");
     let piped = ctx.actor_context.piped.clone()
         .ok_or("WHEN requires a piped value")?;
 
@@ -2238,6 +2289,7 @@ fn build_when_actor(
                         backpressure_permit: actor_context_clone.backpressure_permit.clone(),
                         // Don't propagate HOLD callback into WHEN arms - each arm is a separate evaluation
                         hold_state_update_callback: None,
+                        use_lazy_actors: actor_context_clone.use_lazy_actors,
                     };
 
                     let new_ctx = EvaluationContext {
@@ -2400,6 +2452,7 @@ fn build_while_actor(
                     backpressure_permit: actor_context_clone.backpressure_permit.clone(),
                     // Propagate HOLD callback through WHILE arms - body might need it
                     hold_state_update_callback: actor_context_clone.hold_state_update_callback.clone(),
+                    use_lazy_actors: actor_context_clone.use_lazy_actors,
                 };
 
                 let new_ctx = EvaluationContext {
@@ -2453,6 +2506,39 @@ fn build_while_actor(
     ))
 }
 
+/// Synchronously extract a field value from a Value following a path of field names.
+/// Returns None if the path cannot be fully resolved (e.g., non-object value, missing field).
+fn extract_field_path(value: &Value, path: &[String]) -> Option<Value> {
+    let mut current = value.clone();
+    for field_name in path {
+        match &current {
+            Value::Object(object, _) => {
+                let variable_actor = object.expect_variable(field_name).value_actor();
+                if let Some(val) = variable_actor.stored_value() {
+                    current = val;
+                } else {
+                    // Field actor doesn't have a stored value yet
+                    return None;
+                }
+            }
+            Value::TaggedObject(tagged_object, _) => {
+                let variable_actor = tagged_object.expect_variable(field_name).value_actor();
+                if let Some(val) = variable_actor.stored_value() {
+                    current = val;
+                } else {
+                    // Field actor doesn't have a stored value yet
+                    return None;
+                }
+            }
+            _ => {
+                // Not an object - cannot extract field
+                return None;
+            }
+        }
+    }
+    Some(current)
+}
+
 /// Build a FieldAccess actor (.field.subfield at pipe position).
 /// FieldAccess: `stream |> .field.subfield`
 /// Equivalent to: `stream |> WHILE { value => value.field.subfield }`
@@ -2470,15 +2556,33 @@ fn build_field_access_actor(
 
     // Keep path for display in ConstructInfo
     let path_display = path.join(".");
-    let path_strings = path;
+    let path_strings = path.clone();
 
-    // Start with the piped value's subscription
-    let mut value_stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(piped.clone().subscribe());
+    // CRITICAL: Emit initial value synchronously if piped has a stored value.
+    // This ensures intra-object field references work correctly because the
+    // FieldAccess result is available immediately during synchronous evaluation.
+    let initial_version = piped.version();
+    let initial_value: Option<Value> = if let Some(source_value) = piped.stored_value() {
+        // Synchronously extract the field value from the stored source
+        extract_field_path(&source_value, &path)
+    } else {
+        None
+    };
 
-    // For each field in the path, transform the stream to extract that field
+    // Build the subscription stream that handles future updates (with field extraction)
+    let piped_for_filter = piped.clone();
+    let mut subscription_stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(
+        piped.clone().subscribe()
+            .filter(move |_| {
+                // Skip versions we already processed synchronously
+                zoon::future::ready(piped_for_filter.version() > initial_version)
+            })
+    );
+
+    // For each field in the path, transform the subscription stream to extract that field
     for field_name in path_strings {
-        value_stream = Box::pin(
-            value_stream
+        subscription_stream = Box::pin(
+            subscription_stream
                 .filter_map(move |value| {
                     let field_name = field_name.clone();
                     async move {
@@ -2518,6 +2622,11 @@ fn build_field_access_actor(
         );
     }
 
+    // Combine: emit initial value synchronously first, then follow with subscription stream
+    let combined_stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(
+        stream::iter(initial_value.into_iter()).chain(subscription_stream)
+    );
+
     // Keep the piped actor alive by including it in inputs
     Ok(ValueActor::new_arc_with_inputs(
         ConstructInfo::new(
@@ -2526,7 +2635,7 @@ fn build_field_access_actor(
             format!("{span}; .{path_display}"),
         ),
         ctx.actor_context,
-        TypedStream::infinite(value_stream),
+        TypedStream::infinite(combined_stream),
         Some(persistence_id),
         vec![piped],  // Keep piped actor alive
     ))
@@ -2548,7 +2657,6 @@ fn build_hold_actor(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
 ) -> Result<Option<Arc<ValueActor>>, String> {
-    zoon::println!("[DEBUG] build_hold_actor: state_param={state_param}, span={span:?}");
     // Use a channel to hold current state value and broadcast updates
     let (state_sender, state_receiver) = zoon::futures_channel::mpsc::unbounded::<Value>();
     let state_sender = Rc::new(RefCell::new(state_sender));
@@ -2566,11 +2674,7 @@ fn build_hold_actor(
     // State stream: first value from initial_actor, then updates from state_receiver
     let state_stream = initial_actor.clone().subscribe()
         .take(1)  // Get the first initial value
-        .chain(state_receiver)  // Then listen for updates and resets
-        .inspect(|val| zoon::println!("[DEBUG] state_actor stream: emitting value"));  // Debug log
-
-    zoon::println!("[DEBUG] build_hold_actor: initial_actor version={}",
-        initial_actor.version());
+        .chain(state_receiver);  // Then listen for updates and resets
 
     // Create state actor - initial value will come through the stream asynchronously
     let state_actor = ValueActor::new_arc(
@@ -2595,33 +2699,19 @@ fn build_hold_actor(
 
     // Create backpressure permit for synchronizing THEN with state updates.
     // Initial count = 1 allows first body evaluation to start.
-    // HOLD releases permit after each state update, allowing next body to run.
+    // HOLD's callback releases permit after each state update, allowing next body to run.
     let backpressure_permit = BackpressurePermit::new(1);
-    let permit_for_state_update = backpressure_permit.clone();
     let permit_for_callback = backpressure_permit.clone();
 
-    // Deferred output reference - will be populated after output is created.
-    // This allows the callback to update both state_actor AND output_actor synchronously.
-    let output_weak_for_callback: Rc<RefCell<Option<Weak<ValueActor>>>> = Rc::new(RefCell::new(None));
-    let output_weak_for_callback_clone = output_weak_for_callback.clone();
-
-    // Create callback for THEN to update HOLD's state AND output synchronously.
-    // This enables all pulses to be processed during eager polling in construction,
-    // without waiting for the async Task that normally drives state_update_stream.
+    // Create callback for THEN to update HOLD's state synchronously.
+    // This ensures the next body evaluation sees the updated state.
+    // NOTE: We do NOT store to output here - state_update_stream handles that.
+    // Storing in both places would cause duplicate emissions.
     let hold_state_update_callback: Rc<dyn Fn(Value)> = Rc::new(move |new_value: Value| {
-        zoon::println!("[DEBUG] hold_state_update_callback: updating state synchronously");
         // Update state_actor's stored value directly - THEN will read from here
-        state_actor_for_callback.store_value_directly(new_value.clone());
-        // CRITICAL: Also update output_actor so downstream subscribers see the value immediately
-        if let Some(ref output_weak) = *output_weak_for_callback_clone.borrow() {
-            if let Some(output) = output_weak.upgrade() {
-                zoon::println!("[DEBUG] hold_state_update_callback: updating output synchronously");
-                output.store_value_directly(new_value);
-            }
-        }
+        state_actor_for_callback.store_value_directly(new_value);
         // Release permit to allow THEN to process next input
         permit_for_callback.release();
-        zoon::println!("[DEBUG] hold_state_update_callback: permit released");
     });
 
     let body_actor_context = ActorContext {
@@ -2637,6 +2727,9 @@ fn build_hold_actor(
         backpressure_permit: Some(backpressure_permit),
         // Pass callback to THEN for synchronous state updates during eager polling
         hold_state_update_callback: Some(hold_state_update_callback),
+        // Enable lazy actors in HOLD body for demand-driven evaluation.
+        // This ensures HOLD pulls values one at a time and updates state between each pull.
+        use_lazy_actors: true,
     };
 
     // Create new context for body evaluation
@@ -2662,22 +2755,24 @@ fn build_hold_actor(
     // When body produces new values, update the state
     // Note: We avoid self-reactivity by not triggering body re-evaluation
     // from state changes. Body only evaluates when its event sources fire.
-    let body_subscription = body_result.clone().subscribe();
-    zoon::println!("[DEBUG] HOLD: created body_subscription");
+    //
+    // Use subscribe_boxed() to get lazy subscription if body has lazy_delegate.
+    // This enables demand-driven evaluation where HOLD pulls values one at a time
+    // and updates state between each pull (sequential state updates).
+    let body_subscription = body_result.clone().subscribe_boxed();
     let state_update_stream = body_subscription.map(move |new_value| {
-        zoon::println!("[DEBUG] HOLD state_update_stream: received new_value from body!");
         // Update current state
         *current_state_for_update.borrow_mut() = Some(new_value.clone());
         // Send to state channel so body can see it on next event
         let _ = state_sender_for_update.borrow().unbounded_send(new_value.clone());
         // DIRECTLY update state_actor's stored value - bypass async channel delay.
         // This ensures the next THEN body evaluation reads the fresh state value.
+        // NOTE: The callback already updates state_actor, but we update here too
+        // for cases where the value flows through without callback (e.g., non-THEN body).
         state_actor_for_update.store_value_directly(new_value.clone());
-        // Release permit to allow THEN to process next input.
-        // This guarantees state is updated before next body evaluation starts.
-        zoon::println!("[DEBUG] HOLD state_update_stream: releasing permit");
-        permit_for_state_update.release();
-        zoon::println!("[DEBUG] HOLD state_update_stream: permit released");
+        // NOTE: Do NOT release permit here! The hold_state_update_callback already
+        // releases it after THEN's body evaluation. Releasing twice would cause
+        // permit count to grow, defeating backpressure and allowing parallel processing.
         new_value
     });
 
@@ -2712,23 +2807,12 @@ fn build_hold_actor(
     // even before the Task that drives combined_stream runs.
     // Without this, Stream/skip's task may run before HOLD's task, seeing no values.
     if let Some(initial_value) = initial_actor.stored_value() {
-        zoon::println!("[DEBUG] HOLD: storing initial value synchronously to output");
         output.store_value_directly(initial_value);
     }
 
-    // NOW populate the deferred output reference for the callback.
-    // This enables future THEN callbacks (during eager polling) to update output synchronously.
-    *output_weak_for_callback.borrow_mut() = Some(Arc::downgrade(&output));
-
-    // CRITICAL: Copy any values that body_result already emitted during construction.
-    // During body evaluation, Stream/pulses emits synchronously and THEN processes those pulses.
-    // Those values are now in body_result's history. We need to copy them to output so
-    // downstream subscribers (like Document/new) see them immediately.
-    let (body_values, _version) = body_result.get_values_since(0);
-    zoon::println!("[DEBUG] HOLD: copying {} body values to output synchronously", body_values.len());
-    for value in body_values {
-        output.store_value_directly(value);
-    }
+    // NOTE: We do NOT copy body_result's history here anymore.
+    // The state_update_stream (below) will emit those values when polled, and it calls
+    // store_value_directly() on output. Copying here would cause duplicate emissions.
 
     // Reset/passthrough behavior: ALL emissions from input pass through as HOLD output.
     // First emission: state_actor gets it via take(1), so we don't send to state_receiver.
@@ -2747,11 +2831,9 @@ fn build_hold_actor(
             // First value: just update current_state, don't send to state_receiver
             // (take(1) in state_stream already handles state_actor for first value)
             // NOTE: Don't store to output here - it was already stored synchronously above.
-            zoon::println!("[DEBUG] HOLD: first input value, updating current_state only (already stored sync)");
             *current_state_for_body.borrow_mut() = Some(value.clone());
         } else {
             // Subsequent values (reset): update current_state AND send to state_receiver
-            zoon::println!("[DEBUG] HOLD reset: received reset_value from input");
             *current_state_for_body.borrow_mut() = Some(value.clone());
             let _ = state_sender_for_reset.borrow().unbounded_send(value.clone());
             // Store value directly to output - only for reset values, not initial
@@ -3114,7 +3196,6 @@ fn call_function(
     let func_def_opt = ctx.function_registry.functions.borrow().get(&full_path).cloned();
 
     if let Some(func_def) = func_def_opt {
-        zoon::println!("[DEBUG] call_function: found user-defined function '{}', body type={:?}", full_path, std::mem::discriminant(&func_def.body.node));
         // Create parameters from arguments
         let mut parameters = ctx.actor_context.parameters.clone();
         for (param_name, arg_actor) in arg_map {
@@ -3141,6 +3222,7 @@ fn call_function(
             backpressure_permit: ctx.actor_context.backpressure_permit.clone(),
             // Don't propagate HOLD callback into user-defined functions - they have their own scope
             hold_state_update_callback: None,
+            use_lazy_actors: ctx.actor_context.use_lazy_actors,
         };
 
         let new_ctx = EvaluationContext {
@@ -3153,9 +3235,7 @@ fn call_function(
             source_code: ctx.source_code,
         };
 
-        zoon::println!("[DEBUG] call_function: evaluating function body type={:?}", std::mem::discriminant(&func_def.body.node));
         let result = evaluate_expression(func_def.body, new_ctx);
-        zoon::println!("[DEBUG] call_function: function returned, is_ok={}", result.is_ok());
         // Propagate None (SKIP) from function body
         return result;
     }
@@ -3190,6 +3270,7 @@ fn call_function(
                 backpressure_permit: ctx.actor_context.backpressure_permit.clone(),
                 // Don't propagate HOLD callback into builtin function calls
                 hold_state_update_callback: None,
+                use_lazy_actors: ctx.actor_context.use_lazy_actors,
             };
 
             Ok(Some(FunctionCall::new_arc_value_actor(
@@ -3239,7 +3320,6 @@ async fn match_pattern(
         Value::List(_, _) => "List".to_string(),
         Value::Flushed(_, _) => "Flushed".to_string(),
     };
-    zoon::println!("[DEBUG] match_pattern: pattern={}, value={}", pattern_type, value_type);
 
     match pattern {
         static_expression::Pattern::WildCard => Some(bindings),
@@ -3841,7 +3921,6 @@ fn static_spanned_expression_into_value_actor(
     };
 
     // Delegate to the stack-safe evaluator
-    zoon::println!("[DEBUG] static_spanned_expression_into_value_actor: entering, expr_type={:?}", std::mem::discriminant(&expression.node));
     evaluate_expression(expression, ctx)?
         .ok_or_else(|| "Top-level expression cannot be SKIP".to_string())
 }
