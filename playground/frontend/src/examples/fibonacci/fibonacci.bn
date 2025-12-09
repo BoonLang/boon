@@ -1,14 +1,15 @@
 FUNCTION fibonacci(position) {
     [current: 0, next: 1] |> HOLD state {
         position |> Stream/pulses() |> THEN {
-            [current: state.next, next: state.current + state.next]
+            [current: state.next, next: state.current + current]
         }
     }
     |> Stream/skip(count: position)
+    |> Log/info(label: TEXT { Final state })
     |> .current
 }
 
 position: 10
 result: position |> fibonacci()
 message: TEXT { {position}. Fibonacci number is {result} }
-document: message |> Log/info() |> Document/new()
+document: message |> Document/new()

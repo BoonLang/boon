@@ -1572,21 +1572,78 @@ pub fn function_ulid_generate(
 
 // --- Log functions ---
 
-/// Helper function to convert a Value to a string for logging
+/// Helper function to convert a Value to a string for logging.
+/// Uses get_values_since(0) to get the latest value from history,
+/// falls back to stored_value(), only shows ? if truly no value exists.
 fn value_to_log_string(value: &Value) -> String {
     match value {
         Value::Text(text, _) => text.text().to_string(),
         Value::Number(num, _) => num.number().to_string(),
         Value::Tag(tag, _) => tag.tag().to_string(),
-        Value::Object(_, _) => "[Object]".to_string(),
-        Value::TaggedObject(tagged, _) => format!("{}[...]", tagged.tag()),
-        Value::List(_, _) => "[List]".to_string(),
+        Value::Object(object, _) => {
+            let fields: Vec<String> = object.variables()
+                .iter()
+                .map(|variable| {
+                    let name = variable.name();
+                    let field_value = get_actor_value_for_log(&variable.value_actor());
+                    format!("{}: {}", name, field_value)
+                })
+                .collect();
+            // Use Boon syntax: [] for objects
+            format!("[{}]", fields.join(", "))
+        }
+        Value::TaggedObject(tagged, _) => {
+            let fields: Vec<String> = tagged.variables()
+                .iter()
+                .map(|variable| {
+                    let name = variable.name();
+                    let field_value = get_actor_value_for_log(&variable.value_actor());
+                    format!("{}: {}", name, field_value)
+                })
+                .collect();
+            // Tagged objects: Tag[fields]
+            format!("{}[{}]", tagged.tag(), fields.join(", "))
+        }
+        Value::List(list, _) => {
+            let items: Vec<String> = list.snapshot()
+                .iter()
+                .map(|(_item_id, item_actor)| {
+                    get_actor_value_for_log(item_actor)
+                })
+                .collect();
+            // Use Boon syntax: LIST { items } for lists
+            if items.is_empty() {
+                "LIST { }".to_string()
+            } else {
+                format!("LIST {{ {} }}", items.join(", "))
+            }
+        }
         Value::Flushed(inner, _) => format!("Flushed[{}]", value_to_log_string(inner)),
     }
 }
 
-/// Log/info(message) -> message
-/// Logs an info message to the console and passes through the input value
+/// Get value from a ValueActor for logging purposes.
+/// Tries get_values_since(0) first for the latest historical value,
+/// falls back to stored_value(), shows ? only if truly no value.
+fn get_actor_value_for_log(actor: &Arc<ValueActor>) -> String {
+    // First, try to get from history buffer (most reliable)
+    let (values, _) = actor.get_values_since(0);
+    if let Some(latest) = values.last() {
+        return value_to_log_string(latest);
+    }
+
+    // Fall back to stored_value
+    if let Some(value) = actor.stored_value() {
+        return value_to_log_string(&value);
+    }
+
+    // Only show ? if truly no value exists
+    "?".to_string()
+}
+
+/// Log/info(value: T, label: Text) -> T
+/// Logs an info message to the console and passes through the input value.
+/// Output format: `[INFO] {label}: {value}`
 pub fn function_log_info(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     _function_call_id: ConstructId,
@@ -1594,10 +1651,14 @@ pub fn function_log_info(
     _construct_context: ConstructContext,
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let message_actor = arguments[0].clone();
-    message_actor.subscribe().map(move |value| {
-        let message = value_to_log_string(&value);
-        zoon::println!("[INFO] {}", message);
+    let value_actor = arguments[0].clone();
+    let label_actor = arguments[1].clone();
+
+    value_actor.subscribe().map(move |value| {
+        let value_str = value_to_log_string(&value);
+        let label_str = get_actor_value_for_log(&label_actor);
+
+        zoon::println!("[INFO] {}: {}", label_str, value_str);
         // Pass through the input value for chaining
         value
     })
@@ -1605,8 +1666,9 @@ pub fn function_log_info(
     .chain(stream::pending())
 }
 
-/// Log/error(message) -> message
-/// Logs an error message to the console and passes through the input value
+/// Log/error(value: T, label: Text) -> T
+/// Logs an error message to the console and passes through the input value.
+/// Output format: `[ERROR] {label}: {value}`
 pub fn function_log_error(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     _function_call_id: ConstructId,
@@ -1614,10 +1676,14 @@ pub fn function_log_error(
     _construct_context: ConstructContext,
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let message_actor = arguments[0].clone();
-    message_actor.subscribe().map(move |value| {
-        let message = value_to_log_string(&value);
-        zoon::eprintln!("[ERROR] {}", message);
+    let value_actor = arguments[0].clone();
+    let label_actor = arguments[1].clone();
+
+    value_actor.subscribe().map(move |value| {
+        let value_str = value_to_log_string(&value);
+        let label_str = get_actor_value_for_log(&label_actor);
+
+        zoon::eprintln!("[ERROR] {}: {}", label_str, value_str);
         // Pass through the input value for chaining
         value
     })

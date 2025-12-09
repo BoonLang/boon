@@ -35,11 +35,12 @@ KILLED_ANY=false
 
 echo "Stopping development processes on port $PORT..."
 
-# Kill process on configured port
-PID=$(lsof -ti:$PORT 2>/dev/null || true)
+# Kill process LISTENING on configured port (not browsers connecting to it)
+# Using -sTCP:LISTEN to only target the server, not clients like browsers
+PID=$(lsof -ti:$PORT -sTCP:LISTEN 2>/dev/null || true)
 if [ -n "$PID" ]; then
     if kill -TERM $PID 2>/dev/null; then
-        echo "Sent TERM signal to process on port $PORT"
+        echo "Sent TERM signal to server on port $PORT (PID: $PID)"
         KILLED_ANY=true
     fi
 fi
@@ -60,11 +61,11 @@ if [ "$KILLED_ANY" = "true" ]; then
     echo "Waiting 2 seconds for graceful shutdown..."
     sleep 2
 
-    # Force kill if still running
-    PID=$(lsof -ti:$PORT 2>/dev/null || true)
+    # Force kill if still running (only the LISTENING server)
+    PID=$(lsof -ti:$PORT -sTCP:LISTEN 2>/dev/null || true)
     if [ -n "$PID" ]; then
         if kill -KILL $PID 2>/dev/null; then
-            echo "Force killed process on port $PORT"
+            echo "Force killed server on port $PORT (PID: $PID)"
         fi
     fi
 
