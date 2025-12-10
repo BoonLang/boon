@@ -1,25 +1,17 @@
 -- Multi-Page App: Navigate between pages using buttons
 -- Exercises: Router/route, Router/go_to, WHEN/WHILE patterns
 
-store: [
-    nav: [
-        home_btn: LINK
-        about_btn: LINK
-        contact_btn: LINK
-    ]
-]
+store: [nav: [home: LINK, about: LINK, contact: LINK]]
 
--- Current route from browser URL
 current_route: Router/route()
 
 -- Navigate when buttons are pressed
 nav_action: LATEST {
-    store.nav.home_btn.event.press |> THEN { TEXT { / } }
-    store.nav.about_btn.event.press |> THEN { TEXT { /about } }
-    store.nav.contact_btn.event.press |> THEN { TEXT { /contact } }
+    store.nav.home.event.press |> THEN { TEXT { / } }
+    store.nav.about.event.press |> THEN { TEXT { /about } }
+    store.nav.contact.event.press |> THEN { TEXT { /contact } }
 } |> Router/go_to()
 
--- Determine current page from route
 current_page: current_route |> WHEN {
     TEXT { / } => Home
     TEXT { /about } => About
@@ -27,7 +19,6 @@ current_page: current_route |> WHEN {
     __ => NotFound
 }
 
--- UI
 document: Document/new(root: Element/stripe(
     element: []
     direction: Column
@@ -39,30 +30,22 @@ document: Document/new(root: Element/stripe(
             element: []
             direction: Row
             gap: 8
-            style: [
-                width: Fill
-                padding: 16
-                background: [color: Oklch[lightness: 0.2]]
-            ]
+            style: [width: Fill, padding: 16, background: [color: Oklch[lightness: 0.15]]]
             items: LIST {
-                nav_button(label: TEXT { Home }, route: TEXT { / })
-                    |> LINK { store.nav.home_btn }
-                nav_button(label: TEXT { About }, route: TEXT { /about })
-                    |> LINK { store.nav.about_btn }
-                nav_button(label: TEXT { Contact }, route: TEXT { /contact })
-                    |> LINK { store.nav.contact_btn }
+                nav_button(label: TEXT { Home }, route: TEXT { / }) |> LINK { store.nav.home }
+                nav_button(label: TEXT { About }, route: TEXT { /about }) |> LINK { store.nav.about }
+                nav_button(label: TEXT { Contact }, route: TEXT { /contact }) |> LINK { store.nav.contact }
             }
         )
-
         -- Page content
         Element/container(
             element: []
             style: [width: Fill, height: Fill, padding: 24]
             child: current_page |> WHILE {
-                Home => home_page()
-                About => about_page()
-                Contact => contact_page()
-                NotFound => not_found_page()
+                Home => page(title: TEXT { Welcome Home }, desc: TEXT { This is the home page. Use the navigation above to explore. })
+                About => page(title: TEXT { About }, desc: TEXT { A multi-page Boon app demonstrating Router/route and Router/go_to. })
+                Contact => page(title: TEXT { Contact }, desc: TEXT { Get in touch! URL-driven state and navigation demo. })
+                NotFound => page(title: TEXT { 404 - Not Found }, desc: TEXT { The page you're looking for doesn't exist. })
             }
         )
     }
@@ -75,15 +58,11 @@ FUNCTION nav_button(label, route) {
             element: [event: [press: LINK]]
             style: [
                 padding: [row: 16, column: 8]
+                background: [color: is_active |> WHEN { True => Oklch[lightness: 0.3], False => Oklch[lightness: 0.2] }]
+                rounded_corners: 4
                 font: [
-                    color: is_active |> WHEN {
-                        True => White
-                        False => Oklch[lightness: 0.6]
-                    }
-                    weight: is_active |> WHEN {
-                        True => Bold
-                        False => Regular
-                    }
+                    color: is_active |> WHEN { True => White, False => Oklch[lightness: 0.7] }
+                    weight: is_active |> WHEN { True => Bold, False => Regular }
                 ]
             ]
             label: label
@@ -91,86 +70,15 @@ FUNCTION nav_button(label, route) {
     }
 }
 
-FUNCTION home_page() {
+FUNCTION page(title, desc) {
     Element/stripe(
         element: []
         direction: Column
         gap: 16
         style: []
         items: LIST {
-            Element/label(
-                element: []
-                style: [font: [size: 32, weight: Bold]]
-                label: TEXT { Welcome Home }
-            )
-            Element/label(
-                element: []
-                style: [font: [color: Oklch[lightness: 0.4]]]
-                label: TEXT { This is the home page. Use the navigation above to explore other pages. }
-            )
-        }
-    )
-}
-
-FUNCTION about_page() {
-    Element/stripe(
-        element: []
-        direction: Column
-        gap: 16
-        style: []
-        items: LIST {
-            Element/label(
-                element: []
-                style: [font: [size: 32, weight: Bold]]
-                label: TEXT { About }
-            )
-            Element/label(
-                element: []
-                style: [font: [color: Oklch[lightness: 0.4]]]
-                label: TEXT { This is a multi-page Boon application demonstrating routing with Router/route and Router/go_to. }
-            )
-        }
-    )
-}
-
-FUNCTION contact_page() {
-    Element/stripe(
-        element: []
-        direction: Column
-        gap: 16
-        style: []
-        items: LIST {
-            Element/label(
-                element: []
-                style: [font: [size: 32, weight: Bold]]
-                label: TEXT { Contact }
-            )
-            Element/label(
-                element: []
-                style: [font: [color: Oklch[lightness: 0.4]]]
-                label: TEXT { Get in touch! This page demonstrates URL-driven state and navigation. }
-            )
-        }
-    )
-}
-
-FUNCTION not_found_page() {
-    Element/stripe(
-        element: []
-        direction: Column
-        gap: 16
-        style: []
-        items: LIST {
-            Element/label(
-                element: []
-                style: [font: [size: 32, weight: Bold]]
-                label: TEXT { 404 - Not Found }
-            )
-            Element/label(
-                element: []
-                style: [font: [color: Oklch[lightness: 0.4]]]
-                label: TEXT { The page you're looking for doesn't exist. }
-            )
+            Element/label(element: [], style: [font: [size: 32, weight: Bold]], label: title)
+            Element/label(element: [], style: [font: [color: Oklch[lightness: 0.5]]], label: desc)
         }
     )
 }

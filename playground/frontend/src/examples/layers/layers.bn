@@ -1,42 +1,33 @@
 document: Document/new(root: Element/stack(
     element: []
-    style: [width: 300, height: 250, background: [color: Oklch[lightness: 0.15]]]
+    style: [
+        width: 300
+        height: 250
+        background: [color: Oklch[lightness: 0.15]]
+    ]
     layers: LIST {
-        Element/container(
-            element: []
-            style: [
-                width: 180
-                height: 120
-                padding: 12
-                background: [color: Oklch[lightness: 0.55, chroma: 0.2, hue: 0]]
-                rounded_corners: 8
-                transform: [move_right: 20, move_down: 20]
-            ]
-            child: Element/label(element: [], style: [font: [color: White]], label: TEXT { Red Card })
-        )
-        Element/container(
-            element: []
-            style: [
-                width: 180
-                height: 120
-                padding: 12
-                background: [color: Oklch[lightness: 0.55, chroma: 0.2, hue: 150]]
-                rounded_corners: 8
-                transform: [move_right: 60, move_down: 60]
-            ]
-            child: Element/label(element: [], style: [font: [color: White]], label: TEXT { Green Card })
-        )
-        Element/container(
-            element: []
-            style: [
-                width: 180
-                height: 120
-                padding: 12
-                background: [color: Oklch[lightness: 0.55, chroma: 0.2, hue: 240]]
-                rounded_corners: 8
-                transform: [move_right: 100, move_down: 100]
-            ]
-            child: Element/label(element: [], style: [font: [color: White]], label: TEXT { Blue Card })
-        )
+        card(label: TEXT { Red Card }, hue: 0, x: 20, y: 20)
+        card(label: TEXT { Green Card }, hue: 150, x: 60, y: 60)
+        card(label: TEXT { Blue Card }, hue: 240, x: 100, y: 100)
     }
 ))
+
+FUNCTION card(label, hue, x, y) {
+    Element/container(
+        element: []
+        style: [
+            width: 180
+            height: 120
+            padding: 12
+            font: [color: White]
+            background: [color: Oklch[
+                lightness: 0.55
+                chroma: 0.2
+                hue: hue
+            ]]
+            rounded_corners: 8
+            transform: [move_right: x, move_down: y]
+        ]
+        child: label
+    )
+}
