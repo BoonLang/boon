@@ -43,6 +43,7 @@ fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElO
         Value::TaggedObject(tagged_object, _) => match tagged_object.tag() {
             "ElementContainer" => element_container(tagged_object, construct_context).unify(),
             "ElementStripe" => element_stripe(tagged_object, construct_context).unify(),
+            "ElementStack" => element_stack(tagged_object, construct_context).unify(),
             "ElementButton" => element_button(tagged_object, construct_context).unify(),
             "ElementTextInput" => element_text_input(tagged_object, construct_context).unify(),
             "ElementCheckbox" => element_checkbox(tagged_object, construct_context).unify(),
@@ -51,7 +52,20 @@ fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElO
             "ElementLink" => element_link(tagged_object, construct_context).unify(),
             other => panic!("Element cannot be created from the tagged object with tag '{other}'"),
         },
-        _ => panic!("Element cannot be created from the given Value type"),
+        Value::Flushed(inner, _) => {
+            // Unwrap Flushed and recursively handle the inner value
+            value_to_element(*inner, construct_context)
+        }
+        Value::Object(obj, _) => {
+            // Object can't be rendered as element - render as debug info
+            eprintln!("Warning: Object value passed to element context - rendering as empty. Object has {} variables", obj.variables().len());
+            El::new().unify()
+        }
+        Value::List(list, _) => {
+            // List can't be rendered as a single element - render as debug info
+            eprintln!("Warning: List value passed to element context - rendering as empty. List has {} items", list.items().len());
+            El::new().unify()
+        }
     }
 }
 
@@ -62,11 +76,119 @@ fn element_container(
     let settings_variable = tagged_object.expect_variable("settings");
 
     let child_stream = settings_variable
+        .clone()
         .subscribe()
         .flat_map(|value| value.expect_object().expect_variable("child").subscribe())
-        .map(move |value| value_to_element(value, construct_context.clone()));
+        .map({
+            let construct_context = construct_context.clone();
+            move |value| value_to_element(value, construct_context.clone())
+        });
 
-    El::new().child_signal(signal::from_stream(child_stream))
+    // Create style streams
+    let sv2 = tagged_object.expect_variable("settings");
+    let sv3 = tagged_object.expect_variable("settings");
+    let sv4 = tagged_object.expect_variable("settings");
+    let sv5 = tagged_object.expect_variable("settings");
+    let sv6 = tagged_object.expect_variable("settings");
+
+    let width_signal = signal::from_stream(
+        sv2.subscribe()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("width")).flat_map(|var| var.subscribe())
+            })
+            .filter_map(|value| future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                _ => None,
+            }))
+    );
+
+    let height_signal = signal::from_stream(
+        sv3.subscribe()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("height")).flat_map(|var| var.subscribe())
+            })
+            .filter_map(|value| future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                _ => None,
+            }))
+    );
+
+    let background_signal = signal::from_stream(
+        sv4.subscribe()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("background")).flat_map(|var| var.subscribe())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("color")).flat_map(|var| var.subscribe())
+            })
+            .filter_map(|value| future::ready(oklch_to_css(value)))
+    );
+
+    let border_radius_signal = signal::from_stream(
+        sv5.subscribe()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("rounded_corners")).flat_map(|var| var.subscribe())
+            })
+            .filter_map(|value| future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                _ => None,
+            }))
+    );
+
+    // Transform: move_right and move_down
+    let transform_signal = signal::from_stream(
+        sv6.subscribe()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("transform")).flat_map(|var| var.subscribe())
+            })
+            .filter_map(|value| future::ready({
+                let obj = value.expect_object();
+                let move_right = obj.variable("move_right")
+                    .and_then(|v| v.value_actor().stored_value())
+                    .and_then(|val| match val {
+                        Value::Number(n, _) => Some(n.number()),
+                        _ => None,
+                    })
+                    .unwrap_or(0.0);
+                let move_down = obj.variable("move_down")
+                    .and_then(|v| v.value_actor().stored_value())
+                    .and_then(|val| match val {
+                        Value::Number(n, _) => Some(n.number()),
+                        _ => None,
+                    })
+                    .unwrap_or(0.0);
+                if move_right != 0.0 || move_down != 0.0 {
+                    Some(format!("translate({}px, {}px)", move_right, move_down))
+                } else {
+                    None
+                }
+            }))
+    );
+
+    El::new()
+        .update_raw_el(|raw_el| {
+            raw_el
+                .style_signal("width", width_signal)
+                .style_signal("height", height_signal)
+                .style_signal("background-color", background_signal)
+                .style_signal("border-radius", border_radius_signal)
+                .style_signal("transform", transform_signal)
+        })
+        .child_signal(signal::from_stream(child_stream))
+        .after_remove(move |_| {
+            drop(tagged_object);
+        })
 }
 
 fn element_stripe(
@@ -176,6 +298,135 @@ fn element_stripe(
             drop(items_list_value);
             drop(hovered_handler_task);
         })
+}
+
+fn element_stack(
+    tagged_object: Arc<TaggedObject>,
+    construct_context: ConstructContext,
+) -> impl Element {
+    let settings_variable = tagged_object.expect_variable("settings");
+
+    // Keep the settings Object alive to prevent its Variables from being dropped
+    let settings_object: std::sync::Arc<std::sync::Mutex<Option<Arc<Object>>>> = Default::default();
+    let settings_object_for_layers = settings_object.clone();
+
+    // Keep the layers List value alive
+    let layers_list_value: std::sync::Arc<std::sync::Mutex<Option<Value>>> = Default::default();
+    let layers_list_value_for_stream = layers_list_value.clone();
+
+    let layers_vec_diff_stream = settings_variable
+        .clone()
+        .subscribe()
+        .flat_map(move |value| {
+            let object = value.expect_object();
+            *settings_object_for_layers.lock().unwrap() = Some(object.clone());
+            object.expect_variable("layers").subscribe()
+        })
+        .flat_map(move |value| {
+            *layers_list_value_for_stream.lock().unwrap() = Some(value.clone());
+            value.expect_list().subscribe()
+        })
+        .map(list_change_to_vec_diff);
+
+    // Create individual style streams directly from settings
+    let settings_variable_2 = tagged_object.expect_variable("settings");
+    let settings_variable_3 = tagged_object.expect_variable("settings");
+    let settings_variable_4 = tagged_object.expect_variable("settings");
+
+    let width_signal = signal::from_stream(
+        settings_variable_2.subscribe()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("width")).flat_map(|var| var.subscribe())
+            })
+            .filter_map(|value| future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                _ => None,
+            }))
+    );
+
+    let height_signal = signal::from_stream(
+        settings_variable_3.subscribe()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("height")).flat_map(|var| var.subscribe())
+            })
+            .filter_map(|value| future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                _ => None,
+            }))
+    );
+
+    let background_signal = signal::from_stream(
+        settings_variable_4.subscribe()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("background")).flat_map(|var| var.subscribe())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("color")).flat_map(|var| var.subscribe())
+            })
+            .filter_map(|value| future::ready(oklch_to_css(value)))
+    );
+
+    Stack::new()
+        .update_raw_el(|raw_el| {
+            raw_el
+                .style_signal("width", width_signal)
+                .style_signal("height", height_signal)
+                .style_signal("background-color", background_signal)
+        })
+        .layers_signal_vec(VecDiffStreamSignalVec(layers_vec_diff_stream).map_signal(
+            move |value_actor| {
+                signal::from_stream(value_actor.subscribe().map({
+                    let construct_context = construct_context.clone();
+                    move |value| value_to_element(value, construct_context.clone())
+                }))
+            },
+        ))
+        // Keep tagged_object, settings_object, and layers_list_value alive
+        .after_remove(move |_| {
+            drop(tagged_object);
+            drop(settings_object);
+            drop(layers_list_value);
+        })
+}
+
+/// Convert Oklch tagged object to CSS color string
+fn oklch_to_css(value: Value) -> Option<String> {
+    if let Value::TaggedObject(tagged, _) = value {
+        if tagged.tag() == "Oklch" {
+            // Helper to extract number from Variable's stored value
+            let get_num = |name: &str, default: f64| -> f64 {
+                tagged.variable(name)
+                    .and_then(|v| v.value_actor().stored_value())
+                    .and_then(|val| match val {
+                        Value::Number(n, _) => Some(n.number()),
+                        _ => None,
+                    })
+                    .unwrap_or(default)
+            };
+
+            let lightness = get_num("lightness", 0.0);
+            let chroma = get_num("chroma", 0.0);
+            let hue = get_num("hue", 0.0);
+            let alpha = get_num("alpha", 1.0);
+
+            // oklch(lightness chroma hue / alpha)
+            // Lightness is 0-1, needs to be percentage
+            let css = if alpha < 1.0 {
+                format!("oklch({}% {} {} / {})", lightness * 100.0, chroma, hue, alpha)
+            } else {
+                format!("oklch({}% {} {})", lightness * 100.0, chroma, hue)
+            };
+            return Some(css);
+        }
+    }
+    None
 }
 
 fn element_button(

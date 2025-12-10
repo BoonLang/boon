@@ -182,7 +182,7 @@ pub fn function_element_container(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let [_argument_element, _argument_style, argument_child] = arguments.as_slice() else {
+    let [_argument_element, argument_style, argument_child] = arguments.as_slice() else {
         panic!("Element/container expects 3 arguments")
     };
     TaggedObject::new_constant(
@@ -211,17 +211,103 @@ pub fn function_element_container(
                 construct_context.clone(),
                 ValueIdempotencyKey::new(),
                 actor_context,
-                [Variable::new_arc(
-                    ConstructInfo::new(
-                        function_call_id.with_child_id(3),
+                [
+                    Variable::new_arc(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(3),
+                            None,
+                            "Element/container(..) -> ElementContainer[settings: [style]]",
+                        ),
+                        construct_context.clone(),
+                        "style",
+                        argument_style.clone(),
                         None,
-                        "Element/container(..) -> ElementContainer[settings: [child]]",
                     ),
-                    construct_context,
-                    "child",
-                    argument_child.clone(),
+                    Variable::new_arc(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(4),
+                            None,
+                            "Element/container(..) -> ElementContainer[settings: [child]]",
+                        ),
+                        construct_context,
+                        "child",
+                        argument_child.clone(),
+                        None,
+                    ),
+                ],
+            ),
+            None,
+        )],
+    )
+}
+
+/// ```text
+/// Element/stack(
+///     element<[tag?: Tag]>
+///     style<[]>
+///     layers<List<INTO_ELEMENT>>
+/// ) -> ELEMENT_STACK
+/// ```
+pub fn function_element_stack(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let [_argument_element, argument_style, argument_layers] = arguments.as_slice() else {
+        panic!("Element/stack requires 3 arguments, got {}", arguments.len());
+    };
+    TaggedObject::new_constant(
+        ConstructInfo::new(
+            function_call_id.with_child_id(0),
+            None,
+            "Element/stack(..) -> ElementStack[..]",
+        ),
+        construct_context.clone(),
+        ValueIdempotencyKey::new(),
+        "ElementStack",
+        [Variable::new_arc(
+            ConstructInfo::new(
+                function_call_id.with_child_id(1),
+                None,
+                "Element/stack(..) -> ElementStack[settings]",
+            ),
+            construct_context.clone(),
+            "settings",
+            Object::new_arc_value_actor(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(2),
                     None,
-                )],
+                    "Element/stack(..) -> ElementStack[settings: [..]]",
+                ),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                actor_context,
+                [
+                    Variable::new_arc(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(3),
+                            None,
+                            "Element/stack(..) -> ElementStack[settings: [style]]",
+                        ),
+                        construct_context.clone(),
+                        "style",
+                        argument_style.clone(),
+                        None,
+                    ),
+                    Variable::new_arc(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(4),
+                            None,
+                            "Element/stack(..) -> ElementStack[settings: [layers]]",
+                        ),
+                        construct_context,
+                        "layers",
+                        argument_layers.clone(),
+                        None,
+                    ),
+                ],
             ),
             None,
         )],

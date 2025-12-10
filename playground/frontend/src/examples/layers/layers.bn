@@ -1,0 +1,39 @@
+document: Document/new(root: Element/stack(
+    element: []
+    style: [width: 300, height: 250, background: [color: Oklch[lightness: 0.95]]]
+    layers: LIST {
+        Element/container(
+            element: []
+            style: [
+                width: 180
+                height: 120
+                background: [color: Oklch[lightness: 0.7, chroma: 0.15, hue: 0]]
+                rounded_corners: 8
+                transform: [move_right: 20, move_down: 20]
+            ]
+            child: Element/label(element: [], style: [padding: 12, font: [color: White]], label: TEXT { Red Card })
+        )
+        Element/container(
+            element: []
+            style: [
+                width: 180
+                height: 120
+                background: [color: Oklch[lightness: 0.7, chroma: 0.15, hue: 120]]
+                rounded_corners: 8
+                transform: [move_right: 60, move_down: 60]
+            ]
+            child: Element/label(element: [], style: [padding: 12, font: [color: White]], label: TEXT { Green Card })
+        )
+        Element/container(
+            element: []
+            style: [
+                width: 180
+                height: 120
+                background: [color: Oklch[lightness: 0.7, chroma: 0.15, hue: 240]]
+                rounded_corners: 8
+                transform: [move_right: 100, move_down: 100]
+            ]
+            child: Element/label(element: [], style: [padding: 12, font: [color: White]], label: TEXT { Blue Card })
+        )
+    }
+))
