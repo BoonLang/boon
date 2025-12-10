@@ -1,0 +1,132 @@
+-- Shopping List: A simple list with add/remove functionality
+-- Exercises: List/append, List/map, List/count, List/empty,
+--            Bool/toggle, Text/trim, Text/is_not_empty, SKIP
+
+store: [
+    elements: [
+        item_input: LINK
+    ]
+]
+
+-- Input handling: get text when Enter is pressed
+item_to_add: store.elements.item_input.event.key_down.key |> WHEN {
+    Enter => BLOCK {
+        name: store.elements.item_input.text |> Text/trim()
+        name |> Text/is_not_empty() |> WHEN {
+            True => name
+            False => SKIP
+        }
+    }
+    __ => SKIP
+}
+
+-- Item factory function
+FUNCTION new_item(name) {
+    Item[
+        id: Ulid/generate()
+        name: name
+        bought: False |> Bool/toggle(when: PASSED.checkbox.event.click)
+        checkbox: LINK
+    ]
+}
+
+-- Dynamic list with append
+items: LIST {}
+    |> List/append(item: item_to_add |> new_item(PASS: [checkbox: LINK]))
+
+-- Computed values
+total_count: items |> List/count()
+is_empty: items |> List/empty()
+
+-- UI
+document: Document/new(root: Element/stripe(
+    element: []
+    direction: Column
+    gap: 16
+    style: [padding: 20, width: 400]
+    items: LIST {
+        -- Header
+        Element/label(
+            element: []
+            style: [font: [size: 24, weight: Bold]]
+            label: TEXT { Shopping List }
+        )
+
+        -- Input
+        Element/text_input(
+            element: [event: [change: LINK, key_down: LINK]]
+            style: [width: Fill]
+            label: Hidden[text: TEXT { Item name }]
+            text: LATEST {
+                Text/empty()
+                element.event.change.text
+                item_to_add |> THEN { Text/empty() }
+            }
+            placeholder: [text: TEXT { Add item and press Enter... }]
+            focus: True
+        ) |> LINK { store.elements.item_input }
+
+        -- Stats
+        Element/label(
+            element: []
+            style: [font: [color: Oklch[lightness: 0.5]]]
+            label: TEXT { {total_count} items in list }
+        )
+
+        -- Items list
+        is_empty |> WHILE {
+            True => Element/label(
+                element: []
+                style: [font: [color: Oklch[lightness: 0.6]]]
+                label: TEXT { No items yet. Add something! }
+            )
+            False => Element/stripe(
+                element: []
+                direction: Column
+                gap: 8
+                style: []
+                items: items |> List/map(old, new: item_row(item: old))
+            )
+        }
+    }
+))
+
+FUNCTION item_row(item) {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 12
+        style: [padding: [column: 8]]
+        items: LIST {
+            Element/checkbox(
+                element: [event: [click: LINK]]
+                label: Reference[element: item.checkbox]
+                checked: item.bought
+                icon: Element/container(
+                    element: []
+                    style: [
+                        size: 20
+                        borders: [color: Oklch[lightness: 0.6]]
+                        rounded_corners: 4
+                    ]
+                    child: NoElement
+                )
+            ) |> LINK { item.checkbox }
+
+            Element/label(
+                element: []
+                style: [
+                    width: Fill
+                    font: [
+                        line: [strike: item.bought]
+                        color: item.bought |> WHEN {
+                            True => Oklch[lightness: 0.6]
+                            False => Oklch[lightness: 0.2]
+                        }
+                    ]
+                ]
+                label: item.name
+            )
+        }
+    )
+}

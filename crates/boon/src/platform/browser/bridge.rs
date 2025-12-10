@@ -61,9 +61,9 @@ fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElO
             eprintln!("Warning: Object value passed to element context - rendering as empty. Object has {} variables", obj.variables().len());
             El::new().unify()
         }
-        Value::List(list, _) => {
+        Value::List(_list, _) => {
             // List can't be rendered as a single element - render as debug info
-            eprintln!("Warning: List value passed to element context - rendering as empty. List has {} items", list.items().len());
+            eprintln!("Warning: List value passed to element context - rendering as empty");
             El::new().unify()
         }
     }
@@ -90,6 +90,20 @@ fn element_container(
     let sv4 = tagged_object.expect_variable("settings");
     let sv5 = tagged_object.expect_variable("settings");
     let sv6 = tagged_object.expect_variable("settings");
+    let sv7 = tagged_object.expect_variable("settings");
+
+    let padding_signal = signal::from_stream(
+        sv7.subscribe()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("padding")).flat_map(|var| var.subscribe())
+            })
+            .filter_map(|value| future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                _ => None,
+            }))
+    );
 
     let width_signal = signal::from_stream(
         sv2.subscribe()
@@ -179,6 +193,7 @@ fn element_container(
     El::new()
         .update_raw_el(|raw_el| {
             raw_el
+                .style_signal("padding", padding_signal)
                 .style_signal("width", width_signal)
                 .style_signal("height", height_signal)
                 .style_signal("background-color", background_signal)
@@ -396,37 +411,62 @@ fn element_stack(
         })
 }
 
-/// Convert Oklch tagged object to CSS color string
+/// Convert color value to CSS color string
+/// Handles both Oklch[...] tagged objects and plain color tags like White, Black, etc.
 fn oklch_to_css(value: Value) -> Option<String> {
-    if let Value::TaggedObject(tagged, _) = value {
-        if tagged.tag() == "Oklch" {
-            // Helper to extract number from Variable's stored value
-            let get_num = |name: &str, default: f64| -> f64 {
-                tagged.variable(name)
-                    .and_then(|v| v.value_actor().stored_value())
-                    .and_then(|val| match val {
-                        Value::Number(n, _) => Some(n.number()),
-                        _ => None,
-                    })
-                    .unwrap_or(default)
-            };
+    match value {
+        Value::TaggedObject(tagged, _) => {
+            if tagged.tag() == "Oklch" {
+                // Helper to extract number from Variable's stored value
+                let get_num = |name: &str, default: f64| -> f64 {
+                    tagged.variable(name)
+                        .and_then(|v| v.value_actor().stored_value())
+                        .and_then(|val| match val {
+                            Value::Number(n, _) => Some(n.number()),
+                            _ => None,
+                        })
+                        .unwrap_or(default)
+                };
 
-            let lightness = get_num("lightness", 0.0);
-            let chroma = get_num("chroma", 0.0);
-            let hue = get_num("hue", 0.0);
-            let alpha = get_num("alpha", 1.0);
+                let lightness = get_num("lightness", 0.0);
+                let chroma = get_num("chroma", 0.0);
+                let hue = get_num("hue", 0.0);
+                let alpha = get_num("alpha", 1.0);
 
-            // oklch(lightness chroma hue / alpha)
-            // Lightness is 0-1, needs to be percentage
-            let css = if alpha < 1.0 {
-                format!("oklch({}% {} {} / {})", lightness * 100.0, chroma, hue, alpha)
-            } else {
-                format!("oklch({}% {} {})", lightness * 100.0, chroma, hue)
-            };
-            return Some(css);
+                // oklch(lightness chroma hue / alpha)
+                // Lightness is 0-1, needs to be percentage
+                let css = if alpha < 1.0 {
+                    format!("oklch({}% {} {} / {})", lightness * 100.0, chroma, hue, alpha)
+                } else {
+                    format!("oklch({}% {} {})", lightness * 100.0, chroma, hue)
+                };
+                return Some(css);
+            }
+            None
         }
+        Value::Tag(tag, _) => {
+            // Handle named CSS colors
+            let color = match tag.tag() {
+                "White" => "white",
+                "Black" => "black",
+                "Red" => "red",
+                "Green" => "green",
+                "Blue" => "blue",
+                "Yellow" => "yellow",
+                "Cyan" => "cyan",
+                "Magenta" => "magenta",
+                "Orange" => "orange",
+                "Purple" => "purple",
+                "Pink" => "pink",
+                "Brown" => "brown",
+                "Gray" | "Grey" => "gray",
+                "Transparent" => "transparent",
+                _ => return None,
+            };
+            Some(color.to_string())
+        }
+        _ => None,
     }
-    None
 }
 
 fn element_button(
@@ -653,6 +693,7 @@ fn element_text_input(
         });
 
     let placeholder_stream = settings_variable
+        .clone()
         .subscribe()
         .flat_map(|value| value.expect_object().expect_variable("placeholder").subscribe())
         .filter_map(|value| {
@@ -661,6 +702,24 @@ fn element_text_input(
                 _ => None,
             })
         });
+
+    // Width signal from style
+    let width_signal = signal::from_stream(
+        settings_variable
+            .subscribe()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("width")).flat_map(|var| var.subscribe())
+            })
+            .filter_map(|value| {
+                future::ready(match value {
+                    Value::Number(n, _) => Some(format!("{}px", n.number())),
+                    Value::Tag(tag, _) if tag.tag() == "Fill" => Some("100%".to_string()),
+                    _ => None,
+                })
+            }),
+    );
 
     TextInput::new()
         .label_hidden("text input")
@@ -687,6 +746,17 @@ fn element_text_input(
             move || {
                 let _ = sender.unbounded_send(());
             }
+        })
+        .update_raw_el(|raw_el| {
+            raw_el
+                .style("padding", "8px 12px")
+                .style("border", "1px solid #555")
+                .style("border-radius", "4px")
+                .style("background-color", "#2a2a2a")
+                .style("color", "#fff")
+                .style("font-size", "14px")
+                .style("box-sizing", "border-box")
+                .style_signal("width", width_signal)
         })
         .after_remove(move |_| drop(event_handler_task))
 }
@@ -838,11 +908,51 @@ fn element_label(
     let settings_variable = tagged_object.expect_variable("settings");
 
     let label_stream = settings_variable
+        .clone()
         .subscribe()
         .flat_map(|value| value.expect_object().expect_variable("label").subscribe())
-        .map(move |value| value_to_element(value, construct_context.clone()));
+        .map({
+            let construct_context = construct_context.clone();
+            move |value| value_to_element(value, construct_context.clone())
+        });
+
+    // Create style streams
+    let sv2 = tagged_object.expect_variable("settings");
+    let sv3 = tagged_object.expect_variable("settings");
+
+    let padding_signal = signal::from_stream(
+        sv2.subscribe()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("padding")).flat_map(|var| var.subscribe())
+            })
+            .filter_map(|value| future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                _ => None,
+            }))
+    );
+
+    let font_color_signal = signal::from_stream(
+        sv3.subscribe()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("color")).flat_map(|var| var.subscribe())
+            })
+            .filter_map(|value| future::ready(oklch_to_css(value)))
+    );
 
     Label::new()
+        .update_raw_el(|raw_el| {
+            raw_el
+                .style_signal("padding", padding_signal)
+                .style_signal("color", font_color_signal)
+        })
         .label_signal(signal::from_stream(label_stream).map(|l| {
             l.unwrap_or_else(|| zoon::Text::new("").unify())
         }))
