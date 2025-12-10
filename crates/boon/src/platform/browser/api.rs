@@ -1410,6 +1410,12 @@ pub fn function_list_append(
     // arguments[0] = the list (piped)
     // arguments[1] = the item to append
     let list_actor = arguments[0].clone();
+
+    // If item argument is SKIP (not provided), just forward the list unchanged
+    if arguments.len() < 2 {
+        return list_actor.subscribe().left_stream();
+    }
+
     let item_actor = arguments[1].clone();
 
     // Create a change stream that:
@@ -1438,7 +1444,9 @@ pub fn function_list_append(
 
         let append_changes = item_actor.clone().subscribe().map(move |value| {
             // When item stream produces a value, create a new constant ValueActor
-            // containing that specific value and push it
+            // containing that specific value and push it.
+            // Note: SKIP is not a Value - it's a stream behavior where streams end without
+            // producing values. If item is SKIP, this map closure is never called.
             let new_item_actor = ValueActor::new_arc(
                 ConstructInfo::new(
                     function_call_id_for_append.with_child_id("appended_item"),
@@ -1501,6 +1509,7 @@ pub fn function_list_append(
         Arc::new(list),
         ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
     ))
+    .right_stream()
 }
 
 /// List/latest() -> Value

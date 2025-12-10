@@ -1616,7 +1616,7 @@ fn process_work_item(
             let Some(prev_actor) = state.get(prev_slot) else {
                 return Ok(());
             };
-            let new_ctx = ctx.with_piped(prev_actor);
+            let new_ctx = ctx.with_piped(prev_actor.clone());
 
             // Check if expression is a FunctionCall - these should consume the piped value
             // as their first argument (for builtin functions).
@@ -1686,6 +1686,16 @@ fn process_work_item(
                         }
                     }
                 }
+            } else if let static_expression::Expression::LinkSetter { alias: _ } = &expr.node {
+                // Handle LinkSetter specially when piped: LINK is pass-through.
+                // When you do `element |> LINK { store.path }`, the element flows through
+                // unchanged. The LINK binding (connecting element to store.path) is handled
+                // by the LinkConnector which matches up LINK declarations with LinkSetters
+                // based on span information resolved during parsing.
+                //
+                // The key insight: the piped element IS the value that should flow to
+                // whatever references `store.path`. We just pass it through here.
+                state.store(result_slot, prev_actor);
             } else {
                 // For non-FunctionCall expressions, just schedule normally
                 schedule_expression(state, expr, new_ctx, result_slot)?;
@@ -3202,17 +3212,112 @@ fn call_function(
             parameters.insert(param_name, arg_actor);
         }
 
-        // Bind piped value to unbound function parameters.
+        // Check if piped value should be bound to an unbound function parameter.
         // For `position |> fibonacci()`, bind `position` to the first parameter of `fibonacci`.
-        if let Some(piped) = &ctx.actor_context.piped {
+        let piped_param_name = if let Some(_piped) = &ctx.actor_context.piped {
+            let mut found_param = None;
             for param_name in &func_def.parameters {
                 if !parameters.contains_key(param_name) {
-                    parameters.insert(param_name.clone(), piped.clone());
+                    found_param = Some(param_name.clone());
                     break; // Only bind to the first unbound parameter
                 }
             }
+            found_param
+        } else {
+            None
+        };
+
+        // If there's a piped value bound to a parameter, wrap the function call in a reactive actor.
+        // This ensures that if piped is SKIP (never produces values), the function call is also SKIP.
+        // Without this, the function body would execute immediately with the piped actor as a reference,
+        // producing a value even if the piped actor never produces values.
+        if let (Some(piped), Some(param_name)) = (&ctx.actor_context.piped, &piped_param_name) {
+            // Clone everything needed for the async closure
+            let piped_for_closure = piped.clone();
+            let parameters_for_closure = parameters.clone();
+            let param_name_for_closure = param_name.clone();
+            let func_body = func_def.body.clone();
+            let ctx_for_closure = ctx.clone();
+            let persistence_for_construct = persistence.clone();
+            let span_for_construct = span;
+
+            // Create a stream that:
+            // 1. Subscribes to the piped input
+            // 2. For each value from piped, evaluates the function body with that value
+            // 3. If piped never produces values (SKIP), this stream also never produces values
+            let result_stream = piped_for_closure.subscribe().flat_map(move |piped_value| {
+                // Create a constant actor for this specific piped value
+                let value_actor = ValueActor::new_arc(
+                    ConstructInfo::new(
+                        "piped function input".to_string(),
+                        None,
+                        format!("piped value for user function param: {}", param_name_for_closure),
+                    ),
+                    ctx_for_closure.actor_context.clone(),
+                    constant(piped_value),
+                    None,
+                );
+
+                // Bind the constant value actor to the parameter
+                let mut params = parameters_for_closure.clone();
+                params.insert(param_name_for_closure.clone(), value_actor);
+
+                let new_actor_context = ActorContext {
+                    output_valve_signal: ctx_for_closure.actor_context.output_valve_signal.clone(),
+                    piped: None, // Clear piped - we've consumed it
+                    passed: ctx_for_closure.actor_context.passed.clone(),
+                    parameters: params,
+                    sequential_processing: ctx_for_closure.actor_context.sequential_processing,
+                    backpressure_permit: ctx_for_closure.actor_context.backpressure_permit.clone(),
+                    hold_state_update_callback: None,
+                    use_lazy_actors: ctx_for_closure.actor_context.use_lazy_actors,
+                };
+
+                let new_ctx = EvaluationContext {
+                    construct_context: ctx_for_closure.construct_context.clone(),
+                    actor_context: new_actor_context,
+                    reference_connector: ctx_for_closure.reference_connector.clone(),
+                    link_connector: ctx_for_closure.link_connector.clone(),
+                    function_registry: ctx_for_closure.function_registry.clone(),
+                    module_loader: ctx_for_closure.module_loader.clone(),
+                    source_code: ctx_for_closure.source_code.clone(),
+                };
+
+                // Evaluate the function body with this piped value
+                match evaluate_expression(func_body.clone(), new_ctx) {
+                    Ok(Some(result_actor)) => {
+                        // Take only the first value from the result (like THEN does)
+                        let result_stream: Pin<Box<dyn Stream<Item = Value>>> =
+                            Box::pin(result_actor.subscribe().take(1));
+                        result_stream
+                    }
+                    Ok(None) => {
+                        // Function body returned SKIP - produce empty stream
+                        Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>
+                    }
+                    Err(_) => {
+                        // Error - produce empty stream
+                        Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>
+                    }
+                }
+            });
+
+            // Create the wrapper actor
+            let wrapper_actor = ValueActor::new_arc(
+                ConstructInfo::new(
+                    format!("PersistenceId: {persistence_id}"),
+                    persistence_for_construct,
+                    format!("{span_for_construct}; piped user function call: {full_path}"),
+                ),
+                ctx.actor_context.clone(),
+                TypedStream::infinite(result_stream),
+                None,
+            );
+
+            return Ok(Some(wrapper_actor));
         }
 
+        // No piped value or no parameter to bind - evaluate immediately (original behavior)
         let new_actor_context = ActorContext {
             output_valve_signal: ctx.actor_context.output_valve_signal.clone(),
             piped: ctx.actor_context.piped.clone(),
