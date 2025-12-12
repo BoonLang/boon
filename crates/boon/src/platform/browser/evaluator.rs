@@ -2120,20 +2120,19 @@ fn build_then_actor(
     // Clone piped for the filter closure
     let piped_for_filter = piped.clone();
 
-    // When use_lazy_actors is true and piped has a lazy delegate, use subscribe_boxed()
-    // to get lazy subscription (pull-based). Otherwise use regular subscribe() (eager).
-    let use_lazy_subscription = ctx.actor_context.use_lazy_actors && piped.has_lazy_delegate();
+    // Check if piped has lazy delegate - affects filtering logic
+    let has_lazy_delegate = piped.has_lazy_delegate();
 
     let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if backpressure_permit.is_some() || sequential {
         // For sequential mode, use regular flatten (processes one stream at a time)
         // Skip values we already processed synchronously
-        if use_lazy_subscription {
-            // For LAZY subscription: NO filter needed!
+        if has_lazy_delegate {
+            // For LAZY actors: NO filter needed!
             // LazyValueActor doesn't eagerly buffer values, so there are no "initial values"
             // to skip. The filter `version > initial_version` would ALWAYS fail because
             // LazyValueActor's shell ValueActor has version=0 (never updated).
             // All values will be pulled on demand.
-            let stream = piped.clone().subscribe_boxed()
+            let stream = piped.clone().subscribe()
                 .then(eval_body)
                 .flatten();
             Box::pin(stream)
@@ -2149,9 +2148,9 @@ fn build_then_actor(
         // Clone piped_for_filter for the concurrent branch
         let piped_for_filter_concurrent = piped.clone();
         // For non-sequential mode, use flatten_unordered for concurrent processing
-        if use_lazy_subscription {
-            // For LAZY subscription: NO filter needed (see comment above)
-            let stream = piped.clone().subscribe_boxed()
+        if has_lazy_delegate {
+            // For LAZY actors: NO filter needed (see comment above)
+            let stream = piped.clone().subscribe()
                 .then(eval_body)
                 .flatten_unordered(None);
             Box::pin(stream)
@@ -2796,10 +2795,10 @@ fn build_hold_actor(
     // Note: We avoid self-reactivity by not triggering body re-evaluation
     // from state changes. Body only evaluates when its event sources fire.
     //
-    // Use subscribe_boxed() to get lazy subscription if body has lazy_delegate.
-    // This enables demand-driven evaluation where HOLD pulls values one at a time
-    // and updates state between each pull (sequential state updates).
-    let body_subscription = body_result.clone().subscribe_boxed();
+    // Subscribe to body - handles both lazy and eager actors.
+    // For lazy actors, this enables demand-driven evaluation where HOLD pulls values
+    // one at a time and updates state between each pull (sequential state updates).
+    let body_subscription = body_result.clone().subscribe();
     let state_update_stream = body_subscription.map(move |new_value| {
         // Update current state
         *current_state_for_update.borrow_mut() = Some(new_value.clone());

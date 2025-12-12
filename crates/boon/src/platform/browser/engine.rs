@@ -1659,8 +1659,8 @@ impl LatestCombinator {
 
         let value_stream =
             stream::select_all(inputs.iter().enumerate().map(|(index, value_actor)| {
-                // Use subscribe_boxed() to properly handle lazy actors in HOLD body context
-                value_actor.clone().subscribe_boxed().map(move |value| (index, value))
+                // Use subscribe() to properly handle lazy actors in HOLD body context
+                value_actor.clone().subscribe().map(move |value| (index, value))
             }))
             .scan(true, {
                 let storage = storage.clone();
@@ -1749,8 +1749,8 @@ impl ThenCombinator {
         let observed_for_subscribe = observed.clone();
         let send_impulse_task = Task::start_droppable(
             observed_for_subscribe
-                // Use subscribe_boxed() to properly handle lazy actors in HOLD body context
-                .subscribe_boxed()
+                // Use subscribe() to properly handle lazy actors in HOLD body context
+                .subscribe()
                 .scan(true, {
                     let storage = storage.clone();
                     move |first_run, value| {
@@ -1802,8 +1802,8 @@ impl ThenCombinator {
                     }
                 }),
         );
-        // Use subscribe_boxed() to properly handle lazy body actors in HOLD context
-        let value_stream = body.clone().subscribe_boxed().map(|mut value| {
+        // Use subscribe() to properly handle lazy body actors in HOLD context
+        let value_stream = body.clone().subscribe().map(|mut value| {
             value.set_idempotency_key(ValueIdempotencyKey::new());
             value
         });
@@ -1849,10 +1849,10 @@ impl BinaryOperatorCombinator {
         let construct_info = construct_info.complete(ConstructType::ValueActor);
 
         // Merge both operand streams, tracking which operand changed
-        // Use subscribe_boxed() to properly handle lazy actors in HOLD body context
+        // Use subscribe() to properly handle lazy actors in HOLD body context
         let value_stream = stream::select_all([
-            operand_a.clone().subscribe_boxed().map(|v| (0usize, v)).boxed_local(),
-            operand_b.clone().subscribe_boxed().map(|v| (1usize, v)).boxed_local(),
+            operand_a.clone().subscribe().map(|v| (0usize, v)).boxed_local(),
+            operand_b.clone().subscribe().map(|v| (1usize, v)).boxed_local(),
         ])
         .scan(
             (None::<Value>, None::<Value>),
@@ -2220,10 +2220,10 @@ impl WhenCombinator {
         let arms = Arc::new(arms);
 
         // For each input value, find the matching arm and emit its body's value
-        // Use subscribe_boxed() to properly handle lazy actors in HOLD body context
+        // Use subscribe() to properly handle lazy actors in HOLD body context
         let value_stream = input
             .clone()
-            .subscribe_boxed()
+            .subscribe()
             .flat_map({
                 let arms = arms.clone();
                 move |input_value| {
@@ -2233,8 +2233,8 @@ impl WhenCombinator {
                         .find(|arm| (arm.matcher)(&input_value));
 
                     if let Some(arm) = matched_arm {
-                        // Subscribe to the matching arm's body (use subscribe_boxed for lazy actors)
-                        arm.body.clone().subscribe_boxed().boxed_local()
+                        // Subscribe to the matching arm's body
+                        arm.body.clone().subscribe().boxed_local()
                     } else {
                         // No match - this shouldn't happen if we have a wildcard default
                         // Return an empty stream
@@ -2747,7 +2747,7 @@ impl ValueActor {
     /// Create a ValueActor that delegates to a LazyValueActor for demand-driven evaluation.
     ///
     /// Used in HOLD body context where lazy evaluation is needed for sequential state updates.
-    /// The returned ValueActor is a shell that forwards subscribe_boxed() calls to the lazy actor.
+    /// The returned ValueActor is a shell that forwards subscribe() calls to the lazy actor.
     ///
     /// Note: The shell actor doesn't have its own loop - all subscription happens through
     /// the lazy delegate. The shell exists so the return type is Arc<ValueActor>.
@@ -3151,13 +3151,31 @@ impl ValueActor {
         });
     }
 
-    /// Subscribe to this actor's values using bounded channel notifications.
+    /// Subscribe to this actor's values.
+    ///
+    /// Automatically handles both eager and lazy actors:
+    /// - Eager actors: Returns efficient bounded-channel subscription
+    /// - Lazy actors: Returns demand-driven subscription from lazy delegate
+    ///
+    /// Uses `Either` to avoid boxing while supporting both subscription types.
+    pub fn subscribe(self: Arc<Self>) -> impl Stream<Item = Value> {
+        if let Some(ref lazy_delegate) = self.lazy_delegate {
+            lazy_delegate.clone().subscribe().left_stream()
+        } else {
+            self.subscribe_eager().right_stream()
+        }
+    }
+
+    /// Subscribe to eager actor's values using bounded channel notifications.
+    ///
+    /// WARNING: Only use this for actors you KNOW are eager (no lazy_delegate).
+    /// For general use, prefer `subscribe()` which handles both cases.
     ///
     /// Memory-efficient subscription using bounded(1) channels.
     /// - O(1) memory per subscriber regardless of speed
     /// - Slow subscribers automatically skip to latest value
     /// - No RefCell or internal mutability - pure dataflow
-    pub fn subscribe(self: Arc<Self>) -> Subscription {
+    fn subscribe_eager(self: Arc<Self>) -> Subscription {
         // Create bounded(1) channel - at most 1 pending notification
         let (mut sender, receiver) = mpsc::channel::<()>(1);
 
@@ -3188,20 +3206,6 @@ impl ValueActor {
             // Circular reference chains in HOLD are broken via Weak in HOLD closures (evaluator.rs).
             actor: self,
             pending_values: VecDeque::new(),
-        }
-    }
-
-    /// Subscribe and return a boxed stream.
-    ///
-    /// If this ValueActor has a lazy_delegate, returns a demand-driven lazy stream.
-    /// Otherwise returns the normal eager subscription.
-    ///
-    /// Used in HOLD body context where lazy evaluation is needed for sequential state updates.
-    pub fn subscribe_boxed(self: Arc<Self>) -> Pin<Box<dyn Stream<Item = Value>>> {
-        if let Some(ref lazy_delegate) = self.lazy_delegate {
-            Box::pin(lazy_delegate.clone().subscribe())
-        } else {
-            Box::pin(self.subscribe())
         }
     }
 
