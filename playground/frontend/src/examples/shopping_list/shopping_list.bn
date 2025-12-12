@@ -20,9 +20,19 @@ item_input: Element/text_input(
     focus: True
 )
 
--- Count items using HOLD
+-- Clear button
+clear_button: Element/button(
+    element: [event: [press: LINK]]
+    style: [padding: 10]
+    label: TEXT { Clear }
+)
+
+-- Count items using HOLD with LATEST to handle both Enter and Clear button
 item_count: 0 |> HOLD state {
-    item_added |> THEN { state + 1 }
+    LATEST {
+        item_added |> THEN { state + 1 }
+        clear_button.event.press |> THEN { 0 }
+    }
 }
 
 -- UI
@@ -40,10 +50,19 @@ document: Document/new(root: Element/stripe(
 
         item_input
 
-        Element/label(
+        Element/stripe(
             element: []
-            style: [font: [color: Oklch[lightness: 0.5]]]
-            label: TEXT { {item_count} items added }
+            direction: Row
+            gap: 16
+            style: []
+            items: LIST {
+                Element/label(
+                    element: []
+                    style: [font: [color: Oklch[lightness: 0.5]]]
+                    label: TEXT { {item_count} items added }
+                )
+                clear_button
+            }
         )
     }
 ))

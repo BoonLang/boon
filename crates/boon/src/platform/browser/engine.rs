@@ -1659,7 +1659,8 @@ impl LatestCombinator {
 
         let value_stream =
             stream::select_all(inputs.iter().enumerate().map(|(index, value_actor)| {
-                value_actor.clone().subscribe().map(move |value| (index, value))
+                // Use subscribe_boxed() to properly handle lazy actors in HOLD body context
+                value_actor.clone().subscribe_boxed().map(move |value| (index, value))
             }))
             .scan(true, {
                 let storage = storage.clone();
@@ -1748,7 +1749,8 @@ impl ThenCombinator {
         let observed_for_subscribe = observed.clone();
         let send_impulse_task = Task::start_droppable(
             observed_for_subscribe
-                .subscribe()
+                // Use subscribe_boxed() to properly handle lazy actors in HOLD body context
+                .subscribe_boxed()
                 .scan(true, {
                     let storage = storage.clone();
                     move |first_run, value| {
@@ -1800,7 +1802,8 @@ impl ThenCombinator {
                     }
                 }),
         );
-        let value_stream = body.clone().subscribe().map(|mut value| {
+        // Use subscribe_boxed() to properly handle lazy body actors in HOLD context
+        let value_stream = body.clone().subscribe_boxed().map(|mut value| {
             value.set_idempotency_key(ValueIdempotencyKey::new());
             value
         });
@@ -1846,9 +1849,10 @@ impl BinaryOperatorCombinator {
         let construct_info = construct_info.complete(ConstructType::ValueActor);
 
         // Merge both operand streams, tracking which operand changed
+        // Use subscribe_boxed() to properly handle lazy actors in HOLD body context
         let value_stream = stream::select_all([
-            operand_a.clone().subscribe().map(|v| (0usize, v)).boxed_local(),
-            operand_b.clone().subscribe().map(|v| (1usize, v)).boxed_local(),
+            operand_a.clone().subscribe_boxed().map(|v| (0usize, v)).boxed_local(),
+            operand_b.clone().subscribe_boxed().map(|v| (1usize, v)).boxed_local(),
         ])
         .scan(
             (None::<Value>, None::<Value>),
@@ -2216,9 +2220,10 @@ impl WhenCombinator {
         let arms = Arc::new(arms);
 
         // For each input value, find the matching arm and emit its body's value
+        // Use subscribe_boxed() to properly handle lazy actors in HOLD body context
         let value_stream = input
             .clone()
-            .subscribe()
+            .subscribe_boxed()
             .flat_map({
                 let arms = arms.clone();
                 move |input_value| {
@@ -2228,8 +2233,8 @@ impl WhenCombinator {
                         .find(|arm| (arm.matcher)(&input_value));
 
                     if let Some(arm) = matched_arm {
-                        // Subscribe to the matching arm's body
-                        arm.body.clone().subscribe().boxed_local()
+                        // Subscribe to the matching arm's body (use subscribe_boxed for lazy actors)
+                        arm.body.clone().subscribe_boxed().boxed_local()
                     } else {
                         // No match - this shouldn't happen if we have a wildcard default
                         // Return an empty stream

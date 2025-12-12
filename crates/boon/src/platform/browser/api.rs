@@ -335,11 +335,36 @@ pub fn function_element_button(
     let [argument_element, argument_style, argument_label] = arguments.as_slice() else {
         panic!("Unexpected argument count")
     };
+    // Create a derived actor that extracts `event` from argument_element
+    // This allows direct access via `.event` instead of `.element.event`
+    let event_stream = argument_element
+        .clone()
+        .subscribe()
+        .filter_map(|value| {
+            // value is Object [event: [...]]
+            future::ready(value.expect_object().variable("event"))
+        })
+        .flat_map(|event_variable| {
+            // Subscribe to get the event object values [press: LINK]
+            event_variable.subscribe()
+        });
+
+    let event_actor = ValueActor::new_arc(
+        ConstructInfo::new(
+            function_call_id.with_child_id(7),
+            None,
+            "ElementButton[event] (derived)",
+        ),
+        actor_context.clone(),
+        TypedStream::infinite(event_stream.chain(stream::pending())),
+        None,
+    );
+
     TaggedObject::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
             None,
-            "Element/stripe(..) -> ElementButton[..]",
+            "Element/button(..) -> ElementButton[..]",
         ),
         construct_context.clone(),
         ValueIdempotencyKey::new(),
@@ -349,25 +374,22 @@ pub fn function_element_button(
                 ConstructInfo::new(
                     function_call_id.with_child_id(1),
                     None,
-                    "Element/stripe(..) -> ElementButton[event]",
+                    "ElementButton[element]",
+                ),
+                construct_context.clone(),
+                "element",
+                argument_element.clone(),
+                None,
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(2),
+                    None,
+                    "ElementButton[event]",
                 ),
                 construct_context.clone(),
                 "event",
-                ValueActor::new_arc(
-                    ConstructInfo::new(
-                        function_call_id.with_child_id(2),
-                        None,
-                        "Element/stripe(..) -> ElementButton[event: [..]]",
-                    ),
-                    actor_context.clone(),
-                    // Subscription-based streams are infinite
-                    TypedStream::infinite(argument_element
-                        .clone()
-                        .subscribe()
-                        .filter_map(|value| future::ready(value.expect_object().variable("event")))
-                        .flat_map(|variable| variable.subscribe())),
-                    None,
-                ),
+                event_actor,
                 None,
             ),
             Variable::new_arc(

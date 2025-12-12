@@ -477,10 +477,14 @@ fn element_button(
 
     let (press_event_sender, mut press_event_receiver) = mpsc::unbounded::<PressEvent>();
 
-    let event_stream =
-        stream::iter(tagged_object.variable("event")).flat_map(|variable| variable.subscribe());
+    let element_variable = tagged_object.expect_variable("element");
 
-    let mut press_stream = event_stream
+    // Set up press event handler - use same subscription pattern as text_input
+    let mut press_stream = element_variable
+        .clone()
+        .subscribe()
+        .filter_map(|value| future::ready(value.expect_object().variable("event")))
+        .flat_map(|variable| variable.subscribe())
         .filter_map(|value| future::ready(value.expect_object().variable("press")))
         .map(|variable| variable.expect_link_value_sender())
         .fuse();
@@ -494,6 +498,7 @@ fn element_button(
                 select! {
                     new_press_link_value_sender = press_stream.next() => {
                         if let Some(new_press_link_value_sender) = new_press_link_value_sender {
+                            zoon::println!("[BRIDGE] event_handler: press LINK sender set up (ready to receive events)");
                             press_link_value_sender = Some(new_press_link_value_sender);
                         } else {
                             break
@@ -501,6 +506,7 @@ fn element_button(
                     }
                     press_event = press_event_receiver.select_next_some() => {
                         if let Some(press_link_value_sender) = press_link_value_sender.as_ref() {
+                            zoon::println!("[BRIDGE] event_handler: Received press event from MoonZoon");
                             let press_event_object_value = Object::new_value(
                                 ConstructInfo::new(format!("bridge::element_button::press_event, version: {press_event_object_value_version}"), None, "Button press event"),
                                 construct_context.clone(),
@@ -508,9 +514,13 @@ fn element_button(
                                 [],
                             );
                             press_event_object_value_version += 1;
-                            if let Err(error) = press_link_value_sender.unbounded_send(press_event_object_value) {
+                            let result = press_link_value_sender.unbounded_send(press_event_object_value);
+                            zoon::println!("[BRIDGE] event_handler: Sent press event to Boon engine LINK, result: {}", result.is_ok());
+                            if let Err(error) = result {
                                 eprintln!("Failed to send button press event to event press link variable: {error}");
                             }
+                        } else {
+                            zoon::println!("[BRIDGE] event_handler: Press event received but no LINK sender set up yet");
                         }
                     }
                 }
