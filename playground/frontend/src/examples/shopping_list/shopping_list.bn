@@ -1,49 +1,49 @@
--- Shopping List: Add items with Enter key, count them
--- Demonstrates: Element/text_input, WHEN pattern matching, HOLD accumulator
+-- Shopping List
 
--- Input element for adding items
+-- Detect Enter key press (defined first so it can be referenced)
+item_added: item_input.event.key_down.key |> WHEN {
+    Enter => True
+    __ => SKIP
+}
+
+-- Input element with text clearing on Enter
 item_input: Element/text_input(
-    element: [event: [key_down: LINK]]
+    element: [event: [key_down: LINK, change: LINK]]
     style: [width: Fill]
     label: Hidden[text: TEXT { Item name }]
-    text: Text/empty()
-    placeholder: [text: TEXT { Type item name and press Enter... }]
+    text: LATEST {
+        Text/empty()
+        element.event.change.text
+        item_added |> THEN { Text/empty() }
+    }
+    placeholder: [text: TEXT { Type and press Enter to add... }]
     focus: True
 )
 
--- Get key events
-key_event: item_input.event.key_down.key
-
--- Count Enter key presses (items added)
+-- Count items using HOLD
 item_count: 0 |> HOLD state {
-    key_event |> WHEN {
-        Enter => state + 1
-        __ => SKIP
-    }
+    item_added |> THEN { state + 1 }
 }
 
--- UI Layout
+-- UI
 document: Document/new(root: Element/stripe(
     element: []
     direction: Column
     gap: 16
     style: [padding: 20, width: 400]
     items: LIST {
-        -- Header
         Element/label(
             element: []
             style: [font: [size: 24, weight: Bold]]
             label: TEXT { Shopping List }
         )
 
-        -- Input field
         item_input
 
-        -- Item count display
         Element/label(
             element: []
             style: [font: [color: Oklch[lightness: 0.5]]]
-            label: TEXT { {item_count} items added (press Enter to add) }
+            label: TEXT { {item_count} items added }
         )
     }
 ))
