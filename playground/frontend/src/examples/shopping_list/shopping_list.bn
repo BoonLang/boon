@@ -1,24 +1,27 @@
 -- Shopping List
 
--- Detect Enter key press (defined first so it can be referenced)
-item_added: item_input.event.key_down.key |> WHEN {
-    Enter => True
-    __ => SKIP
-}
-
--- Input element with text clearing on Enter
+-- Input element
 item_input: Element/text_input(
     element: [event: [key_down: LINK, change: LINK]]
     style: [width: Fill]
     label: Hidden[text: TEXT { Item name }]
-    text: LATEST {
-        Text/empty()
-        element.event.change.text
-        item_added |> THEN { Text/empty() }
-    }
+    text: display_text
     placeholder: [text: TEXT { Type and press Enter to add... }]
     focus: True
 )
+
+-- Detect Enter key press
+enter_pressed: item_input.event.key_down.key |> WHEN {
+    Enter => True
+    __ => SKIP
+}
+
+-- Text displayed in input (clears on Enter)
+display_text: LATEST {
+    Text/empty()
+    item_input.event.change.text
+    enter_pressed |> THEN { Text/empty() }
+}
 
 -- Clear button
 clear_button: Element/button(
@@ -27,10 +30,10 @@ clear_button: Element/button(
     label: TEXT { Clear }
 )
 
--- Count items using HOLD with LATEST to handle both Enter and Clear button
+-- Count items using HOLD
 item_count: 0 |> HOLD state {
     LATEST {
-        item_added |> THEN { state + 1 }
+        enter_pressed |> THEN { state + 1 }
         clear_button.event.press |> THEN { 0 }
     }
 }

@@ -97,7 +97,7 @@ pub fn function_element_stripe(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let [_argument_element, argument_direction, _argument_gap, argument_style, argument_items] =
+    let [_argument_element, argument_direction, argument_gap, argument_style, argument_items] =
         arguments.as_slice() else {
             panic!("Element/stripe requires 5 arguments, got {}", arguments.len());
         };
@@ -137,6 +137,17 @@ pub fn function_element_stripe(
                         construct_context.clone(),
                         "direction",
                         argument_direction.clone(),
+                        None,
+                    ),
+                    Variable::new_arc(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(6),
+                            None,
+                            "Element/stripe(..) -> ElementStripe[settings: [gap]]",
+                        ),
+                        construct_context.clone(),
+                        "gap",
+                        argument_gap.clone(),
                         None,
                     ),
                     Variable::new_arc(

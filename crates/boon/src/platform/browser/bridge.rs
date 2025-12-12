@@ -256,6 +256,7 @@ fn element_stripe(
     // Solution: Store the Object when we first receive it and keep it in a shared cell.
     let settings_object: std::sync::Arc<std::sync::Mutex<Option<Arc<Object>>>> = Default::default();
     let settings_object_for_direction = settings_object.clone();
+    let settings_object_for_gap = settings_object.clone();
     let settings_object_for_items = settings_object.clone();
 
     // Similarly, we need to keep the items List value alive to prevent the underlying
@@ -276,6 +277,21 @@ fn element_stripe(
             "Column" => Direction::Column,
             "Row" => Direction::Row,
             other => panic!("Invalid Stripe element direction value: Found: '{other}', Expected: 'Column' or 'Row'"),
+        });
+
+    let gap_stream = settings_variable
+        .clone()
+        .subscribe()
+        .flat_map(move |value| {
+            let object = value.expect_object();
+            *settings_object_for_gap.lock().unwrap() = Some(object.clone());
+            object.expect_variable("gap").subscribe()
+        })
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                _ => None,
+            })
         });
 
     let items_vec_diff_stream = settings_variable
@@ -305,6 +321,9 @@ fn element_stripe(
         ))
         .on_hovered_change(move |is_hovered| {
             let _ = hovered_sender.unbounded_send(is_hovered);
+        })
+        .update_raw_el(|raw_el| {
+            raw_el.style_signal("gap", signal::from_stream(gap_stream))
         })
         // Keep tagged_object, settings_object, and items_list_value alive for the lifetime of this element
         .after_remove(move |_| {
@@ -722,6 +741,7 @@ fn element_text_input(
     // Width signal from style
     let width_signal = signal::from_stream(
         settings_variable
+            .clone()
             .subscribe()
             .flat_map(|value| value.expect_object().expect_variable("style").subscribe())
             .flat_map(|value| {
@@ -736,6 +756,33 @@ fn element_text_input(
                 })
             }),
     );
+
+    // Focus signal - use Mutable with stream updates
+    // Start with false, stream will set to true if focus: True is specified
+    let focus_mutable = Mutable::new(false);
+    let focus_signal = focus_mutable.signal();
+
+    // Update the mutable when the stream emits
+    let focus_stream = settings_variable
+        .subscribe()
+        .flat_map(|value| value.expect_object().expect_variable("focus").subscribe())
+        .filter_map(|value| {
+            future::ready(match value {
+                Value::Tag(tag, _) => Some(tag.tag() == "True"),
+                _ => None,
+            })
+        });
+
+    // Task to update focus from stream - must be kept alive
+    let focus_task = Task::start_droppable({
+        let focus_mutable = focus_mutable.clone();
+        async move {
+            futures_util::pin_mut!(focus_stream);
+            while let Some(focus) = focus_stream.next().await {
+                focus_mutable.set_neq(focus);
+            }
+        }
+    });
 
     TextInput::new()
         .label_hidden("text input")
@@ -765,6 +812,7 @@ fn element_text_input(
                 let _ = sender.unbounded_send(());
             }
         })
+        .focus_signal(focus_signal)
         .update_raw_el(|raw_el| {
             raw_el
                 .style("padding", "8px 12px")
@@ -776,7 +824,10 @@ fn element_text_input(
                 .style("box-sizing", "border-box")
                 .style_signal("width", width_signal)
         })
-        .after_remove(move |_| drop(event_handler_task))
+        .after_remove(move |_| {
+            drop(event_handler_task);
+            drop(focus_task);
+        })
 }
 
 fn element_checkbox(
