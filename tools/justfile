@@ -20,6 +20,10 @@ server:
 status:
     {{boon_tools}} exec status
 
+# Select example by name (e.g., counter, layers, shopping_list)
+select name:
+    {{boon_tools}} exec select {{name}}
+
 # Run the current code in playground
 run:
     {{boon_tools}} exec run

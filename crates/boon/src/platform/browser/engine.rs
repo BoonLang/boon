@@ -1239,28 +1239,56 @@ impl VariableOrArgumentReference {
             // flatten_unordered processes all inner streams concurrently.
             value_stream = value_stream
                 .map(move |value| {
+                    let alias_part = alias_part.clone();
                     match value {
                         Value::Object(object, _) => {
-                            let variable_actor = object.expect_variable(&alias_part).value_actor();
-                            // The Subscription keeps the ValueActor alive. We still keep the parent
-                            // object alive via unfold to ensure any back-references remain valid.
-                            stream::unfold(
-                                (variable_actor.subscribe(), object),
-                                |(mut subscription, object)| async move {
-                                    subscription.next().await.map(|value| (value, (subscription, object)))
-                                }
-                            ).boxed_local()
+                            let variable = object.expect_variable(&alias_part);
+                            let is_link = variable.link_value_sender().is_some();
+                            let variable_actor = variable.value_actor();
+
+                            if is_link {
+                                // LINK field: stay subscribed to receive multiple events
+                                // Keep object and variable alive via unfold state
+                                stream::unfold(
+                                    (variable_actor.subscribe(), object, variable),
+                                    move |(mut subscription, object, variable)| async move {
+                                        subscription.next().await.map(|value| (value, (subscription, object, variable)))
+                                    }
+                                ).boxed_local()
+                            } else {
+                                // Non-LINK field: emit once and complete
+                                // This allows flatten_unordered(Some(1)) to process subsequent parent emissions
+                                stream::once(async move {
+                                    let mut subscription = variable_actor.subscribe();
+                                    let result = subscription.next().await;
+                                    // Keep object and variable alive until we get the value
+                                    let _ = (&object, &variable);
+                                    result
+                                }).filter_map(|opt| async move { opt }).boxed_local()
+                            }
                         }
                         Value::TaggedObject(tagged_object, _) => {
-                            let variable_actor = tagged_object.expect_variable(&alias_part).value_actor();
-                            // The Subscription keeps the ValueActor alive. We still keep the parent
-                            // tagged_object alive via unfold to ensure any back-references remain valid.
-                            stream::unfold(
-                                (variable_actor.subscribe(), tagged_object),
-                                |(mut subscription, tagged_object)| async move {
-                                    subscription.next().await.map(|value| (value, (subscription, tagged_object)))
-                                }
-                            ).boxed_local()
+                            let variable = tagged_object.expect_variable(&alias_part);
+                            let is_link = variable.link_value_sender().is_some();
+                            let variable_actor = variable.value_actor();
+
+                            if is_link {
+                                // LINK field: stay subscribed to receive multiple events
+                                stream::unfold(
+                                    (variable_actor.subscribe(), tagged_object, variable),
+                                    move |(mut subscription, tagged_object, variable)| async move {
+                                        subscription.next().await.map(|value| (value, (subscription, tagged_object, variable)))
+                                    }
+                                ).boxed_local()
+                            } else {
+                                // Non-LINK field: emit once and complete
+                                stream::once(async move {
+                                    let mut subscription = variable_actor.subscribe();
+                                    let result = subscription.next().await;
+                                    let _ = (&tagged_object, &variable);
+                                    result
+                                }).filter_map(|opt| async move { opt }).boxed_local()
+                            }
                         }
                         other => panic!(
                             "Failed to get Object or TaggedObject to create VariableOrArgumentReference: The Value has a different type {}",
@@ -1268,11 +1296,9 @@ impl VariableOrArgumentReference {
                         ),
                     }
                 })
-                // IMPORTANT: Use flatten_unordered(Some(1)) to limit concurrency!
-                // With None (unlimited), each root emission creates a new concurrent
-                // subscription to the field, and these never terminate. This causes
-                // exponential growth in active subscriptions when state updates frequently
-                // (e.g., `state.current` in THEN body inside HOLD).
+                // With Some(1), only 1 inner stream is processed at a time.
+                // This works because non-LINK streams now complete after emitting,
+                // allowing subsequent LINK events to be processed.
                 .flatten_unordered(Some(1))
                 .boxed_local();
         }

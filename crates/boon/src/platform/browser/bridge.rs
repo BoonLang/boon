@@ -599,6 +599,7 @@ fn element_text_input(
                     }
                     new_sender = key_down_stream.next() => {
                         if let Some(sender) = new_sender {
+                            zoon::println!("[BRIDGE] event_handler: key_down LINK sender set up (ready to receive events)");
                             key_down_link_value_sender = Some(sender);
                         }
                     }
@@ -636,7 +637,9 @@ fn element_text_input(
                         }
                     }
                     key = key_down_event_receiver.select_next_some() => {
+                        zoon::println!("[BRIDGE] event_handler: Received key '{}' from channel (from MoonZoon)", key);
                         if let Some(sender) = key_down_link_value_sender.as_ref() {
+                            zoon::println!("[BRIDGE] event_handler: LINK sender exists, creating event object for key '{}'", key);
                             let event_value = Object::new_value(
                                 ConstructInfo::new("text_input::key_down_event", None, "TextInput key_down event"),
                                 construct_context.clone(),
@@ -653,14 +656,17 @@ fn element_text_input(
                                             ConstructInfo::new("text_input::key_down_event::key_value", None, "key_down key value"),
                                             construct_context.clone(),
                                             ValueIdempotencyKey::new(),
-                                            key,
+                                            key.clone(),
                                         ))).chain(stream::pending())),
                                         None,
                                     ),
                                     None,
                                 )],
                             );
-                            let _ = sender.unbounded_send(event_value);
+                            let send_result = sender.unbounded_send(event_value);
+                            zoon::println!("[BRIDGE] event_handler: Sent key '{}' event to Boon engine LINK, result: {:?}", key, send_result.is_ok());
+                        } else {
+                            zoon::println!("[BRIDGE] event_handler: WARNING - key '{}' received but NO LINK sender set up!", key);
                         }
                     }
                     _blur = blur_event_receiver.select_next_some() => {
@@ -738,7 +744,9 @@ fn element_text_input(
                     Key::Escape => "Escape".to_string(),
                     Key::Other(k) => k.clone(),
                 };
-                let _ = sender.unbounded_send(key_name);
+                zoon::println!("[BRIDGE] on_key_down_event: MoonZoon received key '{}' from DOM", key_name);
+                let send_result = sender.unbounded_send(key_name.clone());
+                zoon::println!("[BRIDGE] on_key_down_event: Sent '{}' to channel, result: {:?}", key_name, send_result.is_ok());
             }
         })
         .on_blur({

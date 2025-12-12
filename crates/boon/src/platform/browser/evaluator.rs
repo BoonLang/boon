@@ -2590,45 +2590,75 @@ fn build_field_access_actor(
     );
 
     // For each field in the path, transform the subscription stream to extract that field
+    // IMPORTANT: Use map + flatten_unordered instead of flat_map!
+    // flat_map uses flatten which waits for each inner stream to complete before processing the next.
+    // Since Object field streams are infinite (they use pending()), flatten would block.
+    // flatten_unordered processes inner streams concurrently.
     for field_name in path_strings {
         subscription_stream = Box::pin(
             subscription_stream
-                .filter_map(move |value| {
+                .map(move |value| {
                     let field_name = field_name.clone();
-                    async move {
-                        match value {
-                            Value::Object(object, _) => {
-                                let variable_actor = object.expect_variable(&field_name).value_actor();
-                                // Try stored value first, fall back to subscription if not available yet
-                                // This handles the race condition where the value might not be computed yet
-                                if let Some(val) = variable_actor.stored_value() {
-                                    Some(val)
-                                } else {
-                                    // Value not stored yet - wait for it via subscription
-                                    variable_actor.subscribe().next().await
-                                }
+                    // Get the field Variable and subscribe to all its values
+                    match value {
+                        Value::Object(object, _) => {
+                            let variable = object.expect_variable(&field_name);
+                            let is_link = variable.link_value_sender().is_some();
+                            let variable_actor = variable.value_actor();
+
+                            if is_link {
+                                // LINK field: stay subscribed to receive multiple events
+                                stream::unfold(
+                                    (variable_actor.subscribe(), object, variable),
+                                    move |(mut subscription, object, variable)| async move {
+                                        subscription.next().await.map(|value| (value, (subscription, object, variable)))
+                                    }
+                                ).boxed_local()
+                            } else {
+                                // Non-LINK field: emit once and complete
+                                stream::once(async move {
+                                    let mut subscription = variable_actor.subscribe();
+                                    let result = subscription.next().await;
+                                    let _ = (&object, &variable);
+                                    result
+                                }).filter_map(|opt| async move { opt }).boxed_local()
                             }
-                            Value::TaggedObject(tagged_object, _) => {
-                                let variable_actor = tagged_object.expect_variable(&field_name).value_actor();
-                                // Try stored value first, fall back to subscription if not available yet
-                                if let Some(val) = variable_actor.stored_value() {
-                                    Some(val)
-                                } else {
-                                    // Value not stored yet - wait for it via subscription
-                                    variable_actor.subscribe().next().await
-                                }
+                        }
+                        Value::TaggedObject(tagged_object, _) => {
+                            let variable = tagged_object.expect_variable(&field_name);
+                            let is_link = variable.link_value_sender().is_some();
+                            let variable_actor = variable.value_actor();
+
+                            if is_link {
+                                // LINK field: stay subscribed to receive multiple events
+                                stream::unfold(
+                                    (variable_actor.subscribe(), tagged_object, variable),
+                                    move |(mut subscription, tagged_object, variable)| async move {
+                                        subscription.next().await.map(|value| (value, (subscription, tagged_object, variable)))
+                                    }
+                                ).boxed_local()
+                            } else {
+                                // Non-LINK field: emit once and complete
+                                stream::once(async move {
+                                    let mut subscription = variable_actor.subscribe();
+                                    let result = subscription.next().await;
+                                    let _ = (&tagged_object, &variable);
+                                    result
+                                }).filter_map(|opt| async move { opt }).boxed_local()
                             }
-                            other => {
-                                // Not an object - log error and skip
-                                zoon::println!(
-                                    "FieldAccess: Cannot access field '{}' on non-object value: {}",
-                                    field_name, other.construct_info()
-                                );
-                                None
-                            }
+                        }
+                        other => {
+                            // Not an object - log error and return empty stream
+                            zoon::println!(
+                                "FieldAccess: Cannot access field '{}' on non-object value: {}",
+                                field_name, other.construct_info()
+                            );
+                            stream::empty().boxed_local()
                         }
                     }
                 })
+                // With Some(1), non-LINK streams complete after emitting, allowing subsequent LINK events
+                .flatten_unordered(Some(1))
         );
     }
 

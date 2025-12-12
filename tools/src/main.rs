@@ -124,6 +124,12 @@ enum ExecAction {
         text: String,
     },
 
+    /// Press a special key (Enter, Tab, Escape, Backspace, Delete)
+    Key {
+        /// Key name: Enter, Tab, Escape, Backspace, Delete
+        key: String,
+    },
+
     /// Check connection status
     Status,
 
@@ -364,6 +370,11 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
 
         ExecAction::Type { selector, text } => {
             let response = send_command_to_server(port, WsCommand::Type { selector, text }).await?;
+            print_response(response);
+        }
+
+        ExecAction::Key { key } => {
+            let response = send_command_to_server(port, WsCommand::Key { key }).await?;
             print_response(response);
         }
 

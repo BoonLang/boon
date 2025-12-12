@@ -199,7 +199,8 @@ async function cdpTypeText(tabId, text) {
   await chrome.debugger.sendCommand({ tabId }, 'Input.insertText', { text });
 }
 
-// Press special key (Enter, Tab, Escape, etc.)
+// Press special key (Enter, Tab, Escape, etc.) using CDP Input.dispatchKeyEvent
+// NOTE: This may not trigger JavaScript event listeners attached via web_sys
 async function cdpPressKey(tabId, key, modifiers = 0) {
   await attachDebugger(tabId);
 
@@ -220,6 +221,39 @@ async function cdpPressKey(tabId, key, modifiers = 0) {
   await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
     type: 'keyUp', ...keyInfo, modifiers
   });
+}
+
+// Press special key using JavaScript dispatchEvent (triggers web_sys event listeners)
+async function jsDispatchKeyEvent(tabId, key) {
+  const keyMap = {
+    'Enter': { key: 'Enter', code: 'Enter', keyCode: 13, which: 13 },
+    'Tab': { key: 'Tab', code: 'Tab', keyCode: 9, which: 9 },
+    'Escape': { key: 'Escape', code: 'Escape', keyCode: 27, which: 27 },
+    'Backspace': { key: 'Backspace', code: 'Backspace', keyCode: 8, which: 8 },
+    'Delete': { key: 'Delete', code: 'Delete', keyCode: 46, which: 46 },
+  };
+
+  const keyInfo = keyMap[key] || { key, code: key, keyCode: 0, which: 0 };
+
+  // Dispatch keydown event on the focused element
+  const script = `
+    (function() {
+      const target = document.activeElement || document.body;
+      const event = new KeyboardEvent('keydown', {
+        key: '${keyInfo.key}',
+        code: '${keyInfo.code}',
+        keyCode: ${keyInfo.keyCode},
+        which: ${keyInfo.which},
+        bubbles: true,
+        cancelable: true,
+        composed: true
+      });
+      target.dispatchEvent(event);
+      return { target: target.tagName, key: '${keyInfo.key}' };
+    })()
+  `;
+
+  return await cdpEvaluate(tabId, script);
 }
 
 // Keyboard shortcut (Ctrl+A, Ctrl+V, etc.)
@@ -480,6 +514,16 @@ async function handleCommand(id, command) {
           return { type: 'error', message: e.message };
         }
 
+      case 'key':
+        // Press a special key (Enter, Tab, Escape, etc.)
+        // Use JavaScript dispatchEvent to properly trigger web_sys event listeners
+        try {
+          const result = await jsDispatchKeyEvent(tab.id, command.key);
+          return { type: 'success', data: result };
+        } catch (e) {
+          return { type: 'error', message: e.message };
+        }
+
       case 'screenshot':
         // Use CDP for screenshot
         try {
@@ -551,17 +595,48 @@ async function handleCommand(id, command) {
         }
 
       case 'clearStates':
-        // Use CDP to click the Clear saved states button
+        // Use CDP Runtime.evaluate to find and click the Clear saved states button
         try {
-          // Find the button by its text content via CDP
-          const buttons = await cdpQuerySelectorAll(tab.id, 'button');
-          const clearButton = buttons.find(b =>
-            b.html.toLowerCase().includes('clear') && b.html.toLowerCase().includes('states'));
-          if (clearButton) {
-            await cdpClickAt(tab.id, clearButton.centerX, clearButton.centerY);
-            return { type: 'success', data: { method: 'cdp' } };
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              // Find all elements that might be buttons
+              const elements = document.querySelectorAll('[role="button"], button');
+              for (const el of elements) {
+                const text = (el.textContent || '').toLowerCase();
+                if (text.includes('clear') && text.includes('saved') && text.includes('states')) {
+                  // Found the button - dispatch pointer events (Zoon uses pointer events)
+                  const rect = el.getBoundingClientRect();
+                  const x = rect.left + rect.width / 2;
+                  const y = rect.top + rect.height / 2;
+
+                  el.dispatchEvent(new PointerEvent('pointerdown', {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    clientX: x,
+                    clientY: y,
+                    button: 0,
+                    pointerType: 'mouse'
+                  }));
+                  el.dispatchEvent(new PointerEvent('pointerup', {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    clientX: x,
+                    clientY: y,
+                    button: 0,
+                    pointerType: 'mouse'
+                  }));
+                  return { clicked: true, text: text.trim() };
+                }
+              }
+              return { clicked: false, found: elements.length };
+            })()
+          `);
+          if (result && result.clicked) {
+            return { type: 'success', data: { method: 'cdp-evaluate', text: result.text } };
           }
-          return { type: 'error', message: 'Clear saved states button not found' };
+          return { type: 'error', message: `Clear saved states button not found (searched ${result?.found || 0} elements)` };
         } catch (e) {
           return { type: 'error', message: e.message };
         }

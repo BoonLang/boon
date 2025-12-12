@@ -12,6 +12,9 @@ pub enum Command {
     /// Type text into an element
     Type { selector: String, text: String },
 
+    /// Press a special key (Enter, Tab, Escape, Backspace, Delete)
+    Key { key: String },
+
     /// Inject code into the CodeMirror editor
     InjectCode { code: String },
 

@@ -106,9 +106,22 @@ boon-tools exec run                       # Trigger execution
 boon-tools exec console                   # Get browser console logs
 boon-tools exec preview                   # Get preview panel text
 boon-tools exec screenshot -o test.png    # Capture page
+boon-tools exec select shopping_list      # Select example by name
 ```
 
-See `tools/DEBUG_WITH_BROWSER.md` for full documentation.
+**Using `just` commands (recommended, from `tools/` directory):**
+```bash
+cd tools
+just status                    # Check connection
+just select shopping_list      # Select example by name
+just run                       # Run current code
+just preview                   # Get preview panel text
+just console                   # Get browser console logs
+just screenshot                # Take screenshot
+just --list                    # Show all available commands
+```
+
+See `tools/DEBUG_WITH_BROWSER.md` and `tools/justfile` for full documentation.
 
 ## Architecture
 
