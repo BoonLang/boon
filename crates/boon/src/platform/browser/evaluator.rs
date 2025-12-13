@@ -1395,7 +1395,11 @@ fn process_work_item(
 
                 // Note: For referenced fields with forwarding actors, registration
                 // already happened in schedule_expression, so we skip it here
-                if vd.is_referenced && vd.forwarding_actor.is_none() {
+                // FIX: Always register variables to ensure they're available for
+                // nested function argument references. The is_referenced flag from
+                // scope resolution doesn't correctly track references inside nested
+                // function calls.
+                if vd.forwarding_actor.is_none() {
                     if let Some(ref_connector) = ctx.try_reference_connector() {
                         ref_connector.register_referenceable(vd.span, variable.value_actor());
                     }
@@ -1499,7 +1503,11 @@ fn process_work_item(
 
                 // Note: For referenced fields with forwarding actors, registration
                 // already happened in schedule_expression, so we skip it here
-                if vd.is_referenced && vd.forwarding_actor.is_none() {
+                // FIX: Always register variables to ensure they're available for
+                // nested function argument references. The is_referenced flag from
+                // scope resolution doesn't correctly track references inside nested
+                // function calls.
+                if vd.forwarding_actor.is_none() {
                     if let Some(ref_connector) = ctx.try_reference_connector() {
                         ref_connector.register_referenceable(vd.span, variable.value_actor());
                     }
@@ -3974,9 +3982,10 @@ fn static_spanned_variable_into_variable(
             Some(persistence_id),
         )
     };
-    if is_referenced {
-        reference_connector.register_referenceable(span, variable.value_actor());
-    }
+    // FIX: Always register top-level variables to ensure they're available for
+    // nested function argument references. The is_referenced flag from scope
+    // resolution doesn't correctly track references inside nested function calls.
+    reference_connector.register_referenceable(span, variable.value_actor());
     // Register LINK variable senders with LinkConnector
     if is_link {
         if let Some(sender) = variable.link_value_sender() {

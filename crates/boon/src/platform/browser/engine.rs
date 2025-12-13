@@ -5511,9 +5511,35 @@ impl ListBindingFunction {
         let actor_context_for_stream = actor_context.clone();
 
         println!("[DEBUG create_map_actor] About to subscribe to source_list_actor: {}", source_list_actor.construct_info);
-        let source_actor_for_debug = source_list_actor.clone();
-        let change_stream = source_list_actor.clone().subscribe().filter_map(move |value| {
-            println!("[DEBUG List/map] Received Value from source actor: {}", source_actor_for_debug.construct_info);
+
+        // FIX: Wrap subscription in a stream that yields control first.
+        // This allows the source actor's async loop to run and produce its initial value
+        // before we start waiting for values. Without this yield, when List/map is used
+        // inline (not assigned to a top-level variable), the source actor's loop hasn't
+        // had a chance to run yet, causing the subscription to wait forever.
+        let source_for_stream = source_list_actor.clone();
+        let change_stream = stream::once(async move {
+            // Yield control once to allow other spawned tasks (like source actor's loop) to run
+            use std::task::Poll;
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }).await;
+            println!("[DEBUG create_map_actor] After yield, returning source actor");
+            source_for_stream
+        })
+        .flat_map(|source| {
+            println!("[DEBUG create_map_actor] flat_map: subscribing to source after yield");
+            source.subscribe()
+        })
+        .filter_map(move |value| {
+            println!("[DEBUG List/map] Received Value from source actor");
             future::ready(match value {
                 Value::List(list, _) => {
                     println!("[DEBUG List/map] Extracted Arc<List> from Value::List");
