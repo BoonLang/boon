@@ -9,6 +9,7 @@
 pub mod protocol;
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -19,6 +20,34 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 pub use protocol::*;
+
+/// Directory for saving screenshots
+const SCREENSHOT_DIR: &str = "/tmp/boon-screenshots";
+
+/// Save base64 screenshot to file and return the path
+fn save_screenshot_to_file(base64_data: &str, name_hint: &str) -> Result<String> {
+    // Ensure screenshot directory exists
+    std::fs::create_dir_all(SCREENSHOT_DIR)
+        .context("Failed to create screenshot directory")?;
+
+    // Generate filename with timestamp
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let filename = format!("{}_{}.png", name_hint, timestamp);
+    let filepath = format!("{}/{}", SCREENSHOT_DIR, filename);
+
+    // Decode base64 and save
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(base64_data)
+        .context("Failed to decode base64")?;
+
+    std::fs::write(&filepath, decoded)
+        .context("Failed to write screenshot")?;
+
+    Ok(filepath)
+}
 
 /// Server state shared across connections
 pub struct ServerState {
@@ -58,6 +87,19 @@ impl ServerState {
             .clone();
         drop(extension_tx);
 
+        // Determine screenshot hint based on command type
+        let screenshot_hint = match &command {
+            Command::Screenshot => Some("fullpage"),
+            Command::ScreenshotElement { selector } => {
+                if selector.contains("preview") {
+                    Some("preview")
+                } else {
+                    Some("element")
+                }
+            }
+            _ => None,
+        };
+
         // Get request ID
         let id = {
             let mut next_id = self.next_id.write().await;
@@ -87,6 +129,20 @@ impl ServerState {
             .await
             .context("Extension response timeout")?
             .context("Response channel closed")?;
+
+        // Transform screenshot responses: save to file and return filepath
+        let response = match response {
+            Response::Screenshot { base64 } => {
+                let hint = screenshot_hint.unwrap_or("screenshot");
+                match save_screenshot_to_file(&base64, hint) {
+                    Ok(filepath) => Response::ScreenshotFile { filepath },
+                    Err(e) => Response::Error {
+                        message: format!("Failed to save screenshot: {}", e),
+                    },
+                }
+            }
+            other => other,
+        };
 
         Ok(response)
     }

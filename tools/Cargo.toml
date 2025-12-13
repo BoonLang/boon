@@ -47,3 +47,6 @@ regex = "1"
 
 # File system traversal for example discovery
 walkdir = "2"
+
+# HTTP client for playground status check
+reqwest = { version = "0.12", features = ["json"] }

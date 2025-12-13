@@ -453,8 +453,6 @@ fn schedule_expression(
     };
     let idempotency_key = persistence_id;
 
-    // Debug: log every expression type being scheduled
-
     match expr {
         // ============================================================
         // IMMEDIATE VALUES (no sub-expressions to evaluate)
@@ -1296,9 +1294,18 @@ fn process_work_item(
 
         WorkItem::BuildList { item_slots, span, persistence, ctx, result_slot } => {
             // Collect items that have values (empty slots are ignored)
+            println!("[DEBUG BuildList] Requested slots: {}, span: {}", item_slots.len(), span);
             let items: Vec<_> = item_slots.iter()
-                .filter_map(|slot| state.get(*slot))
+                .enumerate()
+                .filter_map(|(i, slot)| {
+                    let result = state.get(*slot);
+                    if result.is_none() {
+                        println!("[DEBUG BuildList] Slot {:?} at index {} is EMPTY", slot, i);
+                    }
+                    result
+                })
                 .collect();
+            println!("[DEBUG BuildList] Collected {} items", items.len());
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
 
             let actor = List::new_arc_value_actor_with_persistence(
@@ -1821,7 +1828,6 @@ fn evaluate_alias_immediate(
             }
         }
     };
-
     Ok(VariableOrArgumentReference::new_arc_value_actor(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
@@ -3143,6 +3149,7 @@ fn build_list_binding_function(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
 ) -> Result<Option<Arc<ValueActor>>, String> {
+    println!("[DEBUG build_list_binding_function] Called for List/{}", path_strs[1]);
     let operation = match path_strs[1].as_str() {
         "map" => ListBindingOperation::Map,
         "retain" => ListBindingOperation::Retain,
@@ -3195,7 +3202,7 @@ fn build_list_binding_function(
         source_code: ctx.source_code.clone(),
     };
 
-    Ok(Some(ListBindingFunction::new_arc_value_actor(
+    let result = ListBindingFunction::new_arc_value_actor(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -3205,7 +3212,9 @@ fn build_list_binding_function(
         ctx.actor_context,
         list_actor,
         config,
-    )))
+    );
+    println!("[DEBUG build_list_binding_function] Created actor for List/{}", path_strs[1]);
+    Ok(Some(result))
 }
 
 /// Call a function with stack-safe evaluation.
@@ -4114,6 +4123,10 @@ fn static_function_call_path_to_definition(
         },
         ["List", "append"] => |arguments, id, persistence_id, construct_context, actor_context| {
             api::function_list_append(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["List", "clear"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_list_clear(arguments, id, persistence_id, construct_context, actor_context)
                 .boxed_local()
         },
         ["List", "latest"] => |arguments, id, persistence_id, construct_context, actor_context| {

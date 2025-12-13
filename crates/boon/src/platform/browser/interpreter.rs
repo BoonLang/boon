@@ -191,7 +191,7 @@ pub fn run_with_registry(
     virtual_fs: VirtualFilesystem,
     function_registry: Option<StaticFunctionRegistry>,
 ) -> Option<(Arc<Object>, ConstructContext, StaticFunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>)> {
-    println!("*** BOON INTERPRETER VERSION 2025-12-08-B ***");
+    println!("*** BOON INTERPRETER VERSION 2025-12-13-DEBUG ***");
     let states_local_storage_key = states_local_storage_key.into();
     let old_code_local_storage_key = old_code_local_storage_key.into();
     let old_span_id_pairs_local_storage_key = old_span_id_pairs_local_storage_key.into();

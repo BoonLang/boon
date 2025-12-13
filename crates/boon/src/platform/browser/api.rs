@@ -7,6 +7,7 @@ use std::task::Poll;
 use zoon::Timer;
 use zoon::{Task, TaskHandle};
 use zoon::futures_util::{select, stream::{self, Stream, StreamExt}, FutureExt};
+use zoon::println;
 use zoon::futures_channel::mpsc;
 use zoon::{Deserialize, Serialize, serde};
 use zoon::{window, history, Closure, JsValue, UnwrapThrowExt, JsCast, SendWrapper};
@@ -529,6 +530,17 @@ pub fn function_element_text_input(
                 construct_context.clone(),
                 "event",
                 event_actor,
+                None,
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(11),
+                    None,
+                    "ElementTextInput[text]",
+                ),
+                construct_context.clone(),
+                "text",
+                argument_text.clone(),
                 None,
             ),
             Variable::new_arc(
@@ -1414,17 +1426,36 @@ pub fn function_list_count(
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
     list_actor.subscribe().filter_map(move |value| {
+        println!("[DEBUG List/count] Received value from list_actor");
         let result = match &value {
-            Value::List(list, _) => Some(list.clone()),
-            _ => None,
+            Value::List(list, _) => {
+                println!("[DEBUG List/count] Got Value::List");
+                Some(list.clone())
+            },
+            _ => {
+                println!("[DEBUG List/count] Got non-List value!");
+                None
+            },
         };
         future::ready(result)
     }).flat_map(move |list| {
+        println!("[DEBUG List/count] flat_map: subscribing to list");
         let construct_context = construct_context.clone();
         let function_call_id = function_call_id.clone();
         list.subscribe().scan(Vec::<Arc<ValueActor>>::new(), move |items, change| {
+            println!("[DEBUG List/count] Received change: {:?}", match &change {
+                ListChange::Replace { items } => format!("Replace({} items)", items.len()),
+                ListChange::Push { .. } => "Push".to_string(),
+                ListChange::Pop => "Pop".to_string(),
+                ListChange::Clear => "Clear".to_string(),
+                ListChange::InsertAt { index, .. } => format!("InsertAt({})", index),
+                ListChange::RemoveAt { index } => format!("RemoveAt({})", index),
+                ListChange::UpdateAt { index, .. } => format!("UpdateAt({})", index),
+                ListChange::Move { old_index, new_index } => format!("Move({} -> {})", old_index, new_index),
+            });
             change.apply_to_vec(items);
             let count = items.len() as f64;
+            println!("[DEBUG List/count] After apply: {} items, count = {}", items.len(), count);
             future::ready(Some(Number::new_value(
                 ConstructInfo::new(function_call_id.with_child_id(0), None, "List/count result"),
                 construct_context.clone(),
@@ -1573,6 +1604,100 @@ pub fn function_list_append(
         actor_context,
         change_stream,
         (list_actor, item_actor),
+    );
+
+    constant(Value::List(
+        Arc::new(list),
+        ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+    ))
+    .right_stream()
+}
+
+/// List/clear(on: stream) -> List
+/// Clears all items from the list when the trigger stream emits any value
+pub fn function_list_clear(
+    arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    _construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    // arguments[0] = the list (piped)
+    // arguments[1] = the trigger stream (on: xxx)
+    let list_actor = arguments[0].clone();
+
+    // If trigger argument is not provided, just forward the list unchanged
+    if arguments.len() < 2 {
+        return list_actor.subscribe().left_stream();
+    }
+
+    let trigger_actor = arguments[1].clone();
+
+    // Similar pattern to List/append:
+    // 1. Forward all changes from the original list
+    // 2. When trigger fires, emit Clear
+    let change_stream = {
+        enum TaggedChange {
+            FromList(ListChange),
+            Clear,
+        }
+
+        let list_changes = list_actor.clone().subscribe().filter_map(|value| {
+            future::ready(match value {
+                Value::List(list, _) => Some(list),
+                _ => None,
+            })
+        }).flat_map(|list| list.subscribe()).map(TaggedChange::FromList);
+
+        // When trigger stream emits any value, emit Clear
+        let clear_changes = trigger_actor.clone().subscribe().map(|_value| {
+            TaggedChange::Clear
+        });
+
+        // Merge both streams, use scan for proper ordering
+        stream::select(list_changes, clear_changes)
+            .scan(
+                (false, false), // (has_received_first_list_change, has_pending_clear)
+                |state, tagged_change| {
+                    let (has_received_first, has_pending_clear) = state;
+
+                    let changes_to_emit = match tagged_change {
+                        TaggedChange::FromList(change) => {
+                            if !*has_received_first {
+                                *has_received_first = true;
+                                // First list change - emit it plus pending clear if any
+                                if *has_pending_clear {
+                                    *has_pending_clear = false;
+                                    vec![change, ListChange::Clear]
+                                } else {
+                                    vec![change]
+                                }
+                            } else {
+                                vec![change]
+                            }
+                        }
+                        TaggedChange::Clear => {
+                            if *has_received_first {
+                                vec![ListChange::Clear]
+                            } else {
+                                // Buffer the clear until first list change arrives
+                                *has_pending_clear = true;
+                                vec![]
+                            }
+                        }
+                    };
+
+                    future::ready(Some(changes_to_emit))
+                }
+            )
+            .flat_map(|changes| stream::iter(changes))
+    };
+
+    let list = List::new_with_change_stream(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "List/clear result"),
+        actor_context,
+        change_stream,
+        (list_actor, trigger_actor),
     );
 
     constant(Value::List(

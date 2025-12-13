@@ -619,11 +619,40 @@ fn element_text_input(
             let mut change_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
             let mut key_down_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
             let mut blur_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
+            let mut pending_change_events: Vec<String> = Vec::new();
             loop {
                 select! {
                     new_sender = change_stream.next() => {
                         if let Some(sender) = new_sender {
-                            change_link_value_sender = Some(sender);
+                            zoon::println!("[BRIDGE] event_handler: change LINK sender set up (ready to receive events)");
+                            change_link_value_sender = Some(sender.clone());
+                            // Flush any pending change events
+                            for text in pending_change_events.drain(..) {
+                                zoon::println!("[BRIDGE] event_handler: Flushing buffered change event: '{}'", text);
+                                let event_value = Object::new_value(
+                                    ConstructInfo::new("text_input::change_event", None, "TextInput change event"),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    [Variable::new_arc(
+                                        ConstructInfo::new("text_input::change_event::text", None, "change text"),
+                                        construct_context.clone(),
+                                        "text",
+                                        ValueActor::new_arc(
+                                            ConstructInfo::new("text_input::change_event::text_actor", None, "change text actor"),
+                                            ActorContext::default(),
+                                            TypedStream::infinite(stream::once(future::ready(EngineText::new_value(
+                                                ConstructInfo::new("text_input::change_event::text_value", None, "change text value"),
+                                                construct_context.clone(),
+                                                ValueIdempotencyKey::new(),
+                                                text,
+                                            ))).chain(stream::pending())),
+                                            None,
+                                        ),
+                                        None,
+                                    )],
+                                );
+                                let _ = sender.unbounded_send(event_value);
+                            }
                         }
                     }
                     new_sender = key_down_stream.next() => {
@@ -638,7 +667,9 @@ fn element_text_input(
                         }
                     }
                     text = change_event_receiver.select_next_some() => {
+                        zoon::println!("[BRIDGE] event_handler: Received change event with text: '{}'", text);
                         if let Some(sender) = change_link_value_sender.as_ref() {
+                            zoon::println!("[BRIDGE] event_handler: LINK sender exists, sending change event");
                             let event_value = Object::new_value(
                                 ConstructInfo::new("text_input::change_event", None, "TextInput change event"),
                                 construct_context.clone(),
@@ -663,6 +694,9 @@ fn element_text_input(
                                 )],
                             );
                             let _ = sender.unbounded_send(event_value);
+                        } else {
+                            zoon::println!("[BRIDGE] event_handler: LINK not ready, buffering change event");
+                            pending_change_events.push(text);
                         }
                     }
                     key = key_down_event_receiver.select_next_some() => {

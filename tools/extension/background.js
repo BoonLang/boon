@@ -688,6 +688,74 @@ async function handleCommand(id, command) {
           return { type: 'error', message: e.message };
         }
 
+      case 'getEditorCode':
+        // Get current editor code via boonPlayground API
+        try {
+          const code = await cdpEvaluate(tab.id, `window.boonPlayground.getCode()`);
+          return { type: 'editorCode', code: code || '' };
+        } catch (e) {
+          return { type: 'error', message: e.message };
+        }
+
+      case 'screenshotElement':
+        // Take screenshot of a specific element by clipping to its bounds
+        try {
+          const box = await cdpGetElementBox(tab.id, command.selector);
+          if (!box) return { type: 'error', message: `Element not found: ${command.selector}` };
+
+          await attachDebugger(tab.id);
+          const { data } = await chrome.debugger.sendCommand({ tabId: tab.id }, 'Page.captureScreenshot', {
+            format: 'png',
+            clip: {
+              x: box.x,
+              y: box.y,
+              width: box.width,
+              height: box.height,
+              scale: 1
+            }
+          });
+          return { type: 'screenshot', base64: data };
+        } catch (e) {
+          return { type: 'error', message: `Element screenshot failed: ${e.message}` };
+        }
+
+      case 'getAccessibilityTree':
+        // Get accessibility tree of preview pane via CDP Accessibility domain
+        try {
+          await attachDebugger(tab.id);
+          await chrome.debugger.sendCommand({ tabId: tab.id }, 'Accessibility.enable');
+
+          // Get the preview pane node first
+          const { root } = await chrome.debugger.sendCommand({ tabId: tab.id }, 'DOM.getDocument');
+          const { nodeId } = await chrome.debugger.sendCommand({ tabId: tab.id }, 'DOM.querySelector', {
+            nodeId: root.nodeId,
+            selector: '[data-boon-panel="preview"]'
+          });
+
+          if (!nodeId) {
+            return { type: 'error', message: 'Preview pane not found' };
+          }
+
+          // Get accessibility tree for this node
+          const { nodes } = await chrome.debugger.sendCommand({ tabId: tab.id }, 'Accessibility.getPartialAXTree', {
+            nodeId: nodeId,
+            fetchRelatives: true
+          });
+
+          // Format the tree nicely
+          const formattedNodes = nodes.map(node => ({
+            role: node.role?.value,
+            name: node.name?.value,
+            value: node.value?.value,
+            description: node.description?.value,
+            children: node.childIds?.length || 0
+          })).filter(n => n.role || n.name);
+
+          return { type: 'accessibilityTree', tree: formattedNodes };
+        } catch (e) {
+          return { type: 'error', message: `Accessibility tree failed: ${e.message}` };
+        }
+
       // ============ Legacy commands still using executeScript ============
 
       case 'getDOM':

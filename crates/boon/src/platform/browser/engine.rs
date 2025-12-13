@@ -459,6 +459,9 @@ impl LazyValueActor {
     ///
     /// Returns a stream that pulls values on demand.
     /// Each call to .next() on the stream will request the next value from the actor.
+    ///
+    /// Takes ownership of the Arc to keep the actor alive for the subscription lifetime.
+    /// Callers should use `.clone().subscribe()` if they need to retain a reference.
     pub fn subscribe(self: Arc<Self>) -> LazySubscription {
         let subscriber_id = self.subscriber_counter.fetch_add(1, Ordering::SeqCst);
         println!("[DEBUG LazyValueActor] New subscription, subscriber_id={}, construct={}",
@@ -1156,7 +1159,8 @@ impl Variable {
     /// - LINK variables have a `link_value_sender` that must stay alive
     /// - The Variable may be the only reference keeping dependent actors alive
     ///
-    /// Takes `Arc<Self>` to ensure the Variable is kept alive during subscription.
+    /// Takes ownership of the Arc to keep the Variable alive for the subscription lifetime.
+    /// Callers should use `.clone().subscribe()` if they need to retain a reference.
     pub fn subscribe(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
         let subscription = self.value_actor.clone().subscribe();
         // Subscription keeps the actor alive; we also need to keep the Variable alive
@@ -1212,6 +1216,7 @@ impl VariableOrArgumentReference {
         alias: static_expression::Alias,
         root_value_actor: impl Future<Output = Arc<ValueActor>> + 'static,
     ) -> Arc<ValueActor> {
+        let description_for_debug = construct_info.description.clone();
         let construct_info = construct_info.complete(ConstructType::VariableOrArgumentReference);
         let mut skip_alias_parts = 0;
         let alias_parts = match alias {
@@ -1226,9 +1231,15 @@ impl VariableOrArgumentReference {
         };
         // The `subscribe()` method returns a `Subscription` that keeps the actor alive
         // for the duration of the subscription, so we no longer need the manual unfold pattern.
-        let mut value_stream = stream::once(root_value_actor)
+        let description_for_stream = description_for_debug.clone();
+        println!("[DEBUG VariableOrArgumentReference] Creating value_stream for {:?}", description_for_debug);
+        let mut value_stream = stream::once(async move {
+            println!("[DEBUG VariableOrArgumentReference] stream::once future polled for {:?}", description_for_stream);
+            root_value_actor.await
+        })
             .flat_map(|actor| actor.subscribe())
             .boxed_local();
+        println!("[DEBUG VariableOrArgumentReference] value_stream created for {:?}, skip_alias_parts={}", description_for_debug, skip_alias_parts);
         for alias_part in alias_parts.into_iter().skip(skip_alias_parts) {
             let alias_part = alias_part.to_string();
             // IMPORTANT: Use map + flatten_unordered instead of flat_map!
@@ -1344,7 +1355,9 @@ impl ReferenceConnector {
                         result = referenceable_inserter_receiver.next() => {
                             match result {
                                 Some((span, actor)) => {
+                                    println!("[DEBUG ReferenceConnector] Registering actor for span {:?}", span);
                                     if let Some(senders) = referenceable_senders.remove(&span) {
+                                        println!("[DEBUG ReferenceConnector] Found {} waiting senders for span {:?}", senders.len(), span);
                                         for sender in senders {
                                             if sender.send(actor.clone()).is_err() {
                                                 eprintln!("Failed to send referenceable actor from reference connector");
@@ -1365,11 +1378,14 @@ impl ReferenceConnector {
                         result = referenceable_getter_receiver.next() => {
                             match result {
                                 Some((span, referenceable_sender)) => {
+                                    println!("[DEBUG ReferenceConnector] Got request for span {:?}", span);
                                     if let Some(actor) = referenceables.get(&span) {
+                                        println!("[DEBUG ReferenceConnector] Found actor for span {:?}", span);
                                         if referenceable_sender.send(actor.clone()).is_err() {
                                             eprintln!("Failed to send referenceable actor from reference connector");
                                         }
                                     } else {
+                                        println!("[DEBUG ReferenceConnector] Actor NOT found for span {:?}, deferring", span);
                                         referenceable_senders.entry(span).or_default().push(referenceable_sender);
                                     }
                                 }
@@ -1404,6 +1420,7 @@ impl ReferenceConnector {
 
     // @TODO is &self enough?
     pub async fn referenceable(self: Arc<Self>, span: parser::Span) -> Arc<ValueActor> {
+        println!("[DEBUG referenceable] Starting lookup for span {:?}", span);
         let (referenceable_sender, referenceable_receiver) = oneshot::channel();
         if let Err(error) = self
             .referenceable_getter_sender
@@ -2477,50 +2494,15 @@ impl ValueActor {
         let notify_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<()>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        // EAGER SYNCHRONOUS POLLING: Poll the stream synchronously until Pending.
-        // This ensures that stream::iter values are processed immediately, fixing race
-        // conditions in patterns like HOLD + Stream/pulses where values from stream::iter
-        // would otherwise arrive asynchronously after downstream actors have subscribed.
-        let mut boxed_stream: std::pin::Pin<Box<dyn Stream<Item = Value>>> =
+        // EAGER SYNCHRONOUS POLLING: TEMPORARILY DISABLED
+        // The noop waker causes issues with futures that await channel responses.
+        // When such a future returns Pending with noop waker stored, the waker never
+        // gets called when the response arrives, leaving the stream stuck.
+        // TODO: Either use a proper waker, or detect which streams are safe to sync-poll.
+        let boxed_stream: std::pin::Pin<Box<dyn Stream<Item = Value>>> =
             Box::pin(value_stream.inner);
-        // Create a noop waker for synchronous polling
-        fn noop_waker() -> Waker {
-            use std::task::{RawWaker, RawWakerVTable};
-            const NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(
-                |_| RawWaker::new(std::ptr::null(), &NOOP_VTABLE),
-                |_| {},
-                |_| {},
-                |_| {},
-            );
-            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &NOOP_VTABLE)) }
-        }
-        let waker = noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
-        let mut stream_ended_sync = false;
-        let mut stream_ever_produced_sync = false;
-
-        loop {
-            match boxed_stream.as_mut().poll_next(&mut cx) {
-                std::task::Poll::Ready(Some(value)) => {
-                    stream_ever_produced_sync = true;
-                    current_value.store(Arc::new(Some(value.clone())));
-                    let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                    if let Ok(mut history) = value_history.lock() {
-                        history.add(new_version, value);
-                    }
-                    // Note: no subscribers yet at construction time, so no need to notify
-                }
-                std::task::Poll::Ready(None) => {
-                    // Stream ended synchronously - unusual but possible
-                    stream_ended_sync = true;
-                    break;
-                }
-                std::task::Poll::Pending => {
-                    // No more synchronous values, break out of loop
-                    break;
-                }
-            }
-        }
+        let stream_ended_sync = false;
+        let stream_ever_produced_sync = false;
 
         let loop_task = Task::start_droppable({
             let construct_info = construct_info.clone();
@@ -2533,6 +2515,7 @@ impl ValueActor {
             let _inputs = inputs.clone();
 
             async move {
+                println!("[DEBUG ValueActor async loop] Started for {}", construct_info);
                 let mut output_valve_impulse_stream =
                     if let Some(output_valve_signal) = &output_valve_signal {
                         output_valve_signal.subscribe().left_stream()
@@ -2552,7 +2535,12 @@ impl ValueActor {
                 // Initialize from sync polling phase
                 let mut stream_ended = stream_ended_sync;
 
+                let mut loop_iteration = 0u64;
                 loop {
+                    loop_iteration += 1;
+                    if loop_iteration <= 3 {
+                        println!("[DEBUG ValueActor async loop] Iteration {} for {}", loop_iteration, construct_info);
+                    }
                     select! {
                         // Handle new subscriber registrations
                         sender = notify_sender_receiver.next() => {
@@ -2634,6 +2622,7 @@ impl ValueActor {
 
                         // Handle values from the input stream
                         new_value = value_stream.next() => {
+                            println!("[DEBUG ValueActor loop] Got value from stream for {}", construct_info);
                             // Stream ended - but we DON'T break!
                             // Actors stay alive until explicit Shutdown.
                             // This prevents "receiver is gone" errors.
@@ -3158,6 +3147,9 @@ impl ValueActor {
     /// - Lazy actors: Returns demand-driven subscription from lazy delegate
     ///
     /// Uses `Either` to avoid boxing while supporting both subscription types.
+    ///
+    /// Takes ownership of the Arc to keep the actor alive for the subscription lifetime.
+    /// Callers should use `.clone().subscribe()` if they need to retain a reference.
     pub fn subscribe(self: Arc<Self>) -> impl Stream<Item = Value> {
         if let Some(ref lazy_delegate) = self.lazy_delegate {
             lazy_delegate.clone().subscribe().left_stream()
@@ -4607,6 +4599,7 @@ impl List {
                 // Diff subscriber notification senders (bounded channels)
                 let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
                 let mut list = None;
+                println!("[DEBUG List loop] Started for {}", construct_info);
                 loop {
                     select! {
                         // Handle new diff subscriber registrations
@@ -4619,6 +4612,7 @@ impl List {
                         }
 
                         change = change_stream.next() => {
+                            println!("[DEBUG List loop] Received change from stream for {}", construct_info);
                             let Some(change) = change else { break };
                             if output_valve_signal.is_none() {
                                 change_senders.retain(|change_sender| {
@@ -4726,6 +4720,9 @@ impl List {
     /// Subscribe to list updates with diff support.
     ///
     /// Uses bounded(1) channels - pure dataflow, no RefCell.
+    ///
+    /// Takes ownership of the Arc to keep the list alive for the subscription lifetime.
+    /// Callers should use `.clone().subscribe_diffs()` if they need to retain a reference.
     pub fn subscribe_diffs(self: Arc<Self>) -> ListDiffSubscription {
         // Create bounded(1) channel
         let (sender, receiver) = mpsc::channel::<()>(1);
@@ -4823,6 +4820,9 @@ impl List {
     /// The returned `ListSubscription` stream keeps the list alive for the
     /// duration of the subscription. When the stream is dropped, the
     /// list reference is released.
+    ///
+    /// Takes ownership of the Arc to keep the list alive for the subscription lifetime.
+    /// Callers should use `.clone().subscribe()` if they need to retain a reference.
     pub fn subscribe(self: Arc<Self>) -> ListSubscription {
         let (change_sender, change_receiver) = mpsc::unbounded();
         if let Err(error) = self.change_sender_sender.unbounded_send(change_sender) {
@@ -4882,17 +4882,23 @@ impl List {
                 .await;
 
             let initial_items = if let Some(json_items) = loaded_items {
-                // Use code_items for reactivity; JSON only for items beyond code_items length
+                // Merge code_items with loaded_items:
+                // - Use code_items for their reactivity
+                // - If storage has MORE items than code, load extras from JSON
+                // - If code has MORE items than storage, use the code items
                 let code_items_len = code_items.len();
-                json_items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, json)| {
+                let json_items_len = json_items.len();
+                let max_len = code_items_len.max(json_items_len);
+
+                (0..max_len)
+                    .map(|i| {
                         if i < code_items_len {
+                            // Use code item for reactivity
                             code_items[i].clone()
                         } else {
+                            // Load extra items from JSON (beyond code_items)
                             value_actor_from_json(
-                                json,
+                                &json_items[i],
                                 actor_id_for_load.with_child_id(format!("loaded_item_{i}")),
                                 construct_context_for_load.clone(),
                                 Ulid::new(),
@@ -5499,21 +5505,42 @@ impl ListBindingFunction {
         source_list_actor: Arc<ValueActor>,
         config: Rc<ListBindingConfig>,
     ) -> Arc<ValueActor> {
+        println!("[DEBUG create_map_actor] START - creating map actor");
         let config_for_stream = config.clone();
         let construct_context_for_stream = construct_context.clone();
         let actor_context_for_stream = actor_context.clone();
 
-        let change_stream = source_list_actor.clone().subscribe().filter_map(|value| {
+        println!("[DEBUG create_map_actor] About to subscribe to source_list_actor: {}", source_list_actor.construct_info);
+        let source_actor_for_debug = source_list_actor.clone();
+        let change_stream = source_list_actor.clone().subscribe().filter_map(move |value| {
+            println!("[DEBUG List/map] Received Value from source actor: {}", source_actor_for_debug.construct_info);
             future::ready(match value {
-                Value::List(list, _) => Some(list),
-                _ => None,
+                Value::List(list, _) => {
+                    println!("[DEBUG List/map] Extracted Arc<List> from Value::List");
+                    Some(list)
+                },
+                _ => {
+                    println!("[DEBUG List/map] Value is not a List!");
+                    None
+                },
             })
         }).flat_map(move |list| {
+            println!("[DEBUG List/map] flat_map: subscribing to list changes");
             let config = config_for_stream.clone();
             let construct_context = construct_context_for_stream.clone();
             let actor_context = actor_context_for_stream.clone();
 
             list.subscribe().map(move |change| {
+                println!("[DEBUG List/map] Received change from list: {:?}", match &change {
+                    ListChange::Replace { items } => format!("Replace({} items)", items.len()),
+                    ListChange::Push { .. } => "Push".to_string(),
+                    ListChange::Pop => "Pop".to_string(),
+                    ListChange::Clear => "Clear".to_string(),
+                    ListChange::InsertAt { index, .. } => format!("InsertAt({})", index),
+                    ListChange::RemoveAt { index } => format!("RemoveAt({})", index),
+                    ListChange::UpdateAt { index, .. } => format!("UpdateAt({})", index),
+                    ListChange::Move { old_index, new_index } => format!("Move({} -> {})", old_index, new_index),
+                });
                 Self::transform_list_change_for_map(
                     change,
                     &config,
@@ -5534,6 +5561,7 @@ impl ListBindingFunction {
             source_list_actor.clone(),
         );
 
+        println!("[DEBUG create_map_actor] END - returning map actor");
         Arc::new(ValueActor::new(
             construct_info,
             actor_context,

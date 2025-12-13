@@ -1,4 +1,5 @@
 mod commands;
+mod mcp;
 mod ws_server;
 
 use anyhow::Result;
@@ -35,6 +36,13 @@ enum Commands {
 
         /// Server port
         #[arg(short, long, default_value = "9222")]
+        port: u16,
+    },
+
+    /// Run MCP server for Claude Code integration (stdio JSON-RPC)
+    Mcp {
+        /// WebSocket server port to connect to
+        #[arg(long, default_value = "9222")]
         port: u16,
     },
 }
@@ -248,6 +256,11 @@ fn main() -> Result<()> {
         Commands::Exec { action, port } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(handle_exec(action, port))?;
+        }
+
+        Commands::Mcp { port } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(mcp::run_mcp_server(port));
         }
     }
 

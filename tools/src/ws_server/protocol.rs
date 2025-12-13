@@ -75,6 +75,15 @@ pub enum Command {
 
     /// Select an example by name (e.g., "todo_mvc.bn", "counter.bn")
     SelectExample { name: String },
+
+    /// Get current editor code
+    GetEditorCode,
+
+    /// Take screenshot of a specific element by selector
+    ScreenshotElement { selector: String },
+
+    /// Get accessibility tree of preview pane
+    GetAccessibilityTree,
 }
 
 /// Response from Extension to CLI via Server
@@ -90,8 +99,11 @@ pub enum Response {
     /// Command failed
     Error { message: String },
 
-    /// Screenshot data
+    /// Screenshot data (base64, from extension)
     Screenshot { base64: String },
+
+    /// Screenshot saved to file (filepath, transformed by WS server)
+    ScreenshotFile { filepath: String },
 
     /// Console messages
     Console { messages: Vec<ConsoleMessage> },
@@ -116,6 +128,12 @@ pub enum Response {
 
     /// Preview elements with bounding boxes
     PreviewElements { data: serde_json::Value },
+
+    /// Editor code content
+    EditorCode { code: String },
+
+    /// Accessibility tree
+    AccessibilityTree { tree: serde_json::Value },
 }
 
 /// Console message from browser

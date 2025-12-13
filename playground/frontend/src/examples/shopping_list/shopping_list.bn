@@ -10,18 +10,29 @@ item_input: Element/text_input(
     focus: True
 )
 
+-- Store current text from change events
+current_text: item_input.event.change.text
+
 -- Detect Enter key press
 enter_pressed: item_input.event.key_down.key |> WHEN {
     Enter => True
     __ => SKIP
 }
 
--- Text displayed in input (clears on Enter)
+-- Capture text when Enter is pressed
+captured_text: enter_pressed |> THEN { current_text }
+
+-- Text displayed in input (clears after capture)
 display_text: LATEST {
     Text/empty()
-    item_input.event.change.text
-    enter_pressed |> THEN { Text/empty() }
+    current_text
+    captured_text |> THEN { Text/empty() }
 }
+
+-- Store items using reactive list operations
+items: LIST {}
+    |> List/append(item: captured_text)
+    |> List/clear(on: clear_button.event.press)
 
 -- Clear button
 clear_button: Element/button(
@@ -30,13 +41,8 @@ clear_button: Element/button(
     label: TEXT { Clear }
 )
 
--- Count items using HOLD
-item_count: 0 |> HOLD state {
-    LATEST {
-        enter_pressed |> THEN { state + 1 }
-        clear_button.event.press |> THEN { 0 }
-    }
-}
+-- Item count (derived from list)
+item_count: items |> List/count()
 
 -- UI
 document: Document/new(root: Element/stripe(
@@ -55,6 +61,18 @@ document: Document/new(root: Element/stripe(
 
         Element/stripe(
             element: []
+            direction: Column
+            gap: 4
+            style: []
+            items: items |> List/map(item, new: Element/label(
+                element: []
+                style: [font: [color: White]]
+                label: TEXT { - {item} }
+            ))
+        )
+
+        Element/stripe(
+            element: []
             direction: Row
             gap: 16
             style: []
@@ -62,7 +80,7 @@ document: Document/new(root: Element/stripe(
                 Element/label(
                     element: []
                     style: [font: [color: Oklch[lightness: 0.5]]]
-                    label: TEXT { {item_count} items added }
+                    label: TEXT { {item_count} items }
                 )
                 clear_button
             }
