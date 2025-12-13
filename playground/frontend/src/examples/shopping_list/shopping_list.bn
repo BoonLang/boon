@@ -5,28 +5,25 @@ item_input: Element/text_input(
     element: [event: [key_down: LINK, change: LINK]]
     style: [width: Fill]
     label: Hidden[text: TEXT { Item name }]
-    text: display_text
+    text: LATEST {
+        Text/empty()
+        element.event.change.text
+        captured_text |> THEN { Text/empty() }
+    }
     placeholder: [text: TEXT { Type and press Enter to add... }]
     focus: True
 )
 
--- Store current text from change events
-current_text: item_input.event.change.text
-
--- Detect Enter key press
-enter_pressed: item_input.event.key_down.key |> WHEN {
-    Enter => True
+-- Get trimmed text when Enter is pressed
+trimmed_on_enter: item_input.event.key_down.key |> WHEN {
+    Enter => item_input.text |> Text/trim()
     __ => SKIP
 }
 
--- Capture text when Enter is pressed
-captured_text: enter_pressed |> THEN { current_text }
-
--- Text displayed in input (clears after capture)
-display_text: LATEST {
-    Text/empty()
-    current_text
-    captured_text |> THEN { Text/empty() }
+-- Only capture non-empty text
+captured_text: trimmed_on_enter |> Text/is_not_empty() |> WHEN {
+    True => trimmed_on_enter
+    False => SKIP
 }
 
 -- Store items using reactive list operations
@@ -44,7 +41,7 @@ clear_button: Element/button(
 -- Item count (derived from list)
 item_count: items |> List/count()
 
--- Map items to label elements (must be top-level variable to keep actor alive)
+-- Map items to label elements
 item_labels: items |> List/map(item, new: Element/label(
     element: []
     style: [font: [color: White]]

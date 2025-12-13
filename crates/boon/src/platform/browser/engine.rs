@@ -1270,8 +1270,13 @@ impl VariableOrArgumentReference {
                             if is_link {
                                 // LINK field: stay subscribed to receive multiple events
                                 // Keep object and variable alive via unfold state
+                                let subscription = if use_snapshot {
+                                    variable_actor.subscribe_snapshot_mode()
+                                } else {
+                                    variable_actor.subscribe()
+                                };
                                 stream::unfold(
-                                    (variable_actor.subscribe(), object, variable),
+                                    (subscription, object, variable),
                                     move |(mut subscription, object, variable)| async move {
                                         subscription.next().await.map(|value| (value, (subscription, object, variable)))
                                     }
@@ -1280,7 +1285,11 @@ impl VariableOrArgumentReference {
                                 // Non-LINK field: emit once and complete
                                 // This allows flatten_unordered(Some(1)) to process subsequent parent emissions
                                 stream::once(async move {
-                                    let mut subscription = variable_actor.subscribe();
+                                    let mut subscription = if use_snapshot {
+                                        variable_actor.subscribe_snapshot_mode()
+                                    } else {
+                                        variable_actor.subscribe()
+                                    };
                                     let result = subscription.next().await;
                                     // Keep object and variable alive until we get the value
                                     let _ = (&object, &variable);
@@ -1295,8 +1304,13 @@ impl VariableOrArgumentReference {
 
                             if is_link {
                                 // LINK field: stay subscribed to receive multiple events
+                                let subscription = if use_snapshot {
+                                    variable_actor.subscribe_snapshot_mode()
+                                } else {
+                                    variable_actor.subscribe()
+                                };
                                 stream::unfold(
-                                    (variable_actor.subscribe(), tagged_object, variable),
+                                    (subscription, tagged_object, variable),
                                     move |(mut subscription, tagged_object, variable)| async move {
                                         subscription.next().await.map(|value| (value, (subscription, tagged_object, variable)))
                                     }
@@ -1304,7 +1318,11 @@ impl VariableOrArgumentReference {
                             } else {
                                 // Non-LINK field: emit once and complete
                                 stream::once(async move {
-                                    let mut subscription = variable_actor.subscribe();
+                                    let mut subscription = if use_snapshot {
+                                        variable_actor.subscribe_snapshot_mode()
+                                    } else {
+                                        variable_actor.subscribe()
+                                    };
                                     let result = subscription.next().await;
                                     let _ = (&tagged_object, &variable);
                                     result
