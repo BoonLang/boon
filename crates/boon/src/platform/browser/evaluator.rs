@@ -1732,16 +1732,55 @@ fn process_work_item(
                         }
                     }
                 }
-            } else if let static_expression::Expression::LinkSetter { alias: _ } = &expr.node {
-                // Handle LinkSetter specially when piped: LINK is pass-through.
-                // When you do `element |> LINK { store.path }`, the element flows through
-                // unchanged. The LINK binding (connecting element to store.path) is handled
-                // by the LinkConnector which matches up LINK declarations with LinkSetters
-                // based on span information resolved during parsing.
-                //
-                // The key insight: the piped element IS the value that should flow to
-                // whatever references `store.path`. We just pass it through here.
-                state.store(result_slot, prev_actor);
+            } else if let static_expression::Expression::LinkSetter { alias } = &expr.node {
+                // Handle LinkSetter when piped: send piped value TO the LINK, then pass through.
+                // When you do `element |> LINK { store.path }`, the element is:
+                // 1. Sent to the LINK variable at store.path
+                // 2. Passed through unchanged for downstream use
+
+                // Start a task to forward piped values to the target LINK variable
+                let alias_for_task = alias.node.clone();
+                let ctx_for_task = new_ctx.clone();
+                let prev_actor_for_task = prev_actor.clone();
+
+                let forwarding_task = Task::start_droppable(async move {
+                    // Get the target LINK sender by traversing the alias path
+                    let link_sender = get_link_sender_from_alias(
+                        alias_for_task,
+                        ctx_for_task,
+                    ).await;
+
+                    if let Some(sender) = link_sender {
+                        // Forward all values from piped actor to the LINK
+                        let mut piped_stream = prev_actor_for_task.subscribe();
+                        while let Some(value) = piped_stream.next().await {
+                            if sender.unbounded_send(value).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+
+                // Create a wrapper stream that keeps the forwarding task alive
+                // The task handle is captured in the map closure
+                let wrapper_stream = prev_actor.clone().subscribe().map(move |value| {
+                    // Keep task alive by referencing it (compiler will capture it)
+                    let _ = &forwarding_task;
+                    value
+                });
+
+                let wrapper_actor = ValueActor::new_arc(
+                    ConstructInfo::new(
+                        "LinkSetter pass-through",
+                        expr.persistence.clone(),
+                        format!("{:?}; LinkSetter pass-through", expr.span),
+                    ),
+                    new_ctx.actor_context.clone(),
+                    TypedStream::infinite(wrapper_stream),
+                    None,
+                );
+
+                state.store(result_slot, wrapper_actor);
             } else {
                 // For non-FunctionCall expressions, just schedule normally
                 schedule_expression(state, expr, new_ctx, result_slot)?;
@@ -3236,6 +3275,116 @@ fn build_link_setter_actor(
         TypedStream::infinite(stream),
         Some(persistence_id),
     ))
+}
+
+/// Traverse an alias path and return the LINK sender at the end of the path.
+/// This is used by piped LinkSetter (`element |> LINK { path.to.link }`) to send
+/// the piped value to the target LINK variable.
+async fn get_link_sender_from_alias(
+    alias: static_expression::Alias,
+    ctx: EvaluationContext,
+) -> Option<mpsc::UnboundedSender<Value>> {
+    match alias {
+        static_expression::Alias::WithPassed { extra_parts } => {
+            // Start from PASSED value and traverse extra_parts
+            let passed = ctx.actor_context.passed.as_ref()?;
+
+            // Subscribe to get the first value from PASSED
+            let mut current_value = passed.clone().subscribe().next().await?;
+
+            // Traverse the path
+            for (i, part) in extra_parts.iter().enumerate() {
+                let part_str = part.to_string();
+                let is_last = i == extra_parts.len() - 1;
+
+                // Get the variable from the current object
+                let variable = match &current_value {
+                    Value::Object(obj, _) => obj.variable(&part_str),
+                    Value::TaggedObject(tagged, _) => tagged.variable(&part_str),
+                    _ => {
+                        zoon::eprintln!("[get_link_sender_from_alias] Expected object at '{}', got {}",
+                            part_str, current_value.construct_info());
+                        return None;
+                    }
+                }?;
+
+                if is_last {
+                    // At the end of the path, this should be a LINK variable
+                    let sender = variable.link_value_sender();
+                    if sender.is_none() {
+                        zoon::eprintln!("[get_link_sender_from_alias] Final variable '{}' is not a LINK", part_str);
+                    }
+                    return sender;
+                } else {
+                    // Not at the end yet, subscribe to get the next value
+                    current_value = variable.clone().subscribe().next().await?;
+                }
+            }
+
+            None
+        }
+        static_expression::Alias::WithoutPassed { parts, referenced_span } => {
+            // For non-PASSED aliases, use the reference connector to get the root variable
+            if parts.is_empty() {
+                return None;
+            }
+
+            // Get the root variable from reference connector or parameters
+            let first_part = parts.first()?.to_string();
+
+            let root_actor = if let Some(param_actor) = ctx.actor_context.parameters.get(&first_part).cloned() {
+                param_actor
+            } else if let Some(ref_span) = referenced_span {
+                let ref_connector = ctx.try_reference_connector()?;
+                ref_connector.referenceable(ref_span).await
+            } else {
+                zoon::eprintln!("[get_link_sender_from_alias] Cannot resolve root variable '{}'", first_part);
+                return None;
+            };
+
+            if parts.len() == 1 {
+                // Single-part alias - this should be a LINK variable itself
+                // For this case, we need the Variable, not the ValueActor
+                // This is a limitation - we can only get LINK senders for nested paths
+                zoon::eprintln!("[get_link_sender_from_alias] Single-part non-PASSED aliases not yet supported for LINK connection");
+                return None;
+            }
+
+            // Get the first value
+            let mut current_value = root_actor.subscribe().next().await?;
+
+            // Traverse the remaining path (skip first part since we already resolved it)
+            for (i, part) in parts.iter().skip(1).enumerate() {
+                let part_str = part.to_string();
+                let is_last = i == parts.len() - 2; // -2 because we skipped first
+
+                // Get the variable from the current object
+                let variable = match &current_value {
+                    Value::Object(obj, _) => obj.variable(&part_str),
+                    Value::TaggedObject(tagged, _) => tagged.variable(&part_str),
+                    _ => {
+                        zoon::eprintln!("[get_link_sender_from_alias] Expected object at '{}', got {}",
+                            part_str, current_value.construct_info());
+                        return None;
+                    }
+                }?;
+
+                if is_last {
+                    // At the end of the path, this should be a LINK variable
+                    let sender = variable.link_value_sender();
+                    if sender.is_none() {
+                        zoon::eprintln!("[get_link_sender_from_alias] Final variable '{}' is not a LINK", part_str);
+                    }
+                    return sender;
+                } else {
+                    // Not at the end yet, subscribe to get the next value
+                    current_value = variable.clone().subscribe().next().await?;
+                }
+            }
+
+            None
+        }
+    }
 }
 
 /// Build a List binding function (map, retain, every, any, sort_by).

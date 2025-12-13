@@ -1270,7 +1270,8 @@ impl VariableOrArgumentReference {
                                 stream::unfold(
                                     (subscription, object, variable),
                                     move |(mut subscription, object, variable)| async move {
-                                        subscription.next().await.map(|value| (value, (subscription, object, variable)))
+                                        let value = subscription.next().await;
+                                        value.map(|value| (value, (subscription, object, variable)))
                                     }
                                 ).boxed_local()
                             } else {
@@ -1296,7 +1297,8 @@ impl VariableOrArgumentReference {
                                 stream::unfold(
                                     (subscription, tagged_object, variable),
                                     move |(mut subscription, tagged_object, variable)| async move {
-                                        subscription.next().await.map(|value| (value, (subscription, tagged_object, variable)))
+                                        let value = subscription.next().await;
+                                        value.map(|value| (value, (subscription, tagged_object, variable)))
                                     }
                                 ).boxed_local()
                             } else {
