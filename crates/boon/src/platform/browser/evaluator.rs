@@ -1809,7 +1809,7 @@ fn process_work_item(
                             backpressure_permit: ctx.actor_context.backpressure_permit,
                             hold_state_update_callback: ctx.actor_context.hold_state_update_callback,
                             use_lazy_actors: ctx.actor_context.use_lazy_actors,
-                            use_snapshot_subscriptions: ctx.actor_context.use_snapshot_subscriptions,
+                            is_snapshot_context: ctx.actor_context.is_snapshot_context,
                         },
                         reference_connector: ctx.reference_connector,
                         link_connector: ctx.link_connector,
@@ -2061,7 +2061,7 @@ fn build_then_actor(
                 hold_state_update_callback: None,
                 use_lazy_actors: actor_context_clone.use_lazy_actors,
                 // THEN body needs snapshot semantics - read current variable values, not history
-                use_snapshot_subscriptions: true,
+                is_snapshot_context: true,
             };
 
             let new_ctx = EvaluationContext {
@@ -2082,14 +2082,15 @@ fn build_then_actor(
 
             match evaluate_expression(body_expr, new_ctx) {
                 Ok(Some(result_actor)) => {
-                    // IMPORTANT: Use .take(1) because the body may be a reactive expression
-                    // (e.g., `counter + 1`) that re-emits whenever its dependencies change.
-                    // Without take(1), when used inside HOLD, the body would re-emit on each
-                    // state update, causing infinite loops. Each THEN body evaluation should
-                    // produce exactly ONE value per input.
+                    // Use snapshot() for type-safe single-value semantics.
+                    // snapshot() returns a Future that resolves to exactly ONE value,
+                    // making it impossible to accidentally create ongoing subscriptions.
+                    // This is critical for THEN bodies which should produce exactly ONE value per input.
                     let result_actor_keepalive = result_actor.clone();
                     let hold_callback_for_map = hold_callback_clone.clone();
-                    let result_stream = result_actor.subscribe().take(1).map(move |mut result_value| {
+                    let result_stream = stream::once(result_actor.snapshot())
+                        .filter_map(|v| async { v })
+                        .map(move |mut result_value| {
                         // DEBUG: Log the result value from THEN body
                         let result_desc = match &result_value {
                             Value::Text(t, _) => format!("Text('{}')", t.text()),
@@ -2188,7 +2189,7 @@ fn build_then_actor(
             hold_state_update_callback: None,
             use_lazy_actors: ctx.actor_context.use_lazy_actors,
             // THEN body needs snapshot semantics
-            use_snapshot_subscriptions: true,
+            is_snapshot_context: true,
         };
 
         let sync_ctx = EvaluationContext {
@@ -2421,7 +2422,7 @@ fn build_when_actor(
                         hold_state_update_callback: None,
                         use_lazy_actors: actor_context_clone.use_lazy_actors,
                         // WHEN body needs snapshot semantics like THEN
-                        use_snapshot_subscriptions: true,
+                        is_snapshot_context: true,
                     };
 
                     let new_ctx = EvaluationContext {
@@ -2444,19 +2445,20 @@ fn build_when_actor(
 
                     match evaluate_expression(body_expr, new_ctx) {
                         Ok(Some(result_actor)) => {
-                            // IMPORTANT: Use .take(1) because the body may be a reactive expression
-                            // (e.g., `counter + 1`) that re-emits whenever its dependencies change.
-                            // Without take(1), when used inside HOLD, the body would re-emit on each
-                            // state update, causing infinite loops. Each WHEN body evaluation should
-                            // produce exactly ONE value per input.
+                            // Use snapshot() for type-safe single-value semantics.
+                            // snapshot() returns a Future that resolves to exactly ONE value,
+                            // making it impossible to accidentally create ongoing subscriptions.
+                            // This is critical for WHEN bodies which should produce exactly ONE value per input.
                             let result_actor_keepalive = result_actor.clone();
-                            let result_stream = result_actor.subscribe().take(1).map(move |mut result_value| {
-                                // Keep value_actor and result_actor alive while stream is consumed
-                                let _ = &value_actor;
-                                let _ = &result_actor_keepalive;
-                                result_value.set_idempotency_key(ValueIdempotencyKey::new());
-                                result_value
-                            });
+                            let result_stream = stream::once(result_actor.snapshot())
+                                .filter_map(|v| async { v })
+                                .map(move |mut result_value| {
+                                    // Keep value_actor and result_actor alive while stream is consumed
+                                    let _ = &value_actor;
+                                    let _ = &result_actor_keepalive;
+                                    result_value.set_idempotency_key(ValueIdempotencyKey::new());
+                                    result_value
+                                });
                             return Box::pin(result_stream) as Pin<Box<dyn Stream<Item = Value>>>;
                         }
                         Ok(None) => {
@@ -2586,7 +2588,7 @@ fn build_while_actor(
                     hold_state_update_callback: actor_context_clone.hold_state_update_callback.clone(),
                     use_lazy_actors: actor_context_clone.use_lazy_actors,
                     // WHILE is continuous, not snapshot - variables should stream normally
-                    use_snapshot_subscriptions: false,
+                    is_snapshot_context: false,
                 };
 
                 let new_ctx = EvaluationContext {
@@ -2609,7 +2611,9 @@ fn build_while_actor(
 
                 match evaluate_expression(body_expr, new_ctx) {
                     Ok(Some(result_actor)) => {
-                        let stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(result_actor.subscribe());
+                        // Use stream() for continuous streaming semantics.
+                        // WHILE bodies should produce continuous streams while the pattern matches.
+                        let stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(result_actor.stream());
                         stream
                     }
                     Ok(None) => {
@@ -2895,7 +2899,7 @@ fn build_hold_actor(
         // This ensures HOLD pulls values one at a time and updates state between each pull.
         use_lazy_actors: true,
         // Default - THEN/WHEN inside will set their own snapshot flag
-        use_snapshot_subscriptions: false,
+        is_snapshot_context: false,
     };
 
     // Create new context for body evaluation
@@ -3558,7 +3562,7 @@ fn call_function(
                     hold_state_update_callback: None,
                     use_lazy_actors: ctx_for_closure.actor_context.use_lazy_actors,
                     // Don't inherit snapshot mode - function body evaluates in normal streaming context
-                    use_snapshot_subscriptions: false,
+                    is_snapshot_context: false,
                 };
 
                 let new_ctx = EvaluationContext {
@@ -3574,9 +3578,9 @@ fn call_function(
                 // Evaluate the function body with this piped value
                 match evaluate_expression(func_body.clone(), new_ctx) {
                     Ok(Some(result_actor)) => {
-                        // Take only the first value from the result (like THEN does)
+                        // Use snapshot() for type-safe single-value semantics (like THEN does)
                         let result_stream: Pin<Box<dyn Stream<Item = Value>>> =
-                            Box::pin(result_actor.subscribe().take(1));
+                            Box::pin(stream::once(result_actor.snapshot()).filter_map(|v| async { v }));
                         result_stream
                     }
                     Ok(None) => {
@@ -3617,7 +3621,7 @@ fn call_function(
             hold_state_update_callback: None,
             use_lazy_actors: ctx.actor_context.use_lazy_actors,
             // Don't inherit snapshot mode - function body evaluates in normal streaming context
-            use_snapshot_subscriptions: false,
+            is_snapshot_context: false,
         };
 
         let new_ctx = EvaluationContext {
@@ -3667,7 +3671,7 @@ fn call_function(
                 hold_state_update_callback: None,
                 use_lazy_actors: ctx.actor_context.use_lazy_actors,
                 // Don't inherit snapshot mode - builtin functions evaluate in normal streaming context
-                use_snapshot_subscriptions: false,
+                is_snapshot_context: false,
             };
 
             Ok(Some(FunctionCall::new_arc_value_actor(

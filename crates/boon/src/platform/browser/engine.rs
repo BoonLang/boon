@@ -1008,12 +1008,18 @@ pub struct ActorContext {
     /// each pulse from Stream/pulses is pulled one at a time, state is updated between each.
     /// Default: false (normal eager evaluation).
     pub use_lazy_actors: bool,
-    /// When true, subscriptions start from the current version instead of version 0.
-    /// This is set by THEN for body evaluation to ensure variables are read as snapshots.
-    /// Without this, THEN body `{ current_text }` would receive historical values
-    /// from the ValueHistory buffer instead of the current stored value.
-    /// Default: false (normal stream semantics with full history).
-    pub use_snapshot_subscriptions: bool,
+    /// When true, code should use `.snapshot()` instead of `.stream()` for subscriptions.
+    ///
+    /// This flag propagates through function calls:
+    /// - THEN/WHEN bodies set this to `true` (snapshot context)
+    /// - WHILE bodies keep this `false` (streaming context)
+    /// - User-defined function bodies inherit caller's context
+    ///
+    /// Code that needs values (variable references, API functions, operators) checks
+    /// this flag and calls `.snapshot()` or `.stream()` accordingly.
+    ///
+    /// Default: false (streaming context - continuous updates).
+    pub is_snapshot_context: bool,
 }
 
 // --- ActorOutputValveSignal ---
@@ -1339,7 +1345,7 @@ impl VariableOrArgumentReference {
     ) -> Arc<ValueActor> {
         let construct_info = construct_info.complete(ConstructType::VariableOrArgumentReference);
         // Capture snapshot mode flag before closures
-        let use_snapshot = actor_context.use_snapshot_subscriptions;
+        let use_snapshot = actor_context.is_snapshot_context;
         let mut skip_alias_parts = 0;
         let alias_parts = match alias {
             static_expression::Alias::WithoutPassed {
@@ -1357,8 +1363,16 @@ impl VariableOrArgumentReference {
             root_value_actor.await
         })
             .flat_map(move |actor| {
-                // Use snapshot mode when evaluating THEN body - gets current value only, not history
-                actor.subscribe_with_mode(use_snapshot)
+                // Use snapshot() or stream() based on context - type-safe subscription
+                if use_snapshot {
+                    // Snapshot: convert Future to single-item Stream
+                    stream::once(actor.snapshot())
+                        .filter_map(|v| async { v })
+                        .boxed_local()
+                } else {
+                    // Streaming: continuous updates
+                    actor.stream()
+                }
             })
             .boxed_local();
         // Collect parts to detect the last one
@@ -1382,26 +1396,54 @@ impl VariableOrArgumentReference {
                     Value::Object(object, _) => {
                         let variable = object.expect_variable(&alias_part);
                         let variable_actor = variable.value_actor();
-                        let subscription = variable_actor.subscribe_with_mode(use_snapshot);
-                        stream::unfold(
-                            (subscription, object, variable),
-                            move |(mut subscription, object, variable)| async move {
-                                let value = subscription.next().await;
-                                value.map(|value| (value, (subscription, object, variable)))
-                            }
-                        ).boxed_local()
+                        // Use snapshot() or stream() based on context - type-safe subscription
+                        if use_snapshot {
+                            // Snapshot: get one value using the type-safe Future API
+                            stream::once(async move {
+                                let value = variable_actor.snapshot().await;
+                                // Keep object and variable alive for the value's lifetime
+                                let _ = (&object, &variable);
+                                value
+                            })
+                            .filter_map(|v| async { v })
+                            .boxed_local()
+                        } else {
+                            // Streaming: continuous updates
+                            let subscription = variable_actor.stream();
+                            stream::unfold(
+                                (subscription, object, variable),
+                                move |(mut subscription, object, variable)| async move {
+                                    let value = subscription.next().await;
+                                    value.map(|value| (value, (subscription, object, variable)))
+                                }
+                            ).boxed_local()
+                        }
                     }
                     Value::TaggedObject(tagged_object, _) => {
                         let variable = tagged_object.expect_variable(&alias_part);
                         let variable_actor = variable.value_actor();
-                        let subscription = variable_actor.subscribe_with_mode(use_snapshot);
-                        stream::unfold(
-                            (subscription, tagged_object, variable),
-                            move |(mut subscription, tagged_object, variable)| async move {
-                                let value = subscription.next().await;
-                                value.map(|value| (value, (subscription, tagged_object, variable)))
-                            }
-                        ).boxed_local()
+                        // Use snapshot() or stream() based on context - type-safe subscription
+                        if use_snapshot {
+                            // Snapshot: get one value using the type-safe Future API
+                            stream::once(async move {
+                                let value = variable_actor.snapshot().await;
+                                // Keep tagged_object and variable alive for the value's lifetime
+                                let _ = (&tagged_object, &variable);
+                                value
+                            })
+                            .filter_map(|v| async { v })
+                            .boxed_local()
+                        } else {
+                            // Streaming: continuous updates
+                            let subscription = variable_actor.stream();
+                            stream::unfold(
+                                (subscription, tagged_object, variable),
+                                move |(mut subscription, tagged_object, variable)| async move {
+                                    let value = subscription.next().await;
+                                    value.map(|value| (value, (subscription, tagged_object, variable)))
+                                }
+                            ).boxed_local()
+                        }
                     }
                     other => panic!(
                         "Failed to get Object or TaggedObject to create VariableOrArgumentReference: The Value has a different type {}",
@@ -3300,59 +3342,6 @@ impl ValueActor {
         }
     }
 
-    /// Subscribe with explicit snapshot mode control.
-    ///
-    /// This is the single entry point for VariableOrArgumentReference subscriptions.
-    /// - `use_snapshot: false` → regular subscription (stream from version 0)
-    /// - `use_snapshot: true` → snapshot subscription (exactly ONE value, then stream ends)
-    ///
-    /// For version 0 actors (newly created, e.g., BLOCK-local variables), snapshot mode
-    /// waits for the first value to arrive, then emits it and completes.
-    fn subscribe_with_mode(self: Arc<Self>, use_snapshot: bool) -> LocalBoxStream<'static, Value> {
-        stream::once(async move {
-            use std::task::Poll;
-            let mut yielded = false;
-            std::future::poll_fn(|cx| {
-                if yielded {
-                    Poll::Ready(())
-                } else {
-                    yielded = true;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            }).await;
-            (self, use_snapshot)
-        })
-        .flat_map(|(actor, use_snapshot)| {
-            if use_snapshot {
-                // Snapshot mode: emit exactly ONE value then complete.
-                // This is critical for WHEN/THEN semantics where we want to read
-                // the current value once, not create an ongoing subscription.
-                if actor.version() > 0 {
-                    // Actor has history - get current value immediately
-                    actor.subscribe_immediate_snapshot().take(1).boxed_local()
-                } else {
-                    // New actor (version 0) - wait for first value, then complete
-                    actor.subscribe_immediate().take(1).boxed_local()
-                }
-            } else {
-                // Regular subscription: continuous stream of all values
-                actor.subscribe_immediate().boxed_local()
-            }
-        })
-        .boxed_local()
-    }
-
-    /// Subscribe without yielding, snapshot mode.
-    fn subscribe_immediate_snapshot(self: Arc<Self>) -> impl Stream<Item = Value> {
-        if let Some(ref lazy_delegate) = self.lazy_delegate {
-            // Lazy actors already only emit values when pulled, so no history issue
-            lazy_delegate.clone().subscribe().left_stream()
-        } else {
-            self.subscribe_snapshot().right_stream()
-        }
-    }
-
     /// Subscribe to eager actor's values using bounded channel notifications.
     ///
     /// WARNING: Only use this for actors you KNOW are eager (no lazy_delegate).
@@ -3396,35 +3385,45 @@ impl ValueActor {
         }
     }
 
-    /// Subscribe to get ONLY the current snapshot value, not historical values.
-    ///
-    /// Unlike `subscribe_eager()` which starts at version 0 (getting full history),
-    /// this starts at current_version - 1 so subscriber receives only the current
-    /// stored value without any older values from the history buffer.
-    ///
-    /// Use this in THEN body evaluation where variables should be read as snapshots,
-    /// not as streams of historical values.
-    fn subscribe_snapshot(self: Arc<Self>) -> Subscription {
-        let (mut sender, receiver) = mpsc::channel::<()>(1);
-        let _ = sender.try_send(());
-        self.notify_senders.lock().unwrap().push(sender);
-
-        // Start at current_version - 1 so we receive ONLY the current value.
-        // If version is 0, use 0 (no history yet, will get first value when stored).
-        let current = self.version();
-        let start_version = if current > 0 { current - 1 } else { 0 };
-
-        Subscription {
-            last_seen_version: start_version,
-            notify_receiver: receiver,
-            actor: self,
-            pending_values: VecDeque::new(),
-        }
-    }
-
     /// Check if this actor has a lazy delegate.
     pub fn has_lazy_delegate(&self) -> bool {
         self.lazy_delegate.is_some()
+    }
+
+    // === New Type-Safe Subscription API ===
+    //
+    // These methods replace the confusing subscribe_*() family with type-distinct return values:
+    // - snapshot() returns Future<Option<Value>> - exactly ONE value, can't be misused
+    // - stream() returns Stream<Item=Value> - continuous updates
+    //
+    // The return type itself enforces correct usage - no more needing .take(1) externally.
+
+    /// Get exactly ONE value - the current snapshot.
+    ///
+    /// Returns a `Future`, not a `Stream`. This makes it **impossible to misuse**:
+    /// - Future resolves once → you get one value
+    /// - No need for `.take(1)` - the type itself enforces single-value semantics
+    ///
+    /// Use this in THEN/WHEN bodies where you need a point-in-time snapshot of values.
+    ///
+    /// If the actor has no value yet (version 0), waits for the first value.
+    pub fn snapshot(self: Arc<Self>) -> Snapshot {
+        Snapshot {
+            actor: self,
+            resolved: false,
+            notify_receiver: None,
+        }
+    }
+
+    /// Subscribe to continuous stream of all values from version 0.
+    ///
+    /// Use this for WHILE bodies, LATEST inputs, and reactive bindings where you
+    /// need continuous updates.
+    ///
+    /// This is an alias for the existing `subscribe()` method - same behavior,
+    /// clearer name that contrasts with `snapshot()`.
+    pub fn stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        self.subscribe()
     }
 
     /// Get optimal update for subscriber at given version.
@@ -3576,6 +3575,77 @@ impl Stream for Subscription {
                     return Poll::Pending;
                 }
             }
+        }
+    }
+}
+
+// --- Snapshot Future ---
+
+/// Future that resolves to exactly ONE value from an actor.
+///
+/// This is the type returned by `ValueActor::snapshot()`. Unlike a Stream which
+/// can emit many values, this Future resolves exactly once, making it impossible
+/// to accidentally create ongoing subscriptions in THEN/WHEN bodies.
+///
+/// # Semantics
+/// - If the actor has a stored value (version > 0), resolves immediately with that value
+/// - If the actor has no value yet (version 0), waits for the first value
+/// - After resolving once, the Future is complete (returns None on subsequent polls)
+pub struct Snapshot {
+    actor: Arc<ValueActor>,
+    resolved: bool,
+    /// Lazily initialized channel for waiting on notifications.
+    /// Only created if we need to wait (version 0 case).
+    notify_receiver: Option<mpsc::Receiver<()>>,
+}
+
+impl Future for Snapshot {
+    type Output = Option<Value>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Already resolved - return None (Future complete)
+        if self.resolved {
+            return Poll::Ready(None);
+        }
+
+        // Check if value is available
+        if self.actor.version() > 0 {
+            self.resolved = true;
+            return Poll::Ready(self.actor.stored_value());
+        }
+
+        // No value yet - register for notification and wait
+        // Lazily initialize the notification channel
+        if self.notify_receiver.is_none() {
+            let (mut sender, receiver) = mpsc::channel::<()>(1);
+            // Pre-send so we'll wake up when first value arrives
+            let _ = sender.try_send(());
+            self.actor.notify_senders.lock().unwrap().push(sender);
+            self.notify_receiver = Some(receiver);
+        }
+
+        // Poll the notification channel
+        if let Some(ref mut receiver) = self.notify_receiver {
+            match Pin::new(receiver).poll_next(cx) {
+                Poll::Ready(Some(())) => {
+                    // Got notification - check if value is now available
+                    if self.actor.version() > 0 {
+                        self.resolved = true;
+                        return Poll::Ready(self.actor.stored_value());
+                    }
+                    // Spurious wakeup, register waker and wait again
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Poll::Ready(None) => {
+                    // Channel closed, actor dropped
+                    self.resolved = true;
+                    Poll::Ready(None)
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Pending
         }
     }
 }
