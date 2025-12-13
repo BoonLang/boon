@@ -264,6 +264,11 @@ fn element_stripe(
     let items_list_value: std::sync::Arc<std::sync::Mutex<Option<Value>>> = Default::default();
     let items_list_value_for_stream = items_list_value.clone();
 
+    // Keep item ValueActors alive - each item's FunctionCall actor needs to survive
+    // so that its arguments (like List/map actors) stay alive for the element's lifetime.
+    let item_actors: std::sync::Arc<std::sync::Mutex<Vec<Arc<ValueActor>>>> = Default::default();
+    let item_actors_for_stream = item_actors.clone();
+
     let direction_stream = settings_variable
         .clone()
         .subscribe()
@@ -313,6 +318,10 @@ fn element_stripe(
         .direction_signal(signal::from_stream(direction_stream).map(Option::unwrap_or_default))
         .items_signal_vec(VecDiffStreamSignalVec(items_vec_diff_stream).map_signal(
             move |value_actor| {
+                // Keep the value_actor alive for the lifetime of the element.
+                // This ensures that nested elements (like inner stripes with List/map)
+                // keep their argument actors alive.
+                item_actors_for_stream.lock().unwrap().push(value_actor.clone());
                 signal::from_stream(value_actor.subscribe().map({
                     let construct_context = construct_context.clone();
                     move |value| value_to_element(value, construct_context.clone())
@@ -325,11 +334,12 @@ fn element_stripe(
         .update_raw_el(|raw_el| {
             raw_el.style_signal("gap", signal::from_stream(gap_stream))
         })
-        // Keep tagged_object, settings_object, and items_list_value alive for the lifetime of this element
+        // Keep tagged_object, settings_object, items_list_value, and item_actors alive for the lifetime of this element
         .after_remove(move |_| {
             drop(tagged_object);
             drop(settings_object);
             drop(items_list_value);
+            drop(item_actors);
             drop(hovered_handler_task);
         })
 }
