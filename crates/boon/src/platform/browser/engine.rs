@@ -893,6 +893,12 @@ pub struct ActorContext {
     /// each pulse from Stream/pulses is pulled one at a time, state is updated between each.
     /// Default: false (normal eager evaluation).
     pub use_lazy_actors: bool,
+    /// When true, subscriptions start from the current version instead of version 0.
+    /// This is set by THEN for body evaluation to ensure variables are read as snapshots.
+    /// Without this, THEN body `{ current_text }` would receive historical values
+    /// from the ValueHistory buffer instead of the current stored value.
+    /// Default: false (normal stream semantics with full history).
+    pub use_snapshot_subscriptions: bool,
 }
 
 // --- ActorOutputValveSignal ---
@@ -1216,8 +1222,9 @@ impl VariableOrArgumentReference {
         alias: static_expression::Alias,
         root_value_actor: impl Future<Output = Arc<ValueActor>> + 'static,
     ) -> Arc<ValueActor> {
-        let description_for_debug = construct_info.description.clone();
         let construct_info = construct_info.complete(ConstructType::VariableOrArgumentReference);
+        // Capture snapshot mode flag before closures
+        let use_snapshot = actor_context.use_snapshot_subscriptions;
         let mut skip_alias_parts = 0;
         let alias_parts = match alias {
             static_expression::Alias::WithoutPassed {
@@ -1231,15 +1238,18 @@ impl VariableOrArgumentReference {
         };
         // The `subscribe()` method returns a `Subscription` that keeps the actor alive
         // for the duration of the subscription, so we no longer need the manual unfold pattern.
-        let description_for_stream = description_for_debug.clone();
-        println!("[DEBUG VariableOrArgumentReference] Creating value_stream for {:?}", description_for_debug);
         let mut value_stream = stream::once(async move {
-            println!("[DEBUG VariableOrArgumentReference] stream::once future polled for {:?}", description_for_stream);
             root_value_actor.await
         })
-            .flat_map(|actor| actor.subscribe())
+            .flat_map(move |actor| {
+                // Use snapshot mode when evaluating THEN body - gets current value only, not history
+                if use_snapshot {
+                    actor.subscribe_snapshot_mode()
+                } else {
+                    actor.subscribe()
+                }
+            })
             .boxed_local();
-        println!("[DEBUG VariableOrArgumentReference] value_stream created for {:?}, skip_alias_parts={}", description_for_debug, skip_alias_parts);
         for alias_part in alias_parts.into_iter().skip(skip_alias_parts) {
             let alias_part = alias_part.to_string();
             // IMPORTANT: Use map + flatten_unordered instead of flat_map!
@@ -1428,9 +1438,27 @@ impl ReferenceConnector {
         {
             eprintln!("Failed to register referenceable: {error:#}")
         }
-        referenceable_receiver
+        let actor = referenceable_receiver
             .await
-            .expect("Failed to get referenceable from ReferenceConnector")
+            .expect("Failed to get referenceable from ReferenceConnector");
+
+        // DEBUG: Log the actor's stored value
+        if let Some(stored) = actor.stored_value() {
+            let value_desc = match &stored {
+                Value::Text(t, _) => format!("Text('{}')", t.text()),
+                Value::Number(n, _) => format!("Number({})", n.number()),
+                Value::Tag(_, _) => "Tag".to_string(),
+                Value::Object(_, _) => "Object".to_string(),
+                Value::TaggedObject(_, _) => "TaggedObject".to_string(),
+                Value::List(_, _) => "List".to_string(),
+                Value::Flushed(_, _) => "Flushed".to_string(),
+            };
+            println!("[DEBUG referenceable] Found actor for span {:?} with stored_value: {}", span, value_desc);
+        } else {
+            println!("[DEBUG referenceable] Found actor for span {:?} with NO stored_value", span);
+        }
+
+        actor
     }
 }
 
@@ -3185,6 +3213,40 @@ impl ValueActor {
         }
     }
 
+    /// Subscribe in snapshot mode - only receives current value, not historical values.
+    ///
+    /// This is like `subscribe()` but for eager actors, starts from current version
+    /// instead of version 0. Use this in THEN body evaluation where variables should
+    /// be read as snapshots of their current value.
+    pub fn subscribe_snapshot_mode(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        stream::once(async move {
+            use std::task::Poll;
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }).await;
+            self
+        })
+        .flat_map(|actor| actor.subscribe_immediate_snapshot())
+        .boxed_local()
+    }
+
+    /// Subscribe without yielding, snapshot mode.
+    fn subscribe_immediate_snapshot(self: Arc<Self>) -> impl Stream<Item = Value> {
+        if let Some(ref lazy_delegate) = self.lazy_delegate {
+            // Lazy actors already only emit values when pulled, so no history issue
+            lazy_delegate.clone().subscribe().left_stream()
+        } else {
+            self.subscribe_snapshot().right_stream()
+        }
+    }
+
     /// Subscribe to eager actor's values using bounded channel notifications.
     ///
     /// WARNING: Only use this for actors you KNOW are eager (no lazy_delegate).
@@ -3223,6 +3285,32 @@ impl ValueActor {
             notify_receiver: receiver,
             // Strong reference keeps actor alive as long as subscription exists.
             // Circular reference chains in HOLD are broken via Weak in HOLD closures (evaluator.rs).
+            actor: self,
+            pending_values: VecDeque::new(),
+        }
+    }
+
+    /// Subscribe to get ONLY the current snapshot value, not historical values.
+    ///
+    /// Unlike `subscribe_eager()` which starts at version 0 (getting full history),
+    /// this starts at current_version - 1 so subscriber receives only the current
+    /// stored value without any older values from the history buffer.
+    ///
+    /// Use this in THEN body evaluation where variables should be read as snapshots,
+    /// not as streams of historical values.
+    fn subscribe_snapshot(self: Arc<Self>) -> Subscription {
+        let (mut sender, receiver) = mpsc::channel::<()>(1);
+        let _ = sender.try_send(());
+        self.notify_senders.lock().unwrap().push(sender);
+
+        // Start at current_version - 1 so we receive ONLY the current value.
+        // If version is 0, use 0 (no history yet, will get first value when stored).
+        let current = self.version();
+        let start_version = if current > 0 { current - 1 } else { 0 };
+
+        Subscription {
+            last_seen_version: start_version,
+            notify_receiver: receiver,
             actor: self,
             pending_values: VecDeque::new(),
         }
@@ -6068,6 +6156,23 @@ impl ListBindingFunction {
         // Create a new ActorContext with the binding variable set
         let binding_name = config.binding_name.to_string();
         let mut new_params = actor_context.parameters.clone();
+
+        // Debug: log what item value we're transforming
+        if let Some(stored) = item_actor.stored_value() {
+            let value_desc = match &stored {
+                Value::Text(t, _) => format!("Text('{}')", t.text()),
+                Value::Number(n, _) => format!("Number({})", n.number()),
+                Value::Tag(_, _) => "Tag".to_string(),
+                Value::Object(_, _) => "Object".to_string(),
+                Value::TaggedObject(_, _) => "TaggedObject".to_string(),
+                Value::List(_, _) => "List".to_string(),
+                Value::Flushed(_, _) => "Flushed".to_string(),
+            };
+            println!("[DEBUG transform_item] binding_name='{}', stored_value={}", binding_name, value_desc);
+        } else {
+            println!("[DEBUG transform_item] binding_name='{}', no stored value yet", binding_name);
+        }
+
         new_params.insert(binding_name, item_actor.clone());
 
         let new_actor_context = ActorContext {
@@ -6101,6 +6206,17 @@ impl ListBindingFunction {
         construct_context: ConstructContext,
         actor_context: ActorContext,
     ) -> ListChange {
+        let change_type = match &change {
+            ListChange::Replace { items } => format!("Replace({})", items.len()),
+            ListChange::InsertAt { index, .. } => format!("InsertAt({})", index),
+            ListChange::UpdateAt { index, .. } => format!("UpdateAt({})", index),
+            ListChange::Push { .. } => "Push".to_string(),
+            ListChange::RemoveAt { index } => format!("RemoveAt({})", index),
+            ListChange::Move { old_index, new_index } => format!("Move({} -> {})", old_index, new_index),
+            ListChange::Pop => "Pop".to_string(),
+            ListChange::Clear => "Clear".to_string(),
+        };
+        println!("[DEBUG transform_list_change_for_map] Received change: {}", change_type);
         match change {
             ListChange::Replace { items } => {
                 let transformed_items: Vec<Arc<ValueActor>> = items

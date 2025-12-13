@@ -1776,6 +1776,7 @@ fn process_work_item(
                             backpressure_permit: ctx.actor_context.backpressure_permit,
                             hold_state_update_callback: ctx.actor_context.hold_state_update_callback,
                             use_lazy_actors: ctx.actor_context.use_lazy_actors,
+                            use_snapshot_subscriptions: ctx.actor_context.use_snapshot_subscriptions,
                         },
                         reference_connector: ctx.reference_connector,
                         link_connector: ctx.link_connector,
@@ -1958,6 +1959,15 @@ fn build_then_actor(
                 permit.acquire().await;
             }
 
+            // DEBUG: Log the value that triggered THEN
+            let value_desc = match &value {
+                Value::Text(t, _) => format!("Text('{}')", t.text()),
+                Value::Number(n, _) => format!("Number({})", n.number()),
+                Value::Tag(_, _) => "Tag".to_string(),
+                _ => "Other".to_string(),
+            };
+            println!("[DEBUG THEN] Triggered with value: {}", value_desc);
+
             let value_actor = ValueActor::new_arc(
                 ConstructInfo::new(
                     "THEN input value".to_string(),
@@ -2017,6 +2027,8 @@ fn build_then_actor(
                 // Don't propagate callback to body - body evaluation is internal
                 hold_state_update_callback: None,
                 use_lazy_actors: actor_context_clone.use_lazy_actors,
+                // THEN body needs snapshot semantics - read current variable values, not history
+                use_snapshot_subscriptions: true,
             };
 
             let new_ctx = EvaluationContext {
@@ -2045,6 +2057,15 @@ fn build_then_actor(
                     let result_actor_keepalive = result_actor.clone();
                     let hold_callback_for_map = hold_callback_clone.clone();
                     let result_stream = result_actor.subscribe().take(1).map(move |mut result_value| {
+                        // DEBUG: Log the result value from THEN body
+                        let result_desc = match &result_value {
+                            Value::Text(t, _) => format!("Text('{}')", t.text()),
+                            Value::Number(n, _) => format!("Number({})", n.number()),
+                            Value::Tag(_, _) => "Tag".to_string(),
+                            _ => "Other".to_string(),
+                        };
+                        println!("[DEBUG THEN] Body produced: {}", result_desc);
+
                         // Keep value_actor and result_actor alive while stream is consumed
                         let _ = &value_actor;
                         let _ = &result_actor_keepalive;
@@ -2133,6 +2154,8 @@ fn build_then_actor(
             backpressure_permit: ctx.actor_context.backpressure_permit.clone(),
             hold_state_update_callback: None,
             use_lazy_actors: ctx.actor_context.use_lazy_actors,
+            // THEN body needs snapshot semantics
+            use_snapshot_subscriptions: true,
         };
 
         let sync_ctx = EvaluationContext {
@@ -2364,6 +2387,8 @@ fn build_when_actor(
                         // Don't propagate HOLD callback into WHEN arms - each arm is a separate evaluation
                         hold_state_update_callback: None,
                         use_lazy_actors: actor_context_clone.use_lazy_actors,
+                        // WHEN body needs snapshot semantics like THEN
+                        use_snapshot_subscriptions: true,
                     };
 
                     let new_ctx = EvaluationContext {
@@ -2527,6 +2552,8 @@ fn build_while_actor(
                     // Propagate HOLD callback through WHILE arms - body might need it
                     hold_state_update_callback: actor_context_clone.hold_state_update_callback.clone(),
                     use_lazy_actors: actor_context_clone.use_lazy_actors,
+                    // WHILE is continuous, not snapshot - variables should stream normally
+                    use_snapshot_subscriptions: false,
                 };
 
                 let new_ctx = EvaluationContext {
@@ -2834,6 +2861,8 @@ fn build_hold_actor(
         // Enable lazy actors in HOLD body for demand-driven evaluation.
         // This ensures HOLD pulls values one at a time and updates state between each pull.
         use_lazy_actors: true,
+        // Default - THEN/WHEN inside will set their own snapshot flag
+        use_snapshot_subscriptions: false,
     };
 
     // Create new context for body evaluation
@@ -3017,9 +3046,26 @@ fn build_text_literal_actor(
             static_expression::TextPart::Interpolation { var, referenced_span } => {
                 // Interpolation - look up the variable
                 let var_name = var.to_string();
+                println!("[DEBUG TextInterpolation] Looking up var='{}', referenced_span={:?}", var_name, referenced_span);
+                println!("[DEBUG TextInterpolation] Parameters has keys: {:?}", ctx.actor_context.parameters.keys().collect::<Vec<_>>());
                 if let Some(var_actor) = ctx.actor_context.parameters.get(&var_name) {
+                    if let Some(stored) = var_actor.stored_value() {
+                        let value_desc = match &stored {
+                            Value::Text(t, _) => format!("Text('{}')", t.text()),
+                            Value::Number(n, _) => format!("Number({})", n.number()),
+                            Value::Tag(_, _) => "Tag".to_string(),
+                            Value::Object(_, _) => "Object".to_string(),
+                            Value::TaggedObject(_, _) => "TaggedObject".to_string(),
+                            Value::List(_, _) => "List".to_string(),
+                            Value::Flushed(_, _) => "Flushed".to_string(),
+                        };
+                        println!("[DEBUG TextInterpolation] Found '{}' in parameters with value: {}", var_name, value_desc);
+                    } else {
+                        println!("[DEBUG TextInterpolation] Found '{}' in parameters but no stored value", var_name);
+                    }
                     part_actors.push((false, var_actor.clone()));
                 } else if let Some(ref_span) = referenced_span {
+                    println!("[DEBUG TextInterpolation] '{}' NOT in parameters, using reference_connector for span {:?}", var_name, ref_span);
                     // Use reference_connector to get the variable from outer scope
                     // Create a forwarding actor that immediately starts forwarding values
                     // from the referenced actor via a dedicated task.
@@ -3368,6 +3414,8 @@ fn call_function(
                     backpressure_permit: ctx_for_closure.actor_context.backpressure_permit.clone(),
                     hold_state_update_callback: None,
                     use_lazy_actors: ctx_for_closure.actor_context.use_lazy_actors,
+                    // Don't inherit snapshot mode - function body evaluates in normal streaming context
+                    use_snapshot_subscriptions: false,
                 };
 
                 let new_ctx = EvaluationContext {
@@ -3425,6 +3473,8 @@ fn call_function(
             // Don't propagate HOLD callback into user-defined functions - they have their own scope
             hold_state_update_callback: None,
             use_lazy_actors: ctx.actor_context.use_lazy_actors,
+            // Don't inherit snapshot mode - function body evaluates in normal streaming context
+            use_snapshot_subscriptions: false,
         };
 
         let new_ctx = EvaluationContext {
@@ -3473,6 +3523,8 @@ fn call_function(
                 // Don't propagate HOLD callback into builtin function calls
                 hold_state_update_callback: None,
                 use_lazy_actors: ctx.actor_context.use_lazy_actors,
+                // Don't inherit snapshot mode - builtin functions evaluate in normal streaming context
+                use_snapshot_subscriptions: false,
             };
 
             Ok(Some(FunctionCall::new_arc_value_actor(

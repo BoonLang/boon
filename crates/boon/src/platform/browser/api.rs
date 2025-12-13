@@ -1548,6 +1548,12 @@ pub fn function_list_append(
             // containing that specific value and push it.
             // Note: SKIP is not a Value - it's a stream behavior where streams end without
             // producing values. If item is SKIP, this map closure is never called.
+            let value_desc = match &value {
+                Value::Text(t, _) => format!("Text('{}')", t.text()),
+                Value::Number(n, _) => format!("Number({})", n.number()),
+                _ => "Other".to_string(),
+            };
+            println!("[DEBUG List/append] Creating Push for value: {}", value_desc);
             let new_item_actor = ValueActor::new_arc(
                 ConstructInfo::new(
                     function_call_id_for_append.with_child_id("appended_item"),
