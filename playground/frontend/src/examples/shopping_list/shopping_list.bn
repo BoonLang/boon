@@ -14,16 +14,16 @@ item_input: Element/text_input(
     focus: True
 )
 
--- Get trimmed text when Enter is pressed
-trimmed_on_enter: item_input.event.key_down.key |> WHEN {
-    Enter => item_input.text |> Text/trim()
+-- Get trimmed non-empty text when Enter is pressed (using BLOCK)
+captured_text: item_input.event.key_down.key |> WHEN {
+    Enter => BLOCK {
+        trimmed: item_input.text |> Text/trim()
+        trimmed |> Text/is_not_empty() |> WHEN {
+            True => trimmed
+            False => SKIP
+        }
+    }
     __ => SKIP
-}
-
--- Only capture non-empty text
-captured_text: trimmed_on_enter |> Text/is_not_empty() |> WHEN {
-    True => trimmed_on_enter
-    False => SKIP
 }
 
 -- Store items using reactive list operations

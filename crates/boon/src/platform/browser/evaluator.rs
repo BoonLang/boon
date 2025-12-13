@@ -272,9 +272,9 @@ pub enum WorkItem {
     },
 
     /// Build Block after variables and output are evaluated.
-    /// The variable_slots contain all the block's variable actors which must be kept alive.
+    /// The object_slot contains the Object with Variables that must be kept alive.
     BuildBlock {
-        variable_slots: Vec<SlotId>,
+        object_slot: SlotId,
         output_slot: SlotId,
         result_slot: SlotId,
     },
@@ -697,7 +697,6 @@ fn schedule_expression(
             // First pass: collect variable data and allocate slots (don't schedule yet)
             let mut variable_data = Vec::new();
             let mut vars_to_schedule = Vec::new();
-            let mut variable_slots = Vec::new();
 
             for var in variables {
                 let var_slot = state.alloc_slot();
@@ -739,9 +738,6 @@ fn schedule_expression(
                     forwarding_actor,
                 });
 
-                // Collect all variable slots (for keeping them alive)
-                variable_slots.push(var_slot);
-
                 // Collect for later scheduling (skip Link)
                 if !is_link {
                     vars_to_schedule.push((var.node.value, var_slot));
@@ -749,9 +745,10 @@ fn schedule_expression(
             }
 
             // Push BuildBlock first (will be processed last due to LIFO)
-            // BuildBlock takes the output expression result and keeps variables alive
+            // BuildBlock takes the output expression result and keeps the Object alive
+            // (the Object contains the Variables which must not be dropped)
             state.push(WorkItem::BuildBlock {
-                variable_slots,
+                object_slot,
                 output_slot: output_expr_slot,
                 result_slot,
             });
@@ -1626,27 +1623,21 @@ fn process_work_item(
             }
         }
 
-        WorkItem::BuildBlock { variable_slots, output_slot, result_slot } => {
+        WorkItem::BuildBlock { object_slot, output_slot, result_slot } => {
             // If output slot is empty, this block produces nothing
             let Some(output_actor) = state.get(output_slot) else { return Ok(()); };
 
-            // Collect variable actors to keep them alive (empty slots are ignored)
-            let variable_actors: Vec<Arc<ValueActor>> = variable_slots
-                .iter()
-                .filter_map(|slot| state.get(*slot))
-                .collect();
+            // Get the Object actor which contains the Variables
+            // We need to keep the Object alive so Variables don't get dropped
+            let object_actor = state.get(object_slot);
 
-            // If there are variables, create a wrapper actor that keeps them alive
-            // by capturing them in the stream closure
-            if variable_actors.is_empty() {
-                state.store(result_slot, output_actor);
-            } else {
-                // Create a wrapper actor that subscribes to output and holds variable actors
-                // The stream::unfold keeps variable_actors alive in its closure
+            if let Some(object_actor) = object_actor {
+                // Create a wrapper actor that subscribes to output and holds the Object
+                // The stream::unfold keeps the Object alive in its closure, which keeps Variables alive
                 let value_stream = stream::unfold(
-                    (output_actor.subscribe(), variable_actors),
-                    |(mut subscription, vars)| async move {
-                        subscription.next().await.map(|value| (value, (subscription, vars)))
+                    (output_actor.subscribe(), object_actor),
+                    |(mut subscription, obj)| async move {
+                        subscription.next().await.map(|value| (value, (subscription, obj)))
                     },
                 );
                 let wrapper = Arc::new(ValueActor::new(
@@ -1660,6 +1651,9 @@ fn process_work_item(
                     None,
                 ));
                 state.store(result_slot, wrapper);
+            } else {
+                // No Object (block has no variables) - just use output directly
+                state.store(result_slot, output_actor);
             }
         }
 

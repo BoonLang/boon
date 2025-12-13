@@ -1243,11 +1243,7 @@ impl VariableOrArgumentReference {
         })
             .flat_map(move |actor| {
                 // Use snapshot mode when evaluating THEN body - gets current value only, not history
-                if use_snapshot {
-                    actor.subscribe_snapshot_mode()
-                } else {
-                    actor.subscribe()
-                }
+                actor.subscribe_with_mode(use_snapshot)
             })
             .boxed_local();
         for alias_part in alias_parts.into_iter().skip(skip_alias_parts) {
@@ -1270,11 +1266,7 @@ impl VariableOrArgumentReference {
                             if is_link {
                                 // LINK field: stay subscribed to receive multiple events
                                 // Keep object and variable alive via unfold state
-                                let subscription = if use_snapshot {
-                                    variable_actor.subscribe_snapshot_mode()
-                                } else {
-                                    variable_actor.subscribe()
-                                };
+                                let subscription = variable_actor.subscribe_with_mode(use_snapshot);
                                 stream::unfold(
                                     (subscription, object, variable),
                                     move |(mut subscription, object, variable)| async move {
@@ -1285,11 +1277,7 @@ impl VariableOrArgumentReference {
                                 // Non-LINK field: emit once and complete
                                 // This allows flatten_unordered(Some(1)) to process subsequent parent emissions
                                 stream::once(async move {
-                                    let mut subscription = if use_snapshot {
-                                        variable_actor.subscribe_snapshot_mode()
-                                    } else {
-                                        variable_actor.subscribe()
-                                    };
+                                    let mut subscription = variable_actor.subscribe_with_mode(use_snapshot);
                                     let result = subscription.next().await;
                                     // Keep object and variable alive until we get the value
                                     let _ = (&object, &variable);
@@ -1304,11 +1292,7 @@ impl VariableOrArgumentReference {
 
                             if is_link {
                                 // LINK field: stay subscribed to receive multiple events
-                                let subscription = if use_snapshot {
-                                    variable_actor.subscribe_snapshot_mode()
-                                } else {
-                                    variable_actor.subscribe()
-                                };
+                                let subscription = variable_actor.subscribe_with_mode(use_snapshot);
                                 stream::unfold(
                                     (subscription, tagged_object, variable),
                                     move |(mut subscription, tagged_object, variable)| async move {
@@ -1318,11 +1302,7 @@ impl VariableOrArgumentReference {
                             } else {
                                 // Non-LINK field: emit once and complete
                                 stream::once(async move {
-                                    let mut subscription = if use_snapshot {
-                                        variable_actor.subscribe_snapshot_mode()
-                                    } else {
-                                        variable_actor.subscribe()
-                                    };
+                                    let mut subscription = variable_actor.subscribe_with_mode(use_snapshot);
                                     let result = subscription.next().await;
                                     let _ = (&tagged_object, &variable);
                                     result
@@ -3231,12 +3211,15 @@ impl ValueActor {
         }
     }
 
-    /// Subscribe in snapshot mode - only receives current value, not historical values.
+    /// Subscribe with explicit snapshot mode control.
     ///
-    /// This is like `subscribe()` but for eager actors, starts from current version
-    /// instead of version 0. Use this in THEN body evaluation where variables should
-    /// be read as snapshots of their current value.
-    pub fn subscribe_snapshot_mode(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+    /// This is the single entry point for VariableOrArgumentReference subscriptions.
+    /// - `use_snapshot: false` → regular subscription (stream from version 0)
+    /// - `use_snapshot: true` → snapshot subscription (current value only)
+    ///
+    /// For version 0 actors (newly created, e.g., BLOCK-local variables), snapshot mode
+    /// falls back to regular subscription to wait for the first value.
+    fn subscribe_with_mode(self: Arc<Self>, use_snapshot: bool) -> LocalBoxStream<'static, Value> {
         stream::once(async move {
             use std::task::Poll;
             let mut yielded = false;
@@ -3249,9 +3232,18 @@ impl ValueActor {
                     Poll::Pending
                 }
             }).await;
-            self
+            (self, use_snapshot)
         })
-        .flat_map(|actor| actor.subscribe_immediate_snapshot())
+        .flat_map(|(actor, use_snapshot)| {
+            if use_snapshot && actor.version() > 0 {
+                // Snapshot mode for actors with history - get current value only
+                actor.subscribe_immediate_snapshot().boxed_local()
+            } else {
+                // Regular subscription: either snapshot mode disabled, or
+                // new actor (version 0) that needs to wait for first value
+                actor.subscribe_immediate().boxed_local()
+            }
+        })
         .boxed_local()
     }
 
