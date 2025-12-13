@@ -761,16 +761,28 @@ fn element_text_input(
             })
         });
 
-    let placeholder_stream = settings_variable
+    // Placeholder text stream - extract actual text from placeholder object
+    let placeholder_text_stream = settings_variable
         .clone()
         .subscribe()
         .flat_map(|value| value.expect_object().expect_variable("placeholder").subscribe())
+        .flat_map(|value| {
+            match value {
+                Value::Object(obj, _) => {
+                    stream::iter(obj.variable("text")).flat_map(|var| var.subscribe()).left_stream()
+                }
+                _ => stream::empty().right_stream(),
+            }
+        })
         .filter_map(|value| {
             future::ready(match value {
-                Value::Object(obj, _) => obj.variable("text").map(|_| "placeholder"),
+                Value::Text(text, _) => Some(text.text().to_string()),
                 _ => None,
             })
         });
+
+    // Placeholder signal for TextInput
+    let placeholder_signal = signal::from_stream(placeholder_text_stream);
 
     // Width signal from style
     let width_signal = signal::from_stream(
@@ -821,6 +833,7 @@ fn element_text_input(
     TextInput::new()
         .label_hidden("text input")
         .text_signal(signal::from_stream(text_stream).map(|t| t.unwrap_or_default()))
+        .placeholder(Placeholder::with_signal(placeholder_signal.map(|t| t.unwrap_or_default())))
         .on_change({
             let sender = change_event_sender.clone();
             move |text| {

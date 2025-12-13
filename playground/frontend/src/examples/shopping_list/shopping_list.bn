@@ -44,6 +44,13 @@ clear_button: Element/button(
 -- Item count (derived from list)
 item_count: items |> List/count()
 
+-- Map items to label elements (must be top-level variable to keep actor alive)
+item_labels: items |> List/map(item, new: Element/label(
+    element: []
+    style: [font: [color: White]]
+    label: TEXT { - {item} }
+))
+
 -- UI
 document: Document/new(root: Element/stripe(
     element: []
@@ -64,11 +71,7 @@ document: Document/new(root: Element/stripe(
             direction: Column
             gap: 4
             style: []
-            items: items |> List/map(item, new: Element/label(
-                element: []
-                style: [font: [color: White]]
-                label: TEXT { - {item} }
-            ))
+            items: item_labels
         )
 
         Element/stripe(
