@@ -1,89 +1,107 @@
 -- Shopping List
 
--- Input element
-item_input: Element/text_input(
-    element: [event: [key_down: LINK, change: LINK]]
-    style: [width: Fill]
-    label: Hidden[text: TEXT { Item name }]
-    text: LATEST {
-        Text/empty()
-        element.event.change.text
-        captured_text |> THEN { Text/empty() }
-    }
-    placeholder: [text: TEXT { Type and press Enter to add... }]
-    focus: True
-)
-
--- Get trimmed non-empty text when Enter is pressed (using BLOCK)
-captured_text: item_input.event.key_down.key |> WHEN {
-    Enter => BLOCK {
-        trimmed: item_input.text |> Text/trim()
-        trimmed |> Text/is_not_empty() |> WHEN {
-            True => trimmed
-            False => SKIP
+store: [
+    elements: [
+        item_input: LINK
+        clear_button: LINK
+    ]
+    text_to_add: elements.item_input.event.key_down.key |> WHEN {
+        Enter => BLOCK {
+            trimmed: elements.item_input.text |> Text/trim()
+            trimmed |> Text/is_not_empty() |> WHEN {
+                True => trimmed
+                False => SKIP
+            }
         }
+        __ => SKIP
     }
-    __ => SKIP
+    items: LIST {}
+        |> List/append(item: text_to_add)
+        |> List/clear(on: elements.clear_button.event.press)
+]
+
+document: Document/new(root: root_element(PASS: [store: store]))
+
+FUNCTION root_element() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 16
+        style: [padding: 20, width: 400]
+        items: LIST {
+            header()
+            item_input() |> LINK { PASSED.store.elements.item_input }
+            items_list()
+            footer()
+        }
+    )
 }
 
--- Store items using reactive list operations
-items: LIST {}
-    |> List/append(item: captured_text)
-    |> List/clear(on: clear_button.event.press)
+FUNCTION header() {
+    Element/label(
+        element: []
+        style: [font: [size: 24, weight: Bold]]
+        label: TEXT { Shopping List }
+    )
+}
 
--- Clear button
-clear_button: Element/button(
-    element: [event: [press: LINK]]
-    style: [padding: 10]
-    label: TEXT { Clear }
-)
+FUNCTION item_input() {
+    Element/text_input(
+        element: [event: [key_down: LINK, change: LINK]]
+        style: [width: Fill]
+        label: Hidden[text: TEXT { Item name }]
+        text: LATEST {
+            Text/empty()
+            element.event.change.text
+            PASSED.store.text_to_add |> THEN { Text/empty() }
+        }
+        placeholder: [text: TEXT { Type and press Enter to add... }]
+        focus: True
+    )
+}
 
--- Item count (derived from list)
-item_count: items |> List/count()
-
--- Map items to label elements
-item_labels: items |> List/map(item, new: Element/label(
-    element: []
-    style: [font: [color: White]]
-    label: TEXT { - {item} }
-))
-
--- UI
-document: Document/new(root: Element/stripe(
-    element: []
-    direction: Column
-    gap: 16
-    style: [padding: 20, width: 400]
-    items: LIST {
-        Element/label(
+FUNCTION items_list() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 4
+        style: []
+        items: PASSED.store.items |> List/map(item, new: Element/label(
             element: []
-            style: [font: [size: 24, weight: Bold]]
-            label: TEXT { Shopping List }
-        )
+            style: [font: [color: White]]
+            label: TEXT { - {item} }
+        ))
+    )
+}
 
-        item_input
+FUNCTION footer() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 16
+        style: []
+        items: LIST {
+            item_count_label()
+            clear_button() |> LINK { PASSED.store.elements.clear_button }
+        }
+    )
+}
 
-        Element/stripe(
-            element: []
-            direction: Column
-            gap: 4
-            style: []
-            items: item_labels
-        )
+FUNCTION item_count_label() {
+    Element/label(
+        element: []
+        style: [font: [color: Oklch[lightness: 0.5]]]
+        label: BLOCK {
+            count: PASSED.store.items |> List/count()
+            TEXT { {count} items }
+        }
+    )
+}
 
-        Element/stripe(
-            element: []
-            direction: Row
-            gap: 16
-            style: []
-            items: LIST {
-                Element/label(
-                    element: []
-                    style: [font: [color: Oklch[lightness: 0.5]]]
-                    label: TEXT { {item_count} items }
-                )
-                clear_button
-            }
-        )
-    }
-))
+FUNCTION clear_button() {
+    Element/button(
+        element: [event: [press: LINK]]
+        style: [padding: 10]
+        label: TEXT { Clear }
+    )
+}
