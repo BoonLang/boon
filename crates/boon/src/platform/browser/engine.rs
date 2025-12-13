@@ -143,6 +143,121 @@ pub fn constant<T>(item: T) -> TypedStream<impl Stream<Item = T>, Infinite> {
     TypedStream::infinite(stream::once(future::ready(item)).chain(stream::once(future::pending())))
 }
 
+// --- switch_map ---
+
+/// Applies a function to each value from the outer stream, creating an inner stream.
+/// When a new outer value arrives, the previous inner stream is cancelled (dropped)
+/// and a new inner stream is started.
+///
+/// This is the "switch" behavior from RxJS - only the most recent inner stream is active.
+/// Previous inner streams are dropped, cancelling their subscriptions.
+///
+/// # Example
+/// For a path like `event.key_down.key`:
+/// - When `key_down` emits a new KeyboardEvent, we start subscribing to its `.key` field
+/// - When `key_down` emits another KeyboardEvent, we DROP the old `.key` subscription
+///   and start a new one on the new event
+///
+/// This is essential for LINK-based paths where each LINK emission is a discrete event
+/// and we shouldn't continue processing fields from old events.
+pub fn switch_map<S, F, U>(outer: S, f: F) -> LocalBoxStream<'static, U::Item>
+where
+    S: Stream + 'static,
+    F: Fn(S::Item) -> U + 'static,
+    U: Stream + 'static,
+    U::Item: 'static,
+{
+    // Use a channel-based approach for clean switching
+    let (tx, rx) = mpsc::unbounded::<U::Item>();
+
+    // Spawn a task that manages the switch logic
+    // Store the handle to keep the task alive
+    let task_handle = Task::start_droppable({
+        let tx = tx;
+        async move {
+            let mut outer = outer.boxed_local();
+            let mut inner: Option<LocalBoxStream<'static, U::Item>> = None;
+
+            loop {
+                match &mut inner {
+                    Some(inner_stream) => {
+                        // Poll both outer and inner using future::select
+                        use zoon::futures_util::future::Either;
+                        let outer_fut = outer.next();
+                        let inner_fut = inner_stream.next();
+
+                        match future::select(pin!(outer_fut), pin!(inner_fut)).await {
+                            Either::Left((outer_opt, _inner_fut)) => {
+                                match outer_opt {
+                                    Some(value) => {
+                                        // Switch! Drop old inner (by replacing) and create new
+                                        inner = Some(f(value).boxed_local());
+                                    }
+                                    None => {
+                                        // Outer ended - drain inner then exit
+                                        while let Some(item) = inner_stream.next().await {
+                                            if tx.unbounded_send(item).is_err() {
+                                                return;
+                                            }
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                            Either::Right((inner_opt, _outer_fut)) => {
+                                match inner_opt {
+                                    Some(item) => {
+                                        if tx.unbounded_send(item).is_err() {
+                                            return; // Receiver dropped
+                                        }
+                                    }
+                                    None => {
+                                        // Inner ended - clear it, wait for new outer value
+                                        inner = None;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        // No inner stream - wait for outer value
+                        match outer.next().await {
+                            Some(value) => {
+                                inner = Some(f(value).boxed_local());
+                            }
+                            None => {
+                                return; // Outer ended, no inner - we're done
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Wrap the receiver in a stream that keeps the task handle alive
+    SwitchMapStream {
+        rx,
+        _task_handle: task_handle,
+    }.boxed_local()
+}
+
+/// Stream wrapper for switch_map that keeps the task handle alive
+#[pin_project::pin_project]
+struct SwitchMapStream<T> {
+    #[pin]
+    rx: mpsc::UnboundedReceiver<T>,
+    _task_handle: TaskHandle,
+}
+
+impl<T> Stream for SwitchMapStream<T> {
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.project().rx.poll_next(cx)
+    }
+}
+
 // --- BackpressuredStream ---
 
 /// Stream combinator with demand-based backpressure.
@@ -1246,82 +1361,54 @@ impl VariableOrArgumentReference {
                 actor.subscribe_with_mode(use_snapshot)
             })
             .boxed_local();
-        for alias_part in alias_parts.into_iter().skip(skip_alias_parts) {
+        // Collect parts to detect the last one
+        let parts_vec: Vec<_> = alias_parts.into_iter().skip(skip_alias_parts).collect();
+        let num_parts = parts_vec.len();
+
+        for (idx, alias_part) in parts_vec.into_iter().enumerate() {
             let alias_part = alias_part.to_string();
-            // IMPORTANT: Use map + flatten_unordered instead of flat_map!
-            // flat_map uses flatten which waits for each inner stream to complete
-            // before processing the next. Since Object field streams are infinite
-            // (constant streams that emit once then pending forever), flatten
-            // would block on the first Object and never process subsequent Objects.
-            // flatten_unordered processes all inner streams concurrently.
-            value_stream = value_stream
-                .map(move |value| {
-                    let alias_part = alias_part.clone();
-                    match value {
-                        Value::Object(object, _) => {
-                            let variable = object.expect_variable(&alias_part);
-                            let is_link = variable.link_value_sender().is_some();
-                            let variable_actor = variable.value_actor();
+            let _is_last = idx == num_parts - 1;
 
-                            if is_link {
-                                // LINK field: stay subscribed to receive multiple events
-                                // Keep object and variable alive via unfold state
-                                let subscription = variable_actor.subscribe_with_mode(use_snapshot);
-                                stream::unfold(
-                                    (subscription, object, variable),
-                                    move |(mut subscription, object, variable)| async move {
-                                        let value = subscription.next().await;
-                                        value.map(|value| (value, (subscription, object, variable)))
-                                    }
-                                ).boxed_local()
-                            } else {
-                                // Non-LINK field: emit once and complete
-                                // This allows flatten_unordered(Some(1)) to process subsequent parent emissions
-                                stream::once(async move {
-                                    let mut subscription = variable_actor.subscribe_with_mode(use_snapshot);
-                                    let result = subscription.next().await;
-                                    // Keep object and variable alive until we get the value
-                                    let _ = (&object, &variable);
-                                    result
-                                }).filter_map(|opt| async move { opt }).boxed_local()
+            // Process each field in the path using switch_map semantics:
+            // When the outer stream emits a new value, cancel the old inner subscription
+            // and start a new one. This is essential for LINK fields (when a new event arrives,
+            // stop processing the old event's fields) but also correct for all fields.
+            //
+            // This makes LINK transparent: it's just a channel that forwards values.
+            // The switch semantics come from the path traversal, not from LINK itself.
+            value_stream = switch_map(value_stream, move |value| {
+                let alias_part = alias_part.clone();
+                match value {
+                    Value::Object(object, _) => {
+                        let variable = object.expect_variable(&alias_part);
+                        let variable_actor = variable.value_actor();
+                        let subscription = variable_actor.subscribe_with_mode(use_snapshot);
+                        stream::unfold(
+                            (subscription, object, variable),
+                            move |(mut subscription, object, variable)| async move {
+                                let value = subscription.next().await;
+                                value.map(|value| (value, (subscription, object, variable)))
                             }
-                        }
-                        Value::TaggedObject(tagged_object, _) => {
-                            let variable = tagged_object.expect_variable(&alias_part);
-                            let is_link = variable.link_value_sender().is_some();
-                            let variable_actor = variable.value_actor();
-
-                            if is_link {
-                                // LINK field: stay subscribed to receive multiple events
-                                let subscription = variable_actor.subscribe_with_mode(use_snapshot);
-                                stream::unfold(
-                                    (subscription, tagged_object, variable),
-                                    move |(mut subscription, tagged_object, variable)| async move {
-                                        let value = subscription.next().await;
-                                        value.map(|value| (value, (subscription, tagged_object, variable)))
-                                    }
-                                ).boxed_local()
-                            } else {
-                                // Non-LINK field: emit once and complete
-                                stream::once(async move {
-                                    let mut subscription = variable_actor.subscribe_with_mode(use_snapshot);
-                                    let result = subscription.next().await;
-                                    let _ = (&tagged_object, &variable);
-                                    result
-                                }).filter_map(|opt| async move { opt }).boxed_local()
-                            }
-                        }
-                        other => panic!(
-                            "Failed to get Object or TaggedObject to create VariableOrArgumentReference: The Value has a different type {}",
-                            other.construct_info()
-                        ),
+                        ).boxed_local()
                     }
-                })
-                // With Some(1), only 1 inner stream is processed at a time.
-                // This works because non-LINK streams now complete after emitting,
-                // allowing subsequent LINK events to be processed.
-                .flatten_unordered(Some(1))
-                .boxed_local();
+                    Value::TaggedObject(tagged_object, _) => {
+                        let variable = tagged_object.expect_variable(&alias_part);
+                        let variable_actor = variable.value_actor();
+                        let subscription = variable_actor.subscribe_with_mode(use_snapshot);
+                        stream::unfold(
+                            (subscription, tagged_object, variable),
+                            move |(mut subscription, tagged_object, variable)| async move {
+                                let value = subscription.next().await;
+                                value.map(|value| (value, (subscription, tagged_object, variable)))
+                            }
+                        ).boxed_local()
+                    }
+                    other => panic!(
+                        "Failed to get Object or TaggedObject to create VariableOrArgumentReference: The Value has a different type {}",
+                        other.construct_info()
+                    ),
+                }
+            }).boxed_local();
         }
         // Subscription-based streams are infinite (subscriptions never terminate first)
         Arc::new(ValueActor::new(
@@ -3217,10 +3304,10 @@ impl ValueActor {
     ///
     /// This is the single entry point for VariableOrArgumentReference subscriptions.
     /// - `use_snapshot: false` → regular subscription (stream from version 0)
-    /// - `use_snapshot: true` → snapshot subscription (current value only)
+    /// - `use_snapshot: true` → snapshot subscription (exactly ONE value, then stream ends)
     ///
     /// For version 0 actors (newly created, e.g., BLOCK-local variables), snapshot mode
-    /// falls back to regular subscription to wait for the first value.
+    /// waits for the first value to arrive, then emits it and completes.
     fn subscribe_with_mode(self: Arc<Self>, use_snapshot: bool) -> LocalBoxStream<'static, Value> {
         stream::once(async move {
             use std::task::Poll;
@@ -3237,12 +3324,19 @@ impl ValueActor {
             (self, use_snapshot)
         })
         .flat_map(|(actor, use_snapshot)| {
-            if use_snapshot && actor.version() > 0 {
-                // Snapshot mode for actors with history - get current value only
-                actor.subscribe_immediate_snapshot().boxed_local()
+            if use_snapshot {
+                // Snapshot mode: emit exactly ONE value then complete.
+                // This is critical for WHEN/THEN semantics where we want to read
+                // the current value once, not create an ongoing subscription.
+                if actor.version() > 0 {
+                    // Actor has history - get current value immediately
+                    actor.subscribe_immediate_snapshot().take(1).boxed_local()
+                } else {
+                    // New actor (version 0) - wait for first value, then complete
+                    actor.subscribe_immediate().take(1).boxed_local()
+                }
             } else {
-                // Regular subscription: either snapshot mode disabled, or
-                // new actor (version 0) that needs to wait for first value
+                // Regular subscription: continuous stream of all values
                 actor.subscribe_immediate().boxed_local()
             }
         })
