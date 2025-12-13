@@ -301,6 +301,12 @@ pub enum WorkItem {
         ctx: EvaluationContext,
         result_slot: SlotId,
     },
+
+    /// Connect forwarding actors to their evaluated results.
+    /// Used for referenced function arguments.
+    ConnectForwardingActors {
+        connections: Vec<(SlotId, mpsc::UnboundedSender<Value>)>,
+    },
 }
 
 impl WorkItem {
@@ -320,6 +326,7 @@ impl WorkItem {
             WorkItem::BuildBlock { .. } => "BuildBlock",
             WorkItem::EvaluateWithPiped { .. } => "EvaluateWithPiped",
             WorkItem::CallFunction { .. } => "CallFunction",
+            WorkItem::ConnectForwardingActors { .. } => "ConnectForwardingActors",
         }
     }
 }
@@ -983,6 +990,8 @@ fn schedule_expression(
                     let mut args_to_schedule = Vec::new();
                     let mut passed_slot = None;
                     let mut passed_context: Option<SlotId> = None;
+                    // Track forwarding actors for referenced arguments
+                    let mut forwarding_connections: Vec<(SlotId, mpsc::UnboundedSender<Value>)> = Vec::new();
 
                     // Note: piped value is handled in call_function for BUILTIN functions only
                     // User-defined functions don't receive piped as positional arg
@@ -990,6 +999,8 @@ fn schedule_expression(
                     for arg in arguments {
                         let arg_slot = state.alloc_slot();
                         let arg_name = arg.node.name.to_string();
+                        let arg_span = arg.span;
+                        let is_referenced = arg.node.is_referenced;
 
                         // Handle PASS argument - sets implicit context for nested calls
                         if arg_name == "PASS" {
@@ -998,6 +1009,25 @@ fn schedule_expression(
                                 passed_context = Some(arg_slot);
                             }
                             continue; // Don't add PASS to positional arguments
+                        }
+
+                        // For referenced arguments, create a forwarding actor BEFORE scheduling
+                        // This allows subsequent arguments to reference this one
+                        if is_referenced {
+                            let (forwarding_actor, sender) = ValueActor::new_arc_forwarding(
+                                ConstructInfo::new(
+                                    format!("arg:{}", arg_name),
+                                    None,
+                                    format!("{}; (forwarding argument)", arg_span),
+                                ),
+                                ctx.actor_context.clone(),
+                                None,
+                            );
+                            // Register with ReferenceConnector immediately
+                            if let Some(ref_connector) = ctx.try_reference_connector() {
+                                ref_connector.register_referenceable(arg_span, forwarding_actor.clone());
+                            }
+                            forwarding_connections.push((arg_slot, sender));
                         }
 
                         // Handle optional argument value (can be None for PASS arguments without value)
@@ -1014,6 +1044,13 @@ fn schedule_expression(
                                 return Err(format!("PASS argument requires piped value at {:?}", span));
                             }
                         }
+                    }
+
+                    // Push ConnectForwardingActors to connect forwarding actors after args evaluated
+                    if !forwarding_connections.is_empty() {
+                        state.push(WorkItem::ConnectForwardingActors {
+                            connections: forwarding_connections,
+                        });
                     }
 
                     // Push CallFunction first (will be processed last due to LIFO)
@@ -1762,6 +1799,20 @@ fn process_work_item(
             // If function returns SKIP (None), don't store anything
             if let Some(actor) = actor_opt {
                 state.store(result_slot, actor);
+            }
+        }
+
+        WorkItem::ConnectForwardingActors { connections } => {
+            // Connect forwarding actors to their evaluated argument results
+            // For function arguments, we only forward the initial value since
+            // arguments are evaluated once and don't change during the call.
+            for (slot, sender) in connections {
+                if let Some(source_actor) = state.get(slot) {
+                    // Send initial value - this is sufficient for function arguments
+                    if let Some(initial_value) = source_actor.stored_value() {
+                        let _ = sender.unbounded_send(initial_value);
+                    }
+                }
             }
         }
     }

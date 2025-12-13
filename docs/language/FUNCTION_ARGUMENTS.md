@@ -94,3 +94,64 @@ pub struct ActorContext {
 Both can be used together: `x |> fn(PASS: context)` where:
 - `x` becomes the first parameter (via `piped`)
 - `context` is accessible via `PASSED` keyword (via `passed`)
+
+## Argument Scoping: Closest Name Resolution
+
+Function arguments create bindings that can be referenced by other arguments and nested expressions. Boon uses **closest name resolution** - inner code refers to the closest matching name in scope.
+
+### Argument Cross-References
+
+Within a function call, arguments can reference other arguments (both forward and backward), just like variables can reference other variables in the same scope:
+
+```boon
+result: Math/add(x: 10, y: x + 5)
+// x: 10 - the first x refers to outer scope (can't self-reference)
+// y: x + 5 - this x refers to the argument x (value 10)
+// Result: 25
+
+result: Math/add(x: y + 1, y: 10)
+// x: y + 1 - forward reference to argument y (value 10)
+// y: 10
+// Result: 21
+```
+
+### Name Shadowing in Nested Calls
+
+When a function argument has the same name as an outer variable, the argument shadows the outer variable within its scope:
+
+```boon
+items: LIST { TEXT { A }, TEXT { B } }  // outer variable
+
+document: Element/stripe(
+    items: LIST { TEXT { X } }  // argument shadows outer 'items'
+    nested: items |> List/count()  // refers to argument (LIST { X }), not outer
+)
+// nested will be 1, not 2
+```
+
+### Avoiding Name Conflicts
+
+To reference outer variables inside nested function calls, use distinct names:
+
+```boon
+my_data: LIST { TEXT { A }, TEXT { B } }
+
+document: Element/stripe(
+    items: my_data |> List/map(item, new: Element/label(
+        label: item
+    ))
+)
+// my_data doesn't conflict with items:, so it correctly references the outer list
+```
+
+### Scoping Rules Summary
+
+1. **Self-reference not allowed**: An argument cannot reference itself (use HOLD for that)
+2. **Cross-references**: Arguments can reference other arguments (forward or backward) in the same call
+3. **Closest name wins**: Inner references resolve to the closest matching name
+4. **Explicit outer access**: Use distinct names when you need to reference outer variables
+
+This design encourages:
+- Minimal use of global variables
+- Preference for nested objects and PASSED for context
+- Clear, local reasoning about variable references

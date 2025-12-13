@@ -3150,7 +3150,34 @@ impl ValueActor {
     ///
     /// Takes ownership of the Arc to keep the actor alive for the subscription lifetime.
     /// Callers should use `.clone().subscribe()` if they need to retain a reference.
-    pub fn subscribe(self: Arc<Self>) -> impl Stream<Item = Value> {
+    ///
+    /// This method yields control once before subscribing, allowing the actor's async
+    /// loop to start producing values. This is critical when subscribing to actors
+    /// that were just created (e.g., in list operations like map, retain, etc.) - without
+    /// the yield, the subscription would wait forever for values that haven't been produced yet.
+    pub fn subscribe(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        // Yield control once to allow the actor's loop to start
+        stream::once(async move {
+            use std::task::Poll;
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }).await;
+            self
+        })
+        .flat_map(|actor| actor.subscribe_immediate())
+        .boxed_local()
+    }
+
+    /// Subscribe without yielding first. Only use this when you KNOW the actor's loop
+    /// has already started (e.g., for internal chaining within an already-yielded stream).
+    fn subscribe_immediate(self: Arc<Self>) -> impl Stream<Item = Value> {
         if let Some(ref lazy_delegate) = self.lazy_delegate {
             lazy_delegate.clone().subscribe().left_stream()
         } else {
@@ -5505,68 +5532,23 @@ impl ListBindingFunction {
         source_list_actor: Arc<ValueActor>,
         config: Rc<ListBindingConfig>,
     ) -> Arc<ValueActor> {
-        println!("[DEBUG create_map_actor] START - creating map actor");
         let config_for_stream = config.clone();
         let construct_context_for_stream = construct_context.clone();
         let actor_context_for_stream = actor_context.clone();
 
-        println!("[DEBUG create_map_actor] About to subscribe to source_list_actor: {}", source_list_actor.construct_info);
-
-        // FIX: Wrap subscription in a stream that yields control first.
-        // This allows the source actor's async loop to run and produce its initial value
-        // before we start waiting for values. Without this yield, when List/map is used
-        // inline (not assigned to a top-level variable), the source actor's loop hasn't
-        // had a chance to run yet, causing the subscription to wait forever.
-        let source_for_stream = source_list_actor.clone();
-        let change_stream = stream::once(async move {
-            // Yield control once to allow other spawned tasks (like source actor's loop) to run
-            use std::task::Poll;
-            let mut yielded = false;
-            std::future::poll_fn(|cx| {
-                if yielded {
-                    Poll::Ready(())
-                } else {
-                    yielded = true;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            }).await;
-            println!("[DEBUG create_map_actor] After yield, returning source actor");
-            source_for_stream
-        })
-        .flat_map(|source| {
-            println!("[DEBUG create_map_actor] flat_map: subscribing to source after yield");
-            source.subscribe()
-        })
+        // subscribe() now yields automatically, ensuring source actor's loop has started
+        let change_stream = source_list_actor.clone().subscribe()
         .filter_map(move |value| {
-            println!("[DEBUG List/map] Received Value from source actor");
             future::ready(match value {
-                Value::List(list, _) => {
-                    println!("[DEBUG List/map] Extracted Arc<List> from Value::List");
-                    Some(list)
-                },
-                _ => {
-                    println!("[DEBUG List/map] Value is not a List!");
-                    None
-                },
+                Value::List(list, _) => Some(list),
+                _ => None,
             })
         }).flat_map(move |list| {
-            println!("[DEBUG List/map] flat_map: subscribing to list changes");
             let config = config_for_stream.clone();
             let construct_context = construct_context_for_stream.clone();
             let actor_context = actor_context_for_stream.clone();
 
             list.subscribe().map(move |change| {
-                println!("[DEBUG List/map] Received change from list: {:?}", match &change {
-                    ListChange::Replace { items } => format!("Replace({} items)", items.len()),
-                    ListChange::Push { .. } => "Push".to_string(),
-                    ListChange::Pop => "Pop".to_string(),
-                    ListChange::Clear => "Clear".to_string(),
-                    ListChange::InsertAt { index, .. } => format!("InsertAt({})", index),
-                    ListChange::RemoveAt { index } => format!("RemoveAt({})", index),
-                    ListChange::UpdateAt { index, .. } => format!("UpdateAt({})", index),
-                    ListChange::Move { old_index, new_index } => format!("Move({} -> {})", old_index, new_index),
-                });
                 Self::transform_list_change_for_map(
                     change,
                     &config,
@@ -5615,7 +5597,7 @@ impl ListBindingFunction {
         let actor_context_for_result = actor_context.clone();
 
         // Create a stream that:
-        // 1. Subscribes to source list changes
+        // 1. Subscribes to source list changes (subscribe() yields automatically)
         // 2. For each item, evaluates predicate and subscribes to its changes
         // 3. When list or any predicate changes, emits filtered Replace
         let value_stream = source_list_actor.clone().subscribe().filter_map(|value| {
@@ -5775,7 +5757,8 @@ impl ListBindingFunction {
         // Clone for use after the flat_map chain
         let actor_context_for_result = actor_context.clone();
 
-        let value_stream = source_list_actor.subscribe().filter_map(|value| {
+        // subscribe() yields automatically, ensuring source actor's loop has started
+        let value_stream = source_list_actor.clone().subscribe().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
                 _ => None,
@@ -5928,7 +5911,7 @@ impl ListBindingFunction {
         let actor_context_for_result = actor_context.clone();
 
         // Create a stream that:
-        // 1. Subscribes to source list changes
+        // 1. Subscribes to source list changes (subscribe() yields automatically)
         // 2. For each item, evaluates key expression and subscribes to its changes
         // 3. When list or any key changes, emits sorted Replace
         let value_stream = source_list_actor.clone().subscribe().filter_map(|value| {
