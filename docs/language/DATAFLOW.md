@@ -793,7 +793,8 @@ pub struct ValueActor {
     // Channel for registering new subscriber notification senders
     notify_sender_sender: mpsc::UnboundedSender<mpsc::Sender<()>>,
 
-    loop_task: TaskHandle,
+    // The actor's internal loop (see ../engine/ACTOR_MODEL.md)
+    actor_loop: ActorLoop,
 }
 ```
 
@@ -1387,3 +1388,4 @@ This change was made to avoid RefCell/Mutex in the runtime, as they caused debug
 - **WHEN_VS_WHILE.md** - Pattern matching differences
 - **PULSES.md** - Iteration patterns
 - **LIST.md** - List operations
+- **../engine/ACTOR_MODEL.md** - Pure actor model architecture (ActorLoop)

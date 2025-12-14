@@ -311,10 +311,35 @@ While not fully enforced on `ValueActor::new()` yet, these types serve as docume
 
 ## Engine Architecture Rules
 
-### Parallel Processing
-- **Only Actors (ValueActor) should be parallel processing units** in the Boon engine
-- API functions should return **pure streams** that get wrapped into actors by the evaluator
-- Never spawn `Task::start_droppable` outside of actor/engine infrastructure (e.g., not in api.rs stream functions)
+See also: `docs/engine/ACTOR_MODEL.md` for comprehensive documentation.
+
+### Pure Actor Model
+- **Only two constructs allowed for async processing:**
+  1. **Pure Streams** (combinators like `stream::unfold()`) - map to wires in hardware
+  2. **Actors** (types with `actor_loop: ActorLoop`) - map to FSMs in hardware
+- **`Task::start_droppable` only appears inside `ActorLoop::new()`** - never scattered through code
+- This ensures portability to HVM, hardware synthesis, and different runtimes
+
+### ActorLoop Abstraction
+All actors use the `ActorLoop` wrapper for their internal async loop:
+
+```rust
+pub struct ActorLoop {
+    handle: TaskHandle,
+}
+
+impl ActorLoop {
+    pub fn new(future: impl Future<Output = ()> + 'static) -> Self {
+        Self { handle: Task::start_droppable(future) }
+    }
+}
+```
+
+Actor types that use ActorLoop:
+- `ValueActor` - fundamental reactive unit
+- `LazyValueActor` - demand-driven evaluation
+- `List` - reactive list with diffs
+- `ConstructStorage`, `ReferenceConnector`, `LinkConnector`, `ActorOutputValveSignal` - infrastructure
 
 ### Interior Mutability
 - **No `Rc<RefCell>`** in engine code - it fails in multi-threaded environments (WebWorkers)
@@ -323,8 +348,8 @@ While not fully enforced on `ValueActor::new()` yet, these types serve as docume
 
 ### Stream Functions Pattern
 API functions that return streams should:
-1. Return `impl Stream<Item = Value>` (a pure stream)
-2. Use `stream::iter()` for synchronous initial values, `stream::unfold()` for stateful iteration
+1. Return `impl Stream<Item = Value>` (a pure stream using `stream::unfold()`)
+2. **Never spawn tasks** - use pure stream combinators instead
 3. Let the caller (evaluator) wrap the stream in a ValueActor
 4. Keep input actors alive via the stream's closure (Arc<ValueActor> is Clone), NOT via Rc
 
