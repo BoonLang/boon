@@ -39,12 +39,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f47b57fc4521e3cae26a4d45b5227f8fadee4c345be0fefd8d5d1711afb8aeb9"
 
 [[package]]
-name = "arc-swap"
-version = "1.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f7f8c3906b62b754cd5326047894316021dcfe5a194c8ea52bdd94934a3457"
-
-[[package]]
 name = "ariadne"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -76,7 +70,6 @@ checksum = "5c8214115b7bf84099f1309324e63141d4c5d7cc26862f97a0a857dbefe165bd"
 name = "boon"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "ariadne",
  "chumsky",
  "getrandom 0.3.1",

@@ -6,6 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Boon is a reactive, dataflow-oriented programming language designed for building UIs, hardware descriptions, and durable state applications. It uses actors and streams for data flow, with constructs like `LATEST`, `WHEN`, `WHILE`, `THEN` for flow control, and `LINK` for event binding. Boon source files use the `.bn` extension.
 
+## Important Rules for Claude
+
+- **NEVER revert files using `git checkout` or `git restore` without explicit user confirmation.** Even if a file appears broken, ask the user first before reverting. The user may want to investigate the issue or fix it differently.
+- When debugging issues, prefer investigating and fixing over reverting.
+
 ## Project Structure
 
 ```
@@ -374,6 +379,26 @@ Actor types that use ActorLoop:
 - **No `Rc<RefCell>`** in engine code - it fails in multi-threaded environments (WebWorkers)
 - Actor-local state should be owned by the actor's async loop
 - Use channels (mpsc) for communication between actors
+
+### Forbidden Patterns (No Shared Mutable State)
+
+The following are NOT allowed in engine code:
+
+| Pattern | Problem |
+|---------|---------|
+| `Rc<RefCell<T>>` | Not thread-safe, fails in WebWorkers |
+| `Arc<RefCell<T>>` | Same problem - RefCell panics when accessed from multiple threads |
+| `Mutex<T>` | Blocking, doesn't map to hardware/HVM, can cause async deadlocks |
+| `RwLock<T>` | Blocking, doesn't map to hardware/HVM |
+| `ArcSwap<T>` | Complex library dependency, harder to debug/port |
+
+Instead, use:
+- **Channels (mpsc)** - Actor message passing with bounded channels
+- **ActorLoop** - Independent async processing unit with owned state
+- **stream::unfold** - Demand-driven stream with owned state in closure
+- **AtomicBool/AtomicU64** - Simple atomic flags/counters only
+
+**Why this matters**: Boon's actor model must work across WebWorkers, distributed systems, and potentially compile to hardware (HVM). Shared mutable state breaks these invariants.
 
 ### Stream Functions Pattern
 API functions that return streams should:

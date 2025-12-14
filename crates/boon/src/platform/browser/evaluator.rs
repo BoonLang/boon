@@ -8,8 +8,8 @@ use chumsky::Parser as ChumskyParser;
 use chumsky::input::{Input as ChumskyInput, Stream as ChumskyStream};
 use ulid::Ulid;
 use zoon::futures_channel::oneshot;
-use zoon::futures_util::stream;
-use zoon::{Stream, StreamExt, println, eprintln, mpsc};
+use zoon::futures_util::stream::{self, LocalBoxStream};
+use zoon::{Stream, StreamExt, println, eprintln, mpsc, Task};
 
 /// Yields control to the executor, allowing other tasks to run.
 /// This is a simple implementation that returns Pending once and schedules a wake.
@@ -1413,13 +1413,13 @@ fn process_work_item(
                     // Connect forwarding from source actor to forwarding actor
                     let Some(source_actor) = state.get(vd.value_slot) else { continue; };
 
-                    // connect_forwarding sends initial value synchronously (CRITICAL for intra-object
-                    // field references like `[a: 1, b: a + 1]`), then forwards async values
-                    let initial_value = source_actor.stored_value();
+                    // connect_forwarding sends initial value asynchronously, then forwards async values
+                    // Note: We create a 'static future by cloning source_actor into the async block
+                    let source_actor_for_initial = source_actor.clone();
                     let forwarding_loop = ValueActor::connect_forwarding(
                         sender.clone(),
                         source_actor.clone(),
-                        initial_value,
+                        async move { source_actor_for_initial.stored_value().await },
                     );
                     Variable::new_arc_with_forwarding_loop(
                         ConstructInfo::new(
@@ -1511,13 +1511,13 @@ fn process_work_item(
                     // Connect forwarding from source actor to forwarding actor
                     let Some(source_actor) = state.get(vd.value_slot) else { continue; };
 
-                    // connect_forwarding sends initial value synchronously (CRITICAL for intra-object
-                    // field references like `[a: 1, b: a + 1]`), then forwards async values
-                    let initial_value = source_actor.stored_value();
+                    // connect_forwarding sends initial value asynchronously, then forwards async values
+                    // Note: We create a 'static future by cloning source_actor into the async block
+                    let source_actor_for_initial = source_actor.clone();
                     let forwarding_loop = ValueActor::connect_forwarding(
                         sender.clone(),
                         source_actor.clone(),
-                        initial_value,
+                        async move { source_actor_for_initial.stored_value().await },
                     );
                     Variable::new_arc_with_forwarding_loop(
                         ConstructInfo::new(
@@ -1649,10 +1649,15 @@ fn process_work_item(
             if let Some(object_actor) = object_actor {
                 // Create a wrapper actor that subscribes to output and holds the Object
                 // The stream::unfold keeps the Object alive in its closure, which keeps Variables alive
+                // Use deferred subscription pattern for async subscribe()
                 let value_stream = stream::unfold(
-                    (output_actor.subscribe(), object_actor),
-                    |(mut subscription, obj)| async move {
-                        subscription.next().await.map(|value| (value, (subscription, obj)))
+                    (None::<LocalBoxStream<'static, Value>>, Some(output_actor.clone()), object_actor),
+                    |(subscription_opt, actor_opt, obj)| async move {
+                        let mut subscription = match subscription_opt {
+                            Some(s) => s,
+                            None => actor_opt.unwrap().subscribe().await,
+                        };
+                        subscription.next().await.map(|value| (value, (Some(subscription), None, obj)))
                     },
                 );
                 let wrapper = Arc::new(ValueActor::new(
@@ -1767,7 +1772,7 @@ fn process_work_item(
 
                     if let Some(sender) = link_sender {
                         // Forward all values from piped actor to the LINK
-                        let mut piped_stream = prev_actor_for_task.subscribe();
+                        let mut piped_stream = prev_actor_for_task.subscribe().await;
                         while let Some(value) = piped_stream.next().await {
                             if sender.unbounded_send(value).is_err() {
                                 break;
@@ -1778,7 +1783,7 @@ fn process_work_item(
 
                 // Create a wrapper stream that keeps the forwarding loop alive
                 // The actor loop is captured in the map closure
-                let wrapper_stream = prev_actor.clone().subscribe().map(move |value| {
+                let wrapper_stream = prev_actor.clone().subscribe_stream().map(move |value| {
                     // Keep actor loop alive by referencing it (compiler will capture it)
                     let _ = &forwarding_loop;
                     value
@@ -1828,6 +1833,7 @@ fn process_work_item(
                         },
                         reference_connector: ctx.reference_connector,
                         link_connector: ctx.link_connector,
+                        function_registry_snapshot: ctx.function_registry_snapshot,
                         module_loader: ctx.module_loader,
                         source_code: ctx.source_code,
                     };
@@ -1857,10 +1863,12 @@ fn process_work_item(
             // arguments are evaluated once and don't change during the call.
             for (slot, sender) in connections {
                 if let Some(source_actor) = state.get(slot) {
-                    // Send initial value - this is sufficient for function arguments
-                    if let Some(initial_value) = source_actor.stored_value() {
-                        let _ = sender.unbounded_send(initial_value);
-                    }
+                    // Spawn task to send initial value asynchronously
+                    let _ = Task::start_droppable(async move {
+                        if let Some(initial_value) = source_actor.stored_value().await {
+                            let _ = sender.unbounded_send(initial_value);
+                        }
+                    });
                 }
             }
         }
@@ -1978,12 +1986,8 @@ fn build_then_actor(
     // Clone backpressure_permit for the closure
     let backpressure_permit_for_then = backpressure_permit.clone();
 
-    // Clone HOLD callback for synchronous state updates during eager polling
+    // Clone HOLD callback for state updates
     let hold_callback_for_then = actor_context_for_then.hold_state_update_callback.clone();
-
-    // Clone body and callback for synchronous processing before eval_body closure captures them
-    let body_for_sync = body.clone();
-    let hold_callback_for_sync = hold_callback_for_then.clone();
 
     // eval_body now returns a Stream instead of Option<Value>
     // This avoids blocking on .next().await which would hang if body returns SKIP
@@ -2043,28 +2047,26 @@ fn build_then_actor(
             // - We create a "frozen" actor for each parameter with just the current value
             // - Body subscribes to this frozen actor, gets only the current value
             // - Computation uses the correct current state
-            let frozen_parameters: HashMap<String, Arc<ValueActor>> = actor_context_clone.parameters
-                .iter()
-                .filter_map(|(name, actor)| {
-                    // Create a constant actor from the current stored value
-                    if let Some(current_value) = actor.stored_value() {
-                        let frozen_actor = ValueActor::new_arc(
-                            ConstructInfo::new(
-                                format!("frozen param: {name}"),
-                                None,
-                                format!("frozen parameter {name}"),
-                            ),
-                            actor_context_clone.clone(),
-                            constant(current_value),
+            let mut frozen_parameters: HashMap<String, Arc<ValueActor>> = HashMap::new();
+            for (name, actor) in actor_context_clone.parameters.iter() {
+                // Create a constant actor from the current stored value (async)
+                if let Some(current_value) = actor.stored_value().await {
+                    let frozen_actor = ValueActor::new_arc(
+                        ConstructInfo::new(
+                            format!("frozen param: {name}"),
                             None,
-                        );
-                        Some((name.clone(), frozen_actor))
-                    } else {
-                        // No value yet, keep original actor
-                        Some((name.clone(), actor.clone()))
-                    }
-                })
-                .collect();
+                            format!("frozen parameter {name}"),
+                        ),
+                        actor_context_clone.clone(),
+                        constant(current_value),
+                        None,
+                    );
+                    frozen_parameters.insert(name.clone(), frozen_actor);
+                } else {
+                    // No value yet, keep original actor
+                    frozen_parameters.insert(name.clone(), actor.clone());
+                }
+            }
 
             let new_actor_context = ActorContext {
                 output_valve_signal: actor_context_clone.output_valve_signal.clone(),
@@ -2142,164 +2144,27 @@ fn build_then_actor(
     };
 
     // =========================================================================
-    // SYNCHRONOUS INITIAL PROCESSING
-    // =========================================================================
-    // Process piped's historical values synchronously during construction.
-    // This is critical for HOLD + Stream/pulses patterns where:
-    // 1. Stream/pulses emits N pulses synchronously (via stream::iter())
-    // 2. Those pulses are stored in piped's ValueActor (due to eager polling)
-    // 3. THEN must process those pulses synchronously so HOLD sees all updates
-    // 4. Document/new then sees the final computed value, not initial value
-    //
-    // Without this fix, .then(eval_body) makes processing async because
-    // eval_body awaits permit.acquire(), causing Poll::Pending on first poll.
-
-    let initial_version = piped.version();
-    let (initial_piped_values, _oldest) = piped.get_values_since(0);
-
-    // Evaluate body for each initial piped value synchronously
-    let mut initial_results: Vec<Value> = Vec::new();
-    for (idx, input_value) in initial_piped_values.into_iter().enumerate() {
-
-        // Create frozen parameters for SNAPSHOT semantics
-        let frozen_parameters: HashMap<String, Arc<ValueActor>> = ctx.actor_context.parameters
-            .iter()
-            .filter_map(|(name, actor)| {
-                if let Some(current_value) = actor.stored_value() {
-                    let frozen_actor = ValueActor::new_arc(
-                        ConstructInfo::new(
-                            format!("frozen param: {name} (sync)"),
-                            None,
-                            format!("frozen parameter {name} (sync)"),
-                        ),
-                        ctx.actor_context.clone(),
-                        constant(current_value),
-                        None,
-                    );
-                    Some((name.clone(), frozen_actor))
-                } else {
-                    Some((name.clone(), actor.clone()))
-                }
-            })
-            .collect();
-
-        // Create piped value actor for body evaluation
-        let value_actor = ValueActor::new_arc(
-            ConstructInfo::new(
-                "THEN input value (sync)".to_string(),
-                None,
-                format!("{span_for_then}; THEN input (sync)"),
-            ),
-            ctx.actor_context.clone(),
-            constant(input_value),
-            None,
-        );
-
-        let sync_actor_context = ActorContext {
-            output_valve_signal: ctx.actor_context.output_valve_signal.clone(),
-            piped: Some(value_actor.clone()),
-            passed: ctx.actor_context.passed.clone(),
-            parameters: frozen_parameters,
-            sequential_processing: ctx.actor_context.sequential_processing,
-            backpressure_permit: ctx.actor_context.backpressure_permit.clone(),
-            hold_state_update_callback: None,
-            use_lazy_actors: ctx.actor_context.use_lazy_actors,
-            // THEN body needs snapshot semantics
-            is_snapshot_context: true,
-        };
-
-        let sync_ctx = EvaluationContext {
-            construct_context: ctx.construct_context.clone(),
-            actor_context: sync_actor_context,
-            reference_connector: ctx.reference_connector.clone(),
-            link_connector: ctx.link_connector.clone(),
-            function_registry_snapshot: ctx.function_registry_snapshot.clone(),
-            module_loader: ctx.module_loader.clone(),
-            source_code: ctx.source_code.clone(),
-        };
-
-        let body_expr = static_expression::Spanned {
-            span: body_for_sync.span,
-            persistence: persistence.clone(),
-            node: body_for_sync.node.clone(),
-        };
-
-        // Evaluate body synchronously
-        match evaluate_expression(body_expr, sync_ctx) {
-            Ok(Some(result_actor)) => {
-                // Due to ValueActor's eager polling, result_actor should have stored value
-                if let Some(mut result_value) = result_actor.stored_value() {
-                    result_value.set_idempotency_key(ValueIdempotencyKey::new());
-
-                    // Call HOLD's callback if present (for state updates)
-                    if let Some(ref callback) = hold_callback_for_sync {
-                        callback(result_value.clone());
-                    }
-
-                    initial_results.push(result_value);
-                } else {
-                }
-            }
-            Ok(None) => {
-            }
-            Err(e) => {
-            }
-        }
-    }
-
-
-    // =========================================================================
-    // REACTIVE SUBSCRIPTION (for future values)
+    // REACTIVE SUBSCRIPTION
     // =========================================================================
     // Use then + flatten_unordered instead of then + filter_map
     // flatten_unordered processes inner streams concurrently, so even if one stream
     // never emits (SKIP case), others can still produce values
-
-    // Clone piped for the filter closure
-    let piped_for_filter = piped.clone();
-
-    // Check if piped has lazy delegate - affects filtering logic
-    let has_lazy_delegate = piped.has_lazy_delegate();
+    //
+    // NOTE: We use async-only architecture. All values flow through the subscription
+    // stream. No synchronous initial processing - let the async runtime handle ordering.
 
     let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if backpressure_permit.is_some() || sequential {
         // For sequential mode, use regular flatten (processes one stream at a time)
-        // Skip values we already processed synchronously
-        if has_lazy_delegate {
-            // For LAZY actors: NO filter needed!
-            // LazyValueActor doesn't eagerly buffer values, so there are no "initial values"
-            // to skip. The filter `version > initial_version` would ALWAYS fail because
-            // LazyValueActor's shell ValueActor has version=0 (never updated).
-            // All values will be pulled on demand.
-            let stream = piped.clone().subscribe()
-                .then(eval_body)
-                .flatten();
-            Box::pin(stream)
-        } else {
-            let stream = piped.clone().subscribe()
-                .filter(move |_| zoon::future::ready(piped_for_filter.version() > initial_version))
-                .then(eval_body)
-                .flatten();
-            // Chain initial synchronous results with reactive subscription
-            Box::pin(stream::iter(initial_results).chain(stream))
-        }
+        let stream = piped.clone().subscribe_stream()
+            .then(eval_body)
+            .flatten();
+        Box::pin(stream)
     } else {
-        // Clone piped_for_filter for the concurrent branch
-        let piped_for_filter_concurrent = piped.clone();
         // For non-sequential mode, use flatten_unordered for concurrent processing
-        if has_lazy_delegate {
-            // For LAZY actors: NO filter needed (see comment above)
-            let stream = piped.clone().subscribe()
-                .then(eval_body)
-                .flatten_unordered(None);
-            Box::pin(stream)
-        } else {
-            let stream = piped.clone().subscribe()
-                .filter(move |_| zoon::future::ready(piped_for_filter_concurrent.version() > initial_version))
-                .then(eval_body)
-                .flatten_unordered(None);
-            // Chain initial synchronous results with reactive subscription
-            Box::pin(stream::iter(initial_results).chain(stream))
-        }
+        let stream = piped.clone().subscribe_stream()
+            .then(eval_body)
+            .flatten_unordered(None);
+        Box::pin(stream)
     };
 
     // Keep the piped actor alive by including it in inputs
@@ -2391,26 +2256,24 @@ fn build_when_actor(
                     // CRITICAL FIX: Freeze parameters for SNAPSHOT semantics (same as THEN).
                     // When WHEN body references `state` (from HOLD), we want the CURRENT value at the
                     // time of body evaluation, not all historical values from the reactive subscription.
-                    let frozen_parameters: HashMap<String, Arc<ValueActor>> = actor_context_clone.parameters
-                        .iter()
-                        .filter_map(|(name, actor)| {
-                            if let Some(current_value) = actor.stored_value() {
-                                let frozen_actor = ValueActor::new_arc(
-                                    ConstructInfo::new(
-                                        format!("frozen param: {name}"),
-                                        None,
-                                        format!("frozen parameter {name}"),
-                                    ),
-                                    actor_context_clone.clone(),
-                                    constant(current_value),
+                    let mut frozen_parameters: HashMap<String, Arc<ValueActor>> = HashMap::new();
+                    for (name, actor) in actor_context_clone.parameters.iter() {
+                        if let Some(current_value) = actor.stored_value().await {
+                            let frozen_actor = ValueActor::new_arc(
+                                ConstructInfo::new(
+                                    format!("frozen param: {name}"),
                                     None,
-                                );
-                                Some((name.clone(), frozen_actor))
-                            } else {
-                                Some((name.clone(), actor.clone()))
-                            }
-                        })
-                        .collect();
+                                    format!("frozen parameter {name}"),
+                                ),
+                                actor_context_clone.clone(),
+                                constant(current_value),
+                                None,
+                            );
+                            frozen_parameters.insert(name.clone(), frozen_actor);
+                        } else {
+                            frozen_parameters.insert(name.clone(), actor.clone());
+                        }
+                    }
 
                     // Create parameter actors for the pattern bindings
                     let mut parameters = frozen_parameters;
@@ -2497,14 +2360,14 @@ fn build_when_actor(
     // never emits (SKIP case), others can still produce values
     let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if backpressure_permit.is_some() || sequential {
         // For sequential mode, use regular flatten (processes one stream at a time)
-        let stream = piped.clone().subscribe()
+        let stream = piped.clone().subscribe_stream()
             .then(eval_body)
             .flatten();
         Box::pin(stream)
     } else {
         // For non-sequential mode, use flatten_unordered for concurrent processing
         // None = unlimited concurrency
-        let stream = piped.clone().subscribe()
+        let stream = piped.clone().subscribe_stream()
             .then(eval_body)
             .flatten_unordered(None);
         Box::pin(stream)
@@ -2547,7 +2410,7 @@ fn build_while_actor(
     let span_for_while = span;
 
     // Use then().flatten() pattern to allow async pattern matching
-    let stream = piped.clone().subscribe().then(move |value| {
+    let stream = piped.clone().subscribe_stream().then(move |value| {
         let actor_context_clone = actor_context_for_while.clone();
         let construct_context_clone = construct_context_for_while.clone();
         let reference_connector_clone = reference_connector_for_while.clone();
@@ -2629,9 +2492,9 @@ fn build_while_actor(
 
                 match evaluate_expression(body_expr, new_ctx) {
                     Ok(Some(result_actor)) => {
-                        // Use stream() for continuous streaming semantics.
+                        // Use stream_stream() for continuous streaming semantics.
                         // WHILE bodies should produce continuous streams while the pattern matches.
-                        let stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(result_actor.stream());
+                        let stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(result_actor.stream_stream());
                         stream
                     }
                     Ok(None) => {
@@ -2662,15 +2525,15 @@ fn build_while_actor(
     ))
 }
 
-/// Synchronously extract a field value from a Value following a path of field names.
+/// Asynchronously extract a field value from a Value following a path of field names.
 /// Returns None if the path cannot be fully resolved (e.g., non-object value, missing field).
-fn extract_field_path(value: &Value, path: &[String]) -> Option<Value> {
+async fn extract_field_path(value: &Value, path: &[String]) -> Option<Value> {
     let mut current = value.clone();
     for field_name in path {
         match &current {
             Value::Object(object, _) => {
                 let variable_actor = object.expect_variable(field_name).value_actor();
-                if let Some(val) = variable_actor.stored_value() {
+                if let Some(val) = variable_actor.stored_value().await {
                     current = val;
                 } else {
                     // Field actor doesn't have a stored value yet
@@ -2679,7 +2542,7 @@ fn extract_field_path(value: &Value, path: &[String]) -> Option<Value> {
             }
             Value::TaggedObject(tagged_object, _) => {
                 let variable_actor = tagged_object.expect_variable(field_name).value_actor();
-                if let Some(val) = variable_actor.stored_value() {
+                if let Some(val) = variable_actor.stored_value().await {
                     current = val;
                 } else {
                     // Field actor doesn't have a stored value yet
@@ -2714,25 +2577,9 @@ fn build_field_access_actor(
     let path_display = path.join(".");
     let path_strings = path.clone();
 
-    // CRITICAL: Emit initial value synchronously if piped has a stored value.
-    // This ensures intra-object field references work correctly because the
-    // FieldAccess result is available immediately during synchronous evaluation.
-    let initial_version = piped.version();
-    let initial_value: Option<Value> = if let Some(source_value) = piped.stored_value() {
-        // Synchronously extract the field value from the stored source
-        extract_field_path(&source_value, &path)
-    } else {
-        None
-    };
-
-    // Build the subscription stream that handles future updates (with field extraction)
-    let piped_for_filter = piped.clone();
+    // Build the subscription stream that handles all values (async-only architecture)
     let mut subscription_stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(
-        piped.clone().subscribe()
-            .filter(move |_| {
-                // Skip versions we already processed synchronously
-                zoon::future::ready(piped_for_filter.version() > initial_version)
-            })
+        piped.clone().subscribe_stream()
     );
 
     // For each field in the path, transform the subscription stream to extract that field
@@ -2743,63 +2590,77 @@ fn build_field_access_actor(
     for field_name in path_strings {
         subscription_stream = Box::pin(
             subscription_stream
-                .map(move |value| {
+                .then(move |value| {
                     let field_name = field_name.clone();
-                    // Get the field Variable and subscribe to all its values
-                    match value {
-                        Value::Object(object, _) => {
-                            let variable = object.expect_variable(&field_name);
-                            let is_link = variable.link_value_sender().is_some();
-                            let variable_actor = variable.value_actor();
+                    async move {
+                        // Get the field Variable and subscribe to all its values
+                        match value {
+                            Value::Object(object, _) => {
+                                let variable = object.expect_variable(&field_name);
+                                let is_link = variable.link_value_sender().is_some();
+                                let variable_actor = variable.value_actor();
 
-                            if is_link {
-                                // LINK field: stay subscribed to receive multiple events
-                                stream::unfold(
-                                    (variable_actor.subscribe(), object, variable),
-                                    move |(mut subscription, object, variable)| async move {
-                                        subscription.next().await.map(|value| (value, (subscription, object, variable)))
-                                    }
-                                ).boxed_local()
-                            } else {
-                                // Non-LINK field: emit once and complete
-                                stream::once(async move {
-                                    let mut subscription = variable_actor.subscribe();
-                                    let result = subscription.next().await;
-                                    let _ = (&object, &variable);
-                                    result
-                                }).filter_map(|opt| async move { opt }).boxed_local()
+                                if is_link {
+                                    // LINK field: stay subscribed to receive multiple events
+                                    // Use deferred subscription pattern for async subscribe
+                                    stream::unfold(
+                                        (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), object, variable),
+                                        move |(sub_opt, actor_opt, object, variable)| async move {
+                                            let mut subscription = match sub_opt {
+                                                Some(s) => s,
+                                                None => actor_opt.unwrap().subscribe().await,
+                                            };
+                                            subscription.next().await.map(|value| (value, (Some(subscription), None, object, variable)))
+                                        }
+                                    ).boxed_local()
+                                } else {
+                                    // Non-LINK field: emit once and complete
+                                    let subscription = variable_actor.subscribe().await;
+                                    stream::once(async move {
+                                        let mut sub = subscription;
+                                        let result = sub.next().await;
+                                        let _ = (&object, &variable);
+                                        result
+                                    }).filter_map(|opt| async move { opt }).boxed_local()
+                                }
                             }
-                        }
-                        Value::TaggedObject(tagged_object, _) => {
-                            let variable = tagged_object.expect_variable(&field_name);
-                            let is_link = variable.link_value_sender().is_some();
-                            let variable_actor = variable.value_actor();
+                            Value::TaggedObject(tagged_object, _) => {
+                                let variable = tagged_object.expect_variable(&field_name);
+                                let is_link = variable.link_value_sender().is_some();
+                                let variable_actor = variable.value_actor();
 
-                            if is_link {
-                                // LINK field: stay subscribed to receive multiple events
-                                stream::unfold(
-                                    (variable_actor.subscribe(), tagged_object, variable),
-                                    move |(mut subscription, tagged_object, variable)| async move {
-                                        subscription.next().await.map(|value| (value, (subscription, tagged_object, variable)))
-                                    }
-                                ).boxed_local()
-                            } else {
-                                // Non-LINK field: emit once and complete
-                                stream::once(async move {
-                                    let mut subscription = variable_actor.subscribe();
-                                    let result = subscription.next().await;
-                                    let _ = (&tagged_object, &variable);
-                                    result
-                                }).filter_map(|opt| async move { opt }).boxed_local()
+                                if is_link {
+                                    // LINK field: stay subscribed to receive multiple events
+                                    // Use deferred subscription pattern for async subscribe
+                                    stream::unfold(
+                                        (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), tagged_object, variable),
+                                        move |(sub_opt, actor_opt, tagged_object, variable)| async move {
+                                            let mut subscription = match sub_opt {
+                                                Some(s) => s,
+                                                None => actor_opt.unwrap().subscribe().await,
+                                            };
+                                            subscription.next().await.map(|value| (value, (Some(subscription), None, tagged_object, variable)))
+                                        }
+                                    ).boxed_local()
+                                } else {
+                                    // Non-LINK field: emit once and complete
+                                    let subscription = variable_actor.subscribe().await;
+                                    stream::once(async move {
+                                        let mut sub = subscription;
+                                        let result = sub.next().await;
+                                        let _ = (&tagged_object, &variable);
+                                        result
+                                    }).filter_map(|opt| async move { opt }).boxed_local()
+                                }
                             }
-                        }
-                        other => {
-                            // Not an object - log error and return empty stream
-                            zoon::println!(
-                                "FieldAccess: Cannot access field '{}' on non-object value: {}",
-                                field_name, other.construct_info()
-                            );
-                            stream::empty().boxed_local()
+                            other => {
+                                // Not an object - log error and return empty stream
+                                zoon::println!(
+                                    "FieldAccess: Cannot access field '{}' on non-object value: {}",
+                                    field_name, other.construct_info()
+                                );
+                                stream::empty().boxed_local()
+                            }
                         }
                     }
                 })
@@ -2807,11 +2668,6 @@ fn build_field_access_actor(
                 .flatten_unordered(Some(1))
         );
     }
-
-    // Combine: emit initial value synchronously first, then follow with subscription stream
-    let combined_stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(
-        stream::iter(initial_value.into_iter()).chain(subscription_stream)
-    );
 
     // Keep the piped actor alive by including it in inputs
     Ok(ValueActor::new_arc_with_inputs(
@@ -2821,7 +2677,7 @@ fn build_field_access_actor(
             format!("{span}; .{path_display}"),
         ),
         ctx.actor_context,
-        TypedStream::infinite(combined_stream),
+        TypedStream::infinite(subscription_stream),
         Some(persistence_id),
         vec![piped],  // Keep piped actor alive
     ))
@@ -2853,7 +2709,7 @@ fn build_hold_actor(
     // This is what the state_param references
     //
     // State stream: first value from initial_actor, then updates from state_receiver
-    let state_stream = initial_actor.clone().subscribe()
+    let state_stream = initial_actor.clone().subscribe_stream()
         .take(1)  // Get the first initial value
         .chain(state_receiver);  // Then listen for updates and resets
 
@@ -2942,7 +2798,7 @@ fn build_hold_actor(
     // Subscribe to body - handles both lazy and eager actors.
     // For lazy actors, this enables demand-driven evaluation where HOLD pulls values
     // one at a time and updates state between each pull (sequential state updates).
-    let body_subscription = body_result.clone().subscribe();
+    let body_subscription = body_result.clone().subscribe_stream();
     let state_update_stream = body_subscription.map(move |new_value| {
         // Send to state channel so body can see it on next event
         let _ = state_sender_for_update.unbounded_send(new_value.clone());
@@ -2985,22 +2841,13 @@ fn build_hold_actor(
         vec![body_result.clone(), initial_actor.clone()],
     );
 
-    // CRITICAL: Store initial value SYNCHRONOUSLY before returning.
-    // This ensures downstream subscribers (like Stream/skip) see the initial value immediately,
-    // even before the Task that drives combined_stream runs.
-    // Without this, Stream/skip's task may run before HOLD's task, seeing no values.
-    if let Some(initial_value) = initial_actor.stored_value() {
-        output.store_value_directly(initial_value);
-    }
-
     // NOTE: We do NOT copy body_result's history here anymore.
     // The state_update_stream (below) will emit those values when polled, and it calls
-    // store_value_directly() on output. Copying here would cause duplicate emissions.
+    // store_value_directly() on output. Values flow through async streams.
 
     // Reset/passthrough behavior: ALL emissions from input pass through as HOLD output.
     // First emission: state_actor gets it via take(1), so we don't send to state_receiver.
     // Subsequent emissions: send to state_receiver so body sees the reset value.
-    // NOTE: First value is already stored synchronously above, so we skip storing it here.
     //
     // IMPORTANT: Use Weak<ValueActor> instead of Arc to avoid circular reference!
     // The output actor holds (via Arc chain) the driver task, which holds combined_stream,
@@ -3009,17 +2856,18 @@ fn build_hold_actor(
     // Use AtomicBool instead of Rc<RefCell<bool>> for lock-free flag.
     let is_first_input = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let output_weak_for_initial = Arc::downgrade(&output);
-    let initial_stream = initial_actor.clone().subscribe().map(move |value| {
+    let initial_stream = initial_actor.clone().subscribe_stream().map(move |value| {
         // swap() atomically reads AND sets to false in one operation
         let is_first = is_first_input.swap(false, std::sync::atomic::Ordering::SeqCst);
         if is_first {
-            // First value: don't send to state_receiver
-            // (take(1) in state_stream already handles state_actor for first value)
-            // NOTE: Don't store to output here - it was already stored synchronously above.
+            // First value: state_actor gets it via take(1) and store to output
+            if let Some(output) = output_weak_for_initial.upgrade() {
+                output.store_value_directly(value.clone());
+            }
         } else {
             // Subsequent values (reset): send to state_receiver
             let _ = state_sender_for_reset.unbounded_send(value.clone());
-            // Store value directly to output - only for reset values, not initial
+            // Store value directly to output
             // Use weak reference to avoid circular reference
             if let Some(output) = output_weak_for_initial.upgrade() {
                 output.store_value_directly(value.clone());
@@ -3100,20 +2948,7 @@ fn build_text_literal_actor(
                 println!("[DEBUG TextInterpolation] Looking up var='{}', referenced_span={:?}", var_name, referenced_span);
                 println!("[DEBUG TextInterpolation] Parameters has keys: {:?}", ctx.actor_context.parameters.keys().collect::<Vec<_>>());
                 if let Some(var_actor) = ctx.actor_context.parameters.get(&var_name) {
-                    if let Some(stored) = var_actor.stored_value() {
-                        let value_desc = match &stored {
-                            Value::Text(t, _) => format!("Text('{}')", t.text()),
-                            Value::Number(n, _) => format!("Number({})", n.number()),
-                            Value::Tag(_, _) => "Tag".to_string(),
-                            Value::Object(_, _) => "Object".to_string(),
-                            Value::TaggedObject(_, _) => "TaggedObject".to_string(),
-                            Value::List(_, _) => "List".to_string(),
-                            Value::Flushed(_, _) => "Flushed".to_string(),
-                        };
-                        println!("[DEBUG TextInterpolation] Found '{}' in parameters with value: {}", var_name, value_desc);
-                    } else {
-                        println!("[DEBUG TextInterpolation] Found '{}' in parameters but no stored value", var_name);
-                    }
+                    println!("[DEBUG TextInterpolation] Found '{}' in parameters", var_name);
                     part_actors.push((false, var_actor.clone()));
                 } else if let Some(ref_span) = referenced_span {
                     println!("[DEBUG TextInterpolation] '{}' NOT in parameters, using reference_connector for span {:?}", var_name, ref_span);
@@ -3139,7 +2974,7 @@ fn build_text_literal_actor(
                     // Create actor loop to resolve reference and forward values
                     let actor_loop = ActorLoop::new(async move {
                         let actor = ref_connector.referenceable(ref_span_copy).await;
-                        let mut subscription = actor.subscribe();
+                        let mut subscription = actor.subscribe().await;
                         while let Some(value) = subscription.next().await {
                             if sender.unbounded_send(value).is_err() {
                                 // Receiver dropped, stop forwarding
@@ -3182,7 +3017,7 @@ fn build_text_literal_actor(
         // Each time any part emits, we need to recombine
         let part_subscriptions: Vec<_> = part_actors
             .iter()
-            .map(|(_, actor)| actor.clone().subscribe())
+            .map(|(_, actor)| actor.clone().subscribe_stream())
             .collect();
 
         // For simplicity, use select_all and latest values approach
@@ -3278,7 +3113,7 @@ fn build_link_setter_actor(
     )?;
 
     // Create a stream that forwards the alias values through a link setter
-    let stream = alias_actor.subscribe().map(move |value| {
+    let stream = alias_actor.subscribe_stream().map(move |value| {
         // Forward the value through the link connector
         value
     });
@@ -3308,7 +3143,7 @@ async fn get_link_sender_from_alias(
             let passed = ctx.actor_context.passed.as_ref()?;
 
             // Subscribe to get the first value from PASSED
-            let mut current_value = passed.clone().subscribe().next().await?;
+            let mut current_value = passed.clone().subscribe().await.next().await?;
 
             // Traverse the path
             for (i, part) in extra_parts.iter().enumerate() {
@@ -3335,7 +3170,7 @@ async fn get_link_sender_from_alias(
                     return sender;
                 } else {
                     // Not at the end yet, subscribe to get the next value
-                    current_value = variable.clone().subscribe().next().await?;
+                    current_value = variable.clone().subscribe().await.next().await?;
                 }
             }
 
@@ -3369,7 +3204,7 @@ async fn get_link_sender_from_alias(
             }
 
             // Get the first value
-            let mut current_value = root_actor.subscribe().next().await?;
+            let mut current_value = root_actor.subscribe().await.next().await?;
 
             // Traverse the remaining path (skip first part since we already resolved it)
             for (i, part) in parts.iter().skip(1).enumerate() {
@@ -3396,7 +3231,7 @@ async fn get_link_sender_from_alias(
                     return sender;
                 } else {
                     // Not at the end yet, subscribe to get the next value
-                    current_value = variable.clone().subscribe().next().await?;
+                    current_value = variable.clone().subscribe().await.next().await?;
                 }
             }
 
@@ -3555,7 +3390,7 @@ fn call_function(
             // 1. Subscribes to the piped input
             // 2. For each value from piped, evaluates the function body with that value
             // 3. If piped never produces values (SKIP), this stream also never produces values
-            let result_stream = piped_for_closure.subscribe().flat_map(move |piped_value| {
+            let result_stream = piped_for_closure.subscribe_stream().flat_map(move |piped_value| {
                 // Create a constant actor for this specific piped value
                 let value_actor = ValueActor::new_arc(
                     ConstructInfo::new(
@@ -3786,7 +3621,7 @@ async fn match_pattern(
                         // Find the variable in the tagged object by name
                         if let Some(variable) = to.variables().iter().find(|v| v.name() == var_name) {
                             // Await the current value from the reactive actor
-                            if let Some(field_value) = variable.value_actor().subscribe().next().await {
+                            if let Some(field_value) = variable.value_actor().subscribe().await.next().await {
                                 // Handle nested patterns if present
                                 if let Some(ref nested_pattern) = pattern_var.value {
                                     // Recursively match nested pattern
@@ -3827,7 +3662,7 @@ async fn match_pattern(
                     // Find the variable in the object by name
                     if let Some(variable) = variables.iter().find(|v| v.name() == var_name) {
                         // Await the current value from the reactive actor
-                        if let Some(field_value) = variable.value_actor().subscribe().next().await {
+                        if let Some(field_value) = variable.value_actor().subscribe().await.next().await {
                             // Handle nested patterns if present
                             if let Some(ref nested_pattern) = pattern_var.value {
                                 // Recursively match nested pattern

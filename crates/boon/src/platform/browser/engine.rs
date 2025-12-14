@@ -761,6 +761,38 @@ impl Default for MigrationState {
     }
 }
 
+// --- Subscription Registration (Push-Based Model) ---
+
+/// Request for subscribing to a ValueActor.
+/// The actor loop will send back a Receiver<Value> through the oneshot channel.
+pub struct SubscriptionRequest {
+    /// Channel to receive the value receiver back
+    pub reply: oneshot::Sender<mpsc::Receiver<Value>>,
+    /// Starting version - 0 means all history
+    pub starting_version: u64,
+}
+
+/// A simple push-based subscription that just wraps a receiver.
+/// Values are pushed by the actor loop, no polling of shared state needed.
+pub struct PushSubscription {
+    receiver: mpsc::Receiver<Value>,
+    /// Keeps the actor alive for the subscription lifetime
+    _actor: Arc<ValueActor>,
+}
+
+impl Stream for PushSubscription {
+    type Item = Value;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.receiver).poll_next(cx)
+    }
+}
+
+/// Request for getting the current stored value from a ValueActor.
+pub struct StoredValueQuery {
+    pub reply: oneshot::Sender<Option<Value>>,
+}
+
 // --- VirtualFilesystem ---
 
 /// Request types for VirtualFilesystem actor
@@ -1374,7 +1406,7 @@ impl Variable {
         })
     }
 
-    /// Subscribe to this variable's value stream.
+    /// Subscribe to this variable's value stream (async).
     ///
     /// This method keeps the Variable alive for the lifetime of the returned stream.
     /// This is important because:
@@ -1383,8 +1415,8 @@ impl Variable {
     ///
     /// Takes ownership of the Arc to keep the Variable alive for the subscription lifetime.
     /// Callers should use `.clone().subscribe()` if they need to retain a reference.
-    pub fn subscribe(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        let subscription = self.value_actor.clone().subscribe();
+    pub async fn subscribe(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        let subscription = self.value_actor.clone().subscribe().await;
         // Subscription keeps the actor alive; we also need to keep the Variable alive
         stream::unfold(
             (subscription, self),
@@ -1392,6 +1424,13 @@ impl Variable {
                 subscription.next().await.map(|value| (value, (subscription, variable)))
             }
         ).boxed_local()
+    }
+
+    /// Subscribe stream with synchronous wrapper (for use in sync contexts).
+    ///
+    /// See `ValueActor::subscribe_stream()` for details.
+    pub fn subscribe_stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        stream::once(async move { self.subscribe().await }).flatten().boxed_local()
     }
 
     pub fn value_actor(&self) -> Arc<ValueActor> {
@@ -1466,7 +1505,7 @@ impl VariableOrArgumentReference {
                         .boxed_local()
                 } else {
                     // Streaming: continuous updates
-                    actor.stream()
+                    actor.stream_stream()
                 }
             })
             .boxed_local();
@@ -1503,13 +1542,16 @@ impl VariableOrArgumentReference {
                             .filter_map(|v| async { v })
                             .boxed_local()
                         } else {
-                            // Streaming: continuous updates
-                            let subscription = variable_actor.stream();
+                            // Streaming: continuous updates - use stream_stream() and keep alive
                             stream::unfold(
-                                (subscription, object, variable),
-                                move |(mut subscription, object, variable)| async move {
+                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), object, variable),
+                                move |(subscription_opt, actor_opt, object, variable)| async move {
+                                    let mut subscription = match subscription_opt {
+                                        Some(s) => s,
+                                        None => actor_opt.unwrap().stream().await,
+                                    };
                                     let value = subscription.next().await;
-                                    value.map(|value| (value, (subscription, object, variable)))
+                                    value.map(|value| (value, (Some(subscription), None, object, variable)))
                                 }
                             ).boxed_local()
                         }
@@ -1529,13 +1571,16 @@ impl VariableOrArgumentReference {
                             .filter_map(|v| async { v })
                             .boxed_local()
                         } else {
-                            // Streaming: continuous updates
-                            let subscription = variable_actor.stream();
+                            // Streaming: continuous updates - use stream_stream() and keep alive
                             stream::unfold(
-                                (subscription, tagged_object, variable),
-                                move |(mut subscription, tagged_object, variable)| async move {
+                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), tagged_object, variable),
+                                move |(subscription_opt, actor_opt, tagged_object, variable)| async move {
+                                    let mut subscription = match subscription_opt {
+                                        Some(s) => s,
+                                        None => actor_opt.unwrap().stream().await,
+                                    };
                                     let value = subscription.next().await;
-                                    value.map(|value| (value, (subscription, tagged_object, variable)))
+                                    value.map(|value| (value, (Some(subscription), None, tagged_object, variable)))
                                 }
                             ).boxed_local()
                         }
@@ -1669,7 +1714,7 @@ impl ReferenceConnector {
             .expect("Failed to get referenceable from ReferenceConnector");
 
         // DEBUG: Log the actor's stored value
-        if let Some(stored) = actor.stored_value() {
+        if let Some(stored) = actor.stored_value().await {
             let value_desc = match &stored {
                 Value::Text(t, _) => format!("Text('{}')", t.text()),
                 Value::Number(n, _) => format!("Number({})", n.number()),
@@ -1859,7 +1904,7 @@ impl FunctionCall {
             // Subscribe to all arguments and filter for FLUSHED values only
             let flushed_streams: Vec<_> = arguments_for_flushed
                 .iter()
-                .map(|arg| arg.clone().subscribe().filter(|v| {
+                .map(|arg| arg.clone().subscribe_stream().filter(|v| {
                     let is_flushed = v.is_flushed();
                     std::future::ready(is_flushed)
                 }))
@@ -1931,8 +1976,8 @@ impl LatestCombinator {
 
         let value_stream =
             stream::select_all(inputs.iter().enumerate().map(|(index, value_actor)| {
-                // Use subscribe() to properly handle lazy actors in HOLD body context
-                value_actor.clone().subscribe().map(move |value| (index, value))
+                // Use subscribe_stream() to properly handle lazy actors in HOLD body context
+                value_actor.clone().subscribe_stream().map(move |value| (index, value))
             }))
             .scan(true, {
                 let storage = storage.clone();
@@ -2021,8 +2066,8 @@ impl ThenCombinator {
         let observed_for_subscribe = observed.clone();
         let send_impulse_loop = ActorLoop::new(
             observed_for_subscribe
-                // Use subscribe() to properly handle lazy actors in HOLD body context
-                .subscribe()
+                // Use subscribe_stream() to properly handle lazy actors in HOLD body context
+                .subscribe_stream()
                 .scan(true, {
                     let storage = storage.clone();
                     move |first_run, value| {
@@ -2074,8 +2119,8 @@ impl ThenCombinator {
                     }
                 }),
         );
-        // Use subscribe() to properly handle lazy body actors in HOLD context
-        let value_stream = body.clone().subscribe().map(|mut value| {
+        // Use subscribe_stream() to properly handle lazy body actors in HOLD context
+        let value_stream = body.clone().subscribe_stream().map(|mut value| {
             value.set_idempotency_key(ValueIdempotencyKey::new());
             value
         });
@@ -2121,10 +2166,10 @@ impl BinaryOperatorCombinator {
         let construct_info = construct_info.complete(ConstructType::ValueActor);
 
         // Merge both operand streams, tracking which operand changed
-        // Use subscribe() to properly handle lazy actors in HOLD body context
+        // Use subscribe_stream() to properly handle lazy actors in HOLD body context
         let value_stream = stream::select_all([
-            operand_a.clone().subscribe().map(|v| (0usize, v)).boxed_local(),
-            operand_b.clone().subscribe().map(|v| (1usize, v)).boxed_local(),
+            operand_a.clone().subscribe_stream().map(|v| (0usize, v)).boxed_local(),
+            operand_b.clone().subscribe_stream().map(|v| (1usize, v)).boxed_local(),
         ])
         .scan(
             (None::<Value>, None::<Value>),
@@ -2492,10 +2537,10 @@ impl WhenCombinator {
         let arms = Arc::new(arms);
 
         // For each input value, find the matching arm and emit its body's value
-        // Use subscribe() to properly handle lazy actors in HOLD body context
+        // Use subscribe_stream() to properly handle lazy actors in HOLD body context
         let value_stream = input
             .clone()
-            .subscribe()
+            .subscribe_stream()
             .flat_map({
                 let arms = arms.clone();
                 move |input_value| {
@@ -2506,7 +2551,7 @@ impl WhenCombinator {
 
                     if let Some(arm) = matched_arm {
                         // Subscribe to the matching arm's body
-                        arm.body.clone().subscribe().boxed_local()
+                        arm.body.clone().subscribe_stream()
                     } else {
                         // No match - this shouldn't happen if we have a wildcard default
                         // Return an empty stream
@@ -2667,42 +2712,35 @@ pub struct ValueActor {
     construct_info: Arc<ConstructInfoComplete>,
     persistence_id: Option<parser::PersistenceId>,
 
-    /// Message channel for actor communication.
-    /// All subscription management happens via messages.
+    /// Message channel for actor communication (migration, shutdown).
     message_sender: mpsc::UnboundedSender<ActorMessage>,
 
     /// Explicit dependency tracking - keeps input actors alive.
-    /// This replaces the old `extra_owned_data` pattern.
     inputs: Vec<Arc<ValueActor>>,
 
     /// Current version number - increments on each value change.
-    /// Used by Subscription for push-pull architecture.
     current_version: Arc<AtomicU64>,
 
-    /// History of recent values for preventing message loss.
-    /// Subscribers can pull all values since their last_seen_version.
-    value_history: Arc<std::sync::Mutex<ValueHistory>>,
+    /// Channel for subscription requests.
+    /// Subscribers send SubscriptionRequest, receive back a Receiver<Value>.
+    subscription_sender: mpsc::UnboundedSender<SubscriptionRequest>,
 
-    /// Channel for registering new subscribers.
-    /// Subscribers send their bounded sender here, actor loop stores them locally.
-    /// Using bounded(1) channels prevents unbounded memory growth for slow consumers.
-    notify_sender_sender: mpsc::UnboundedSender<mpsc::Sender<()>>,
+    /// Channel for direct value storage.
+    /// Used by HOLD to store values without going through the input stream.
+    direct_store_sender: mpsc::UnboundedSender<Value>,
 
-    /// Shared notify senders for use by store_value_directly.
-    /// This allows synchronous notification when values are stored directly.
-    notify_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<()>>>>,
+    /// Channel for stored value queries.
+    /// Used by stored_value() and snapshot() to get current value.
+    stored_value_query_sender: mpsc::UnboundedSender<StoredValueQuery>,
 
     /// The actor's internal loop.
     actor_loop: ActorLoop,
 
     /// Optional lazy delegate for demand-driven evaluation.
     /// When Some, subscribe() delegates to this lazy actor instead of the normal subscription.
-    /// Used in HOLD body context where lazy evaluation is needed for sequential state updates.
     lazy_delegate: Option<Arc<LazyValueActor>>,
 
     /// Extra ActorLoops that should be kept alive with this actor.
-    /// Used by HOLD to keep the driver loop alive - when the ValueActor is dropped,
-    /// the extra loops are dropped too, cancelling their async tasks.
     extra_loops: Vec<ActorLoop>,
 }
 
@@ -2747,35 +2785,35 @@ impl ValueActor {
         let construct_info = Arc::new(construct_info);
         let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
         let current_version = Arc::new(AtomicU64::new(0));
-        // History of recent values for preventing message loss
-        let value_history = Arc::new(std::sync::Mutex::new(ValueHistory::new(64)));
-        // Channel for subscribers to register their notification senders
-        let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
-        // Shared notify senders - used by both main loop and store_value_directly
-        let notify_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<()>>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        // EAGER SYNCHRONOUS POLLING: TEMPORARILY DISABLED
-        // The noop waker causes issues with futures that await channel responses.
-        // When such a future returns Pending with noop waker stored, the waker never
-        // gets called when the response arrives, leaving the stream stuck.
-        // TODO: Either use a proper waker, or detect which streams are safe to sync-poll.
+        // Unbounded channel for subscription requests
+        let (subscription_sender, subscription_receiver) = mpsc::unbounded::<SubscriptionRequest>();
+
+        // Unbounded channel for direct value storage
+        let (direct_store_sender, direct_store_receiver) = mpsc::unbounded::<Value>();
+
+        // Unbounded channel for stored value queries
+        let (stored_value_query_sender, stored_value_query_receiver) = mpsc::unbounded::<StoredValueQuery>();
+
         let boxed_stream: std::pin::Pin<Box<dyn Stream<Item = Value>>> =
             Box::pin(value_stream.inner);
-        let stream_ended_sync = false;
-        let stream_ever_produced_sync = false;
 
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
             let current_version = current_version.clone();
-            let value_history = value_history.clone();
-            let notify_senders = notify_senders.clone();
             let output_valve_signal = actor_context.output_valve_signal;
             // Keep inputs alive in the spawned task
             let _inputs = inputs.clone();
 
             async move {
                 println!("[DEBUG ValueActor async loop] Started for {}", construct_info);
+
+                // Actor-local state (no Mutex needed!)
+                let mut value_history = ValueHistory::new(64);
+                let mut subscribers: Vec<mpsc::Sender<Value>> = Vec::new();
+                let mut stream_ever_produced = false;
+                let mut stream_ended = false;
+
                 let mut output_valve_impulse_stream =
                     if let Some(output_valve_signal) = &output_valve_signal {
                         output_valve_signal.subscribe().left_stream()
@@ -2783,17 +2821,13 @@ impl ValueActor {
                         stream::pending().right_stream()
                     }
                     .fuse();
-                // Use the boxed stream that was already polled synchronously
+
                 let mut value_stream = boxed_stream.fuse();
                 let mut message_receiver = pin!(message_receiver.fuse());
-                let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
+                let mut subscription_receiver = pin!(subscription_receiver.fuse());
+                let mut direct_store_receiver = pin!(direct_store_receiver.fuse());
+                let mut stored_value_query_receiver = pin!(stored_value_query_receiver.fuse());
                 let mut migration_state = MigrationState::Normal;
-                // Track if stream ever produced a value (for SKIP detection)
-                // Initialize from sync polling phase
-                let mut stream_ever_produced = stream_ever_produced_sync;
-                // Track if stream has ended
-                // Initialize from sync polling phase
-                let mut stream_ended = stream_ended_sync;
 
                 let mut loop_iteration = 0u64;
                 loop {
@@ -2802,24 +2836,57 @@ impl ValueActor {
                         println!("[DEBUG ValueActor async loop] Iteration {} for {}", loop_iteration, construct_info);
                     }
                     select! {
-                        // Handle new subscriber registrations
-                        sender = notify_sender_receiver.next() => {
-                            if let Some(mut sender) = sender {
+                        // Handle new subscription requests
+                        req = subscription_receiver.next() => {
+                            if let Some(SubscriptionRequest { reply, starting_version }) = req {
                                 // If stream ended without producing any value (SKIP case),
-                                // don't register subscriber - just drop sender to signal completion
+                                // don't register subscriber - send empty receiver to signal completion
                                 if stream_ended && !stream_ever_produced {
-                                    // Drop sender - subscriber will see channel closed
-                                    drop(sender);
+                                    let (tx, rx) = mpsc::channel(1);
+                                    drop(tx); // Close immediately
+                                    let _ = reply.send(rx);
                                 } else {
-                                    // Immediately notify - subscriber will check version and see current value if any
-                                    let _ = sender.try_send(());
-                                    notify_senders.lock().unwrap().push(sender);
+                                    // Create channel for this subscriber (capacity 32 for buffering)
+                                    let (mut tx, rx) = mpsc::channel(32);
+
+                                    // Send historical values from starting_version
+                                    for value in value_history.get_values_since(starting_version).0 {
+                                        // Best effort - if channel full, subscriber is too slow
+                                        let _ = tx.try_send(value.clone());
+                                    }
+
+                                    // Add to live subscribers list
+                                    subscribers.push(tx);
+
+                                    // Reply with the receiver
+                                    let _ = reply.send(rx);
                                 }
                             }
                         }
 
+                        // Handle direct value storage (from store_value_directly)
+                        value = direct_store_receiver.next() => {
+                            if let Some(value) = value {
+                                stream_ever_produced = true;
+                                let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+                                value_history.add(new_version, value.clone());
+
+                                // Push value to all subscribers
+                                subscribers.retain_mut(|tx| {
+                                    tx.try_send(value.clone()).is_ok()
+                                });
+                            }
+                        }
+
+                        // Handle stored value queries
+                        query = stored_value_query_receiver.next() => {
+                            if let Some(StoredValueQuery { reply }) = query {
+                                let current_value = value_history.get_latest();
+                                let _ = reply.send(current_value);
+                            }
+                        }
+
                         // Handle messages from the message channel
-                        // When message_sender is dropped (ValueActor dropped), this returns None
                         msg = message_receiver.next() => {
                             let Some(msg) = msg else {
                                 // Channel closed - ValueActor was dropped, exit the loop
@@ -2827,24 +2894,17 @@ impl ValueActor {
                             };
                             match msg {
                                 ActorMessage::StreamValue(value) => {
-                                    // Value received from migration source - treat as new value
-                                    // Increment version and store in history
+                                    // Value received from migration source
+                                    stream_ever_produced = true;
                                     let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                                    if let Ok(mut history) = value_history.lock() {
-                                        history.add(new_version, value);
-                                    }
-                                    // Notify subscribers via bounded channels (try_send - if full, skip)
-                                    notify_senders.lock().unwrap().retain_mut(|sender| {
-                                        // try_send returns Err if receiver dropped or buffer full
-                                        // If dropped, remove from list. If full, keep (subscriber has pending notification)
-                                        match sender.try_send(()) {
-                                            Ok(()) => true,
-                                            Err(e) => !e.is_disconnected(),
-                                        }
+                                    value_history.add(new_version, value.clone());
+
+                                    // Push value to all subscribers
+                                    subscribers.retain_mut(|tx| {
+                                        tx.try_send(value.clone()).is_ok()
                                     });
                                 }
                                 ActorMessage::MigrateTo { target, transform } => {
-                                    // Phase 3: Migration - not implemented yet
                                     migration_state = MigrationState::Migrating {
                                         target,
                                         transform,
@@ -2853,24 +2913,19 @@ impl ValueActor {
                                     };
                                 }
                                 ActorMessage::MigrationBatch { batch_id, items, is_final: _ } => {
-                                    // Phase 3: Receiving migration data
                                     if let MigrationState::Receiving { received_batches, source: _ } = &mut migration_state {
                                         received_batches.insert(batch_id, items);
-                                        // TODO: Send BatchAck, rebuild state when complete
                                     }
                                 }
                                 ActorMessage::BatchAck { batch_id } => {
-                                    // Phase 3: Batch acknowledged
                                     if let MigrationState::Migrating { pending_batches, .. } = &mut migration_state {
                                         pending_batches.remove(&batch_id);
                                     }
                                 }
                                 ActorMessage::MigrationComplete => {
-                                    // Phase 3: Migration complete
                                     migration_state = MigrationState::Normal;
                                 }
                                 ActorMessage::RedirectSubscribers { target: _ } => {
-                                    // Phase 3: Redirect - subscribers will pick up data via version checks
                                     migration_state = MigrationState::ShuttingDown;
                                 }
                                 ActorMessage::Shutdown => {
@@ -2882,35 +2937,23 @@ impl ValueActor {
                         // Handle values from the input stream
                         new_value = value_stream.next() => {
                             println!("[DEBUG ValueActor loop] Got value from stream for {}", construct_info);
-                            // Stream ended - but we DON'T break!
-                            // Actors stay alive until explicit Shutdown.
-                            // This prevents "receiver is gone" errors.
                             let Some(new_value) = new_value else {
-                                // Stream ended
+                                // Stream ended - but we DON'T break!
                                 stream_ended = true;
-                                // If stream ended without ever producing a value (SKIP case),
-                                // close all notify channels so subscribers see completion
                                 if !stream_ever_produced {
-                                    // Clear senders - this drops them, closing channels
-                                    // Subscribers will receive Poll::Ready(None)
-                                    notify_senders.lock().unwrap().clear();
+                                    // Clear subscribers - they'll see channel closed
+                                    subscribers.clear();
                                 }
-                                // Continue listening for messages
                                 continue;
                             };
 
                             stream_ever_produced = true;
-                            // Increment version and store in history
                             let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                            if let Ok(mut history) = value_history.lock() {
-                                history.add(new_version, new_value.clone());
-                            }
-                            // Notify subscribers via bounded channels
-                            notify_senders.lock().unwrap().retain_mut(|sender| {
-                                match sender.try_send(()) {
-                                    Ok(()) => true,
-                                    Err(e) => !e.is_disconnected(),
-                                }
+                            value_history.add(new_version, new_value.clone());
+
+                            // Push value to all subscribers
+                            subscribers.retain_mut(|tx| {
+                                tx.try_send(new_value.clone()).is_ok()
                             });
 
                             // Handle migration forwarding
@@ -2920,18 +2963,16 @@ impl ValueActor {
                             }
                         }
 
-                        // Handle output valve impulses (for output gating)
+                        // Handle output valve impulses
                         impulse = output_valve_impulse_stream.next() => {
                             if impulse.is_none() {
-                                // Valve closed - but we DON'T break!
                                 continue;
                             }
-                            // Subscribers pull on demand - no explicit broadcast needed
                         }
                     }
                 }
 
-                // Explicit cleanup - inputs dropped when task ends
+                // Explicit cleanup
                 drop(_inputs);
 
                 if LOG_DROPS_AND_LOOP_ENDS {
@@ -2946,9 +2987,9 @@ impl ValueActor {
             message_sender,
             inputs,
             current_version,
-            value_history,
-            notify_sender_sender,
-            notify_senders,
+            subscription_sender,
+            direct_store_sender,
+            stored_value_query_sender,
             actor_loop,
             lazy_delegate: None,
             extra_loops: Vec::new(),
@@ -3011,14 +3052,15 @@ impl ValueActor {
             inputs.clone(),
         ));
 
-        // Create a shell ValueActor with a constant empty stream (it won't be used)
-        // The lazy_delegate will handle all subscriptions
+        // Create a shell ValueActor - the lazy_delegate handles all subscriptions
         let construct_info = Arc::new(construct_info);
         let (message_sender, _message_receiver) = mpsc::unbounded::<ActorMessage>();
         let current_version = Arc::new(AtomicU64::new(0));
-        let (notify_sender_sender, _notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
-        let value_history = Arc::new(std::sync::Mutex::new(ValueHistory::new(64)));
-        let notify_senders = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Dummy channels (won't be used since lazy_delegate handles subscriptions)
+        let (subscription_sender, _subscription_receiver) = mpsc::unbounded::<SubscriptionRequest>();
+        let (direct_store_sender, _direct_store_receiver) = mpsc::unbounded::<Value>();
+        let (stored_value_query_sender, _stored_value_query_receiver) = mpsc::unbounded::<StoredValueQuery>();
 
         // Create a no-op task (the lazy delegate owns the real processing)
         let actor_loop = ActorLoop::new(async {});
@@ -3029,9 +3071,9 @@ impl ValueActor {
             message_sender,
             inputs,
             current_version,
-            value_history,
-            notify_sender_sender,
-            notify_senders,
+            subscription_sender,
+            direct_store_sender,
+            stored_value_query_sender,
             actor_loop,
             lazy_delegate: Some(lazy_actor),
             extra_loops: Vec::new(),
@@ -3058,27 +3100,29 @@ impl ValueActor {
         let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
         // Start at version 1 since we have an initial value
         let current_version = Arc::new(AtomicU64::new(1));
-        let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
-        // History of recent values for preventing message loss (start with initial value at version 1)
-        let value_history = Arc::new(std::sync::Mutex::new({
-            let mut history = ValueHistory::new(64);
-            history.add(1, initial_value);
-            history
-        }));
-        // Shared notify senders - used by both main loop and store_value_directly
-        let notify_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<()>>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Unbounded channels for subscription, direct store, and stored value queries
+        let (subscription_sender, subscription_receiver) = mpsc::unbounded::<SubscriptionRequest>();
+        let (direct_store_sender, direct_store_receiver) = mpsc::unbounded::<Value>();
+        let (stored_value_query_sender, stored_value_query_receiver) = mpsc::unbounded::<StoredValueQuery>();
 
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
             let current_version = current_version.clone();
-            let value_history = value_history.clone();
-            let notify_senders = notify_senders.clone();
             let output_valve_signal = actor_context.output_valve_signal;
-            // Keep inputs alive in the spawned task
             let _inputs = inputs.clone();
 
             async move {
+                // Actor-local state with initial value
+                let mut value_history = {
+                    let mut history = ValueHistory::new(64);
+                    history.add(1, initial_value);
+                    history
+                };
+                let mut subscribers: Vec<mpsc::Sender<Value>> = Vec::new();
+                let mut stream_ever_produced = true; // We have initial value
+                let mut stream_ended = false;
+
                 let mut output_valve_impulse_stream =
                     if let Some(output_valve_signal) = &output_valve_signal {
                         output_valve_signal.subscribe().left_stream()
@@ -3088,43 +3132,56 @@ impl ValueActor {
                     .fuse();
                 let mut value_stream = pin!(value_stream.fuse());
                 let mut message_receiver = pin!(message_receiver.fuse());
-                let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
+                let mut subscription_receiver = pin!(subscription_receiver.fuse());
+                let mut direct_store_receiver = pin!(direct_store_receiver.fuse());
+                let mut stored_value_query_receiver = pin!(stored_value_query_receiver.fuse());
                 let migration_state = MigrationState::Normal;
-                let mut stream_ever_produced = true; // We have initial value
-                let mut stream_ended = false;
 
                 loop {
                     select! {
-                        sender = notify_sender_receiver.next() => {
-                            if let Some(mut sender) = sender {
+                        req = subscription_receiver.next() => {
+                            if let Some(SubscriptionRequest { reply, starting_version }) = req {
                                 if stream_ended && !stream_ever_produced {
-                                    drop(sender);
+                                    let (tx, rx) = mpsc::channel(1);
+                                    drop(tx);
+                                    let _ = reply.send(rx);
                                 } else {
-                                    let _ = sender.try_send(());
-                                    notify_senders.lock().unwrap().push(sender);
+                                    let (mut tx, rx) = mpsc::channel(32);
+                                    for value in value_history.get_values_since(starting_version).0 {
+                                        let _ = tx.try_send(value.clone());
+                                    }
+                                    subscribers.push(tx);
+                                    let _ = reply.send(rx);
                                 }
                             }
                         }
 
+                        value = direct_store_receiver.next() => {
+                            if let Some(value) = value {
+                                stream_ever_produced = true;
+                                let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+                                value_history.add(new_version, value.clone());
+                                subscribers.retain_mut(|tx| tx.try_send(value.clone()).is_ok());
+                            }
+                        }
+
+                        query = stored_value_query_receiver.next() => {
+                            if let Some(StoredValueQuery { reply }) = query {
+                                let current_value = value_history.get_latest();
+                                let _ = reply.send(current_value);
+                            }
+                        }
+
                         msg = message_receiver.next() => {
-                            let Some(msg) = msg else {
-                                break;
-                            };
+                            let Some(msg) = msg else { break; };
                             match msg {
                                 ActorMessage::StreamValue(value) => {
-                                    // Increment version and store in history
+                                    stream_ever_produced = true;
                                     let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                                    if let Ok(mut history) = value_history.lock() {
-                                        history.add(new_version, value);
-                                    }
-                                    notify_senders.lock().unwrap().retain_mut(|sender| {
-                                        match sender.try_send(()) {
-                                            Ok(()) => true,
-                                            Err(e) => !e.is_disconnected(),
-                                        }
-                                    });
+                                    value_history.add(new_version, value.clone());
+                                    subscribers.retain_mut(|tx| tx.try_send(value.clone()).is_ok());
                                 }
-                                _ => {} // Ignore other messages for simplicity
+                                _ => {}
                             }
                         }
 
@@ -3138,23 +3195,13 @@ impl ValueActor {
                             };
 
                             stream_ever_produced = true;
-                            // Increment version and store in history
                             let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                            if let Ok(mut history) = value_history.lock() {
-                                history.add(new_version, new_value);
-                            }
-                            notify_senders.lock().unwrap().retain_mut(|sender| {
-                                match sender.try_send(()) {
-                                    Ok(()) => true,
-                                    Err(e) => !e.is_disconnected(),
-                                }
-                            });
+                            value_history.add(new_version, new_value.clone());
+                            subscribers.retain_mut(|tx| tx.try_send(new_value.clone()).is_ok());
                         }
 
                         impulse = output_valve_impulse_stream.next() => {
-                            if impulse.is_none() {
-                                continue;
-                            }
+                            if impulse.is_none() { continue; }
                         }
                     }
                 }
@@ -3173,9 +3220,9 @@ impl ValueActor {
             message_sender,
             inputs,
             current_version,
-            value_history,
-            notify_sender_sender,
-            notify_senders,
+            subscription_sender,
+            direct_store_sender,
+            stored_value_query_sender,
             actor_loop,
             lazy_delegate: None,
             extra_loops: Vec::new(),
@@ -3191,17 +3238,18 @@ impl ValueActor {
         self.current_version.load(Ordering::SeqCst)
     }
 
-    /// Get all values since a given version from the history buffer.
-    /// Returns (values, oldest_available_version).
-    /// If the requested version is older than the oldest in history,
-    /// the caller should fall back to the current snapshot.
-    pub fn get_values_since(&self, since_version: u64) -> (Vec<Value>, Option<u64>) {
-        if let Ok(history) = self.value_history.lock() {
-            let result = history.get_values_since(since_version);
-            result
-        } else {
-            (Vec::new(), None)
+    /// Get the current stored value (async).
+    ///
+    /// Returns `Some(value)` if the actor has produced a value, `None` otherwise.
+    /// This queries the actor loop via a bounded channel with backpressure.
+    pub async fn stored_value(&self) -> Option<Value> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        // Use try_send for non-blocking send (unbounded semantics)
+        if let Err(e) = self.stored_value_query_sender.unbounded_send(StoredValueQuery { reply: reply_tx }) {
+            eprintln!("Failed to send stored value query: {e:#}");
+            return None;
         }
+        reply_rx.await.ok().flatten()
     }
 
     /// Create a new ValueActor with a channel-based stream for forwarding values.
@@ -3256,15 +3304,15 @@ impl ValueActor {
     pub fn connect_forwarding(
         forwarding_sender: mpsc::UnboundedSender<Value>,
         source_actor: Arc<ValueActor>,
-        initial_value: Option<Value>,
+        initial_value_future: impl Future<Output = Option<Value>> + 'static,
     ) -> ActorLoop {
-        // Send initial value synchronously if provided
-        if let Some(value) = initial_value {
-            let _ = forwarding_sender.unbounded_send(value);
-        }
-
         ActorLoop::new(async move {
-            let mut subscription = source_actor.subscribe();
+            // Send initial value first (awaiting if needed)
+            if let Some(value) = initial_value_future.await {
+                let _ = forwarding_sender.unbounded_send(value);
+            }
+
+            let mut subscription = source_actor.subscribe().await;
             while let Some(value) = subscription.next().await {
                 if forwarding_sender.unbounded_send(value).is_err() {
                     break;
@@ -3291,26 +3339,28 @@ impl ValueActor {
         let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
         // Start at version 1 since we have an initial value
         let current_version = Arc::new(AtomicU64::new(1));
-        let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
-        // History of recent values for preventing message loss (start with initial value at version 1)
-        let value_history = Arc::new(std::sync::Mutex::new({
-            let mut history = ValueHistory::new(64);
-            history.add(1, initial_value);
-            history
-        }));
 
-        // Shared notify_senders for use by store_value_directly
-        let notify_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<()>>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Unbounded channels for subscription, direct store, and stored value queries
+        let (subscription_sender, subscription_receiver) = mpsc::unbounded::<SubscriptionRequest>();
+        let (direct_store_sender, direct_store_receiver) = mpsc::unbounded::<Value>();
+        let (stored_value_query_sender, stored_value_query_receiver) = mpsc::unbounded::<StoredValueQuery>();
 
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
             let current_version = current_version.clone();
-            let value_history = value_history.clone();
             let output_valve_signal = actor_context.output_valve_signal.clone();
-            let notify_senders = notify_senders.clone();
 
             async move {
+                // Actor-local state with initial value
+                let mut value_history = {
+                    let mut history = ValueHistory::new(64);
+                    history.add(1, initial_value);
+                    history
+                };
+                let mut subscribers: Vec<mpsc::Sender<Value>> = Vec::new();
+                let stream_ever_produced = true; // We have an initial value
+                let mut stream_ended = false;
+
                 let mut output_valve_impulse_stream =
                     if let Some(output_valve_signal) = &output_valve_signal {
                         output_valve_signal.subscribe().left_stream()
@@ -3320,39 +3370,50 @@ impl ValueActor {
                     .fuse();
                 let mut value_stream = pin!(value_stream.fuse());
                 let mut message_receiver = pin!(message_receiver.fuse());
-                let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
-                let stream_ever_produced = true; // We have an initial value
-                let mut stream_ended = false;
+                let mut subscription_receiver = pin!(subscription_receiver.fuse());
+                let mut direct_store_receiver = pin!(direct_store_receiver.fuse());
+                let mut stored_value_query_receiver = pin!(stored_value_query_receiver.fuse());
 
                 loop {
                     select! {
-                        sender = notify_sender_receiver.next() => {
-                            if let Some(mut sender) = sender {
+                        query = stored_value_query_receiver.next() => {
+                            if let Some(StoredValueQuery { reply }) = query {
+                                let _ = reply.send(value_history.get_latest());
+                            }
+                        }
+
+                        req = subscription_receiver.next() => {
+                            if let Some(SubscriptionRequest { reply, starting_version }) = req {
                                 if stream_ended && !stream_ever_produced {
-                                    drop(sender);
+                                    let (tx, rx) = mpsc::channel(1);
+                                    drop(tx);
+                                    let _ = reply.send(rx);
                                 } else {
-                                    let _ = sender.try_send(());
-                                    notify_senders.lock().unwrap().push(sender);
+                                    let (mut tx, rx) = mpsc::channel(32);
+                                    for value in value_history.get_values_since(starting_version).0 {
+                                        let _ = tx.try_send(value.clone());
+                                    }
+                                    subscribers.push(tx);
+                                    let _ = reply.send(rx);
                                 }
                             }
                         }
 
+                        value = direct_store_receiver.next() => {
+                            if let Some(value) = value {
+                                let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+                                value_history.add(new_version, value.clone());
+                                subscribers.retain_mut(|tx| tx.try_send(value.clone()).is_ok());
+                            }
+                        }
+
                         msg = message_receiver.next() => {
-                            let Some(msg) = msg else {
-                                break;
-                            };
+                            let Some(msg) = msg else { break; };
                             match msg {
                                 ActorMessage::StreamValue(new_value) => {
                                     let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                                    if let Ok(mut history) = value_history.lock() {
-                                        history.add(new_version, new_value);
-                                    }
-                                    notify_senders.lock().unwrap().retain_mut(|sender| {
-                                        match sender.try_send(()) {
-                                            Ok(()) => true,
-                                            Err(e) => !e.is_disconnected(),
-                                        }
-                                    });
+                                    value_history.add(new_version, new_value.clone());
+                                    subscribers.retain_mut(|tx| tx.try_send(new_value.clone()).is_ok());
                                 }
                                 ActorMessage::Shutdown => break,
                                 _ => {}
@@ -3366,15 +3427,8 @@ impl ValueActor {
                         new_value = value_stream.next() => {
                             if let Some(new_value) = new_value {
                                 let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
-                                if let Ok(mut history) = value_history.lock() {
-                                    history.add(new_version, new_value);
-                                }
-                                notify_senders.lock().unwrap().retain_mut(|sender| {
-                                    match sender.try_send(()) {
-                                        Ok(()) => true,
-                                        Err(e) => !e.is_disconnected(),
-                                    }
-                                });
+                                value_history.add(new_version, new_value.clone());
+                                subscribers.retain_mut(|tx| tx.try_send(new_value.clone()).is_ok());
                             } else {
                                 stream_ended = true;
                             }
@@ -3393,128 +3447,74 @@ impl ValueActor {
             message_sender,
             inputs: Vec::new(),
             current_version,
-            value_history,
-            notify_sender_sender,
-            notify_senders,
+            subscription_sender,
+            direct_store_sender,
+            stored_value_query_sender,
             actor_loop,
             lazy_delegate: None,
             extra_loops: Vec::new(),
         })
     }
 
-    /// Read stored value from value history.
-    /// Used by Subscription within engine.rs and for synchronous initial value storage.
-    /// Prefer subscribe().next().await for async reactive semantics.
-    pub fn stored_value(&self) -> Option<Value> {
-        self.value_history.lock().ok()?.get_latest()
-    }
-
-    /// Directly store a value, bypassing the async stream.
-    /// Used by HOLD to ensure state is visible before next body evaluation.
-    /// This also increments the version so subscribers can see the new value.
+    /// Directly store a value, bypassing the async input stream.
+    /// Used by HOLD to update state between body evaluations.
+    ///
+    /// The actor loop processes the value and notifies all subscribers.
     pub fn store_value_directly(&self, value: Value) {
-        // Increment version
-        let new_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
-        // Store in history (also serves as current value storage)
-        if let Ok(mut history) = self.value_history.lock() {
-            history.add(new_version, value);
-        }
-        // Notify subscribers
-        if let Ok(mut senders) = self.notify_senders.lock() {
-            senders.retain_mut(|sender| {
-                match sender.try_send(()) {
-                    Ok(()) => true,
-                    Err(e) => !e.is_disconnected(),
-                }
-            });
+        if let Err(e) = self.direct_store_sender.unbounded_send(value) {
+            eprintln!("Failed to store value directly: {e:#}");
         }
     }
 
-    /// Subscribe to this actor's values.
+    /// Subscribe to this actor's values (async).
     ///
-    /// Automatically handles both eager and lazy actors:
-    /// - Eager actors: Returns efficient bounded-channel subscription
-    /// - Lazy actors: Returns demand-driven subscription from lazy delegate
-    ///
-    /// Uses `Either` to avoid boxing while supporting both subscription types.
+    /// This async method registers with the actor loop and returns a stream of values.
+    /// The actor loop will push all historical values followed by live updates.
     ///
     /// Takes ownership of the Arc to keep the actor alive for the subscription lifetime.
-    /// Callers should use `.clone().subscribe()` if they need to retain a reference.
-    ///
-    /// This method yields control once before subscribing, allowing the actor's async
-    /// loop to start producing values. This is critical when subscribing to actors
-    /// that were just created (e.g., in list operations like map, retain, etc.) - without
-    /// the yield, the subscription would wait forever for values that haven't been produced yet.
-    pub fn subscribe(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        // Yield control once to allow the actor's loop to start
-        stream::once(async move {
-            use std::task::Poll;
-            let mut yielded = false;
-            std::future::poll_fn(|cx| {
-                if yielded {
-                    Poll::Ready(())
-                } else {
-                    yielded = true;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            }).await;
-            self
-        })
-        .flat_map(|actor| actor.subscribe_immediate())
-        .boxed_local()
-    }
-
-    /// Subscribe without yielding first. Only use this when you KNOW the actor's loop
-    /// has already started (e.g., for internal chaining within an already-yielded stream).
-    fn subscribe_immediate(self: Arc<Self>) -> impl Stream<Item = Value> {
+    /// Callers should use `.clone().subscribe().await` if they need to retain a reference.
+    pub async fn subscribe(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        // Handle lazy actors
         if let Some(ref lazy_delegate) = self.lazy_delegate {
-            lazy_delegate.clone().subscribe().left_stream()
-        } else {
-            self.subscribe_eager().right_stream()
+            return lazy_delegate.clone().subscribe().boxed_local();
         }
-    }
 
-    /// Subscribe to eager actor's values using bounded channel notifications.
-    ///
-    /// WARNING: Only use this for actors you KNOW are eager (no lazy_delegate).
-    /// For general use, prefer `subscribe()` which handles both cases.
-    ///
-    /// Memory-efficient subscription using bounded(1) channels.
-    /// - O(1) memory per subscriber regardless of speed
-    /// - Slow subscribers automatically skip to latest value
-    /// - No RefCell or internal mutability - pure dataflow
-    fn subscribe_eager(self: Arc<Self>) -> Subscription {
-        // Create bounded(1) channel - at most 1 pending notification
-        let (mut sender, receiver) = mpsc::channel::<()>(1);
+        // Yield control once to allow the actor's loop to start
+        use std::task::Poll;
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if yielded {
+                Poll::Ready(())
+            } else {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }).await;
 
-        // CRITICAL: Add sender directly to notify_senders for IMMEDIATE registration.
-        // This ensures store_value_directly() can notify this subscriber right away,
-        // even before the main loop has a chance to poll and process the registration.
-        // This is essential for synchronous value delivery (e.g., HOLD with Stream/pulses).
-        //
-        // Send an immediate notification so subscriber can check current version.
-        let _ = sender.try_send(());
-        self.notify_senders.lock().unwrap().push(sender);
+        // Send subscription request to actor loop
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if let Err(e) = self.subscription_sender.unbounded_send(SubscriptionRequest {
+            reply: reply_tx,
+            starting_version: 0,
+        }) {
+            eprintln!("Failed to subscribe: actor dropped: {e:#}");
+            // Return empty stream
+            return stream::empty().boxed_local();
+        }
 
-        let _current_version = self.version();
-
-        // NOTE: We no longer send to notify_sender_sender because we're registering directly.
-        // The main loop's registration logic is now only for actors that don't use
-        // store_value_directly() (i.e., actors that receive values through their stream).
-
-        // Start at version 0 so subscriber can pull ALL historical values from the buffer.
-        // This gives STREAM semantics: new subscriptions see all values from history.
-        // Combined with the ValueHistory ring buffer (64 entries), this prevents message loss
-        // for synchronous event streams like Stream/pulses().
-        // If subscriber is too far behind (history full), it falls back to snapshot.
-        Subscription {
-            last_seen_version: 0,
-            notify_receiver: receiver,
-            // Strong reference keeps actor alive as long as subscription exists.
-            // Circular reference chains in HOLD are broken via Weak in HOLD closures (evaluator.rs).
-            actor: self,
-            pending_values: VecDeque::new(),
+        // Wait for the receiver from actor loop
+        match reply_rx.await {
+            Ok(receiver) => {
+                PushSubscription {
+                    receiver,
+                    _actor: self,
+                }.boxed_local()
+            }
+            Err(_) => {
+                eprintln!("Failed to subscribe: actor dropped before reply");
+                stream::empty().boxed_local()
+            }
         }
     }
 
@@ -3540,37 +3540,65 @@ impl ValueActor {
     /// Use this in THEN/WHEN bodies where you need a point-in-time snapshot of values.
     ///
     /// If the actor has no value yet (version 0), waits for the first value.
-    pub fn snapshot(self: Arc<Self>) -> Snapshot {
-        Snapshot {
-            actor: self,
-            resolved: false,
-            notify_receiver: None,
+    pub async fn snapshot(self: Arc<Self>) -> Option<Value> {
+        // If we already have a value, return it directly
+        if self.version() > 0 {
+            return self.stored_value().await;
         }
+        // Otherwise subscribe and wait for first value
+        let mut stream = self.subscribe().await;
+        stream.next().await
     }
 
-    /// Subscribe to continuous stream of all values from version 0.
+    /// Subscribe to continuous stream of all values from version 0 (async).
     ///
     /// Use this for WHILE bodies, LATEST inputs, and reactive bindings where you
     /// need continuous updates.
     ///
     /// This is an alias for the existing `subscribe()` method - same behavior,
     /// clearer name that contrasts with `snapshot()`.
-    pub fn stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        self.subscribe()
+    pub async fn stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        self.subscribe().await
     }
 
-    /// Get optimal update for subscriber at given version.
+    /// Subscribe stream with synchronous wrapper (for use in sync contexts).
+    ///
+    /// This wraps the async `subscribe()` in a stream that performs the async
+    /// subscription lazily when first polled. Use this when you need a Stream
+    /// but are in a sync context that returns `impl Stream`.
+    ///
+    /// Example:
+    /// ```ignore
+    /// // Instead of:
+    /// stream::once(async move { actor.subscribe().await }).flatten()
+    /// // Use:
+    /// actor.subscribe_stream()
+    /// ```
+    pub fn subscribe_stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        stream::once(async move { self.subscribe().await }).flatten().boxed_local()
+    }
+
+    /// Stream with synchronous wrapper (for use in sync contexts).
+    ///
+    /// This wraps the async `stream()` in a stream that performs the async
+    /// subscription lazily when first polled. Use this when you need a Stream
+    /// but are in a sync context that returns `impl Stream`.
+    pub fn stream_stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        stream::once(async move { self.stream().await }).flatten().boxed_local()
+    }
+
+    /// Get optimal update for subscriber at given version (async).
     ///
     /// For scalar values, always returns a snapshot (cheap to copy).
     /// For collections with DiffHistory (future), may return diffs if
     /// subscriber is close enough to current version.
-    pub fn get_update_since(&self, subscriber_version: u64) -> ValueUpdate {
+    pub async fn get_update_since(&self, subscriber_version: u64) -> ValueUpdate {
         let current = self.version();
         if subscriber_version >= current {
             return ValueUpdate::Current;
         }
         // For now, always return snapshot. Phase 4 will add diff support for LIST.
-        match self.stored_value() {
+        match self.stored_value().await {
             Some(value) => ValueUpdate::Snapshot(value),
             None => ValueUpdate::Current,
         }
@@ -3597,190 +3625,6 @@ pub enum ValueUpdate {
     Snapshot(Value),
     /// Incremental diffs for collections (more efficient when subscriber is close to current)
     Diffs(Vec<Arc<ListDiff>>),
-}
-
-// --- Subscription ---
-
-/// Bounded-channel subscription that pulls data on demand.
-///
-/// Uses bounded(1) channels for notifications - pure dataflow, no RefCell.
-/// O(1) memory per subscriber regardless of speed.
-///
-/// # Memory Characteristics
-/// - Notifications: bounded(1) channel - at most 1 pending signal
-/// - Data: Pulled from history buffer
-/// - Slow consumer: Falls back to latest if too far behind
-pub struct Subscription {
-    /// Strong reference to the subscribed actor.
-    /// This keeps the actor alive as long as the subscription exists.
-    actor: Arc<ValueActor>,
-    last_seen_version: u64,
-    notify_receiver: mpsc::Receiver<()>,
-    /// Local buffer for values pulled from history, yielded one at a time.
-    pending_values: VecDeque<Value>,
-}
-
-impl Subscription {
-    /// Wait for next value.
-    pub async fn next_value(&mut self) -> Option<Value> {
-        // Wait for version to change
-        loop {
-            let current = self.actor.version();
-            if current > self.last_seen_version {
-                break;
-            }
-            // Wait for notification from actor loop
-            if self.notify_receiver.next().await.is_none() {
-                // Actor dropped - no more values
-                return None;
-            }
-        }
-
-        self.last_seen_version = self.actor.version();
-        self.actor.stored_value()
-    }
-
-    /// Get current value immediately without waiting.
-    pub fn current(&self) -> Option<Value> {
-        self.actor.stored_value()
-    }
-
-    /// Check if there are pending updates without consuming them.
-    pub fn has_pending(&self) -> bool {
-        self.actor.version() > self.last_seen_version
-    }
-
-    /// Get the actor being subscribed to.
-    pub fn actor(&self) -> &Arc<ValueActor> {
-        &self.actor
-    }
-}
-
-impl Stream for Subscription {
-    type Item = Value;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // 1. First yield from local buffer if we have pending values
-        if let Some(value) = self.pending_values.pop_front() {
-            return Poll::Ready(Some(value));
-        }
-
-        loop {
-            let current_version = self.actor.version();
-
-            // 2. Check if new values are available
-            if current_version > self.last_seen_version {
-                let (values, _oldest_available) = self.actor.get_values_since(self.last_seen_version);
-
-                if values.is_empty() {
-                    // History exhausted or subscriber too far behind - fall back to snapshot
-                    self.last_seen_version = current_version;
-                    if let Some(value) = self.actor.stored_value() {
-                        return Poll::Ready(Some(value));
-                    }
-                } else {
-                    // Got values from history - buffer them and yield first one
-                    // Update last_seen_version based on how many values we got, not current_version
-                    // This prevents skipping values if the actor is still processing more
-                    let values_count = values.len() as u64;
-                    self.last_seen_version = self.last_seen_version.saturating_add(values_count);
-                    let mut iter = values.into_iter();
-                    let first = iter.next();
-                    self.pending_values.extend(iter);
-
-                    if let Some(value) = first {
-                        return Poll::Ready(Some(value));
-                    }
-                }
-            }
-
-            // 3. Wait for notification
-            match Pin::new(&mut self.notify_receiver).poll_next(cx) {
-                Poll::Ready(Some(())) => {
-                    // Got notification, loop to check version again
-                    continue;
-                }
-                Poll::Ready(None) => {
-                    // Channel closed, actor dropped
-                    return Poll::Ready(None);
-                }
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
-            }
-        }
-    }
-}
-
-// --- Snapshot Future ---
-
-/// Future that resolves to exactly ONE value from an actor.
-///
-/// This is the type returned by `ValueActor::snapshot()`. Unlike a Stream which
-/// can emit many values, this Future resolves exactly once, making it impossible
-/// to accidentally create ongoing subscriptions in THEN/WHEN bodies.
-///
-/// # Semantics
-/// - If the actor has a stored value (version > 0), resolves immediately with that value
-/// - If the actor has no value yet (version 0), waits for the first value
-/// - After resolving once, the Future is complete (returns None on subsequent polls)
-pub struct Snapshot {
-    actor: Arc<ValueActor>,
-    resolved: bool,
-    /// Lazily initialized channel for waiting on notifications.
-    /// Only created if we need to wait (version 0 case).
-    notify_receiver: Option<mpsc::Receiver<()>>,
-}
-
-impl Future for Snapshot {
-    type Output = Option<Value>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Already resolved - return None (Future complete)
-        if self.resolved {
-            return Poll::Ready(None);
-        }
-
-        // Check if value is available
-        if self.actor.version() > 0 {
-            self.resolved = true;
-            return Poll::Ready(self.actor.stored_value());
-        }
-
-        // No value yet - register for notification and wait
-        // Lazily initialize the notification channel
-        if self.notify_receiver.is_none() {
-            let (mut sender, receiver) = mpsc::channel::<()>(1);
-            // Pre-send so we'll wake up when first value arrives
-            let _ = sender.try_send(());
-            self.actor.notify_senders.lock().unwrap().push(sender);
-            self.notify_receiver = Some(receiver);
-        }
-
-        // Poll the notification channel
-        if let Some(ref mut receiver) = self.notify_receiver {
-            match Pin::new(receiver).poll_next(cx) {
-                Poll::Ready(Some(())) => {
-                    // Got notification - check if value is now available
-                    if self.actor.version() > 0 {
-                        self.resolved = true;
-                        return Poll::Ready(self.actor.stored_value());
-                    }
-                    // Spurious wakeup, register waker and wait again
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-                Poll::Ready(None) => {
-                    // Channel closed, actor dropped
-                    self.resolved = true;
-                    Poll::Ready(None)
-                }
-                Poll::Pending => Poll::Pending,
-            }
-        } else {
-            Poll::Pending
-        }
-    }
 }
 
 // --- ListDiffSubscription ---
@@ -4004,7 +3848,7 @@ impl Value {
             Value::Object(object, _) => {
                 let mut obj = serde_json::Map::new();
                 for variable in object.variables() {
-                    let value = variable.value_actor().subscribe().next().await;
+                    let value = variable.value_actor().clone().subscribe().await.next().await;
                     if let Some(value) = value {
                         let json_value = Box::pin(value.to_json()).await;
                         obj.insert(variable.name().to_string(), json_value);
@@ -4016,7 +3860,7 @@ impl Value {
                 let mut obj = serde_json::Map::new();
                 obj.insert("_tag".to_string(), serde_json::Value::String(tagged_object.tag().to_string()));
                 for variable in tagged_object.variables() {
-                    let value = variable.value_actor().subscribe().next().await;
+                    let value = variable.value_actor().clone().subscribe().await.next().await;
                     if let Some(value) = value {
                         let json_value = Box::pin(value.to_json()).await;
                         obj.insert(variable.name().to_string(), json_value);
@@ -4029,7 +3873,7 @@ impl Value {
                 if let Some(ListChange::Replace { items }) = first_change {
                     let mut json_items = Vec::new();
                     for item in items {
-                        let value = item.subscribe().next().await;
+                        let value = item.clone().subscribe().await.next().await;
                         if let Some(value) = value {
                             let json_value = Box::pin(value.to_json()).await;
                             json_items.push(json_value);
@@ -4257,7 +4101,7 @@ pub async fn materialize_value(
             let mut materialized_vars: Vec<Arc<Variable>> = Vec::new();
             for variable in object.variables() {
                 // Await the variable's current value through subscription (proper async)
-                let var_value = variable.value_actor().subscribe().next().await;
+                let var_value = variable.value_actor().clone().subscribe().await.next().await;
                 if let Some(var_value) = var_value {
                     // Recursively materialize nested values
                     let materialized = Box::pin(materialize_value(
@@ -4301,7 +4145,7 @@ pub async fn materialize_value(
         Value::TaggedObject(tagged_object, metadata) => {
             let mut materialized_vars: Vec<Arc<Variable>> = Vec::new();
             for variable in tagged_object.variables() {
-                let var_value = variable.value_actor().subscribe().next().await;
+                let var_value = variable.value_actor().clone().subscribe().await.next().await;
                 if let Some(var_value) = var_value {
                     let materialized = Box::pin(materialize_value(
                         var_value,
@@ -5377,7 +5221,7 @@ impl List {
                     if let ListChange::Replace { ref items } = change {
                         let mut json_items = Vec::new();
                         for item in items {
-                            if let Some(value) = item.clone().subscribe().next().await {
+                            if let Some(value) = item.clone().subscribe().await.next().await {
                                 json_items.push(value.to_json().await);
                             }
                         }
@@ -5389,7 +5233,7 @@ impl List {
                         if let Some(ListChange::Replace { items }) = list_for_save.clone().subscribe().next().await {
                             let mut json_items = Vec::new();
                             for item in &items {
-                                if let Some(value) = item.clone().subscribe().next().await {
+                                if let Some(value) = item.clone().subscribe().await.next().await {
                                     json_items.push(value.to_json().await);
                                 }
                             }
@@ -5951,8 +5795,8 @@ impl ListBindingFunction {
         let construct_context_for_stream = construct_context.clone();
         let actor_context_for_stream = actor_context.clone();
 
-        // subscribe() now yields automatically, ensuring source actor's loop has started
-        let change_stream = source_list_actor.clone().subscribe()
+        // subscribe_stream() now yields automatically, ensuring source actor's loop has started
+        let change_stream = source_list_actor.clone().subscribe_stream()
         .filter_map(move |value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
@@ -6012,10 +5856,10 @@ impl ListBindingFunction {
         let actor_context_for_result = actor_context.clone();
 
         // Create a stream that:
-        // 1. Subscribes to source list changes (subscribe() yields automatically)
+        // 1. Subscribes to source list changes (subscribe_stream() yields automatically)
         // 2. For each item, evaluates predicate and subscribes to its changes
         // 3. When list or any predicate changes, emits filtered Replace
-        let value_stream = source_list_actor.clone().subscribe().filter_map(|value| {
+        let value_stream = source_list_actor.clone().subscribe_stream().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
                 _ => None,
@@ -6097,7 +5941,7 @@ impl ListBindingFunction {
                 // Subscribe to all predicates and emit filtered list when any changes
                 let predicate_streams: Vec<_> = item_predicates.iter().enumerate().map(|(idx, (item, pred))| {
                     let item = item.clone();
-                    pred.clone().subscribe().map(move |value| (idx, item.clone(), value))
+                    pred.clone().subscribe_stream().map(move |value| (idx, item.clone(), value))
                 }).collect();
 
                 stream::select_all(predicate_streams)
@@ -6172,8 +6016,8 @@ impl ListBindingFunction {
         // Clone for use after the flat_map chain
         let actor_context_for_result = actor_context.clone();
 
-        // subscribe() yields automatically, ensuring source actor's loop has started
-        let value_stream = source_list_actor.clone().subscribe().filter_map(|value| {
+        // subscribe_stream() yields automatically, ensuring source actor's loop has started
+        let value_stream = source_list_actor.clone().subscribe_stream().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
                 _ => None,
@@ -6256,7 +6100,7 @@ impl ListBindingFunction {
                 let construct_context_map = construct_context.clone();
 
                 let predicate_streams: Vec<_> = item_predicates.iter().enumerate().map(|(idx, (_, pred))| {
-                    pred.clone().subscribe().map(move |value| (idx, value))
+                    pred.clone().subscribe_stream().map(move |value| (idx, value))
                 }).collect();
 
                 stream::select_all(predicate_streams)
@@ -6326,10 +6170,10 @@ impl ListBindingFunction {
         let actor_context_for_result = actor_context.clone();
 
         // Create a stream that:
-        // 1. Subscribes to source list changes (subscribe() yields automatically)
+        // 1. Subscribes to source list changes (subscribe_stream() yields automatically)
         // 2. For each item, evaluates key expression and subscribes to its changes
         // 3. When list or any key changes, emits sorted Replace
-        let value_stream = source_list_actor.clone().subscribe().filter_map(|value| {
+        let value_stream = source_list_actor.clone().subscribe_stream().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
                 _ => None,
@@ -6411,7 +6255,7 @@ impl ListBindingFunction {
                 // Subscribe to all keys and emit sorted list when any changes
                 let key_streams: Vec<_> = item_keys.iter().enumerate().map(|(idx, (item, key_actor))| {
                     let item = item.clone();
-                    key_actor.clone().subscribe().map(move |value| (idx, item.clone(), value))
+                    key_actor.clone().subscribe_stream().map(move |value| (idx, item.clone(), value))
                 }).collect();
 
                 stream::select_all(key_streams)
@@ -6483,22 +6327,6 @@ impl ListBindingFunction {
         // Create a new ActorContext with the binding variable set
         let binding_name = config.binding_name.to_string();
         let mut new_params = actor_context.parameters.clone();
-
-        // Debug: log what item value we're transforming
-        if let Some(stored) = item_actor.stored_value() {
-            let value_desc = match &stored {
-                Value::Text(t, _) => format!("Text('{}')", t.text()),
-                Value::Number(n, _) => format!("Number({})", n.number()),
-                Value::Tag(_, _) => "Tag".to_string(),
-                Value::Object(_, _) => "Object".to_string(),
-                Value::TaggedObject(_, _) => "TaggedObject".to_string(),
-                Value::List(_, _) => "List".to_string(),
-                Value::Flushed(_, _) => "Flushed".to_string(),
-            };
-            println!("[DEBUG transform_item] binding_name='{}', stored_value={}", binding_name, value_desc);
-        } else {
-            println!("[DEBUG transform_item] binding_name='{}', no stored value yet", binding_name);
-        }
 
         new_params.insert(binding_name, item_actor.clone());
 

@@ -152,14 +152,14 @@ The fundamental reactive unit. Every expression evaluates to a `ValueActor`.
 ```rust
 pub struct ValueActor {
     construct_info: Arc<ConstructInfoComplete>,
-    current_value: Arc<ArcSwap<Option<Value>>>,
     current_version: Arc<AtomicU64>,
-    notify_sender_sender: mpsc::UnboundedSender<mpsc::Sender<()>>,
-    notify_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<()>>>>,
+    // All state management happens inside actor_loop via channels
     actor_loop: ActorLoop,  // The actor's processing loop
     // ...
 }
 ```
+
+**Key design**: All subscriber management and value history is owned by the actor loop internally (not in shared Mutex). The `subscribe()` method is async and uses channel-based registration.
 
 ### LazyValueActor
 
@@ -182,10 +182,12 @@ Reactive list with diff-based updates.
 pub struct List {
     construct_info: Arc<ConstructInfoComplete>,
     actor_loop: ActorLoop,  // Handles list changes and subscriptions
-    diff_history: Arc<RefCell<DiffHistory>>,
+    // diff_history is owned by actor_loop (no shared RefCell)
     // ...
 }
 ```
+
+**Key design**: The diff history is owned by the actor loop internally and accessed via channels, not shared mutable state.
 
 ### Infrastructure Actors
 
@@ -353,9 +355,9 @@ Variable::new_arc_with_forwarding_loop(
 
 ---
 
-## Why No Mutexes/Locks
+## Why No Mutexes/Locks (Pure Channel Architecture)
 
-The actor model avoids Mutex/RwLock for several reasons:
+The actor model avoids Mutex/RwLock/ArcSwap entirely:
 
 1. **Hardware mapping**: Blocking primitives don't map to hardware.
 
@@ -363,13 +365,16 @@ The actor model avoids Mutex/RwLock for several reasons:
 
 3. **Deadlock freedom**: Actor message passing can't deadlock (unlike nested locks).
 
-4. **Performance**: Lock-free data structures (ArcSwap, AtomicU64) for shared state.
+4. **Simplicity**: All state is actor-local, communicated via channels.
+
+5. **WebWorker safety**: No shared mutable state means safe multi-threaded execution.
 
 Instead of locks, Boon uses:
-- **Channels** (mpsc) for actor communication
-- **ArcSwap** for lock-free current value access
-- **AtomicU64** for version tracking
+- **Channels** (mpsc) for actor communication and value delivery
+- **AtomicU64** for simple version tracking
+- **AtomicBool** for simple flags
 - **Actor-local state** owned by the actor loop (no shared mutable state)
+- **Async subscribe()** with channel-based registration for subscriptions
 
 ---
 
@@ -380,8 +385,8 @@ Instead of locks, Boon uses:
 | Pure Stream | Combinational logic, wires | Lambda composition |
 | ActorLoop | FSM, registers | Interaction net node |
 | mpsc channel | FIFO buffer | Port connection |
-| ArcSwap | Register with read port | Reference cell |
 | AtomicU64 | Counter register | Numeric node |
+| AtomicBool | Single-bit register | Boolean node |
 
 ---
 
@@ -389,19 +394,34 @@ Instead of locks, Boon uses:
 
 After the refactoring, these properties hold:
 
+### Task Spawning
 - [x] `Task::start_droppable` only appears inside `ActorLoop::new()`
 - [x] No `Task::start_droppable` in api.rs
 - [x] No `Task::start_droppable` in evaluator.rs
 - [x] No `Task::start_droppable` in bridge.rs
+
+### Pure Stream Functions
 - [x] `switch_map` uses `stream::unfold()`
 - [x] `Stream/skip` uses `stream::unfold()`
 - [x] `Stream/take` uses `stream::unfold()`
 - [x] `Stream/debounce` uses `stream::unfold()`
+
+### Actor Architecture
 - [x] All infrastructure actors use `ActorLoop`
 - [x] `ValueActor` uses `actor_loop: ActorLoop`
 - [x] `LazyValueActor` uses `actor_loop: ActorLoop`
 - [x] `List` uses `actor_loop: ActorLoop`
 - [x] Forwarding integrated via `ValueActor::connect_forwarding()`
+
+### No Shared Mutable State
+- [x] No `Rc<RefCell>` in engine code
+- [x] No `Arc<RefCell>` in engine code
+- [x] No `Mutex` in engine code
+- [x] No `ArcSwap` in engine code
+- [x] `subscribe()` is async with channel-based registration
+- [x] `stored_value()` is async with channel-based query
+- [x] All subscriber management is actor-local (inside actor_loop)
+- [x] All diff history is actor-local (inside actor_loop)
 
 ---
 
