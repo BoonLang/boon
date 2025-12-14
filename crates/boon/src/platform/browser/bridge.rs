@@ -5,7 +5,7 @@ use zoon::futures_channel::mpsc;
 use zoon::{eprintln, *};
 
 use super::engine::{
-    ActorContext, ConstructContext, ConstructInfo, ListChange, Object,
+    ActorContext, ActorLoop, ConstructContext, ConstructInfo, ListChange, Object,
     TaggedObject, TypedStream, Value, ValueActor, ValueIdempotencyKey, Variable,
     Text as EngineText, Tag as EngineTag,
 };
@@ -219,7 +219,7 @@ fn element_stripe(
         .filter_map(|value| future::ready(value.expect_object().variable("hovered")))
         .map(|variable| variable.expect_link_value_sender());
 
-    let hovered_handler_task = Task::start_droppable({
+    let hovered_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
             let mut hovered_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
@@ -340,7 +340,7 @@ fn element_stripe(
             drop(settings_object);
             drop(items_list_value);
             drop(item_actors);
-            drop(hovered_handler_task);
+            drop(hovered_handler_loop);
         })
 }
 
@@ -518,7 +518,7 @@ fn element_button(
         .map(|variable| variable.expect_link_value_sender())
         .fuse();
 
-    let press_handler_task = Task::start_droppable({
+    let press_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
             let mut press_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
@@ -579,7 +579,7 @@ fn element_button(
                 eprintln!("Failed to send button press event from on_press handler: {error}");
             }
         })
-        .after_remove(move |_| drop(press_handler_task))
+        .after_remove(move |_| drop(press_handler_loop))
 }
 
 fn element_text_input(
@@ -623,7 +623,7 @@ fn element_text_input(
         .map(|variable| variable.expect_link_value_sender())
         .fuse();
 
-    let event_handler_task = Task::start_droppable({
+    let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
             let mut change_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
@@ -830,7 +830,7 @@ fn element_text_input(
         });
 
     // Task to update focus from stream - must be kept alive
-    let focus_task = Task::start_droppable({
+    let focus_loop = ActorLoop::new({
         let focus_mutable = focus_mutable.clone();
         async move {
             futures_util::pin_mut!(focus_stream);
@@ -882,8 +882,8 @@ fn element_text_input(
                 .style_signal("width", width_signal)
         })
         .after_remove(move |_| {
-            drop(event_handler_task);
-            drop(focus_task);
+            drop(event_handler_loop);
+            drop(focus_loop);
         })
 }
 
@@ -907,7 +907,7 @@ fn element_checkbox(
         .map(|variable| variable.expect_link_value_sender())
         .fuse();
 
-    let event_handler_task = Task::start_droppable({
+    let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
             let mut click_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
@@ -965,7 +965,7 @@ fn element_checkbox(
                 let _ = sender.unbounded_send(());
             }
         })
-        .after_remove(move |_| drop(event_handler_task))
+        .after_remove(move |_| drop(event_handler_loop))
 }
 
 fn element_label(
@@ -997,7 +997,7 @@ fn element_label(
         .map(|variable| variable.expect_link_value_sender())
         .fuse();
 
-    let event_handler_task = Task::start_droppable({
+    let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
             let mut double_click_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
@@ -1088,7 +1088,7 @@ fn element_label(
                 let _ = sender.unbounded_send(());
             }
         })
-        .after_remove(move |_| drop(event_handler_task))
+        .after_remove(move |_| drop(event_handler_loop))
 }
 
 fn element_paragraph(

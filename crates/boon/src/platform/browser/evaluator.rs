@@ -10,7 +10,7 @@ use chumsky::Parser as ChumskyParser;
 use chumsky::input::{Input as ChumskyInput, Stream as ChumskyStream};
 use ulid::Ulid;
 use zoon::futures_util::stream;
-use zoon::{Stream, StreamExt, println, eprintln, Task, TaskHandle, mpsc};
+use zoon::{Stream, StreamExt, println, eprintln, mpsc};
 
 /// Yields control to the executor, allowing other tasks to run.
 /// This is a simple implementation that returns Pending once and schedules a wake.
@@ -1378,28 +1378,18 @@ fn process_work_item(
                     )
                 } else if let Some((forwarding_actor, sender)) = &vd.forwarding_actor {
                     // Use the pre-created forwarding actor for referenced fields
-                    // Spawn a task to forward values from the expression's actor to the channel
+                    // Connect forwarding from source actor to forwarding actor
                     let Some(source_actor) = state.get(vd.value_slot) else { continue; };
-                    let sender = sender.clone();
 
-                    // CRITICAL: Send initial value synchronously BEFORE starting the async task.
-                    // This ensures intra-object field references (e.g., `[a: 1, b: a + 1]`) work
-                    // correctly, because the forwarding actor needs to have a value before
-                    // other field expressions try to subscribe to it.
-                    if let Some(initial_value) = source_actor.stored_value() {
-                        let _ = sender.unbounded_send(initial_value);
-                    }
-
-                    let source_actor_clone = source_actor.clone();
-                    let forwarding_task = Task::start_droppable(async move {
-                        let mut subscription = source_actor_clone.subscribe();
-                        while let Some(value) = subscription.next().await {
-                            if sender.unbounded_send(value).is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    Variable::new_arc_with_forwarding_task(
+                    // connect_forwarding sends initial value synchronously (CRITICAL for intra-object
+                    // field references like `[a: 1, b: a + 1]`), then forwards async values
+                    let initial_value = source_actor.stored_value();
+                    let forwarding_loop = ValueActor::connect_forwarding(
+                        sender.clone(),
+                        source_actor.clone(),
+                        initial_value,
+                    );
+                    Variable::new_arc_with_forwarding_loop(
                         ConstructInfo::new(
                             format!("PersistenceId: {:?}", var_persistence_id),
                             vd.persistence.clone(),
@@ -1409,7 +1399,7 @@ fn process_work_item(
                         vd.name.clone(),
                         forwarding_actor.clone(),
                         var_persistence_id,
-                        forwarding_task,
+                        forwarding_loop,
                     )
                 } else {
                     // If value slot is empty, skip this variable
@@ -1486,28 +1476,18 @@ fn process_work_item(
                     )
                 } else if let Some((forwarding_actor, sender)) = &vd.forwarding_actor {
                     // Use the pre-created forwarding actor for referenced fields
-                    // Spawn a task to forward values from the expression's actor to the channel
+                    // Connect forwarding from source actor to forwarding actor
                     let Some(source_actor) = state.get(vd.value_slot) else { continue; };
-                    let sender = sender.clone();
 
-                    // CRITICAL: Send initial value synchronously BEFORE starting the async task.
-                    // This ensures intra-object field references (e.g., `[a: 1, b: a + 1]`) work
-                    // correctly, because the forwarding actor needs to have a value before
-                    // other field expressions try to subscribe to it.
-                    if let Some(initial_value) = source_actor.stored_value() {
-                        let _ = sender.unbounded_send(initial_value);
-                    }
-
-                    let source_actor_clone = source_actor.clone();
-                    let forwarding_task = Task::start_droppable(async move {
-                        let mut subscription = source_actor_clone.subscribe();
-                        while let Some(value) = subscription.next().await {
-                            if sender.unbounded_send(value).is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    Variable::new_arc_with_forwarding_task(
+                    // connect_forwarding sends initial value synchronously (CRITICAL for intra-object
+                    // field references like `[a: 1, b: a + 1]`), then forwards async values
+                    let initial_value = source_actor.stored_value();
+                    let forwarding_loop = ValueActor::connect_forwarding(
+                        sender.clone(),
+                        source_actor.clone(),
+                        initial_value,
+                    );
+                    Variable::new_arc_with_forwarding_loop(
                         ConstructInfo::new(
                             format!("PersistenceId: {:?}", var_persistence_id),
                             vd.persistence.clone(),
@@ -1517,7 +1497,7 @@ fn process_work_item(
                         vd.name.clone(),
                         forwarding_actor.clone(),
                         var_persistence_id,
-                        forwarding_task,
+                        forwarding_loop,
                     )
                 } else {
                     // If value slot is empty, skip this variable
@@ -1738,12 +1718,12 @@ fn process_work_item(
                 // 1. Sent to the LINK variable at store.path
                 // 2. Passed through unchanged for downstream use
 
-                // Start a task to forward piped values to the target LINK variable
+                // Start an actor loop to forward piped values to the target LINK variable
                 let alias_for_task = alias.node.clone();
                 let ctx_for_task = new_ctx.clone();
                 let prev_actor_for_task = prev_actor.clone();
 
-                let forwarding_task = Task::start_droppable(async move {
+                let forwarding_loop = ActorLoop::new(async move {
                     // Get the target LINK sender by traversing the alias path
                     let link_sender = get_link_sender_from_alias(
                         alias_for_task,
@@ -1761,11 +1741,11 @@ fn process_work_item(
                     }
                 });
 
-                // Create a wrapper stream that keeps the forwarding task alive
-                // The task handle is captured in the map closure
+                // Create a wrapper stream that keeps the forwarding loop alive
+                // The actor loop is captured in the map closure
                 let wrapper_stream = prev_actor.clone().subscribe().map(move |value| {
-                    // Keep task alive by referencing it (compiler will capture it)
-                    let _ = &forwarding_task;
+                    // Keep actor loop alive by referencing it (compiler will capture it)
+                    let _ = &forwarding_loop;
                     value
                 });
 
@@ -2950,14 +2930,14 @@ fn build_hold_actor(
     // Values will be stored directly via store_value_directly() from the stream closures below.
     // This ensures values are available in history immediately when Stream/skip subscribes.
     //
-    // The task_handle_cell holds the TaskHandle for the driver task. When the output actor
-    // is dropped, the stream is dropped, which drops the Rc, which drops the TaskHandle,
+    // The actor_loop_cell holds the ActorLoop for the driver task. When the output actor
+    // is dropped, the stream is dropped, which drops the Rc, which drops the ActorLoop,
     // which cancels the driver task. This ensures Timer/interval stops when switching examples.
-    let task_handle_cell: Rc<RefCell<Option<TaskHandle>>> = Rc::new(RefCell::new(None));
-    let task_handle_cell_for_stream = task_handle_cell.clone();
+    let actor_loop_cell: Rc<RefCell<Option<ActorLoop>>> = Rc::new(RefCell::new(None));
+    let actor_loop_cell_for_stream = actor_loop_cell.clone();
     let output_stream = stream::poll_fn(move |_cx| {
-        // Keep the RefCell alive - this holds the TaskHandle when set
-        let _keep_alive = task_handle_cell_for_stream.borrow();
+        // Keep the RefCell alive - this holds the ActorLoop when set
+        let _keep_alive = actor_loop_cell_for_stream.borrow();
         Poll::Pending::<Option<Value>>
     });
     let output = ValueActor::new_arc_with_inputs(
@@ -3034,17 +3014,17 @@ fn build_hold_actor(
         state_update_stream
     );
 
-    // Start a droppable task to drive the combined stream (poll it so closures execute).
+    // Create an actor loop to drive the combined stream (poll it so closures execute).
     // The output actor stays alive via its pending stream, and values are stored
     // directly via store_value_directly() in the stream closures above.
-    // The TaskHandle is stored in task_handle_cell so it's dropped when the output is dropped.
-    let task_handle = Task::start_droppable(async move {
+    // The ActorLoop is stored in actor_loop_cell so it's dropped when the output is dropped.
+    let actor_loop = ActorLoop::new(async move {
         let mut stream = combined_stream;
         while stream.next().await.is_some() {
             // Values are already stored via store_value_directly in the map closures
         }
     });
-    *task_handle_cell.borrow_mut() = Some(task_handle);
+    *actor_loop_cell.borrow_mut() = Some(actor_loop);
 
     Ok(Some(output))
 }
@@ -3059,8 +3039,8 @@ fn build_text_literal_actor(
 ) -> Result<Arc<ValueActor>, String> {
     // Collect all parts - literals as constant streams, interpolations as variable lookups
     let mut part_actors: Vec<(bool, Arc<ValueActor>)> = Vec::new();
-    // Collect task handles to keep forwarding tasks alive
-    let mut forwarding_tasks: Vec<TaskHandle> = Vec::new();
+    // Collect actor loops to keep forwarding tasks alive
+    let mut forwarding_loops: Vec<ActorLoop> = Vec::new();
 
     for part in &parts {
         match part {
@@ -3122,8 +3102,8 @@ fn build_text_literal_actor(
                         None,
                     );
 
-                    // Spawn task to resolve reference and forward values
-                    let task_handle = Task::start_droppable(async move {
+                    // Create actor loop to resolve reference and forward values
+                    let actor_loop = ActorLoop::new(async move {
                         let actor = ref_connector.referenceable(ref_span_copy).await;
                         let mut subscription = actor.subscribe();
                         while let Some(value) = subscription.next().await {
@@ -3133,7 +3113,7 @@ fn build_text_literal_actor(
                             }
                         }
                     });
-                    forwarding_tasks.push(task_handle);
+                    forwarding_loops.push(actor_loop);
 
                     part_actors.push((false, ref_actor));
                 } else {
@@ -3177,10 +3157,10 @@ fn build_text_literal_actor(
         }));
 
         let part_count = part_actors.len();
-        // Move forwarding_tasks into scan state to keep them alive
+        // Move forwarding_loops into scan state to keep them alive
         let combined_stream = merged.scan(
-            (vec![None; part_count], forwarding_tasks),
-            move |(latest_values, _forwarding_tasks), (idx, value)| {
+            (vec![None; part_count], forwarding_loops),
+            move |(latest_values, _forwarding_loops), (idx, value)| {
                 latest_values[idx] = Some(value);
 
                 // Check if all parts have values

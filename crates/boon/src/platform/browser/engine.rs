@@ -143,6 +143,32 @@ pub fn constant<T>(item: T) -> TypedStream<impl Stream<Item = T>, Infinite> {
     TypedStream::infinite(stream::once(future::ready(item)).chain(stream::once(future::pending())))
 }
 
+// --- ActorLoop ---
+
+/// Encapsulates the async loop that makes an Actor an Actor.
+///
+/// This abstraction keeps `Task::start_droppable` in ONE place (here),
+/// rather than scattered throughout the codebase. All infrastructure
+/// actors (StorageActor, RegistryActor, BroadcastActor) should use this.
+///
+/// # Why This Exists
+/// - **Hardware portability**: Actors map to FSMs, Tasks are runtime-specific
+/// - **Conceptual clarity**: If something uses ActorLoop, it IS an Actor
+/// - **Single point of change**: If Task spawning changes, only change here
+pub struct ActorLoop {
+    handle: TaskHandle,
+}
+
+impl ActorLoop {
+    /// Create a new actor loop from an async closure.
+    /// The future should contain the actor's main loop (typically with select!).
+    pub fn new(future: impl Future<Output = ()> + 'static) -> Self {
+        Self {
+            handle: Task::start_droppable(future),
+        }
+    }
+}
+
 // --- switch_map ---
 
 /// Applies a function to each value from the outer stream, creating an inner stream.
@@ -160,6 +186,10 @@ pub fn constant<T>(item: T) -> TypedStream<impl Stream<Item = T>, Infinite> {
 ///
 /// This is essential for LINK-based paths where each LINK emission is a discrete event
 /// and we shouldn't continue processing fields from old events.
+///
+/// # Implementation
+/// Uses `stream::unfold()` for a pure demand-driven stream (no Task spawn).
+/// State is threaded through the unfold closure, making this a pure stream combinator.
 pub fn switch_map<S, F, U>(outer: S, f: F) -> LocalBoxStream<'static, U::Item>
 where
     S: Stream + 'static,
@@ -167,95 +197,74 @@ where
     U: Stream + 'static,
     U::Item: 'static,
 {
-    // Use a channel-based approach for clean switching
-    let (tx, rx) = mpsc::unbounded::<U::Item>();
+    use zoon::futures_util::stream::FusedStream;
 
-    // Spawn a task that manages the switch logic
-    // Store the handle to keep the task alive
-    let task_handle = Task::start_droppable({
-        let tx = tx;
-        async move {
-            let mut outer = outer.boxed_local();
-            let mut inner: Option<LocalBoxStream<'static, U::Item>> = None;
+    // Use type aliases to avoid complex generic inference issues
+    type FusedOuter<T> = stream::Fuse<LocalBoxStream<'static, T>>;
+    type FusedInner<T> = stream::Fuse<LocalBoxStream<'static, T>>;
 
-            loop {
-                match &mut inner {
-                    Some(inner_stream) => {
-                        // Poll both outer and inner using future::select
-                        use zoon::futures_util::future::Either;
-                        let outer_fut = outer.next();
-                        let inner_fut = inner_stream.next();
+    // State as tuple: (outer_stream, inner_stream_opt, map_fn)
+    let initial: (FusedOuter<S::Item>, Option<FusedInner<U::Item>>, F) = (
+        outer.boxed_local().fuse(),
+        None,
+        f,
+    );
 
-                        match future::select(pin!(outer_fut), pin!(inner_fut)).await {
-                            Either::Left((outer_opt, _inner_fut)) => {
-                                match outer_opt {
-                                    Some(value) => {
-                                        // Switch! Drop old inner (by replacing) and create new
-                                        inner = Some(f(value).boxed_local());
-                                    }
-                                    None => {
-                                        // Outer ended - drain inner then exit
-                                        while let Some(item) = inner_stream.next().await {
-                                            if tx.unbounded_send(item).is_err() {
-                                                return;
-                                            }
-                                        }
-                                        return;
-                                    }
+    stream::unfold(initial, |state| async move {
+        use zoon::futures_util::future::Either;
+
+        // Destructure state - we need to rebuild it for the return
+        let (mut outer_stream, mut inner_opt, map_fn) = state;
+
+        loop {
+            match &mut inner_opt {
+                Some(inner) if !inner.is_terminated() => {
+                    // Both streams active - race between them
+                    let outer_fut = outer_stream.next();
+                    let inner_fut = inner.next();
+
+                    match future::select(pin!(outer_fut), pin!(inner_fut)).await {
+                        Either::Left((outer_opt, _)) => {
+                            match outer_opt {
+                                Some(value) => {
+                                    // Switch! Drop old inner by replacing
+                                    inner_opt = Some(map_fn(value).boxed_local().fuse());
                                 }
-                            }
-                            Either::Right((inner_opt, _outer_fut)) => {
-                                match inner_opt {
-                                    Some(item) => {
-                                        if tx.unbounded_send(item).is_err() {
-                                            return; // Receiver dropped
-                                        }
+                                None => {
+                                    // Outer ended - drain inner then finish
+                                    while let Some(item) = inner.next().await {
+                                        return Some((item, (outer_stream, inner_opt, map_fn)));
                                     }
-                                    None => {
-                                        // Inner ended - clear it, wait for new outer value
-                                        inner = None;
-                                    }
+                                    return None;
                                 }
                             }
                         }
-                    }
-                    None => {
-                        // No inner stream - wait for outer value
-                        match outer.next().await {
-                            Some(value) => {
-                                inner = Some(f(value).boxed_local());
-                            }
-                            None => {
-                                return; // Outer ended, no inner - we're done
+                        Either::Right((inner_opt_val, _)) => {
+                            match inner_opt_val {
+                                Some(item) => {
+                                    return Some((item, (outer_stream, inner_opt, map_fn)));
+                                }
+                                None => {
+                                    // Inner ended - clear it
+                                    inner_opt = None;
+                                }
                             }
                         }
                     }
                 }
+                _ => {
+                    // No active inner stream - wait for outer value
+                    match outer_stream.next().await {
+                        Some(value) => {
+                            inner_opt = Some(map_fn(value).boxed_local().fuse());
+                        }
+                        None => return None, // Outer ended
+                    }
+                }
             }
         }
-    });
-
-    // Wrap the receiver in a stream that keeps the task handle alive
-    SwitchMapStream {
-        rx,
-        _task_handle: task_handle,
-    }.boxed_local()
-}
-
-/// Stream wrapper for switch_map that keeps the task handle alive
-#[pin_project::pin_project]
-struct SwitchMapStream<T> {
-    #[pin]
-    rx: mpsc::UnboundedReceiver<T>,
-    _task_handle: TaskHandle,
-}
-
-impl<T> Stream for SwitchMapStream<T> {
-    type Item = T;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.project().rx.poll_next(cx)
-    }
+    })
+    .boxed_local()
 }
 
 // --- BackpressuredStream ---
@@ -449,8 +458,8 @@ pub struct LazyValueActor {
     subscriber_counter: std::sync::atomic::AtomicUsize,
     /// Keep input actors alive
     inputs: Vec<Arc<ValueActor>>,
-    /// The actor's internal task
-    _task_handle: TaskHandle,
+    /// The actor's internal loop
+    actor_loop: ActorLoop,
 }
 
 impl LazyValueActor {
@@ -466,11 +475,11 @@ impl LazyValueActor {
         let construct_info = Arc::new(construct_info);
         let (request_tx, request_rx) = mpsc::unbounded::<LazyValueRequest>();
 
-        let task_handle = Task::start_droppable({
+        let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
             // Keep inputs alive in the task
             let _inputs = inputs.clone();
-            Self::actor_loop(construct_info, source_stream, request_rx)
+            Self::internal_loop(construct_info, source_stream, request_rx)
         });
 
         Self {
@@ -478,7 +487,7 @@ impl LazyValueActor {
             request_tx,
             subscriber_counter: std::sync::atomic::AtomicUsize::new(0),
             inputs,
-            _task_handle: task_handle,
+            actor_loop,
         }
     }
 
@@ -495,11 +504,11 @@ impl LazyValueActor {
         ))
     }
 
-    /// The internal actor loop that handles demand-driven value delivery.
+    /// The internal loop that handles demand-driven value delivery.
     ///
     /// This loop owns all state (buffer, cursors) - no locks needed.
     /// Values are only pulled from the source when a subscriber requests one.
-    async fn actor_loop<S: Stream<Item = Value> + 'static>(
+    async fn internal_loop<S: Stream<Item = Value> + 'static>(
         construct_info: Arc<ConstructInfoComplete>,
         source_stream: S,
         mut request_rx: mpsc::UnboundedReceiver<LazyValueRequest>,
@@ -863,6 +872,8 @@ pub struct ConstructContext {
 
 // --- ConstructStorage ---
 
+/// Actor for persistent storage operations.
+/// Uses ActorLoop internally to encapsulate the async task.
 pub struct ConstructStorage {
     state_inserter_sender: mpsc::UnboundedSender<(
         parser::PersistenceId,
@@ -873,7 +884,7 @@ pub struct ConstructStorage {
         parser::PersistenceId,
         oneshot::Sender<Option<serde_json::Value>>,
     )>,
-    loop_task: TaskHandle,
+    actor_loop: ActorLoop,
 }
 
 // @TODO Replace LocalStorage with IndexedDB
@@ -888,7 +899,7 @@ impl ConstructStorage {
         Self {
             state_inserter_sender,
             state_getter_sender,
-            loop_task: Task::start_droppable(async move {
+            actor_loop: ActorLoop::new(async move {
                 let mut states = match local_storage().get(&states_local_storage_key) {
                     None => BTreeMap::<String, serde_json::Value>::new(),
                     Some(Ok(states)) => states,
@@ -1024,9 +1035,11 @@ pub struct ActorContext {
 
 // --- ActorOutputValveSignal ---
 
+/// Actor for broadcasting impulses to multiple subscribers.
+/// Uses ActorLoop internally to encapsulate the async task.
 pub struct ActorOutputValveSignal {
     impulse_sender_sender: mpsc::UnboundedSender<mpsc::UnboundedSender<()>>,
-    loop_task: TaskHandle,
+    actor_loop: ActorLoop,
 }
 
 impl ActorOutputValveSignal {
@@ -1035,7 +1048,7 @@ impl ActorOutputValveSignal {
             mpsc::unbounded::<mpsc::UnboundedSender<()>>();
         Self {
             impulse_sender_sender,
-            loop_task: Task::start_droppable(async move {
+            actor_loop: ActorLoop::new(async move {
                 let mut impulse_stream = pin!(impulse_stream.fuse());
                 let mut impulse_senders = Vec::<mpsc::UnboundedSender<()>>::new();
                 loop {
@@ -1182,9 +1195,9 @@ pub struct Variable {
     name: Cow<'static, str>,
     value_actor: Arc<ValueActor>,
     link_value_sender: Option<mpsc::UnboundedSender<Value>>,
-    /// Holds the forwarding task for referenced fields (fixes forward reference race).
-    /// The TaskHandle must be kept alive to prevent the forwarding task from being cancelled.
-    forwarding_task: Option<TaskHandle>,
+    /// Holds the forwarding actor loop for referenced fields (fixes forward reference race).
+    /// The ActorLoop must be kept alive to prevent the forwarding task from being cancelled.
+    forwarding_loop: Option<ActorLoop>,
 }
 
 impl Variable {
@@ -1201,7 +1214,7 @@ impl Variable {
             name: name.into(),
             value_actor,
             link_value_sender: None,
-            forwarding_task: None,
+            forwarding_loop: None,
         }
     }
 
@@ -1221,15 +1234,15 @@ impl Variable {
         ))
     }
 
-    /// Create a new Arc<Variable> with a forwarding task.
-    /// The task will be kept alive as long as the Variable exists.
-    pub fn new_arc_with_forwarding_task(
+    /// Create a new Arc<Variable> with a forwarding actor loop.
+    /// The loop will be kept alive as long as the Variable exists.
+    pub fn new_arc_with_forwarding_loop(
         construct_info: ConstructInfo,
         construct_context: ConstructContext,
         name: impl Into<Cow<'static, str>>,
         value_actor: Arc<ValueActor>,
         persistence_id: Option<parser::PersistenceId>,
-        forwarding_task: TaskHandle,
+        forwarding_loop: ActorLoop,
     ) -> Arc<Self> {
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::Variable),
@@ -1237,7 +1250,7 @@ impl Variable {
             name: name.into(),
             value_actor,
             link_value_sender: None,
-            forwarding_task: Some(forwarding_task),
+            forwarding_loop: Some(forwarding_loop),
         })
     }
 
@@ -1275,7 +1288,7 @@ impl Variable {
             name: name.into(),
             value_actor: Arc::new(value_actor),
             link_value_sender: Some(link_value_sender),
-            forwarding_task: None,
+            forwarding_loop: None,
         })
     }
 
@@ -1464,11 +1477,13 @@ impl VariableOrArgumentReference {
 
 // --- ReferenceConnector ---
 
+/// Actor for connecting references to actors by span.
+/// Uses ActorLoop internally to encapsulate the async task.
 pub struct ReferenceConnector {
     referenceable_inserter_sender: mpsc::UnboundedSender<(parser::Span, Arc<ValueActor>)>,
     referenceable_getter_sender:
         mpsc::UnboundedSender<(parser::Span, oneshot::Sender<Arc<ValueActor>>)>,
-    loop_task: TaskHandle,
+    actor_loop: ActorLoop,
 }
 
 impl ReferenceConnector {
@@ -1479,7 +1494,7 @@ impl ReferenceConnector {
         Self {
             referenceable_inserter_sender,
             referenceable_getter_sender,
-            loop_task: Task::start_droppable(async move {
+            actor_loop: ActorLoop::new(async move {
                 let mut referenceables = HashMap::<parser::Span, Arc<ValueActor>>::new();
                 let mut referenceable_senders =
                     HashMap::<parser::Span, Vec<oneshot::Sender<Arc<ValueActor>>>>::new();
@@ -1593,13 +1608,14 @@ impl ReferenceConnector {
 
 // --- LinkConnector ---
 
-/// Connects LINK variables with their setters.
+/// Actor for connecting LINK variables with their setters.
 /// Similar to ReferenceConnector but stores mpsc senders for LINK variables.
+/// Uses ActorLoop internally to encapsulate the async task.
 pub struct LinkConnector {
     link_inserter_sender: mpsc::UnboundedSender<(parser::Span, mpsc::UnboundedSender<Value>)>,
     link_getter_sender:
         mpsc::UnboundedSender<(parser::Span, oneshot::Sender<mpsc::UnboundedSender<Value>>)>,
-    loop_task: TaskHandle,
+    actor_loop: ActorLoop,
 }
 
 impl LinkConnector {
@@ -1609,7 +1625,7 @@ impl LinkConnector {
         Self {
             link_inserter_sender,
             link_getter_sender,
-            loop_task: Task::start_droppable(async move {
+            actor_loop: ActorLoop::new(async move {
                 let mut links = HashMap::<parser::Span, mpsc::UnboundedSender<Value>>::new();
                 let mut link_senders =
                     HashMap::<parser::Span, Vec<oneshot::Sender<mpsc::UnboundedSender<Value>>>>::new();
@@ -1921,7 +1937,7 @@ impl ThenCombinator {
         let storage = construct_context.construct_storage.clone();
 
         let observed_for_subscribe = observed.clone();
-        let send_impulse_task = Task::start_droppable(
+        let send_impulse_loop = ActorLoop::new(
             observed_for_subscribe
                 // Use subscribe() to properly handle lazy actors in HOLD body context
                 .subscribe()
@@ -1983,11 +1999,11 @@ impl ThenCombinator {
         });
         // Subscription-based streams are infinite (subscriptions never terminate first)
         // Keep both observed and body alive as explicit dependencies
-        // Also leak the impulse task handle into the stream closure to keep it alive
+        // Also include the impulse actor loop in the stream state to keep it alive
         let value_stream = stream::unfold(
-            (value_stream, send_impulse_task, observed.clone()),
-            |(mut inner_stream, task, observed)| async move {
-                inner_stream.next().await.map(|value| (value, (inner_stream, task, observed)))
+            (value_stream, send_impulse_loop, observed.clone()),
+            |(mut inner_stream, actor_loop, observed)| async move {
+                inner_stream.next().await.map(|value| (value, (inner_stream, actor_loop, observed)))
             }
         );
         Arc::new(ValueActor::new_with_inputs(
@@ -2592,8 +2608,8 @@ pub struct ValueActor {
     /// This allows synchronous notification when values are stored directly.
     notify_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<()>>>>,
 
-    /// The actor's internal task.
-    loop_task: TaskHandle,
+    /// The actor's internal loop.
+    actor_loop: ActorLoop,
 
     /// Optional lazy delegate for demand-driven evaluation.
     /// When Some, subscribe() delegates to this lazy actor instead of the normal subscription.
@@ -2661,7 +2677,7 @@ impl ValueActor {
         let stream_ended_sync = false;
         let stream_ever_produced_sync = false;
 
-        let loop_task = Task::start_droppable({
+        let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
             let current_value = current_value.clone();
             let current_version = current_version.clone();
@@ -2849,7 +2865,7 @@ impl ValueActor {
             value_history,
             notify_sender_sender,
             notify_senders,
-            loop_task,
+            actor_loop,
             lazy_delegate: None,
         }
     }
@@ -2921,7 +2937,7 @@ impl ValueActor {
         let notify_senders = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         // Create a no-op task (the lazy delegate owns the real processing)
-        let loop_task = Task::start_droppable(async {});
+        let actor_loop = ActorLoop::new(async {});
 
         Arc::new(Self {
             construct_info,
@@ -2933,7 +2949,7 @@ impl ValueActor {
             value_history,
             notify_sender_sender,
             notify_senders,
-            loop_task,
+            actor_loop,
             lazy_delegate: Some(lazy_actor),
         })
     }
@@ -2971,7 +2987,7 @@ impl ValueActor {
         let notify_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<()>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        let loop_task = Task::start_droppable({
+        let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
             let current_value = current_value.clone();
             let current_version = current_version.clone();
@@ -3082,7 +3098,7 @@ impl ValueActor {
             value_history,
             notify_sender_sender,
             notify_senders,
-            loop_task,
+            actor_loop,
             lazy_delegate: None,
         }
     }
@@ -3136,6 +3152,48 @@ impl ValueActor {
         (actor, sender)
     }
 
+    /// Connect a forwarding actor to its source actor.
+    ///
+    /// This creates an ActorLoop that subscribes to the source actor and forwards
+    /// all values through the provided sender to the forwarding actor.
+    /// Optionally sends an initial value synchronously before starting the async forwarding.
+    ///
+    /// # Arguments
+    /// - `forwarding_sender`: The sender from `new_arc_forwarding()` to send values to
+    /// - `source_actor`: The source actor to subscribe to
+    /// - `initial_value`: Optional initial value to send synchronously before async forwarding
+    ///
+    /// # Returns
+    /// An ActorLoop that must be kept alive for forwarding to continue.
+    ///
+    /// # Usage Pattern
+    /// ```ignore
+    /// let (forwarding_actor, sender) = ValueActor::new_arc_forwarding(...);
+    /// // Register forwarding_actor immediately
+    /// // Later, when source_actor is available:
+    /// let actor_loop = ValueActor::connect_forwarding(sender, source_actor, initial_value);
+    /// // Store actor_loop to keep forwarding alive
+    /// ```
+    pub fn connect_forwarding(
+        forwarding_sender: mpsc::UnboundedSender<Value>,
+        source_actor: Arc<ValueActor>,
+        initial_value: Option<Value>,
+    ) -> ActorLoop {
+        // Send initial value synchronously if provided
+        if let Some(value) = initial_value {
+            let _ = forwarding_sender.unbounded_send(value);
+        }
+
+        ActorLoop::new(async move {
+            let mut subscription = source_actor.subscribe();
+            while let Some(value) = subscription.next().await {
+                if forwarding_sender.unbounded_send(value).is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
     /// Create a new Arc<ValueActor> with an initial value pre-set.
     /// This ensures the value is immediately available to subscribers without
     /// waiting for the async task to poll the stream.
@@ -3168,7 +3226,7 @@ impl ValueActor {
         let notify_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<()>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        let loop_task = Task::start_droppable({
+        let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
             let current_value = current_value.clone();
             let current_version = current_version.clone();
@@ -3265,7 +3323,7 @@ impl ValueActor {
             value_history,
             notify_sender_sender,
             notify_senders,
-            loop_task,
+            actor_loop,
             lazy_delegate: None,
         })
     }
@@ -4828,7 +4886,7 @@ impl Drop for Number {
 
 pub struct List {
     construct_info: Arc<ConstructInfoComplete>,
-    loop_task: TaskHandle,
+    actor_loop: ActorLoop,
     change_sender_sender: mpsc::UnboundedSender<mpsc::UnboundedSender<ListChange>>,
     /// Current version (increments on each change)
     current_version: Arc<AtomicU64>,
@@ -4872,7 +4930,7 @@ impl List {
         let diff_history = Arc::new(RefCell::new(DiffHistory::new(DiffHistoryConfig::default())));
         let diff_history_for_loop = diff_history.clone();
 
-        let loop_task = Task::start_droppable({
+        let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
             let output_valve_signal = actor_context.output_valve_signal;
             async move {
@@ -4984,7 +5042,7 @@ impl List {
         });
         Self {
             construct_info,
-            loop_task,
+            actor_loop,
             change_sender_sender,
             current_version,
             notify_sender_sender,

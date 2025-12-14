@@ -1,12 +1,8 @@
-use std::cell::RefCell;
 use std::future;
-use std::rc::Rc;
 use std::sync::Arc;
-use std::task::Poll;
 
 use zoon::Timer;
-use zoon::{Task, TaskHandle};
-use zoon::futures_util::{select, stream::{self, Stream, StreamExt}, FutureExt};
+use zoon::futures_util::{select, stream::{self, LocalBoxStream, Stream, StreamExt}, FutureExt};
 use zoon::println;
 use zoon::futures_channel::mpsc;
 use zoon::{Deserialize, Serialize, serde};
@@ -2322,180 +2318,202 @@ pub fn function_file_write_text(
 /// Stream/skip(count) -> Stream<Value>
 /// Skips the first N values from the piped stream.
 /// When `count` changes, the skip counter resets and starts skipping again.
+///
+/// # Implementation
+/// Uses `stream::unfold()` for a pure demand-driven stream (no Task spawn).
 pub fn function_stream_skip(
     arguments: Arc<Vec<Arc<ValueActor>>>,
-    function_call_id: ConstructId,
+    _function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
-    construct_context: ConstructContext,
+    _construct_context: ConstructContext,
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let stream_actor = arguments[0].clone();
     let count_actor = arguments[1].clone();
 
-    // Create a channel for output
-    let (tx, rx) = mpsc::unbounded::<Value>();
+    // State type for unfold
+    type FusedSub = stream::Fuse<LocalBoxStream<'static, Value>>;
 
     // Subscribe to both streams IMMEDIATELY to not miss synchronous values
-    let mut stream_sub = stream_actor.subscribe().fuse();
-    let mut count_sub = count_actor.subscribe().fuse();
+    let initial_state: (FusedSub, FusedSub, usize, usize, bool, Vec<Value>) = (
+        stream_actor.subscribe().boxed_local().fuse(),
+        count_actor.subscribe().boxed_local().fuse(),
+        0,     // current_skip_count
+        0,     // skipped
+        false, // count_received
+        Vec::new(), // buffered_values
+    );
 
-    // State
-    let mut current_skip_count: usize = 0;
-    let mut skipped: usize = 0;
-    let mut count_received = false;
-    let mut buffered_values: Vec<Value> = Vec::new();
+    stream::unfold(initial_state, |state| async move {
+        let (mut stream_sub, mut count_sub, mut skip_count, mut skipped, mut count_received, mut buffer) = state;
 
-    // Use Task::start_droppable and store handle so it's cancelled when the output stream is dropped.
-    // This ensures the task stops running when switching examples.
-    let task_handle_cell: Rc<RefCell<Option<TaskHandle>>> = Rc::new(RefCell::new(None));
-    let task_handle = Task::start_droppable(async move {
         loop {
-            select! {
-                count_value = count_sub.next() => {
-                    match count_value {
-                        Some(value) => {
-                            current_skip_count = match &value {
-                                Value::Number(num, _) => num.number() as usize,
-                                _ => 0,
-                            };
+            // If we have buffered values and count is received, process buffer first
+            if count_received && !buffer.is_empty() {
+                let buffered = buffer.remove(0);
+                if skipped < skip_count {
+                    skipped += 1;
+                    // Continue loop to process next buffered value
+                } else {
+                    return Some((buffered, (stream_sub, count_sub, skip_count, skipped, count_received, buffer)));
+                }
+                continue;
+            }
 
-                            if count_received {
-                                // Count changed - reset skip counter
-                                skipped = 0;
-                            } else {
-                                // First count received - process buffered values
+            if !count_received {
+                // Wait for count first, buffer stream values
+                select! {
+                    count_value = count_sub.next() => {
+                        match count_value {
+                            Some(value) => {
+                                skip_count = match &value {
+                                    Value::Number(num, _) => num.number() as usize,
+                                    _ => 0,
+                                };
                                 count_received = true;
-                                for buffered in buffered_values.drain(..) {
-                                    if skipped < current_skip_count {
-                                        skipped += 1;
-                                    } else {
-                                        let _ = tx.unbounded_send(buffered);
-                                    }
-                                }
+                                // Buffer processing will happen on next loop iteration
                             }
+                            None => return None, // Count stream ended
                         }
-                        None => break, // Count stream ended
+                    }
+                    stream_value = stream_sub.next() => {
+                        match stream_value {
+                            Some(value) => buffer.push(value),
+                            None => return None, // Stream ended
+                        }
                     }
                 }
-                stream_value = stream_sub.next() => {
-                    match stream_value {
-                        Some(value) => {
-                            if !count_received {
-                                // Buffer values until we know the count
-                                buffered_values.push(value);
-                            } else {
-                                if skipped < current_skip_count {
+            } else {
+                // Normal operation - skip values
+                select! {
+                    count_value = count_sub.next() => {
+                        match count_value {
+                            Some(value) => {
+                                skip_count = match &value {
+                                    Value::Number(num, _) => num.number() as usize,
+                                    _ => 0,
+                                };
+                                skipped = 0; // Reset on count change
+                            }
+                            None => return None, // Count stream ended
+                        }
+                    }
+                    stream_value = stream_sub.next() => {
+                        match stream_value {
+                            Some(value) => {
+                                if skipped < skip_count {
                                     skipped += 1;
                                 } else {
-                                    // Debug: print value construct_info
-                                    let _ = tx.unbounded_send(value);
+                                    return Some((value, (stream_sub, count_sub, skip_count, skipped, count_received, buffer)));
                                 }
                             }
+                            None => return None, // Stream ended
                         }
-                        None => break, // Stream ended
                     }
                 }
-                complete => break,
             }
         }
-    });
-    *task_handle_cell.borrow_mut() = Some(task_handle);
-
-    // Return a wrapper stream that keeps the TaskHandle alive via the Rc.
-    // When this stream is dropped, the Rc refcount drops, dropping the TaskHandle, cancelling the task.
-    let task_handle_cell_for_stream = task_handle_cell.clone();
-    rx.chain(stream::poll_fn(move |_cx| {
-        // Keep the Rc alive - this holds the TaskHandle
-        let _keep_alive = task_handle_cell_for_stream.borrow();
-        Poll::Pending::<Option<Value>>
-    }))
+    })
 }
 
 /// Stream/take(count) -> Stream<Value>
 /// Takes only the first N values from the piped stream.
 /// When `count` changes, the take counter resets.
+///
+/// # Implementation
+/// Uses `stream::unfold()` for a pure demand-driven stream (no Task spawn).
 pub fn function_stream_take(
     arguments: Arc<Vec<Arc<ValueActor>>>,
-    function_call_id: ConstructId,
+    _function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
-    construct_context: ConstructContext,
+    _construct_context: ConstructContext,
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let stream_actor = arguments[0].clone();
     let count_actor = arguments[1].clone();
 
-    // Create a channel for output
-    let (tx, rx) = mpsc::unbounded::<Value>();
+    // State type for unfold
+    type FusedSub = stream::Fuse<LocalBoxStream<'static, Value>>;
 
     // Subscribe to both streams IMMEDIATELY to not miss synchronous values
-    let mut stream_sub = stream_actor.subscribe().fuse();
-    let mut count_sub = count_actor.subscribe().fuse();
+    let initial_state: (FusedSub, FusedSub, usize, usize, bool, Vec<Value>) = (
+        stream_actor.subscribe().boxed_local().fuse(),
+        count_actor.subscribe().boxed_local().fuse(),
+        0,     // current_take_count
+        0,     // taken
+        false, // count_received
+        Vec::new(), // buffered_values
+    );
 
-    // State
-    let mut current_take_count: usize = 0;
-    let mut taken: usize = 0;
-    let mut count_received = false;
-    let mut buffered_values: Vec<Value> = Vec::new();
+    stream::unfold(initial_state, |state| async move {
+        let (mut stream_sub, mut count_sub, mut take_count, mut taken, mut count_received, mut buffer) = state;
 
-    // Use Task::start_droppable and store handle so it's cancelled when the output stream is dropped.
-    let task_handle_cell: Rc<RefCell<Option<TaskHandle>>> = Rc::new(RefCell::new(None));
-    let task_handle = Task::start_droppable(async move {
         loop {
-            select! {
-                count_value = count_sub.next() => {
-                    match count_value {
-                        Some(value) => {
-                            current_take_count = match &value {
-                                Value::Number(num, _) => num.number() as usize,
-                                _ => 0,
-                            };
+            // If we have buffered values and count is received, process buffer first
+            if count_received && !buffer.is_empty() {
+                let buffered = buffer.remove(0);
+                if taken < take_count {
+                    taken += 1;
+                    return Some((buffered, (stream_sub, count_sub, take_count, taken, count_received, buffer)));
+                }
+                // Exceeded take limit, drop this buffered value and continue
+                continue;
+            }
 
-                            if count_received {
-                                // Count changed - reset take counter
-                                taken = 0;
-                            } else {
-                                // First count received - process buffered values
+            if !count_received {
+                // Wait for count first, buffer stream values
+                select! {
+                    count_value = count_sub.next() => {
+                        match count_value {
+                            Some(value) => {
+                                take_count = match &value {
+                                    Value::Number(num, _) => num.number() as usize,
+                                    _ => 0,
+                                };
                                 count_received = true;
-                                for buffered in buffered_values.drain(..) {
-                                    if taken < current_take_count {
-                                        taken += 1;
-                                        let _ = tx.unbounded_send(buffered);
-                                    }
-                                }
+                                // Buffer processing will happen on next loop iteration
                             }
+                            None => return None, // Count stream ended
                         }
-                        None => break, // Count stream ended
+                    }
+                    stream_value = stream_sub.next() => {
+                        match stream_value {
+                            Some(value) => buffer.push(value),
+                            None => return None, // Stream ended
+                        }
                     }
                 }
-                stream_value = stream_sub.next() => {
-                    match stream_value {
-                        Some(value) => {
-                            if !count_received {
-                                // Buffer values until we know the count
-                                buffered_values.push(value);
-                            } else {
-                                if taken < current_take_count {
+            } else {
+                // Normal operation - take values up to limit
+                select! {
+                    count_value = count_sub.next() => {
+                        match count_value {
+                            Some(value) => {
+                                take_count = match &value {
+                                    Value::Number(num, _) => num.number() as usize,
+                                    _ => 0,
+                                };
+                                taken = 0; // Reset on count change
+                            }
+                            None => return None, // Count stream ended
+                        }
+                    }
+                    stream_value = stream_sub.next() => {
+                        match stream_value {
+                            Some(value) => {
+                                if taken < take_count {
                                     taken += 1;
-                                    let _ = tx.unbounded_send(value);
+                                    return Some((value, (stream_sub, count_sub, take_count, taken, count_received, buffer)));
                                 }
-                                // After taking enough, just drop subsequent values
+                                // After taking enough, drop subsequent values (but keep listening for count changes)
                             }
+                            None => return None, // Stream ended
                         }
-                        None => break, // Stream ended
                     }
                 }
-                complete => break,
             }
         }
-    });
-    *task_handle_cell.borrow_mut() = Some(task_handle);
-
-    // Return a wrapper stream that keeps the TaskHandle alive via the Rc.
-    let task_handle_cell_for_stream = task_handle_cell.clone();
-    rx.chain(stream::poll_fn(move |_cx| {
-        let _keep_alive = task_handle_cell_for_stream.borrow();
-        Poll::Pending::<Option<Value>>
-    }))
+    })
 }
 
 /// Stream/distinct() -> Stream<Value>
@@ -2592,6 +2610,9 @@ pub fn function_stream_pulses(
 /// When a new value arrives, it resets the timer. Only when the timer expires (no new values
 /// for `duration`), the most recent value is emitted.
 /// When `duration` changes, the debounce timer is updated with the new duration.
+///
+/// # Implementation
+/// Uses `stream::unfold()` for a pure demand-driven stream (no Task spawn).
 pub fn function_stream_debounce(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     _function_call_id: ConstructId,
@@ -2602,104 +2623,97 @@ pub fn function_stream_debounce(
     let stream_actor = arguments[0].clone();
     let duration_actor = arguments[1].clone();
 
-    // Create a channel to send debounced values
-    let (sender, receiver) = mpsc::unbounded::<Value>();
-
-    // Spawn a task that handles the debounce logic
-    let _debounce_task = Task::start_droppable({
-        async move {
-            let mut input_stream = stream_actor.subscribe().fuse();
-            let mut duration_stream = duration_actor.subscribe().fuse();
-
-            let mut pending_value: Option<Value> = None;
-            let mut current_duration_ms: f64 = 0.0;
-
-            // Helper to extract milliseconds from Duration tagged object
-            fn extract_duration_ms(value: &Value) -> f64 {
-                let duration_object = value.clone().expect_tagged_object("Duration");
-                if let Some(seconds) = duration_object.variable("seconds") {
-                    // Subscribe to get the first value
-                    // Note: This is synchronous because duration values typically emit immediately
-                    let mut sub = seconds.value_actor().subscribe();
-                    if let Some(value) = sub.next().now_or_never().flatten() {
-                        return value.expect_number().number() * 1000.0;
-                    }
-                }
-                if let Some(ms) = duration_object.variable("ms") {
-                    let mut sub = ms.value_actor().subscribe();
-                    if let Some(value) = sub.next().now_or_never().flatten() {
-                        return value.expect_number().number();
-                    }
-                }
-                if let Some(milliseconds) = duration_object.variable("milliseconds") {
-                    let mut sub = milliseconds.value_actor().subscribe();
-                    if let Some(value) = sub.next().now_or_never().flatten() {
-                        return value.expect_number().number();
-                    }
-                }
-                0.0
+    // Helper to extract milliseconds from Duration tagged object
+    fn extract_duration_ms(value: &Value) -> f64 {
+        let duration_object = value.clone().expect_tagged_object("Duration");
+        if let Some(seconds) = duration_object.variable("seconds") {
+            let mut sub = seconds.value_actor().subscribe();
+            if let Some(value) = sub.next().now_or_never().flatten() {
+                return value.expect_number().number() * 1000.0;
             }
+        }
+        if let Some(ms) = duration_object.variable("ms") {
+            let mut sub = ms.value_actor().subscribe();
+            if let Some(value) = sub.next().now_or_never().flatten() {
+                return value.expect_number().number();
+            }
+        }
+        if let Some(milliseconds) = duration_object.variable("milliseconds") {
+            let mut sub = milliseconds.value_actor().subscribe();
+            if let Some(value) = sub.next().now_or_never().flatten() {
+                return value.expect_number().number();
+            }
+        }
+        0.0
+    }
 
-            loop {
-                if pending_value.is_some() && current_duration_ms > 0.0 {
-                    // We have a pending value and a valid duration - race between timer and new input
-                    let mut timer = Box::pin(Timer::sleep(current_duration_ms.round() as u32).fuse());
+    // State type for unfold
+    type FusedSub = stream::Fuse<LocalBoxStream<'static, Value>>;
 
-                    select! {
-                        new_value = input_stream.next() => {
-                            match new_value {
-                                Some(value) => {
-                                    // New value arrived - update pending and restart timer
-                                    pending_value = Some(value);
-                                }
-                                None => {
-                                    // Input stream ended - emit pending and exit
-                                    if let Some(value) = pending_value.take() {
-                                        let _ = sender.unbounded_send(value);
-                                    }
-                                    break;
-                                }
+    let initial_state: (FusedSub, FusedSub, Option<Value>, f64) = (
+        stream_actor.subscribe().boxed_local().fuse(),
+        duration_actor.subscribe().boxed_local().fuse(),
+        None, // pending_value
+        0.0,  // current_duration_ms
+    );
+
+    stream::unfold(initial_state, |state| async move {
+        let (mut input_stream, mut duration_stream, mut pending, mut duration_ms) = state;
+
+        loop {
+            if pending.is_some() && duration_ms > 0.0 {
+                // Have pending value and valid duration - race timer vs new input
+                let mut timer = Box::pin(Timer::sleep(duration_ms.round() as u32).fuse());
+
+                select! {
+                    new_value = input_stream.next() => {
+                        match new_value {
+                            Some(value) => {
+                                // New value - update pending, timer restarts on next loop
+                                pending = Some(value);
                             }
-                        }
-                        new_duration = duration_stream.next() => {
-                            if let Some(duration_value) = new_duration {
-                                current_duration_ms = extract_duration_ms(&duration_value);
-                            }
-                            // Continue loop with updated duration
-                        }
-                        _ = timer.as_mut() => {
-                            // Timer expired - emit the pending value
-                            if let Some(value) = pending_value.take() {
-                                let _ = sender.unbounded_send(value);
+                            None => {
+                                // Input ended - emit pending and finish
+                                if let Some(value) = pending.take() {
+                                    return Some((value, (input_stream, duration_stream, None, duration_ms)));
+                                }
+                                return None;
                             }
                         }
                     }
-                } else {
-                    // No pending value or no duration yet - wait for input or duration
-                    select! {
-                        new_value = input_stream.next() => {
-                            match new_value {
-                                Some(value) => {
-                                    pending_value = Some(value);
-                                }
-                                None => {
-                                    // Input stream ended
-                                    break;
-                                }
-                            }
+                    new_duration = duration_stream.next() => {
+                        if let Some(duration_value) = new_duration {
+                            duration_ms = extract_duration_ms(&duration_value);
                         }
-                        new_duration = duration_stream.next() => {
-                            if let Some(duration_value) = new_duration {
-                                current_duration_ms = extract_duration_ms(&duration_value);
+                        // Continue with updated duration
+                    }
+                    _ = timer.as_mut() => {
+                        // Timer expired - emit pending
+                        if let Some(value) = pending.take() {
+                            return Some((value, (input_stream, duration_stream, None, duration_ms)));
+                        }
+                    }
+                }
+            } else {
+                // No pending or no duration - wait for input or duration
+                select! {
+                    new_value = input_stream.next() => {
+                        match new_value {
+                            Some(value) => {
+                                pending = Some(value);
                             }
+                            None => return None, // Input ended
+                        }
+                    }
+                    new_duration = duration_stream.next() => {
+                        if let Some(duration_value) = new_duration {
+                            duration_ms = extract_duration_ms(&duration_value);
                         }
                     }
                 }
             }
         }
-    });
-
-    receiver
+    })
 }
 
 // --- Directory functions ---
