@@ -644,6 +644,35 @@ pub fn function_element_checkbox(
     else {
         panic!("Element/checkbox expects 5 arguments")
     };
+
+    // Create a derived actor that extracts `event` from argument_element
+    // This allows direct access via `.event` instead of `.element.event`
+    let argument_element_for_event = argument_element.clone();
+    let event_stream = stream::once(async move {
+        argument_element_for_event
+            .subscribe().await
+            .filter_map(|value| {
+                // value is Object [event: [...]]
+                future::ready(value.expect_object().variable("event"))
+            })
+            .then(|event_variable| async move {
+                // Subscribe to get the event object values [click: LINK]
+                event_variable.subscribe().await
+            })
+            .flatten()
+    }).flatten();
+
+    let event_actor = ValueActor::new_arc(
+        ConstructInfo::new(
+            function_call_id.with_child_id(8),
+            None,
+            "ElementCheckbox[event] (derived)",
+        ),
+        actor_context.clone(),
+        TypedStream::infinite(event_stream.chain(stream::pending())),
+        None,
+    );
+
     TaggedObject::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -663,6 +692,17 @@ pub fn function_element_checkbox(
                 construct_context.clone(),
                 "element",
                 argument_element.clone(),
+                None,
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(9),
+                    None,
+                    "ElementCheckbox[event]",
+                ),
+                construct_context.clone(),
+                "event",
+                event_actor,
                 None,
             ),
             Variable::new_arc(
@@ -1181,6 +1221,22 @@ pub fn function_text_empty(
         construct_context,
         ValueIdempotencyKey::new(),
         String::new(),
+    )))
+}
+
+/// Text/space constant - returns a single space character " "
+pub fn function_text_space(
+    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    function_call_id: ConstructId,
+    _function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
+    _actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    stream::once(future::ready(Text::new_value(
+        ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/space"),
+        construct_context,
+        ValueIdempotencyKey::new(),
+        " ".to_string(),
     )))
 }
 

@@ -3052,46 +3052,109 @@ fn build_text_literal_actor(
                 part_actors.push((true, text_actor));
             }
             static_expression::TextPart::Interpolation { var, referenced_span } => {
-                // Interpolation - look up the variable
+                // Interpolation - look up the variable (supports field access paths like "item.text")
                 let var_name = var.to_string();
-                if let Some(var_actor) = ctx.actor_context.parameters.get(&var_name) {
-                    part_actors.push((false, var_actor.clone()));
+                let parts: Vec<&str> = var_name.split('.').collect();
+                let base_name = parts[0];
+                let field_path: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+
+                // Look up the base variable
+                let base_actor = if let Some(var_actor) = ctx.actor_context.parameters.get(base_name) {
+                    Some(var_actor.clone())
                 } else if let Some(ref_span) = referenced_span {
-                    // Use reference_connector to get the variable from outer scope
-                    // Create a forwarding actor that immediately starts forwarding values
-                    // from the referenced actor via a dedicated task.
-                    // This avoids timing issues with the lazy stream approach.
+                    // Use reference_connector for outer scope
                     let ref_connector = ctx.try_reference_connector()
                         .ok_or_else(|| "ReferenceConnector dropped - program shutting down".to_string())?;
                     let ref_span_copy = *ref_span;
 
-                    // Create forwarding actor with unbounded channel
-                    let (ref_actor, sender) = ValueActor::new_arc_forwarding(
+                    // Create forwarding actor for the base variable
+                    let (base_ref_actor, base_sender) = ValueActor::new_arc_forwarding(
                         ConstructInfo::new(
-                            format!("TextInterpolation:{}", var_name),
+                            format!("TextInterpolation:{}:base", var_name),
                             None,
-                            format!("{span}; TextInterpolation for '{}'", var_name),
+                            format!("{span}; TextInterpolation base for '{}'", base_name),
                         ),
                         ctx.actor_context.clone(),
                         None,
                     );
 
-                    // Create actor loop to resolve reference and forward values
                     let actor_loop = ActorLoop::new(async move {
                         let actor = ref_connector.referenceable(ref_span_copy).await;
                         let mut subscription = actor.subscribe().await;
                         while let Some(value) = subscription.next().await {
-                            if sender.unbounded_send(value).is_err() {
-                                // Receiver dropped, stop forwarding
+                            if base_sender.unbounded_send(value).is_err() {
                                 break;
                             }
                         }
                     });
                     forwarding_loops.push(actor_loop);
-
-                    part_actors.push((false, ref_actor));
+                    Some(base_ref_actor)
                 } else {
-                    return Err(format!("Variable '{}' not found for text interpolation", var_name));
+                    None
+                };
+
+                if let Some(base_actor) = base_actor {
+                    if field_path.is_empty() {
+                        // Simple variable, no field access
+                        part_actors.push((false, base_actor));
+                    } else {
+                        // Field access path - create forwarding actor that resolves fields
+                        let (field_actor, field_sender) = ValueActor::new_arc_forwarding(
+                            ConstructInfo::new(
+                                format!("TextInterpolation:{}", var_name),
+                                None,
+                                format!("{span}; TextInterpolation for '{}'", var_name),
+                            ),
+                            ctx.actor_context.clone(),
+                            None,
+                        );
+
+                        let actor_loop = ActorLoop::new(async move {
+                            let mut subscription = base_actor.subscribe().await;
+                            while let Some(value) = subscription.next().await {
+                                // Resolve the field path
+                                let mut current_value = value;
+                                for field_name in &field_path {
+                                    match &current_value {
+                                        Value::Object(obj, _) => {
+                                            if let Some(var) = obj.variable(field_name) {
+                                                if let Some(val) = var.value_actor().stored_value().await {
+                                                    current_value = val;
+                                                } else {
+                                                    // Field not ready yet, skip
+                                                    break;
+                                                }
+                                            } else {
+                                                // Field not found
+                                                break;
+                                            }
+                                        }
+                                        Value::TaggedObject(tagged, _) => {
+                                            if let Some(var) = tagged.variable(field_name) {
+                                                if let Some(val) = var.value_actor().stored_value().await {
+                                                    current_value = val;
+                                                } else {
+                                                    break;
+                                                }
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        _ => break, // Not an object, can't access fields
+                                    }
+                                }
+                                if field_sender.unbounded_send(current_value).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                        forwarding_loops.push(actor_loop);
+
+                        part_actors.push((false, field_actor));
+                    }
+                } else {
+                    return Err(format!("Variable '{}' not found for text interpolation. Available: {:?}",
+                        var_name, ctx.actor_context.parameters.keys().collect::<Vec<_>>()));
                 }
             }
         }
@@ -3405,6 +3468,7 @@ fn build_list_binding_function(
         reference_connector,
         link_connector,
         source_code: ctx.source_code.clone(),
+        function_registry_snapshot: ctx.function_registry_snapshot.clone(),
     };
 
     let result = ListBindingFunction::new_arc_value_actor(
@@ -4307,9 +4371,9 @@ fn flatten_pipe_chain(
     chain
 }
 
-///
-/// Note: User-defined function calls inside the expression will not work
-/// (the function registry is empty). Built-in functions and operators work fine.
+/// Evaluates a static expression with optional function registry.
+/// If `function_registry_snapshot` is provided, user-defined functions are available.
+/// Otherwise, only built-in functions and operators work.
 pub fn evaluate_static_expression(
     static_expr: &static_expression::Spanned<static_expression::Expression>,
     construct_context: ConstructContext,
@@ -4318,14 +4382,39 @@ pub fn evaluate_static_expression(
     link_connector: Arc<LinkConnector>,
     source_code: SourceCode,
 ) -> Result<Arc<ValueActor>, String> {
-    let empty_registry = FunctionRegistry::new();
+    evaluate_static_expression_with_registry(
+        static_expr,
+        construct_context,
+        actor_context,
+        reference_connector,
+        link_connector,
+        source_code,
+        None,
+    )
+}
+
+/// Evaluates a static expression with an optional function registry snapshot.
+/// When registry is provided, user-defined function calls work.
+pub fn evaluate_static_expression_with_registry(
+    static_expr: &static_expression::Spanned<static_expression::Expression>,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+    reference_connector: Arc<ReferenceConnector>,
+    link_connector: Arc<LinkConnector>,
+    source_code: SourceCode,
+    function_registry_snapshot: Option<Arc<FunctionRegistry>>,
+) -> Result<Arc<ValueActor>, String> {
+    // Use the provided registry or create an empty one
+    let registry = function_registry_snapshot
+        .map(|snap| (*snap).clone())
+        .unwrap_or_else(FunctionRegistry::new);
     static_spanned_expression_into_value_actor(
         static_expr.clone(),
         construct_context,
         actor_context,
         reference_connector,
         link_connector,
-        &empty_registry,
+        &registry,
         ModuleLoader::default(),
         source_code,
     )
@@ -4391,6 +4480,10 @@ fn static_function_call_path_to_definition(
         },
         ["Text", "empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
             api::function_text_empty(arguments, id, persistence_id, construct_context, actor_context)
+                .boxed_local()
+        },
+        ["Text", "space"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_text_space(arguments, id, persistence_id, construct_context, actor_context)
                 .boxed_local()
         },
         ["Text", "trim"] => |arguments, id, persistence_id, construct_context, actor_context| {

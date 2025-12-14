@@ -21,39 +21,27 @@ store: [
             elements.filter_buttons.completed.event.press |> THEN { TEXT { /completed } }
         }
         |> Router/go_to()
-    title_to_save: elements.new_todo_title_text_input.event.key_down.key |> WHEN {
+    title_to_add: elements.new_todo_title_text_input.event.key_down.key |> WHEN {
         Enter => BLOCK {
-            new_todo_title: elements.new_todo_title_text_input.text |> Text/trim()
-            new_todo_title
-                |> Text/is_not_empty()
-                |> WHEN { True => new_todo_title, False => SKIP }
+            trimmed: elements.new_todo_title_text_input.text |> Text/trim()
+            trimmed |> Text/is_not_empty() |> WHEN { True => trimmed, False => SKIP }
         }
         __ => SKIP
     }
-    todos: LIST {}
-        |> List/append(item: title_to_save |> new_todo())
-        |> List/retain(item, if: LATEST {
-            True
-            item.todo_elements.remove_todo_button.event.press 
-                |> THEN { False }
-            elements.remove_completed_button.event.press 
-                |> THEN { item.completed |> Bool/not() }
-        })
-    selected_todo_id: LATEST {
-        None
-        todos
-            |> List/map(old, new: LATEST {
-                old.todo_elements.editing_todo_title_element.event.key_down.key
-                    |> WHEN { Escape => None, __ => SKIP }
-                old.title_to_update 
-                    |> THEN { None }
-                old.todo_elements.todo_title_element.event.double_click 
-                    |> THEN { old.id }
-            })
-            |> List/latest()
-    }
+    -- Create todo Objects with id, title, completed fields
+    todo_to_add: title_to_add |> WHEN { t => new_todo(title: t) }
+    -- Start with initial todos using proper Objects
+    todos: LIST { new_todo(title: TEXT { Buy groceries }), new_todo(title: TEXT { Clean room }) } |> List/append(item: todo_to_add)
+    -- Simplified for debugging
+    selected_todo_id: None
 ]
 
+-- Simple helper function that just wraps text in object
+FUNCTION make_todo_object(t) {
+    [text: t]
+}
+
+-- Create a new todo with reactive completed state
 FUNCTION new_todo(title) {
     [
         todo_elements: [
@@ -63,41 +51,10 @@ FUNCTION new_todo(title) {
             todo_checkbox: LINK
         ]
         id: TodoId[id: Ulid/generate()]
-        title_to_update:
-            LATEST {
-                todo_elements.editing_todo_title_element.event.blur
-                    |> THEN { [] }
-                todo_elements.editing_todo_title_element.event.key_down.key 
-                    |> WHEN { Enter => [], __ => SKIP }
-            }
-            |> THEN { todo_elements.editing_todo_title_element.text }
-        title: LATEST {
-            title
-            title_to_update
-        }
-        completed:
-            LATEST {
-                False
-                store.elements.toggle_all_checkbox.event.click |> THEN {
-                    store.todos
-                        |> List/every(item, if: item.completed)
-                        |> Bool/not()
-                }
-            }
-            |> Bool/toggle(when: todo_elements.todo_checkbox.event.click)
-        edited_title: BLOCK {
-            edited_title: LATEST {
-                Text/empty()
-                todo_elements.editing_todo_title_element.event.change.text
-                title_to_update |> THEN { Text/empty() }
-            }
-            LATEST {
-                edited_title
-                todo_elements.todo_title_element.event.double_click |> THEN {
-                    edited_title
-                        |> Text/is_empty()
-                        |> WHEN { True => title, False => SKIP }
-                }
+        title: title
+        completed: False |> HOLD state {
+            todo_elements.todo_checkbox.event.click |> THEN {
+                state |> Bool/not()
             }
         }
     ]
@@ -113,6 +70,7 @@ FUNCTION root_element() {
         style: [
             width: Fill
             height: [sizing: Fill, minimum: Screen]
+            align: [row: Center]
             font: [
                 size: 14
                 color: Oklch[lightness: 0.17]
@@ -136,7 +94,7 @@ FUNCTION content_element() {
         direction: Column
         gap: 0
         style: [
-            width: [sizing: Fill, minimum: 230, maximum: 550]
+            width: 550
             align: [row: Center]
         ]
         items: LIST {
@@ -224,7 +182,7 @@ FUNCTION new_todo_title_text_input() {
         text: LATEST {
             Text/empty()
             element.event.change.text
-            PASSED.store.title_to_save |> THEN { Text/empty() }
+            PASSED.store.title_to_add |> THEN { Text/empty() }
         }
         placeholder: [
             style: [font: [style: Italic, color: Oklch[lightness: 0.925]]]
@@ -235,38 +193,44 @@ FUNCTION new_todo_title_text_input() {
 
 }
 
+-- Render todo Objects using full todo_element, filtered by selected_filter
 FUNCTION todos_element() {
-    Element/stack(
-        element: []
-        style: [width: Fill]
-        layers: LIST {
-            Element/stripe(
-                element: []
-                direction: Column
-                gap: 1
-                style: [
-                    borders: [top: [color: Oklch[lightness: 0.915]]]
-                    background: [color: Oklch[lightness: 0.946]]
-                ]
-                items: PASSED.store.todos
-                    |> List/retain(item, if: PASSED.store.selected_filter |> WHILE {
-                        All => True
-                        Active => item.completed |> Bool/not()
-                        Completed => item.completed
-                    })
-                    |> List/map(old, new: old |> todo_element())
-            )
-            Element/container(
-                element: []
-                style: [
-                    width: 60
-                    height: Fill
-                    align: [row: Left, column: Top]
-                ]
-                child: toggle_all_checkbox()
-                    |> LINK { PASSED.store.elements.toggle_all_checkbox }
-            )
-        }
+    Element/stripe(
+        element: [tag: Ul]
+        direction: Column
+        gap: 0
+        style: []
+        -- Filter inside List/map using WHEN (workaround for List/retain |> List/map bug)
+        items: PASSED.store.todos
+            |> List/map(item, new: BLOCK {
+                should_show: PASSED.store.selected_filter |> WHEN {
+                    All => True
+                    Active => item.completed |> Bool/not()
+                    Completed => item.completed
+                }
+                should_show |> WHILE {
+                    True => Element/stripe(
+                        element: []
+                        direction: Row
+                        gap: 5
+                        style: [
+                            width: Fill
+                            background: [color: Oklch[lightness: 1]]
+                            font: [size: 24]
+                            padding: [row: 15, column: 10]
+                        ]
+                        items: LIST {
+                            todo_checkbox(todo: item)
+                            Element/label(
+                                element: []
+                                style: [width: Fill, font: [size: 24, color: Oklch[lightness: 0.42]]]
+                                label: item.title
+                            )
+                        }
+                    )
+                    False => NoElement
+                }
+            })
     )
 }
 
@@ -279,23 +243,11 @@ FUNCTION todo_element(todo) {
             width: Fill
             background: [color: Oklch[lightness: 1]]
             font: [size: 24]
+            padding: [row: 15, column: 10]
         ]
-        items: PASSED.store.selected_todo_id == todo.id |> WHILE {
-            True => LIST {
-                editing_todo_title_element(todo: todo)
-                    |> LINK { todo.todo_elements.editing_todo_title_element }
-            }
-            False => LIST {
-                todo_checkbox(todo: todo)
-                    |> LINK { todo.todo_elements.todo_checkbox }
-                todo_title_element(todo: todo)
-                    |> LINK { todo.todo_elements.todo_title_element }
-                element.hovered |> WHILE {
-                    True => remove_todo_button()
-                        |> LINK { todo.todo_elements.remove_todo_button }
-                    False => NoElement
-                }
-            }
+        items: LIST {
+            todo_checkbox(todo: todo)
+            todo_title_element(todo: todo)
         }
     )
 }
@@ -305,7 +257,8 @@ FUNCTION toggle_all_checkbox() {
         element: [event: [click: LINK]]
         style: [width: 60, height: Fill]
         label: Hidden[text: TEXT { Toggle all }]
-        checked: PASSED.store.todos |> List/every(item, if: item.completed)
+        -- SIMPLIFIED: items are text now, not objects
+        checked: False
         icon: Element/container(
             element: []
             style: [
@@ -357,37 +310,31 @@ FUNCTION todo_checkbox(todo) {
         icon_active: TEXT { data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23ededed%22%20stroke-width%3D%223%22/%3E%3C/svg%3E }
         Element/checkbox(
             element: [event: [click: LINK]]
+            style: []
             label: Reference[element: todo.todo_elements.todo_title_element]
             checked: todo.completed
             icon: Element/container(
                 element: []
                 style: [
                     size: 40
-                    background: [url: checked |> WHEN { 
+                    background: [url: checked |> WHEN {
                         True => icon_completed
-                        False => icon_active 
+                        False => icon_active
                     }]
                 ]
+                child: NoElement
             )
         )
+        |> LINK { todo.todo_elements.todo_checkbox }
     }
 }
 
 FUNCTION todo_title_element(todo) {
     Element/label(
-        element: [event: [double_click: LINK]]
+        element: []
         style: [
             width: Fill
-            font: [
-                size: 24
-                line: [strike: todo.completed]
-                color: Oklch[lightness: todo.completed |> WHEN {
-                    True => 0.885
-                    False => 0.42
-                }]
-            ]
-            padding: [column: 15, left: 15, right: 60]
-            clip: Row
+            font: [size: 24, color: Oklch[lightness: 0.42]]
         ]
         label: todo.title
     )
@@ -435,11 +382,8 @@ FUNCTION panel_footer() {
         items: LIST {
             active_items_count_text()
             filters_element()
-            PASSED.store.todos |> List/any(item, if: item.completed) |> WHILE {
-                True => remove_completed_button() 
-                    |> LINK { PASSED.store.elements.remove_completed_button }
-                False => NoElement
-            }
+            -- SIMPLIFIED: Hide remove button since items are text now
+            NoElement
         } |> List/map(old, new: Element/container(
             element: []
             style: [width: Fill]
@@ -448,12 +392,13 @@ FUNCTION panel_footer() {
     )
 }
 
+-- Count only active (non-completed) items
 FUNCTION active_items_count_text() {
     PASSED.store.todos
-        |> List/retain(item, if: item.completed |> Bool/not())
+        |> List/retain(item, condition: item.completed |> Bool/not())
         |> List/count()
         |> WHEN { count => BLOCK {
-            maybe_s: count > 1 |> WHEN { True => TEXT { s }, False => Text/empty() }
+            maybe_s: count == 1 |> Bool/not() |> WHEN { True => TEXT { s }, False => Text/empty() }
             TEXT { {count} item{maybe_s} left }
         }}
 }
@@ -544,6 +489,7 @@ FUNCTION footer() {
                 style: []
                 contents: LIST {
                     TEXT { Created by }
+                    Text/space()
                     footer_link(
                         label: TEXT { Martin Kavík }
                         to: TEXT { https://github.com/MartinKavik }
@@ -555,6 +501,7 @@ FUNCTION footer() {
                 style: []
                 contents: LIST {
                     TEXT { Part of }
+                    Text/space()
                     footer_link(label: TEXT { TodoMVC }, to: TEXT { http://todomvc.com })
                 }
             )

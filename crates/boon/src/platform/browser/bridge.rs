@@ -91,7 +91,14 @@ fn element_container(
     let sv5 = tagged_object.expect_variable("settings");
     let sv6 = tagged_object.expect_variable("settings");
     let sv7 = tagged_object.expect_variable("settings");
+    let sv_font_size = tagged_object.expect_variable("settings");
+    let sv_font_color = tagged_object.expect_variable("settings");
+    let sv_font_weight = tagged_object.expect_variable("settings");
+    let sv_align = tagged_object.expect_variable("settings");
+    let sv_bg_url = tagged_object.expect_variable("settings");
+    let sv_size = tagged_object.expect_variable("settings");
 
+    // Padding with directional support
     let padding_signal = signal::from_stream(
         sv7.subscribe_stream()
             .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
@@ -99,10 +106,158 @@ fn element_container(
                 let obj = value.expect_object();
                 stream::iter(obj.variable("padding")).flat_map(|var| var.subscribe_stream())
             })
-            .filter_map(|value| future::ready(match value {
-                Value::Number(n, _) => Some(format!("{}px", n.number())),
-                _ => None,
-            }))
+            .filter_map(|value| async move {
+                match value {
+                    Value::Number(n, _) => Some(format!("{}px", n.number())),
+                    Value::Object(obj, _) => {
+                        let top = if let Some(v) = obj.variable("top") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else if let Some(v) = obj.variable("column") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else { 0.0 };
+                        let right = if let Some(v) = obj.variable("right") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else if let Some(v) = obj.variable("row") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else { 0.0 };
+                        let bottom = if let Some(v) = obj.variable("bottom") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else if let Some(v) = obj.variable("column") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else { 0.0 };
+                        let left = if let Some(v) = obj.variable("left") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else if let Some(v) = obj.variable("row") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else { 0.0 };
+                        Some(format!("{}px {}px {}px {}px", top, right, bottom, left))
+                    }
+                    _ => None,
+                }
+            })
+            .boxed_local()
+    );
+
+    // Font size
+    let font_size_signal = signal::from_stream(
+        sv_font_size
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("size")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                let result = if let Value::Number(n, _) = value {
+                    Some(format!("{}px", n.number()))
+                } else { None };
+                future::ready(result)
+            })
+            .boxed_local()
+    );
+
+    // Font color
+    let font_color_signal = signal::from_stream(
+        sv_font_color
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("color")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| oklch_to_css(value))
+            .boxed_local()
+    );
+
+    // Font weight
+    let font_weight_signal = signal::from_stream(
+        sv_font_weight
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("weight")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                let result = match value {
+                    Value::Tag(tag, _) => {
+                        match tag.tag() {
+                            "Hairline" => Some("100"),
+                            "ExtraLight" | "UltraLight" => Some("200"),
+                            "Light" => Some("300"),
+                            "Regular" | "Normal" => Some("400"),
+                            "Medium" => Some("500"),
+                            "SemiBold" | "DemiBold" => Some("600"),
+                            "Bold" => Some("700"),
+                            "ExtraBold" | "UltraBold" => Some("800"),
+                            "Black" | "Heavy" => Some("900"),
+                            _ => None,
+                        }.map(|s| s.to_string())
+                    }
+                    Value::Number(n, _) => Some(n.number().to_string()),
+                    _ => None,
+                };
+                future::ready(result)
+            })
+            .boxed_local()
+    );
+
+    // Align (row: Center -> text-align: center + display: flex + justify-content)
+    let align_signal = signal::from_stream(
+        sv_align
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("align")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("row")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                let result = match value {
+                    Value::Tag(tag, _) => {
+                        match tag.tag() {
+                            "Center" => Some("center"),
+                            "Left" | "Start" => Some("flex-start"),
+                            "Right" | "End" => Some("flex-end"),
+                            _ => None,
+                        }.map(|s| s.to_string())
+                    }
+                    _ => None,
+                };
+                future::ready(result)
+            })
+            .boxed_local()
     );
 
     let width_signal = signal::from_stream(
@@ -144,6 +299,40 @@ fn element_container(
             })
             .filter_map(|value| oklch_to_css(value))
             .boxed_local()
+    );
+
+    // Background image URL
+    let background_image_signal = signal::from_stream(
+        sv_bg_url
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("background")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("url")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| future::ready(match value {
+                Value::Text(text, _) => Some(format!("url(\"{}\")", text.text())),
+                _ => None,
+            }))
+    );
+
+    // Size (shorthand for width + height)
+    let size_signal = signal::from_stream(
+        sv_size
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("size")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                _ => None,
+            }))
     );
 
     let border_radius_signal = signal::from_stream(
@@ -194,15 +383,44 @@ fn element_container(
             .boxed_local()
     );
 
+    // Size signal for height (duplicate for separate signal)
+    let sv_size2 = tagged_object.expect_variable("settings");
+    let size_for_height_signal = signal::from_stream(
+        sv_size2
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("size")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| future::ready(match value {
+                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                _ => None,
+            }))
+    );
+
     El::new()
         .update_raw_el(|raw_el| {
             raw_el
                 .style_signal("padding", padding_signal)
+                // Apply width from style.width, then size overrides if present
                 .style_signal("width", width_signal)
+                .style_signal("width", size_signal)
                 .style_signal("height", height_signal)
+                .style_signal("height", size_for_height_signal)
                 .style_signal("background-color", background_signal)
+                .style_signal("background-image", background_image_signal)
+                .style("background-size", "contain")
+                .style("background-repeat", "no-repeat")
                 .style_signal("border-radius", border_radius_signal)
                 .style_signal("transform", transform_signal)
+                .style_signal("font-size", font_size_signal)
+                .style_signal("color", font_color_signal)
+                .style_signal("font-weight", font_weight_signal)
+                .style_signal("text-align", align_signal)
+                .style("display", "flex")
+                .style("flex-direction", "column")
+                .style("align-items", "center")
         })
         .child_signal(signal::from_stream(child_stream))
         .after_remove(move |_| {
@@ -303,6 +521,484 @@ fn element_stripe(
             })
         });
 
+    // Style property streams for element_stripe
+    // Width with Fill and min/max support: Fill | number | [sizing: Fill, minimum: X, maximum: Y]
+    let sv_width = tagged_object.expect_variable("settings");
+    let width_signal = signal::from_stream(
+        sv_width
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("width")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| async move {
+                match value {
+                    Value::Number(n, _) => Some(format!("{}px", n.number())),
+                    Value::Tag(tag, _) if tag.tag() == "Fill" => Some("100%".to_string()),
+                    Value::Object(obj, _) => {
+                        // Handle [sizing: Fill, minimum: X, maximum: Y]
+                        if let Some(v) = obj.variable("sizing") {
+                            if let Some(Value::Tag(tag, _)) = v.value_actor().stored_value().await {
+                                if tag.tag() == "Fill" {
+                                    return Some("100%".to_string());
+                                }
+                            }
+                        }
+                        None
+                    }
+                    _ => None,
+                }
+            })
+            .boxed_local()
+    );
+
+    // Min-width
+    let sv_min_width = tagged_object.expect_variable("settings");
+    let min_width_signal = signal::from_stream(
+        sv_min_width
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("width")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| async move {
+                if let Value::Object(obj, _) = value {
+                    if let Some(v) = obj.variable("minimum") {
+                        if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                            return Some(format!("{}px", n.number()));
+                        }
+                    }
+                }
+                None
+            })
+            .boxed_local()
+    );
+
+    // Max-width
+    let sv_max_width = tagged_object.expect_variable("settings");
+    let max_width_signal = signal::from_stream(
+        sv_max_width
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("width")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| async move {
+                if let Value::Object(obj, _) = value {
+                    if let Some(v) = obj.variable("maximum") {
+                        if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                            return Some(format!("{}px", n.number()));
+                        }
+                    }
+                }
+                None
+            })
+            .boxed_local()
+    );
+
+    // Height with Fill and minimum: Screen support
+    let sv_height = tagged_object.expect_variable("settings");
+    let height_signal = signal::from_stream(
+        sv_height
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("height")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| async move {
+                match value {
+                    Value::Number(n, _) => Some(format!("{}px", n.number())),
+                    Value::Tag(tag, _) if tag.tag() == "Fill" => Some("100%".to_string()),
+                    Value::Object(obj, _) => {
+                        if let Some(v) = obj.variable("sizing") {
+                            if let Some(Value::Tag(tag, _)) = v.value_actor().stored_value().await {
+                                if tag.tag() == "Fill" {
+                                    return Some("100%".to_string());
+                                }
+                            }
+                        }
+                        None
+                    }
+                    _ => None,
+                }
+            })
+            .boxed_local()
+    );
+
+    // Min-height (supports Screen -> 100vh)
+    let sv_min_height = tagged_object.expect_variable("settings");
+    let min_height_signal = signal::from_stream(
+        sv_min_height
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("height")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| async move {
+                if let Value::Object(obj, _) = value {
+                    if let Some(v) = obj.variable("minimum") {
+                        match v.value_actor().stored_value().await {
+                            Some(Value::Number(n, _)) => return Some(format!("{}px", n.number())),
+                            Some(Value::Tag(tag, _)) if tag.tag() == "Screen" => return Some("100vh".to_string()),
+                            _ => {}
+                        }
+                    }
+                }
+                None
+            })
+            .boxed_local()
+    );
+
+    // Background color
+    let sv_bg = tagged_object.expect_variable("settings");
+    let background_signal = signal::from_stream(
+        sv_bg
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("background")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("color")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| oklch_to_css(value))
+            .boxed_local()
+    );
+
+    // Padding (directional: [top, column, left, right, row, bottom])
+    let sv_padding = tagged_object.expect_variable("settings");
+    let padding_signal = signal::from_stream(
+        sv_padding
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("padding")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| async move {
+                match value {
+                    Value::Number(n, _) => Some(format!("{}px", n.number())),
+                    Value::Object(obj, _) => {
+                        async fn get_num(obj: &Object, name: &str) -> f64 {
+                            if let Some(v) = obj.variable(name) {
+                                match v.value_actor().stored_value().await {
+                                    Some(Value::Number(n, _)) => n.number(),
+                                    _ => 0.0,
+                                }
+                            } else {
+                                0.0
+                            }
+                        }
+                        let top = get_num(&obj, "top").await;
+                        let bottom = get_num(&obj, "bottom").await;
+                        let left = get_num(&obj, "left").await;
+                        let right = get_num(&obj, "right").await;
+                        let column = get_num(&obj, "column").await;
+                        let row = get_num(&obj, "row").await;
+
+                        let final_top = if top > 0.0 { top } else { column };
+                        let final_bottom = if bottom > 0.0 { bottom } else { column };
+                        let final_left = if left > 0.0 { left } else { row };
+                        let final_right = if right > 0.0 { right } else { row };
+
+                        Some(format!("{}px {}px {}px {}px", final_top, final_right, final_bottom, final_left))
+                    }
+                    _ => None,
+                }
+            })
+            .boxed_local()
+    );
+
+    // Shadows (box-shadow from LIST of shadow objects)
+    let sv_shadows = tagged_object.expect_variable("settings");
+    let shadows_signal = signal::from_stream(
+        sv_shadows
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("shadows")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| async move {
+                if let Value::List(list, _) = &value {
+                    let mut shadow_parts = Vec::new();
+                    // Get all items from the list (snapshot returns (ItemId, Arc<ValueActor>) pairs)
+                    let snapshot = list.snapshot().await;
+                    for (_item_id, actor) in snapshot {
+                        let item = actor.stored_value().await;
+                        if let Some(Value::Object(obj, _)) = item {
+                            async fn get_num(obj: &Object, name: &str) -> f64 {
+                                if let Some(v) = obj.variable(name) {
+                                    match v.value_actor().stored_value().await {
+                                        Some(Value::Number(n, _)) => n.number(),
+                                        _ => 0.0,
+                                    }
+                                } else {
+                                    0.0
+                                }
+                            }
+                            let x = get_num(&obj, "x").await;
+                            let y = get_num(&obj, "y").await;
+                            let blur = get_num(&obj, "blur").await;
+                            let spread = get_num(&obj, "spread").await;
+
+                            // Check for inset (direction: Inwards)
+                            let inset = if let Some(v) = obj.variable("direction") {
+                                match v.value_actor().stored_value().await {
+                                    Some(Value::Tag(tag, _)) if tag.tag() == "Inwards" => true,
+                                    _ => false,
+                                }
+                            } else {
+                                false
+                            };
+
+                            // Get color
+                            let color_css = if let Some(v) = obj.variable("color") {
+                                if let Some(color_value) = v.value_actor().stored_value().await {
+                                    oklch_to_css(color_value).await.unwrap_or_else(|| "rgba(0,0,0,0.2)".to_string())
+                                } else {
+                                    "rgba(0,0,0,0.2)".to_string()
+                                }
+                            } else {
+                                "rgba(0,0,0,0.2)".to_string()
+                            };
+
+                            let inset_str = if inset { "inset " } else { "" };
+                            shadow_parts.push(format!("{}{}px {}px {}px {}px {}", inset_str, x, y, blur, spread, color_css));
+                        }
+                    }
+                    if !shadow_parts.is_empty() {
+                        Some(shadow_parts.join(", "))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .boxed_local()
+    );
+
+    // Font size (cascading to children)
+    let sv_font_size = tagged_object.expect_variable("settings");
+    let font_size_signal = signal::from_stream(
+        sv_font_size
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("size")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                future::ready(match value {
+                    Value::Number(n, _) => Some(format!("{}px", n.number())),
+                    _ => None,
+                })
+            })
+    );
+
+    // Font color
+    let sv_font_color = tagged_object.expect_variable("settings");
+    let font_color_signal = signal::from_stream(
+        sv_font_color
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("color")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| oklch_to_css(value))
+            .boxed_local()
+    );
+
+    // Font weight
+    let sv_font_weight = tagged_object.expect_variable("settings");
+    let font_weight_signal = signal::from_stream(
+        sv_font_weight
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("weight")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                let result = match value {
+                    Value::Tag(tag, _) => {
+                        match tag.tag() {
+                            "Hairline" => Some("100"),
+                            "ExtraLight" | "UltraLight" => Some("200"),
+                            "Light" => Some("300"),
+                            "Regular" | "Normal" => Some("400"),
+                            "Medium" => Some("500"),
+                            "SemiBold" | "DemiBold" => Some("600"),
+                            "Bold" => Some("700"),
+                            "ExtraBold" | "UltraBold" => Some("800"),
+                            "Black" | "Heavy" => Some("900"),
+                            _ => None,
+                        }.map(|s| s.to_string())
+                    }
+                    Value::Number(n, _) => Some(n.number().to_string()),
+                    _ => None,
+                };
+                future::ready(result)
+            })
+            .boxed_local()
+    );
+
+    // Font family
+    let sv_font_family = tagged_object.expect_variable("settings");
+    let font_family_signal = signal::from_stream(
+        sv_font_family
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("family")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| async move {
+                if let Value::List(list, _) = &value {
+                    // Get all items from list (snapshot returns (ItemId, Arc<ValueActor>) pairs)
+                    let snapshot = list.snapshot().await;
+                    let mut families = Vec::new();
+                    for (_item_id, actor) in snapshot {
+                        if let Some(item) = actor.stored_value().await {
+                            match item {
+                                Value::Text(t, _) => families.push(format!("\"{}\"", t.text())),
+                                Value::Tag(tag, _) => match tag.tag() {
+                                    "SansSerif" => families.push("sans-serif".to_string()),
+                                    "Serif" => families.push("serif".to_string()),
+                                    "Monospace" => families.push("monospace".to_string()),
+                                    _ => {}
+                                },
+                                _ => {}
+                            }
+                        }
+                    }
+                    if !families.is_empty() {
+                        Some(families.join(", "))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .boxed_local()
+    );
+
+    // Font align (text-align)
+    let sv_font_align = tagged_object.expect_variable("settings");
+    let font_align_signal = signal::from_stream(
+        sv_font_align
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("align")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                let result = match value {
+                    Value::Tag(tag, _) => {
+                        match tag.tag() {
+                            "Center" => Some("center"),
+                            "Left" => Some("left"),
+                            "Right" => Some("right"),
+                            _ => None,
+                        }.map(|s| s.to_string())
+                    }
+                    _ => None,
+                };
+                future::ready(result)
+            })
+            .boxed_local()
+    );
+
+    // Borders (supports [top: [color: Oklch[...]]])
+    let sv_borders = tagged_object.expect_variable("settings");
+    let border_top_signal = signal::from_stream(
+        sv_borders
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("borders")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("top")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("color")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| async move {
+                if let Some(color) = oklch_to_css(value).await {
+                    Some(format!("1px solid {}", color))
+                } else {
+                    None
+                }
+            })
+            .boxed_local()
+    );
+
+    // Align (row: Center -> justify-content: center for Row, align-items: center for Column)
+    let sv_align = tagged_object.expect_variable("settings");
+    let align_items_signal = signal::from_stream(
+        sv_align
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("align")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("row")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                let result = match value {
+                    Value::Tag(tag, _) => {
+                        match tag.tag() {
+                            "Center" => Some("center"),
+                            "Start" => Some("flex-start"),
+                            "End" => Some("flex-end"),
+                            _ => None,
+                        }.map(|s| s.to_string())
+                    }
+                    _ => None,
+                };
+                future::ready(result)
+            })
+            .boxed_local()
+    );
+
     let items_vec_diff_stream = settings_variable
         .subscribe_stream()
         .flat_map(move |value| {
@@ -336,7 +1032,23 @@ fn element_stripe(
             let _ = hovered_sender.unbounded_send(is_hovered);
         })
         .update_raw_el(|raw_el| {
-            raw_el.style_signal("gap", signal::from_stream(gap_stream))
+            raw_el
+                .style_signal("gap", signal::from_stream(gap_stream))
+                .style_signal("width", width_signal)
+                .style_signal("min-width", min_width_signal)
+                .style_signal("max-width", max_width_signal)
+                .style_signal("height", height_signal)
+                .style_signal("min-height", min_height_signal)
+                .style_signal("background-color", background_signal)
+                .style_signal("padding", padding_signal)
+                .style_signal("box-shadow", shadows_signal)
+                .style_signal("font-size", font_size_signal)
+                .style_signal("color", font_color_signal)
+                .style_signal("font-weight", font_weight_signal)
+                .style_signal("font-family", font_family_signal)
+                .style_signal("text-align", font_align_signal)
+                .style_signal("border-top", border_top_signal)
+                .style_signal("align-items", align_items_signal)
         })
         // Keep tagged_object, settings_object, items_list_value, and item_actors alive for the lifetime of this element
         .after_remove(move |_| {
@@ -511,6 +1223,7 @@ fn element_button(
     type PressEvent = ();
 
     let (press_event_sender, mut press_event_receiver) = mpsc::unbounded::<PressEvent>();
+    let (hovered_sender, mut hovered_receiver) = mpsc::unbounded::<bool>();
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -524,19 +1237,30 @@ fn element_button(
         .map(|variable| variable.expect_link_value_sender())
         .fuse();
 
-    let press_handler_loop = ActorLoop::new({
+    // Set up hovered link if element field exists with hovered property
+    let hovered_stream = element_variable
+        .subscribe_stream()
+        .filter_map(|value| future::ready(value.expect_object().variable("hovered")))
+        .map(|variable| variable.expect_link_value_sender());
+
+    let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
             let mut press_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
+            let mut hovered_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
             let mut press_event_object_value_version = 0u64;
+            let mut hovered_stream = hovered_stream.fuse();
             loop {
                 select! {
                     new_press_link_value_sender = press_stream.next() => {
                         if let Some(new_press_link_value_sender) = new_press_link_value_sender {
                             zoon::println!("[BRIDGE] event_handler: press LINK sender set up (ready to receive events)");
                             press_link_value_sender = Some(new_press_link_value_sender);
-                        } else {
-                            break
+                        }
+                    }
+                    new_sender = hovered_stream.next() => {
+                        if let Some(sender) = new_sender {
+                            hovered_link_value_sender = Some(sender);
                         }
                     }
                     press_event = press_event_receiver.select_next_some() => {
@@ -558,6 +1282,18 @@ fn element_button(
                             zoon::println!("[BRIDGE] event_handler: Press event received but no LINK sender set up yet");
                         }
                     }
+                    is_hovered = hovered_receiver.select_next_some() => {
+                        if let Some(sender) = hovered_link_value_sender.as_ref() {
+                            let hover_tag = if is_hovered { "True" } else { "False" };
+                            let event_value = EngineTag::new_value(
+                                ConstructInfo::new("button::hovered", None, "Button hovered state"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                hover_tag,
+                            );
+                            let _ = sender.unbounded_send(event_value);
+                        }
+                    }
                 }
             }
         }
@@ -566,9 +1302,289 @@ fn element_button(
     let settings_variable = tagged_object.expect_variable("settings");
 
     let label_stream = settings_variable
+        .clone()
         .subscribe_stream()
         .flat_map(|value| value.expect_object().expect_variable("label").subscribe_stream())
-        .map(move |value| value_to_element(value, construct_context.clone()));
+        .map({
+            let construct_context = construct_context.clone();
+            move |value| value_to_element(value, construct_context.clone())
+        });
+
+    // Font size signal
+    let sv_font_size = settings_variable.clone();
+    let font_size_signal = signal::from_stream(
+        sv_font_size
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("size")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                let result = if let Value::Number(n, _) = value {
+                    Some(format!("{}px", n.number()))
+                } else {
+                    None
+                };
+                future::ready(result)
+            })
+            .boxed_local()
+    );
+
+    // Font color signal
+    let sv_font_color = settings_variable.clone();
+    let font_color_signal = signal::from_stream(
+        sv_font_color
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("color")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| oklch_to_css(value))
+            .boxed_local()
+    );
+
+    // Padding signal
+    let sv_padding = settings_variable.clone();
+    let padding_signal = signal::from_stream(
+        sv_padding
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("padding")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| async move {
+                match value {
+                    Value::Number(n, _) => Some(format!("{}px", n.number())),
+                    Value::Object(obj, _) => {
+                        let top = if let Some(v) = obj.variable("top") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else if let Some(v) = obj.variable("column") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else { 0.0 };
+                        let right = if let Some(v) = obj.variable("right") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else if let Some(v) = obj.variable("row") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else { 0.0 };
+                        let bottom = if let Some(v) = obj.variable("bottom") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else if let Some(v) = obj.variable("column") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else { 0.0 };
+                        let left = if let Some(v) = obj.variable("left") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else if let Some(v) = obj.variable("row") {
+                            if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                                n.number()
+                            } else { 0.0 }
+                        } else { 0.0 };
+                        Some(format!("{}px {}px {}px {}px", top, right, bottom, left))
+                    }
+                    _ => None,
+                }
+            })
+            .boxed_local()
+    );
+
+    // Size (width) signal
+    let sv_size_width = settings_variable.clone();
+    let size_width_signal = signal::from_stream(
+        sv_size_width
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("size")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                let result = if let Value::Number(n, _) = value {
+                    Some(format!("{}px", n.number()))
+                } else {
+                    None
+                };
+                future::ready(result)
+            })
+            .boxed_local()
+    );
+
+    // Size (height) signal
+    let sv_size_height = settings_variable.clone();
+    let size_height_signal = signal::from_stream(
+        sv_size_height
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("size")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                let result = if let Value::Number(n, _) = value {
+                    Some(format!("{}px", n.number()))
+                } else {
+                    None
+                };
+                future::ready(result)
+            })
+            .boxed_local()
+    );
+
+    // Rounded corners signal
+    let sv_rounded = settings_variable.clone();
+    let rounded_signal = signal::from_stream(
+        sv_rounded
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("rounded_corners")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                let result = if let Value::Number(n, _) = value {
+                    Some(format!("{}px", n.number()))
+                } else {
+                    None
+                };
+                future::ready(result)
+            })
+            .boxed_local()
+    );
+
+    // Transform signal (move_left, move_down -> translate)
+    let sv_transform = settings_variable.clone();
+    let transform_signal = signal::from_stream(
+        sv_transform
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("transform")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| async move {
+                if let Value::Object(obj, _) = value {
+                    let move_left = if let Some(v) = obj.variable("move_left") {
+                        if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                            n.number()
+                        } else { 0.0 }
+                    } else { 0.0 };
+                    let move_down = if let Some(v) = obj.variable("move_down") {
+                        if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                            n.number()
+                        } else { 0.0 }
+                    } else { 0.0 };
+                    let move_up = if let Some(v) = obj.variable("move_up") {
+                        if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                            n.number()
+                        } else { 0.0 }
+                    } else { 0.0 };
+                    let move_right = if let Some(v) = obj.variable("move_right") {
+                        if let Some(Value::Number(n, _)) = v.value_actor().stored_value().await {
+                            n.number()
+                        } else { 0.0 }
+                    } else { 0.0 };
+                    // Calculate final x (negative for move_left, positive for move_right)
+                    let x = move_right - move_left;
+                    // Calculate final y (positive for move_down, negative for move_up)
+                    let y = move_down - move_up;
+                    if x != 0.0 || y != 0.0 {
+                        Some(format!("translate({}px, {}px)", x, y))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .boxed_local()
+    );
+
+    // Font align signal (text-align)
+    let sv_font_align = settings_variable.clone();
+    let font_align_signal = signal::from_stream(
+        sv_font_align
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("align")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                let result = match value {
+                    Value::Tag(tag, _) => {
+                        match tag.tag() {
+                            "Center" => Some("center".to_string()),
+                            "Left" => Some("left".to_string()),
+                            "Right" => Some("right".to_string()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                future::ready(result)
+            })
+            .boxed_local()
+    );
+
+    // Outline signal
+    let sv_outline = settings_variable.clone();
+    let outline_signal = signal::from_stream(
+        sv_outline
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("outline")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| async move {
+                match value {
+                    Value::Tag(tag, _) if tag.tag() == "NoOutline" => {
+                        Some("none".to_string())
+                    }
+                    Value::Object(obj, _) => {
+                        // Get color from outline object
+                        if let Some(color_var) = obj.variable("color") {
+                            if let Some(color_value) = color_var.value_actor().stored_value().await {
+                                if let Some(css_color) = oklch_to_css(color_value).await {
+                                    // Default to 1px solid outline
+                                    return Some(format!("1px solid {}", css_color));
+                                }
+                            }
+                        }
+                        None
+                    }
+                    _ => None,
+                }
+            })
+            .boxed_local()
+    );
 
     Button::new()
         .label_signal(signal::from_stream(label_stream).map(|label| {
@@ -585,7 +1601,25 @@ fn element_button(
                 eprintln!("Failed to send button press event from on_press handler: {error}");
             }
         })
-        .after_remove(move |_| drop(press_handler_loop))
+        .on_hovered_change(move |is_hovered| {
+            let _ = hovered_sender.unbounded_send(is_hovered);
+        })
+        .update_raw_el(|raw_el| {
+            raw_el
+                .style_signal("font-size", font_size_signal)
+                .style_signal("color", font_color_signal)
+                .style_signal("padding", padding_signal)
+                .style_signal("width", size_width_signal)
+                .style_signal("height", size_height_signal)
+                .style_signal("border-radius", rounded_signal)
+                .style_signal("transform", transform_signal)
+                .style_signal("text-align", font_align_signal)
+                .style_signal("outline", outline_signal)
+        })
+        .after_remove(move |_| {
+            drop(event_handler_loop);
+            drop(tagged_object);
+        })
 }
 
 fn element_text_input(
@@ -801,9 +1835,9 @@ fn element_text_input(
     let placeholder_signal = signal::from_stream(placeholder_text_stream);
 
     // Width signal from style
+    let sv_width = tagged_object.expect_variable("settings");
     let width_signal = signal::from_stream(
-        settings_variable
-            .clone()
+        sv_width
             .subscribe_stream()
             .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
             .flat_map(|value| {
@@ -817,6 +1851,110 @@ fn element_text_input(
                     _ => None,
                 })
             }),
+    );
+
+    // Padding signal from style - supports simple number or directional object
+    let sv_padding = tagged_object.expect_variable("settings");
+    let padding_signal = signal::from_stream(
+        sv_padding
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("padding")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| async move {
+                match value {
+                    Value::Number(n, _) => Some(format!("{}px", n.number())),
+                    Value::Object(obj, _) => {
+                        // Handle directional padding: [top, column, left, right, row, bottom]
+                        async fn get_num(obj: &Object, name: &str) -> f64 {
+                            if let Some(v) = obj.variable(name) {
+                                match v.value_actor().stored_value().await {
+                                    Some(Value::Number(n, _)) => n.number(),
+                                    _ => 0.0,
+                                }
+                            } else {
+                                0.0
+                            }
+                        }
+                        let top = get_num(&obj, "top").await;
+                        let bottom = get_num(&obj, "bottom").await;
+                        let left = get_num(&obj, "left").await;
+                        let right = get_num(&obj, "right").await;
+                        let column = get_num(&obj, "column").await;
+                        let row = get_num(&obj, "row").await;
+
+                        // column applies to top/bottom, row applies to left/right
+                        let final_top = if top > 0.0 { top } else { column };
+                        let final_bottom = if bottom > 0.0 { bottom } else { column };
+                        let final_left = if left > 0.0 { left } else { row };
+                        let final_right = if right > 0.0 { right } else { row };
+
+                        Some(format!("{}px {}px {}px {}px", final_top, final_right, final_bottom, final_left))
+                    }
+                    _ => None,
+                }
+            })
+            .boxed_local()
+    );
+
+    // Font size signal from style
+    let sv_font_size = tagged_object.expect_variable("settings");
+    let font_size_signal = signal::from_stream(
+        sv_font_size
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("size")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                future::ready(match value {
+                    Value::Number(n, _) => Some(format!("{}px", n.number())),
+                    _ => None,
+                })
+            })
+    );
+
+    // Font color signal from style
+    let sv_font_color = tagged_object.expect_variable("settings");
+    let font_color_signal = signal::from_stream(
+        sv_font_color
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("color")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| oklch_to_css(value))
+            .boxed_local()
+    );
+
+    // Background color signal from style
+    let sv_bg_color = tagged_object.expect_variable("settings");
+    let background_color_signal = signal::from_stream(
+        sv_bg_color
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("background")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("color")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| oklch_to_css(value))
+            .boxed_local()
     );
 
     // Focus signal - use Mutable with stream updates
@@ -878,14 +2016,12 @@ fn element_text_input(
         .focus_signal(focus_signal)
         .update_raw_el(|raw_el| {
             raw_el
-                .style("padding", "8px 12px")
-                .style("border", "1px solid #555")
-                .style("border-radius", "4px")
-                .style("background-color", "#2a2a2a")
-                .style("color", "#fff")
-                .style("font-size", "14px")
                 .style("box-sizing", "border-box")
                 .style_signal("width", width_signal)
+                .style_signal("padding", padding_signal)
+                .style_signal("font-size", font_size_signal)
+                .style_signal("color", font_color_signal)
+                .style_signal("background-color", background_color_signal)
         })
         .after_remove(move |_| {
             drop(event_handler_loop);
@@ -921,10 +2057,12 @@ fn element_checkbox(
                 select! {
                     new_sender = click_stream.next() => {
                         if let Some(sender) = new_sender {
+                            zoon::println!("[BRIDGE] checkbox: click LINK sender set up (ready to receive events)");
                             click_link_value_sender = Some(sender);
                         }
                     }
                     _click = click_event_receiver.select_next_some() => {
+                        zoon::println!("[BRIDGE] checkbox: on_click received from Zoon");
                         if let Some(sender) = click_link_value_sender.as_ref() {
                             let event_value = Object::new_value(
                                 ConstructInfo::new("checkbox::click_event", None, "Checkbox click event"),
@@ -932,7 +2070,10 @@ fn element_checkbox(
                                 ValueIdempotencyKey::new(),
                                 [],
                             );
-                            let _ = sender.unbounded_send(event_value);
+                            let result = sender.unbounded_send(event_value);
+                            zoon::println!("[BRIDGE] checkbox: sent click event to Boon LINK, result: {:?}", result.is_ok());
+                        } else {
+                            zoon::println!("[BRIDGE] checkbox: on_click received but no LINK sender set up yet");
                         }
                     }
                 }
@@ -962,8 +2103,7 @@ fn element_checkbox(
         .label_hidden("checkbox")
         .checked_signal(signal::from_stream(checked_stream).map(|c| c.unwrap_or(false)))
         .icon(move |_checked_mutable| {
-            // For now, just use the icon from settings
-            El::new()
+            El::new().child_signal(signal::from_stream(icon_stream))
         })
         .on_click({
             let sender = click_event_sender.clone();
@@ -1051,6 +2191,7 @@ fn element_label(
     // Create style streams
     let sv2 = tagged_object.expect_variable("settings");
     let sv3 = tagged_object.expect_variable("settings");
+    let sv4 = tagged_object.expect_variable("settings");
 
     let padding_signal = signal::from_stream(
         sv2.subscribe_stream()
@@ -1080,11 +2221,31 @@ fn element_label(
             .boxed_local()
     );
 
+    let font_size_signal = signal::from_stream(
+        sv4.subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("size")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                future::ready(match value {
+                    Value::Number(n, _) => Some(format!("{}px", n.number())),
+                    _ => None,
+                })
+            })
+    );
+
     Label::new()
         .update_raw_el(|raw_el| {
             raw_el
                 .style_signal("padding", padding_signal)
                 .style_signal("color", font_color_signal)
+                .style_signal("font-size", font_size_signal)
         })
         .label_signal(signal::from_stream(label_stream).map(|l| {
             l.unwrap_or_else(|| zoon::Text::new("").unify())
@@ -1110,29 +2271,75 @@ fn element_paragraph(
         .flat_map(|value| value.expect_list().subscribe())
         .map(list_change_to_vec_diff);
 
-    Paragraph::new().contents_signal_vec(
-        VecDiffStreamSignalVec(contents_vec_diff_stream).map_signal(move |value_actor| {
-            signal::from_stream(value_actor.subscribe_stream().map({
-                let construct_context = construct_context.clone();
-                move |value| value_to_element(value, construct_context.clone())
-            }))
-        }),
-    )
+    Paragraph::new()
+        .update_raw_el(|raw_el| {
+            raw_el.style("white-space", "pre-wrap")
+        })
+        .contents_signal_vec(
+            VecDiffStreamSignalVec(contents_vec_diff_stream).map_signal(move |value_actor| {
+                signal::from_stream(value_actor.subscribe_stream().map({
+                    let construct_context = construct_context.clone();
+                    move |value| value_to_element(value, construct_context.clone())
+                }))
+            }),
+        )
 }
 
 fn element_link(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
+    let (hovered_sender, mut hovered_receiver) = mpsc::unbounded::<bool>();
+
+    let element_variable = tagged_object.expect_variable("element");
+
+    // Set up hovered handler
+    let mut hovered_stream = element_variable
+        .subscribe_stream()
+        .filter_map(|value| future::ready(value.expect_object().variable("hovered")))
+        .map(|variable| variable.expect_link_value_sender())
+        .fuse();
+
+    let event_handler_loop = ActorLoop::new({
+        let construct_context = construct_context.clone();
+        async move {
+            let mut hovered_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
+
+            loop {
+                select! {
+                    sender = hovered_stream.select_next_some() => {
+                        hovered_link_value_sender = Some(sender);
+                    }
+                    is_hovered = hovered_receiver.select_next_some() => {
+                        if let Some(sender) = hovered_link_value_sender.as_ref() {
+                            let hover_tag = if is_hovered { "True" } else { "False" };
+                            let event_value = EngineTag::new_value(
+                                ConstructInfo::new("link::hovered", None, "Link hovered state"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                hover_tag,
+                            );
+                            let _ = sender.unbounded_send(event_value);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     let settings_variable = tagged_object.expect_variable("settings");
 
     let label_stream = settings_variable
         .clone()
         .subscribe_stream()
         .flat_map(|value| value.expect_object().expect_variable("label").subscribe_stream())
-        .map(move |value| value_to_element(value, construct_context.clone()));
+        .map({
+            let construct_context = construct_context.clone();
+            move |value| value_to_element(value, construct_context.clone())
+        });
 
-    let to_stream = settings_variable
+    let sv_to = settings_variable.clone();
+    let to_stream = sv_to
         .subscribe_stream()
         .flat_map(|value| value.expect_object().expect_variable("to").subscribe_stream())
         .filter_map(|value| {
@@ -1142,12 +2349,56 @@ fn element_link(
             })
         });
 
+    // Underline signal (font.line.underline)
+    let sv_underline = settings_variable.clone();
+    let underline_signal = signal::from_stream(
+        sv_underline
+            .subscribe_stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").subscribe_stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("font")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("line")).flat_map(|var| var.subscribe_stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("underline")).flat_map(|var| var.subscribe_stream())
+            })
+            .filter_map(|value| {
+                let result = match value {
+                    Value::Tag(tag, _) => {
+                        match tag.tag() {
+                            "True" => Some("underline".to_string()),
+                            "False" => Some("none".to_string()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                future::ready(result)
+            })
+            .boxed_local()
+    );
+
     Link::new()
         .label_signal(signal::from_stream(label_stream).map(|l| {
             l.unwrap_or_else(|| zoon::Text::new("").unify())
         }))
         .to_signal(signal::from_stream(to_stream).map(|t| t.unwrap_or_default()))
         .new_tab(NewTab::new())
+        .on_hovered_change(move |is_hovered| {
+            let _ = hovered_sender.unbounded_send(is_hovered);
+        })
+        .update_raw_el(|raw_el| {
+            raw_el.style_signal("text-decoration", underline_signal)
+        })
+        .after_remove(move |_| {
+            drop(event_handler_loop);
+            drop(tagged_object);
+        })
 }
 
 #[pin_project]
@@ -1188,3 +2439,4 @@ fn list_change_to_vec_diff(change: ListChange) -> VecDiff<Arc<ValueActor>> {
         ListChange::Clear => VecDiff::Clear {},
     }
 }
+

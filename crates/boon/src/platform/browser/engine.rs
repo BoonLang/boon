@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 use crate::parser;
 use crate::parser::SourceCode;
 use crate::parser::static_expression;
-use super::evaluator::evaluate_static_expression;
+use super::evaluator::{evaluate_static_expression_with_registry, FunctionRegistry};
 
 use ulid::Ulid;
 
@@ -5503,26 +5503,45 @@ impl ListChange {
                 *vec = items;
             }
             Self::InsertAt { index, item } => {
-                vec.insert(index, item);
+                if index <= vec.len() {
+                    vec.insert(index, item);
+                } else {
+                    eprintln!("ListChange::InsertAt index {} out of bounds (len: {})", index, vec.len());
+                }
             }
             Self::UpdateAt { index, item } => {
-                vec[index] = item;
+                if index < vec.len() {
+                    vec[index] = item;
+                } else {
+                    eprintln!("ListChange::UpdateAt index {} out of bounds (len: {})", index, vec.len());
+                }
             }
             Self::Push { item } => {
                 vec.push(item);
             }
             Self::RemoveAt { index } => {
-                vec.remove(index);
+                if index < vec.len() {
+                    vec.remove(index);
+                } else {
+                    eprintln!("ListChange::RemoveAt index {} out of bounds (len: {})", index, vec.len());
+                }
             }
             Self::Move {
                 old_index,
                 new_index,
             } => {
-                let item = vec.remove(old_index);
-                vec.insert(new_index, item);
+                if old_index < vec.len() {
+                    let item = vec.remove(old_index);
+                    let insert_index = new_index.min(vec.len());
+                    vec.insert(insert_index, item);
+                } else {
+                    eprintln!("ListChange::Move old_index {} out of bounds (len: {})", old_index, vec.len());
+                }
             }
             Self::Pop => {
-                vec.pop().unwrap();
+                if vec.pop().is_none() {
+                    eprintln!("ListChange::Pop on empty vec");
+                }
             }
             Self::Clear => {
                 vec.clear();
@@ -5579,23 +5598,27 @@ impl ListChange {
                 // Move is Remove + Insert
                 // For simplicity, we model it as Remove followed by Insert
                 // The caller should handle this as two separate diffs if needed
-                let id = snapshot.get(*old_index).map(|(id, _)| *id).unwrap_or_else(ItemId::new);
-                let value = snapshot.get(*old_index).map(|(_, v)| v.clone()).unwrap_or_else(|| {
-                    panic!("Move operation with invalid old_index")
-                });
-                let after = if *new_index == 0 {
-                    None
-                } else {
-                    // Account for removal when calculating position
-                    let adjusted_index = if *new_index > *old_index {
-                        new_index - 1
+                if let Some((id, value)) = snapshot.get(*old_index).map(|(id, v)| (*id, v.clone())) {
+                    let after = if *new_index == 0 {
+                        None
                     } else {
-                        *new_index - 1
+                        // Account for removal when calculating position
+                        let adjusted_index = if *new_index > *old_index {
+                            new_index - 1
+                        } else {
+                            *new_index - 1
+                        };
+                        snapshot.get(adjusted_index).map(|(id, _)| *id)
                     };
-                    snapshot.get(adjusted_index).map(|(id, _)| *id)
-                };
-                // Return as Insert with same ID (effectively a move)
-                ListDiff::Insert { id, after, value }
+                    // Return as Insert with same ID (effectively a move)
+                    ListDiff::Insert { id, after, value }
+                } else {
+                    eprintln!("ListChange::Move old_index {} out of bounds in to_diff (snapshot len: {})", old_index, snapshot.len());
+                    // Return a no-op by replacing with current snapshot
+                    ListDiff::Replace {
+                        items: snapshot.iter().map(|(id, v)| (*id, v.clone())).collect()
+                    }
+                }
             }
             Self::Pop => {
                 let id = snapshot.last().map(|(id, _)| *id).unwrap_or_else(ItemId::new);
@@ -5640,6 +5663,8 @@ pub struct ListBindingConfig {
     pub link_connector: Arc<LinkConnector>,
     /// Source code for creating borrowed expressions
     pub source_code: SourceCode,
+    /// Function registry snapshot for resolving user-defined functions
+    pub function_registry_snapshot: Option<Arc<FunctionRegistry>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5872,12 +5897,24 @@ impl ListBindingFunction {
         // 1. Subscribes to source list changes (subscribe_stream() yields automatically)
         // 2. For each item, evaluates predicate and subscribes to its changes
         // 3. When list or any predicate changes, emits filtered Replace
+        //
+        // We use scan with a flag to only process the first List value while keeping
+        // the stream alive. This avoids duplicate flat_map streams while allowing
+        // the inner list.subscribe() to continue receiving Push/Pop changes.
         let value_stream = source_list_actor.clone().subscribe_stream().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
                 _ => None,
             })
-        }).flat_map(move |list| {
+        }).scan(false, |seen, list| {
+            if *seen {
+                // Already processed a list, skip this emission
+                future::ready(Some(None))
+            } else {
+                *seen = true;
+                future::ready(Some(Some(list)))
+            }
+        }).filter_map(future::ready).flat_map(move |list| {
             let config = config.clone();
             let construct_context = construct_context.clone();
             let actor_context = actor_context.clone();
@@ -6030,12 +6067,20 @@ impl ListBindingFunction {
         let actor_context_for_result = actor_context.clone();
 
         // subscribe_stream() yields automatically, ensuring source actor's loop has started
+        // Use scan with flag to only process the first List value while keeping stream alive
         let value_stream = source_list_actor.clone().subscribe_stream().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
                 _ => None,
             })
-        }).flat_map(move |list| {
+        }).scan(false, |seen, list| {
+            if *seen {
+                future::ready(Some(None))
+            } else {
+                *seen = true;
+                future::ready(Some(Some(list)))
+            }
+        }).filter_map(future::ready).flat_map(move |list| {
             let config = config.clone();
             let construct_context = construct_context.clone();
             let actor_context = actor_context.clone();
@@ -6186,12 +6231,20 @@ impl ListBindingFunction {
         // 1. Subscribes to source list changes (subscribe_stream() yields automatically)
         // 2. For each item, evaluates key expression and subscribes to its changes
         // 3. When list or any key changes, emits sorted Replace
+        // Use scan with flag to only process the first List value while keeping stream alive
         let value_stream = source_list_actor.clone().subscribe_stream().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
                 _ => None,
             })
-        }).flat_map(move |list| {
+        }).scan(false, |seen, list| {
+            if *seen {
+                future::ready(Some(None))
+            } else {
+                *seen = true;
+                future::ready(Some(Some(list)))
+            }
+        }).filter_map(future::ready).flat_map(move |list| {
             let config = config.clone();
             let construct_context = construct_context.clone();
             let actor_context = actor_context.clone();
@@ -6349,13 +6402,15 @@ impl ListBindingFunction {
         };
 
         // Evaluate the transform expression with the binding in scope
-        match evaluate_static_expression(
+        // Pass the function registry snapshot to enable user-defined function calls
+        match evaluate_static_expression_with_registry(
             &config.transform_expr,
             construct_context,
             new_actor_context,
             config.reference_connector.clone(),
             config.link_connector.clone(),
             config.source_code.clone(),
+            config.function_registry_snapshot.clone(),
         ) {
             Ok(result_actor) => result_actor,
             Err(e) => {

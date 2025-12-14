@@ -140,7 +140,9 @@ async function cdpClickAt(tabId, x, y) {
         return;
       }
 
-      // Dispatch pointer events (what Zoon listens to)
+      // Dispatch pointer events for hover state handling
+      // NOTE: CDP mousePressed/mouseReleased already triggers native click event,
+      // so we do NOT dispatch an extra click here to avoid double-clicks
       ['pointerdown', 'pointerup'].forEach(type => {
         el.dispatchEvent(new PointerEvent(type, {
           bubbles: true, cancelable: true, view: window,
@@ -148,12 +150,6 @@ async function cdpClickAt(tabId, x, y) {
           pointerId: 1, pointerType: 'mouse', isPrimary: true
         }));
       });
-
-      // Also dispatch click for good measure
-      el.dispatchEvent(new MouseEvent('click', {
-        bubbles: true, cancelable: true, view: window,
-        clientX: viewportX, clientY: viewportY
-      }));
     })()
   `);
 

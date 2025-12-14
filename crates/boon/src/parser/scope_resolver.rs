@@ -548,9 +548,14 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
         Expression::Skip => (),
         Expression::TextLiteral { parts } => {
             // Resolve interpolation variables in the text literal
+            // Supports field access paths like "item.text" where "item" is the base variable
             for part in parts.iter_mut() {
                 if let TextPart::Interpolation { var, referenced_span } = part {
-                    // Look up the variable in reachable referenceables
+                    // Split on '.' to handle field access paths
+                    let var_parts: Vec<&str> = var.split('.').collect();
+                    let base_var = var_parts[0];
+
+                    // Look up the base variable in reachable referenceables
                     let reachable_map: BTreeMap<&str, Referenceable> = reachable_referenceables
                         .iter()
                         .filter_map(|(name, referenceables)| {
@@ -566,7 +571,8 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                         })
                         .collect();
 
-                    if let Some(referenceable) = reachable_map.get(*var) {
+                    if let Some(referenceable) = reachable_map.get(base_var) {
+                        // Found the base variable - field access will be resolved at runtime
                         *referenced_span = Some(referenceable.span);
                         all_referenced.insert(*referenceable);
                     } else {
