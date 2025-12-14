@@ -9,7 +9,7 @@ use chumsky::input::{Input as ChumskyInput, Stream as ChumskyStream};
 use ulid::Ulid;
 use zoon::futures_channel::oneshot;
 use zoon::futures_util::stream::{self, LocalBoxStream};
-use zoon::{Stream, StreamExt, println, eprintln, mpsc, Task};
+use zoon::{Stream, StreamExt, println, eprintln, mpsc};
 
 /// Yields control to the executor, allowing other tasks to run.
 /// This is a simple implementation that returns Pending once and schedules a wake.
@@ -362,6 +362,11 @@ pub struct EvaluationState {
     /// Function registry - stores user-defined functions during evaluation.
     /// Owned by the evaluation state, no sharing or interior mutability needed.
     function_registry: HashMap<String, StaticFunctionDefinition>,
+
+    /// Forwarding loops for referenced arguments.
+    /// These must be kept alive for the duration of the evaluation to ensure
+    /// that forwarding actors receive their values from source actors.
+    forwarding_loops: Vec<ActorLoop>,
 }
 
 impl EvaluationState {
@@ -372,6 +377,7 @@ impl EvaluationState {
             results: HashMap::new(),
             next_slot: 0,
             function_registry: HashMap::new(),
+            forwarding_loops: Vec::new(),
         }
     }
 
@@ -382,7 +388,19 @@ impl EvaluationState {
             results: HashMap::new(),
             next_slot: 0,
             function_registry: functions,
+            forwarding_loops: Vec::new(),
         }
+    }
+
+    /// Add a forwarding loop to keep alive.
+    pub fn add_forwarding_loop(&mut self, loop_: ActorLoop) {
+        self.forwarding_loops.push(loop_);
+    }
+
+    /// Take ownership of all forwarding loops.
+    /// Used to transfer loops to the final result for lifetime management.
+    pub fn take_forwarding_loops(&mut self) -> Vec<ActorLoop> {
+        std::mem::take(&mut self.forwarding_loops)
     }
 
     /// Register a function in the registry.
@@ -1075,13 +1093,6 @@ fn schedule_expression(
                         }
                     }
 
-                    // Push ConnectForwardingActors to connect forwarding actors after args evaluated
-                    if !forwarding_connections.is_empty() {
-                        state.push(WorkItem::ConnectForwardingActors {
-                            connections: forwarding_connections,
-                        });
-                    }
-
                     // Push CallFunction first (will be processed last due to LIFO)
                     // Note: use_piped_for_builtin is false because this is a normal function call,
                     // not the direct target of a pipe. EvaluateWithPiped will set it to true.
@@ -1096,6 +1107,15 @@ fn schedule_expression(
                         ctx: ctx.clone(),
                         result_slot,
                     });
+
+                    // Push ConnectForwardingActors AFTER CallFunction (so it's processed BEFORE due to LIFO)
+                    // This ensures forwarding actors are connected to their sources BEFORE the function is called,
+                    // allowing subsequent arguments that reference earlier arguments to work correctly.
+                    if !forwarding_connections.is_empty() {
+                        state.push(WorkItem::ConnectForwardingActors {
+                            connections: forwarding_connections,
+                        });
+                    }
 
                     // Schedule argument expressions last (will be processed first due to LIFO)
                     for (arg_expr, arg_slot) in args_to_schedule {
@@ -1360,18 +1380,9 @@ fn process_work_item(
 
         WorkItem::BuildList { item_slots, span, persistence, ctx, result_slot } => {
             // Collect items that have values (empty slots are ignored)
-            println!("[DEBUG BuildList] Requested slots: {}, span: {}", item_slots.len(), span);
             let items: Vec<_> = item_slots.iter()
-                .enumerate()
-                .filter_map(|(i, slot)| {
-                    let result = state.get(*slot);
-                    if result.is_none() {
-                        println!("[DEBUG BuildList] Slot {:?} at index {} is EMPTY", slot, i);
-                    }
-                    result
-                })
+                .filter_map(|slot| state.get(*slot))
                 .collect();
-            println!("[DEBUG BuildList] Collected {} items", items.len());
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
 
             let actor = List::new_arc_value_actor_with_persistence(
@@ -1842,33 +1853,66 @@ fn process_work_item(
 
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
             let actor_opt = call_function(
-                path,
+                path.clone(),
                 args,
                 span,
-                persistence,
+                persistence.clone(),
                 persistence_id,
-                ctx,
+                ctx.clone(),
                 use_piped_for_builtin,
                 &state.function_registry,
             )?;
+
+            // Take forwarding loops from state - they need to stay alive as long as the result actor
+            let forwarding_loops = state.take_forwarding_loops();
+
             // If function returns SKIP (None), don't store anything
             if let Some(actor) = actor_opt {
-                state.store(result_slot, actor);
+                // If there are forwarding loops, wrap the result to keep them alive
+                if !forwarding_loops.is_empty() {
+                    // Create a wrapper actor that forwards values and keeps forwarding loops alive
+                    let wrapper = ValueActor::new_arc(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {:?}", persistence.as_ref().map(|p| p.id)),
+                            persistence,
+                            format!("{}; {}(..) (with forwarding)", span, path.join("/")),
+                        ),
+                        ctx.actor_context.clone(),
+                        TypedStream::infinite(actor.subscribe_stream().scan(forwarding_loops, |_loops, value| {
+                            // Keep _loops alive in scan state
+                            async move { Some(value) }
+                        })),
+                        None,
+                    );
+                    state.store(result_slot, wrapper);
+                } else {
+                    state.store(result_slot, actor);
+                }
             }
         }
 
         WorkItem::ConnectForwardingActors { connections } => {
-            // Connect forwarding actors to their evaluated argument results
-            // For function arguments, we only forward the initial value since
-            // arguments are evaluated once and don't change during the call.
+            // Connect forwarding actors to their evaluated argument results.
+            // We need to forward values from the source actor to the forwarding actor's channel.
+            // The forwarding actor was created with an empty channel that needs values.
             for (slot, sender) in connections {
                 if let Some(source_actor) = state.get(slot) {
-                    // Spawn task to send initial value asynchronously
-                    let _ = Task::start_droppable(async move {
-                        if let Some(initial_value) = source_actor.stored_value().await {
-                            let _ = sender.unbounded_send(initial_value);
-                        }
-                    });
+                    // Use ValueActor::connect_forwarding which properly subscribes and forwards ALL values.
+                    // This creates an ActorLoop that:
+                    // 1. Subscribes to source_actor
+                    // 2. Forwards every value through sender
+                    // 3. Stays alive until sender is dropped
+                    //
+                    // We store the ActorLoop in the state to keep it alive for the duration
+                    // of the function call evaluation.
+                    let forwarding_loop = ValueActor::connect_forwarding(
+                        sender,
+                        source_actor.clone(),
+                        async { None }, // No initial value needed - subscription provides it
+                    );
+
+                    // Store in state to keep alive
+                    state.add_forwarding_loop(forwarding_loop);
                 }
             }
         }
@@ -2019,7 +2063,7 @@ fn build_then_actor(
                 Value::Tag(_, _) => "Tag".to_string(),
                 _ => "Other".to_string(),
             };
-            println!("[DEBUG THEN] Triggered with value: {}", value_desc);
+            let _ = value_desc;  // Used for debugging
 
             let value_actor = ValueActor::new_arc(
                 ConstructInfo::new(
@@ -2116,7 +2160,7 @@ fn build_then_actor(
                             Value::Tag(_, _) => "Tag".to_string(),
                             _ => "Other".to_string(),
                         };
-                        println!("[DEBUG THEN] Body produced: {}", result_desc);
+                        let _ = result_desc;  // Used for debugging
 
                         // Keep value_actor and result_actor alive while stream is consumed
                         let _ = &value_actor;
@@ -2238,6 +2282,17 @@ fn build_when_actor(
         let arms_clone = arms.clone();
 
         Box::pin(async move {
+            // DEBUG: Log the value that triggered WHEN
+            let value_desc = match &value {
+                Value::Text(t, _) => format!("Text('{}')", t.text()),
+                Value::Number(n, _) => format!("Number({})", n.number()),
+                Value::Tag(tag, _) => format!("Tag('{}')", tag.tag()),
+                Value::Object(_, _) => "Object".to_string(),
+                Value::TaggedObject(tagged, _) => format!("TaggedObject('{}')", tagged.tag()),
+                _ => "Other".to_string(),
+            };
+            let _ = value_desc;  // Used for debugging
+
             // Try to match against each arm
             for arm in &arms_clone {
                 // Use async pattern matching to properly extract bindings from Objects
@@ -2945,13 +3000,9 @@ fn build_text_literal_actor(
             static_expression::TextPart::Interpolation { var, referenced_span } => {
                 // Interpolation - look up the variable
                 let var_name = var.to_string();
-                println!("[DEBUG TextInterpolation] Looking up var='{}', referenced_span={:?}", var_name, referenced_span);
-                println!("[DEBUG TextInterpolation] Parameters has keys: {:?}", ctx.actor_context.parameters.keys().collect::<Vec<_>>());
                 if let Some(var_actor) = ctx.actor_context.parameters.get(&var_name) {
-                    println!("[DEBUG TextInterpolation] Found '{}' in parameters", var_name);
                     part_actors.push((false, var_actor.clone()));
                 } else if let Some(ref_span) = referenced_span {
-                    println!("[DEBUG TextInterpolation] '{}' NOT in parameters, using reference_connector for span {:?}", var_name, ref_span);
                     // Use reference_connector to get the variable from outer scope
                     // Create a forwarding actor that immediately starts forwarding values
                     // from the referenced actor via a dedicated task.
@@ -3250,7 +3301,6 @@ fn build_list_binding_function(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
 ) -> Result<Option<Arc<ValueActor>>, String> {
-    println!("[DEBUG build_list_binding_function] Called for List/{}", path_strs[1]);
     let operation = match path_strs[1].as_str() {
         "map" => ListBindingOperation::Map,
         "retain" => ListBindingOperation::Retain,
@@ -3314,7 +3364,6 @@ fn build_list_binding_function(
         list_actor,
         config,
     );
-    println!("[DEBUG build_list_binding_function] Created actor for List/{}", path_strs[1]);
     Ok(Some(result))
 }
 

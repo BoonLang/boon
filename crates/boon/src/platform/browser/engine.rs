@@ -517,33 +517,23 @@ impl LazyValueActor {
         let mut source_exhausted = false;
         const CLEANUP_THRESHOLD: usize = 100;
 
-        println!("[DEBUG LazyValueActor] Loop started: {}", construct_info.description);
-
         while let Some(request) = request_rx.next().await {
             let cursor = cursors.entry(request.subscriber_id).or_insert(0);
 
             let value = if *cursor < buffer.len() {
                 // Return buffered value (replay for this subscriber)
-                println!("[DEBUG LazyValueActor] Returning buffered value at cursor {} for subscriber {}",
-                    *cursor, request.subscriber_id);
                 Some(buffer[*cursor].clone())
             } else if source_exhausted {
                 // Source is exhausted, no more values
-                println!("[DEBUG LazyValueActor] Source exhausted for subscriber {}",
-                    request.subscriber_id);
                 None
             } else {
                 // Poll source for next value (demand-driven pull!)
-                println!("[DEBUG LazyValueActor] Pulling from source for subscriber {}",
-                    request.subscriber_id);
                 match source.next().await {
                     Some(value) => {
-                        println!("[DEBUG LazyValueActor] Got value from source, buffering");
                         buffer.push(value.clone());
                         Some(value)
                     }
                     None => {
-                        println!("[DEBUG LazyValueActor] Source exhausted");
                         source_exhausted = true;
                         None
                     }
@@ -558,7 +548,6 @@ impl LazyValueActor {
             if !cursors.is_empty() {
                 let min_cursor = *cursors.values().min().unwrap_or(&0);
                 if min_cursor >= CLEANUP_THRESHOLD {
-                    println!("[DEBUG LazyValueActor] Cleaning buffer, min_cursor={}", min_cursor);
                     // Remove consumed values from buffer
                     buffer.drain(0..min_cursor);
                     // Adjust all cursors
@@ -586,8 +575,6 @@ impl LazyValueActor {
     /// Callers should use `.clone().subscribe()` if they need to retain a reference.
     pub fn subscribe(self: Arc<Self>) -> LazySubscription {
         let subscriber_id = self.subscriber_counter.fetch_add(1, Ordering::SeqCst);
-        println!("[DEBUG LazyValueActor] New subscription, subscriber_id={}, construct={}",
-            subscriber_id, self.construct_info.description);
         LazySubscription {
             actor: self,
             subscriber_id,
@@ -1384,6 +1371,8 @@ impl Variable {
             persistence,
             description: variable_description,
         } = construct_info;
+        // Clone description for logging before it's moved
+        let description_for_log = variable_description.to_string();
         let construct_info = ConstructInfo::new(
             actor_id.with_child_id("wrapped Variable"),
             persistence,
@@ -1394,8 +1383,22 @@ impl Variable {
                 .complete(ConstructType::ValueActor);
         let (link_value_sender, link_value_receiver) = mpsc::unbounded();
         // UnboundedReceiver is infinite - it never terminates unless sender is dropped
+        // Wrap with logging to debug LINK value flow
+        let link_stream_with_logging = link_value_receiver.map(move |value| {
+            let type_name = match &value {
+                Value::Object(_, _) => "Object".to_string(),
+                Value::TaggedObject(t, _) => format!("TaggedObject({})", t.tag()),
+                Value::Text(t, _) => format!("Text('{}')", t.text()),
+                Value::Tag(t, _) => format!("Tag('{}')", t.tag()),
+                Value::Number(n, _) => format!("Number({})", n.number()),
+                Value::List(_, _) => "List".to_string(),
+                Value::Flushed(_, _) => "Flushed".to_string(),
+            };
+            let _ = type_name;  // Used for debugging
+            value
+        });
         let value_actor =
-            ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_value_receiver), persistence_id);
+            ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_stream_with_logging), persistence_id);
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
             persistence_id,
@@ -1543,15 +1546,31 @@ impl VariableOrArgumentReference {
                             .boxed_local()
                         } else {
                             // Streaming: continuous updates - use stream_stream() and keep alive
+                            let alias_part_for_log = alias_part.clone();
                             stream::unfold(
                                 (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), object, variable),
-                                move |(subscription_opt, actor_opt, object, variable)| async move {
-                                    let mut subscription = match subscription_opt {
-                                        Some(s) => s,
-                                        None => actor_opt.unwrap().stream().await,
-                                    };
-                                    let value = subscription.next().await;
-                                    value.map(|value| (value, (Some(subscription), None, object, variable)))
+                                move |(subscription_opt, actor_opt, object, variable)| {
+                                    let alias_part_log = alias_part_for_log.clone();
+                                    async move {
+                                        let mut subscription = match subscription_opt {
+                                            Some(s) => s,
+                                            None => actor_opt.unwrap().stream().await,
+                                        };
+                                        let value = subscription.next().await;
+                                        if let Some(ref v) = value {
+                                            let type_name = match v {
+                                                Value::Object(_, _) => "Object",
+                                                Value::TaggedObject(t, _) => t.tag(),
+                                                Value::Text(_, _) => "Text",
+                                                Value::Tag(t, _) => t.tag(),
+                                                Value::Number(_, _) => "Number",
+                                                Value::List(_, _) => "List",
+                                                Value::Flushed(_, _) => "Flushed",
+                                            };
+                                            let _ = (&alias_part_log, type_name);  // Used for debugging
+                                        }
+                                        value.map(|value| (value, (Some(subscription), None, object, variable)))
+                                    }
                                 }
                             ).boxed_local()
                         }
@@ -1572,15 +1591,31 @@ impl VariableOrArgumentReference {
                             .boxed_local()
                         } else {
                             // Streaming: continuous updates - use stream_stream() and keep alive
+                            let alias_part_for_log = alias_part.clone();
                             stream::unfold(
                                 (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), tagged_object, variable),
-                                move |(subscription_opt, actor_opt, tagged_object, variable)| async move {
-                                    let mut subscription = match subscription_opt {
-                                        Some(s) => s,
-                                        None => actor_opt.unwrap().stream().await,
-                                    };
-                                    let value = subscription.next().await;
-                                    value.map(|value| (value, (Some(subscription), None, tagged_object, variable)))
+                                move |(subscription_opt, actor_opt, tagged_object, variable)| {
+                                    let alias_part_log = alias_part_for_log.clone();
+                                    async move {
+                                        let mut subscription = match subscription_opt {
+                                            Some(s) => s,
+                                            None => actor_opt.unwrap().stream().await,
+                                        };
+                                        let value = subscription.next().await;
+                                        if let Some(ref v) = value {
+                                            let type_name = match v {
+                                                Value::Object(_, _) => "Object",
+                                                Value::TaggedObject(t, _) => t.tag(),
+                                                Value::Text(_, _) => "Text",
+                                                Value::Tag(t, _) => t.tag(),
+                                                Value::Number(_, _) => "Number",
+                                                Value::List(_, _) => "List",
+                                                Value::Flushed(_, _) => "Flushed",
+                                            };
+                                            let _ = (&alias_part_log, type_name);  // Used for debugging
+                                        }
+                                        value.map(|value| (value, (Some(subscription), None, tagged_object, variable)))
+                                    }
                                 }
                             ).boxed_local()
                         }
@@ -1636,9 +1671,7 @@ impl ReferenceConnector {
                         result = referenceable_inserter_receiver.next() => {
                             match result {
                                 Some((span, actor)) => {
-                                    println!("[DEBUG ReferenceConnector] Registering actor for span {:?}", span);
                                     if let Some(senders) = referenceable_senders.remove(&span) {
-                                        println!("[DEBUG ReferenceConnector] Found {} waiting senders for span {:?}", senders.len(), span);
                                         for sender in senders {
                                             if sender.send(actor.clone()).is_err() {
                                                 eprintln!("Failed to send referenceable actor from reference connector");
@@ -1659,14 +1692,11 @@ impl ReferenceConnector {
                         result = referenceable_getter_receiver.next() => {
                             match result {
                                 Some((span, referenceable_sender)) => {
-                                    println!("[DEBUG ReferenceConnector] Got request for span {:?}", span);
                                     if let Some(actor) = referenceables.get(&span) {
-                                        println!("[DEBUG ReferenceConnector] Found actor for span {:?}", span);
                                         if referenceable_sender.send(actor.clone()).is_err() {
                                             eprintln!("Failed to send referenceable actor from reference connector");
                                         }
                                     } else {
-                                        println!("[DEBUG ReferenceConnector] Actor NOT found for span {:?}, deferring", span);
                                         referenceable_senders.entry(span).or_default().push(referenceable_sender);
                                     }
                                 }
@@ -1701,7 +1731,6 @@ impl ReferenceConnector {
 
     // @TODO is &self enough?
     pub async fn referenceable(self: Arc<Self>, span: parser::Span) -> Arc<ValueActor> {
-        println!("[DEBUG referenceable] Starting lookup for span {:?}", span);
         let (referenceable_sender, referenceable_receiver) = oneshot::channel();
         if let Err(error) = self
             .referenceable_getter_sender
@@ -1709,27 +1738,9 @@ impl ReferenceConnector {
         {
             eprintln!("Failed to register referenceable: {error:#}")
         }
-        let actor = referenceable_receiver
+        referenceable_receiver
             .await
-            .expect("Failed to get referenceable from ReferenceConnector");
-
-        // DEBUG: Log the actor's stored value
-        if let Some(stored) = actor.stored_value().await {
-            let value_desc = match &stored {
-                Value::Text(t, _) => format!("Text('{}')", t.text()),
-                Value::Number(n, _) => format!("Number({})", n.number()),
-                Value::Tag(_, _) => "Tag".to_string(),
-                Value::Object(_, _) => "Object".to_string(),
-                Value::TaggedObject(_, _) => "TaggedObject".to_string(),
-                Value::List(_, _) => "List".to_string(),
-                Value::Flushed(_, _) => "Flushed".to_string(),
-            };
-            println!("[DEBUG referenceable] Found actor for span {:?} with stored_value: {}", span, value_desc);
-        } else {
-            println!("[DEBUG referenceable] Found actor for span {:?} with NO stored_value", span);
-        }
-
-        actor
+            .expect("Failed to get referenceable from ReferenceConnector")
     }
 }
 
@@ -1977,7 +1988,20 @@ impl LatestCombinator {
         let value_stream =
             stream::select_all(inputs.iter().enumerate().map(|(index, value_actor)| {
                 // Use subscribe_stream() to properly handle lazy actors in HOLD body context
-                value_actor.clone().subscribe_stream().map(move |value| (index, value))
+                value_actor.clone().subscribe_stream().map(move |value| {
+                    // DEBUG: Log what LATEST receives from each arm
+                    let value_desc = match &value {
+                        Value::Text(t, _) => format!("Text('{}')", t.text()),
+                        Value::Tag(t, _) => format!("Tag('{}')", t.tag()),
+                        Value::Object(_, _) => "Object".to_string(),
+                        Value::TaggedObject(t, _) => format!("TaggedObject('{}')", t.tag()),
+                        Value::Number(n, _) => format!("Number({})", n.number()),
+                        Value::List(_, _) => "List".to_string(),
+                        Value::Flushed(_, _) => "Flushed".to_string(),
+                    };
+                    let _ = value_desc;  // Used for debugging
+                    (index, value)
+                })
             }))
             .scan(true, {
                 let storage = storage.clone();
@@ -2806,8 +2830,6 @@ impl ValueActor {
             let _inputs = inputs.clone();
 
             async move {
-                println!("[DEBUG ValueActor async loop] Started for {}", construct_info);
-
                 // Actor-local state (no Mutex needed!)
                 let mut value_history = ValueHistory::new(64);
                 let mut subscribers: Vec<mpsc::Sender<Value>> = Vec::new();
@@ -2829,12 +2851,7 @@ impl ValueActor {
                 let mut stored_value_query_receiver = pin!(stored_value_query_receiver.fuse());
                 let mut migration_state = MigrationState::Normal;
 
-                let mut loop_iteration = 0u64;
                 loop {
-                    loop_iteration += 1;
-                    if loop_iteration <= 3 {
-                        println!("[DEBUG ValueActor async loop] Iteration {} for {}", loop_iteration, construct_info);
-                    }
                     select! {
                         // Handle new subscription requests
                         req = subscription_receiver.next() => {
@@ -2936,7 +2953,6 @@ impl ValueActor {
 
                         // Handle values from the input stream
                         new_value = value_stream.next() => {
-                            println!("[DEBUG ValueActor loop] Got value from stream for {}", construct_info);
                             let Some(new_value) = new_value else {
                                 // Stream ended - but we DON'T break!
                                 stream_ended = true;
@@ -4863,7 +4879,6 @@ impl List {
                 // Diff subscriber notification senders (bounded channels)
                 let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
                 let mut list = None;
-                println!("[DEBUG List loop] Started for {}", construct_info);
                 loop {
                     select! {
                         // Handle diff history queries
@@ -4892,7 +4907,6 @@ impl List {
                         }
 
                         change = change_stream.next() => {
-                            println!("[DEBUG List loop] Received change from stream for {}", construct_info);
                             let Some(change) = change else { break };
                             if output_valve_signal.is_none() {
                                 change_senders.retain(|change_sender| {
@@ -5828,7 +5842,6 @@ impl ListBindingFunction {
             source_list_actor.clone(),
         );
 
-        println!("[DEBUG create_map_actor] END - returning map actor");
         Arc::new(ValueActor::new(
             construct_info,
             actor_context,
@@ -6361,17 +6374,6 @@ impl ListBindingFunction {
         construct_context: ConstructContext,
         actor_context: ActorContext,
     ) -> ListChange {
-        let change_type = match &change {
-            ListChange::Replace { items } => format!("Replace({})", items.len()),
-            ListChange::InsertAt { index, .. } => format!("InsertAt({})", index),
-            ListChange::UpdateAt { index, .. } => format!("UpdateAt({})", index),
-            ListChange::Push { .. } => "Push".to_string(),
-            ListChange::RemoveAt { index } => format!("RemoveAt({})", index),
-            ListChange::Move { old_index, new_index } => format!("Move({} -> {})", old_index, new_index),
-            ListChange::Pop => "Pop".to_string(),
-            ListChange::Clear => "Clear".to_string(),
-        };
-        println!("[DEBUG transform_list_change_for_map] Received change: {}", change_type);
         match change {
             ListChange::Replace { items } => {
                 let transformed_items: Vec<Arc<ValueActor>> = items

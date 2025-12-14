@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use zoon::Timer;
 use zoon::futures_util::{select, stream::{self, LocalBoxStream, Stream, StreamExt}, FutureExt};
-use zoon::println;
 use zoon::futures_channel::mpsc;
 use zoon::{Deserialize, Serialize, serde};
 use zoon::{window, history, Closure, JsValue, UnwrapThrowExt, JsCast, SendWrapper};
@@ -1432,36 +1431,17 @@ pub fn function_list_count(
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
     list_actor.subscribe_stream().filter_map(move |value| {
-        println!("[DEBUG List/count] Received value from list_actor");
         let result = match &value {
-            Value::List(list, _) => {
-                println!("[DEBUG List/count] Got Value::List");
-                Some(list.clone())
-            },
-            _ => {
-                println!("[DEBUG List/count] Got non-List value!");
-                None
-            },
+            Value::List(list, _) => Some(list.clone()),
+            _ => None,
         };
         future::ready(result)
     }).flat_map(move |list| {
-        println!("[DEBUG List/count] flat_map: subscribing to list");
         let construct_context = construct_context.clone();
         let function_call_id = function_call_id.clone();
         list.subscribe().scan(Vec::<Arc<ValueActor>>::new(), move |items, change| {
-            println!("[DEBUG List/count] Received change: {:?}", match &change {
-                ListChange::Replace { items } => format!("Replace({} items)", items.len()),
-                ListChange::Push { .. } => "Push".to_string(),
-                ListChange::Pop => "Pop".to_string(),
-                ListChange::Clear => "Clear".to_string(),
-                ListChange::InsertAt { index, .. } => format!("InsertAt({})", index),
-                ListChange::RemoveAt { index } => format!("RemoveAt({})", index),
-                ListChange::UpdateAt { index, .. } => format!("UpdateAt({})", index),
-                ListChange::Move { old_index, new_index } => format!("Move({} -> {})", old_index, new_index),
-            });
             change.apply_to_vec(items);
             let count = items.len() as f64;
-            println!("[DEBUG List/count] After apply: {} items, count = {}", items.len(), count);
             future::ready(Some(Number::new_value(
                 ConstructInfo::new(function_call_id.with_child_id(0), None, "List/count result"),
                 construct_context.clone(),
@@ -1554,12 +1534,6 @@ pub fn function_list_append(
             // containing that specific value and push it.
             // Note: SKIP is not a Value - it's a stream behavior where streams end without
             // producing values. If item is SKIP, this map closure is never called.
-            let value_desc = match &value {
-                Value::Text(t, _) => format!("Text('{}')", t.text()),
-                Value::Number(n, _) => format!("Number({})", n.number()),
-                _ => "Other".to_string(),
-            };
-            println!("[DEBUG List/append] Creating Push for value: {}", value_desc);
             let new_item_actor = ValueActor::new_arc(
                 ConstructInfo::new(
                     function_call_id_for_append.with_child_id("appended_item"),
