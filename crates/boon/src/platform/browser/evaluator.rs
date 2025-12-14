@@ -630,7 +630,15 @@ fn schedule_expression(
         static_expression::Expression::Then { body } => {
             // THEN creates an actor that evaluates body at runtime for each piped value
             // We can build it immediately since the body is evaluated lazily
-            let registry_snapshot = Arc::new(state.function_registry.clone());
+            // Merge context's snapshot (top-level functions) with state's registry (local functions)
+            let mut merged_registry = ctx.function_registry_snapshot
+                .as_ref()
+                .map(|s| (**s).clone())
+                .unwrap_or_default();
+            for (name, def) in &state.function_registry {
+                merged_registry.insert(name.clone(), def.clone());
+            }
+            let registry_snapshot = Arc::new(merged_registry);
             let actor = build_then_actor(
                 *body,
                 span,
@@ -643,7 +651,15 @@ fn schedule_expression(
         }
 
         static_expression::Expression::When { arms } => {
-            let registry_snapshot = Arc::new(state.function_registry.clone());
+            // Merge context's snapshot (top-level functions) with state's registry (local functions)
+            let mut merged_registry = ctx.function_registry_snapshot
+                .as_ref()
+                .map(|s| (**s).clone())
+                .unwrap_or_default();
+            for (name, def) in &state.function_registry {
+                merged_registry.insert(name.clone(), def.clone());
+            }
+            let registry_snapshot = Arc::new(merged_registry);
             let actor = build_when_actor(
                 arms,
                 span,
@@ -656,7 +672,15 @@ fn schedule_expression(
         }
 
         static_expression::Expression::While { arms } => {
-            let registry_snapshot = Arc::new(state.function_registry.clone());
+            // Merge context's snapshot (top-level functions) with state's registry (local functions)
+            let mut merged_registry = ctx.function_registry_snapshot
+                .as_ref()
+                .map(|s| (**s).clone())
+                .unwrap_or_default();
+            for (name, def) in &state.function_registry {
+                merged_registry.insert(name.clone(), def.clone());
+            }
+            let registry_snapshot = Arc::new(merged_registry);
             let actor = build_while_actor(
                 arms,
                 span,
@@ -1619,21 +1643,45 @@ fn process_work_item(
 
         WorkItem::BuildThen { piped_slot: _, body, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
-            let registry_snapshot = Arc::new(state.function_registry.clone());
+            // Merge context's snapshot (top-level functions) with state's registry (local functions)
+            let mut merged_registry = ctx.function_registry_snapshot
+                .as_ref()
+                .map(|s| (**s).clone())
+                .unwrap_or_default();
+            for (name, def) in &state.function_registry {
+                merged_registry.insert(name.clone(), def.clone());
+            }
+            let registry_snapshot = Arc::new(merged_registry);
             let actor = build_then_actor(*body, span, persistence, persistence_id, ctx, registry_snapshot)?;
             state.store(result_slot, actor);
         }
 
         WorkItem::BuildWhen { piped_slot: _, arms, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
-            let registry_snapshot = Arc::new(state.function_registry.clone());
+            // Merge context's snapshot (top-level functions) with state's registry (local functions)
+            let mut merged_registry = ctx.function_registry_snapshot
+                .as_ref()
+                .map(|s| (**s).clone())
+                .unwrap_or_default();
+            for (name, def) in &state.function_registry {
+                merged_registry.insert(name.clone(), def.clone());
+            }
+            let registry_snapshot = Arc::new(merged_registry);
             let actor = build_when_actor(arms, span, persistence, persistence_id, ctx, registry_snapshot)?;
             state.store(result_slot, actor);
         }
 
         WorkItem::BuildWhile { piped_slot: _, arms, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
-            let registry_snapshot = Arc::new(state.function_registry.clone());
+            // Merge context's snapshot (top-level functions) with state's registry (local functions)
+            let mut merged_registry = ctx.function_registry_snapshot
+                .as_ref()
+                .map(|s| (**s).clone())
+                .unwrap_or_default();
+            for (name, def) in &state.function_registry {
+                merged_registry.insert(name.clone(), def.clone());
+            }
+            let registry_snapshot = Arc::new(merged_registry);
             let actor = build_while_actor(arms, span, persistence, persistence_id, ctx, registry_snapshot)?;
             state.store(result_slot, actor);
         }
@@ -2464,8 +2512,11 @@ fn build_while_actor(
     let persistence_for_while = persistence.clone();
     let span_for_while = span;
 
-    // Use then().flatten() pattern to allow async pattern matching
-    let stream = piped.clone().subscribe_stream().then(move |value| {
+    // Use switch_map for proper WHILE semantics - when input changes, cancel old arm and switch to new one.
+    // This is essential for reactive UI: when `current_page` changes from `Home` to `About`,
+    // we must STOP rendering Home content and START rendering About content.
+    // Regular flatten() would merge both streams, causing both to render.
+    let stream = switch_map(piped.clone().subscribe_stream(), move |value| {
         let actor_context_clone = actor_context_for_while.clone();
         let construct_context_clone = construct_context_for_while.clone();
         let reference_connector_clone = reference_connector_for_while.clone();
@@ -2476,7 +2527,10 @@ fn build_while_actor(
         let persistence_clone = persistence_for_while.clone();
         let arms_clone = arms.clone();
 
-        async move {
+        // Wrap async pattern matching in stream::once().flatten() so switch_map can work with it.
+        // When a new input arrives, switch_map will drop this whole inner stream (cancelling
+        // any async work and the forwarded body stream) and start a new one.
+        stream::once(async move {
             // Find matching arm using async pattern matching
             let mut matched_arm_with_bindings: Option<(&static_expression::Arm, HashMap<String, Value>)> = None;
             for arm in &arms_clone {
@@ -2549,22 +2603,22 @@ fn build_while_actor(
                     Ok(Some(result_actor)) => {
                         // Use stream_stream() for continuous streaming semantics.
                         // WHILE bodies should produce continuous streams while the pattern matches.
-                        let stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(result_actor.stream_stream());
+                        let stream: LocalBoxStream<'static, Value> = result_actor.stream_stream();
                         stream
                     }
                     Ok(None) => {
-                        // SKIP - return finite empty stream (flatten removes it cleanly)
-                        Box::pin(stream::empty())
+                        // SKIP - return finite empty stream (switch_map handles this)
+                        stream::empty().boxed_local()
                     }
                     Err(_) => {
-                        Box::pin(stream::empty())
+                        stream::empty().boxed_local()
                     }
                 }
             } else {
-                Box::pin(stream::empty())
+                stream::empty().boxed_local()
             }
-        }
-    }).flatten();
+        }).flatten()
+    });
 
     // Keep the piped actor alive by including it in inputs
     Ok(ValueActor::new_arc_with_inputs(
@@ -3514,6 +3568,10 @@ fn call_function(
         }
 
         // No piped value or no parameter to bind - evaluate immediately (original behavior)
+        // Collect argument actors to keep them alive for the duration of the function result
+        // Note: we collect from parameters which now contains the arg_map values
+        let arg_actors: Vec<Arc<ValueActor>> = parameters.values().cloned().collect();
+
         let new_actor_context = ActorContext {
             output_valve_signal: ctx.actor_context.output_valve_signal.clone(),
             piped: ctx.actor_context.piped.clone(),
@@ -3529,7 +3587,7 @@ fn call_function(
         };
 
         let new_ctx = EvaluationContext {
-            construct_context: ctx.construct_context,
+            construct_context: ctx.construct_context.clone(),
             actor_context: new_actor_context,
             reference_connector: ctx.reference_connector,
             link_connector: ctx.link_connector,
@@ -3539,8 +3597,26 @@ fn call_function(
         };
 
         let result = evaluate_expression(func_def.body, new_ctx);
-        // Propagate None (SKIP) from function body
-        return result;
+
+        // If we have argument actors, wrap the result to keep them alive
+        match result {
+            Ok(Some(result_actor)) if !arg_actors.is_empty() => {
+                // Create a wrapper actor that keeps argument actors alive
+                let wrapper = ValueActor::new_arc_with_inputs(
+                    ConstructInfo::new(
+                        format!("PersistenceId: {persistence_id}"),
+                        persistence,
+                        format!("{span}; {}(..) (with args)", full_path),
+                    ),
+                    ctx.actor_context,
+                    TypedStream::infinite(result_actor.subscribe_stream()),
+                    None,
+                    arg_actors,  // Keep argument actors alive
+                );
+                return Ok(Some(wrapper));
+            }
+            _ => return result,
+        }
     }
 
     // Try builtin functions

@@ -1768,7 +1768,6 @@ pub fn function_router_route(
     let popstate_closure = SendWrapper::new(popstate_closure);
 
     // Store the global route sender for go_to to use
-    // Note: This is a simplified approach - in production we'd use a proper global state
     ROUTE_SENDER.with(|cell| {
         *cell.borrow_mut() = Some(route_sender);
     });

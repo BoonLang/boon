@@ -1,16 +1,17 @@
 -- Multi-Page App: Navigate between pages using buttons
 -- Exercises: Router/route, Router/go_to, WHEN/WHILE patterns
 
-store: [nav: [home: LINK, about: LINK, contact: LINK]]
+store: [
+    nav: [home: LINK, about: LINK, contact: LINK]
+    -- Navigate when buttons are pressed (must be inside store to keep actor alive)
+    nav_action: LATEST {
+        nav.home.event.press |> THEN { TEXT { / } }
+        nav.about.event.press |> THEN { TEXT { /about } }
+        nav.contact.event.press |> THEN { TEXT { /contact } }
+    } |> Router/go_to()
+]
 
 current_route: Router/route()
-
--- Navigate when buttons are pressed
-nav_action: LATEST {
-    store.nav.home.event.press |> THEN { TEXT { / } }
-    store.nav.about.event.press |> THEN { TEXT { /about } }
-    store.nav.contact.event.press |> THEN { TEXT { /contact } }
-} |> Router/go_to()
 
 current_page: current_route |> WHEN {
     TEXT { / } => Home
@@ -78,7 +79,7 @@ FUNCTION page(title, desc) {
         style: []
         items: LIST {
             Element/label(element: [], style: [font: [size: 32, weight: Bold]], label: title)
-            Element/label(element: [], style: [font: [color: Oklch[lightness: 0.5]]], label: desc)
+            Element/label(element: [], style: [font: [color: Oklch[lightness: 0.7]]], label: desc)
         }
     )
 }
