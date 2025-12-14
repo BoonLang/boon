@@ -1925,7 +1925,7 @@ fn resolve_value_for_log(value: Value) -> Pin<Box<dyn Future<Output = String>>> 
             }
             Value::List(list, _) => {
                 let mut items = Vec::new();
-                for (_item_id, item_actor) in list.snapshot() {
+                for (_item_id, item_actor) in list.snapshot().await {
                     let item_value = resolve_actor_value_for_log(item_actor).await;
                     items.push(item_value);
                 }
@@ -2259,21 +2259,26 @@ pub fn function_file_read_text(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let path_actor = arguments[0].clone();
-    path_actor.subscribe().map(move |value| {
-        let path = match &value {
-            Value::Text(text, _) => text.text().to_string(),
-            _ => String::new(),
-        };
-        let content = construct_context
-            .virtual_fs
-            .read_text(&path)
-            .unwrap_or_default();
-        Text::new_value(
-            ConstructInfo::new(function_call_id.with_child_id(0), None, "File/read_text"),
-            construct_context.clone(),
-            ValueIdempotencyKey::new(),
-            content,
-        )
+    path_actor.subscribe().then(move |value| {
+        let construct_context = construct_context.clone();
+        let function_call_id = function_call_id.clone();
+        async move {
+            let path = match &value {
+                Value::Text(text, _) => text.text().to_string(),
+                _ => String::new(),
+            };
+            let content = construct_context
+                .virtual_fs
+                .read_text(&path)
+                .await
+                .unwrap_or_default();
+            Text::new_value(
+                ConstructInfo::new(function_call_id.with_child_id(0), None, "File/read_text"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                content,
+            )
+        }
     })
 }
 
@@ -2728,35 +2733,40 @@ pub fn function_directory_entries(
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let path_actor = arguments[0].clone();
-    path_actor.subscribe().map(move |value| {
-        let path = match &value {
-            Value::Text(text, _) => text.text().to_string(),
-            _ => String::new(),
-        };
-        let entries = construct_context.virtual_fs.list_directory(&path);
-        let entry_actors: Vec<Arc<ValueActor>> = entries
-            .into_iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                Text::new_arc_value_actor(
-                    ConstructInfo::new(
-                        function_call_id.with_child_id(i as u32),
-                        None,
-                        "Directory/entries item",
-                    ),
-                    construct_context.clone(),
-                    ValueIdempotencyKey::new(),
-                    actor_context.clone(),
-                    entry,
-                )
-            })
-            .collect();
-        List::new_value(
-            ConstructInfo::new(function_call_id.with_child_id(0), None, "Directory/entries"),
-            construct_context.clone(),
-            ValueIdempotencyKey::new(),
-            actor_context.clone(),
-            entry_actors,
-        )
+    path_actor.subscribe().then(move |value| {
+        let construct_context = construct_context.clone();
+        let function_call_id = function_call_id.clone();
+        let actor_context = actor_context.clone();
+        async move {
+            let path = match &value {
+                Value::Text(text, _) => text.text().to_string(),
+                _ => String::new(),
+            };
+            let entries = construct_context.virtual_fs.list_directory(&path).await;
+            let entry_actors: Vec<Arc<ValueActor>> = entries
+                .into_iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    Text::new_arc_value_actor(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(i as u32),
+                            None,
+                            "Directory/entries item",
+                        ),
+                        construct_context.clone(),
+                        ValueIdempotencyKey::new(),
+                        actor_context.clone(),
+                        entry,
+                    )
+                })
+                .collect();
+            List::new_value(
+                ConstructInfo::new(function_call_id.with_child_id(0), None, "Directory/entries"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                actor_context.clone(),
+                entry_actors,
+            )
+        }
     })
 }

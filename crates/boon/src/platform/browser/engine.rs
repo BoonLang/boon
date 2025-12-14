@@ -6,12 +6,10 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::{pin, Pin};
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use arc_swap::ArcSwap;
 
 use crate::parser;
 use crate::parser::SourceCode;
@@ -344,7 +342,7 @@ impl<S: Stream> Stream for BackpressuredStream<S> {
 
 // --- BackpressurePermit ---
 
-use std::cell::RefCell;
+// RefCell removed - using actor model with channels instead
 use std::task::Waker;
 
 /// A permit-based synchronization primitive for backpressure between producer and consumer.
@@ -765,83 +763,168 @@ impl Default for MigrationState {
 
 // --- VirtualFilesystem ---
 
-/// In-memory filesystem for WASM environment
-/// Stores files as path -> content mappings
-#[derive(Clone, Default)]
+/// Request types for VirtualFilesystem actor
+enum FsRequest {
+    ReadText {
+        path: String,
+        reply: oneshot::Sender<Option<String>>,
+    },
+    WriteText {
+        path: String,
+        content: String,
+    },
+    Exists {
+        path: String,
+        reply: oneshot::Sender<bool>,
+    },
+    Delete {
+        path: String,
+        reply: oneshot::Sender<bool>,
+    },
+    ListDirectory {
+        path: String,
+        reply: oneshot::Sender<Vec<String>>,
+    },
+}
+
+/// Actor-based virtual filesystem for module loading.
+///
+/// Uses actor model with channels instead of RefCell for thread safety
+/// and portability to WebWorkers, HVM, and hardware.
+///
+/// - Writes are fire-and-forget (sync send, async processing)
+/// - Reads are async (request/response via oneshot channel)
+#[derive(Clone)]
 pub struct VirtualFilesystem {
-    files: Arc<std::cell::RefCell<HashMap<String, String>>>,
+    request_sender: mpsc::UnboundedSender<FsRequest>,
+    // Note: ActorLoop is NOT cloned - only the sender.
+    // The actor loop is stored separately and kept alive by the context owner.
+    _actor_loop: Arc<ActorLoop>,
 }
 
 impl VirtualFilesystem {
     pub fn new() -> Self {
-        Self {
-            files: Arc::new(std::cell::RefCell::new(HashMap::new())),
-        }
+        Self::with_files(HashMap::new())
     }
 
     /// Create a VirtualFilesystem pre-populated with files
-    pub fn with_files(files: HashMap<String, String>) -> Self {
+    pub fn with_files(initial_files: HashMap<String, String>) -> Self {
+        let (tx, mut rx) = mpsc::unbounded::<FsRequest>();
+
+        let actor_loop = ActorLoop::new(async move {
+            let mut files: HashMap<String, String> = initial_files;
+
+            while let Some(req) = rx.next().await {
+                match req {
+                    FsRequest::ReadText { path, reply } => {
+                        let normalized = Self::normalize_path(&path);
+                        let result = files.get(&normalized).cloned();
+                        let _ = reply.send(result);
+                    }
+                    FsRequest::WriteText { path, content } => {
+                        let normalized = Self::normalize_path(&path);
+                        files.insert(normalized, content);
+                    }
+                    FsRequest::Exists { path, reply } => {
+                        let normalized = Self::normalize_path(&path);
+                        let exists = files.contains_key(&normalized);
+                        let _ = reply.send(exists);
+                    }
+                    FsRequest::Delete { path, reply } => {
+                        let normalized = Self::normalize_path(&path);
+                        let was_present = files.remove(&normalized).is_some();
+                        let _ = reply.send(was_present);
+                    }
+                    FsRequest::ListDirectory { path, reply } => {
+                        let normalized = Self::normalize_path(&path);
+                        let prefix = if normalized.is_empty() || normalized == "/" {
+                            String::new()
+                        } else if normalized.ends_with('/') {
+                            normalized.clone()
+                        } else {
+                            format!("{}/", normalized)
+                        };
+
+                        let mut entries: Vec<String> = files
+                            .keys()
+                            .filter_map(|file_path| {
+                                if prefix.is_empty() {
+                                    // Root directory - get first path component
+                                    file_path.split('/').next().map(|s| s.to_string())
+                                } else if file_path.starts_with(&prefix) {
+                                    // Get the next path component after the prefix
+                                    let remainder = &file_path[prefix.len()..];
+                                    remainder.split('/').next().map(|s| s.to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        // Remove duplicates and sort
+                        entries.sort();
+                        entries.dedup();
+                        let _ = reply.send(entries);
+                    }
+                }
+            }
+        });
+
         Self {
-            files: Arc::new(std::cell::RefCell::new(files)),
+            request_sender: tx,
+            _actor_loop: Arc::new(actor_loop),
         }
     }
 
-    /// Read text content from a file
-    pub fn read_text(&self, path: &str) -> Option<String> {
-        let normalized = Self::normalize_path(path);
-        self.files.borrow().get(&normalized).cloned()
+    /// Read text content from a file (async)
+    pub async fn read_text(&self, path: &str) -> Option<String> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.request_sender.unbounded_send(FsRequest::ReadText {
+            path: path.to_string(),
+            reply: tx,
+        });
+        rx.await.ok().flatten()
     }
 
-    /// Write text content to a file
+    /// Write text content to a file (fire-and-forget)
+    ///
+    /// This is synchronous because it just sends a message to the actor.
+    /// The actual write happens asynchronously in the actor loop.
     pub fn write_text(&self, path: &str, content: String) {
-        let normalized = Self::normalize_path(path);
-        self.files.borrow_mut().insert(normalized, content);
+        let _ = self.request_sender.unbounded_send(FsRequest::WriteText {
+            path: path.to_string(),
+            content,
+        });
     }
 
-    /// List entries in a directory
-    pub fn list_directory(&self, path: &str) -> Vec<String> {
-        let normalized = Self::normalize_path(path);
-        let prefix = if normalized.is_empty() || normalized == "/" {
-            String::new()
-        } else if normalized.ends_with('/') {
-            normalized.clone()
-        } else {
-            format!("{}/", normalized)
-        };
-
-        let files = self.files.borrow();
-        let mut entries: Vec<String> = files
-            .keys()
-            .filter_map(|file_path| {
-                if prefix.is_empty() {
-                    // Root directory - get first path component
-                    file_path.split('/').next().map(|s| s.to_string())
-                } else if file_path.starts_with(&prefix) {
-                    // Get the next path component after the prefix
-                    let remainder = &file_path[prefix.len()..];
-                    remainder.split('/').next().map(|s| s.to_string())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Remove duplicates and sort
-        entries.sort();
-        entries.dedup();
-        entries
+    /// List entries in a directory (async)
+    pub async fn list_directory(&self, path: &str) -> Vec<String> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.request_sender.unbounded_send(FsRequest::ListDirectory {
+            path: path.to_string(),
+            reply: tx,
+        });
+        rx.await.unwrap_or_default()
     }
 
-    /// Check if a file exists
-    pub fn exists(&self, path: &str) -> bool {
-        let normalized = Self::normalize_path(path);
-        self.files.borrow().contains_key(&normalized)
+    /// Check if a file exists (async)
+    pub async fn exists(&self, path: &str) -> bool {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.request_sender.unbounded_send(FsRequest::Exists {
+            path: path.to_string(),
+            reply: tx,
+        });
+        rx.await.unwrap_or(false)
     }
 
-    /// Delete a file
-    pub fn delete(&self, path: &str) -> bool {
-        let normalized = Self::normalize_path(path);
-        self.files.borrow_mut().remove(&normalized).is_some()
+    /// Delete a file (async)
+    pub async fn delete(&self, path: &str) -> bool {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.request_sender.unbounded_send(FsRequest::Delete {
+            path: path.to_string(),
+            reply: tx,
+        });
+        rx.await.unwrap_or(false)
     }
 
     /// Normalize path by removing leading/trailing slashes and "./" prefixes
@@ -1010,9 +1093,8 @@ pub struct ActorContext {
     /// 2. Releases the backpressure permit
     /// Without this, THEN would block on permit.acquire() for the second pulse
     /// because permit release normally happens in HOLD's Task which hasn't run yet.
-    /// Uses Rc (not Arc) since the engine runs single-threaded in WASM.
-    /// This allows capturing non-Send/Sync types like ValueActor.
-    pub hold_state_update_callback: Option<Rc<dyn Fn(Value)>>,
+    /// Uses Arc for thread-safety (WebWorkers, future HVM targets).
+    pub hold_state_update_callback: Option<Arc<dyn Fn(Value) + Send + Sync>>,
     /// When true, expression evaluation creates LazyValueActors instead of eager ValueActors.
     /// Lazy actors only poll their source stream when a subscriber requests values (demand-driven).
     /// This is set by HOLD for body evaluation to ensure sequential state updates:
@@ -2561,6 +2643,11 @@ impl ValueHistory {
     pub fn has_version(&self, version: u64) -> bool {
         self.values.front().map(|(v, _)| *v <= version).unwrap_or(false)
     }
+
+    /// Get the latest value in the history.
+    pub fn get_latest(&self) -> Option<Value> {
+        self.values.back().map(|(_, v)| v.clone())
+    }
 }
 
 // --- ValueActor ---
@@ -2588,9 +2675,6 @@ pub struct ValueActor {
     /// This replaces the old `extra_owned_data` pattern.
     inputs: Vec<Arc<ValueActor>>,
 
-    /// Lock-free access to current value for efficient reads.
-    current_value: Arc<ArcSwap<Option<Value>>>,
-
     /// Current version number - increments on each value change.
     /// Used by Subscription for push-pull architecture.
     current_version: Arc<AtomicU64>,
@@ -2615,6 +2699,11 @@ pub struct ValueActor {
     /// When Some, subscribe() delegates to this lazy actor instead of the normal subscription.
     /// Used in HOLD body context where lazy evaluation is needed for sequential state updates.
     lazy_delegate: Option<Arc<LazyValueActor>>,
+
+    /// Extra ActorLoops that should be kept alive with this actor.
+    /// Used by HOLD to keep the driver loop alive - when the ValueActor is dropped,
+    /// the extra loops are dropped too, cancelling their async tasks.
+    extra_loops: Vec<ActorLoop>,
 }
 
 impl ValueActor {
@@ -2657,7 +2746,6 @@ impl ValueActor {
     ) -> Self {
         let construct_info = Arc::new(construct_info);
         let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
-        let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(None));
         let current_version = Arc::new(AtomicU64::new(0));
         // History of recent values for preventing message loss
         let value_history = Arc::new(std::sync::Mutex::new(ValueHistory::new(64)));
@@ -2679,7 +2767,6 @@ impl ValueActor {
 
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
-            let current_value = current_value.clone();
             let current_version = current_version.clone();
             let value_history = value_history.clone();
             let notify_senders = notify_senders.clone();
@@ -2741,7 +2828,6 @@ impl ValueActor {
                             match msg {
                                 ActorMessage::StreamValue(value) => {
                                     // Value received from migration source - treat as new value
-                                    current_value.store(Arc::new(Some(value.clone())));
                                     // Increment version and store in history
                                     let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                     if let Ok(mut history) = value_history.lock() {
@@ -2814,7 +2900,6 @@ impl ValueActor {
                             };
 
                             stream_ever_produced = true;
-                            current_value.store(Arc::new(Some(new_value.clone())));
                             // Increment version and store in history
                             let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                             if let Ok(mut history) = value_history.lock() {
@@ -2860,13 +2945,13 @@ impl ValueActor {
             persistence_id,
             message_sender,
             inputs,
-            current_value,
             current_version,
             value_history,
             notify_sender_sender,
             notify_senders,
             actor_loop,
             lazy_delegate: None,
+            extra_loops: Vec::new(),
         }
     }
 
@@ -2930,7 +3015,6 @@ impl ValueActor {
         // The lazy_delegate will handle all subscriptions
         let construct_info = Arc::new(construct_info);
         let (message_sender, _message_receiver) = mpsc::unbounded::<ActorMessage>();
-        let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(None));
         let current_version = Arc::new(AtomicU64::new(0));
         let (notify_sender_sender, _notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
         let value_history = Arc::new(std::sync::Mutex::new(ValueHistory::new(64)));
@@ -2944,13 +3028,13 @@ impl ValueActor {
             persistence_id,
             message_sender,
             inputs,
-            current_value,
             current_version,
             value_history,
             notify_sender_sender,
             notify_senders,
             actor_loop,
             lazy_delegate: Some(lazy_actor),
+            extra_loops: Vec::new(),
         })
     }
 
@@ -2972,8 +3056,6 @@ impl ValueActor {
         let value_stream = value_stream.inner;
         let construct_info = Arc::new(construct_info);
         let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
-        // Pre-set the initial value
-        let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(Some(initial_value.clone())));
         // Start at version 1 since we have an initial value
         let current_version = Arc::new(AtomicU64::new(1));
         let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
@@ -2989,7 +3071,6 @@ impl ValueActor {
 
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
-            let current_value = current_value.clone();
             let current_version = current_version.clone();
             let value_history = value_history.clone();
             let notify_senders = notify_senders.clone();
@@ -3031,7 +3112,6 @@ impl ValueActor {
                             };
                             match msg {
                                 ActorMessage::StreamValue(value) => {
-                                    current_value.store(Arc::new(Some(value.clone())));
                                     // Increment version and store in history
                                     let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                     if let Ok(mut history) = value_history.lock() {
@@ -3058,7 +3138,6 @@ impl ValueActor {
                             };
 
                             stream_ever_produced = true;
-                            current_value.store(Arc::new(Some(new_value.clone())));
                             // Increment version and store in history
                             let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                             if let Ok(mut history) = value_history.lock() {
@@ -3093,13 +3172,13 @@ impl ValueActor {
             persistence_id,
             message_sender,
             inputs,
-            current_value,
             current_version,
             value_history,
             notify_sender_sender,
             notify_senders,
             actor_loop,
             lazy_delegate: None,
+            extra_loops: Vec::new(),
         }
     }
 
@@ -3210,8 +3289,6 @@ impl ValueActor {
         let value_stream = value_stream.inner;
         let construct_info = Arc::new(construct_info);
         let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
-        // Pre-set the initial value
-        let current_value: Arc<ArcSwap<Option<Value>>> = Arc::new(ArcSwap::from_pointee(Some(initial_value.clone())));
         // Start at version 1 since we have an initial value
         let current_version = Arc::new(AtomicU64::new(1));
         let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
@@ -3228,7 +3305,6 @@ impl ValueActor {
 
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
-            let current_value = current_value.clone();
             let current_version = current_version.clone();
             let value_history = value_history.clone();
             let output_valve_signal = actor_context.output_valve_signal.clone();
@@ -3269,9 +3345,8 @@ impl ValueActor {
                                 ActorMessage::StreamValue(new_value) => {
                                     let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                     if let Ok(mut history) = value_history.lock() {
-                                        history.add(new_version, new_value.clone());
+                                        history.add(new_version, new_value);
                                     }
-                                    current_value.store(Arc::new(Some(new_value)));
                                     notify_senders.lock().unwrap().retain_mut(|sender| {
                                         match sender.try_send(()) {
                                             Ok(()) => true,
@@ -3292,9 +3367,8 @@ impl ValueActor {
                             if let Some(new_value) = new_value {
                                 let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                 if let Ok(mut history) = value_history.lock() {
-                                    history.add(new_version, new_value.clone());
+                                    history.add(new_version, new_value);
                                 }
-                                current_value.store(Arc::new(Some(new_value)));
                                 notify_senders.lock().unwrap().retain_mut(|sender| {
                                     match sender.try_send(()) {
                                         Ok(()) => true,
@@ -3318,21 +3392,21 @@ impl ValueActor {
             persistence_id,
             message_sender,
             inputs: Vec::new(),
-            current_value,
             current_version,
             value_history,
             notify_sender_sender,
             notify_senders,
             actor_loop,
             lazy_delegate: None,
+            extra_loops: Vec::new(),
         })
     }
 
-    /// Read stored value from ArcSwap.
+    /// Read stored value from value history.
     /// Used by Subscription within engine.rs and for synchronous initial value storage.
     /// Prefer subscribe().next().await for async reactive semantics.
     pub fn stored_value(&self) -> Option<Value> {
-        self.current_value.load().as_ref().clone()
+        self.value_history.lock().ok()?.get_latest()
     }
 
     /// Directly store a value, bypassing the async stream.
@@ -3341,18 +3415,19 @@ impl ValueActor {
     pub fn store_value_directly(&self, value: Value) {
         // Increment version
         let new_version = self.current_version.fetch_add(1, Ordering::SeqCst) + 1;
-        // Store in history
-        self.value_history.lock().unwrap().add(new_version, value.clone());
-        // Store as current value
-        self.current_value.store(Arc::new(Some(value)));
+        // Store in history (also serves as current value storage)
+        if let Ok(mut history) = self.value_history.lock() {
+            history.add(new_version, value);
+        }
         // Notify subscribers
-        let mut senders = self.notify_senders.lock().unwrap();
-        senders.retain_mut(|sender| {
-            match sender.try_send(()) {
-                Ok(()) => true,
-                Err(e) => !e.is_disconnected(),
-            }
-        });
+        if let Ok(mut senders) = self.notify_senders.lock() {
+            senders.retain_mut(|sender| {
+                match sender.try_send(()) {
+                    Ok(()) => true,
+                    Err(e) => !e.is_disconnected(),
+                }
+            });
+        }
     }
 
     /// Subscribe to this actor's values.
@@ -3533,7 +3608,7 @@ pub enum ValueUpdate {
 ///
 /// # Memory Characteristics
 /// - Notifications: bounded(1) channel - at most 1 pending signal
-/// - Data: Pulled from history buffer, then from ArcSwap if history exhausted
+/// - Data: Pulled from history buffer
 /// - Slow consumer: Falls back to latest if too far behind
 pub struct Subscription {
     /// Strong reference to the subscribed actor.
@@ -3735,14 +3810,14 @@ impl ListDiffSubscription {
             }
         }
 
-        let update = self.list.get_update_since(self.last_seen_version);
+        let update = self.list.get_update_since(self.last_seen_version).await;
         self.last_seen_version = self.list.version();
         Some(update)
     }
 
-    /// Get current snapshot immediately without waiting.
-    pub fn snapshot(&self) -> Vec<(ItemId, Arc<ValueActor>)> {
-        self.list.snapshot()
+    /// Get current snapshot (async).
+    pub async fn snapshot(&self) -> Vec<(ItemId, Arc<ValueActor>)> {
+        self.list.snapshot().await
     }
 
     /// Check if there are pending updates without consuming them.
@@ -3754,36 +3829,18 @@ impl ListDiffSubscription {
     pub fn list(&self) -> &Arc<List> {
         &self.list
     }
-}
 
-impl Stream for ListDiffSubscription {
-    type Item = ValueUpdate;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            let current = self.list.version();
-            if current > self.last_seen_version {
-                let update = self.list.get_update_since(self.last_seen_version);
-                self.last_seen_version = current;
-                return Poll::Ready(Some(update));
-            }
-
-            // Poll the notification receiver
-            match Pin::new(&mut self.notify_receiver).poll_next(cx) {
-                Poll::Ready(Some(())) => {
-                    // Got notification, loop to check version again
-                    continue;
-                }
-                Poll::Ready(None) => {
-                    return Poll::Ready(None);
-                }
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
-            }
-        }
+    /// Convert to a Stream using unfold (async-compatible).
+    pub fn into_stream(self) -> impl Stream<Item = ValueUpdate> {
+        stream::unfold(self, |mut subscription| async move {
+            let update = subscription.next_update().await?;
+            Some((update, subscription))
+        })
     }
 }
+
+// Note: Direct Stream impl removed because get_update_since is now async.
+// Use into_stream() or next_update() instead.
 
 // --- ValueIdempotencyKey ---
 
@@ -4884,6 +4941,17 @@ impl Drop for Number {
 
 // --- List ---
 
+/// Query types for List's diff history actor
+enum DiffHistoryQuery {
+    GetUpdateSince {
+        subscriber_version: u64,
+        reply: oneshot::Sender<ValueUpdate>,
+    },
+    Snapshot {
+        reply: oneshot::Sender<Vec<(ItemId, Arc<ValueActor>)>>,
+    },
+}
+
 pub struct List {
     construct_info: Arc<ConstructInfoComplete>,
     actor_loop: ActorLoop,
@@ -4892,8 +4960,8 @@ pub struct List {
     current_version: Arc<AtomicU64>,
     /// Channel for registering diff subscribers (bounded channels)
     notify_sender_sender: mpsc::UnboundedSender<mpsc::Sender<()>>,
-    /// Diff history for efficient incremental updates
-    diff_history: Arc<RefCell<DiffHistory>>,
+    /// Channel for querying diff history (actor-owned, no RefCell)
+    diff_query_sender: mpsc::UnboundedSender<DiffHistoryQuery>,
 }
 
 impl List {
@@ -4926,14 +4994,16 @@ impl List {
         // Channel for diff subscriber registration (bounded channels)
         let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
 
-        // Diff history for efficient incremental updates
-        let diff_history = Arc::new(RefCell::new(DiffHistory::new(DiffHistoryConfig::default())));
-        let diff_history_for_loop = diff_history.clone();
+        // Channel for diff history queries (actor-owned, no RefCell)
+        let (diff_query_sender, diff_query_receiver) = mpsc::unbounded::<DiffHistoryQuery>();
 
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
             let output_valve_signal = actor_context.output_valve_signal;
             async move {
+                // Diff history is owned by the actor loop - no RefCell needed
+                let mut diff_history = DiffHistory::new(DiffHistoryConfig::default());
+
                 let output_valve_signal = output_valve_signal;
                 let mut output_valve_impulse_stream =
                     if let Some(output_valve_signal) = &output_valve_signal {
@@ -4944,6 +5014,7 @@ impl List {
                     .fuse();
                 let mut change_stream = pin!(change_stream.fuse());
                 let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
+                let mut diff_query_receiver = pin!(diff_query_receiver.fuse());
                 let mut change_senders = Vec::<mpsc::UnboundedSender<ListChange>>::new();
                 // Diff subscriber notification senders (bounded channels)
                 let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
@@ -4951,6 +5022,22 @@ impl List {
                 println!("[DEBUG List loop] Started for {}", construct_info);
                 loop {
                     select! {
+                        // Handle diff history queries
+                        query = diff_query_receiver.next() => {
+                            if let Some(query) = query {
+                                match query {
+                                    DiffHistoryQuery::GetUpdateSince { subscriber_version, reply } => {
+                                        let update = diff_history.get_update_since(subscriber_version);
+                                        let _ = reply.send(update);
+                                    }
+                                    DiffHistoryQuery::Snapshot { reply } => {
+                                        let snapshot = diff_history.snapshot().to_vec();
+                                        let _ = reply.send(snapshot);
+                                    }
+                                }
+                            }
+                        }
+
                         // Handle new diff subscriber registrations
                         sender = notify_sender_receiver.next() => {
                             if let Some(mut sender) = sender {
@@ -4975,11 +5062,8 @@ impl List {
                             }
 
                             // Convert to diff and add to history (before modifying list)
-                            {
-                                let mut history = diff_history_for_loop.borrow_mut();
-                                let diff = change.to_diff(history.snapshot());
-                                history.add(diff);
-                            }
+                            let diff = change.to_diff(diff_history.snapshot());
+                            diff_history.add(diff);
 
                             if let Some(list) = &mut list {
                                 change.clone().apply_to_vec(list);
@@ -5046,7 +5130,7 @@ impl List {
             change_sender_sender,
             current_version,
             notify_sender_sender,
-            diff_history,
+            diff_query_sender,
         }
     }
 
@@ -5055,15 +5139,24 @@ impl List {
         self.current_version.load(Ordering::SeqCst)
     }
 
-    /// Get optimal update for subscriber at given version.
+    /// Get optimal update for subscriber at given version (async).
     /// Returns diffs if subscriber is close, snapshot if too far behind.
-    pub fn get_update_since(&self, subscriber_version: u64) -> ValueUpdate {
-        self.diff_history.borrow().get_update_since(subscriber_version)
+    pub async fn get_update_since(&self, subscriber_version: u64) -> ValueUpdate {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.diff_query_sender.unbounded_send(DiffHistoryQuery::GetUpdateSince {
+            subscriber_version,
+            reply: tx,
+        });
+        rx.await.unwrap_or(ValueUpdate::Current)
     }
 
-    /// Get current snapshot of items with their stable IDs.
-    pub fn snapshot(&self) -> Vec<(ItemId, Arc<ValueActor>)> {
-        self.diff_history.borrow().snapshot().to_vec()
+    /// Get current snapshot of items with their stable IDs (async).
+    pub async fn snapshot(&self) -> Vec<(ItemId, Arc<ValueActor>)> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.diff_query_sender.unbounded_send(DiffHistoryQuery::Snapshot {
+            reply: tx,
+        });
+        rx.await.unwrap_or_default()
     }
 
     /// Subscribe to list updates with diff support.
@@ -5793,7 +5886,7 @@ impl ListBindingFunction {
         config: ListBindingConfig,
     ) -> Arc<ValueActor> {
         let construct_info = construct_info.complete(ConstructType::FunctionCall);
-        let config = Rc::new(config);
+        let config = Arc::new(config);
 
         match config.operation {
             ListBindingOperation::Map => {
@@ -5852,7 +5945,7 @@ impl ListBindingFunction {
         construct_context: ConstructContext,
         actor_context: ActorContext,
         source_list_actor: Arc<ValueActor>,
-        config: Rc<ListBindingConfig>,
+        config: Arc<ListBindingConfig>,
     ) -> Arc<ValueActor> {
         let config_for_stream = config.clone();
         let construct_context_for_stream = construct_context.clone();
@@ -5910,7 +6003,7 @@ impl ListBindingFunction {
         construct_context: ConstructContext,
         actor_context: ActorContext,
         source_list_actor: Arc<ValueActor>,
-        config: Rc<ListBindingConfig>,
+        config: Arc<ListBindingConfig>,
     ) -> Arc<ValueActor> {
         let construct_info_id = construct_info.id.clone();
 
@@ -6071,7 +6164,7 @@ impl ListBindingFunction {
         construct_context: ConstructContext,
         actor_context: ActorContext,
         source_list_actor: Arc<ValueActor>,
-        config: Rc<ListBindingConfig>,
+        config: Arc<ListBindingConfig>,
         is_every: bool, // true = every, false = any
     ) -> Arc<ValueActor> {
         let construct_info_id = construct_info.id.clone();
@@ -6224,7 +6317,7 @@ impl ListBindingFunction {
         construct_context: ConstructContext,
         actor_context: ActorContext,
         source_list_actor: Arc<ValueActor>,
-        config: Rc<ListBindingConfig>,
+        config: Arc<ListBindingConfig>,
     ) -> Arc<ValueActor> {
         let construct_info_id = construct_info.id.clone();
 

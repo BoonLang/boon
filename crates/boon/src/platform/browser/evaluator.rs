@@ -1,14 +1,13 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::{Arc, Weak};
 use std::task::Poll;
 
 use chumsky::Parser as ChumskyParser;
 use chumsky::input::{Input as ChumskyInput, Stream as ChumskyStream};
 use ulid::Ulid;
+use zoon::futures_channel::oneshot;
 use zoon::futures_util::stream;
 use zoon::{Stream, StreamExt, println, eprintln, mpsc};
 
@@ -51,9 +50,12 @@ pub struct EvaluationContext {
     pub actor_context: ActorContext,
     pub reference_connector: Weak<ReferenceConnector>,
     pub link_connector: Weak<LinkConnector>,
-    pub function_registry: StaticFunctionRegistry,
     pub module_loader: ModuleLoader,
     pub source_code: SourceCode,
+    /// Optional snapshot of function registry for nested evaluations (closures).
+    /// None during main evaluation (uses EvaluationState.function_registry instead).
+    /// Some(arc) for nested evaluations with immutable snapshot.
+    pub function_registry_snapshot: Option<Arc<HashMap<String, StaticFunctionDefinition>>>,
 }
 
 impl EvaluationContext {
@@ -63,7 +65,6 @@ impl EvaluationContext {
         actor_context: ActorContext,
         reference_connector: Arc<ReferenceConnector>,
         link_connector: Arc<LinkConnector>,
-        function_registry: StaticFunctionRegistry,
         module_loader: ModuleLoader,
         source_code: SourceCode,
     ) -> Self {
@@ -72,9 +73,9 @@ impl EvaluationContext {
             actor_context,
             reference_connector: Arc::downgrade(&reference_connector),
             link_connector: Arc::downgrade(&link_connector),
-            function_registry,
             module_loader,
             source_code,
+            function_registry_snapshot: None,
         }
     }
 
@@ -357,6 +358,10 @@ pub struct EvaluationState {
 
     /// Next available slot ID.
     next_slot: SlotId,
+
+    /// Function registry - stores user-defined functions during evaluation.
+    /// Owned by the evaluation state, no sharing or interior mutability needed.
+    function_registry: HashMap<String, StaticFunctionDefinition>,
 }
 
 impl EvaluationState {
@@ -366,7 +371,28 @@ impl EvaluationState {
             work_queue: Vec::new(),
             results: HashMap::new(),
             next_slot: 0,
+            function_registry: HashMap::new(),
         }
+    }
+
+    /// Create evaluation state with pre-populated function registry.
+    pub fn with_functions(functions: HashMap<String, StaticFunctionDefinition>) -> Self {
+        Self {
+            work_queue: Vec::new(),
+            results: HashMap::new(),
+            next_slot: 0,
+            function_registry: functions,
+        }
+    }
+
+    /// Register a function in the registry.
+    pub fn register_function(&mut self, name: String, def: StaticFunctionDefinition) {
+        self.function_registry.insert(name, def);
+    }
+
+    /// Look up a function by name.
+    pub fn get_function(&self, name: &str) -> Option<&StaticFunctionDefinition> {
+        self.function_registry.get(name)
     }
 
     /// Allocate a new result slot.
@@ -586,34 +612,40 @@ fn schedule_expression(
         static_expression::Expression::Then { body } => {
             // THEN creates an actor that evaluates body at runtime for each piped value
             // We can build it immediately since the body is evaluated lazily
+            let registry_snapshot = Arc::new(state.function_registry.clone());
             let actor = build_then_actor(
                 *body,
                 span,
                 persistence,
                 persistence_id,
                 ctx,
+                registry_snapshot,
             )?;
             state.store(result_slot, actor);
         }
 
         static_expression::Expression::When { arms } => {
+            let registry_snapshot = Arc::new(state.function_registry.clone());
             let actor = build_when_actor(
                 arms,
                 span,
                 persistence,
                 persistence_id,
                 ctx,
+                registry_snapshot,
             )?;
             state.store(result_slot, actor);
         }
 
         static_expression::Expression::While { arms } => {
+            let registry_snapshot = Arc::new(state.function_registry.clone());
             let actor = build_while_actor(
                 arms,
                 span,
                 persistence,
                 persistence_id,
                 ctx,
+                registry_snapshot,
             )?;
             state.store(result_slot, actor);
         }
@@ -1093,7 +1125,7 @@ fn schedule_expression(
         // ============================================================
 
         static_expression::Expression::Function { name, parameters, body } => {
-            // Register the function in the function registry
+            // Register the function in the evaluation state's registry
             let func_name = name.to_string();
             let param_names: Vec<String> = parameters.iter().map(|p| p.node.to_string()).collect();
 
@@ -1102,7 +1134,7 @@ fn schedule_expression(
                 body: *body,
             };
 
-            ctx.function_registry.functions.borrow_mut().insert(func_name.clone(), func_def);
+            state.register_function(func_name.clone(), func_def);
 
             // Function definitions don't produce a value, return SKIP
             let actor = ValueActor::new_arc(
@@ -1576,19 +1608,22 @@ fn process_work_item(
 
         WorkItem::BuildThen { piped_slot: _, body, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
-            let actor = build_then_actor(*body, span, persistence, persistence_id, ctx)?;
+            let registry_snapshot = Arc::new(state.function_registry.clone());
+            let actor = build_then_actor(*body, span, persistence, persistence_id, ctx, registry_snapshot)?;
             state.store(result_slot, actor);
         }
 
         WorkItem::BuildWhen { piped_slot: _, arms, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
-            let actor = build_when_actor(arms, span, persistence, persistence_id, ctx)?;
+            let registry_snapshot = Arc::new(state.function_registry.clone());
+            let actor = build_when_actor(arms, span, persistence, persistence_id, ctx, registry_snapshot)?;
             state.store(result_slot, actor);
         }
 
         WorkItem::BuildWhile { piped_slot: _, arms, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().map(|p| p.id).unwrap_or_default();
-            let actor = build_while_actor(arms, span, persistence, persistence_id, ctx)?;
+            let registry_snapshot = Arc::new(state.function_registry.clone());
+            let actor = build_while_actor(arms, span, persistence, persistence_id, ctx, registry_snapshot)?;
             state.store(result_slot, actor);
         }
 
@@ -1793,7 +1828,6 @@ fn process_work_item(
                         },
                         reference_connector: ctx.reference_connector,
                         link_connector: ctx.link_connector,
-                        function_registry: ctx.function_registry,
                         module_loader: ctx.module_loader,
                         source_code: ctx.source_code,
                     };
@@ -1809,6 +1843,7 @@ fn process_work_item(
                 persistence_id,
                 ctx,
                 use_piped_for_builtin,
+                &state.function_registry,
             )?;
             // If function returns SKIP (None), don't store anything
             if let Some(actor) = actor_opt {
@@ -1921,6 +1956,7 @@ fn build_then_actor(
     persistence: Option<Persistence>,
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
+    function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
 ) -> Result<Arc<ValueActor>, String> {
     let piped = ctx.actor_context.piped.clone()
         .ok_or("THEN requires a piped value")?;
@@ -1933,7 +1969,7 @@ fn build_then_actor(
     let actor_context_for_then = ctx.actor_context.clone();
     let reference_connector_for_then = ctx.reference_connector.clone();
     let link_connector_for_then = ctx.link_connector.clone();
-    let function_registry_for_then = ctx.function_registry.clone();
+    let function_registry_for_then = function_registry_snapshot;
     let module_loader_for_then = ctx.module_loader.clone();
     let source_code_for_then = ctx.source_code.clone();
     let persistence_for_then = persistence.clone();
@@ -2049,9 +2085,9 @@ fn build_then_actor(
                 actor_context: new_actor_context.clone(),
                 reference_connector: reference_connector_clone,
                 link_connector: link_connector_clone,
-                function_registry: function_registry_clone,
                 module_loader: module_loader_clone,
                 source_code: source_code_clone,
+                function_registry_snapshot: Some(function_registry_clone),
             };
 
             let body_expr = static_expression::Spanned {
@@ -2177,7 +2213,7 @@ fn build_then_actor(
             actor_context: sync_actor_context,
             reference_connector: ctx.reference_connector.clone(),
             link_connector: ctx.link_connector.clone(),
-            function_registry: ctx.function_registry.clone(),
+            function_registry_snapshot: ctx.function_registry_snapshot.clone(),
             module_loader: ctx.module_loader.clone(),
             source_code: ctx.source_code.clone(),
         };
@@ -2301,6 +2337,7 @@ fn build_when_actor(
     persistence: Option<Persistence>,
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
+    function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
 ) -> Result<Arc<ValueActor>, String> {
     let piped = ctx.actor_context.piped.clone()
         .ok_or("WHEN requires a piped value")?;
@@ -2313,7 +2350,7 @@ fn build_when_actor(
     let actor_context_for_when = ctx.actor_context.clone();
     let reference_connector_for_when = ctx.reference_connector.clone();
     let link_connector_for_when = ctx.link_connector.clone();
-    let function_registry_for_when = ctx.function_registry.clone();
+    let function_registry_for_when = function_registry_snapshot;
     let module_loader_for_when = ctx.module_loader.clone();
     let source_code_for_when = ctx.source_code.clone();
     let persistence_for_when = persistence.clone();
@@ -2410,9 +2447,9 @@ fn build_when_actor(
                         actor_context: new_actor_context.clone(),
                         reference_connector: reference_connector_clone.clone(),
                         link_connector: link_connector_clone.clone(),
-                        function_registry: function_registry_clone.clone(),
                         module_loader: module_loader_clone.clone(),
                         source_code: source_code_clone.clone(),
+                        function_registry_snapshot: Some(function_registry_clone.clone()),
                     };
 
                     // arm.body is Expression, not Spanned<Expression>
@@ -2494,6 +2531,7 @@ fn build_while_actor(
     persistence: Option<Persistence>,
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
+    function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
 ) -> Result<Arc<ValueActor>, String> {
     let piped = ctx.actor_context.piped.clone()
         .ok_or("WHILE requires a piped value")?;
@@ -2502,7 +2540,7 @@ fn build_while_actor(
     let actor_context_for_while = ctx.actor_context.clone();
     let reference_connector_for_while = ctx.reference_connector.clone();
     let link_connector_for_while = ctx.link_connector.clone();
-    let function_registry_for_while = ctx.function_registry.clone();
+    let function_registry_for_while = function_registry_snapshot;
     let module_loader_for_while = ctx.module_loader.clone();
     let source_code_for_while = ctx.source_code.clone();
     let persistence_for_while = persistence.clone();
@@ -2576,9 +2614,9 @@ fn build_while_actor(
                     actor_context: new_actor_context,
                     reference_connector: reference_connector_clone,
                     link_connector: link_connector_clone,
-                    function_registry: function_registry_clone,
                     module_loader: module_loader_clone,
                     source_code: source_code_clone,
+                    function_registry_snapshot: Some(function_registry_clone),
                 };
 
                 // arm.body is Expression, not Spanned<Expression>
@@ -2806,15 +2844,10 @@ fn build_hold_actor(
     ctx: EvaluationContext,
 ) -> Result<Option<Arc<ValueActor>>, String> {
     // Use a channel to hold current state value and broadcast updates
+    // Note: UnboundedSender::unbounded_send takes &self, so we can just clone the sender
     let (state_sender, state_receiver) = zoon::futures_channel::mpsc::unbounded::<Value>();
-    let state_sender = Rc::new(RefCell::new(state_sender));
     let state_sender_for_update = state_sender.clone();
     let state_sender_for_reset = state_sender.clone();
-
-    // Current state holder (starts with None, will be set when initial emits)
-    let current_state: Rc<RefCell<Option<Value>>> = Rc::new(RefCell::new(None));
-    let current_state_for_body = current_state.clone();
-    let current_state_for_update = current_state.clone();
 
     // Create a ValueActor that provides the current state to the body
     // This is what the state_param references
@@ -2855,7 +2888,7 @@ fn build_hold_actor(
     // This ensures the next body evaluation sees the updated state.
     // NOTE: We do NOT store to output here - state_update_stream handles that.
     // Storing in both places would cause duplicate emissions.
-    let hold_state_update_callback: Rc<dyn Fn(Value)> = Rc::new(move |new_value: Value| {
+    let hold_state_update_callback: Arc<dyn Fn(Value) + Send + Sync> = Arc::new(move |new_value: Value| {
         // Update state_actor's stored value directly - THEN will read from here
         state_actor_for_callback.store_value_directly(new_value);
         // Release permit to allow THEN to process next input
@@ -2888,7 +2921,7 @@ fn build_hold_actor(
         actor_context: body_actor_context,
         reference_connector: ctx.reference_connector.clone(),
         link_connector: ctx.link_connector.clone(),
-        function_registry: ctx.function_registry.clone(),
+        function_registry_snapshot: ctx.function_registry_snapshot.clone(),
         module_loader: ctx.module_loader.clone(),
         source_code: ctx.source_code.clone(),
     };
@@ -2911,10 +2944,8 @@ fn build_hold_actor(
     // one at a time and updates state between each pull (sequential state updates).
     let body_subscription = body_result.clone().subscribe();
     let state_update_stream = body_subscription.map(move |new_value| {
-        // Update current state
-        *current_state_for_update.borrow_mut() = Some(new_value.clone());
         // Send to state channel so body can see it on next event
-        let _ = state_sender_for_update.borrow().unbounded_send(new_value.clone());
+        let _ = state_sender_for_update.unbounded_send(new_value.clone());
         // DIRECTLY update state_actor's stored value - bypass async channel delay.
         // This ensures the next THEN body evaluation reads the fresh state value.
         // NOTE: The callback already updates state_actor, but we update here too
@@ -2930,14 +2961,16 @@ fn build_hold_actor(
     // Values will be stored directly via store_value_directly() from the stream closures below.
     // This ensures values are available in history immediately when Stream/skip subscribes.
     //
-    // The actor_loop_cell holds the ActorLoop for the driver task. When the output actor
-    // is dropped, the stream is dropped, which drops the Rc, which drops the ActorLoop,
+    // The driver_loop_holder holds the ActorLoop for the driver task. When the output actor
+    // is dropped, the stream is dropped, which drops the Arc, which drops the ActorLoop,
     // which cancels the driver task. This ensures Timer/interval stops when switching examples.
-    let actor_loop_cell: Rc<RefCell<Option<ActorLoop>>> = Rc::new(RefCell::new(None));
-    let actor_loop_cell_for_stream = actor_loop_cell.clone();
+    //
+    // Using OnceLock instead of Rc<RefCell> - it's a thread-safe write-once cell.
+    let driver_loop_holder: Arc<std::sync::OnceLock<ActorLoop>> = Arc::new(std::sync::OnceLock::new());
+    let driver_loop_holder_for_stream = driver_loop_holder.clone();
     let output_stream = stream::poll_fn(move |_cx| {
-        // Keep the RefCell alive - this holds the ActorLoop when set
-        let _keep_alive = actor_loop_cell_for_stream.borrow();
+        // Keep the Arc<OnceLock> alive - when this is dropped, the ActorLoop is dropped
+        let _ = &driver_loop_holder_for_stream;
         Poll::Pending::<Option<Value>>
     });
     let output = ValueActor::new_arc_with_inputs(
@@ -2970,22 +3003,22 @@ fn build_hold_actor(
     // NOTE: First value is already stored synchronously above, so we skip storing it here.
     //
     // IMPORTANT: Use Weak<ValueActor> instead of Arc to avoid circular reference!
-    // The output actor holds (via Rc chain) the driver task, which holds combined_stream,
+    // The output actor holds (via Arc chain) the driver task, which holds combined_stream,
     // which holds these closures. Using Arc would create a cycle preventing cleanup.
-    let is_first_input = Rc::new(RefCell::new(true));
+    //
+    // Use AtomicBool instead of Rc<RefCell<bool>> for lock-free flag.
+    let is_first_input = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let output_weak_for_initial = Arc::downgrade(&output);
     let initial_stream = initial_actor.clone().subscribe().map(move |value| {
-        let is_first = *is_first_input.borrow();
+        // swap() atomically reads AND sets to false in one operation
+        let is_first = is_first_input.swap(false, std::sync::atomic::Ordering::SeqCst);
         if is_first {
-            *is_first_input.borrow_mut() = false;
-            // First value: just update current_state, don't send to state_receiver
+            // First value: don't send to state_receiver
             // (take(1) in state_stream already handles state_actor for first value)
             // NOTE: Don't store to output here - it was already stored synchronously above.
-            *current_state_for_body.borrow_mut() = Some(value.clone());
         } else {
-            // Subsequent values (reset): update current_state AND send to state_receiver
-            *current_state_for_body.borrow_mut() = Some(value.clone());
-            let _ = state_sender_for_reset.borrow().unbounded_send(value.clone());
+            // Subsequent values (reset): send to state_receiver
+            let _ = state_sender_for_reset.unbounded_send(value.clone());
             // Store value directly to output - only for reset values, not initial
             // Use weak reference to avoid circular reference
             if let Some(output) = output_weak_for_initial.upgrade() {
@@ -3017,14 +3050,15 @@ fn build_hold_actor(
     // Create an actor loop to drive the combined stream (poll it so closures execute).
     // The output actor stays alive via its pending stream, and values are stored
     // directly via store_value_directly() in the stream closures above.
-    // The ActorLoop is stored in actor_loop_cell so it's dropped when the output is dropped.
-    let actor_loop = ActorLoop::new(async move {
+    // The driver loop is stored in driver_loop_holder so it's dropped when the output is dropped.
+    let driver_loop = ActorLoop::new(async move {
         let mut stream = combined_stream;
         while stream.next().await.is_some() {
             // Values are already stored via store_value_directly in the map closures
         }
     });
-    *actor_loop_cell.borrow_mut() = Some(actor_loop);
+    // Store driver loop in the OnceLock - it will be dropped when the output stream is dropped
+    let _ = driver_loop_holder.set(driver_loop);
 
     Ok(Some(output))
 }
@@ -3460,6 +3494,7 @@ fn call_function(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
     use_piped_for_builtin: bool,
+    function_registry: &HashMap<String, StaticFunctionDefinition>,
 ) -> Result<Option<Arc<ValueActor>>, String> {
     let full_path = path.join("/");
 
@@ -3473,7 +3508,12 @@ fn call_function(
     }
 
     // Check user-defined functions first
-    let func_def_opt = ctx.function_registry.functions.borrow().get(&full_path).cloned();
+    // For nested evaluations (closures), use snapshot from context.
+    // For main evaluation, use the passed registry.
+    let func_def_opt = ctx.function_registry_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.get(&full_path).cloned())
+        .or_else(|| function_registry.get(&full_path).cloned());
 
     if let Some(func_def) = func_def_opt {
         // Create parameters from arguments
@@ -3550,9 +3590,9 @@ fn call_function(
                     actor_context: new_actor_context,
                     reference_connector: ctx_for_closure.reference_connector.clone(),
                     link_connector: ctx_for_closure.link_connector.clone(),
-                    function_registry: ctx_for_closure.function_registry.clone(),
                     module_loader: ctx_for_closure.module_loader.clone(),
                     source_code: ctx_for_closure.source_code.clone(),
+                    function_registry_snapshot: ctx_for_closure.function_registry_snapshot.clone(),
                 };
 
                 // Evaluate the function body with this piped value
@@ -3609,7 +3649,7 @@ fn call_function(
             actor_context: new_actor_context,
             reference_connector: ctx.reference_connector,
             link_connector: ctx.link_connector,
-            function_registry: ctx.function_registry,
+            function_registry_snapshot: ctx.function_registry_snapshot,
             module_loader: ctx.module_loader,
             source_code: ctx.source_code,
         };
@@ -3852,12 +3892,10 @@ async fn match_pattern(
 // END STACK-SAFE EVALUATION FUNCTIONS
 // =============================================================================
 
-/// Registry for user-defined functions using static expressions.
-/// No lifetime parameter - can be stored and used anywhere.
-#[derive(Clone, Default)]
-pub struct StaticFunctionRegistry {
-    pub functions: Rc<RefCell<HashMap<String, StaticFunctionDefinition>>>,
-}
+/// Type alias for function registry - just a simple HashMap.
+/// No actor, no ArcSwap, no locks. Owned by EvaluationState during evaluation,
+/// then returned to caller for potential reuse across files.
+pub type FunctionRegistry = HashMap<String, StaticFunctionDefinition>;
 
 /// A user-defined function definition using static expressions.
 #[derive(Clone)]
@@ -3875,32 +3913,87 @@ pub struct ModuleData {
     pub variables: HashMap<String, static_expression::Spanned<static_expression::Expression>>,
 }
 
+/// Request types for the module loader actor.
+enum ModuleLoaderRequest {
+    SetBaseDir(String),
+    GetBaseDir { reply: oneshot::Sender<String> },
+    GetCached { name: String, reply: oneshot::Sender<Option<ModuleData>> },
+    Cache { name: String, data: ModuleData },
+}
+
 /// Module loader with caching for loading and parsing Boon modules.
 /// Resolves module paths like "Theme" to file paths and caches parsed modules.
-#[derive(Clone, Default)]
+/// Uses actor model with channels - no locks, no RefCell.
+#[derive(Clone)]
 pub struct ModuleLoader {
-    /// Cache of loaded modules (module_path -> ModuleData)
-    cache: Rc<RefCell<HashMap<String, ModuleData>>>,
-    /// Base directory for module resolution (e.g., the directory containing RUN.bn)
-    base_dir: Rc<RefCell<String>>,
+    request_sender: mpsc::UnboundedSender<ModuleLoaderRequest>,
+    _actor_loop: Arc<ActorLoop>,
+}
+
+impl Default for ModuleLoader {
+    fn default() -> Self {
+        Self::new("")
+    }
 }
 
 impl ModuleLoader {
     pub fn new(base_dir: impl Into<String>) -> Self {
+        let (tx, mut rx) = mpsc::unbounded::<ModuleLoaderRequest>();
+        let initial_base_dir = base_dir.into();
+
+        let actor_loop = ActorLoop::new(async move {
+            let mut cache: HashMap<String, ModuleData> = HashMap::new();
+            let mut base_dir = initial_base_dir;
+
+            while let Some(request) = rx.next().await {
+                match request {
+                    ModuleLoaderRequest::SetBaseDir(dir) => {
+                        base_dir = dir;
+                    }
+                    ModuleLoaderRequest::GetBaseDir { reply } => {
+                        let _ = reply.send(base_dir.clone());
+                    }
+                    ModuleLoaderRequest::GetCached { name, reply } => {
+                        let _ = reply.send(cache.get(&name).cloned());
+                    }
+                    ModuleLoaderRequest::Cache { name, data } => {
+                        cache.insert(name, data);
+                    }
+                }
+            }
+        });
+
         Self {
-            cache: Rc::new(RefCell::new(HashMap::new())),
-            base_dir: Rc::new(RefCell::new(base_dir.into())),
+            request_sender: tx,
+            _actor_loop: Arc::new(actor_loop),
         }
     }
 
-    /// Set the base directory for module resolution
+    /// Set the base directory for module resolution (fire-and-forget).
     pub fn set_base_dir(&self, dir: impl Into<String>) {
-        *self.base_dir.borrow_mut() = dir.into();
+        let _ = self.request_sender.unbounded_send(ModuleLoaderRequest::SetBaseDir(dir.into()));
     }
 
-    /// Get the base directory
-    pub fn base_dir(&self) -> String {
-        self.base_dir.borrow().clone()
+    /// Get the base directory (async).
+    pub async fn base_dir(&self) -> String {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.request_sender.unbounded_send(ModuleLoaderRequest::GetBaseDir { reply: tx });
+        rx.await.unwrap_or_default()
+    }
+
+    /// Get a cached module (async).
+    async fn get_cached(&self, name: &str) -> Option<ModuleData> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.request_sender.unbounded_send(ModuleLoaderRequest::GetCached {
+            name: name.to_string(),
+            reply: tx,
+        });
+        rx.await.ok().flatten()
+    }
+
+    /// Cache a module (fire-and-forget).
+    fn cache(&self, name: String, data: ModuleData) {
+        let _ = self.request_sender.unbounded_send(ModuleLoaderRequest::Cache { name, data });
     }
 
     /// Load a module by name (e.g., "Theme", "Professional", "Assets")
@@ -3908,19 +4001,19 @@ impl ModuleLoader {
     /// 1. {base_dir}/{module_name}.bn
     /// 2. {base_dir}/{module_name}/{module_name}.bn
     /// 3. {base_dir}/Generated/{module_name}.bn (for generated files)
-    pub fn load_module(
+    pub async fn load_module(
         &self,
         module_name: &str,
         virtual_fs: &VirtualFilesystem,
         current_dir: Option<&str>,
     ) -> Option<ModuleData> {
         // Check cache first
-        if let Some(cached) = self.cache.borrow().get(module_name) {
-            return Some(cached.clone());
+        if let Some(cached) = self.get_cached(module_name).await {
+            return Some(cached);
         }
 
-        let base_dir_binding = self.base_dir.borrow();
-        let base = current_dir.unwrap_or(&base_dir_binding);
+        let base_dir_owned = self.base_dir().await;
+        let base = current_dir.unwrap_or(&base_dir_owned);
 
         // Helper to create path, avoiding leading slash when base is empty
         let make_path = |base: &str, rest: &str| {
@@ -3937,17 +4030,17 @@ impl ModuleLoader {
             make_path(base, &format!("{}/{}.bn", module_name, module_name)),
             make_path(base, &format!("Generated/{}.bn", module_name)),
             // Also try from the module loader's base directory if current_dir is different
-            make_path(&base_dir_binding, &format!("{}.bn", module_name)),
-            make_path(&base_dir_binding, &format!("{}/{}.bn", module_name, module_name)),
-            make_path(&base_dir_binding, &format!("Generated/{}.bn", module_name)),
+            make_path(&base_dir_owned, &format!("{}.bn", module_name)),
+            make_path(&base_dir_owned, &format!("{}/{}.bn", module_name, module_name)),
+            make_path(&base_dir_owned, &format!("Generated/{}.bn", module_name)),
         ];
 
         for path in paths_to_try {
-            if let Some(source_code) = virtual_fs.read_text(&path) {
+            if let Some(source_code) = virtual_fs.read_text(&path).await {
                 println!("[ModuleLoader] Loading module '{}' from '{}'", module_name, path);
-                if let Some(module_data) = self.parse_module(&path, &source_code) {
+                if let Some(module_data) = parse_module(&path, &source_code) {
                     // Cache the module
-                    self.cache.borrow_mut().insert(module_name.to_string(), module_data.clone());
+                    self.cache(module_name.to_string(), module_data.clone());
                     return Some(module_data);
                 }
             }
@@ -3957,93 +4050,93 @@ impl ModuleLoader {
         None
     }
 
-    /// Parse module source code into ModuleData
-    fn parse_module(&self, filename: &str, source_code: &str) -> Option<ModuleData> {
-        // Lexer
-        let (tokens, errors) = lexer().parse(source_code).into_output_errors();
-        if !errors.is_empty() {
-            eprintln!("[ModuleLoader] Lex errors in '{}': {:?}", filename, errors.len());
-            return None;
-        }
-        let mut tokens = tokens?;
-        tokens.retain(|spanned_token| !matches!(spanned_token.node, Token::Comment(_)));
-
-        // Parser
-        let (ast, errors) = parser()
-            .parse(ChumskyStream::from_iter(tokens).map(
-                span_at(source_code.len()),
-                |Spanned { node, span, persistence: _ }| (node, span),
-            ))
-            .into_output_errors();
-        if !errors.is_empty() {
-            eprintln!("[ModuleLoader] Parse errors in '{}': {:?}", filename, errors.len());
-            return None;
-        }
-        let ast = ast?;
-
-        // Reference resolution
-        let ast = match resolve_references(ast) {
-            Ok(ast) => ast,
-            Err(errors) => {
-                eprintln!("[ModuleLoader] Reference errors in '{}': {:?}", filename, errors.len());
-                return None;
-            }
-        };
-
-        // Convert to static expressions
-        let source_code_arc = SourceCode::new(source_code.to_string());
-        let static_ast = static_expression::convert_expressions(source_code_arc, ast);
-
-        // Extract functions and variables
-        let mut functions = HashMap::new();
-        let mut variables = HashMap::new();
-
-        for expr in static_ast {
-            match expr.node.clone() {
-                static_expression::Expression::Variable(variable) => {
-                    let name = variable.name.to_string();
-                    let value_expr = variable.value;
-                    variables.insert(name, value_expr);
-                }
-                static_expression::Expression::Function { name, parameters, body } => {
-                    functions.insert(
-                        name.to_string(),
-                        StaticFunctionDefinition {
-                            parameters: parameters.into_iter().map(|p| p.node.to_string()).collect(),
-                            body: *body,
-                        },
-                    );
-                }
-                _ => {}
-            }
-        }
-
-        Some(ModuleData { functions, variables })
-    }
-
     /// Get a function from a module
-    pub fn get_function(
+    pub async fn get_function(
         &self,
         module_name: &str,
         function_name: &str,
         virtual_fs: &VirtualFilesystem,
         current_dir: Option<&str>,
     ) -> Option<StaticFunctionDefinition> {
-        let module = self.load_module(module_name, virtual_fs, current_dir)?;
+        let module = self.load_module(module_name, virtual_fs, current_dir).await?;
         module.functions.get(function_name).cloned()
     }
 
     /// Get a variable from a module
-    pub fn get_variable(
+    pub async fn get_variable(
         &self,
         module_name: &str,
         variable_name: &str,
         virtual_fs: &VirtualFilesystem,
         current_dir: Option<&str>,
     ) -> Option<static_expression::Spanned<static_expression::Expression>> {
-        let module = self.load_module(module_name, virtual_fs, current_dir)?;
+        let module = self.load_module(module_name, virtual_fs, current_dir).await?;
         module.variables.get(variable_name).cloned()
     }
+}
+
+/// Parse module source code into ModuleData (free function, no state needed).
+fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
+    // Lexer
+    let (tokens, errors) = lexer().parse(source_code).into_output_errors();
+    if !errors.is_empty() {
+        eprintln!("[ModuleLoader] Lex errors in '{}': {:?}", filename, errors.len());
+        return None;
+    }
+    let mut tokens = tokens?;
+    tokens.retain(|spanned_token| !matches!(spanned_token.node, Token::Comment(_)));
+
+    // Parser
+    let (ast, errors) = parser()
+        .parse(ChumskyStream::from_iter(tokens).map(
+            span_at(source_code.len()),
+            |Spanned { node, span, persistence: _ }| (node, span),
+        ))
+        .into_output_errors();
+    if !errors.is_empty() {
+        eprintln!("[ModuleLoader] Parse errors in '{}': {:?}", filename, errors.len());
+        return None;
+    }
+    let ast = ast?;
+
+    // Reference resolution
+    let ast = match resolve_references(ast) {
+        Ok(ast) => ast,
+        Err(errors) => {
+            eprintln!("[ModuleLoader] Reference errors in '{}': {:?}", filename, errors.len());
+            return None;
+        }
+    };
+
+    // Convert to static expressions
+    let source_code_arc = SourceCode::new(source_code.to_string());
+    let static_ast = static_expression::convert_expressions(source_code_arc, ast);
+
+    // Extract functions and variables
+    let mut functions = HashMap::new();
+    let mut variables = HashMap::new();
+
+    for expr in static_ast {
+        match expr.node.clone() {
+            static_expression::Expression::Variable(variable) => {
+                let name = variable.name.to_string();
+                let value_expr = variable.value;
+                variables.insert(name, value_expr);
+            }
+            static_expression::Expression::Function { name, parameters, body } => {
+                functions.insert(
+                    name.to_string(),
+                    StaticFunctionDefinition {
+                        parameters: parameters.into_iter().map(|p| p.node.to_string()).collect(),
+                        body: *body,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    Some(ModuleData { functions, variables })
 }
 
 /// Main evaluation function - takes static expressions (owned, 'static, no lifetimes).
@@ -4053,7 +4146,7 @@ pub fn evaluate(
     states_local_storage_key: impl Into<Cow<'static, str>>,
     virtual_fs: VirtualFilesystem,
 ) -> Result<(Arc<Object>, ConstructContext), String> {
-    let function_registry = StaticFunctionRegistry::default();
+    let function_registry = FunctionRegistry::new();
     let module_loader = ModuleLoader::default();
     let (obj, ctx, _, _, _, _) = evaluate_with_registry(
         source_code,
@@ -4072,7 +4165,7 @@ pub fn evaluate(
 /// Returns a tuple containing:
 /// - `Arc<Object>`: The root object containing all top-level variables
 /// - `ConstructContext`: Context for construct storage and virtual filesystem
-/// - `StaticFunctionRegistry`: Registry of function definitions
+/// - `FunctionRegistry`: Registry of function definitions (HashMap)
 /// - `ModuleLoader`: Module loader for imports
 /// - `Arc<ReferenceConnector>`: Connector for variable references (MUST be dropped when done!)
 /// - `Arc<LinkConnector>`: Connector for LINK variables (MUST be dropped when done!)
@@ -4085,9 +4178,9 @@ pub fn evaluate_with_registry(
     expressions: Vec<static_expression::Spanned<static_expression::Expression>>,
     states_local_storage_key: impl Into<Cow<'static, str>>,
     virtual_fs: VirtualFilesystem,
-    function_registry: StaticFunctionRegistry,
+    mut function_registry: FunctionRegistry,
     module_loader: ModuleLoader,
-) -> Result<(Arc<Object>, ConstructContext, StaticFunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>), String> {
+) -> Result<(Arc<Object>, ConstructContext, FunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>), String> {
     let construct_context = ConstructContext {
         construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
         virtual_fs,
@@ -4117,8 +4210,8 @@ pub fn evaluate_with_registry(
                 parameters,
                 body,
             } => {
-                // Store function definition in registry
-                function_registry.functions.borrow_mut().insert(
+                // Store function definition in registry - direct insert, no locks
+                function_registry.insert(
                     name.to_string(),
                     StaticFunctionDefinition {
                         parameters: parameters.into_iter().map(|p| p.node.to_string()).collect(),
@@ -4144,7 +4237,7 @@ pub fn evaluate_with_registry(
                 actor_context.clone(),
                 reference_connector.clone(),
                 link_connector.clone(),
-                function_registry.clone(),
+                &function_registry,
                 module_loader.clone(),
                 source_code.clone(),
             )
@@ -4166,7 +4259,7 @@ fn static_spanned_variable_into_variable(
     actor_context: ActorContext,
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
-    function_registry: StaticFunctionRegistry,
+    function_registry: &FunctionRegistry,
     module_loader: ModuleLoader,
     source_code: SourceCode,
 ) -> Result<Arc<Variable>, String> {
@@ -4265,13 +4358,14 @@ pub fn evaluate_static_expression(
     link_connector: Arc<LinkConnector>,
     source_code: SourceCode,
 ) -> Result<Arc<ValueActor>, String> {
+    let empty_registry = FunctionRegistry::new();
     static_spanned_expression_into_value_actor(
         static_expr.clone(),
         construct_context,
         actor_context,
         reference_connector,
         link_connector,
-        StaticFunctionRegistry::default(),
+        &empty_registry,
         ModuleLoader::default(),
         source_code,
     )
@@ -4287,19 +4381,26 @@ fn static_spanned_expression_into_value_actor(
     actor_context: ActorContext,
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
-    function_registry: StaticFunctionRegistry,
+    function_registry: &FunctionRegistry,
     module_loader: ModuleLoader,
     source_code: SourceCode,
 ) -> Result<Arc<ValueActor>, String> {
+    // Create snapshot from function registry for nested evaluations
+    let snapshot = if function_registry.is_empty() {
+        None
+    } else {
+        Some(Arc::new(function_registry.clone()))
+    };
+
     // Create EvaluationContext from the parameters
     let ctx = EvaluationContext {
         construct_context,
         actor_context,
         reference_connector: Arc::downgrade(&reference_connector),
         link_connector: Arc::downgrade(&link_connector),
-        function_registry,
         module_loader,
         source_code,
+        function_registry_snapshot: snapshot,
     };
 
     // Delegate to the stack-safe evaluator

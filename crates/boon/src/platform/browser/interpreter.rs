@@ -18,7 +18,7 @@ use crate::parser::{
 };
 use crate::platform::browser::{
     engine::{ConstructContext, LinkConnector, Object, ReferenceConnector, VirtualFilesystem},
-    evaluator::{evaluate_with_registry, ModuleLoader, StaticFunctionRegistry},
+    evaluator::{evaluate_with_registry, FunctionRegistry, ModuleLoader},
 };
 
 /// Run a Boon program and return the result.
@@ -125,7 +125,7 @@ pub fn run(
     // Note: source_code_arc was created at the start of this function
     let static_ast = static_expression::convert_expressions(source_code_arc.clone(), ast);
 
-    let function_registry = StaticFunctionRegistry::default();
+    let function_registry = FunctionRegistry::new();
     let module_loader = ModuleLoader::default();
     let evaluation_result = match evaluate_with_registry(
         source_code_arc.clone(),
@@ -189,8 +189,8 @@ pub fn run_with_registry(
     old_code_local_storage_key: impl Into<Cow<'static, str>>,
     old_span_id_pairs_local_storage_key: impl Into<Cow<'static, str>>,
     virtual_fs: VirtualFilesystem,
-    function_registry: Option<StaticFunctionRegistry>,
-) -> Option<(Arc<Object>, ConstructContext, StaticFunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>)> {
+    function_registry: Option<FunctionRegistry>,
+) -> Option<(Arc<Object>, ConstructContext, FunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>)> {
     println!("*** BOON INTERPRETER VERSION 2025-12-13-DEBUG ***");
     let states_local_storage_key = states_local_storage_key.into();
     let old_code_local_storage_key = old_code_local_storage_key.into();

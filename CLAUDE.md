@@ -123,6 +123,35 @@ just --list                    # Show all available commands
 
 See `tools/DEBUG_WITH_BROWSER.md` and `tools/justfile` for full documentation.
 
+### Boon Browser MCP (preferred for Claude)
+
+When Claude has access to the Boon Browser MCP server, **always prefer MCP tools over running cargo/boon-tools directly**:
+
+| Task | MCP Tool | Notes |
+|------|----------|-------|
+| Check compilation status | `boon_playground_status` | Shows if server is healthy, WASM loading, errors |
+| Get console logs | `boon_console` | Browser console output |
+| Get preview text | `boon_preview` | Rendered output text |
+| Take screenshot | `boon_screenshot` / `boon_screenshot_preview` | Visual verification |
+| Inject code | `boon_inject` | Put code in editor |
+| Run code | `boon_run` | Trigger execution |
+| Select example | `boon_select_example` | Load example by name |
+| Check connection | `boon_status` | Extension connected? |
+| Refresh page | `boon_refresh` | Soft refresh (keeps extension) |
+| Get accessibility tree | `boon_accessibility_tree` | Semantic UI structure |
+
+**Rules for Claude when using Boon Browser MCP:**
+1. **Never run `cargo test` or `cargo build` directly** - use mzoon's auto-compilation
+2. Use `boon_playground_status` to check if code compiled successfully
+3. Use `boon_console` to check for runtime errors (not screenshots)
+4. Use `boon_preview` for output verification (not screenshots)
+5. Only use `boon_screenshot` when visual inspection is absolutely required
+
+**Future MCP improvements to consider:**
+- `boon_get_compile_errors` - Extract compilation errors from mzoon output
+- `boon_watch_compile` - Stream compilation status changes
+- `boon_test` - Run specific playground tests
+
 ## Architecture
 
 ### Parser (`crates/boon/src/parser/`)
