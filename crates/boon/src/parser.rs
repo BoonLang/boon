@@ -136,7 +136,10 @@ where
             let regular_argument = snake_case_identifier
                 .then(group((colon.clone(), tracked_expr.clone())).or_not())
                 .map_with(|(name, value), extra| {
-                    let value = value.map(|(_, value)| value);
+                    let value = value.map(|(_, value)| {
+                        eprintln!("[Parser] Argument '{}' value span: {:?}", name, value.span);
+                        value
+                    });
                     Spanned {
                         node: Argument {
                             name,

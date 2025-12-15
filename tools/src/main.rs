@@ -201,6 +201,15 @@ enum ExecAction {
         y: i32,
     },
 
+    /// Click element containing specific text in the preview panel
+    ClickText {
+        /// Text to find and click
+        text: String,
+        /// Match exact text (default: contains match)
+        #[arg(long)]
+        exact: bool,
+    },
+
     /// Clear saved states (reset localStorage for tests)
     ClearStates,
 
@@ -535,6 +544,33 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
             print_response(response);
         }
 
+        ExecAction::ClickText { text, exact } => {
+            // Get preview elements to find the one containing the text
+            let response = send_command_to_server(port, WsCommand::GetPreviewElements).await?;
+            match response {
+                WsResponse::PreviewElements { data } => {
+                    if let Some(element) = find_element_by_text(&data, &text, exact) {
+                        let x = element.x + element.width / 2;
+                        let y = element.y + element.height / 2;
+                        println!("Found '{}' at ({}, {}), clicking...", text, x, y);
+                        let response = send_command_to_server(port, WsCommand::ClickAt { x, y }).await?;
+                        print_response(response);
+                    } else {
+                        eprintln!("Error: No element found containing text '{}'", text);
+                        std::process::exit(1);
+                    }
+                }
+                WsResponse::Error { message } => {
+                    eprintln!("Error getting elements: {}", message);
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("Unexpected response");
+                    std::process::exit(1);
+                }
+            }
+        }
+
         ExecAction::ClearStates => {
             println!("Clearing saved states...");
             let response = send_command_to_server(port, WsCommand::ClearStates).await?;
@@ -584,6 +620,92 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Element bounds for click-by-text
+struct ElementBounds {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+/// Recursively find an element containing the specified text
+fn find_element_by_text(data: &serde_json::Value, text: &str, exact: bool) -> Option<ElementBounds> {
+    // Try to find a matching element in the JSON structure
+    // The GetPreviewElements returns a nested structure with text and bounds
+    find_element_by_text_recursive(data, text, exact)
+}
+
+fn find_element_by_text_recursive(value: &serde_json::Value, text: &str, exact: bool) -> Option<ElementBounds> {
+    match value {
+        serde_json::Value::Object(obj) => {
+            // Check if this element has matching text (in 'text' or 'html' field)
+            let has_match = {
+                // Try 'text' field first
+                if let Some(elem_text) = obj.get("text").and_then(|t| t.as_str()) {
+                    if exact {
+                        elem_text.trim() == text
+                    } else {
+                        elem_text.contains(text)
+                    }
+                // Then try 'html' field (preview elements use this)
+                } else if let Some(html) = obj.get("html").and_then(|t| t.as_str()) {
+                    // Extract text content from HTML (simple extraction between > and <)
+                    if exact {
+                        // For exact match, look for >text< pattern
+                        html.contains(&format!(">{}<", text)) || html.contains(&format!(">{}\"", text))
+                    } else {
+                        html.contains(text)
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if has_match {
+                // Try to extract bounds
+                if let (Some(x), Some(y), Some(width), Some(height)) = (
+                    obj.get("x").and_then(|v| v.as_f64()),
+                    obj.get("y").and_then(|v| v.as_f64()),
+                    obj.get("width").and_then(|v| v.as_f64()),
+                    obj.get("height").and_then(|v| v.as_f64()),
+                ) {
+                    return Some(ElementBounds {
+                        x: x as i32,
+                        y: y as i32,
+                        width: width as i32,
+                        height: height as i32,
+                    });
+                }
+            }
+
+            // Search in children
+            if let Some(children) = obj.get("children") {
+                if let Some(result) = find_element_by_text_recursive(children, text, exact) {
+                    return Some(result);
+                }
+            }
+
+            // Search in other object values
+            for (key, val) in obj {
+                if key != "text" && key != "children" {
+                    if let Some(result) = find_element_by_text_recursive(val, text, exact) {
+                        return Some(result);
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if let Some(result) = find_element_by_text_recursive(item, text, exact) {
+                    return Some(result);
+                }
+            }
+        }
+        _ => {}
+    }
+    None
 }
 
 fn print_response(response: WsResponse) {

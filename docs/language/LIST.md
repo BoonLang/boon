@@ -207,6 +207,87 @@ rest: list |> List/drop(count: 3)
 flat: nested_lists |> List/flatten()
 ```
 
+### List/retain: Permanent Removal vs Filtered View
+
+`List/retain` has **two distinct behaviors** depending on how it's used:
+
+#### 1. Source of Truth (Permanent Removal)
+
+When `List/retain` is part of the **definition chain**, items that don't match the condition are **permanently removed**:
+
+```boon
+-- Items are permanently filtered - 1 is destroyed, not hidden
+todos: LIST {}
+    |> List/append(item: 123)
+    |> List/append(item: 345)
+    |> List/append(item: 1)
+    |> List/retain(item, condition: item > 1)
+-- Result: todos contains [123, 345] - the 1 is gone forever
+```
+
+This is useful for:
+- Removing items based on reactive conditions (e.g., "Clear completed" button)
+- Building pipelines where you want to actually discard items
+
+**Example: Clear completed todos on button press**
+```boon
+todos: LIST { todo1, todo2 }
+    |> List/append(item: new_todo)
+    |> List/retain(item, condition: LATEST {
+        True  -- Default: keep all items
+        clear_button.event.press |> THEN { item.completed |> Bool/not() }
+    })
+-- When button is pressed: completed items are permanently removed
+-- New items added after: kept (LATEST emits True immediately for them)
+```
+
+#### 2. Filtered View (Non-Destructive)
+
+When `List/retain` is applied to an **existing list variable**, it creates a **filtered view** without modifying the source:
+
+```boon
+-- Source list (source of truth)
+todos: LIST {}
+    |> List/append(item: 123)
+    |> List/append(item: 345)
+    |> List/append(item: 1)
+-- todos contains [123, 345, 1]
+
+-- Filtered view (does NOT modify todos)
+large_todos: todos |> List/retain(item, condition: item > 200)
+-- large_todos contains [345]
+-- todos still contains [123, 345, 1]
+```
+
+This is useful for:
+- Creating derived/computed lists for display
+- Filtering for different views (All/Active/Completed tabs)
+- Analytics and counting without modifying data
+
+**Example: Filter tabs in todo app**
+```boon
+-- Source of truth
+todos: LIST {} |> List/append(item: new_todo)
+
+-- Filtered views (non-destructive)
+active_todos: todos |> List/retain(item, condition: item.completed |> Bool/not())
+completed_todos: todos |> List/retain(item, condition: item.completed)
+
+-- Display based on selected tab
+visible_todos: selected_tab |> WHILE {
+    All => todos
+    Active => active_todos
+    Completed => completed_todos
+}
+```
+
+#### Summary
+
+| Context | Behavior | Items matching `False` |
+|---------|----------|------------------------|
+| Definition chain (`x: LIST {} \|> retain`) | Permanent removal | Destroyed |
+| Derived from variable (`y: x \|> retain`) | Filtered view | Hidden but still in source |
+
 ---
 
 ## Domain-Specific Behavior

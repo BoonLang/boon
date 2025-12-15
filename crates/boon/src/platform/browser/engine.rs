@@ -1132,6 +1132,13 @@ pub struct ActorContext {
     ///
     /// Default: false (streaming context - continuous updates).
     pub is_snapshot_context: bool,
+    /// Object-local variables - maps span to actor for sibling field access.
+    /// When evaluating expressions inside an Object, sibling variables should
+    /// check this map first before falling back to ReferenceConnector.
+    /// This prevents span collisions when multiple Objects are created from
+    /// the same function definition (they would otherwise share the same spans
+    /// and overwrite each other in the global ReferenceConnector).
+    pub object_locals: HashMap<parser::Span, Arc<ValueActor>>,
 }
 
 // --- ActorOutputValveSignal ---
@@ -1406,6 +1413,39 @@ impl Variable {
             value_actor: Arc::new(value_actor),
             link_value_sender: Some(link_value_sender),
             forwarding_loop: None,
+        })
+    }
+
+    /// Create a new LINK variable with a forwarding actor for sibling field access.
+    /// This is used when a LINK is referenced by another field in the same Object.
+    /// The forwarding actor was pre-created and registered with ReferenceConnector,
+    /// so sibling fields will find it. The forwarding_loop connects the LINK's internal
+    /// value_actor to the forwarding_actor so events flow through correctly.
+    ///
+    /// Arguments:
+    /// - `forwarding_actor`: The actor sibling fields will subscribe to (via ReferenceConnector)
+    /// - `link_value_sender`: The sender for elements to send events to the LINK
+    /// - `forwarding_loop`: Connects internal link_value_actor → forwarding_actor
+    ///   (the link_value_actor is kept alive by forwarding_loop's subscription)
+    pub fn new_link_arc_with_forwarding_loop(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        name: impl Into<Cow<'static, str>>,
+        persistence_id: Option<parser::PersistenceId>,
+        forwarding_actor: Arc<ValueActor>,
+        link_value_sender: mpsc::UnboundedSender<Value>,
+        forwarding_loop: ActorLoop,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            construct_info: construct_info.complete(ConstructType::LinkVariable),
+            persistence_id,
+            name: name.into(),
+            // Use forwarding_actor so sibling field lookups work correctly
+            value_actor: forwarding_actor,
+            // Keep the sender so elements can send events - this is the original sender
+            link_value_sender: Some(link_value_sender),
+            // Keep forwarding loop alive - it connects link_value_actor to forwarding_actor
+            forwarding_loop: Some(forwarding_loop),
         })
     }
 
@@ -5915,6 +5955,7 @@ impl ListBindingFunction {
                 future::ready(Some(Some(list)))
             }
         }).filter_map(future::ready).flat_map(move |list| {
+            eprintln!("[List/retain] Got source list");
             let config = config.clone();
             let construct_context = construct_context.clone();
             let actor_context = actor_context.clone();
@@ -5932,8 +5973,10 @@ impl ListBindingFunction {
                     let actor_context = actor_context.clone();
 
                     // Apply change and update predicate actors
+                    eprintln!("[List/retain] Got change: {:?}", std::mem::discriminant(&change));
                     match &change {
                         ListChange::Replace { items } => {
+                            eprintln!("[List/retain] Replace with {} items", items.len());
                             *item_predicates = items.iter().map(|item| {
                                 let predicate = Self::transform_item(
                                     item.clone(),
@@ -5983,8 +6026,10 @@ impl ListBindingFunction {
             ).flat_map(move |item_predicates| {
                 let construct_info_id = construct_info_id_inner.clone();
 
+                eprintln!("[List/retain] flat_map with {} item_predicates", item_predicates.len());
                 if item_predicates.is_empty() {
                     // Empty list - emit empty Replace
+                    eprintln!("[List/retain] Empty predicates, emitting empty Replace");
                     return stream::once(future::ready(ListChange::Replace { items: vec![] })).boxed_local();
                 }
 
@@ -6003,6 +6048,7 @@ impl ListBindingFunction {
                                 Value::Tag(tag, _) => tag.tag() == "True",
                                 _ => false,
                             };
+                            eprintln!("[List/retain] Predicate {} evaluated to {}", idx, is_true);
                             if idx < states.len() {
                                 states[idx] = (item, Some(is_true));
                             }
@@ -6019,8 +6065,10 @@ impl ListBindingFunction {
                                         }
                                     })
                                     .collect();
+                                eprintln!("[List/retain] All predicates evaluated, filtered to {} items", filtered.len());
                                 future::ready(Some(Some(ListChange::Replace { items: filtered })))
                             } else {
+                                eprintln!("[List/retain] Not all predicates evaluated yet ({}/{})", states.iter().filter(|(_, r)| r.is_some()).count(), states.len());
                                 future::ready(Some(None))
                             }
                         }
@@ -6390,11 +6438,13 @@ impl ListBindingFunction {
         construct_context: ConstructContext,
         actor_context: ActorContext,
     ) -> Arc<ValueActor> {
+        eprintln!("[List/retain] transform_item called");
         // Create a new ActorContext with the binding variable set
         let binding_name = config.binding_name.to_string();
         let mut new_params = actor_context.parameters.clone();
 
-        new_params.insert(binding_name, item_actor.clone());
+        new_params.insert(binding_name.clone(), item_actor.clone());
+        eprintln!("[List/retain] binding_name: {}", binding_name);
 
         let new_actor_context = ActorContext {
             parameters: new_params,
@@ -6412,7 +6462,10 @@ impl ListBindingFunction {
             config.source_code.clone(),
             config.function_registry_snapshot.clone(),
         ) {
-            Ok(result_actor) => result_actor,
+            Ok(result_actor) => {
+                eprintln!("[List/retain] transform_item result: {}", result_actor.construct_info.to_string());
+                result_actor
+            }
             Err(e) => {
                 eprintln!("Error evaluating transform expression: {e}");
                 // Return the original item as fallback

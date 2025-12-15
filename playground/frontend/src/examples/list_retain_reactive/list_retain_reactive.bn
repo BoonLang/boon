@@ -1,0 +1,43 @@
+-- Test: Does List/retain work with a reactive condition?
+store: [
+    toggle: LINK
+    show_even: False |> HOLD state {
+        store.toggle.event.press |> THEN { state |> Bool/not() }
+    }
+    numbers: LIST { 1, 2, 3, 4, 5, 6 }
+
+    -- Retain with reactive condition
+    filtered: numbers |> List/retain(n, condition:
+        show_even |> WHEN {
+            True => n == 2 |> Bool/or(that: n == 4) |> Bool/or(that: n == 6)
+            False => True
+        }
+    )
+]
+
+document: Document/new(root: Element/stripe(
+    element: []
+    direction: Column
+    gap: 10
+    style: [padding: 20]
+    items: LIST {
+        Element/button(
+            element: [event: [press: LINK]]
+            style: [padding: 10]
+            label: TEXT { Toggle filter (show_even: {store.show_even}) }
+        ) |> LINK { store.toggle }
+
+        Element/label(element: [], style: [],
+            label: TEXT { Filtered count: {store.filtered |> List/count()} })
+
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 10
+            style: []
+            items: store.filtered |> List/map(n, new:
+                Element/label(element: [], style: [], label: n)
+            )
+        )
+    }
+))

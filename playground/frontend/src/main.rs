@@ -63,7 +63,7 @@ macro_rules! make_example_data {
     }};
 }
 
-static EXAMPLE_DATAS: [ExampleData; 11] = [
+static EXAMPLE_DATAS: [ExampleData; 16] = [
     make_example_data!("minimal"),
     make_example_data!("hello_world"),
     make_example_data!("interval"),
@@ -75,6 +75,11 @@ static EXAMPLE_DATAS: [ExampleData; 11] = [
     make_example_data!("shopping_list"),
     make_example_data!("pages"),
     make_example_data!("todo_mvc"),
+    make_example_data!("list_retain_count"),
+    make_example_data!("list_map_block"),
+    make_example_data!("list_object_state"),
+    make_example_data!("list_retain_reactive"),
+    make_example_data!("list_retain_remove"),
 ];
 
 #[derive(Clone, Copy)]
@@ -1287,7 +1292,7 @@ impl Playground {
         // Run the main file (uses ModuleLoader for imports, no shared registry)
         // We keep reference_connector and link_connector alive to preserve all actors.
         // Dropping them (via after_remove) will trigger cleanup of all actors.
-        println!("*** FRONTEND VERSION 2025-12-08-C ***");
+        println!("*** FRONTEND VERSION 2025-12-15-A ***");
         let evaluation_result = interpreter::run_with_registry(
             filename,
             &source_code,

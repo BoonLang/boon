@@ -772,6 +772,12 @@ fn schedule_expression(
             let mut variable_data = Vec::new();
             let mut vars_to_schedule = Vec::new();
 
+            // Build object_locals map from forwarding actors
+            // This allows sibling field expressions to resolve references locally
+            // instead of relying on the global ReferenceConnector (which can be overwritten
+            // when multiple Objects are created from the same function definition)
+            let mut object_locals = ctx.actor_context.object_locals.clone();
+
             for var in variables {
                 let var_slot = state.alloc_slot();
                 let name = var.node.name.to_string();
@@ -780,9 +786,11 @@ fn schedule_expression(
                 let var_span = var.span;
                 let var_persistence = var.persistence.clone();
 
-                // For referenced fields, create a forwarding actor BEFORE scheduling expressions
+                // For referenced fields (including LINKs), create a forwarding actor BEFORE scheduling expressions
                 // This allows sibling fields to look up this field's actor immediately
-                let forwarding_actor = if is_referenced && !is_link {
+                // FIX: Include LINK variables to prevent span-based ReferenceConnector overwrites
+                // when multiple Objects are created from the same function definition
+                let forwarding_actor = if is_referenced {
                     let var_persistence_id = var_persistence.as_ref().map(|p| p.id);
                     let (actor, sender) = ValueActor::new_arc_forwarding(
                         ConstructInfo::new(
@@ -793,7 +801,9 @@ fn schedule_expression(
                         ctx.actor_context.clone(),
                         var_persistence_id,
                     );
-                    // Register with ReferenceConnector immediately
+                    // Store in object_locals for local resolution
+                    object_locals.insert(var_span, actor.clone());
+                    // Also register with ReferenceConnector for backward compatibility
                     if let Some(ref_connector) = ctx.try_reference_connector() {
                         ref_connector.register_referenceable(var_span, actor.clone());
                     }
@@ -818,6 +828,15 @@ fn schedule_expression(
                 }
             }
 
+            // Create context with object_locals for variable expression evaluation
+            let ctx_with_locals = EvaluationContext {
+                actor_context: ActorContext {
+                    object_locals: object_locals.clone(),
+                    ..ctx.actor_context.clone()
+                },
+                ..ctx.clone()
+            };
+
             // Push BuildBlock first (will be processed last due to LIFO)
             // BuildBlock takes the output expression result and keeps the Object alive
             // (the Object contains the Variables which must not be dropped)
@@ -830,7 +849,7 @@ fn schedule_expression(
             // Schedule output expression second - these work items will be processed AFTER BuildObject
             // This is important because the output may reference block variables (like `state.iteration`)
             // which need to be registered with the reference_connector by BuildObject first
-            schedule_expression(state, *output, ctx.clone(), output_expr_slot)?;
+            schedule_expression(state, *output, ctx_with_locals.clone(), output_expr_slot)?;
 
             // Push BuildObject third - will be processed AFTER variable expressions but BEFORE output
             // This registers variables with reference_connector so output can resolve them
@@ -838,13 +857,13 @@ fn schedule_expression(
                 variable_data,
                 span,
                 persistence,
-                ctx: ctx.clone(),
+                ctx: ctx_with_locals.clone(),
                 result_slot: object_slot,
             });
 
             // Schedule variable expressions last (will be processed first due to LIFO)
             for (var_expr, var_slot) in vars_to_schedule {
-                schedule_expression(state, var_expr, ctx.clone(), var_slot)?;
+                schedule_expression(state, var_expr, ctx_with_locals.clone(), var_slot)?;
             }
         }
 
@@ -857,6 +876,9 @@ fn schedule_expression(
             let mut variable_data = Vec::new();
             let mut vars_to_schedule = Vec::new();
 
+            // Build object_locals map from forwarding actors
+            let mut object_locals = ctx.actor_context.object_locals.clone();
+
             for var in object.variables {
                 let var_slot = state.alloc_slot();
                 let name = var.node.name.to_string();
@@ -865,9 +887,11 @@ fn schedule_expression(
                 let var_span = var.span;
                 let var_persistence = var.persistence.clone();
 
-                // For referenced fields, create a forwarding actor BEFORE scheduling expressions
+                // For referenced fields (including LINKs), create a forwarding actor BEFORE scheduling expressions
                 // This allows sibling fields to look up this field's actor immediately
-                let forwarding_actor = if is_referenced && !is_link {
+                // FIX: Include LINK variables to prevent span-based ReferenceConnector overwrites
+                // when multiple Objects are created from the same function definition
+                let forwarding_actor = if is_referenced {
                     let var_persistence_id = var_persistence.as_ref().map(|p| p.id);
                     let (actor, sender) = ValueActor::new_arc_forwarding(
                         ConstructInfo::new(
@@ -878,7 +902,9 @@ fn schedule_expression(
                         ctx.actor_context.clone(),
                         var_persistence_id,
                     );
-                    // Register with ReferenceConnector immediately
+                    // Store in object_locals for local resolution
+                    object_locals.insert(var_span, actor.clone());
+                    // Also register with ReferenceConnector for backward compatibility
                     if let Some(ref_connector) = ctx.try_reference_connector() {
                         ref_connector.register_referenceable(var_span, actor.clone());
                     }
@@ -903,12 +929,21 @@ fn schedule_expression(
                 }
             }
 
+            // Create context with object_locals for variable expression evaluation
+            let ctx_with_locals = EvaluationContext {
+                actor_context: ActorContext {
+                    object_locals: object_locals.clone(),
+                    ..ctx.actor_context.clone()
+                },
+                ..ctx.clone()
+            };
+
             // Push BuildObject first (will be processed last due to LIFO)
             state.push(WorkItem::BuildObject {
                 variable_data,
                 span,
                 persistence,
-                ctx: ctx.clone(),
+                ctx: ctx_with_locals.clone(),
                 result_slot,
             });
 
@@ -919,13 +954,13 @@ fn schedule_expression(
             // First: schedule NON-referenced fields (processed last due to LIFO)
             for (var_expr, var_slot, is_referenced) in vars_to_schedule.iter() {
                 if !*is_referenced {
-                    schedule_expression(state, var_expr.clone(), ctx.clone(), *var_slot)?;
+                    schedule_expression(state, var_expr.clone(), ctx_with_locals.clone(), *var_slot)?;
                 }
             }
             // Last: schedule referenced fields (processed first due to LIFO)
             for (var_expr, var_slot, is_referenced) in vars_to_schedule {
                 if is_referenced {
-                    schedule_expression(state, var_expr, ctx.clone(), var_slot)?;
+                    schedule_expression(state, var_expr, ctx_with_locals.clone(), var_slot)?;
                 }
             }
         }
@@ -936,6 +971,12 @@ fn schedule_expression(
             let mut variable_data = Vec::new();
             let mut vars_to_schedule = Vec::new();
 
+            // Build object_locals map from forwarding actors
+            // This allows sibling field expressions to resolve references locally
+            // instead of relying on the global ReferenceConnector (which can be overwritten
+            // when multiple Objects are created from the same function definition)
+            let mut object_locals = ctx.actor_context.object_locals.clone();
+
             for var in object.variables {
                 let var_slot = state.alloc_slot();
                 let name = var.node.name.to_string();
@@ -944,9 +985,11 @@ fn schedule_expression(
                 let var_span = var.span;
                 let var_persistence = var.persistence.clone();
 
-                // For referenced fields, create a forwarding actor BEFORE scheduling expressions
+                // For referenced fields (including LINKs), create a forwarding actor BEFORE scheduling expressions
                 // This allows sibling fields to look up this field's actor immediately
-                let forwarding_actor = if is_referenced && !is_link {
+                // FIX: Include LINK variables to prevent span-based ReferenceConnector overwrites
+                // when multiple Objects are created from the same function definition
+                let forwarding_actor = if is_referenced {
                     let var_persistence_id = var_persistence.as_ref().map(|p| p.id);
                     let (actor, sender) = ValueActor::new_arc_forwarding(
                         ConstructInfo::new(
@@ -957,7 +1000,9 @@ fn schedule_expression(
                         ctx.actor_context.clone(),
                         var_persistence_id,
                     );
-                    // Register with ReferenceConnector immediately
+                    // Store in object_locals for local resolution
+                    object_locals.insert(var_span, actor.clone());
+                    // Also register with ReferenceConnector for backward compatibility
                     if let Some(ref_connector) = ctx.try_reference_connector() {
                         ref_connector.register_referenceable(var_span, actor.clone());
                     }
@@ -982,13 +1027,22 @@ fn schedule_expression(
                 }
             }
 
+            // Create context with object_locals for variable expression evaluation
+            let ctx_with_locals = EvaluationContext {
+                actor_context: ActorContext {
+                    object_locals: object_locals.clone(),
+                    ..ctx.actor_context.clone()
+                },
+                ..ctx.clone()
+            };
+
             // Push BuildTaggedObject first (will be processed last due to LIFO)
             state.push(WorkItem::BuildTaggedObject {
                 tag: tag_str,
                 variable_data,
                 span,
                 persistence,
-                ctx: ctx.clone(),
+                ctx: ctx_with_locals.clone(),
                 result_slot,
             });
 
@@ -999,13 +1053,13 @@ fn schedule_expression(
             // First: schedule NON-referenced fields (processed last due to LIFO)
             for (var_expr, var_slot, is_referenced) in vars_to_schedule.iter() {
                 if !*is_referenced {
-                    schedule_expression(state, var_expr.clone(), ctx.clone(), *var_slot)?;
+                    schedule_expression(state, var_expr.clone(), ctx_with_locals.clone(), *var_slot)?;
                 }
             }
             // Last: schedule referenced fields (processed first due to LIFO)
             for (var_expr, var_slot, is_referenced) in vars_to_schedule {
                 if is_referenced {
-                    schedule_expression(state, var_expr, ctx.clone(), var_slot)?;
+                    schedule_expression(state, var_expr, ctx_with_locals.clone(), var_slot)?;
                 }
             }
         }
@@ -1430,7 +1484,52 @@ fn process_work_item(
             let mut variables = Vec::new();
             for vd in variable_data.iter() {
                 let var_persistence_id = vd.persistence.as_ref().map(|p| p.id);
-                let variable = if vd.is_link {
+                let variable = if vd.is_link && vd.forwarding_actor.is_some() {
+                    // LINK variable with forwarding actor (referenced by sibling field)
+                    // Create the LINK and connect its value_actor to the forwarding actor
+                    let (forwarding_actor, forwarding_sender) = vd.forwarding_actor.as_ref().unwrap();
+
+                    // First create a temporary LINK to get the connected sender and value_actor
+                    let temp_link = Variable::new_link_arc(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {:?}", var_persistence_id),
+                            vd.persistence.clone(),
+                            format!("{}: (link variable internal)", vd.name),
+                        ),
+                        ctx.construct_context.clone(),
+                        vd.name.clone(),
+                        ctx.actor_context.clone(),
+                        var_persistence_id,
+                    );
+
+                    // Get the components we need from the temporary LINK
+                    let link_value_actor = temp_link.value_actor();
+                    let link_value_sender = temp_link.expect_link_value_sender();
+
+                    // Connect LINK's value_actor to the forwarding actor so sibling fields see LINK values
+                    let link_value_actor_for_initial = link_value_actor.clone();
+                    let forwarding_loop = ValueActor::connect_forwarding(
+                        forwarding_sender.clone(),
+                        link_value_actor.clone(),
+                        async move { link_value_actor_for_initial.stored_value().await },
+                    );
+
+                    // Create the final Variable with all components properly connected
+                    // Note: link_value_actor is kept alive by forwarding_loop's subscription
+                    Variable::new_link_arc_with_forwarding_loop(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {:?}", var_persistence_id),
+                            vd.persistence.clone(),
+                            format!("{}: (link variable with forwarding)", vd.name),
+                        ),
+                        ctx.construct_context.clone(),
+                        vd.name.clone(),
+                        var_persistence_id,
+                        forwarding_actor.clone(),
+                        link_value_sender,
+                        forwarding_loop,
+                    )
+                } else if vd.is_link {
                     // LINK variables don't have pre-evaluated values
                     Variable::new_link_arc(
                         ConstructInfo::new(
@@ -1529,7 +1628,51 @@ fn process_work_item(
             let mut variables = Vec::new();
             for vd in variable_data.iter() {
                 let var_persistence_id = vd.persistence.as_ref().map(|p| p.id);
-                let variable = if vd.is_link {
+                let variable = if vd.is_link && vd.forwarding_actor.is_some() {
+                    // LINK variable with forwarding actor (referenced by sibling field)
+                    let (forwarding_actor, forwarding_sender) = vd.forwarding_actor.as_ref().unwrap();
+
+                    // First create a temporary LINK to get the connected sender and value_actor
+                    let temp_link = Variable::new_link_arc(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {:?}", var_persistence_id),
+                            vd.persistence.clone(),
+                            format!("{}: (link variable internal)", vd.name),
+                        ),
+                        ctx.construct_context.clone(),
+                        vd.name.clone(),
+                        ctx.actor_context.clone(),
+                        var_persistence_id,
+                    );
+
+                    // Get the components we need from the temporary LINK
+                    let link_value_actor = temp_link.value_actor();
+                    let link_value_sender = temp_link.expect_link_value_sender();
+
+                    // Connect LINK's value_actor to the forwarding actor
+                    let link_value_actor_for_initial = link_value_actor.clone();
+                    let forwarding_loop = ValueActor::connect_forwarding(
+                        forwarding_sender.clone(),
+                        link_value_actor.clone(),
+                        async move { link_value_actor_for_initial.stored_value().await },
+                    );
+
+                    // Create the final Variable with all components properly connected
+                    // Note: link_value_actor is kept alive by forwarding_loop's subscription
+                    Variable::new_link_arc_with_forwarding_loop(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {:?}", var_persistence_id),
+                            vd.persistence.clone(),
+                            format!("{}: (link variable with forwarding)", vd.name),
+                        ),
+                        ctx.construct_context.clone(),
+                        vd.name.clone(),
+                        var_persistence_id,
+                        forwarding_actor.clone(),
+                        link_value_sender,
+                        forwarding_loop,
+                    )
+                } else if vd.is_link {
                     Variable::new_link_arc(
                         ConstructInfo::new(
                             format!("PersistenceId: {:?}", var_persistence_id),
@@ -1755,6 +1898,14 @@ fn process_work_item(
                     ["List", "map"] | ["List", "retain"] | ["List", "every"] | ["List", "any"] | ["List", "sort_by"] => {
                         // Handle List binding functions specially - they have their own handling
                         // These use the piped value from the context
+                        eprintln!("[List/retain EvaluateWithPiped] expr.span: {:?}", expr.span);
+                        if let static_expression::Expression::FunctionCall { path: _, arguments: args } = &expr.node {
+                            if args.len() > 1 {
+                                if let Some(v) = &args[1].node.value {
+                                    eprintln!("[List/retain EvaluateWithPiped] args[1].node.value.span: {:?}", v.span);
+                                }
+                            }
+                        }
                         schedule_expression(state, expr, new_ctx, result_slot)?;
                     }
                     _ => {
@@ -1889,6 +2040,7 @@ fn process_work_item(
                             hold_state_update_callback: ctx.actor_context.hold_state_update_callback,
                             use_lazy_actors: ctx.actor_context.use_lazy_actors,
                             is_snapshot_context: ctx.actor_context.is_snapshot_context,
+                            object_locals: ctx.actor_context.object_locals,
                         },
                         reference_connector: ctx.reference_connector,
                         link_connector: ctx.link_connector,
@@ -2024,10 +2176,17 @@ fn evaluate_alias_immediate(
                 // For multi-part aliases (e.g., state.current), wrap in async Future
                 Box::pin(async move { param_actor })
             } else if let Some(ref_span) = referenced_span {
-                // Use async lookup via ReferenceConnector
-                let ref_connector = ctx.try_reference_connector()
-                    .ok_or_else(|| "ReferenceConnector dropped - program shutting down".to_string())?;
-                Box::pin(ref_connector.referenceable(*ref_span))
+                // First check object_locals for instance-specific resolution
+                // This prevents span-based overwrites when multiple Objects are created
+                // from the same function definition (Bug 7.2 fix)
+                if let Some(local_actor) = ctx.actor_context.object_locals.get(ref_span).cloned() {
+                    Box::pin(async move { local_actor })
+                } else {
+                    // Fall back to async lookup via ReferenceConnector
+                    let ref_connector = ctx.try_reference_connector()
+                        .ok_or_else(|| "ReferenceConnector dropped - program shutting down".to_string())?;
+                    Box::pin(ref_connector.referenceable(*ref_span))
+                }
             } else if parts.len() >= 2 {
                 // Module variable access - for now fall back to returning an error
                 return Err(format!("Module variable access '{}' not yet supported in stack-safe evaluator", first_part));
@@ -2172,6 +2331,8 @@ fn build_then_actor(
                 use_lazy_actors: actor_context_clone.use_lazy_actors,
                 // THEN body needs snapshot semantics - read current variable values, not history
                 is_snapshot_context: true,
+                // Inherit object_locals - THEN body may reference Object sibling fields
+                object_locals: actor_context_clone.object_locals.clone(),
             };
 
             let new_ctx = EvaluationContext {
@@ -2406,6 +2567,8 @@ fn build_when_actor(
                         use_lazy_actors: actor_context_clone.use_lazy_actors,
                         // WHEN body needs snapshot semantics like THEN
                         is_snapshot_context: true,
+                        // Inherit object_locals - WHEN body may reference Object sibling fields
+                        object_locals: actor_context_clone.object_locals.clone(),
                     };
 
                     let new_ctx = EvaluationContext {
@@ -2579,6 +2742,8 @@ fn build_while_actor(
                     use_lazy_actors: actor_context_clone.use_lazy_actors,
                     // WHILE is continuous, not snapshot - variables should stream normally
                     is_snapshot_context: false,
+                    // Inherit object_locals - WHILE body may reference Object sibling fields
+                    object_locals: actor_context_clone.object_locals.clone(),
                 };
 
                 let new_ctx = EvaluationContext {
@@ -2878,6 +3043,8 @@ fn build_hold_actor(
         use_lazy_actors: true,
         // Default - THEN/WHEN inside will set their own snapshot flag
         is_snapshot_context: false,
+        // Inherit object_locals - HOLD body may reference Object sibling fields
+        object_locals: ctx.actor_context.object_locals.clone(),
     };
 
     // Create new context for body evaluation
@@ -3454,8 +3621,31 @@ fn build_list_binding_function(
     };
 
     // Get transform/predicate expression from second argument (NOT evaluated)
+    eprintln!("[List/retain] arguments.len(): {}", arguments.len());
+    eprintln!("[List/retain] arguments[0].node.name: {:?}", arguments[0].node.name);
+    eprintln!("[List/retain] arguments[0].node.value.is_some(): {}", arguments[0].node.value.is_some());
+    eprintln!("[List/retain] arguments[1].node.name: {:?}", arguments[1].node.name);
+    eprintln!("[List/retain] arguments[1].node.value.is_some(): {}", arguments[1].node.value.is_some());
+    if let Some(ref v) = arguments[1].node.value {
+        eprintln!("[List/retain] arguments[1].node.value.span: {:?}", v.span);
+        eprintln!("[List/retain] arguments[1].node.value.node: {:?}", std::mem::discriminant(&v.node));
+        // Try to get more details about the expression
+        match &v.node {
+            static_expression::Expression::Literal(lit) => {
+                eprintln!("[List/retain] Literal: {:?}", lit);
+            }
+            static_expression::Expression::Latest { inputs } => {
+                eprintln!("[List/retain] Latest with {} inputs", inputs.len());
+            }
+            _ => {
+                eprintln!("[List/retain] Other expression type");
+            }
+        }
+    }
     let transform_expr = arguments[1].node.value.clone()
         .ok_or_else(|| format!("List/{} requires a transform expression", path_strs[1]))?;
+    eprintln!("[List/retain] transform_expr span: {:?}", transform_expr.span);
+    eprintln!("[List/retain] transform_expr type: {:?}", std::mem::discriminant(&transform_expr.node));
 
     let reference_connector = ctx.try_reference_connector()
         .ok_or_else(|| "ReferenceConnector dropped - program shutting down".to_string())?;
@@ -3585,6 +3775,8 @@ fn call_function(
                     use_lazy_actors: ctx_for_closure.actor_context.use_lazy_actors,
                     // Don't inherit snapshot mode - function body evaluates in normal streaming context
                     is_snapshot_context: false,
+                    // Clear object_locals - function body is a new scope
+                    object_locals: HashMap::new(),
                 };
 
                 let new_ctx = EvaluationContext {
@@ -3648,6 +3840,8 @@ fn call_function(
             use_lazy_actors: ctx.actor_context.use_lazy_actors,
             // Don't inherit snapshot mode - function body evaluates in normal streaming context
             is_snapshot_context: false,
+            // Clear object_locals - function body is a new scope
+            object_locals: HashMap::new(),
         };
 
         let new_ctx = EvaluationContext {
@@ -3716,6 +3910,8 @@ fn call_function(
                 use_lazy_actors: ctx.actor_context.use_lazy_actors,
                 // Don't inherit snapshot mode - builtin functions evaluate in normal streaming context
                 is_snapshot_context: false,
+                // Clear object_locals - function call is a new scope
+                object_locals: HashMap::new(),
             };
 
             Ok(Some(FunctionCall::new_arc_value_actor(

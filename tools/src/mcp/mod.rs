@@ -400,6 +400,24 @@ fn get_tools() -> Vec<Tool> {
                 "required": []
             }),
         },
+        Tool {
+            name: "boon_click_text".to_string(),
+            description: "Click an element in the preview panel by its text content. More reliable than coordinate-based clicking when UI positions change.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to find and click (e.g., 'All', 'Active', 'Completed')"
+                    },
+                    "exact": {
+                        "type": "boolean",
+                        "description": "If true, match exact text. If false (default), match if text contains the search string."
+                    }
+                },
+                "required": ["text"]
+            }),
+        },
     ]
 }
 
@@ -441,6 +459,17 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
     // Handle playground start (no WebSocket)
     if name == "boon_start_playground" {
         return start_playground().await;
+    }
+
+    // Handle click-by-text (compound command)
+    if name == "boon_click_text" {
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or("text parameter required")?;
+        let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        return click_element_by_text(text, exact, ws_port).await;
     }
 
     // Handle browser launch separately (doesn't use WebSocket command)
@@ -677,6 +706,111 @@ async fn check_playground_status() -> Result<String, String> {
     }
 
     Ok(status)
+}
+
+/// Click an element by its text content
+async fn click_element_by_text(text: &str, exact: bool, ws_port: u16) -> Result<String, String> {
+    // First get preview elements
+    let response = ws_server::send_command_to_server(ws_port, Command::GetPreviewElements)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::PreviewElements { data } => {
+            if let Some((x, y, width, height)) = find_element_bounds_by_text(&data, text, exact) {
+                let click_x = x + width / 2;
+                let click_y = y + height / 2;
+
+                // Click at the center of the element
+                let response = ws_server::send_command_to_server(
+                    ws_port,
+                    Command::ClickAt { x: click_x, y: click_y },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+
+                match response {
+                    Response::Success { .. } => Ok(format!(
+                        "Clicked '{}' at ({}, {})",
+                        text, click_x, click_y
+                    )),
+                    Response::Error { message } => Err(format!("Click failed: {}", message)),
+                    _ => Ok(format!("Clicked '{}' at ({}, {})", text, click_x, click_y)),
+                }
+            } else {
+                Err(format!("No element found containing text '{}'", text))
+            }
+        }
+        Response::Error { message } => Err(format!("Failed to get elements: {}", message)),
+        _ => Err("Unexpected response from GetPreviewElements".to_string()),
+    }
+}
+
+/// Recursively find element bounds by text content
+fn find_element_bounds_by_text(value: &Value, text: &str, exact: bool) -> Option<(i32, i32, i32, i32)> {
+    match value {
+        Value::Object(obj) => {
+            // Check if this element has matching text (in 'text' or 'html' field)
+            let has_match = {
+                // Try 'text' field first
+                if let Some(elem_text) = obj.get("text").and_then(|t| t.as_str()) {
+                    if exact {
+                        elem_text.trim() == text
+                    } else {
+                        elem_text.contains(text)
+                    }
+                // Then try 'html' field (preview elements use this)
+                } else if let Some(html) = obj.get("html").and_then(|t| t.as_str()) {
+                    // Extract text content from HTML (simple extraction between > and <)
+                    if exact {
+                        // For exact match, look for >text< pattern
+                        html.contains(&format!(">{}<", text)) || html.contains(&format!(">{}\"", text))
+                    } else {
+                        html.contains(text)
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if has_match {
+                // Try to extract bounds
+                if let (Some(x), Some(y), Some(width), Some(height)) = (
+                    obj.get("x").and_then(|v| v.as_f64()),
+                    obj.get("y").and_then(|v| v.as_f64()),
+                    obj.get("width").and_then(|v| v.as_f64()),
+                    obj.get("height").and_then(|v| v.as_f64()),
+                ) {
+                    return Some((x as i32, y as i32, width as i32, height as i32));
+                }
+            }
+
+            // Search in children first
+            if let Some(children) = obj.get("children") {
+                if let Some(result) = find_element_bounds_by_text(children, text, exact) {
+                    return Some(result);
+                }
+            }
+
+            // Search in other object values
+            for (key, val) in obj {
+                if key != "text" && key != "children" {
+                    if let Some(result) = find_element_bounds_by_text(val, text, exact) {
+                        return Some(result);
+                    }
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                if let Some(result) = find_element_bounds_by_text(item, text, exact) {
+                    return Some(result);
+                }
+            }
+        }
+        _ => {}
+    }
+    None
 }
 
 /// Start the playground dev server

@@ -1,0 +1,48 @@
+-- Test: Do objects in a list have independent HOLD state?
+FUNCTION make_counter() {
+    [
+        button: LINK
+        count: 0 |> HOLD state {
+            button.event.press |> THEN { state |> Math/add(that: 1) }
+        }
+    ]
+}
+
+store: [
+    counters: LIST { make_counter(), make_counter(), make_counter() }
+]
+
+document: Document/new(root: Element/stripe(
+    element: []
+    direction: Column
+    gap: 10
+    style: [padding: 20]
+    items: LIST {
+        Element/label(element: [], style: [font: [size: 20]],
+            label: TEXT { Click each button - counts should be independent })
+
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 20
+            style: []
+            items: store.counters |> List/map(counter, new:
+                Element/stripe(
+                    element: []
+                    direction: Column
+                    gap: 5
+                    style: []
+                    items: LIST {
+                        Element/button(
+                            element: [event: [press: LINK]]
+                            style: [padding: 10]
+                            label: TEXT { Click me }
+                        ) |> LINK { counter.button }
+                        Element/label(element: [], style: [],
+                            label: TEXT { Count: {counter.count} })
+                    }
+                )
+            )
+        )
+    }
+))

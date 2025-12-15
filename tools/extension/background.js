@@ -346,8 +346,11 @@ async function cdpQuerySelectorAll(tabId, selector) {
       const { model } = await chrome.debugger.sendCommand({ tabId }, 'DOM.getBoxModel', { nodeId });
       const content = model.content;
 
-      // Get node info
+      // Get node info - use full outerHTML to include text content
       const { outerHTML } = await chrome.debugger.sendCommand({ tabId }, 'DOM.getOuterHTML', { nodeId });
+
+      // Extract text content from HTML (strip tags)
+      const text = outerHTML.replace(/<[^>]*>/g, '').trim();
 
       elements.push({
         nodeId,
@@ -357,7 +360,8 @@ async function cdpQuerySelectorAll(tabId, selector) {
         height: content[5] - content[1],
         centerX: (content[0] + content[2]) / 2,
         centerY: (content[1] + content[5]) / 2,
-        html: outerHTML.substring(0, 200)
+        html: outerHTML.substring(0, 200),
+        text: text.substring(0, 100)
       });
     } catch (e) {
       // Element might be invisible or have no layout
