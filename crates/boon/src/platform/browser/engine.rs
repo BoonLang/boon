@@ -5929,18 +5929,11 @@ impl ListBindingFunction {
     ) -> Arc<ValueActor> {
         let construct_info_id = construct_info.id.clone();
 
-        // Clone for use after the flat_map chain
+        // Clone for use after the chain
         let actor_context_for_list = actor_context.clone();
         let actor_context_for_result = actor_context.clone();
 
-        // Create a stream that:
-        // 1. Subscribes to source list changes (subscribe_stream() yields automatically)
-        // 2. For each item, evaluates predicate and subscribes to its changes
-        // 3. When list or any predicate changes, emits filtered Replace
-        //
-        // We use scan with a flag to only process the first List value while keeping
-        // the stream alive. This avoids duplicate flat_map streams while allowing
-        // the inner list.subscribe() to continue receiving Push/Pop changes.
+        // Use stream::unfold for better control over state and merged streams
         let value_stream = source_list_actor.clone().subscribe_stream().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
@@ -5948,134 +5941,138 @@ impl ListBindingFunction {
             })
         }).scan(false, |seen, list| {
             if *seen {
-                // Already processed a list, skip this emission
                 future::ready(Some(None))
             } else {
                 *seen = true;
                 future::ready(Some(Some(list)))
             }
         }).filter_map(future::ready).flat_map(move |list| {
-            eprintln!("[List/retain] Got source list");
             let config = config.clone();
             let construct_context = construct_context.clone();
             let actor_context = actor_context.clone();
-            let construct_info_id = construct_info_id.clone();
 
-            // Clone for the second flat_map
-            let construct_info_id_inner = construct_info_id.clone();
+            // Create channels for predicate results
+            let (predicate_tx, predicate_rx) = mpsc::unbounded::<(usize, bool)>();
 
-            // Track items and their predicates
-            list.subscribe().scan(
-                Vec::<(Arc<ValueActor>, Arc<ValueActor>)>::new(), // (item, predicate)
-                move |item_predicates, change| {
-                    let config = config.clone();
-                    let construct_context = construct_context.clone();
-                    let actor_context = actor_context.clone();
+            // Event type for merged streams
+            enum RetainEvent {
+                ListChange(ListChange),
+                PredicateResult(usize, bool),
+            }
 
-                    // Apply change and update predicate actors
-                    eprintln!("[List/retain] Got change: {:?}", std::mem::discriminant(&change));
-                    match &change {
-                        ListChange::Replace { items } => {
-                            eprintln!("[List/retain] Replace with {} items", items.len());
-                            *item_predicates = items.iter().map(|item| {
-                                let predicate = Self::transform_item(
-                                    item.clone(),
-                                    &config,
-                                    construct_context.clone(),
-                                    actor_context.clone(),
-                                );
-                                (item.clone(), predicate)
-                            }).collect();
-                        }
-                        ListChange::Push { item } => {
-                            let predicate = Self::transform_item(
-                                item.clone(),
-                                &config,
-                                construct_context.clone(),
-                                actor_context.clone(),
-                            );
-                            item_predicates.push((item.clone(), predicate));
-                        }
-                        ListChange::InsertAt { index, item } => {
-                            let predicate = Self::transform_item(
-                                item.clone(),
-                                &config,
-                                construct_context.clone(),
-                                actor_context.clone(),
-                            );
-                            if *index <= item_predicates.len() {
-                                item_predicates.insert(*index, (item.clone(), predicate));
+            // Create list change stream
+            let list_changes = list.clone().subscribe().map(RetainEvent::ListChange);
+
+            // Create predicate result stream
+            let predicate_results = predicate_rx.map(|(idx, result)| RetainEvent::PredicateResult(idx, result));
+
+            // Merge list changes and predicate results
+            stream::select(list_changes, predicate_results).scan(
+                (
+                    Vec::<(Arc<ValueActor>, Arc<ValueActor>, Option<bool>, Option<TaskHandle>)>::new(), // (item, predicate, result, task_handle)
+                    predicate_tx,
+                    config.clone(),
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    0usize, // next_predicate_idx
+                ),
+                move |state, event| {
+                    let (items, predicate_tx, config, construct_context, actor_context, next_idx) = state;
+
+                    match event {
+                        RetainEvent::ListChange(change) => {
+                            match change {
+                                ListChange::Replace { items: new_items } => {
+                                    // Reset the index counter
+                                    *next_idx = 0;
+                                    *items = new_items.iter().map(|item| {
+                                        let idx = *next_idx;
+                                        *next_idx += 1;
+                                        let predicate = Self::transform_item(
+                                            item.clone(),
+                                            config,
+                                            construct_context.clone(),
+                                            actor_context.clone(),
+                                        );
+                                        // Spawn a task to forward predicate results - store handle to keep alive
+                                        let tx = predicate_tx.clone();
+                                        let pred_clone = predicate.clone();
+                                        let task_handle = Task::start_droppable(async move {
+                                            let mut stream = pred_clone.subscribe_stream();
+                                            while let Some(value) = stream.next().await {
+                                                let is_true = match &value {
+                                                    Value::Tag(tag, _) => tag.tag() == "True",
+                                                    _ => false,
+                                                };
+                                                if tx.unbounded_send((idx, is_true)).is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        });
+                                        (item.clone(), predicate, None, Some(task_handle))
+                                    }).collect();
+                                }
+                                ListChange::Push { item } => {
+                                    let idx = *next_idx;
+                                    *next_idx += 1;
+                                    let predicate = Self::transform_item(
+                                        item.clone(),
+                                        config,
+                                        construct_context.clone(),
+                                        actor_context.clone(),
+                                    );
+                                    // Spawn a task to forward predicate results - store handle to keep alive
+                                    let tx = predicate_tx.clone();
+                                    let pred_clone = predicate.clone();
+                                    let task_handle = Task::start_droppable(async move {
+                                        let mut stream = pred_clone.subscribe_stream();
+                                        while let Some(value) = stream.next().await {
+                                            let is_true = match &value {
+                                                Value::Tag(tag, _) => tag.tag() == "True",
+                                                _ => false,
+                                            };
+                                            if tx.unbounded_send((idx, is_true)).is_err() {
+                                                break;
+                                            }
+                                        }
+                                    });
+                                    items.push((item, predicate, None, Some(task_handle)));
+                                }
+                                ListChange::Clear => {
+                                    items.clear();
+                                    *next_idx = 0;
+                                }
+                                ListChange::Pop => {
+                                    items.pop();
+                                }
+                                _ => {}
                             }
                         }
-                        ListChange::RemoveAt { index } => {
-                            if *index < item_predicates.len() {
-                                item_predicates.remove(*index);
+                        RetainEvent::PredicateResult(idx, is_true) => {
+                            if idx < items.len() {
+                                items[idx].2 = Some(is_true);
                             }
                         }
-                        ListChange::Clear => {
-                            item_predicates.clear();
-                        }
-                        ListChange::Pop => {
-                            item_predicates.pop();
-                        }
-                        _ => {}
                     }
 
-                    future::ready(Some(item_predicates.clone()))
+                    // Check if all predicates are evaluated
+                    let all_evaluated = !items.is_empty() && items.iter().all(|(_, _, result, _)| result.is_some());
+                    if all_evaluated || items.is_empty() {
+                        let filtered: Vec<Arc<ValueActor>> = items.iter()
+                            .filter_map(|(item, _, result, _)| {
+                                if result == &Some(true) {
+                                    Some(item.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        future::ready(Some(Some(ListChange::Replace { items: filtered })))
+                    } else {
+                        future::ready(Some(None))
+                    }
                 }
-            ).flat_map(move |item_predicates| {
-                let construct_info_id = construct_info_id_inner.clone();
-
-                eprintln!("[List/retain] flat_map with {} item_predicates", item_predicates.len());
-                if item_predicates.is_empty() {
-                    // Empty list - emit empty Replace
-                    eprintln!("[List/retain] Empty predicates, emitting empty Replace");
-                    return stream::once(future::ready(ListChange::Replace { items: vec![] })).boxed_local();
-                }
-
-                // Subscribe to all predicates and emit filtered list when any changes
-                let predicate_streams: Vec<_> = item_predicates.iter().enumerate().map(|(idx, (item, pred))| {
-                    let item = item.clone();
-                    pred.clone().subscribe_stream().map(move |value| (idx, item.clone(), value))
-                }).collect();
-
-                stream::select_all(predicate_streams)
-                    .scan(
-                        item_predicates.iter().map(|(item, _)| (item.clone(), None::<bool>)).collect::<Vec<_>>(),
-                        move |states, (idx, item, value)| {
-                            // Update the predicate result for this item
-                            let is_true = match &value {
-                                Value::Tag(tag, _) => tag.tag() == "True",
-                                _ => false,
-                            };
-                            eprintln!("[List/retain] Predicate {} evaluated to {}", idx, is_true);
-                            if idx < states.len() {
-                                states[idx] = (item, Some(is_true));
-                            }
-
-                            // If all items have predicate results, emit filtered list
-                            let all_evaluated = states.iter().all(|(_, result)| result.is_some());
-                            if all_evaluated {
-                                let filtered: Vec<Arc<ValueActor>> = states.iter()
-                                    .filter_map(|(item, result)| {
-                                        if result == &Some(true) {
-                                            Some(item.clone())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
-                                eprintln!("[List/retain] All predicates evaluated, filtered to {} items", filtered.len());
-                                future::ready(Some(Some(ListChange::Replace { items: filtered })))
-                            } else {
-                                eprintln!("[List/retain] Not all predicates evaluated yet ({}/{})", states.iter().filter(|(_, r)| r.is_some()).count(), states.len());
-                                future::ready(Some(None))
-                            }
-                        }
-                    )
-                    .filter_map(future::ready)
-                    .boxed_local()
-            })
+            ).filter_map(future::ready)
         });
 
         let list = List::new_with_change_stream(
@@ -6438,13 +6435,11 @@ impl ListBindingFunction {
         construct_context: ConstructContext,
         actor_context: ActorContext,
     ) -> Arc<ValueActor> {
-        eprintln!("[List/retain] transform_item called");
         // Create a new ActorContext with the binding variable set
         let binding_name = config.binding_name.to_string();
         let mut new_params = actor_context.parameters.clone();
 
         new_params.insert(binding_name.clone(), item_actor.clone());
-        eprintln!("[List/retain] binding_name: {}", binding_name);
 
         let new_actor_context = ActorContext {
             parameters: new_params,
@@ -6462,10 +6457,7 @@ impl ListBindingFunction {
             config.source_code.clone(),
             config.function_registry_snapshot.clone(),
         ) {
-            Ok(result_actor) => {
-                eprintln!("[List/retain] transform_item result: {}", result_actor.construct_info.to_string());
-                result_actor
-            }
+            Ok(result_actor) => result_actor,
             Err(e) => {
                 eprintln!("Error evaluating transform expression: {e}");
                 // Return the original item as fallback

@@ -10,8 +10,11 @@ document: Document/new(root: Element/stripe(
     gap: 10
     style: [padding: 20]
     items: LIST {
-        Element/label(element: [], style: [],
-            label: TEXT { Mode: {store.mode} })
+        Element/label(
+            element: []
+            style: []
+            label: TEXT { Mode: {store.mode} }
+        )
 
         -- Test 1: Direct WHEN (should work)
         Element/stripe(
@@ -21,7 +24,11 @@ document: Document/new(root: Element/stripe(
             style: []
             items: store.items |> List/map(item, new:
                 store.mode |> WHEN {
-                    All => Element/label(element: [], style: [], label: item)
+                    All => Element/label(
+                        element: []
+                        style: []
+                        label: item
+                    )
                     __ => NoElement
                 }
             )
@@ -40,7 +47,11 @@ document: Document/new(root: Element/stripe(
                     Odd => item == 1 |> Bool/or(that: item == 3) |> Bool/or(that: item == 5)
                 }
                 should_show |> WHILE {
-                    True => Element/label(element: [], style: [], label: item)
+                    True => Element/label(
+                        element: []
+                        style: []
+                        label: item
+                    )
                     False => NoElement
                 }
             })

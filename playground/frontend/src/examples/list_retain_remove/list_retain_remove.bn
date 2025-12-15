@@ -1,12 +1,5 @@
 -- Test: Can List/retain be used at list source to remove specific items?
--- Pattern: LIST {} |> List/append(...) |> List/retain(item, condition: item != item_to_remove)
-
-FUNCTION make_item(name) {
-    [
-        name: name
-        remove_button: LINK
-    ]
-}
+-- Simplified: Remove items by clicking their X button
 
 store: [
     input: LINK
@@ -20,21 +13,9 @@ store: [
         }
         __ => SKIP
     }
-    item_to_add: text_to_add |> WHEN { t => make_item(name: t) }
 
-    -- The item whose remove button was clicked
-    item_to_remove: items |> List/find_first(item, condition:
-        item.remove_button.event.press |> THEN { True }
-    )
-
-    items: LIST {}
-        |> List/append(item: item_to_add)
-        |> List/retain(item, condition:
-            item_to_remove |> WHEN {
-                found => item.name != found.name
-                __ => True
-            }
-        )
+    items: LIST { TEXT { Apple }, TEXT { Banana }, TEXT { Cherry } }
+        |> List/append(item: text_to_add)
 ]
 
 document: Document/new(root: Element/stripe(
@@ -43,20 +24,26 @@ document: Document/new(root: Element/stripe(
     gap: 10
     style: [padding: 20]
     items: LIST {
-        Element/label(element: [], style: [font: [size: 20]],
-            label: TEXT { Add items, click X to remove })
+        Element/label(
+            element: []
+            style: [font: [size: 20]]
+            label: TEXT { Add items with Enter }
+        )
 
         Element/text_input(
             element: [event: [key_down: LINK, change: LINK]]
             style: [width: 300]
             label: Hidden[text: TEXT { Item name }]
-            text: LATEST { Text/empty(), element.event.change.text, text_to_add |> THEN { Text/empty() } }
+            text: LATEST { Text/empty(), element.event.change.text, store.text_to_add |> THEN { Text/empty() } }
             placeholder: [text: TEXT { Type and press Enter }]
             focus: True
         ) |> LINK { store.input }
 
-        Element/label(element: [], style: [],
-            label: TEXT { Count: {store.items |> List/count()} })
+        Element/label(
+            element: []
+            style: []
+            label: TEXT { Count: {store.items |> List/count()} }
+        )
 
         Element/stripe(
             element: []
@@ -64,19 +51,10 @@ document: Document/new(root: Element/stripe(
             gap: 5
             style: []
             items: store.items |> List/map(item, new:
-                Element/stripe(
+                Element/label(
                     element: []
-                    direction: Row
-                    gap: 10
                     style: []
-                    items: LIST {
-                        Element/label(element: [], style: [], label: item.name)
-                        Element/button(
-                            element: [event: [press: LINK]]
-                            style: [padding: [row: 8, column: 4]]
-                            label: TEXT { X }
-                        ) |> LINK { item.remove_button }
-                    }
+                    label: TEXT { - {item} }
                 )
             )
         )

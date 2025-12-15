@@ -1118,6 +1118,12 @@ fn schedule_expression(
                     // Track forwarding actors for referenced arguments
                     let mut forwarding_connections: Vec<(SlotId, mpsc::UnboundedSender<Value>)> = Vec::new();
 
+                    // Build arg_locals map from forwarding actors
+                    // This allows subsequent arguments to resolve references locally
+                    // instead of relying on the global ReferenceConnector (which can be overwritten
+                    // when the same function is called multiple times)
+                    let mut arg_locals = ctx.actor_context.object_locals.clone();
+
                     // Note: piped value is handled in call_function for BUILTIN functions only
                     // User-defined functions don't receive piped as positional arg
 
@@ -1148,7 +1154,10 @@ fn schedule_expression(
                                 ctx.actor_context.clone(),
                                 None,
                             );
-                            // Register with ReferenceConnector immediately
+                            // Store in arg_locals for local resolution
+                            // This prevents overwrites when same function is called multiple times
+                            arg_locals.insert(arg_span, forwarding_actor.clone());
+                            // Also register with ReferenceConnector for backward compatibility
                             if let Some(ref_connector) = ctx.try_reference_connector() {
                                 ref_connector.register_referenceable(arg_span, forwarding_actor.clone());
                             }
@@ -1170,6 +1179,15 @@ fn schedule_expression(
                             }
                         }
                     }
+
+                    // Create context with arg_locals for argument expression evaluation
+                    let ctx_with_arg_locals = EvaluationContext {
+                        actor_context: ActorContext {
+                            object_locals: arg_locals,
+                            ..ctx.actor_context.clone()
+                        },
+                        ..ctx.clone()
+                    };
 
                     // Push CallFunction first (will be processed last due to LIFO)
                     // Note: use_piped_for_builtin is false because this is a normal function call,
@@ -1196,8 +1214,9 @@ fn schedule_expression(
                     }
 
                     // Schedule argument expressions last (will be processed first due to LIFO)
+                    // Use ctx_with_arg_locals so subsequent args can resolve references to earlier args
                     for (arg_expr, arg_slot) in args_to_schedule {
-                        schedule_expression(state, arg_expr, ctx.clone(), arg_slot)?;
+                        schedule_expression(state, arg_expr, ctx_with_arg_locals.clone(), arg_slot)?;
                     }
                 }
             }
@@ -1898,14 +1917,6 @@ fn process_work_item(
                     ["List", "map"] | ["List", "retain"] | ["List", "every"] | ["List", "any"] | ["List", "sort_by"] => {
                         // Handle List binding functions specially - they have their own handling
                         // These use the piped value from the context
-                        eprintln!("[List/retain EvaluateWithPiped] expr.span: {:?}", expr.span);
-                        if let static_expression::Expression::FunctionCall { path: _, arguments: args } = &expr.node {
-                            if args.len() > 1 {
-                                if let Some(v) = &args[1].node.value {
-                                    eprintln!("[List/retain EvaluateWithPiped] args[1].node.value.span: {:?}", v.span);
-                                }
-                            }
-                        }
                         schedule_expression(state, expr, new_ctx, result_slot)?;
                     }
                     _ => {
@@ -3265,7 +3276,7 @@ fn build_text_literal_actor(
                         // Simple variable, no field access
                         part_actors.push((false, base_actor));
                     } else {
-                        // Field access path - create forwarding actor that resolves fields
+                        // Field access path - create forwarding actor that subscribes to the final field
                         let (field_actor, field_sender) = ValueActor::new_arc_forwarding(
                             ConstructInfo::new(
                                 format!("TextInterpolation:{}", var_name),
@@ -3277,41 +3288,68 @@ fn build_text_literal_actor(
                         );
 
                         let actor_loop = ActorLoop::new(async move {
-                            let mut subscription = base_actor.subscribe().await;
-                            while let Some(value) = subscription.next().await {
-                                // Resolve the field path
-                                let mut current_value = value;
-                                for field_name in &field_path {
-                                    match &current_value {
-                                        Value::Object(obj, _) => {
-                                            if let Some(var) = obj.variable(field_name) {
-                                                if let Some(val) = var.value_actor().stored_value().await {
-                                                    current_value = val;
-                                                } else {
-                                                    // Field not ready yet, skip
-                                                    break;
-                                                }
+                            // First, wait for base actor to have a value so we can navigate to the field
+                            let base_value = {
+                                let mut sub = base_actor.subscribe().await;
+                                sub.next().await
+                            };
+
+                            let Some(base_value) = base_value else {
+                                return; // Base actor closed without emitting
+                            };
+
+                            // Navigate through the field path to find the final value actor
+                            let mut current_value_actor: Option<Arc<ValueActor>> = None;
+
+                            // For intermediate fields, we need to resolve them
+                            let mut current_obj_value = base_value;
+                            for (i, field_name) in field_path.iter().enumerate() {
+                                let is_last = i == field_path.len() - 1;
+
+                                match &current_obj_value {
+                                    Value::Object(obj, _) => {
+                                        if let Some(var) = obj.variable(field_name) {
+                                            if is_last {
+                                                // Last field - we want to subscribe to this
+                                                current_value_actor = Some(var.value_actor().clone());
                                             } else {
-                                                // Field not found
-                                                break;
-                                            }
-                                        }
-                                        Value::TaggedObject(tagged, _) => {
-                                            if let Some(var) = tagged.variable(field_name) {
+                                                // Intermediate field - get its stored value to navigate further
                                                 if let Some(val) = var.value_actor().stored_value().await {
-                                                    current_value = val;
+                                                    current_obj_value = val;
                                                 } else {
-                                                    break;
+                                                    return; // Can't resolve path
                                                 }
-                                            } else {
-                                                break;
                                             }
+                                        } else {
+                                            return; // Field not found
                                         }
-                                        _ => break, // Not an object, can't access fields
                                     }
+                                    Value::TaggedObject(tagged, _) => {
+                                        if let Some(var) = tagged.variable(field_name) {
+                                            if is_last {
+                                                current_value_actor = Some(var.value_actor().clone());
+                                            } else {
+                                                if let Some(val) = var.value_actor().stored_value().await {
+                                                    current_obj_value = val;
+                                                } else {
+                                                    return;
+                                                }
+                                            }
+                                        } else {
+                                            return;
+                                        }
+                                    }
+                                    _ => return, // Not an object, can't access fields
                                 }
-                                if field_sender.unbounded_send(current_value).is_err() {
-                                    break;
+                            }
+
+                            // Now subscribe to the final field's value actor
+                            if let Some(final_actor) = current_value_actor {
+                                let mut subscription = final_actor.subscribe().await;
+                                while let Some(value) = subscription.next().await {
+                                    if field_sender.unbounded_send(value).is_err() {
+                                        break;
+                                    }
                                 }
                             }
                         });
@@ -3621,31 +3659,8 @@ fn build_list_binding_function(
     };
 
     // Get transform/predicate expression from second argument (NOT evaluated)
-    eprintln!("[List/retain] arguments.len(): {}", arguments.len());
-    eprintln!("[List/retain] arguments[0].node.name: {:?}", arguments[0].node.name);
-    eprintln!("[List/retain] arguments[0].node.value.is_some(): {}", arguments[0].node.value.is_some());
-    eprintln!("[List/retain] arguments[1].node.name: {:?}", arguments[1].node.name);
-    eprintln!("[List/retain] arguments[1].node.value.is_some(): {}", arguments[1].node.value.is_some());
-    if let Some(ref v) = arguments[1].node.value {
-        eprintln!("[List/retain] arguments[1].node.value.span: {:?}", v.span);
-        eprintln!("[List/retain] arguments[1].node.value.node: {:?}", std::mem::discriminant(&v.node));
-        // Try to get more details about the expression
-        match &v.node {
-            static_expression::Expression::Literal(lit) => {
-                eprintln!("[List/retain] Literal: {:?}", lit);
-            }
-            static_expression::Expression::Latest { inputs } => {
-                eprintln!("[List/retain] Latest with {} inputs", inputs.len());
-            }
-            _ => {
-                eprintln!("[List/retain] Other expression type");
-            }
-        }
-    }
     let transform_expr = arguments[1].node.value.clone()
         .ok_or_else(|| format!("List/{} requires a transform expression", path_strs[1]))?;
-    eprintln!("[List/retain] transform_expr span: {:?}", transform_expr.span);
-    eprintln!("[List/retain] transform_expr type: {:?}", std::mem::discriminant(&transform_expr.node));
 
     let reference_connector = ctx.try_reference_connector()
         .ok_or_else(|| "ReferenceConnector dropped - program shutting down".to_string())?;

@@ -27,8 +27,11 @@ document: Document/new(root: Element/stripe(
             label: TEXT { Toggle filter (show_even: {store.show_even}) }
         ) |> LINK { store.toggle }
 
-        Element/label(element: [], style: [],
-            label: TEXT { Filtered count: {store.filtered |> List/count()} })
+        Element/label(
+            element: []
+            style: []
+            label: TEXT { Filtered count: {store.filtered |> List/count()} }
+        )
 
         Element/stripe(
             element: []
@@ -36,7 +39,11 @@ document: Document/new(root: Element/stripe(
             gap: 10
             style: []
             items: store.filtered |> List/map(n, new:
-                Element/label(element: [], style: [], label: n)
+                Element/label(
+                    element: []
+                    style: []
+                    label: n
+                )
             )
         )
     }

@@ -1,0 +1,37 @@
+-- Test: Does TEXT interpolation update when referenced variable changes?
+-- BUG: TEXT { Value: {store.value} } doesn't update when store.value changes
+
+store: [
+    toggle: LINK
+    value: False |> HOLD state {
+        toggle.event.press |> THEN { state |> Bool/not() }
+    }
+]
+
+document: Document/new(root: Element/stripe(
+    element: []
+    direction: Column
+    gap: 10
+    style: [padding: 20]
+    items: LIST {
+        -- Test 1: Direct TEXT interpolation in button label
+        Element/button(
+            element: [event: [press: LINK]]
+            style: [padding: 10]
+            label: TEXT { Toggle (value: {store.value}) }
+        ) |> LINK { store.toggle }
+
+        -- Test 2: Separate label element with TEXT interpolation
+        Element/label(
+            element: []
+            style: [font: [size: 20]]
+            label: TEXT { Label shows: {store.value} }
+        )
+
+        -- Test 3: WHILE showing actual state (control)
+        store.value |> WHILE {
+            True => Element/label(element: [], style: [], label: TEXT { WHILE says: True })
+            False => Element/label(element: [], style: [], label: TEXT { WHILE says: False })
+        }
+    }
+))

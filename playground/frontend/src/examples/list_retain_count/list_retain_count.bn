@@ -7,45 +7,67 @@ store: [
     }
     items: LIST { TEXT { Initial } }
         |> List/append(item: text_to_add)
-
-    -- This count should update when items are added
-    all_count: items |> List/count()
-
-    -- This count uses retain (always True) - does it update?
-    retain_count: items
-        |> List/retain(item, condition: True)
-        |> List/count()
 ]
 
-document: Document/new(root: Element/stripe(
-    element: []
-    direction: Column
-    gap: 10
-    style: [padding: 20]
-    items: LIST {
-        Element/text_input(
-            element: [event: [key_down: LINK, change: LINK]]
-            style: []
-            label: Hidden[text: TEXT { Add item }]
-            text: LATEST { Text/empty(), element.event.change.text }
-            placeholder: [text: TEXT { Type and press Enter }]
-            focus: True
-        ) |> LINK { store.input }
+document: Document/new(root: root_element(PASS: [store: store]))
 
-        Element/label(element: [], style: [],
-            label: TEXT { All count: {store.all_count} })
-        Element/label(element: [], style: [],
-            label: TEXT { Retain count: {store.retain_count} })
+FUNCTION root_element() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 10
+        style: [padding: 20]
+        items: LIST {
+            Element/text_input(
+                element: [event: [key_down: LINK, change: LINK]]
+                style: []
+                label: Hidden[text: TEXT { Add item }]
+                text: LATEST { Text/empty(), element.event.change.text }
+                placeholder: [text: TEXT { Type and press Enter }]
+                focus: True
+            ) |> LINK { PASSED.store.input }
 
-        -- Show items
-        Element/stripe(
-            element: []
-            direction: Column
-            gap: 5
-            style: []
-            items: store.items |> List/map(item, new:
-                Element/label(element: [], style: [], label: item)
+            all_count_label()
+            retain_count_label()
+
+            -- Show items
+            Element/stripe(
+                element: []
+                direction: Column
+                gap: 5
+                style: []
+                items: PASSED.store.items |> List/map(item, new:
+                    Element/label(
+                        element: []
+                        style: []
+                        label: item
+                    )
+                )
             )
-        )
-    }
-))
+        }
+    )
+}
+
+FUNCTION all_count_label() {
+    Element/label(
+        element: []
+        style: []
+        label: BLOCK {
+            count: PASSED.store.items |> List/count()
+            TEXT { All count: {count} }
+        }
+    )
+}
+
+FUNCTION retain_count_label() {
+    Element/label(
+        element: []
+        style: []
+        label: BLOCK {
+            count: PASSED.store.items
+                |> List/retain(item, condition: True)
+                |> List/count()
+            TEXT { Retain count: {count} }
+        }
+    )
+}

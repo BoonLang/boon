@@ -1,0 +1,59 @@
+-- Test: Does List/map re-evaluate when external dependencies change?
+-- BUG: WHILE inside List/map transform doesn't update when external variable changes
+
+store: [
+    filter_button: LINK
+    show_filtered: False |> HOLD state {
+        filter_button.event.press |> THEN { state |> Bool/not() }
+    }
+    -- Use specific items instead of modulo
+    items: LIST {
+        [name: TEXT { Apple }, show_when_filtered: True]
+        [name: TEXT { Banana }, show_when_filtered: False]
+        [name: TEXT { Cherry }, show_when_filtered: True]
+        [name: TEXT { Date }, show_when_filtered: False]
+    }
+]
+
+document: Document/new(root: Element/stripe(
+    element: []
+    direction: Column
+    gap: 10
+    style: [padding: 20]
+    items: LIST {
+        Element/label(
+            element: []
+            style: [font: [size: 20]]
+            label: TEXT { show_filtered: {store.show_filtered} }
+        )
+
+        Element/button(
+            element: [event: [press: LINK]]
+            style: [padding: 10]
+            label: TEXT { Toggle filter }
+        ) |> LINK { store.filter_button }
+
+        Element/label(
+            element: []
+            style: []
+            label: TEXT { Expected: When True, show Apple and Cherry. When False, show all. }
+        )
+
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 10
+            style: []
+            -- BUG: This should update when show_filtered changes, but currently doesn't
+            items: store.items |> List/map(item, new:
+                store.show_filtered |> WHILE {
+                    True => item.show_when_filtered |> WHILE {
+                        True => Element/label(element: [], style: [], label: item.name)
+                        False => NoElement
+                    }
+                    False => Element/label(element: [], style: [], label: item.name)
+                }
+            )
+        )
+    }
+))

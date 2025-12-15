@@ -9,18 +9,18 @@ store: [
         toggle_all_checkbox: LINK
         new_todo_title_text_input: LINK
     ]
-    selected_filter: Router/route() |> WHEN {
-        TEXT { /active } => Active
-        TEXT { /completed } => Completed
-        __ => All
-    }
-    go_to_result:
+    -- Simple filter state using HOLD (no routing)
+    selected_filter: All |> HOLD state {
         LATEST {
-            elements.filter_buttons.all.event.press |> THEN { TEXT { / } }
-            elements.filter_buttons.active.event.press |> THEN { TEXT { /active } }
-            elements.filter_buttons.completed.event.press |> THEN { TEXT { /completed } }
+            elements.filter_buttons.all.event.press |> THEN { All }
+            elements.filter_buttons.active.event.press |> THEN { Active }
+            elements.filter_buttons.completed.event.press |> THEN { Completed }
         }
-        |> Router/go_to()
+    }
+    -- Three separate filtered lists
+    all_todos: todos
+    active_todos: todos |> List/retain(item, condition: item.completed |> Bool/not())
+    completed_todos: todos |> List/retain(item, condition: item.completed)
     title_to_add: elements.new_todo_title_text_input.event.key_down.key |> WHEN {
         Enter => BLOCK {
             trimmed: elements.new_todo_title_text_input.text |> Text/trim()
@@ -35,11 +35,6 @@ store: [
     -- Simplified for debugging
     selected_todo_id: None
 ]
-
--- Simple helper function that just wraps text in object
-FUNCTION make_todo_object(t) {
-    [text: t]
-}
 
 -- Create a new todo with reactive completed state
 FUNCTION new_todo(title) {
@@ -193,63 +188,88 @@ FUNCTION new_todo_title_text_input() {
 
 }
 
--- Render todo Objects using full todo_element, filtered by selected_filter
+-- Render todo Objects based on selected filter (inlined)
 FUNCTION todos_element() {
-    Element/stripe(
-        element: [tag: Ul]
-        direction: Column
-        gap: 0
-        style: []
-        -- Filter inside List/map using WHEN (workaround for List/retain |> List/map bug)
-        items: PASSED.store.todos
-            |> List/map(item, new: BLOCK {
-                should_show: PASSED.store.selected_filter |> WHEN {
-                    All => True
-                    Active => item.completed |> Bool/not()
-                    Completed => item.completed
-                }
-                should_show |> WHILE {
-                    True => Element/stripe(
-                        element: []
-                        direction: Row
-                        gap: 5
-                        style: [
-                            width: Fill
-                            background: [color: Oklch[lightness: 1]]
-                            font: [size: 24]
-                            padding: [row: 15, column: 10]
-                        ]
-                        items: LIST {
-                            todo_checkbox(todo: item)
-                            Element/label(
-                                element: []
-                                style: [width: Fill, font: [size: 24, color: Oklch[lightness: 0.42]]]
-                                label: item.title
-                            )
-                        }
-                    )
-                    False => NoElement
-                }
-            })
-    )
-}
-
-FUNCTION todo_element(todo) {
-    Element/stripe(
-        element: [hovered: LINK]
-        direction: Row
-        gap: 5
-        style: [
-            width: Fill
-            background: [color: Oklch[lightness: 1]]
-            font: [size: 24]
-            padding: [row: 15, column: 10]
-        ]
-        items: LIST {
-            todo_checkbox(todo: todo)
-            todo_title_element(todo: todo)
-        }
-    )
+    PASSED.store.selected_filter |> WHILE {
+        All => Element/stripe(
+            element: [tag: Ul]
+            direction: Column
+            gap: 0
+            style: []
+            items: PASSED.store.all_todos
+                |> List/map(item, new: Element/stripe(
+                    element: []
+                    direction: Row
+                    gap: 5
+                    style: [
+                        width: Fill
+                        background: [color: Oklch[lightness: 1]]
+                        font: [size: 24]
+                        padding: [row: 15, column: 10]
+                    ]
+                    items: LIST {
+                        todo_checkbox(todo: item)
+                        Element/label(
+                            element: []
+                            style: [width: Fill, font: [size: 24, color: Oklch[lightness: 0.42]]]
+                            label: item.title
+                        )
+                    }
+                ))
+        )
+        Active => Element/stripe(
+            element: [tag: Ul]
+            direction: Column
+            gap: 0
+            style: []
+            items: PASSED.store.active_todos
+                |> List/map(item, new: Element/stripe(
+                    element: []
+                    direction: Row
+                    gap: 5
+                    style: [
+                        width: Fill
+                        background: [color: Oklch[lightness: 1]]
+                        font: [size: 24]
+                        padding: [row: 15, column: 10]
+                    ]
+                    items: LIST {
+                        todo_checkbox(todo: item)
+                        Element/label(
+                            element: []
+                            style: [width: Fill, font: [size: 24, color: Oklch[lightness: 0.42]]]
+                            label: item.title
+                        )
+                    }
+                ))
+        )
+        Completed => Element/stripe(
+            element: [tag: Ul]
+            direction: Column
+            gap: 0
+            style: []
+            items: PASSED.store.completed_todos
+                |> List/map(item, new: Element/stripe(
+                    element: []
+                    direction: Row
+                    gap: 5
+                    style: [
+                        width: Fill
+                        background: [color: Oklch[lightness: 1]]
+                        font: [size: 24]
+                        padding: [row: 15, column: 10]
+                    ]
+                    items: LIST {
+                        todo_checkbox(todo: item)
+                        Element/label(
+                            element: []
+                            style: [width: Fill, font: [size: 24, color: Oklch[lightness: 0.42]]]
+                            label: item.title
+                        )
+                    }
+                ))
+        )
+    }
 }
 
 FUNCTION toggle_all_checkbox() {
@@ -278,32 +298,6 @@ FUNCTION toggle_all_checkbox() {
     )
 }
 
-FUNCTION editing_todo_title_element(todo) {
-    Element/text_input(
-        element: [
-            event: [
-                blur: LINK
-                change: LINK
-                key_down: LINK
-            ]
-        ]
-        style: [
-            width: 506
-            padding: [row: 17, top: 17, bottom: 16]
-            align: Right
-            borders: [color: Oklch[lightness: 0.68]]
-            shadows: LIST { 
-                [direction: Inwards, y: -1, blur: 5, color: Oklch[lightness: 0.2]]        
-            }
-            font: [color: Oklch[lightness: 0.42]]
-        ]
-        label: Hidden[text: TEXT { selected todo title }]
-        text: todo.edited_title
-        placeholder: []
-        focus: True
-    )
-}
-
 FUNCTION todo_checkbox(todo) {
     BLOCK {
         icon_completed: TEXT { data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23bddad5%22%20stroke-width%3D%223%22/%3E%3Cpath%20fill%3D%22%235dc2af%22%20d%3D%22M72%2025L42%2071%2027%2056l-4%204%2020%2020%2034-52z%22/%3E%3C/svg%3E }
@@ -317,7 +311,7 @@ FUNCTION todo_checkbox(todo) {
                 element: []
                 style: [
                     size: 40
-                    background: [url: checked |> WHEN {
+                    background: [url: todo.completed |> WHEN {
                         True => icon_completed
                         False => icon_active
                     }]

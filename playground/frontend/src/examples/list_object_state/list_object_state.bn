@@ -18,8 +18,11 @@ document: Document/new(root: Element/stripe(
     gap: 10
     style: [padding: 20]
     items: LIST {
-        Element/label(element: [], style: [font: [size: 20]],
-            label: TEXT { Click each button - counts should be independent })
+        Element/label(
+            element: []
+            style: [font: [size: 20]]
+            label: TEXT { Click each button - counts should be independent }
+        )
 
         Element/stripe(
             element: []
@@ -38,8 +41,11 @@ document: Document/new(root: Element/stripe(
                             style: [padding: 10]
                             label: TEXT { Click me }
                         ) |> LINK { counter.button }
-                        Element/label(element: [], style: [],
-                            label: TEXT { Count: {counter.count} })
+                        Element/label(
+                            element: []
+                            style: []
+                            label: TEXT { Count: {counter.count} }
+                        )
                     }
                 )
             )

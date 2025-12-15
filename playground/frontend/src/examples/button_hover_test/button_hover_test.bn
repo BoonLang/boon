@@ -1,0 +1,53 @@
+-- Test: Do multiple buttons have independent hover states?
+-- Simplified test without PASSED/store
+
+document: Document/new(root: Element/stripe(
+    element: []
+    direction: Column
+    gap: 20
+    style: [padding: 20]
+    items: LIST {
+        Element/label(
+            element: []
+            style: []
+            label: TEXT { Hover each button - only hovered one should show border }
+        )
+
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 10
+            style: []
+            items: LIST {
+                simple_button(name: TEXT { A })
+                simple_button(name: TEXT { B })
+                simple_button(name: TEXT { C })
+            }
+        )
+    }
+))
+
+FUNCTION simple_button(name) {
+    Element/button(
+        element: [
+            event: [press: LINK]
+            hovered: LINK
+        ]
+        style: [
+            padding: [row: 20, column: 10]
+            rounded_corners: 5
+            background: [color: element.hovered |> WHILE {
+                True => Oklch[lightness: 0.85]
+                False => Oklch[lightness: 0.95]
+            }]
+            outline: element.hovered |> WHILE {
+                True => [
+                    side: Inner
+                    color: Oklch[lightness: 0.3, chroma: 0.15, hue: 250]
+                ]
+                False => NoOutline
+            }
+        ]
+        label: TEXT { Button {name} }
+    )
+}

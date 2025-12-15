@@ -63,7 +63,7 @@ macro_rules! make_example_data {
     }};
 }
 
-static EXAMPLE_DATAS: [ExampleData; 16] = [
+static EXAMPLE_DATAS: [ExampleData; 20] = [
     make_example_data!("minimal"),
     make_example_data!("hello_world"),
     make_example_data!("interval"),
@@ -80,6 +80,10 @@ static EXAMPLE_DATAS: [ExampleData; 16] = [
     make_example_data!("list_object_state"),
     make_example_data!("list_retain_reactive"),
     make_example_data!("list_retain_remove"),
+    make_example_data!("while_function_call"),
+    make_example_data!("list_map_external_dep"),
+    make_example_data!("text_interpolation_update"),
+    make_example_data!("button_hover_test"),
 ];
 
 #[derive(Clone, Copy)]

@@ -1,0 +1,32 @@
+-- Test: Can functions be called inside WHILE arms?
+-- This verifies the fix from commit f3576e5 that merges function registry snapshots
+
+FUNCTION greeting(name) {
+    TEXT { Hello, {name}! }
+}
+
+store: [
+    toggle: LINK
+    show_greeting: False |> HOLD state {
+        toggle.event.press |> THEN { state |> Bool/not() }
+    }
+]
+
+document: Document/new(root: Element/stripe(
+    element: []
+    direction: Column
+    gap: 10
+    style: [padding: 20]
+    items: LIST {
+        Element/button(
+            element: [event: [press: LINK]]
+            style: [padding: 10]
+            label: TEXT { Toggle (show: {store.show_greeting}) }
+        ) |> LINK { store.toggle }
+
+        store.show_greeting |> WHILE {
+            True => Element/label(element: [], style: [], label: greeting(name: TEXT { World }))
+            False => Element/label(element: [], style: [], label: TEXT { Hidden })
+        }
+    }
+))
