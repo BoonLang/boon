@@ -1,0 +1,84 @@
+-- Test: Does HOLD receive events from a LINK after switching via WHILE?
+-- This tests HOLD inside an object referencing sibling LINK field (like todo_mvc's completed HOLD)
+
+store: [
+    view_toggle: LINK
+    show_item_a: True |> HOLD state {
+        view_toggle.event.press |> THEN { state |> Bool/not() }
+    }
+    -- Two items with HOLD referencing sibling LINK (like todo_mvc structure)
+    item_a: create_item(name: TEXT { Item A })
+    item_b: create_item(name: TEXT { Item B })
+]
+
+-- Create an item with LINK and HOLD referencing sibling field (like new_todo in todo_mvc)
+FUNCTION create_item(name) {
+    [
+        item_elements: [
+            button: LINK
+        ]
+        name: name
+        -- HOLD subscribes to sibling field's LINK's event (like todo_mvc's completed HOLD)
+        click_count: 0 |> HOLD state {
+            item_elements.button.event.press |> THEN { state + 1 }
+        }
+    ]
+}
+
+document: Document/new(root: Element/stripe(
+    element: []
+    direction: Column
+    gap: 20
+    style: [padding: 20]
+    items: LIST {
+        store.show_item_a |> WHILE {
+            True => Element/label(element: [], style: [], label: TEXT { Showing: Item A })
+            False => Element/label(element: [], style: [], label: TEXT { Showing: Item B })
+        }
+
+        Element/button(
+            element: [event: [press: LINK]]
+            style: [padding: 10]
+            label: TEXT { Toggle View }
+        ) |> LINK { store.view_toggle }
+
+        -- Show the item's click count and button based on which view is selected
+        store.show_item_a |> WHILE {
+            True => Element/stripe(
+                element: []
+                direction: Column
+                gap: 10
+                style: []
+                items: LIST {
+                    Element/label(element: [], style: [font: [size: 18]], label: TEXT { Item A clicks: {store.item_a.click_count} })
+                    Element/button(
+                        element: [event: [press: LINK]]
+                        style: [padding: [row: 20, column: 15], background: [color: Oklch[lightness: 0.8, chroma: 0.1, hue: 120]]]
+                        label: TEXT { Click Item A }
+                    ) |> LINK { store.item_a.item_elements.button }
+                }
+            )
+
+            False => Element/stripe(
+                element: []
+                direction: Column
+                gap: 10
+                style: []
+                items: LIST {
+                    Element/label(element: [], style: [font: [size: 18]], label: TEXT { Item B clicks: {store.item_b.click_count} })
+                    Element/button(
+                        element: [event: [press: LINK]]
+                        style: [padding: [row: 20, column: 15], background: [color: Oklch[lightness: 0.8, chroma: 0.1, hue: 240]]]
+                        label: TEXT { Click Item B }
+                    ) |> LINK { store.item_b.item_elements.button }
+                }
+            )
+        }
+
+        Element/label(
+            element: []
+            style: []
+            label: TEXT { Test: Click button, toggle view, click again. Counts should increment correctly. }
+        )
+    }
+))

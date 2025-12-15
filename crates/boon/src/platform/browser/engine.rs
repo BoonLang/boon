@@ -1378,8 +1378,6 @@ impl Variable {
             persistence,
             description: variable_description,
         } = construct_info;
-        // Clone description for logging before it's moved
-        let description_for_log = variable_description.to_string();
         let construct_info = ConstructInfo::new(
             actor_id.with_child_id("wrapped Variable"),
             persistence,
@@ -1390,20 +1388,7 @@ impl Variable {
                 .complete(ConstructType::ValueActor);
         let (link_value_sender, link_value_receiver) = mpsc::unbounded();
         // UnboundedReceiver is infinite - it never terminates unless sender is dropped
-        // Wrap with logging to debug LINK value flow
-        let link_stream_with_logging = link_value_receiver.map(move |value| {
-            let type_name = match &value {
-                Value::Object(_, _) => "Object".to_string(),
-                Value::TaggedObject(t, _) => format!("TaggedObject({})", t.tag()),
-                Value::Text(t, _) => format!("Text('{}')", t.text()),
-                Value::Tag(t, _) => format!("Tag('{}')", t.tag()),
-                Value::Number(n, _) => format!("Number({})", n.number()),
-                Value::List(_, _) => "List".to_string(),
-                Value::Flushed(_, _) => "Flushed".to_string(),
-            };
-            let _ = type_name;  // Used for debugging
-            value
-        });
+        let link_stream_with_logging = link_value_receiver;
         let value_actor =
             ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_stream_with_logging), persistence_id);
         Arc::new(Self {

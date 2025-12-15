@@ -8,6 +8,7 @@ use chumsky::Parser as ChumskyParser;
 use chumsky::input::{Input as ChumskyInput, Stream as ChumskyStream};
 use ulid::Ulid;
 use zoon::futures_channel::oneshot;
+use zoon::futures_util::select;
 use zoon::futures_util::stream::{self, LocalBoxStream};
 use zoon::{Stream, StreamExt, println, eprintln, mpsc};
 
@@ -2862,97 +2863,239 @@ fn build_field_access_actor(
     let path_display = path.join(".");
     let path_strings = path.clone();
 
-    // Build the subscription stream that handles all values (async-only architecture)
-    let mut subscription_stream: Pin<Box<dyn Stream<Item = Value>>> = Box::pin(
-        piped.clone().subscribe_stream()
-    );
+    // Build a stream that navigates through the entire field path.
+    // Uses "switch" semantics: when any intermediate LINK value changes, cancel old subscriptions
+    // and re-navigate through the new value. This is essential for paths like
+    // `todo_elements.todo_checkbox.event.click` where `todo_checkbox` is a LINK that
+    // can emit new checkbox elements when filters change.
+    //
+    // The approach:
+    // 1. Navigate through path fields, tracking LINK fields we encounter
+    // 2. Subscribe to the final field (if LINK, stay subscribed)
+    // 3. Watch for changes in intermediate LINKs - when one changes, re-navigate from that point
+    let (field_sender, field_receiver) = mpsc::unbounded::<Value>();
+    let piped_for_loop = piped.clone();
 
-    // For each field in the path, transform the subscription stream to extract that field
-    // IMPORTANT: Use map + flatten_unordered instead of flat_map!
-    // flat_map uses flatten which waits for each inner stream to complete before processing the next.
-    // Since Object field streams are infinite (they use pending()), flatten would block.
-    // flatten_unordered processes inner streams concurrently.
-    for field_name in path_strings {
-        subscription_stream = Box::pin(
-            subscription_stream
-                .then(move |value| {
-                    let field_name = field_name.clone();
-                    async move {
-                        // Get the field Variable and subscribe to all its values
-                        match value {
-                            Value::Object(object, _) => {
-                                let variable = object.expect_variable(&field_name);
-                                let is_link = variable.link_value_sender().is_some();
-                                let variable_actor = variable.value_actor();
+    let field_access_loop = ActorLoop::new(async move {
+        let _piped_ref = piped_for_loop;
 
-                                if is_link {
-                                    // LINK field: stay subscribed to receive multiple events
-                                    // Use deferred subscription pattern for async subscribe
-                                    stream::unfold(
-                                        (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), object, variable),
-                                        move |(sub_opt, actor_opt, object, variable)| async move {
-                                            let mut subscription = match sub_opt {
-                                                Some(s) => s,
-                                                None => actor_opt.unwrap().subscribe().await,
-                                            };
-                                            subscription.next().await.map(|value| (value, (Some(subscription), None, object, variable)))
-                                        }
-                                    ).boxed_local()
-                                } else {
-                                    // Non-LINK field: emit once and complete
-                                    let subscription = variable_actor.subscribe().await;
-                                    stream::once(async move {
-                                        let mut sub = subscription;
-                                        let result = sub.next().await;
-                                        let _ = (&object, &variable);
-                                        result
-                                    }).filter_map(|opt| async move { opt }).boxed_local()
-                                }
-                            }
-                            Value::TaggedObject(tagged_object, _) => {
-                                let variable = tagged_object.expect_variable(&field_name);
-                                let is_link = variable.link_value_sender().is_some();
-                                let variable_actor = variable.value_actor();
+        // Helper: navigate from a starting value through remaining path fields, return final value
+        async fn navigate_path(
+            start_value: Value,
+            fields: &[String],
+        ) -> Option<Value> {
+            let mut current = start_value;
+            for field_name in fields {
+                let variable = match &current {
+                    Value::Object(obj, _) => obj.variable(field_name),
+                    Value::TaggedObject(tagged, _) => tagged.variable(field_name),
+                    _ => return None,
+                };
+                if let Some(var) = variable {
+                    let mut sub = var.value_actor().subscribe().await;
+                    current = sub.next().await?;
+                } else {
+                    return None;
+                }
+            }
+            Some(current)
+        }
 
-                                if is_link {
-                                    // LINK field: stay subscribed to receive multiple events
-                                    // Use deferred subscription pattern for async subscribe
-                                    stream::unfold(
-                                        (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), tagged_object, variable),
-                                        move |(sub_opt, actor_opt, tagged_object, variable)| async move {
-                                            let mut subscription = match sub_opt {
-                                                Some(s) => s,
-                                                None => actor_opt.unwrap().subscribe().await,
-                                            };
-                                            subscription.next().await.map(|value| (value, (Some(subscription), None, tagged_object, variable)))
-                                        }
-                                    ).boxed_local()
-                                } else {
-                                    // Non-LINK field: emit once and complete
-                                    let subscription = variable_actor.subscribe().await;
-                                    stream::once(async move {
-                                        let mut sub = subscription;
-                                        let result = sub.next().await;
-                                        let _ = (&tagged_object, &variable);
-                                        result
-                                    }).filter_map(|opt| async move { opt }).boxed_local()
-                                }
+        // Helper: get the LINK sender for the final field of a path
+        async fn get_final_link_subscription(
+            value: &Value,
+            final_field: &str,
+        ) -> Option<(bool, LocalBoxStream<'static, Value>)> {
+            let variable = match value {
+                Value::Object(obj, _) => obj.variable(final_field),
+                Value::TaggedObject(tagged, _) => tagged.variable(final_field),
+                _ => return None,
+            };
+            let var = variable?;
+            let is_link = var.link_value_sender().is_some();
+            let subscription = var.value_actor().subscribe().await;
+            Some((is_link, subscription))
+        }
+
+        // Start by getting the first value from the piped stream
+        let mut piped_subscription = _piped_ref.subscribe().await.fuse();
+        let Some(initial_piped_value) = piped_subscription.next().await else {
+            return;
+        };
+
+        // Find the first LINK field in the path (excluding the last field)
+        // This is the field we need to watch for changes
+        let intermediate_fields: Vec<String> = path_strings.iter()
+            .take(path_strings.len().saturating_sub(1))
+            .cloned()
+            .collect();
+        let final_field = match path_strings.last() {
+            Some(f) => f.clone(),
+            None => return,
+        };
+
+        // Navigate to find the first LINK and get its subscription
+        let mut current_value = initial_piped_value;
+        let mut first_link_idx: Option<usize> = None;
+        let mut first_link_subscription: Option<stream::Fuse<LocalBoxStream<'static, Value>>> = None;
+        let mut fields_before_first_link: Vec<String> = Vec::new();
+        let mut fields_after_first_link: Vec<String> = Vec::new();
+
+        for (idx, field_name) in intermediate_fields.iter().enumerate() {
+            let variable = match &current_value {
+                Value::Object(obj, _) => obj.variable(field_name),
+                Value::TaggedObject(tagged, _) => tagged.variable(field_name),
+                _ => {
+                    zoon::println!("FieldAccess: Cannot access field '{}' on non-object", field_name);
+                    return;
+                }
+            };
+
+            if let Some(var) = variable {
+                let is_link = var.link_value_sender().is_some();
+
+                if is_link && first_link_idx.is_none() {
+                    // Found the first LINK - subscribe to it
+                    first_link_idx = Some(idx);
+                    first_link_subscription = Some(var.value_actor().subscribe().await.fuse());
+                    fields_before_first_link = intermediate_fields[..idx].to_vec();
+                    fields_after_first_link = intermediate_fields[idx + 1..].to_vec();
+                }
+
+                // Get the current value from this field
+                let mut sub = var.value_actor().subscribe().await;
+                if let Some(val) = sub.next().await {
+                    current_value = val;
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
+        }
+
+        // Now we have current_value pointing to the object containing the final field
+        // Get the subscription for the final field
+        let Some((final_is_link, final_subscription)) = get_final_link_subscription(&current_value, &final_field).await else {
+            return;
+        };
+
+        if !final_is_link {
+            // Final field is not a LINK - just emit one value and we're done
+            let mut sub = final_subscription;
+            if let Some(val) = sub.next().await {
+                let _ = field_sender.unbounded_send(val);
+            }
+            return;
+        }
+
+        // Final field IS a LINK - we need to stay subscribed and watch for intermediate changes
+        let mut final_sub = final_subscription.fuse();
+
+        loop {
+            if let Some(ref mut first_link_sub) = first_link_subscription {
+                // We have an intermediate LINK to watch
+                select! {
+                    final_value = final_sub.next() => {
+                        if let Some(val) = final_value {
+                            zoon::println!("[FieldAccess] Forwarding value from final LINK");
+                            if field_sender.unbounded_send(val).is_err() {
+                                return;
                             }
-                            other => {
-                                // Not an object - log error and return empty stream
-                                zoon::println!(
-                                    "FieldAccess: Cannot access field '{}' on non-object value: {}",
-                                    field_name, other.construct_info()
-                                );
-                                stream::empty().boxed_local()
-                            }
+                        } else {
+                            zoon::println!("[FieldAccess] Final subscription ended");
+                            break; // Final subscription ended
                         }
                     }
-                })
-                // With Some(1), non-LINK streams complete after emitting, allowing subsequent LINK events
-                .flatten_unordered(Some(1))
-        );
-    }
+                    first_link_value = first_link_sub.next() => {
+                        if let Some(new_value) = first_link_value {
+                            // First LINK emitted a new value - re-navigate from here
+                            zoon::println!("[FieldAccess] First LINK emitted new value - re-navigating through {:?}", fields_after_first_link);
+                            // Navigate through remaining intermediate fields
+                            let nav_result = navigate_path(new_value, &fields_after_first_link).await;
+
+                            if let Some(nav_value) = nav_result {
+                                // Get the new final field subscription
+                                if let Some((_, new_final_sub)) = get_final_link_subscription(&nav_value, &final_field).await {
+                                    final_sub = new_final_sub.fuse();
+                                } else {
+                                    break; // Can't get new subscription
+                                }
+                            }
+                            // Continue loop with new final subscription
+                        } else {
+                            break; // First LINK subscription ended
+                        }
+                    }
+                    piped_value = piped_subscription.next() => {
+                        if let Some(new_piped) = piped_value {
+                            // Piped value changed - re-navigate from the beginning
+                            // Navigate through fields before first LINK
+                            let before_result = navigate_path(new_piped.clone(), &fields_before_first_link).await;
+
+                            if let Some(before_value) = before_result {
+                                // Get the first LINK variable and subscribe to it
+                                if let Some(first_link_field) = intermediate_fields.get(first_link_idx.unwrap_or(0)) {
+                                    let first_link_var = match &before_value {
+                                        Value::Object(obj, _) => obj.variable(first_link_field),
+                                        Value::TaggedObject(tagged, _) => tagged.variable(first_link_field),
+                                        _ => None,
+                                    };
+
+                                    if let Some(var) = first_link_var {
+                                        *first_link_sub = var.value_actor().subscribe().await.fuse();
+
+                                        // Get first value and navigate to final field
+                                        let mut temp_sub = var.value_actor().subscribe().await;
+                                        if let Some(first_val) = temp_sub.next().await {
+                                            if let Some(nav_value) = navigate_path(first_val, &fields_after_first_link).await {
+                                                if let Some((_, new_final_sub)) = get_final_link_subscription(&nav_value, &final_field).await {
+                                                    final_sub = new_final_sub.fuse();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            return; // Piped subscription ended
+                        }
+                    }
+                }
+            } else {
+                // No intermediate LINK to watch - just forward from final LINK
+                select! {
+                    final_value = final_sub.next() => {
+                        if let Some(val) = final_value {
+                            if field_sender.unbounded_send(val).is_err() {
+                                return;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    piped_value = piped_subscription.next() => {
+                        if let Some(new_piped) = piped_value {
+                            // Navigate through all intermediate fields
+                            if let Some(nav_value) = navigate_path(new_piped, &intermediate_fields).await {
+                                if let Some((_, new_final_sub)) = get_final_link_subscription(&nav_value, &final_field).await {
+                                    final_sub = new_final_sub.fuse();
+                                }
+                            }
+                        } else {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Wrap the receiver stream to keep the actor loop alive
+    let subscription_stream = field_receiver.map(move |value| {
+        let _ = &field_access_loop; // Keep actor loop alive
+        value
+    });
 
     // Keep the piped actor alive by including it in inputs
     Ok(ValueActor::new_arc_with_inputs(
@@ -3555,14 +3698,24 @@ async fn get_link_sender_from_alias(
                 return None;
             }
 
-            // Get the root variable from reference connector or parameters
+            // Get the root variable from object_locals, parameters, or reference connector
+            // Note: object_locals contains function argument actors (arg_locals) which are needed
+            // to correctly resolve LINK targets inside function calls. Without this, multiple
+            // calls to the same function would overwrite each other's LINK registrations.
             let first_part = parts.first()?.to_string();
 
             let root_actor = if let Some(param_actor) = ctx.actor_context.parameters.get(&first_part).cloned() {
                 param_actor
             } else if let Some(ref_span) = referenced_span {
-                let ref_connector = ctx.try_reference_connector()?;
-                ref_connector.referenceable(ref_span).await
+                // First check object_locals (which includes arg_locals for function arguments)
+                // This ensures each function call instance gets its own unique actor
+                if let Some(local_actor) = ctx.actor_context.object_locals.get(&ref_span).cloned() {
+                    local_actor
+                } else {
+                    // Fall back to global reference connector
+                    let ref_connector = ctx.try_reference_connector()?;
+                    ref_connector.referenceable(ref_span).await
+                }
             } else {
                 zoon::eprintln!("[get_link_sender_from_alias] Cannot resolve root variable '{}'", first_part);
                 return None;

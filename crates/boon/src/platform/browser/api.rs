@@ -792,6 +792,33 @@ pub fn function_element_label(
     let [argument_element, argument_style, argument_label] = arguments.as_slice() else {
         panic!("Element/label expects 3 arguments")
     };
+
+    // Create a derived actor that extracts `event` from argument_element
+    // This allows direct access via `.event` instead of `.element.event`
+    let event_stream = argument_element
+        .clone()
+        .subscribe_stream()
+        .filter_map(|value| {
+            // value is Object [event: [...]]
+            future::ready(value.expect_object().variable("event"))
+        })
+        .then(|event_variable| async move {
+            // Subscribe to get the event object values [double_click: LINK]
+            event_variable.subscribe().await
+        })
+        .flatten();
+
+    let event_actor = ValueActor::new_arc(
+        ConstructInfo::new(
+            function_call_id.with_child_id(6),
+            None,
+            "ElementLabel[event] (derived)",
+        ),
+        actor_context.clone(),
+        TypedStream::infinite(event_stream.chain(stream::pending())),
+        None,
+    );
+
     TaggedObject::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -811,6 +838,17 @@ pub fn function_element_label(
                 construct_context.clone(),
                 "element",
                 argument_element.clone(),
+                None,
+            ),
+            Variable::new_arc(
+                ConstructInfo::new(
+                    function_call_id.with_child_id(7),
+                    None,
+                    "ElementLabel[event]",
+                ),
+                construct_context.clone(),
+                "event",
+                event_actor,
                 None,
             ),
             Variable::new_arc(
