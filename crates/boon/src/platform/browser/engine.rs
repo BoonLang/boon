@@ -1703,6 +1703,28 @@ impl Variable {
         ).boxed_local()
     }
 
+    /// Subscribe to future values only - skips historical replay (async).
+    ///
+    /// Use this for event triggers (THEN, WHEN, List/remove) where historical
+    /// events should NOT be replayed.
+    ///
+    /// Takes ownership of the Arc to keep the Variable alive for the subscription lifetime.
+    pub async fn stream_from_now(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        let subscription = self.value_actor.clone().stream_from_now().await;
+        // Subscription keeps the actor alive; we also need to keep the Variable alive
+        stream::unfold(
+            (subscription, self),
+            |(mut subscription, variable)| async move {
+                subscription.next().await.map(|value| (value, (subscription, variable)))
+            }
+        ).boxed_local()
+    }
+
+    /// Sync wrapper for stream_from_now() - returns stream that emits only future values.
+    pub fn stream_from_now_stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        stream::once(async move { self.stream_from_now().await }).flatten().boxed_local()
+    }
+
     // === Deprecated Wrappers ===
 
     /// Deprecated: Use `stream()` instead.
@@ -1763,7 +1785,7 @@ impl VariableOrArgumentReference {
         root_value_actor: impl Future<Output = Arc<ValueActor>> + 'static,
     ) -> Arc<ValueActor> {
         let construct_info = construct_info.complete(ConstructType::VariableOrArgumentReference);
-        // Capture snapshot mode flag before closures
+        // Capture context flags before closures
         let use_snapshot = actor_context.is_snapshot_context;
         let mut skip_alias_parts = 0;
         let alias_parts = match alias {
@@ -1859,7 +1881,7 @@ impl VariableOrArgumentReference {
                             .filter_map(|v| async { v })
                             .boxed_local()
                         } else {
-                            // Streaming: continuous updates - use stream_stream() and keep alive
+                            // Streaming: continuous updates - use stream() and keep alive
                             let alias_part_for_log = alias_part.clone();
                             stream::unfold(
                                 (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), object, variable),
@@ -1870,7 +1892,8 @@ impl VariableOrArgumentReference {
                                             Some(s) => (s, false),
                                             None => {
                                                 zoon::println!("[ALIAS_UNFOLD] Creating new subscription for '.{}'", alias_part_log);
-                                                (actor_opt.unwrap().stream().await, true)
+                                                let actor = actor_opt.unwrap();
+                                                (actor.stream().await, true)
                                             }
                                         };
                                         zoon::println!("[ALIAS_UNFOLD] Waiting for value from '.{}' (new_sub={})", alias_part_log, is_new);
@@ -1910,7 +1933,7 @@ impl VariableOrArgumentReference {
                             .filter_map(|v| async { v })
                             .boxed_local()
                         } else {
-                            // Streaming: continuous updates - use stream_stream() and keep alive
+                            // Streaming: continuous updates - use stream() and keep alive
                             let alias_part_for_log = alias_part.clone();
                             stream::unfold(
                                 (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), tagged_object, variable),
@@ -1921,7 +1944,8 @@ impl VariableOrArgumentReference {
                                             Some(s) => (s, false),
                                             None => {
                                                 zoon::println!("[ALIAS_UNFOLD:Tagged] Creating new subscription for '.{}'", alias_part_log);
-                                                (actor_opt.unwrap().stream().await, true)
+                                                let actor = actor_opt.unwrap();
+                                                (actor.stream().await, true)
                                             }
                                         };
                                         zoon::println!("[ALIAS_UNFOLD:Tagged] Waiting for value from '.{}' (new_sub={})", alias_part_log, is_new);
@@ -4109,6 +4133,49 @@ impl ValueActor {
                 stream::empty().boxed_local()
             }
         }
+    }
+
+    /// Subscribe starting from current version - only future values (async).
+    ///
+    /// Use this for event triggers (THEN, WHEN, List/remove) where historical
+    /// events should NOT be replayed. Subscribers will only receive values
+    /// emitted AFTER this subscription is created.
+    ///
+    /// Takes ownership of the Arc to keep the actor alive for the subscription lifetime.
+    pub async fn stream_from_now(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        // Handle lazy actors
+        if let Some(ref lazy_delegate) = self.lazy_delegate {
+            return lazy_delegate.clone().subscribe().boxed_local();
+        }
+
+        // Capture current version BEFORE subscribing - this is the key difference from stream()
+        let current_version = self.version();
+
+        // Send subscription request to actor loop with current version as starting point
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if let Err(e) = self.subscription_sender.unbounded_send(SubscriptionRequest {
+            reply: reply_tx,
+            starting_version: current_version,
+        }) {
+            eprintln!("Failed to stream_from_now: actor dropped: {e:#}");
+            return stream::empty().boxed_local();
+        }
+
+        // Wait for the receiver from actor loop
+        match reply_rx.await {
+            Ok(receiver) => {
+                PushSubscription::new(receiver, self).boxed_local()
+            }
+            Err(_) => {
+                eprintln!("Failed to stream_from_now: actor dropped before reply");
+                stream::empty().boxed_local()
+            }
+        }
+    }
+
+    /// Sync wrapper for stream_from_now() - returns stream that emits only future values.
+    pub fn stream_from_now_stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        stream::once(async move { self.stream_from_now().await }).flatten().boxed_local()
     }
 
     // === Deprecated Wrappers ===
@@ -6756,10 +6823,11 @@ impl ListBindingFunction {
                                             actor_context.clone(),
                                         );
                                         // Spawn task to listen for `when` event
+                                        // Use stream_from_now_stream to avoid replaying historical events
                                         let tx = remove_tx.clone();
                                         let when_clone = when_actor.clone();
                                         let task_handle = Task::start_droppable(async move {
-                                            let mut stream = when_clone.subscribe_stream();
+                                            let mut stream = when_clone.stream_from_now_stream();
                                             // Wait for ANY emission - that triggers removal
                                             if stream.next().await.is_some() {
                                                 let _ = tx.unbounded_send(idx);
@@ -6778,10 +6846,11 @@ impl ListBindingFunction {
                                         actor_context.clone(),
                                     );
                                     // Spawn task to listen for `when` event
+                                    // Use stream_from_now_stream to avoid replaying historical events
                                     let tx = remove_tx.clone();
                                     let when_clone = when_actor.clone();
                                     let task_handle = Task::start_droppable(async move {
-                                        let mut stream = when_clone.subscribe_stream();
+                                        let mut stream = when_clone.stream_from_now_stream();
                                         if stream.next().await.is_some() {
                                             let _ = tx.unbounded_send(idx);
                                         }

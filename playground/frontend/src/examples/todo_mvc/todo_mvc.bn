@@ -39,14 +39,16 @@ store: [
     }
     -- Create todo Objects with id, title, completed fields
     todo_to_add: title_to_add |> WHEN { t => new_todo(title: t, toggle_all: toggle_all_target) }
-    -- Reactive list operations (no HOLD - HOLD only works with scalar values)
+    -- Reactive list operations
     -- List/append adds new todos, List/remove handles both:
-    -- 1. Individual X button clicks
-    -- 2. Bulk "clear completed" button (removes completed items when pressed)
+    -- 1. Individual X button clicks (direct event)
+    -- 2. Clear completed button (event triggers check of item.completed)
     todos: LIST { new_todo(title: TEXT { Buy groceries }, toggle_all: toggle_all_target), new_todo(title: TEXT { Clean room }, toggle_all: toggle_all_target) }
         |> List/append(item: todo_to_add)
         |> List/remove(item, when: item.todo_elements.remove_todo_button.event.press)
-        |> List/remove(item, when: item.completed |> WHILE { True => elements.remove_completed_button.event.press, False => SKIP })
+        |> List/remove(item, when: elements.remove_completed_button.event.press |> THEN {
+            item.completed |> WHEN { True => [], False => SKIP }
+        })
     -- Simplified for debugging
     selected_todo_id: None
 ]

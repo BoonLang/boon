@@ -2803,8 +2803,7 @@ fn build_while_actor(
 
                 match evaluate_expression(body_expr, new_ctx) {
                     Ok(Some(result_actor)) => {
-                        // Use stream() for continuous streaming semantics.
-                        // WHILE bodies should produce continuous streams while the pattern matches.
+                        // Use stream() for continuous streaming semantics
                         result_actor.stream().await
                     }
                     Ok(None) => {
