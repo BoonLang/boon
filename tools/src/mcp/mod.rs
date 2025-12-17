@@ -229,10 +229,27 @@ fn get_tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "boon_console".to_string(),
-            description: "Get browser console logs from the Boon playground. Returns all console messages (log, warn, error, info) captured since page load.".to_string(),
+            description: "Get browser console logs from the Boon playground. Returns console messages (log, warn, error, info) captured since page load.".to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of messages to return (default: 100)"
+                    },
+                    "tail": {
+                        "type": "boolean",
+                        "description": "If true, return last N messages instead of first N (default: true)"
+                    },
+                    "level": {
+                        "type": "string",
+                        "description": "Filter by log level: 'error', 'warn', 'info', 'log', or 'all' (default: 'all')"
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "description": "Filter messages containing this text pattern"
+                    }
+                },
                 "required": []
             }),
         },
@@ -418,6 +435,38 @@ fn get_tools() -> Vec<Tool> {
                 "required": ["text"]
             }),
         },
+        Tool {
+            name: "boon_dblclick_text".to_string(),
+            description: "Double-click an element in the preview panel by its text content. Use for triggering double-click events (e.g., editing mode).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to find and double-click (e.g., 'Buy groceries')"
+                    },
+                    "exact": {
+                        "type": "boolean",
+                        "description": "If true, match exact text. If false (default), match if text contains the search string."
+                    }
+                },
+                "required": ["text"]
+            }),
+        },
+        Tool {
+            name: "boon_click_checkbox".to_string(),
+            description: "Click a checkbox in the preview panel by index (0-indexed). Index 0 is typically the 'toggle all' checkbox if present.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "integer",
+                        "description": "The checkbox index (0-indexed)"
+                    }
+                },
+                "required": ["index"]
+            }),
+        },
     ]
 }
 
@@ -470,6 +519,51 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
         let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
 
         return click_element_by_text(text, exact, ws_port).await;
+    }
+
+    // Handle double-click-by-text (compound command)
+    if name == "boon_dblclick_text" {
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or("text parameter required")?;
+        let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        return dblclick_element_by_text(text, exact, ws_port).await;
+    }
+
+    // Handle click-checkbox
+    if name == "boon_click_checkbox" {
+        let index = args
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .ok_or("index parameter required")? as u32;
+
+        let response = ws_server::send_command_to_server(ws_port, Command::ClickCheckbox { index })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        return match response {
+            Response::Success { data } => {
+                if let Some(d) = data {
+                    Ok(format!("Clicked checkbox {}: {}", index, serde_json::to_string_pretty(&d).unwrap_or_default()))
+                } else {
+                    Ok(format!("Clicked checkbox {}", index))
+                }
+            }
+            Response::Error { message } => Err(format!("Click checkbox failed: {}", message)),
+            _ => Ok(format!("Clicked checkbox {}", index)),
+        };
+    }
+
+    // Handle console with filtering
+    if name == "boon_console" {
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+        let tail = args.get("tail").and_then(|v| v.as_bool()).unwrap_or(true);
+        let level_filter = args.get("level").and_then(|v| v.as_str()).unwrap_or("all");
+        let pattern = args.get("pattern").and_then(|v| v.as_str());
+
+        return get_filtered_console(ws_port, limit, tail, level_filter, pattern).await;
     }
 
     // Handle browser launch separately (doesn't use WebSocket command)
@@ -610,7 +704,7 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
 
         Response::Success { data } => {
             if let Some(d) = data {
-                Ok(format!("Success: {}", serde_json::to_string_pretty(&d).unwrap_or_default()))
+                Ok(format!("Success: {}", serde_json::to_string(&d).unwrap_or_default()))
             } else {
                 Ok("Success".to_string())
             }
@@ -621,13 +715,34 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
         Response::Dom { structure } => Ok(format!("DOM:\n{}", structure)),
 
         Response::PreviewElements { data } => {
-            Ok(serde_json::to_string_pretty(&data).unwrap_or_default())
+            // Truncate to max 50 elements to avoid huge responses
+            let mut json: serde_json::Value = serde_json::to_value(&data).unwrap_or_default();
+            let mut truncated = false;
+            let mut total = 0;
+            if let Some(arr) = json.get_mut("elements").and_then(|v| v.as_array_mut()) {
+                total = arr.len();
+                if total > 50 {
+                    arr.truncate(50);
+                    truncated = true;
+                }
+            }
+            let mut result = serde_json::to_string(&json).unwrap_or_default();
+            if truncated {
+                result.push_str(&format!("\n[truncated: showing 50 of {} elements]", total));
+            }
+            Ok(result)
         }
 
         Response::EditorCode { code } => Ok(code),
 
         Response::AccessibilityTree { tree } => {
-            Ok(serde_json::to_string_pretty(&tree).unwrap_or_default())
+            // Truncate tree to max 100 nodes to avoid huge responses
+            let (truncated_tree, node_count) = truncate_json_tree(&tree, 100);
+            let mut result = serde_json::to_string(&truncated_tree).unwrap_or_default();
+            if node_count > 100 {
+                result.push_str(&format!("\n[truncated: showing ~100 of {} nodes]", node_count));
+            }
+            Ok(result)
         }
 
         Response::Error { message } => Err(message),
@@ -708,6 +823,85 @@ async fn check_playground_status() -> Result<String, String> {
     Ok(status)
 }
 
+/// Get filtered console messages
+async fn get_filtered_console(
+    ws_port: u16,
+    limit: usize,
+    tail: bool,
+    level_filter: &str,
+    pattern: Option<&str>,
+) -> Result<String, String> {
+    let response = ws_server::send_command_to_server(ws_port, Command::GetConsole)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::Console { messages } => {
+            if messages.is_empty() {
+                return Ok("No console messages captured.".to_string());
+            }
+
+            let total_count = messages.len();
+
+            // Filter by level
+            let filtered: Vec<_> = messages
+                .into_iter()
+                .filter(|msg| {
+                    if level_filter == "all" {
+                        true
+                    } else {
+                        msg.level == level_filter
+                    }
+                })
+                // Filter by pattern
+                .filter(|msg| {
+                    if let Some(pat) = pattern {
+                        msg.text.contains(pat)
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+
+            let filtered_count = filtered.len();
+
+            // Apply limit with tail/head
+            let limited: Vec<_> = if tail {
+                filtered.into_iter().rev().take(limit).collect::<Vec<_>>().into_iter().rev().collect()
+            } else {
+                filtered.into_iter().take(limit).collect()
+            };
+
+            let shown_count = limited.len();
+
+            // Format messages
+            let formatted: Vec<String> = limited
+                .iter()
+                .map(|msg| {
+                    let level = match msg.level.as_str() {
+                        "error" => "[ERROR]",
+                        "warn" => "[WARN]",
+                        "info" => "[INFO]",
+                        _ => "[LOG]",
+                    };
+                    format!("{} {}", level, msg.text)
+                })
+                .collect();
+
+            // Add summary header
+            let mut result = format!(
+                "Showing {} of {} messages (total: {})\n---\n",
+                shown_count, filtered_count, total_count
+            );
+            result.push_str(&formatted.join("\n"));
+
+            Ok(result)
+        }
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response from GetConsole".to_string()),
+    }
+}
+
 /// Click an element by its text content
 async fn click_element_by_text(text: &str, exact: bool, ws_port: u16) -> Result<String, String> {
     // First get preview elements
@@ -736,6 +930,44 @@ async fn click_element_by_text(text: &str, exact: bool, ws_port: u16) -> Result<
                     )),
                     Response::Error { message } => Err(format!("Click failed: {}", message)),
                     _ => Ok(format!("Clicked '{}' at ({}, {})", text, click_x, click_y)),
+                }
+            } else {
+                Err(format!("No element found containing text '{}'", text))
+            }
+        }
+        Response::Error { message } => Err(format!("Failed to get elements: {}", message)),
+        _ => Err("Unexpected response from GetPreviewElements".to_string()),
+    }
+}
+
+/// Double-click an element by its text content
+async fn dblclick_element_by_text(text: &str, exact: bool, ws_port: u16) -> Result<String, String> {
+    // First get preview elements
+    let response = ws_server::send_command_to_server(ws_port, Command::GetPreviewElements)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::PreviewElements { data } => {
+            if let Some((x, y, width, height)) = find_element_bounds_by_text(&data, text, exact) {
+                let click_x = x + width / 2;
+                let click_y = y + height / 2;
+
+                // Double-click at the center of the element
+                let response = ws_server::send_command_to_server(
+                    ws_port,
+                    Command::DoubleClickAt { x: click_x, y: click_y },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+
+                match response {
+                    Response::Success { .. } => Ok(format!(
+                        "Double-clicked '{}' at ({}, {})",
+                        text, click_x, click_y
+                    )),
+                    Response::Error { message } => Err(format!("Double-click failed: {}", message)),
+                    _ => Ok(format!("Double-clicked '{}' at ({}, {})", text, click_x, click_y)),
                 }
             } else {
                 Err(format!("No element found containing text '{}'", text))
@@ -849,5 +1081,51 @@ async fn start_playground() -> Result<String, String> {
             ))
         }
         Err(e) => Err(format!("Failed to start mzoon: {}", e)),
+    }
+}
+
+/// Truncate a JSON tree to max_nodes, returning the truncated tree and total node count
+fn truncate_json_tree(tree: &serde_json::Value, max_nodes: usize) -> (serde_json::Value, usize) {
+    let mut count = 0;
+    let truncated = truncate_json_tree_recursive(tree, max_nodes, &mut count);
+    (truncated, count)
+}
+
+fn truncate_json_tree_recursive(
+    value: &serde_json::Value,
+    max_nodes: usize,
+    count: &mut usize,
+) -> serde_json::Value {
+    use serde_json::Value;
+
+    match value {
+        Value::Object(obj) => {
+            *count += 1;
+            if *count > max_nodes {
+                return Value::String("[truncated]".to_string());
+            }
+            let mut new_obj = serde_json::Map::new();
+            for (key, val) in obj {
+                if *count > max_nodes {
+                    new_obj.insert(key.clone(), Value::String("[truncated]".to_string()));
+                    break;
+                }
+                new_obj.insert(key.clone(), truncate_json_tree_recursive(val, max_nodes, count));
+            }
+            Value::Object(new_obj)
+        }
+        Value::Array(arr) => {
+            let mut new_arr = Vec::new();
+            for item in arr {
+                *count += 1;
+                if *count > max_nodes {
+                    new_arr.push(Value::String(format!("[...{} more items truncated]", arr.len() - new_arr.len())));
+                    break;
+                }
+                new_arr.push(truncate_json_tree_recursive(item, max_nodes, count));
+            }
+            Value::Array(new_arr)
+        }
+        _ => value.clone(),
     }
 }

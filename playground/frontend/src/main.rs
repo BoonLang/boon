@@ -63,7 +63,7 @@ macro_rules! make_example_data {
     }};
 }
 
-static EXAMPLE_DATAS: [ExampleData; 21] = [
+static EXAMPLE_DATAS: [ExampleData; 22] = [
     make_example_data!("minimal"),
     make_example_data!("hello_world"),
     make_example_data!("interval"),
@@ -85,6 +85,7 @@ static EXAMPLE_DATAS: [ExampleData; 21] = [
     make_example_data!("text_interpolation_update"),
     make_example_data!("button_hover_test"),
     make_example_data!("switch_hold_test"),
+    make_example_data!("filter_checkbox_bug"),
 ];
 
 #[derive(Clone, Copy)]

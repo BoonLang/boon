@@ -59,7 +59,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       text: params.args.map(arg => arg.value || arg.description || '').join(' '),
       timestamp: Date.now()
     });
-    if (messages.length > 100) messages.shift();
+    if (messages.length > 2000) messages.shift();
     cdpConsoleMessages.set(source.tabId, messages);
   }
   // Capture uncaught exceptions (e.g., "Maximum call stack size exceeded")
@@ -74,7 +74,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       text: `[EXCEPTION] ${text}`,
       timestamp: Date.now()
     });
-    if (messages.length > 100) messages.shift();
+    if (messages.length > 2000) messages.shift();
     cdpConsoleMessages.set(source.tabId, messages);
   }
 });
@@ -154,6 +154,133 @@ async function cdpClickAt(tabId, x, y) {
   `);
 
   console.log(`[Boon] CDP: Clicked at (${x}, ${y}) with pointer events`);
+}
+
+// Double-click at coordinates (trusted event)
+async function cdpDoubleClickAt(tabId, x, y) {
+  await attachDebugger(tabId);
+
+  // Get scroll offset to convert page coords to viewport coords for CDP events
+  const scrollOffset = await cdpEvaluate(tabId, `({ scrollX: window.scrollX, scrollY: window.scrollY })`);
+  const viewportX = x - (scrollOffset?.scrollX || 0);
+  const viewportY = y - (scrollOffset?.scrollY || 0);
+
+  // First, move mouse to position
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseMoved', x: viewportX, y: viewportY, button: 'none'
+  });
+
+  // Send double-click with clickCount: 2
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mousePressed', x: viewportX, y: viewportY, button: 'left', clickCount: 2
+  });
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x: viewportX, y: viewportY, button: 'left', clickCount: 2
+  });
+
+  // Also dispatch dblclick event via JS since Zoon may use it
+  await cdpEvaluate(tabId, `
+    (function() {
+      const viewportX = ${x} - window.scrollX;
+      const viewportY = ${y} - window.scrollY;
+      const el = document.elementFromPoint(viewportX, viewportY);
+      if (!el) {
+        console.warn('[Boon] No element at viewport coords for dblclick:', viewportX, viewportY);
+        return;
+      }
+
+      // Dispatch dblclick event
+      el.dispatchEvent(new MouseEvent('dblclick', {
+        bubbles: true, cancelable: true, view: window,
+        clientX: viewportX, clientY: viewportY,
+        detail: 2
+      }));
+    })()
+  `);
+
+  console.log(`[Boon] CDP: Double-clicked at (${x}, ${y})`);
+}
+
+// Hover at coordinates (move mouse without clicking)
+// Uses CDP mouse movement + JavaScript mouseenter/mouseleave dispatch.
+// CDP mouseMoved positions the pointer but doesn't fire JS mouseenter/mouseleave events.
+// Zoon/dominator uses MouseEnter/MouseLeave events and doesn't check isTrusted,
+// so we dispatch synthetic JS events to trigger on_hovered_change callbacks.
+async function cdpHoverAt(tabId, x, y) {
+  await attachDebugger(tabId);
+
+  // Get scroll offset to convert page coords to viewport coords
+  const scrollOffset = await cdpEvaluate(tabId, `({ scrollX: window.scrollX, scrollY: window.scrollY })`);
+  const viewportX = x - (scrollOffset?.scrollX || 0);
+  const viewportY = y - (scrollOffset?.scrollY || 0);
+
+  // Move mouse to position via CDP (creates trusted mouse positioning)
+  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+    type: 'mouseMoved', x: viewportX, y: viewportY, button: 'none'
+  });
+
+  // Dispatch JavaScript mouseenter/mouseleave events to trigger Zoon's on_hovered_change
+  // Zoon/dominator doesn't check isTrusted, so synthetic events work
+  await cdpEvaluate(tabId, `
+    (function() {
+      const viewportX = ${viewportX};
+      const viewportY = ${viewportY};
+      const newTarget = document.elementFromPoint(viewportX, viewportY);
+
+      if (!newTarget) return { success: false, reason: 'no element at point' };
+
+      // Get previous hovered elements (all ancestors that received mouseenter)
+      // Filter out any elements that are no longer in the document (e.g., after page navigation)
+      const prevElements = (window.__boonHoveredElements || []).filter(el => document.contains(el));
+
+      // Collect all ancestors of newTarget including itself
+      const newElements = [];
+      let el = newTarget;
+      while (el && el !== document.documentElement) {
+        newElements.push(el);
+        el = el.parentElement;
+      }
+
+      // Find elements to leave (in prevElements but not in newElements)
+      const toLeave = prevElements.filter(el => !newElements.includes(el));
+
+      // Find elements to enter (in newElements but not in prevElements)
+      const toEnter = newElements.filter(el => !prevElements.includes(el));
+
+      // Dispatch mouseleave on elements we're leaving (from innermost to outermost)
+      for (const el of toLeave) {
+        el.dispatchEvent(new MouseEvent('mouseleave', {
+          bubbles: false, cancelable: false, view: window,
+          clientX: viewportX, clientY: viewportY,
+          relatedTarget: newTarget
+        }));
+      }
+
+      // Dispatch mouseenter on elements we're entering (from outermost to innermost)
+      for (let i = toEnter.length - 1; i >= 0; i--) {
+        toEnter[i].dispatchEvent(new MouseEvent('mouseenter', {
+          bubbles: false, cancelable: false, view: window,
+          clientX: viewportX, clientY: viewportY,
+          relatedTarget: prevElements[0] || null
+        }));
+      }
+
+      // Update tracked elements
+      window.__boonHoveredElements = newElements;
+
+      return {
+        success: true,
+        entered: toEnter.length,
+        left: toLeave.length,
+        newTarget: newTarget.tagName
+      };
+    })()
+  `);
+
+  // Small delay for event handlers to process
+  await new Promise(r => setTimeout(r, 50));
+
+  console.log(`[Boon] CDP: Hovered at (${x}, ${y}) with mouseenter/mouseleave dispatch`);
 }
 
 // Get element bounding box via CDP
@@ -503,6 +630,16 @@ async function handleCommand(id, command) {
         await cdpClickAt(tab.id, command.x, command.y);
         return { type: 'success', data: { x: command.x, y: command.y, method: 'cdp' } };
 
+      case 'hoverAt':
+        // Use CDP to move mouse without clicking (trigger hover)
+        await cdpHoverAt(tab.id, command.x, command.y);
+        return { type: 'success', data: { x: command.x, y: command.y, method: 'cdp' } };
+
+      case 'doubleClickAt':
+        // Use CDP for trusted double-click at coordinates
+        await cdpDoubleClickAt(tab.id, command.x, command.y);
+        return { type: 'success', data: { x: command.x, y: command.y, method: 'cdp' } };
+
       case 'type':
         // Use CDP: focus element, then type
         try {
@@ -585,11 +722,63 @@ async function handleCommand(id, command) {
         }
 
       case 'getPreviewElements':
-        // Use CDP to get elements with bounding boxes
+        // Use CDP to get ALL visible elements with bounding boxes (like raybox approach)
         try {
-          const elements = await cdpQuerySelectorAll(tab.id,
-            '[data-boon-panel="preview"] [role="button"], [data-boon-panel="preview"] button');
-          return { type: 'previewElements', data: { elements } };
+          const elements = await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { elements: [], error: 'Preview panel not found' };
+
+              const allElements = preview.querySelectorAll('*');
+              const results = [];
+
+              allElements.forEach((el) => {
+                const rect = el.getBoundingClientRect();
+                // Skip invisible elements
+                if (rect.width === 0 || rect.height === 0) return;
+
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return;
+
+                // Get direct text content (not from children)
+                let directText = '';
+                for (const node of el.childNodes) {
+                  if (node.nodeType === Node.TEXT_NODE) {
+                    directText += node.textContent;
+                  }
+                }
+                directText = directText.trim();
+
+                // Get full text content
+                const fullText = (el.textContent || '').trim().substring(0, 100);
+
+                // Determine element type
+                const role = el.getAttribute('role');
+                const tagName = el.tagName.toLowerCase();
+                let elementType = tagName;
+                if (role) elementType = role;
+                if (tagName === 'input') elementType = 'input:' + (el.type || 'text');
+
+                results.push({
+                  tagName,
+                  role,
+                  elementType,
+                  x: Math.round(rect.x),
+                  y: Math.round(rect.y),
+                  width: Math.round(rect.width),
+                  height: Math.round(rect.height),
+                  centerX: Math.round(rect.x + rect.width / 2),
+                  centerY: Math.round(rect.y + rect.height / 2),
+                  directText,
+                  fullText,
+                  className: el.className || ''
+                });
+              });
+
+              return { elements: results };
+            })()
+          `);
+          return { type: 'previewElements', data: elements };
         } catch (e) {
           return { type: 'error', message: e.message };
         }
@@ -754,6 +943,44 @@ async function handleCommand(id, command) {
           return { type: 'accessibilityTree', tree: formattedNodes };
         } catch (e) {
           return { type: 'error', message: `Accessibility tree failed: ${e.message}` };
+        }
+
+      case 'clickCheckbox':
+        // Click a checkbox by index (0-indexed) in the preview pane
+        try {
+          const checkboxElements = await cdpQuerySelectorAll(tab.id,
+            '[data-boon-panel="preview"] [role="checkbox"]');
+          const checkboxIndex = command.index;
+          if (checkboxIndex >= checkboxElements.length) {
+            return { type: 'error', message: `Checkbox index ${checkboxIndex} out of range (found ${checkboxElements.length} checkboxes)` };
+          }
+          const checkbox = checkboxElements[checkboxIndex];
+          await cdpClickAt(tab.id, checkbox.centerX, checkbox.centerY);
+          return { type: 'success', data: { index: checkboxIndex, text: checkbox.text, x: checkbox.centerX, y: checkbox.centerY } };
+        } catch (e) {
+          return { type: 'error', message: `Click checkbox failed: ${e.message}` };
+        }
+
+      case 'clickButton':
+        // Click a button by index (0-indexed) in the preview pane, excluding checkboxes
+        try {
+          const buttonElements = await cdpQuerySelectorAll(tab.id,
+            '[data-boon-panel="preview"] [role="button"]');
+          // Filter out checkboxes (they also have role="button" sometimes or are inside buttons)
+          const checkboxes = await cdpQuerySelectorAll(tab.id,
+            '[data-boon-panel="preview"] [role="checkbox"]');
+          const checkboxCenters = new Set(checkboxes.map(c => `${c.centerX},${c.centerY}`));
+          const pureButtons = buttonElements.filter(b => !checkboxCenters.has(`${b.centerX},${b.centerY}`));
+
+          const buttonIndex = command.index;
+          if (buttonIndex >= pureButtons.length) {
+            return { type: 'error', message: `Button index ${buttonIndex} out of range (found ${pureButtons.length} buttons)` };
+          }
+          const button = pureButtons[buttonIndex];
+          await cdpClickAt(tab.id, button.centerX, button.centerY);
+          return { type: 'success', data: { index: buttonIndex, text: button.text, x: button.centerX, y: button.centerY } };
+        } catch (e) {
+          return { type: 'error', message: `Click button failed: ${e.message}` };
         }
 
       // ============ Legacy commands still using executeScript ============
@@ -994,7 +1221,9 @@ function typeInElement(selector, text) {
   }
   el.focus();
   el.value = text;
+  // Dispatch both 'input' (for real-time updates) and 'change' (for Zoon's on_change)
   el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
   return { type: 'success', data: null };
 }
 

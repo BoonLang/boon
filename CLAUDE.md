@@ -10,6 +10,7 @@ Boon is a reactive, dataflow-oriented programming language designed for building
 
 - **NEVER revert files using `git checkout` or `git restore` without explicit user confirmation.** Even if a file appears broken, ask the user first before reverting. The user may want to investigate the issue or fix it differently.
 - When debugging issues, prefer investigating and fixing over reverting.
+- **NEVER use underscore prefix (`_`) to silence "unused variable" warnings without investigating why the variable is unused.** The underscore prefix hides potential bugs where a value should be used but isn't. For example, `_argument_element` in Element API functions caused a bug where the `element` argument was silently ignored instead of being passed to the settings object. If a variable appears unused, investigate whether it's a bug before adding `_` prefix.
 
 ## Project Structure
 

@@ -201,9 +201,46 @@ enum ExecAction {
         y: i32,
     },
 
+    /// Hover at absolute screen coordinates (move mouse without clicking)
+    HoverAt {
+        /// X coordinate
+        x: i32,
+        /// Y coordinate
+        y: i32,
+    },
+
     /// Click element containing specific text in the preview panel
     ClickText {
         /// Text to find and click
+        text: String,
+        /// Match exact text (default: contains match)
+        #[arg(long)]
+        exact: bool,
+    },
+
+    /// Click checkbox by index in preview panel (0-indexed)
+    ClickCheckbox {
+        /// Checkbox index (0-based)
+        index: u32,
+    },
+
+    /// Click button by index in preview panel (0-indexed, skips checkboxes)
+    ClickButton {
+        /// Button index (0-based)
+        index: u32,
+    },
+
+    /// Double-click at absolute screen coordinates
+    DblclickAt {
+        /// X coordinate
+        x: i32,
+        /// Y coordinate
+        y: i32,
+    },
+
+    /// Double-click element containing specific text in the preview panel
+    DblclickText {
+        /// Text to find and double-click
         text: String,
         /// Match exact text (default: contains match)
         #[arg(long)]
@@ -544,6 +581,11 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
             print_response(response);
         }
 
+        ExecAction::HoverAt { x, y } => {
+            let response = send_command_to_server(port, WsCommand::HoverAt { x, y }).await?;
+            print_response(response);
+        }
+
         ExecAction::ClickText { text, exact } => {
             // Get preview elements to find the one containing the text
             let response = send_command_to_server(port, WsCommand::GetPreviewElements).await?;
@@ -554,6 +596,50 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
                         let y = element.y + element.height / 2;
                         println!("Found '{}' at ({}, {}), clicking...", text, x, y);
                         let response = send_command_to_server(port, WsCommand::ClickAt { x, y }).await?;
+                        print_response(response);
+                    } else {
+                        eprintln!("Error: No element found containing text '{}'", text);
+                        std::process::exit(1);
+                    }
+                }
+                WsResponse::Error { message } => {
+                    eprintln!("Error getting elements: {}", message);
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("Unexpected response");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        ExecAction::ClickCheckbox { index } => {
+            println!("Clicking checkbox {}...", index);
+            let response = send_command_to_server(port, WsCommand::ClickCheckbox { index }).await?;
+            print_response(response);
+        }
+
+        ExecAction::ClickButton { index } => {
+            println!("Clicking button {}...", index);
+            let response = send_command_to_server(port, WsCommand::ClickButton { index }).await?;
+            print_response(response);
+        }
+
+        ExecAction::DblclickAt { x, y } => {
+            let response = send_command_to_server(port, WsCommand::DoubleClickAt { x, y }).await?;
+            print_response(response);
+        }
+
+        ExecAction::DblclickText { text, exact } => {
+            // Get preview elements to find the one containing the text
+            let response = send_command_to_server(port, WsCommand::GetPreviewElements).await?;
+            match response {
+                WsResponse::PreviewElements { data } => {
+                    if let Some(element) = find_element_by_text(&data, &text, exact) {
+                        let x = element.x + element.width / 2;
+                        let y = element.y + element.height / 2;
+                        println!("Found '{}' at ({}, {}), double-clicking...", text, x, y);
+                        let response = send_command_to_server(port, WsCommand::DoubleClickAt { x, y }).await?;
                         print_response(response);
                     } else {
                         eprintln!("Error: No element found containing text '{}'", text);

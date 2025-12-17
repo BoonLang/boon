@@ -39,18 +39,14 @@ store: [
     }
     -- Create todo Objects with id, title, completed fields
     todo_to_add: title_to_add |> WHEN { t => new_todo(title: t, toggle_all: toggle_all_target) }
-    -- Start with initial todos using proper Objects
-    -- HOLD allows both appending new todos and removing completed ones
-    todos: LIST { new_todo(title: TEXT { Buy groceries }, toggle_all: toggle_all_target), new_todo(title: TEXT { Clean room }, toggle_all: toggle_all_target) } |> HOLD state {
-        LATEST {
-            -- Append new todo when created
-            todo_to_add |> WHEN { todo => state |> List/append(item: todo) }
-            -- Remove completed todos when clear button is pressed
-            elements.remove_completed_button.event.press |> THEN {
-                state |> List/retain(item, condition: item.completed |> Bool/not())
-            }
-        }
-    }
+    -- Reactive list operations (no HOLD - HOLD only works with scalar values)
+    -- List/append adds new todos, List/remove handles both:
+    -- 1. Individual X button clicks
+    -- 2. Bulk "clear completed" button (removes completed items when pressed)
+    todos: LIST { new_todo(title: TEXT { Buy groceries }, toggle_all: toggle_all_target), new_todo(title: TEXT { Clean room }, toggle_all: toggle_all_target) }
+        |> List/append(item: todo_to_add)
+        |> List/remove(item, when: item.todo_elements.remove_todo_button.event.press)
+        |> List/remove(item, when: item.completed |> WHILE { True => elements.remove_completed_button.event.press, False => SKIP })
     -- Simplified for debugging
     selected_todo_id: None
 ]
@@ -165,7 +161,7 @@ FUNCTION header() {
     Element/container(
         element: [tag: Header]
         style: [
-            padding: [top: 10]
+            padding: [top: 10, bottom: 20]
             align: [row: Center]
             height: 130
             font: [
@@ -260,7 +256,7 @@ FUNCTION new_todo_title_text_input() {
 -- Render a single todo item (shared by all filters)
 FUNCTION todo_item(todo) {
     Element/stripe(
-        element: []
+        element: [hovered: LINK]
         direction: Row
         gap: 5
         style: [
@@ -309,6 +305,11 @@ FUNCTION todo_item(todo) {
                     label: todo.title
                 ) |> LINK { todo.todo_elements.todo_title_element }
             }
+            -- X button to remove todo (visible on hover)
+            element.hovered |> WHILE {
+                True => remove_todo_button() |> LINK { todo.todo_elements.remove_todo_button }
+                False => NoElement
+            }
         }
     )
 }
@@ -356,13 +357,13 @@ FUNCTION toggle_all_checkbox() {
                     font: [
                         size: 22
                         color: Oklch[lightness: all_completed |> WHILE {
-                            True => 0.555
-                            False => 0.92
+                            True => 0.40
+                            False => 0.75
                         }]
                     ]
-                    transform: [rotate: 90, move_up: 18]
+                    transform: [rotate: 90]
                 ]
-                child: TEXT { > }
+                child: TEXT { ❯ }
             )
         )
     }
@@ -432,7 +433,8 @@ FUNCTION panel_footer() {
         direction: Row
         gap: 0
         style: [
-            padding: [row: 15, column: 8]
+            width: Fill
+            padding: [row: 15, column: 10]
             font: [color: Oklch[lightness: 0.57]]
             borders: [top: [color: Oklch[lightness: 0.925]]]
             shadows: LIST {
@@ -446,16 +448,11 @@ FUNCTION panel_footer() {
         items: LIST {
             active_items_count_text()
             filters_element()
-            -- Show clear completed button only when there are completed todos
             PASSED.store.completed_todos |> List/empty() |> WHILE {
                 True => NoElement
                 False => remove_completed_button() |> LINK { PASSED.store.elements.remove_completed_button }
             }
-        } |> List/map(old, new: Element/container(
-            element: []
-            style: [width: Fill]
-            child: old
-        ))
+        }
     )
 }
 

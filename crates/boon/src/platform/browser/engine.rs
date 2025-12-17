@@ -21,6 +21,7 @@ use ulid::Ulid;
 use zoon::IntoCowStr;
 use zoon::future;
 use zoon::futures_channel::{mpsc, oneshot};
+use zoon::futures_util::future::{FutureExt, Shared};
 use zoon::futures_util::select;
 use zoon::futures_util::stream::{self, LocalBoxStream, Stream, StreamExt};
 use zoon::{Deserialize, DeserializeOwned, Serialize, serde, serde_json};
@@ -188,6 +189,8 @@ impl ActorLoop {
 /// # Implementation
 /// Uses `stream::unfold()` for a pure demand-driven stream (no Task spawn).
 /// State is threaded through the unfold closure, making this a pure stream combinator.
+static SWITCH_MAP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub fn switch_map<S, F, U>(outer: S, f: F) -> LocalBoxStream<'static, U::Item>
 where
     S: Stream + 'static,
@@ -197,22 +200,166 @@ where
 {
     use zoon::futures_util::stream::FusedStream;
 
+    let switch_id = SWITCH_MAP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     // Use type aliases to avoid complex generic inference issues
     type FusedOuter<T> = stream::Fuse<LocalBoxStream<'static, T>>;
     type FusedInner<T> = stream::Fuse<LocalBoxStream<'static, T>>;
 
-    // State as tuple: (outer_stream, inner_stream_opt, map_fn)
-    let initial: (FusedOuter<S::Item>, Option<FusedInner<U::Item>>, F) = (
+    // State as tuple: (outer_stream, inner_stream_opt, map_fn, switch_id, pending_outer_value)
+    // pending_outer_value: When outer emits while inner is active, we store the outer value
+    // and drain the inner stream before switching. This prevents losing in-flight events.
+    let initial: (FusedOuter<S::Item>, Option<FusedInner<U::Item>>, F, usize, Option<S::Item>) = (
         outer.boxed_local().fuse(),
         None,
         f,
+        switch_id,
+        None, // pending_outer_value
+    );
+
+    stream::unfold(initial, |state| async move {
+        use zoon::futures_util::future::Either;
+        use std::task::Poll;
+
+        // Destructure state - we need to rebuild it for the return
+        let (mut outer_stream, mut inner_opt, map_fn, switch_id, mut pending_outer) = state;
+
+        loop {
+            // If we have a pending outer value and the inner stream is done/empty, switch now
+            if let Some(pending_value) = pending_outer.take() {
+                zoon::println!("[SWITCH_MAP:{}] Switching to pending outer value (inner drained)", switch_id);
+                inner_opt = Some(map_fn(pending_value).boxed_local().fuse());
+                continue;
+            }
+
+            match &mut inner_opt {
+                Some(inner) if !inner.is_terminated() => {
+                    // Both streams active - race between them
+                    let outer_fut = outer_stream.next();
+                    let inner_fut = inner.next();
+
+                    match future::select(pin!(outer_fut), pin!(inner_fut)).await {
+                        Either::Left((outer_opt, inner_fut_incomplete)) => {
+                            match outer_opt {
+                                Some(new_outer_value) => {
+                                    // Outer emitted - but don't switch immediately!
+                                    // First, try to drain any ready items from inner stream.
+                                    zoon::println!("[SWITCH_MAP:{}] Outer value arrived, draining inner before switch", switch_id);
+
+                                    // Poll the inner stream once to check for ready items
+                                    // We use poll_fn to do a non-blocking check
+                                    let inner_item = std::future::poll_fn(|cx| {
+                                        match Pin::new(&mut *inner).poll_next(cx) {
+                                            Poll::Ready(item) => Poll::Ready(item),
+                                            Poll::Pending => Poll::Ready(None), // No ready item
+                                        }
+                                    }).await;
+
+                                    if let Some(item) = inner_item {
+                                        // Inner had a ready item - emit it and store outer for later
+                                        zoon::println!("[SWITCH_MAP:{}] Drained item from inner, storing outer for later", switch_id);
+                                        pending_outer = Some(new_outer_value);
+                                        return Some((item, (outer_stream, inner_opt, map_fn, switch_id, pending_outer)));
+                                    } else {
+                                        // No ready items in inner - safe to switch now
+                                        // Drop the old inner stream explicitly for logging
+                                        zoon::println!("[SWITCH_MAP:{}] Inner empty, DROPPING old inner and switching", switch_id);
+                                        drop(inner_opt.take());
+                                        zoon::println!("[SWITCH_MAP:{}] Old inner dropped, creating new inner", switch_id);
+                                        inner_opt = Some(map_fn(new_outer_value).boxed_local().fuse());
+                                    }
+                                }
+                                None => {
+                                    // Outer ended - drain inner then finish
+                                    zoon::println!("[SWITCH_MAP:{}] Outer ended, draining inner", switch_id);
+                                    while let Some(item) = inner.next().await {
+                                        return Some((item, (outer_stream, inner_opt, map_fn, switch_id, None)));
+                                    }
+                                    return None;
+                                }
+                            }
+                        }
+                        Either::Right((inner_opt_val, _)) => {
+                            match inner_opt_val {
+                                Some(item) => {
+                                    zoon::println!("[SWITCH_MAP:{}] Inner stream emitted value", switch_id);
+                                    return Some((item, (outer_stream, inner_opt, map_fn, switch_id, pending_outer)));
+                                }
+                                None => {
+                                    // Inner ended - clear it
+                                    zoon::println!("[SWITCH_MAP:{}] Inner stream ended, waiting for new outer value", switch_id);
+                                    inner_opt = None;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // No active inner stream - wait for outer value
+                    match outer_stream.next().await {
+                        Some(_value) => {
+                            zoon::println!("[SWITCH_MAP:{}] Initial outer value, creating inner stream", switch_id);
+                            inner_opt = Some(map_fn(_value).boxed_local().fuse());
+                        }
+                        None => {
+                            zoon::println!("[SWITCH_MAP:{}] Outer ended with no active inner", switch_id);
+                            return None; // Outer ended
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .boxed_local()
+}
+
+/// A key-aware switch_map that only switches the inner stream when the key changes.
+/// If the same key is produced, it keeps the existing inner stream subscription,
+/// preventing race conditions where events could be lost during subscription recreation.
+///
+/// This is critical for LINK subscriptions in alias paths like `item.elements.checkbox.event.click`.
+/// When `item` changes but the underlying `click` LINK Variable is the same (same Arc pointer),
+/// we must NOT drop and recreate the subscription, as events could arrive during the transition.
+pub fn switch_map_by_key<S, K, F, U>(
+    outer: S,
+    key_fn: impl Fn(&S::Item) -> K + 'static,
+    f: F,
+) -> LocalBoxStream<'static, U::Item>
+where
+    S: Stream + 'static,
+    K: PartialEq + Clone + std::fmt::Debug + 'static,
+    F: Fn(S::Item) -> U + 'static,
+    U: Stream + 'static,
+    U::Item: 'static,
+{
+    use zoon::futures_util::stream::FusedStream;
+
+    let switch_id = SWITCH_MAP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    type FusedOuter<T> = stream::Fuse<LocalBoxStream<'static, T>>;
+    type FusedInner<T> = stream::Fuse<LocalBoxStream<'static, T>>;
+
+    // State: (outer_stream, inner_stream_opt, map_fn, key_fn, switch_id, current_key)
+    let initial: (
+        FusedOuter<S::Item>,
+        Option<FusedInner<U::Item>>,
+        F,
+        Box<dyn Fn(&S::Item) -> K>,
+        usize,
+        Option<K>,
+    ) = (
+        outer.boxed_local().fuse(),
+        None,
+        f,
+        Box::new(key_fn),
+        switch_id,
+        None,
     );
 
     stream::unfold(initial, |state| async move {
         use zoon::futures_util::future::Either;
 
-        // Destructure state - we need to rebuild it for the return
-        let (mut outer_stream, mut inner_opt, map_fn) = state;
+        let (mut outer_stream, mut inner_opt, map_fn, key_fn, switch_id, mut current_key) = state;
 
         loop {
             match &mut inner_opt {
@@ -224,14 +371,26 @@ where
                     match future::select(pin!(outer_fut), pin!(inner_fut)).await {
                         Either::Left((outer_opt, _)) => {
                             match outer_opt {
-                                Some(value) => {
-                                    // Switch! Drop old inner by replacing
-                                    inner_opt = Some(map_fn(value).boxed_local().fuse());
+                                Some(new_outer_value) => {
+                                    let new_key = key_fn(&new_outer_value);
+
+                                    // Check if key changed
+                                    let key_changed = current_key.as_ref().map_or(true, |k| k != &new_key);
+
+                                    if key_changed {
+                                        zoon::println!("[SWITCH_MAP_BY_KEY:{}] Key changed from {:?} to {:?}, switching", switch_id, current_key, new_key);
+                                        current_key = Some(new_key);
+                                        inner_opt = Some(map_fn(new_outer_value).boxed_local().fuse());
+                                    } else {
+                                        zoon::println!("[SWITCH_MAP_BY_KEY:{}] Same key {:?}, keeping subscription", switch_id, new_key);
+                                        // Don't create new inner - keep existing subscription!
+                                    }
                                 }
                                 None => {
                                     // Outer ended - drain inner then finish
+                                    zoon::println!("[SWITCH_MAP_BY_KEY:{}] Outer ended, draining inner", switch_id);
                                     while let Some(item) = inner.next().await {
-                                        return Some((item, (outer_stream, inner_opt, map_fn)));
+                                        return Some((item, (outer_stream, inner_opt, map_fn, key_fn, switch_id, current_key)));
                                     }
                                     return None;
                                 }
@@ -240,11 +399,12 @@ where
                         Either::Right((inner_opt_val, _)) => {
                             match inner_opt_val {
                                 Some(item) => {
-                                    return Some((item, (outer_stream, inner_opt, map_fn)));
+                                    return Some((item, (outer_stream, inner_opt, map_fn, key_fn, switch_id, current_key)));
                                 }
                                 None => {
-                                    // Inner ended - clear it
+                                    zoon::println!("[SWITCH_MAP_BY_KEY:{}] Inner stream ended, waiting for new outer value", switch_id);
                                     inner_opt = None;
+                                    current_key = None; // Reset key since inner ended
                                 }
                             }
                         }
@@ -253,10 +413,16 @@ where
                 _ => {
                     // No active inner stream - wait for outer value
                     match outer_stream.next().await {
-                        Some(value) => {
-                            inner_opt = Some(map_fn(value).boxed_local().fuse());
+                        Some(_value) => {
+                            let new_key = key_fn(&_value);
+                            zoon::println!("[SWITCH_MAP_BY_KEY:{}] Initial outer value with key {:?}, creating inner stream", switch_id, new_key);
+                            current_key = Some(new_key);
+                            inner_opt = Some(map_fn(_value).boxed_local().fuse());
                         }
-                        None => return None, // Outer ended
+                        None => {
+                            zoon::println!("[SWITCH_MAP_BY_KEY:{}] Outer ended with no active inner", switch_id);
+                            return None;
+                        }
                     }
                 }
             }
@@ -765,6 +931,19 @@ pub struct PushSubscription {
     receiver: mpsc::Receiver<Value>,
     /// Keeps the actor alive for the subscription lifetime
     _actor: Arc<ValueActor>,
+    /// Debug ID for tracking drops
+    debug_id: usize,
+}
+
+static PUSH_SUBSCRIPTION_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ACTOR_INSTANCE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl PushSubscription {
+    fn new(receiver: mpsc::Receiver<Value>, actor: Arc<ValueActor>) -> Self {
+        let debug_id = PUSH_SUBSCRIPTION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        zoon::println!("[PUSH_SUB:{}] Created for: {} (id: {:?})", debug_id, actor.construct_info.description, actor.construct_info.id);
+        Self { receiver, _actor: actor, debug_id }
+    }
 }
 
 impl Stream for PushSubscription {
@@ -772,6 +951,12 @@ impl Stream for PushSubscription {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.receiver).poll_next(cx)
+    }
+}
+
+impl Drop for PushSubscription {
+    fn drop(&mut self) {
+        zoon::println!("[PUSH_SUB:{}] DROPPED for: {}", self.debug_id, self._actor.construct_info.description);
     }
 }
 
@@ -962,6 +1147,7 @@ impl VirtualFilesystem {
 pub struct ConstructContext {
     pub construct_storage: Arc<ConstructStorage>,
     pub virtual_fs: VirtualFilesystem,
+    pub link_actor_registry: Arc<LinkActorRegistry>,
     // NOTE: `previous_actors` was intentionally REMOVED from here.
     // It should NOT be part of ConstructContext because:
     // 1. It gets captured in stream closures, causing memory leaks
@@ -1139,6 +1325,41 @@ pub struct ActorContext {
     /// the same function definition (they would otherwise share the same spans
     /// and overwrite each other in the global ReferenceConnector).
     pub object_locals: HashMap<parser::Span, Arc<ValueActor>>,
+    /// Prefix for persistence IDs when evaluating expressions in isolated scopes.
+    ///
+    /// **IMPORTANT: When to create a new scope:**
+    /// A new scope must be created when evaluating code from the SAME source position
+    /// but for DIFFERENT runtime instances. This includes:
+    /// - LIST items (each item needs unique LINK registrations)
+    /// - List/map items (each transformed item needs unique LINK registrations)
+    /// - Function calls that create multiple instances with LINK fields
+    ///
+    /// Use `with_child_scope()` to create a properly isolated child scope.
+    /// Without proper scoping, LINK variables would collide and events would be
+    /// routed to wrong elements.
+    pub persistence_id_prefix: Option<String>,
+}
+
+impl ActorContext {
+    /// Creates a child context with a new unique scope prefix.
+    ///
+    /// Use this when evaluating code that needs isolation from siblings:
+    /// - LIST items
+    /// - List/map transformed items
+    /// - Any context where the same source code position is evaluated multiple times
+    ///   for different runtime instances
+    ///
+    /// The `scope_id` should be unique among siblings (e.g., "list_item_0", "map_item_abc123").
+    pub fn with_child_scope(&self, scope_id: &str) -> Self {
+        let new_prefix = match &self.persistence_id_prefix {
+            Some(existing) => format!("{}:{}", existing, scope_id),
+            None => scope_id.to_string(),
+        };
+        Self {
+            persistence_id_prefix: Some(new_prefix),
+            ..self.clone()
+        }
+    }
 }
 
 // --- ActorOutputValveSignal ---
@@ -1223,7 +1444,7 @@ impl ConstructInfo {
 
 // --- ConstructInfoComplete ---
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ConstructInfoComplete {
     r#type: ConstructType,
     id: ConstructId,
@@ -1300,6 +1521,9 @@ impl<T: IntoCowStr<'static>> From<T> for ConstructId {
 pub struct Variable {
     construct_info: ConstructInfoComplete,
     persistence_id: Option<parser::PersistenceId>,
+    /// Registry key for LINK variables, includes persistence_id_prefix from List/map context.
+    /// Used by bridges to subscribe to registry updates with the correct item-unique key.
+    registry_key: Option<LinkRegistryKey>,
     name: Cow<'static, str>,
     value_actor: Arc<ValueActor>,
     link_value_sender: Option<mpsc::UnboundedSender<Value>>,
@@ -1319,6 +1543,7 @@ impl Variable {
         Self {
             construct_info: construct_info.complete(ConstructType::Variable),
             persistence_id,
+            registry_key: None,  // Non-LINK variables don't use registry
             name: name.into(),
             value_actor,
             link_value_sender: None,
@@ -1355,6 +1580,7 @@ impl Variable {
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::Variable),
             persistence_id,
+            registry_key: None,  // Non-LINK variables don't use registry
             name: name.into(),
             value_actor,
             link_value_sender: None,
@@ -1364,6 +1590,10 @@ impl Variable {
 
     pub fn persistence_id(&self) -> Option<parser::PersistenceId> {
         self.persistence_id
+    }
+
+    pub fn registry_key(&self) -> Option<&LinkRegistryKey> {
+        self.registry_key.as_ref()
     }
 
     pub fn new_link_arc(
@@ -1378,6 +1608,7 @@ impl Variable {
             persistence,
             description: variable_description,
         } = construct_info;
+        let variable_description_for_log = variable_description.clone();
         let construct_info = ConstructInfo::new(
             actor_id.with_child_id("wrapped Variable"),
             persistence,
@@ -1386,16 +1617,32 @@ impl Variable {
         let actor_construct_info =
             ConstructInfo::new(actor_id.clone(), persistence, "Link variable value actor")
                 .complete(ConstructType::ValueActor);
-        let (link_value_sender, link_value_receiver) = mpsc::unbounded();
+        let (link_value_sender, link_value_receiver) = mpsc::unbounded::<Value>();
         // UnboundedReceiver is infinite - it never terminates unless sender is dropped
-        let link_stream_with_logging = link_value_receiver;
+        let link_stream_with_logging = link_value_receiver.map(move |value| {
+            zoon::println!("[LINK] Received value: {} -> {:?}", variable_description_for_log, value.construct_info());
+            value
+        });
+        // Capture the persistence_id_prefix before actor_context is moved
+        let persistence_id_prefix = actor_context.persistence_id_prefix.clone();
         let value_actor =
             ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_stream_with_logging), persistence_id);
+        let value_actor = Arc::new(value_actor);
+
+        // Register with LinkActorRegistry so bridges can subscribe to sender updates
+        // Use the persistence_id_prefix from actor_context to make the key unique per list item
+        let registry_key = persistence_id.map(|pid| {
+            let key = LinkRegistryKey::new(persistence_id_prefix.clone(), pid);
+            construct_context.link_actor_registry.register(key.clone(), link_value_sender.clone(), value_actor.clone());
+            key
+        });
+
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
             persistence_id,
+            registry_key,
             name: name.into(),
-            value_actor: Arc::new(value_actor),
+            value_actor,
             link_value_sender: Some(link_value_sender),
             forwarding_loop: None,
         })
@@ -1417,6 +1664,7 @@ impl Variable {
         construct_context: ConstructContext,
         name: impl Into<Cow<'static, str>>,
         persistence_id: Option<parser::PersistenceId>,
+        registry_key: Option<LinkRegistryKey>,
         forwarding_actor: Arc<ValueActor>,
         link_value_sender: mpsc::UnboundedSender<Value>,
         forwarding_loop: ActorLoop,
@@ -1424,6 +1672,7 @@ impl Variable {
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
             persistence_id,
+            registry_key,  // Pass through from the base LINK so bridges can look up with correct key
             name: name.into(),
             // Use forwarding_actor so sibling field lookups work correctly
             value_actor: forwarding_actor,
@@ -1442,9 +1691,9 @@ impl Variable {
     /// - The Variable may be the only reference keeping dependent actors alive
     ///
     /// Takes ownership of the Arc to keep the Variable alive for the subscription lifetime.
-    /// Callers should use `.clone().subscribe()` if they need to retain a reference.
-    pub async fn subscribe(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        let subscription = self.value_actor.clone().subscribe().await;
+    /// Callers should use `.clone().stream().await` if they need to retain a reference.
+    pub async fn stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        let subscription = self.value_actor.clone().stream().await;
         // Subscription keeps the actor alive; we also need to keep the Variable alive
         stream::unfold(
             (subscription, self),
@@ -1454,11 +1703,19 @@ impl Variable {
         ).boxed_local()
     }
 
-    /// Subscribe stream with synchronous wrapper (for use in sync contexts).
-    ///
-    /// See `ValueActor::subscribe_stream()` for details.
+    // === Deprecated Wrappers ===
+
+    /// Deprecated: Use `stream()` instead.
+    #[deprecated(since = "0.2.0", note = "Use stream() instead")]
+    #[allow(dead_code)]
+    pub async fn subscribe(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        self.stream().await
+    }
+
+    /// Deprecated: Use `stream::once(async move { var.stream().await }).flatten()` instead.
+    #[deprecated(since = "0.2.0", note = "Use stream::once(async move { var.stream().await }).flatten() instead")]
     pub fn subscribe_stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        stream::once(async move { self.subscribe().await }).flatten().boxed_local()
+        stream::once(async move { self.stream().await }).flatten().boxed_local()
     }
 
     pub fn value_actor(&self) -> Arc<ValueActor> {
@@ -1532,8 +1789,8 @@ impl VariableOrArgumentReference {
                         .filter_map(|v| async { v })
                         .boxed_local()
                 } else {
-                    // Streaming: continuous updates
-                    actor.stream_stream()
+                    // Streaming: continuous updates - lazy wrapper for sync context
+                    stream::once(async move { actor.stream().await }).flatten().boxed_local()
                 }
             })
             .boxed_local();
@@ -1544,16 +1801,48 @@ impl VariableOrArgumentReference {
         for (idx, alias_part) in parts_vec.into_iter().enumerate() {
             let alias_part = alias_part.to_string();
             let _is_last = idx == num_parts - 1;
+            let alias_part_for_log = alias_part.clone();
+            let alias_part_for_key = alias_part.clone();
+            let idx_for_log = idx;
 
-            // Process each field in the path using switch_map semantics:
-            // When the outer stream emits a new value, cancel the old inner subscription
-            // and start a new one. This is essential for LINK fields (when a new event arrives,
-            // stop processing the old event's fields) but also correct for all fields.
+            // Process each field in the path using switch_map_by_key semantics:
+            // Use the Variable's Arc pointer as the key - if the same Variable is returned
+            // (same underlying Arc), we keep the existing subscription to prevent race conditions.
             //
-            // This makes LINK transparent: it's just a channel that forwards values.
-            // The switch semantics come from the path traversal, not from LINK itself.
-            value_stream = switch_map(value_stream, move |value| {
+            // This is critical for LINK subscriptions: when filter changes in HOLD, the outer
+            // objects change but the inner LINK Variables may be the same. If we unconditionally
+            // dropped subscriptions, events could be lost during the recreation window.
+            //
+            // The key_fn extracts the Variable pointer from the Value before deciding to switch.
+            value_stream = switch_map_by_key(
+                value_stream,
+                move |value: &Value| {
+                    // Extract Variable pointer as key - same Variable = same key = keep subscription
+                    match value {
+                        Value::Object(object, _) => {
+                            let variable = object.expect_variable(&alias_part_for_key);
+                            Arc::as_ptr(&variable) as usize
+                        }
+                        Value::TaggedObject(tagged_object, _) => {
+                            let variable = tagged_object.expect_variable(&alias_part_for_key);
+                            Arc::as_ptr(&variable) as usize
+                        }
+                        _ => 0, // Non-object values get key 0 (will cause panic in map_fn anyway)
+                    }
+                },
+                move |value| {
                 let alias_part = alias_part.clone();
+                zoon::println!("[ALIAS:{}] switch_map_by_key triggered for '.{}', value type: {}",
+                    idx_for_log, alias_part_for_log,
+                    match &value {
+                        Value::Object(_, _) => "Object",
+                        Value::TaggedObject(t, _) => t.tag(),
+                        Value::Text(_, _) => "Text",
+                        Value::Tag(t, _) => t.tag(),
+                        Value::Number(_, _) => "Number",
+                        Value::List(_, _) => "List",
+                        Value::Flushed(_, _) => "Flushed",
+                    });
                 match value {
                     Value::Object(object, _) => {
                         let variable = object.expect_variable(&alias_part);
@@ -1577,10 +1866,14 @@ impl VariableOrArgumentReference {
                                 move |(subscription_opt, actor_opt, object, variable)| {
                                     let alias_part_log = alias_part_for_log.clone();
                                     async move {
-                                        let mut subscription = match subscription_opt {
-                                            Some(s) => s,
-                                            None => actor_opt.unwrap().stream().await,
+                                        let (mut subscription, is_new) = match subscription_opt {
+                                            Some(s) => (s, false),
+                                            None => {
+                                                zoon::println!("[ALIAS_UNFOLD] Creating new subscription for '.{}'", alias_part_log);
+                                                (actor_opt.unwrap().stream().await, true)
+                                            }
                                         };
+                                        zoon::println!("[ALIAS_UNFOLD] Waiting for value from '.{}' (new_sub={})", alias_part_log, is_new);
                                         let value = subscription.next().await;
                                         if let Some(ref v) = value {
                                             let type_name = match v {
@@ -1592,7 +1885,9 @@ impl VariableOrArgumentReference {
                                                 Value::List(_, _) => "List",
                                                 Value::Flushed(_, _) => "Flushed",
                                             };
-                                            let _ = (&alias_part_log, type_name);  // Used for debugging
+                                            zoon::println!("[ALIAS_UNFOLD] Got value from '.{}': {}", alias_part_log, type_name);
+                                        } else {
+                                            zoon::println!("[ALIAS_UNFOLD] '.{}' subscription ended (None)", alias_part_log);
                                         }
                                         value.map(|value| (value, (Some(subscription), None, object, variable)))
                                     }
@@ -1622,10 +1917,14 @@ impl VariableOrArgumentReference {
                                 move |(subscription_opt, actor_opt, tagged_object, variable)| {
                                     let alias_part_log = alias_part_for_log.clone();
                                     async move {
-                                        let mut subscription = match subscription_opt {
-                                            Some(s) => s,
-                                            None => actor_opt.unwrap().stream().await,
+                                        let (mut subscription, is_new) = match subscription_opt {
+                                            Some(s) => (s, false),
+                                            None => {
+                                                zoon::println!("[ALIAS_UNFOLD:Tagged] Creating new subscription for '.{}'", alias_part_log);
+                                                (actor_opt.unwrap().stream().await, true)
+                                            }
                                         };
+                                        zoon::println!("[ALIAS_UNFOLD:Tagged] Waiting for value from '.{}' (new_sub={})", alias_part_log, is_new);
                                         let value = subscription.next().await;
                                         if let Some(ref v) = value {
                                             let type_name = match v {
@@ -1637,7 +1936,9 @@ impl VariableOrArgumentReference {
                                                 Value::List(_, _) => "List",
                                                 Value::Flushed(_, _) => "Flushed",
                                             };
-                                            let _ = (&alias_part_log, type_name);  // Used for debugging
+                                            zoon::println!("[ALIAS_UNFOLD:Tagged] Got value from '.{}': {}", alias_part_log, type_name);
+                                        } else {
+                                            zoon::println!("[ALIAS_UNFOLD:Tagged] '.{}' subscription ended (None)", alias_part_log);
                                         }
                                         value.map(|value| (value, (Some(subscription), None, tagged_object, variable)))
                                     }
@@ -1650,7 +1951,7 @@ impl VariableOrArgumentReference {
                         other.construct_info()
                     ),
                 }
-            }).boxed_local();
+            });
         }
         // Subscription-based streams are infinite (subscriptions never terminate first)
         Arc::new(ValueActor::new(
@@ -1874,6 +2175,154 @@ impl LinkConnector {
         link_receiver
             .await
             .expect("Failed to get link sender from LinkConnector")
+    }
+}
+
+// --- LinkActorRegistry ---
+
+/// Composite key for LinkActorRegistry that combines persistence_id with an optional prefix.
+/// The prefix comes from List/map evaluation context, making LINKs unique per list item.
+/// Without the prefix, all LINKs from the same source position would share the same registry entry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LinkRegistryKey {
+    pub prefix: Option<String>,
+    pub persistence_id: parser::PersistenceId,
+}
+
+impl LinkRegistryKey {
+    pub fn new(prefix: Option<String>, persistence_id: parser::PersistenceId) -> Self {
+        Self { prefix, persistence_id }
+    }
+}
+
+/// Registry for sharing LINK value_actors by persistence_id.
+/// When multiple LINK variables are created with the same persistence_id
+/// (e.g., during WHILE re-renders), they share the same value_actor.
+/// This ensures events sent to any LINK sender reach the same subscribers.
+pub struct LinkActorRegistry {
+    insert_sender: mpsc::UnboundedSender<(
+        LinkRegistryKey,
+        mpsc::UnboundedSender<Value>,
+        Arc<ValueActor>,
+    )>,
+    get_sender: mpsc::UnboundedSender<(
+        LinkRegistryKey,
+        oneshot::Sender<Option<(mpsc::UnboundedSender<Value>, Arc<ValueActor>)>>,
+    )>,
+    subscribe_sender: mpsc::UnboundedSender<(
+        LinkRegistryKey,
+        mpsc::UnboundedSender<mpsc::UnboundedSender<Value>>,
+    )>,
+    actor_loop: ActorLoop,
+}
+
+impl LinkActorRegistry {
+    pub fn new() -> Self {
+        let (insert_sender, mut insert_receiver) = mpsc::unbounded();
+        let (get_sender, mut get_receiver) = mpsc::unbounded();
+        let (subscribe_sender, mut subscribe_receiver) = mpsc::unbounded::<(
+            LinkRegistryKey,
+            mpsc::UnboundedSender<mpsc::UnboundedSender<Value>>,
+        )>();
+
+        Self {
+            insert_sender,
+            get_sender,
+            subscribe_sender,
+            actor_loop: ActorLoop::new(async move {
+                let mut registry = HashMap::<
+                    LinkRegistryKey,
+                    (mpsc::UnboundedSender<Value>, Arc<ValueActor>),
+                >::new();
+                // Subscribers waiting for sender updates
+                let mut subscribers = HashMap::<
+                    LinkRegistryKey,
+                    Vec<mpsc::UnboundedSender<mpsc::UnboundedSender<Value>>>,
+                >::new();
+
+                loop {
+                    select! {
+                        result = insert_receiver.next() => {
+                            match result {
+                                Some((registry_key, sender, value_actor)) => {
+                                    zoon::println!("[REGISTRY] Registering LINK with key: {:?}", registry_key);
+                                    // Notify subscribers of new sender
+                                    if let Some(subs) = subscribers.get_mut(&registry_key) {
+                                        let sub_count = subs.len();
+                                        subs.retain(|sub| sub.unbounded_send(sender.clone()).is_ok());
+                                        zoon::println!("[REGISTRY] Notified {}/{} subscribers for key: {:?}", subs.len(), sub_count, registry_key);
+                                    } else {
+                                        zoon::println!("[REGISTRY] No subscribers yet for key: {:?}", registry_key);
+                                    }
+                                    registry.insert(registry_key, (sender, value_actor));
+                                }
+                                None => break,
+                            }
+                        }
+                        result = get_receiver.next() => {
+                            match result {
+                                Some((registry_key, reply)) => {
+                                    let entry = registry.get(&registry_key).cloned();
+                                    let _ = reply.send(entry);
+                                }
+                                None => break,
+                            }
+                        }
+                        result = subscribe_receiver.next() => {
+                            match result {
+                                Some((registry_key, sender_channel)) => {
+                                    zoon::println!("[REGISTRY] Subscribe request for key: {:?}", registry_key);
+                                    // Send current sender if exists
+                                    if let Some((sender, _)) = registry.get(&registry_key) {
+                                        let _ = sender_channel.unbounded_send(sender.clone());
+                                        zoon::println!("[REGISTRY] Sent existing sender to new subscriber for key: {:?}", registry_key);
+                                    } else {
+                                        zoon::println!("[REGISTRY] No existing sender for key: {:?}", registry_key);
+                                    }
+                                    // Add to subscribers for future updates
+                                    subscribers.entry(registry_key.clone()).or_default().push(sender_channel);
+                                    zoon::println!("[REGISTRY] Now have {} subscribers for key: {:?}", subscribers.get(&registry_key).map(|v| v.len()).unwrap_or(0), registry_key);
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                }
+                drop(registry);
+                drop(subscribers);
+                if LOG_DROPS_AND_LOOP_ENDS {
+                    println!("LinkActorRegistry loop ended");
+                }
+            }),
+        }
+    }
+
+    /// Register a LINK's sender and value_actor by registry key.
+    pub fn register(
+        &self,
+        key: LinkRegistryKey,
+        sender: mpsc::UnboundedSender<Value>,
+        value_actor: Arc<ValueActor>,
+    ) {
+        let _ = self.insert_sender.unbounded_send((key, sender, value_actor));
+    }
+
+    /// Get an existing LINK's sender and value_actor by registry key, if it exists.
+    pub async fn get(
+        &self,
+        key: LinkRegistryKey,
+    ) -> Option<(mpsc::UnboundedSender<Value>, Arc<ValueActor>)> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        let _ = self.get_sender.unbounded_send((key, reply_sender));
+        reply_receiver.await.ok().flatten()
+    }
+
+    /// Subscribe to sender updates for a given registry key.
+    /// Returns a stream that emits the current sender (if any) and any future updates.
+    pub fn subscribe_senders(&self, key: LinkRegistryKey) -> mpsc::UnboundedReceiver<mpsc::UnboundedSender<Value>> {
+        let (sender_channel, receiver) = mpsc::unbounded();
+        let _ = self.subscribe_sender.unbounded_send((key, sender_channel));
+        receiver
     }
 }
 
@@ -2143,6 +2592,13 @@ impl ThenCombinator {
                     let skip_value = state
                         .observed_idempotency_key
                         .is_some_and(|key| key == idempotency_key);
+
+                    // DEBUG: Log idempotency key comparison for THEN
+                    zoon::println!("[THEN:idem] incoming_key={:?}, stored_key={:?}, skip={}",
+                        idempotency_key,
+                        state.observed_idempotency_key,
+                        skip_value);
+
                     if !skip_value {
                         state.observed_idempotency_key = Some(idempotency_key);
                     }
@@ -2782,6 +3238,10 @@ pub struct ValueActor {
     /// Used by stored_value() and snapshot() to get current value.
     stored_value_query_sender: mpsc::UnboundedSender<StoredValueQuery>,
 
+    /// Signal that fires when actor has processed at least one value.
+    /// Used by stream() to wait for initial value instead of arbitrary yields.
+    ready_signal: Shared<oneshot::Receiver<()>>,
+
     /// The actor's internal loop.
     actor_loop: ActorLoop,
 
@@ -2844,6 +3304,10 @@ impl ValueActor {
         // Unbounded channel for stored value queries
         let (stored_value_query_sender, stored_value_query_receiver) = mpsc::unbounded::<StoredValueQuery>();
 
+        // Oneshot channel for ready signal - fires when first value is processed
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        let ready_signal = ready_rx.shared();
+
         let boxed_stream: std::pin::Pin<Box<dyn Stream<Item = Value>>> =
             Box::pin(value_stream.inner);
 
@@ -2853,6 +3317,7 @@ impl ValueActor {
             let output_valve_signal = actor_context.output_valve_signal;
             // Keep inputs alive in the spawned task
             let _inputs = inputs.clone();
+            let actor_instance_id = ACTOR_INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             async move {
                 // Actor-local state (no Mutex needed!)
@@ -2860,6 +3325,8 @@ impl ValueActor {
                 let mut subscribers: Vec<mpsc::Sender<Value>> = Vec::new();
                 let mut stream_ever_produced = false;
                 let mut stream_ended = false;
+                // Ready signal sender - consumed on first value
+                let mut ready_tx = Some(ready_tx);
 
                 let mut output_valve_impulse_stream =
                     if let Some(output_valve_signal) = &output_valve_signal {
@@ -2899,6 +3366,10 @@ impl ValueActor {
 
                                     // Add to live subscribers list
                                     subscribers.push(tx);
+                                    if construct_info.description.contains("Link") || construct_info.description.contains("click") {
+                                        zoon::println!("[SUBSCRIBE:inst#{}] Added sender, count now: {} for: {}",
+                                            actor_instance_id, subscribers.len(), construct_info.description);
+                                    }
 
                                     // Reply with the receiver
                                     let _ = reply.send(rx);
@@ -2909,7 +3380,10 @@ impl ValueActor {
                         // Handle direct value storage (from store_value_directly)
                         value = direct_store_receiver.next() => {
                             if let Some(value) = value {
-                                stream_ever_produced = true;
+                                if !stream_ever_produced {
+                                    stream_ever_produced = true;
+                                    if let Some(tx) = ready_tx.take() { let _ = tx.send(()); }
+                                }
                                 let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                 value_history.add(new_version, value.clone());
 
@@ -2937,7 +3411,10 @@ impl ValueActor {
                             match msg {
                                 ActorMessage::StreamValue(value) => {
                                     // Value received from migration source
-                                    stream_ever_produced = true;
+                                    if !stream_ever_produced {
+                                        stream_ever_produced = true;
+                                        if let Some(tx) = ready_tx.take() { let _ = tx.send(()); }
+                                    }
                                     let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                     value_history.add(new_version, value.clone());
 
@@ -2988,14 +3465,22 @@ impl ValueActor {
                                 continue;
                             };
 
-                            stream_ever_produced = true;
+                            if !stream_ever_produced {
+                                stream_ever_produced = true;
+                                if let Some(tx) = ready_tx.take() { let _ = tx.send(()); }
+                            }
                             let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                             value_history.add(new_version, new_value.clone());
 
                             // Push value to all subscribers
+                            let sub_count_before = subscribers.len();
                             subscribers.retain_mut(|tx| {
                                 tx.try_send(new_value.clone()).is_ok()
                             });
+                            if construct_info.description.contains("Link") || construct_info.description.contains("click") {
+                                zoon::println!("[VALUE_ACTOR:inst#{}] Pushed to {}/{} subscribers: {}",
+                                    actor_instance_id, subscribers.len(), sub_count_before, construct_info.description);
+                            }
 
                             // Handle migration forwarding
                             if let MigrationState::Migrating { buffered_writes, target, .. } = &mut migration_state {
@@ -3031,6 +3516,7 @@ impl ValueActor {
             subscription_sender,
             direct_store_sender,
             stored_value_query_sender,
+            ready_signal,
             actor_loop,
             lazy_delegate: None,
             extra_loops: Vec::new(),
@@ -3103,6 +3589,11 @@ impl ValueActor {
         let (direct_store_sender, _direct_store_receiver) = mpsc::unbounded::<Value>();
         let (stored_value_query_sender, _stored_value_query_receiver) = mpsc::unbounded::<StoredValueQuery>();
 
+        // Dummy ready signal (lazy actors bypass it in stream())
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        drop(ready_tx); // Won't be used
+        let ready_signal = ready_rx.shared();
+
         // Create a no-op task (the lazy delegate owns the real processing)
         let actor_loop = ActorLoop::new(async {});
 
@@ -3115,6 +3606,7 @@ impl ValueActor {
             subscription_sender,
             direct_store_sender,
             stored_value_query_sender,
+            ready_signal,
             actor_loop,
             lazy_delegate: Some(lazy_actor),
             extra_loops: Vec::new(),
@@ -3146,6 +3638,11 @@ impl ValueActor {
         let (subscription_sender, subscription_receiver) = mpsc::unbounded::<SubscriptionRequest>();
         let (direct_store_sender, direct_store_receiver) = mpsc::unbounded::<Value>();
         let (stored_value_query_sender, stored_value_query_receiver) = mpsc::unbounded::<StoredValueQuery>();
+
+        // Oneshot channel for ready signal - immediately fire since we have initial value
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        let _ = ready_tx.send(()); // Fire immediately
+        let ready_signal = ready_rx.shared();
 
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
@@ -3179,6 +3676,10 @@ impl ValueActor {
                 let migration_state = MigrationState::Normal;
 
                 loop {
+                    // Check if this is a click-related actor (for debug logging)
+                    let construct_str = construct_info.to_string();
+                    let is_click_related = construct_str.contains("click") || construct_str.contains("checkbox");
+
                     select! {
                         req = subscription_receiver.next() => {
                             if let Some(SubscriptionRequest { reply, starting_version }) = req {
@@ -3192,6 +3693,8 @@ impl ValueActor {
                                         let _ = tx.try_send(value.clone());
                                     }
                                     subscribers.push(tx);
+                                    zoon::println!("[SUBSCRIBE:Lazy] Added sender, count now: {} for: {}",
+                                        subscribers.len(), construct_str);
                                     let _ = reply.send(rx);
                                 }
                             }
@@ -3238,7 +3741,18 @@ impl ValueActor {
                             stream_ever_produced = true;
                             let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                             value_history.add(new_version, new_value.clone());
+
+                            // Debug logging for click-related actors
+                            let construct_str = construct_info.to_string();
+                            let is_click_related = construct_str.contains("click") || construct_str.contains("checkbox");
+                            let sub_count_before = subscribers.len();
+
                             subscribers.retain_mut(|tx| tx.try_send(new_value.clone()).is_ok());
+
+                            if is_click_related {
+                                zoon::println!("[BROADCAST] {} -> {} subscribers before, {} after",
+                                    construct_str, sub_count_before, subscribers.len());
+                            }
                         }
 
                         impulse = output_valve_impulse_stream.next() => {
@@ -3264,6 +3778,7 @@ impl ValueActor {
             subscription_sender,
             direct_store_sender,
             stored_value_query_sender,
+            ready_signal,
             actor_loop,
             lazy_delegate: None,
             extra_loops: Vec::new(),
@@ -3386,6 +3901,11 @@ impl ValueActor {
         let (direct_store_sender, direct_store_receiver) = mpsc::unbounded::<Value>();
         let (stored_value_query_sender, stored_value_query_receiver) = mpsc::unbounded::<StoredValueQuery>();
 
+        // Oneshot channel for ready signal - immediately fire since we have initial value
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        let _ = ready_tx.send(()); // Fire immediately
+        let ready_signal = ready_rx.shared();
+
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
             let current_version = current_version.clone();
@@ -3435,6 +3955,8 @@ impl ValueActor {
                                         let _ = tx.try_send(value.clone());
                                     }
                                     subscribers.push(tx);
+                                    zoon::println!("[SUBSCRIBE:InitVal] Added sender, count now: {} for: {} (id: {:?})",
+                                        subscribers.len(), construct_info.description, construct_info.id);
                                     let _ = reply.send(rx);
                                 }
                             }
@@ -3444,7 +3966,12 @@ impl ValueActor {
                             if let Some(value) = value {
                                 let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                 value_history.add(new_version, value.clone());
+                                let sub_count_before = subscribers.len();
                                 subscribers.retain_mut(|tx| tx.try_send(value.clone()).is_ok());
+                                if sub_count_before > 0 || construct_info.description.contains("click") {
+                                    zoon::println!("[VALUE_ACTOR:InitVal] Pushed to {}/{} subscribers: {} (id: {:?})",
+                                        subscribers.len(), sub_count_before, construct_info.description, construct_info.id);
+                                }
                             }
                         }
 
@@ -3491,6 +4018,7 @@ impl ValueActor {
             subscription_sender,
             direct_store_sender,
             stored_value_query_sender,
+            ready_signal,
             actor_loop,
             lazy_delegate: None,
             extra_loops: Vec::new(),
@@ -3507,70 +4035,18 @@ impl ValueActor {
         }
     }
 
-    /// Subscribe to this actor's values (async).
-    ///
-    /// This async method registers with the actor loop and returns a stream of values.
-    /// The actor loop will push all historical values followed by live updates.
-    ///
-    /// Takes ownership of the Arc to keep the actor alive for the subscription lifetime.
-    /// Callers should use `.clone().subscribe().await` if they need to retain a reference.
-    pub async fn subscribe(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        // Handle lazy actors
-        if let Some(ref lazy_delegate) = self.lazy_delegate {
-            return lazy_delegate.clone().subscribe().boxed_local();
-        }
-
-        // Yield control once to allow the actor's loop to start
-        use std::task::Poll;
-        let mut yielded = false;
-        std::future::poll_fn(|cx| {
-            if yielded {
-                Poll::Ready(())
-            } else {
-                yielded = true;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }).await;
-
-        // Send subscription request to actor loop
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if let Err(e) = self.subscription_sender.unbounded_send(SubscriptionRequest {
-            reply: reply_tx,
-            starting_version: 0,
-        }) {
-            eprintln!("Failed to subscribe: actor dropped: {e:#}");
-            // Return empty stream
-            return stream::empty().boxed_local();
-        }
-
-        // Wait for the receiver from actor loop
-        match reply_rx.await {
-            Ok(receiver) => {
-                PushSubscription {
-                    receiver,
-                    _actor: self,
-                }.boxed_local()
-            }
-            Err(_) => {
-                eprintln!("Failed to subscribe: actor dropped before reply");
-                stream::empty().boxed_local()
-            }
-        }
-    }
-
     /// Check if this actor has a lazy delegate.
     pub fn has_lazy_delegate(&self) -> bool {
         self.lazy_delegate.is_some()
     }
 
-    // === New Type-Safe Subscription API ===
+    // === Clean Subscription API ===
     //
-    // These methods replace the confusing subscribe_*() family with type-distinct return values:
-    // - snapshot() returns Future<Option<Value>> - exactly ONE value, can't be misused
+    // Primary methods for getting values:
+    // - snapshot() returns Future<Option<Value>> - exactly ONE value
     // - stream() returns Stream<Item=Value> - continuous updates
     //
-    // The return type itself enforces correct usage - no more needing .take(1) externally.
+    // Deprecated wrappers are provided for incremental migration.
 
     /// Get exactly ONE value - the current snapshot.
     ///
@@ -3586,9 +4062,9 @@ impl ValueActor {
         if self.version() > 0 {
             return self.stored_value().await;
         }
-        // Otherwise subscribe and wait for first value
-        let mut stream = self.subscribe().await;
-        stream.next().await
+        // Otherwise stream and wait for first value
+        let mut s = self.stream().await;
+        s.next().await
     }
 
     /// Subscribe to continuous stream of all values from version 0 (async).
@@ -3596,34 +4072,62 @@ impl ValueActor {
     /// Use this for WHILE bodies, LATEST inputs, and reactive bindings where you
     /// need continuous updates.
     ///
-    /// This is an alias for the existing `subscribe()` method - same behavior,
-    /// clearer name that contrasts with `snapshot()`.
+    /// Takes ownership of the Arc to keep the actor alive for the subscription lifetime.
+    /// Callers should use `.clone().stream().await` if they need to retain a reference.
     pub async fn stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        self.subscribe().await
+        // Handle lazy actors
+        if let Some(ref lazy_delegate) = self.lazy_delegate {
+            return lazy_delegate.clone().subscribe().boxed_local();
+        }
+
+        // Wait for actor to be ready (has processed at least one value).
+        // This ensures constant() values are in value_history before we subscribe.
+        // The ready_signal fires when the actor loop processes its first value.
+        if self.version() == 0 {
+            // Clone the shared future and await it - ignoring errors (sender dropped means actor dead)
+            let _ = self.ready_signal.clone().await;
+        }
+
+        // Send subscription request to actor loop
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if let Err(e) = self.subscription_sender.unbounded_send(SubscriptionRequest {
+            reply: reply_tx,
+            starting_version: 0,
+        }) {
+            eprintln!("Failed to stream: actor dropped: {e:#}");
+            // Return empty stream
+            return stream::empty().boxed_local();
+        }
+
+        // Wait for the receiver from actor loop
+        match reply_rx.await {
+            Ok(receiver) => {
+                PushSubscription::new(receiver, self).boxed_local()
+            }
+            Err(_) => {
+                eprintln!("Failed to stream: actor dropped before reply");
+                stream::empty().boxed_local()
+            }
+        }
     }
 
-    /// Subscribe stream with synchronous wrapper (for use in sync contexts).
-    ///
-    /// This wraps the async `subscribe()` in a stream that performs the async
-    /// subscription lazily when first polled. Use this when you need a Stream
-    /// but are in a sync context that returns `impl Stream`.
-    ///
-    /// Example:
-    /// ```ignore
-    /// // Instead of:
-    /// stream::once(async move { actor.subscribe().await }).flatten()
-    /// // Use:
-    /// actor.subscribe_stream()
-    /// ```
+    // === Deprecated Wrappers ===
+    // These are provided for incremental migration. Use stream() instead.
+
+    /// Deprecated: Use `stream()` instead.
+    #[deprecated(since = "0.2.0", note = "Use stream() instead")]
+    pub async fn subscribe(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        self.stream().await
+    }
+
+    /// Deprecated: Use `stream::once(async move { actor.stream().await }).flatten()` instead.
+    #[deprecated(since = "0.2.0", note = "Use stream::once(async move { actor.stream().await }).flatten() instead")]
     pub fn subscribe_stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        stream::once(async move { self.subscribe().await }).flatten().boxed_local()
+        stream::once(async move { self.stream().await }).flatten().boxed_local()
     }
 
-    /// Stream with synchronous wrapper (for use in sync contexts).
-    ///
-    /// This wraps the async `stream()` in a stream that performs the async
-    /// subscription lazily when first polled. Use this when you need a Stream
-    /// but are in a sync context that returns `impl Stream`.
+    /// Deprecated: Use `stream::once(async move { actor.stream().await }).flatten()` instead.
+    #[deprecated(since = "0.2.0", note = "Use stream::once(async move { actor.stream().await }).flatten() instead")]
     pub fn stream_stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
         stream::once(async move { self.stream().await }).flatten().boxed_local()
     }
@@ -5696,6 +6200,7 @@ pub struct ListBindingConfig {
 pub enum ListBindingOperation {
     Map,
     Retain,
+    Remove,
     Every,
     Any,
     SortBy,
@@ -5793,6 +6298,16 @@ impl ListBindingFunction {
         source_list_actor: Arc<ValueActor>,
         config: ListBindingConfig,
     ) -> Arc<ValueActor> {
+        let op_name = match config.operation {
+            ListBindingOperation::Map => "Map",
+            ListBindingOperation::Retain => "Retain",
+            ListBindingOperation::Remove => "Remove",
+            ListBindingOperation::Every => "Every",
+            ListBindingOperation::Any => "Any",
+            ListBindingOperation::SortBy => "SortBy",
+        };
+        zoon::println!("[LIST_BINDING] new_arc_value_actor called: binding='{}', operation={}, source={}",
+            config.binding_name, op_name, source_list_actor.construct_info);
         let construct_info = construct_info.complete(ConstructType::FunctionCall);
         let config = Arc::new(config);
 
@@ -5808,6 +6323,15 @@ impl ListBindingFunction {
             }
             ListBindingOperation::Retain => {
                 Self::create_retain_actor(
+                    construct_info,
+                    construct_context,
+                    actor_context,
+                    source_list_actor,
+                    config,
+                )
+            }
+            ListBindingOperation::Remove => {
+                Self::create_remove_actor(
                     construct_info,
                     construct_context,
                     actor_context,
@@ -5855,23 +6379,79 @@ impl ListBindingFunction {
         source_list_actor: Arc<ValueActor>,
         config: Arc<ListBindingConfig>,
     ) -> Arc<ValueActor> {
+        zoon::println!("[LIST_MAP] create_map_actor: binding='{}', source={}",
+            config.binding_name, source_list_actor.construct_info);
+
         let config_for_stream = config.clone();
         let construct_context_for_stream = construct_context.clone();
         let actor_context_for_stream = actor_context.clone();
 
-        // subscribe_stream() now yields automatically, ensuring source actor's loop has started
-        let change_stream = source_list_actor.clone().subscribe_stream()
-        .filter_map(move |value| {
-            future::ready(match value {
-                Value::List(list, _) => Some(list),
-                _ => None,
+        // Use switch_map for proper list replacement handling:
+        // When source emits a new list, cancel old subscription and start fresh.
+        // But filter out re-emissions of the same list by ID to avoid cancelling
+        // LINK connections unnecessarily.
+        let binding_name_for_filter_log = config.binding_name.clone();
+        let binding_name_for_dedup_log = config.binding_name.clone();
+        let change_stream = switch_map(
+            source_list_actor.clone().subscribe_stream()
+            .inspect(move |value| {
+                let value_type = match value {
+                    Value::List(_, _) => "List",
+                    Value::Object(_, _) => "Object",
+                    Value::TaggedObject(_, _) => "TaggedObject",
+                    Value::Text(_, _) => "Text",
+                    Value::Tag(_, _) => "Tag",
+                    Value::Number(_, _) => "Number",
+                    Value::Flushed(_, _) => "Flushed",
+                };
+                zoon::println!("[LIST_MAP] source emitted value for binding='{}': {}",
+                    binding_name_for_filter_log, value_type);
             })
-        }).flat_map(move |list| {
+            .filter_map(move |value| {
+                future::ready(match value {
+                    Value::List(list, _) => Some(list),
+                    _ => None,
+                })
+            })
+            // Deduplicate by list ID - only emit when we see a genuinely new list
+            .scan(None, move |prev_id: &mut Option<ConstructId>, list| {
+                let list_id = list.construct_info.id.clone();
+                if prev_id.as_ref() == Some(&list_id) {
+                    // Same list re-emitted, skip to avoid cancelling LINK connections
+                    zoon::println!("[LIST_MAP] skipping duplicate list for binding='{}', id={:?}",
+                        binding_name_for_dedup_log, list_id);
+                    future::ready(Some(None))
+                } else {
+                    zoon::println!("[LIST_MAP] new list for binding='{}', id={:?} (prev={:?})",
+                        binding_name_for_dedup_log, list_id, prev_id);
+                    *prev_id = Some(list_id);
+                    future::ready(Some(Some(list)))
+                }
+            })
+            .filter_map(future::ready),
+            move |list| {
             let config = config_for_stream.clone();
             let construct_context = construct_context_for_stream.clone();
             let actor_context = actor_context_for_stream.clone();
+            let binding_for_log = config.binding_name.clone();
+            let list_info = list.construct_info.to_string();
+            zoon::println!("[LIST_MAP] flat_map received new List for binding='{}': {}",
+                binding_for_log, list_info);
 
             list.subscribe().map(move |change| {
+                let change_type = match &change {
+                    ListChange::Replace { items } => format!("Replace({} items)", items.len()),
+                    ListChange::Push { .. } => "Push".to_string(),
+                    ListChange::Pop => "Pop".to_string(),
+                    ListChange::InsertAt { index, .. } => format!("InsertAt({})", index),
+                    ListChange::RemoveAt { index } => format!("RemoveAt({})", index),
+                    ListChange::UpdateAt { index, .. } => format!("UpdateAt({})", index),
+                    ListChange::Clear => "Clear".to_string(),
+                    ListChange::Move { old_index, new_index } => format!("Move({} -> {})", old_index, new_index),
+                };
+                zoon::println!("[LIST_MAP] received change '{}' for binding='{}', source={}",
+                    change_type, binding_for_log, list_info);
+
                 Self::transform_list_change_for_map(
                     change,
                     &config,
@@ -5918,20 +6498,30 @@ impl ListBindingFunction {
         let actor_context_for_list = actor_context.clone();
         let actor_context_for_result = actor_context.clone();
 
-        // Use stream::unfold for better control over state and merged streams
-        let value_stream = source_list_actor.clone().subscribe_stream().filter_map(|value| {
-            future::ready(match value {
-                Value::List(list, _) => Some(list),
-                _ => None,
+        // Use switch_map for proper list replacement handling:
+        // When source emits a new list, cancel old subscription and start fresh.
+        // But filter out re-emissions of the same list by ID to avoid cancelling
+        // subscriptions unnecessarily.
+        let value_stream = switch_map(
+            source_list_actor.clone().subscribe_stream().filter_map(|value| {
+                future::ready(match value {
+                    Value::List(list, _) => Some(list),
+                    _ => None,
+                })
             })
-        }).scan(false, |seen, list| {
-            if *seen {
-                future::ready(Some(None))
-            } else {
-                *seen = true;
-                future::ready(Some(Some(list)))
-            }
-        }).filter_map(future::ready).flat_map(move |list| {
+            // Deduplicate by list ID - only emit when we see a genuinely new list
+            .scan(None, |prev_id: &mut Option<ConstructId>, list| {
+                let list_id = list.construct_info.id.clone();
+                if prev_id.as_ref() == Some(&list_id) {
+                    // Same list re-emitted, skip
+                    future::ready(Some(None))
+                } else {
+                    *prev_id = Some(list_id);
+                    future::ready(Some(Some(list)))
+                }
+            })
+            .filter_map(future::ready),
+            move |list| {
             let config = config.clone();
             let construct_context = construct_context.clone();
             let actor_context = actor_context.clone();
@@ -6034,6 +6624,7 @@ impl ListBindingFunction {
                             }
                         }
                         RetainEvent::PredicateResult(idx, is_true) => {
+                            zoon::println!("[RETAIN] PredicateResult: idx={}, is_true={}", idx, is_true);
                             if idx < items.len() {
                                 items[idx].2 = Some(is_true);
                             }
@@ -6052,6 +6643,7 @@ impl ListBindingFunction {
                                 }
                             })
                             .collect();
+                        zoon::println!("[RETAIN] Emitting filtered list with {} items", filtered.len());
                         future::ready(Some(Some(ListChange::Replace { items: filtered })))
                     } else {
                         future::ready(Some(None))
@@ -6065,6 +6657,177 @@ impl ListBindingFunction {
                 construct_info.id.clone().with_child_id(0),
                 None,
                 "List/retain result",
+            ),
+            actor_context_for_list,
+            value_stream,
+            source_list_actor.clone(),
+        );
+
+        Arc::new(ValueActor::new(
+            construct_info,
+            actor_context_for_result,
+            constant(Value::List(
+                Arc::new(list),
+                ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+            )),
+            None,
+        ))
+    }
+
+    /// Creates a remove actor that removes items when their `when` event fires.
+    /// Unlike retain (which filters based on a boolean predicate), remove listens
+    /// to event streams and removes items when those streams emit any value.
+    fn create_remove_actor(
+        construct_info: ConstructInfoComplete,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        source_list_actor: Arc<ValueActor>,
+        config: Arc<ListBindingConfig>,
+    ) -> Arc<ValueActor> {
+        // Clone for use after the chain
+        let actor_context_for_list = actor_context.clone();
+        let actor_context_for_result = actor_context.clone();
+
+        // Use switch_map for proper list replacement handling
+        let value_stream = switch_map(
+            source_list_actor.clone().subscribe_stream().filter_map(|value| {
+                future::ready(match value {
+                    Value::List(list, _) => Some(list),
+                    _ => None,
+                })
+            })
+            // Deduplicate by list ID
+            .scan(None, |prev_id: &mut Option<ConstructId>, list| {
+                let list_id = list.construct_info.id.clone();
+                if prev_id.as_ref() == Some(&list_id) {
+                    future::ready(Some(None))
+                } else {
+                    *prev_id = Some(list_id);
+                    future::ready(Some(Some(list)))
+                }
+            })
+            .filter_map(future::ready),
+            move |list| {
+            let config = config.clone();
+            let construct_context = construct_context.clone();
+            let actor_context = actor_context.clone();
+
+            // Create channel for removal events (index of item to remove)
+            let (remove_tx, remove_rx) = mpsc::unbounded::<usize>();
+
+            // Event type for merged streams
+            enum RemoveEvent {
+                ListChange(ListChange),
+                RemoveItem(usize),
+            }
+
+            // Create list change stream
+            let list_changes = list.clone().subscribe().map(RemoveEvent::ListChange);
+
+            // Create removal event stream
+            let removal_events = remove_rx.map(RemoveEvent::RemoveItem);
+
+            // Merge list changes and removal events
+            stream::select(list_changes, removal_events).scan(
+                (
+                    Vec::<(usize, Arc<ValueActor>, Arc<ValueActor>, bool, Option<TaskHandle>)>::new(), // (original_idx, item, when_actor, removed, task_handle)
+                    remove_tx,
+                    config.clone(),
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    0usize, // next_idx for assigning unique IDs
+                ),
+                move |state, event| {
+                    let (items, remove_tx, config, construct_context, actor_context, next_idx) = state;
+
+                    match event {
+                        RemoveEvent::ListChange(change) => {
+                            match change {
+                                ListChange::Replace { items: new_items } => {
+                                    // Reset and rebuild
+                                    *next_idx = 0;
+                                    *items = new_items.iter().map(|item| {
+                                        let idx = *next_idx;
+                                        *next_idx += 1;
+                                        let when_actor = Self::transform_item(
+                                            item.clone(),
+                                            config,
+                                            construct_context.clone(),
+                                            actor_context.clone(),
+                                        );
+                                        // Spawn task to listen for `when` event
+                                        let tx = remove_tx.clone();
+                                        let when_clone = when_actor.clone();
+                                        let task_handle = Task::start_droppable(async move {
+                                            let mut stream = when_clone.subscribe_stream();
+                                            // Wait for ANY emission - that triggers removal
+                                            if stream.next().await.is_some() {
+                                                let _ = tx.unbounded_send(idx);
+                                            }
+                                        });
+                                        (idx, item.clone(), when_actor, false, Some(task_handle))
+                                    }).collect();
+                                }
+                                ListChange::Push { item } => {
+                                    let idx = *next_idx;
+                                    *next_idx += 1;
+                                    let when_actor = Self::transform_item(
+                                        item.clone(),
+                                        config,
+                                        construct_context.clone(),
+                                        actor_context.clone(),
+                                    );
+                                    // Spawn task to listen for `when` event
+                                    let tx = remove_tx.clone();
+                                    let when_clone = when_actor.clone();
+                                    let task_handle = Task::start_droppable(async move {
+                                        let mut stream = when_clone.subscribe_stream();
+                                        if stream.next().await.is_some() {
+                                            let _ = tx.unbounded_send(idx);
+                                        }
+                                    });
+                                    items.push((idx, item, when_actor, false, Some(task_handle)));
+                                }
+                                ListChange::Clear => {
+                                    items.clear();
+                                    *next_idx = 0;
+                                }
+                                ListChange::Pop => {
+                                    items.pop();
+                                }
+                                _ => {}
+                            }
+                            // Emit current list state (all non-removed items)
+                            let current: Vec<Arc<ValueActor>> = items.iter()
+                                .filter(|(_, _, _, removed, _)| !removed)
+                                .map(|(_, item, _, _, _)| item.clone())
+                                .collect();
+                            future::ready(Some(Some(ListChange::Replace { items: current })))
+                        }
+                        RemoveEvent::RemoveItem(idx) => {
+                            zoon::println!("[REMOVE] RemoveItem event for idx={}", idx);
+                            // Mark the item as removed
+                            if let Some(item_entry) = items.iter_mut().find(|(i, _, _, _, _)| *i == idx) {
+                                item_entry.3 = true; // Mark as removed
+                            }
+                            // Emit updated list without removed items
+                            let remaining: Vec<Arc<ValueActor>> = items.iter()
+                                .filter(|(_, _, _, removed, _)| !removed)
+                                .map(|(_, item, _, _, _)| item.clone())
+                                .collect();
+                            zoon::println!("[REMOVE] Emitting list with {} remaining items", remaining.len());
+                            future::ready(Some(Some(ListChange::Replace { items: remaining })))
+                        }
+                    }
+                }
+            ).filter_map(future::ready)
+        });
+
+        let list = List::new_with_change_stream(
+            ConstructInfo::new(
+                construct_info.id.clone().with_child_id(0),
+                None,
+                "List/remove result",
             ),
             actor_context_for_list,
             value_stream,
@@ -6096,21 +6859,30 @@ impl ListBindingFunction {
         // Clone for use after the flat_map chain
         let actor_context_for_result = actor_context.clone();
 
-        // subscribe_stream() yields automatically, ensuring source actor's loop has started
-        // Use scan with flag to only process the first List value while keeping stream alive
-        let value_stream = source_list_actor.clone().subscribe_stream().filter_map(|value| {
-            future::ready(match value {
-                Value::List(list, _) => Some(list),
-                _ => None,
+        // Use switch_map for proper list replacement handling:
+        // When source emits a new list, cancel old subscription and start fresh.
+        // But filter out re-emissions of the same list by ID to avoid cancelling
+        // subscriptions unnecessarily.
+        let value_stream = switch_map(
+            source_list_actor.clone().subscribe_stream().filter_map(|value| {
+                future::ready(match value {
+                    Value::List(list, _) => Some(list),
+                    _ => None,
+                })
             })
-        }).scan(false, |seen, list| {
-            if *seen {
-                future::ready(Some(None))
-            } else {
-                *seen = true;
-                future::ready(Some(Some(list)))
-            }
-        }).filter_map(future::ready).flat_map(move |list| {
+            // Deduplicate by list ID - only emit when we see a genuinely new list
+            .scan(None, |prev_id: &mut Option<ConstructId>, list| {
+                let list_id = list.construct_info.id.clone();
+                if prev_id.as_ref() == Some(&list_id) {
+                    // Same list re-emitted, skip
+                    future::ready(Some(None))
+                } else {
+                    *prev_id = Some(list_id);
+                    future::ready(Some(Some(list)))
+                }
+            })
+            .filter_map(future::ready),
+            move |list| {
             let config = config.clone();
             let construct_context = construct_context.clone();
             let actor_context = actor_context.clone();
@@ -6261,20 +7033,30 @@ impl ListBindingFunction {
         // 1. Subscribes to source list changes (subscribe_stream() yields automatically)
         // 2. For each item, evaluates key expression and subscribes to its changes
         // 3. When list or any key changes, emits sorted Replace
-        // Use scan with flag to only process the first List value while keeping stream alive
-        let value_stream = source_list_actor.clone().subscribe_stream().filter_map(|value| {
-            future::ready(match value {
-                Value::List(list, _) => Some(list),
-                _ => None,
+        // Use switch_map for proper list replacement handling:
+        // When source emits a new list, cancel old subscription and start fresh.
+        // But filter out re-emissions of the same list by ID to avoid cancelling
+        // subscriptions unnecessarily.
+        let value_stream = switch_map(
+            source_list_actor.clone().subscribe_stream().filter_map(|value| {
+                future::ready(match value {
+                    Value::List(list, _) => Some(list),
+                    _ => None,
+                })
             })
-        }).scan(false, |seen, list| {
-            if *seen {
-                future::ready(Some(None))
-            } else {
-                *seen = true;
-                future::ready(Some(Some(list)))
-            }
-        }).filter_map(future::ready).flat_map(move |list| {
+            // Deduplicate by list ID - only emit when we see a genuinely new list
+            .scan(None, |prev_id: &mut Option<ConstructId>, list| {
+                let list_id = list.construct_info.id.clone();
+                if prev_id.as_ref() == Some(&list_id) {
+                    // Same list re-emitted, skip
+                    future::ready(Some(None))
+                } else {
+                    *prev_id = Some(list_id);
+                    future::ready(Some(Some(list)))
+                }
+            })
+            .filter_map(future::ready),
+            move |list| {
             let config = config.clone();
             let construct_context = construct_context.clone();
             let actor_context = actor_context.clone();
@@ -6420,15 +7202,21 @@ impl ListBindingFunction {
         construct_context: ConstructContext,
         actor_context: ActorContext,
     ) -> Arc<ValueActor> {
+        zoon::println!("[LIST_MAP] transform_item called for binding '{}'", config.binding_name);
+
         // Create a new ActorContext with the binding variable set
         let binding_name = config.binding_name.to_string();
         let mut new_params = actor_context.parameters.clone();
 
         new_params.insert(binding_name.clone(), item_actor.clone());
 
+        // Use with_child_scope to create a properly isolated scope for this list item
+        // This ensures LINKs inside the transform expression have unique persistence IDs
+        // per item, preventing cross-item contamination when List/map is used.
+        let scope_id = format!("{:?}", item_actor.construct_info.id);
         let new_actor_context = ActorContext {
             parameters: new_params,
-            ..actor_context
+            ..actor_context.with_child_scope(&scope_id)
         };
 
         // Evaluate the transform expression with the binding in scope

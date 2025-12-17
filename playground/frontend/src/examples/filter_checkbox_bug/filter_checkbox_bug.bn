@@ -1,0 +1,123 @@
+-- Minimal reproduction: Checkbox toggle fails after filter switching
+-- Reproduction steps: Click "Active", Click "All", Click checkbox 3 times
+-- Expected: check, uncheck, check
+-- Actual: check, uncheck, FAIL
+--
+-- KEY DIFFERENCE: Uses LIST with List/map like todo_mvc
+
+store: [
+    filter_buttons: [
+        all: LINK
+        active: LINK
+    ]
+    toggle_all_checkbox: LINK
+    selected_filter: All |> HOLD state {
+        LATEST {
+            filter_buttons.all.event.press |> THEN { All }
+            filter_buttons.active.event.press |> THEN { Active }
+        }
+    }
+    -- Toggle all like in todo_mvc (for testing if LATEST is the issue)
+    toggle_all_target: toggle_all_checkbox.event.click |> THEN { True }
+    -- LIST of items like in todo_mvc
+    items: LIST {
+        create_item(name: TEXT { Item A }, toggle_all: toggle_all_target)
+        create_item(name: TEXT { Item B }, toggle_all: toggle_all_target)
+    }
+    -- List/retain causes the bug when switching WHILE arms
+    all_items: items
+    active_items: items |> List/retain(item, condition: item.checked |> Bool/not())
+]
+
+-- Pattern from todo_mvc: HOLD with LATEST, one arm for checkbox, one for toggle_all
+FUNCTION create_item(name, toggle_all) {
+    [
+        name: name
+        elements: [
+            checkbox: LINK
+        ]
+        checked: False |> HOLD state {
+            LATEST {
+                elements.checkbox.event.click |> THEN {
+                    state |> Bool/not()
+                }
+                toggle_all
+            }
+        }
+    ]
+}
+
+-- Render a single item
+FUNCTION render_item(item, view_label) {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: []
+        items: LIST {
+            Element/checkbox(
+                element: [event: [click: LINK]]
+                style: []
+                label: Hidden[text: TEXT { toggle }]
+                settings: [checked: item.checked]
+                icon: item.checked |> WHEN {
+                    True => Element/label(element: [], style: [], label: TEXT { [X] })
+                    False => Element/label(element: [], style: [], label: TEXT { [ ] })
+                }
+            ) |> LINK { item.elements.checkbox }
+
+            Element/label(element: [], style: [], label: TEXT { {item.name} ({view_label}) - checked: {item.checked} })
+        }
+    )
+}
+
+document: Document/new(root: Element/stripe(
+    element: []
+    direction: Column
+    gap: 20
+    style: [padding: 20]
+    items: LIST {
+        Element/label(element: [], style: [], label: TEXT { Filter: {store.selected_filter} })
+
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 10
+            style: []
+            items: LIST {
+                Element/button(
+                    element: [event: [press: LINK]]
+                    style: [padding: 10, background: [color: Oklch[lightness: 0.9]]]
+                    label: TEXT { All }
+                ) |> LINK { store.filter_buttons.all }
+
+                Element/button(
+                    element: [event: [press: LINK]]
+                    style: [padding: 10, background: [color: Oklch[lightness: 0.9]]]
+                    label: TEXT { Active }
+                ) |> LINK { store.filter_buttons.active }
+            }
+        )
+
+        -- WHILE that switches based on filter, using filtered lists like todo_mvc
+        store.selected_filter |> WHILE {
+            All => Element/stripe(
+                element: []
+                direction: Column
+                gap: 10
+                style: []
+                items: store.all_items |> List/map(item, new: render_item(item: item, view_label: TEXT { ALL }))
+            )
+
+            Active => Element/stripe(
+                element: []
+                direction: Column
+                gap: 10
+                style: []
+                items: store.active_items |> List/map(item, new: render_item(item: item, view_label: TEXT { ACTIVE }))
+            )
+        }
+
+        Element/label(element: [], style: [], label: TEXT { Test: Click Active, All, then checkbox 3x })
+    }
+))

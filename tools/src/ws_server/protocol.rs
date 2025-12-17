@@ -70,6 +70,12 @@ pub enum Command {
     /// Click at absolute screen coordinates
     ClickAt { x: i32, y: i32 },
 
+    /// Hover at absolute screen coordinates (move mouse without clicking)
+    HoverAt { x: i32, y: i32 },
+
+    /// Double-click at absolute screen coordinates
+    DoubleClickAt { x: i32, y: i32 },
+
     /// Clear saved states (reset localStorage for Boon playground)
     ClearStates,
 
@@ -84,6 +90,12 @@ pub enum Command {
 
     /// Get accessibility tree of preview pane
     GetAccessibilityTree,
+
+    /// Click checkbox by index in preview pane (0-indexed)
+    ClickCheckbox { index: u32 },
+
+    /// Click button by index in preview pane (0-indexed, buttons only)
+    ClickButton { index: u32 },
 }
 
 /// Response from Extension to CLI via Server

@@ -93,7 +93,7 @@ pub fn function_element_stripe(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let [_argument_element, argument_direction, argument_gap, argument_style, argument_items] =
+    let [argument_element, argument_direction, argument_gap, argument_style, argument_items] =
         arguments.as_slice() else {
             panic!("Element/stripe requires 5 arguments, got {}", arguments.len());
         };
@@ -124,6 +124,17 @@ pub fn function_element_stripe(
                 ValueIdempotencyKey::new(),
                 actor_context,
                 [
+                    Variable::new_arc(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(7),
+                            None,
+                            "Element/stripe(..) -> ElementStripe[settings: [element]]",
+                        ),
+                        construct_context.clone(),
+                        "element",
+                        argument_element.clone(),
+                        None,
+                    ),
                     Variable::new_arc(
                         ConstructInfo::new(
                             function_call_id.with_child_id(3),
@@ -189,7 +200,7 @@ pub fn function_element_container(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let [_argument_element, argument_style, argument_child] = arguments.as_slice() else {
+    let [argument_element, argument_style, argument_child] = arguments.as_slice() else {
         panic!("Element/container expects 3 arguments")
     };
     TaggedObject::new_constant(
@@ -219,6 +230,17 @@ pub fn function_element_container(
                 ValueIdempotencyKey::new(),
                 actor_context,
                 [
+                    Variable::new_arc(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(5),
+                            None,
+                            "Element/container(..) -> ElementContainer[settings: [element]]",
+                        ),
+                        construct_context.clone(),
+                        "element",
+                        argument_element.clone(),
+                        None,
+                    ),
                     Variable::new_arc(
                         ConstructInfo::new(
                             function_call_id.with_child_id(3),
@@ -262,7 +284,7 @@ pub fn function_element_stack(
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    let [_argument_element, argument_style, argument_layers] = arguments.as_slice() else {
+    let [argument_element, argument_style, argument_layers] = arguments.as_slice() else {
         panic!("Element/stack requires 3 arguments, got {}", arguments.len());
     };
     TaggedObject::new_constant(
@@ -292,6 +314,17 @@ pub fn function_element_stack(
                 ValueIdempotencyKey::new(),
                 actor_context,
                 [
+                    Variable::new_arc(
+                        ConstructInfo::new(
+                            function_call_id.with_child_id(5),
+                            None,
+                            "Element/stack(..) -> ElementStack[settings: [element]]",
+                        ),
+                        construct_context.clone(),
+                        "element",
+                        argument_element.clone(),
+                        None,
+                    ),
                     Variable::new_arc(
                         ConstructInfo::new(
                             function_call_id.with_child_id(3),
@@ -1680,7 +1713,7 @@ pub fn function_list_append(
     };
 
     let list = List::new_with_change_stream(
-        ConstructInfo::new(function_call_id.with_child_id(0), None, "List/append result"),
+        ConstructInfo::new(function_call_id.with_child_id(ulid::Ulid::new().to_string()), None, "List/append result"),
         actor_context,
         change_stream,
         (list_actor, item_actor),

@@ -588,9 +588,17 @@ fn schedule_expression(
                 result_slot,
             });
 
-            // Schedule each item (pushed last = processed first)
-            for (item, slot) in items.into_iter().zip(item_slots.into_iter()) {
-                schedule_expression(state, item, ctx.clone(), slot)?;
+            // Schedule each item with a unique persistence_id_prefix
+            // This ensures LINKs inside each LIST item have unique registry keys,
+            // preventing cross-item contamination (e.g., clicking one checkbox affects another)
+            for (idx, (item, slot)) in items.into_iter().zip(item_slots.into_iter()).enumerate() {
+                // Use the helper method to create a properly isolated child scope
+                let scope_id = format!("list_item_{}_{}", idx, Ulid::new());
+                let item_ctx = EvaluationContext {
+                    actor_context: ctx.actor_context.with_child_scope(&scope_id),
+                    ..ctx.clone()
+                };
+                schedule_expression(state, item, item_ctx, slot)?;
             }
         }
 
@@ -1093,10 +1101,13 @@ fn schedule_expression(
             let path_strs: Vec<String> = path.iter().map(|s| s.to_string()).collect();
             let path_strs_ref: Vec<&str> = path_strs.iter().map(|s| s.as_str()).collect();
 
-            // Special handling for List binding functions (map, retain, every, any, sort_by)
+            zoon::println!("[EVAL:FunctionCall] path={:?}", path_strs);
+
+            // Special handling for List binding functions (map, retain, remove, every, any, sort_by)
             // These need the unevaluated expression to evaluate per-item with bindings
             match path_strs_ref.as_slice() {
-                ["List", "map"] | ["List", "retain"] | ["List", "every"] | ["List", "any"] | ["List", "sort_by"] => {
+                ["List", "map"] | ["List", "retain"] | ["List", "remove"] | ["List", "every"] | ["List", "any"] | ["List", "sort_by"] => {
+                    zoon::println!("[EVAL:ListBinding] Detected List binding function: {:?}", path_strs);
                     // Handle List binding functions specially - don't pre-evaluate transform expression
                     if let Some(actor) = build_list_binding_function(
                         &path_strs,
@@ -1182,9 +1193,15 @@ fn schedule_expression(
                     }
 
                     // Create context with arg_locals for argument expression evaluation
+                    // CRITICAL: Function arguments must NOT inherit snapshot mode.
+                    // When a function is called inside THEN/WHEN (which have is_snapshot_context: true),
+                    // stream arguments like `toggle_all_target` would only capture ONE value instead of
+                    // maintaining a live subscription. This breaks reactive patterns where dynamically
+                    // created objects need to receive future events from passed stream parameters.
                     let ctx_with_arg_locals = EvaluationContext {
                         actor_context: ActorContext {
                             object_locals: arg_locals,
+                            is_snapshot_context: false,  // Arguments evaluate in streaming mode
                             ..ctx.actor_context.clone()
                         },
                         ..ctx.clone()
@@ -1525,6 +1542,7 @@ fn process_work_item(
                     // Get the components we need from the temporary LINK
                     let link_value_actor = temp_link.value_actor();
                     let link_value_sender = temp_link.expect_link_value_sender();
+                    let registry_key = temp_link.registry_key().cloned();
 
                     // Connect LINK's value_actor to the forwarding actor so sibling fields see LINK values
                     let link_value_actor_for_initial = link_value_actor.clone();
@@ -1545,6 +1563,7 @@ fn process_work_item(
                         ctx.construct_context.clone(),
                         vd.name.clone(),
                         var_persistence_id,
+                        registry_key,
                         forwarding_actor.clone(),
                         link_value_sender,
                         forwarding_loop,
@@ -1668,6 +1687,7 @@ fn process_work_item(
                     // Get the components we need from the temporary LINK
                     let link_value_actor = temp_link.value_actor();
                     let link_value_sender = temp_link.expect_link_value_sender();
+                    let registry_key = temp_link.registry_key().cloned();
 
                     // Connect LINK's value_actor to the forwarding actor
                     let link_value_actor_for_initial = link_value_actor.clone();
@@ -1688,6 +1708,7 @@ fn process_work_item(
                         ctx.construct_context.clone(),
                         vd.name.clone(),
                         var_persistence_id,
+                        registry_key,
                         forwarding_actor.clone(),
                         link_value_sender,
                         forwarding_loop,
@@ -1915,7 +1936,7 @@ fn process_work_item(
 
                 // Check for List binding functions first
                 match path_strs_ref.as_slice() {
-                    ["List", "map"] | ["List", "retain"] | ["List", "every"] | ["List", "any"] | ["List", "sort_by"] => {
+                    ["List", "map"] | ["List", "retain"] | ["List", "remove"] | ["List", "every"] | ["List", "any"] | ["List", "sort_by"] => {
                         // Handle List binding functions specially - they have their own handling
                         // These use the piped value from the context
                         schedule_expression(state, expr, new_ctx, result_slot)?;
@@ -2053,6 +2074,7 @@ fn process_work_item(
                             use_lazy_actors: ctx.actor_context.use_lazy_actors,
                             is_snapshot_context: ctx.actor_context.is_snapshot_context,
                             object_locals: ctx.actor_context.object_locals,
+                            persistence_id_prefix: ctx.actor_context.persistence_id_prefix,
                         },
                         reference_connector: ctx.reference_connector,
                         link_connector: ctx.link_connector,
@@ -2282,7 +2304,7 @@ fn build_then_actor(
                 Value::Tag(_, _) => "Tag".to_string(),
                 _ => "Other".to_string(),
             };
-            let _ = value_desc;  // Used for debugging
+            zoon::println!("[THEN:eval_body] THEN body triggered with value: {}", value_desc);
 
             let value_actor = ValueActor::new_arc(
                 ConstructInfo::new(
@@ -2345,6 +2367,7 @@ fn build_then_actor(
                 is_snapshot_context: true,
                 // Inherit object_locals - THEN body may reference Object sibling fields
                 object_locals: actor_context_clone.object_locals.clone(),
+                persistence_id_prefix: actor_context_clone.persistence_id_prefix.clone(),
             };
 
             let new_ctx = EvaluationContext {
@@ -2581,6 +2604,7 @@ fn build_when_actor(
                         is_snapshot_context: true,
                         // Inherit object_locals - WHEN body may reference Object sibling fields
                         object_locals: actor_context_clone.object_locals.clone(),
+                        persistence_id_prefix: actor_context_clone.persistence_id_prefix.clone(),
                     };
 
                     let new_ctx = EvaluationContext {
@@ -2756,6 +2780,7 @@ fn build_while_actor(
                     is_snapshot_context: false,
                     // Inherit object_locals - WHILE body may reference Object sibling fields
                     object_locals: actor_context_clone.object_locals.clone(),
+                    persistence_id_prefix: actor_context_clone.persistence_id_prefix.clone(),
                 };
 
                 let new_ctx = EvaluationContext {
@@ -2778,16 +2803,16 @@ fn build_while_actor(
 
                 match evaluate_expression(body_expr, new_ctx) {
                     Ok(Some(result_actor)) => {
-                        // Use stream_stream() for continuous streaming semantics.
+                        // Use stream() for continuous streaming semantics.
                         // WHILE bodies should produce continuous streams while the pattern matches.
-                        let stream: LocalBoxStream<'static, Value> = result_actor.stream_stream();
-                        stream
+                        result_actor.stream().await
                     }
                     Ok(None) => {
                         // SKIP - return finite empty stream (switch_map handles this)
                         stream::empty().boxed_local()
                     }
-                    Err(_) => {
+                    Err(_e) => {
+                        // Error evaluating body - return empty stream
                         stream::empty().boxed_local()
                     }
                 }
@@ -2918,10 +2943,14 @@ fn build_field_access_actor(
         }
 
         // Start by getting the first value from the piped stream
+        zoon::println!("[FieldAccess] Starting field access for path {:?}", path_strings);
         let mut piped_subscription = _piped_ref.subscribe().await.fuse();
+        zoon::println!("[FieldAccess] Waiting for initial piped value...");
         let Some(initial_piped_value) = piped_subscription.next().await else {
+            zoon::println!("[FieldAccess] Piped subscription returned None - returning early");
             return;
         };
+        zoon::println!("[FieldAccess] Got initial piped value");
 
         // Find the first LINK field in the path (excluding the last field)
         // This is the field we need to watch for changes
@@ -2976,12 +3005,16 @@ fn build_field_access_actor(
 
         // Now we have current_value pointing to the object containing the final field
         // Get the subscription for the final field
+        zoon::println!("[FieldAccess] About to get final field subscription for '{}'", final_field);
         let Some((final_is_link, final_subscription)) = get_final_link_subscription(&current_value, &final_field).await else {
+            zoon::println!("[FieldAccess] Failed to get final field subscription - returning early");
             return;
         };
+        zoon::println!("[FieldAccess] Final field '{}' is_link: {}", final_field, final_is_link);
 
         if !final_is_link {
             // Final field is not a LINK - just emit one value and we're done
+            zoon::println!("[FieldAccess] Final field is not a LINK, emitting one value and returning");
             let mut sub = final_subscription;
             if let Some(val) = sub.next().await {
                 let _ = field_sender.unbounded_send(val);
@@ -2991,6 +3024,9 @@ fn build_field_access_actor(
 
         // Final field IS a LINK - we need to stay subscribed and watch for intermediate changes
         let mut final_sub = final_subscription.fuse();
+
+        zoon::println!("[FieldAccess] Starting loop for path {:?}, first_link_idx={:?}, intermediate_fields={:?}",
+            path_strings, first_link_idx, intermediate_fields);
 
         loop {
             if let Some(ref mut first_link_sub) = first_link_subscription {
@@ -3024,6 +3060,7 @@ fn build_field_access_actor(
                             }
                             // Continue loop with new final subscription
                         } else {
+                            zoon::println!("[FieldAccess] First LINK subscription ended - breaking loop");
                             break; // First LINK subscription ended
                         }
                     }
@@ -3199,6 +3236,7 @@ fn build_hold_actor(
         is_snapshot_context: false,
         // Inherit object_locals - HOLD body may reference Object sibling fields
         object_locals: ctx.actor_context.object_locals.clone(),
+        persistence_id_prefix: ctx.actor_context.persistence_id_prefix.clone(),
     };
 
     // Create new context for body evaluation
@@ -3229,7 +3267,9 @@ fn build_hold_actor(
     // For lazy actors, this enables demand-driven evaluation where HOLD pulls values
     // one at a time and updates state between each pull (sequential state updates).
     let body_subscription = body_result.clone().subscribe_stream();
+    let state_param_for_log = state_param.clone();
     let state_update_stream = body_subscription.map(move |new_value| {
+        zoon::println!("[HOLD] Body produced value for '{}': {:?}", state_param_for_log, new_value.construct_info());
         // Send to state channel so body can see it on next event
         let _ = state_sender_for_update.unbounded_send(new_value.clone());
         // DIRECTLY update state_actor's stored value - bypass async channel delay.
@@ -3723,10 +3763,25 @@ async fn get_link_sender_from_alias(
 
             if parts.len() == 1 {
                 // Single-part alias - this should be a LINK variable itself
-                // For this case, we need the Variable, not the ValueActor
-                // This is a limitation - we can only get LINK senders for nested paths
-                zoon::eprintln!("[get_link_sender_from_alias] Single-part non-PASSED aliases not yet supported for LINK connection");
-                return None;
+                // Get the persistence_id from the actor and look up the LINK sender in the registry
+                if let Some(persistence_id) = root_actor.persistence_id() {
+                    // Use the registry to get the LINK sender
+                    let registry = &ctx.construct_context.link_actor_registry;
+                    let registry_key = LinkRegistryKey::new(
+                        ctx.actor_context.persistence_id_prefix.clone(),
+                        persistence_id,
+                    );
+                    if let Some((sender, _value_actor)) = registry.get(registry_key.clone()).await {
+                        zoon::println!("[get_link_sender_from_alias] Found LINK sender via registry for '{}' (key: {:?})", first_part, registry_key);
+                        return Some(sender);
+                    } else {
+                        zoon::eprintln!("[get_link_sender_from_alias] No LINK registered for key: {:?}", registry_key);
+                        return None;
+                    }
+                } else {
+                    zoon::eprintln!("[get_link_sender_from_alias] Single-part alias '{}' has no persistence_id", first_part);
+                    return None;
+                }
             }
 
             // Get the first value
@@ -3779,6 +3834,7 @@ fn build_list_binding_function(
     let operation = match path_strs[1].as_str() {
         "map" => ListBindingOperation::Map,
         "retain" => ListBindingOperation::Retain,
+        "remove" => ListBindingOperation::Remove,
         "every" => ListBindingOperation::Every,
         "any" => ListBindingOperation::Any,
         "sort_by" => ListBindingOperation::SortBy,
@@ -3945,6 +4001,7 @@ fn call_function(
                     is_snapshot_context: false,
                     // Clear object_locals - function body is a new scope
                     object_locals: HashMap::new(),
+                    persistence_id_prefix: ctx_for_closure.actor_context.persistence_id_prefix.clone(),
                 };
 
                 let new_ctx = EvaluationContext {
@@ -4010,6 +4067,7 @@ fn call_function(
             is_snapshot_context: false,
             // Clear object_locals - function body is a new scope
             object_locals: HashMap::new(),
+            persistence_id_prefix: ctx.actor_context.persistence_id_prefix.clone(),
         };
 
         let new_ctx = EvaluationContext {
@@ -4080,6 +4138,7 @@ fn call_function(
                 is_snapshot_context: false,
                 // Clear object_locals - function call is a new scope
                 object_locals: HashMap::new(),
+                persistence_id_prefix: ctx.actor_context.persistence_id_prefix.clone(),
             };
 
             Ok(Some(FunctionCall::new_arc_value_actor(
@@ -4572,6 +4631,7 @@ pub fn evaluate_with_registry(
     let construct_context = ConstructContext {
         construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
         virtual_fs,
+        link_actor_registry: Arc::new(LinkActorRegistry::new()),
     };
     let actor_context = ActorContext::default();
     let reference_connector = Arc::new(ReferenceConnector::new());
