@@ -2636,15 +2636,7 @@ fn build_when_actor(
                         function_registry_snapshot: Some(function_registry_clone.clone()),
                     };
 
-                    // arm.body is Expression, not Spanned<Expression>
-                    // We wrap it with the parent's span/persistence
-                    let body_expr = static_expression::Spanned {
-                        span: span.clone(),
-                        persistence: persistence_clone,
-                        node: arm.body.clone(),
-                    };
-
-                    match evaluate_expression(body_expr, new_ctx) {
+                    match evaluate_expression(arm.body.clone(), new_ctx) {
                         Ok(Some(result_actor)) => {
                             // Use value() for type-safe single-value semantics.
                             // value() returns a Future that resolves to exactly ONE value,
@@ -2812,15 +2804,7 @@ fn build_while_actor(
                     function_registry_snapshot: Some(function_registry_clone),
                 };
 
-                // arm.body is Expression, not Spanned<Expression>
-                // We wrap it with the parent's span/persistence
-                let body_expr = static_expression::Spanned {
-                    span: span.clone(),
-                    persistence: persistence_clone,
-                    node: arm.body.clone(),
-                };
-
-                match evaluate_expression(body_expr, new_ctx) {
+                match evaluate_expression(arm.body.clone(), new_ctx) {
                     Ok(Some(result_actor)) => {
                         // Use stream() for continuous streaming semantics
                         result_actor.stream().await

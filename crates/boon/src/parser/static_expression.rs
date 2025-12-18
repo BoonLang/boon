@@ -223,7 +223,7 @@ pub enum Alias {
 #[derive(Debug, Clone)]
 pub struct Arm {
     pub pattern: Pattern,
-    pub body: Expression,
+    pub body: Spanned<Expression>,
 }
 
 #[derive(Debug, Clone)]
@@ -484,7 +484,7 @@ impl ExpressionConverter {
     fn convert_arm(&self, arm: &parser::Arm) -> Arm {
         Arm {
             pattern: self.convert_pattern(&arm.pattern),
-            body: self.convert_expr(&arm.body),
+            body: self.convert_spanned(&arm.body),
         }
     }
 

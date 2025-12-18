@@ -492,7 +492,7 @@ where
         let arm = pattern
             .then_ignore(just(Token::Implies))
             .then(tracked_expr.clone())
-            .map(|(pattern, body)| Arm { pattern, body: body.node });
+            .map(|(pattern, body)| Arm { pattern, body });
 
         let when = just(Token::When)
             .ignore_then(
@@ -1030,7 +1030,7 @@ impl<'code> fmt::Display for Alias<'code> {
 #[derive(Debug, Clone)]
 pub struct Arm<'code> {
     pub pattern: Pattern<'code>,
-    pub body: Expression<'code>,
+    pub body: Spanned<Expression<'code>>,
 }
 
 #[derive(Debug, Clone)]

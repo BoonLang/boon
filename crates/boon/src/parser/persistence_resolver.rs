@@ -845,22 +845,28 @@ fn set_persistence<'a, 'code, 'old_code>(
             }
         }
         Expression::When { arms } => {
-            // For When expressions, assign a new ID (arms have non-Spanned bodies)
             let id = PersistenceId::new();
             new_span_id_pairs.insert(*span, id);
             *persistence = Some(Persistence {
                 id,
                 status: PersistenceStatus::NewOrChanged,
             });
+            // Recurse into arm bodies
+            for arm in arms {
+                set_persistence(&mut arm.body, &[], old_span_id_pairs, new_span_id_pairs, errors);
+            }
         }
         Expression::While { arms } => {
-            // For While expressions, assign a new ID (arms have non-Spanned bodies)
             let id = PersistenceId::new();
             new_span_id_pairs.insert(*span, id);
             *persistence = Some(Persistence {
                 id,
                 status: PersistenceStatus::NewOrChanged,
             });
+            // Recurse into arm bodies
+            for arm in arms {
+                set_persistence(&mut arm.body, &[], old_span_id_pairs, new_span_id_pairs, errors);
+            }
         }
         Expression::Pipe { from, to } => {
             let old_from_to_and_id =

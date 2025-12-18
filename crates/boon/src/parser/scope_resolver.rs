@@ -363,22 +363,14 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                 }
 
                 // Resolve body references with pattern bindings in scope
-                // Note: We must create a temporary Spanned, resolve it, then copy back
-                // because arm.body is Expression not Spanned<Expression>
-                let mut body_spanned = Spanned {
-                    span: *span,
-                    node: arm.body.clone(),
-                    persistence: None,
-                };
                 set_is_referenced_and_alias_referenceables(
-                    &mut body_spanned,
+                    &mut arm.body,
                     body_reachables,
                     body_level,
                     parent_name,
                     errors,
                     all_referenced,
                 );
-                arm.body = body_spanned.node;
             }
         }
         Expression::While { arms } => {
@@ -394,22 +386,14 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                 }
 
                 // Resolve body references with pattern bindings in scope
-                // Note: We must create a temporary Spanned, resolve it, then copy back
-                // because arm.body is Expression not Spanned<Expression>
-                let mut body_spanned = Spanned {
-                    span: *span,
-                    node: arm.body.clone(),
-                    persistence: None,
-                };
                 set_is_referenced_and_alias_referenceables(
-                    &mut body_spanned,
+                    &mut arm.body,
                     body_reachables,
                     body_level,
                     parent_name,
                     errors,
                     all_referenced,
                 );
-                arm.body = body_spanned.node;
             }
         }
         Expression::Pipe { from, to } => {
