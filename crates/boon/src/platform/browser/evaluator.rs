@@ -596,8 +596,7 @@ fn schedule_expression(
             // - persistence_id is STABLE across WHILE re-renders (derived from source position)
             // - Ulid::new() creates a new random ID each time
             //
-            // This is part of the fix for the 3rd click bug: stable scope_id means stable
-            // LinkRegistryKey prefix, so subscriptions remain valid after WHILE re-renders.
+            // Stable scope_id ensures each list item gets a consistent key for subscriptions.
             for (idx, (item, slot)) in items.into_iter().zip(item_slots.into_iter()).enumerate() {
                 // Use the helper method to create a properly isolated child scope
                 let scope_id = if let Some(ref persistence) = item.persistence {
@@ -1555,7 +1554,6 @@ fn process_work_item(
                     // Get the components we need from the temporary LINK
                     let link_value_actor = temp_link.value_actor();
                     let link_value_sender = temp_link.expect_link_value_sender();
-                    let registry_key = temp_link.registry_key().cloned();
 
                     // Connect LINK's value_actor to the forwarding actor so sibling fields see LINK values
                     let link_value_actor_for_initial = link_value_actor.clone();
@@ -1577,7 +1575,6 @@ fn process_work_item(
                         vd.name.clone(),
                         var_persistence_id,
                         ctx.actor_context.scope.clone(),
-                        registry_key,
                         forwarding_actor.clone(),
                         link_value_sender,
                         forwarding_loop,
@@ -1703,7 +1700,6 @@ fn process_work_item(
                     // Get the components we need from the temporary LINK
                     let link_value_actor = temp_link.value_actor();
                     let link_value_sender = temp_link.expect_link_value_sender();
-                    let registry_key = temp_link.registry_key().cloned();
 
                     // Connect LINK's value_actor to the forwarding actor
                     let link_value_actor_for_initial = link_value_actor.clone();
@@ -1725,7 +1721,6 @@ fn process_work_item(
                         vd.name.clone(),
                         var_persistence_id,
                         ctx.actor_context.scope.clone(),
-                        registry_key,
                         forwarding_actor.clone(),
                         link_value_sender,
                         forwarding_loop,
@@ -2902,35 +2897,14 @@ fn build_field_access_actor(
     // 3. Watch for changes in intermediate LINKs - when one changes, re-navigate from that point
     let (field_sender, field_receiver) = mpsc::unbounded::<Value>();
     let piped_for_loop = piped.clone();
-    let link_actor_registry = ctx.construct_context.link_actor_registry.clone();
 
     let field_access_loop = ActorLoop::new(async move {
         let _piped_ref = piped_for_loop;
-        let registry = link_actor_registry;
-
-        // Helper: get the value_actor for a LINK variable.
-        // KEY FIX for 3rd click bug: Look up by persistence_id in registry to get the
-        // SHARED value_actor. This ensures subscriptions go to the same ValueActor
-        // even when WHILE re-renders create new Variable instances.
-        async fn get_link_value_actor(
-            var: &Arc<Variable>,
-            registry: &Arc<LinkActorRegistry>,
-        ) -> Arc<ValueActor> {
-            let pid = var.persistence_id();
-            // Look up by persistence_id to get the shared ValueActor
-            if let Some((_, shared_actor)) = registry.get_link_by_persistence_id(pid).await {
-                zoon::println!("[FieldAccess] Using shared ValueActor from registry for pid {:?}", pid);
-                return shared_actor;
-            }
-            // Fall back to variable's value_actor if not in registry
-            var.value_actor()
-        }
 
         // Helper: navigate from a starting value through remaining path fields, return final value
         async fn navigate_path(
             start_value: Value,
             fields: &[String],
-            registry: &Arc<LinkActorRegistry>,
         ) -> Option<Value> {
             let mut current = start_value;
             for field_name in fields {
@@ -2940,12 +2914,7 @@ fn build_field_access_actor(
                     _ => return None,
                 };
                 if let Some(var) = variable {
-                    let is_link = var.link_value_sender().is_some();
-                    let value_actor = if is_link {
-                        get_link_value_actor(&var, registry).await
-                    } else {
-                        var.value_actor()
-                    };
+                    let value_actor = var.value_actor();
                     let mut sub = value_actor.stream().await;
                     current = sub.next().await?;
                 } else {
@@ -2959,7 +2928,6 @@ fn build_field_access_actor(
         async fn get_final_link_subscription(
             value: &Value,
             final_field: &str,
-            registry: &Arc<LinkActorRegistry>,
         ) -> Option<(bool, LocalBoxStream<'static, Value>)> {
             let variable = match value {
                 Value::Object(obj, _) => obj.variable(final_field),
@@ -2968,11 +2936,7 @@ fn build_field_access_actor(
             };
             let var = variable?;
             let is_link = var.link_value_sender().is_some();
-            let value_actor = if is_link {
-                get_link_value_actor(&var, registry).await
-            } else {
-                var.value_actor()
-            };
+            let value_actor = var.value_actor();
             let subscription = value_actor.stream().await;
             Some((is_link, subscription))
         }
@@ -3019,20 +2983,16 @@ fn build_field_access_actor(
                 let is_link = var.link_value_sender().is_some();
 
                 if is_link && first_link_idx.is_none() {
-                    // Found the first LINK - subscribe to it via registry lookup
+                    // Found the first LINK - subscribe to it
                     first_link_idx = Some(idx);
-                    let value_actor = get_link_value_actor(&var, &registry).await;
+                    let value_actor = var.value_actor();
                     first_link_subscription = Some(value_actor.stream().await.fuse());
                     fields_before_first_link = intermediate_fields[..idx].to_vec();
                     fields_after_first_link = intermediate_fields[idx + 1..].to_vec();
                 }
 
-                // Get the current value from this field - use registry lookup for LINKs
-                let value_actor = if is_link {
-                    get_link_value_actor(&var, &registry).await
-                } else {
-                    var.value_actor()
-                };
+                // Get the current value from this field
+                let value_actor = var.value_actor();
                 let mut sub = value_actor.stream().await;
                 if let Some(val) = sub.next().await {
                     current_value = val;
@@ -3047,7 +3007,7 @@ fn build_field_access_actor(
         // Now we have current_value pointing to the object containing the final field
         // Get the subscription for the final field
         zoon::println!("[FieldAccess] About to get final field subscription for '{}'", final_field);
-        let Some((final_is_link, final_subscription)) = get_final_link_subscription(&current_value, &final_field, &registry).await else {
+        let Some((final_is_link, final_subscription)) = get_final_link_subscription(&current_value, &final_field).await else {
             zoon::println!("[FieldAccess] Failed to get final field subscription - returning early");
             return;
         };
@@ -3089,11 +3049,11 @@ fn build_field_access_actor(
                             // First LINK emitted a new value - re-navigate from here
                             zoon::println!("[FieldAccess] First LINK emitted new value - re-navigating through {:?}", fields_after_first_link);
                             // Navigate through remaining intermediate fields
-                            let nav_result = navigate_path(new_value, &fields_after_first_link, &registry).await;
+                            let nav_result = navigate_path(new_value, &fields_after_first_link).await;
 
                             if let Some(nav_value) = nav_result {
                                 // Get the new final field subscription
-                                if let Some((_, new_final_sub)) = get_final_link_subscription(&nav_value, &final_field, &registry).await {
+                                if let Some((_, new_final_sub)) = get_final_link_subscription(&nav_value, &final_field).await {
                                     final_sub = new_final_sub.fuse();
                                 } else {
                                     break; // Can't get new subscription
@@ -3109,7 +3069,7 @@ fn build_field_access_actor(
                         if let Some(new_piped) = piped_value {
                             // Piped value changed - re-navigate from the beginning
                             // Navigate through fields before first LINK
-                            let before_result = navigate_path(new_piped.clone(), &fields_before_first_link, &registry).await;
+                            let before_result = navigate_path(new_piped.clone(), &fields_before_first_link).await;
 
                             if let Some(before_value) = before_result {
                                 // Get the first LINK variable and subscribe to it
@@ -3121,15 +3081,14 @@ fn build_field_access_actor(
                                     };
 
                                     if let Some(var) = first_link_var {
-                                        // Use registry lookup for the first LINK subscription
-                                        let value_actor = get_link_value_actor(&var, &registry).await;
+                                        let value_actor = var.value_actor();
                                         *first_link_sub = value_actor.clone().stream().await.fuse();
 
                                         // Get first value and navigate to final field
                                         let mut temp_sub = value_actor.stream().await;
                                         if let Some(first_val) = temp_sub.next().await {
-                                            if let Some(nav_value) = navigate_path(first_val, &fields_after_first_link, &registry).await {
-                                                if let Some((_, new_final_sub)) = get_final_link_subscription(&nav_value, &final_field, &registry).await {
+                                            if let Some(nav_value) = navigate_path(first_val, &fields_after_first_link).await {
+                                                if let Some((_, new_final_sub)) = get_final_link_subscription(&nav_value, &final_field).await {
                                                     final_sub = new_final_sub.fuse();
                                                 }
                                             }
@@ -3157,8 +3116,8 @@ fn build_field_access_actor(
                     piped_value = piped_subscription.next() => {
                         if let Some(new_piped) = piped_value {
                             // Navigate through all intermediate fields
-                            if let Some(nav_value) = navigate_path(new_piped, &intermediate_fields, &registry).await {
-                                if let Some((_, new_final_sub)) = get_final_link_subscription(&nav_value, &final_field, &registry).await {
+                            if let Some(nav_value) = navigate_path(new_piped, &intermediate_fields).await {
+                                if let Some((_, new_final_sub)) = get_final_link_subscription(&nav_value, &final_field).await {
                                     final_sub = new_final_sub.fuse();
                                 }
                             }
@@ -3805,26 +3764,12 @@ async fn get_link_sender_from_alias(
             };
 
             if parts.len() == 1 {
-                // Single-part alias - this should be a LINK variable itself
-                // Get the persistence_id from the actor and look up the LINK sender in the registry
-                if let Some(persistence_id) = root_actor.persistence_id() {
-                    // Use the registry to get the LINK sender
-                    let registry = &ctx.construct_context.link_actor_registry;
-                    let registry_key = LinkRegistryKey::new(
-                        ctx.actor_context.scope.clone(),
-                        persistence_id,
-                    );
-                    if let Some((sender, _value_actor)) = registry.get(registry_key.clone()).await {
-                        zoon::println!("[get_link_sender_from_alias] Found LINK sender via registry for '{}' (key: {:?})", first_part, registry_key);
-                        return Some(sender);
-                    } else {
-                        zoon::eprintln!("[get_link_sender_from_alias] No LINK registered for key: {:?}", registry_key);
-                        return None;
-                    }
-                } else {
-                    zoon::eprintln!("[get_link_sender_from_alias] Single-part alias '{}' has no persistence_id", first_part);
-                    return None;
-                }
+                // Single-part alias pointing to a LINK variable directly is not supported
+                // without object navigation context. LINK senders are obtained from Variables,
+                // and for single-part aliases we only have a ValueActor.
+                // Multi-part paths like `obj.link_field` navigate to the Variable and work.
+                zoon::eprintln!("[get_link_sender_from_alias] Single-part LINK alias '{}' not supported without object context", first_part);
+                return None;
             }
 
             // Get the first value
@@ -4674,7 +4619,6 @@ pub fn evaluate_with_registry(
     let construct_context = ConstructContext {
         construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
         virtual_fs,
-        link_actor_registry: Arc::new(LinkActorRegistry::new()),
     };
     let actor_context = ActorContext::default();
     let reference_connector = Arc::new(ReferenceConnector::new());

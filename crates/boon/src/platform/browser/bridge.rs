@@ -5,7 +5,7 @@ use zoon::futures_channel::mpsc;
 use zoon::{eprintln, *};
 
 use super::engine::{
-    ActorContext, ActorLoop, ConstructContext, ConstructInfo, LinkRegistryKey, ListChange, Object,
+    ActorContext, ActorLoop, ConstructContext, ConstructInfo, ListChange, Object,
     TaggedObject, TypedStream, Value, ValueActor, ValueIdempotencyKey, Variable,
     Text as EngineText, Tag as EngineTag,
 };
@@ -1674,8 +1674,7 @@ fn element_text_input(
 
     let element_variable = tagged_object.expect_variable("element");
 
-    // Set up event handlers - create separate subscriptions
-    // Include registry_key so we can subscribe to registry updates (like checkbox fix)
+    // Set up event handlers - create separate subscriptions for each event type
     let mut change_stream = element_variable
         .clone()
         .stream_sync()
@@ -1684,9 +1683,8 @@ fn element_text_input(
         .filter_map(|value| future::ready(value.expect_object().variable("change")))
         .map(move |variable| {
             let sender = variable.expect_link_value_sender();
-            let registry_key = variable.registry_key().cloned();
-            zoon::println!("[BRIDGE] text_input instance #{}: got change LINK sender, registry_key = {:?}", instance_id, registry_key);
-            (sender, registry_key)
+            zoon::println!("[BRIDGE] text_input instance #{}: got change LINK sender", instance_id);
+            sender
         })
         .fuse();
 
@@ -1700,9 +1698,8 @@ fn element_text_input(
             let instance_id = instance_id;
             move |variable| {
                 let sender = variable.expect_link_value_sender();
-                let registry_key = variable.registry_key().cloned();
-                zoon::println!("[BRIDGE] text_input instance #{}: got key_down LINK sender, registry_key = {:?}", instance_id, registry_key);
-                (sender, registry_key)
+                zoon::println!("[BRIDGE] text_input instance #{}: got key_down LINK sender", instance_id);
+                sender
             }
         })
         .fuse();
@@ -1716,54 +1713,25 @@ fn element_text_input(
             let instance_id = instance_id;
             move |variable| {
                 let sender = variable.expect_link_value_sender();
-                let registry_key = variable.registry_key().cloned();
-                zoon::println!("[BRIDGE] text_input instance #{}: got blur LINK sender, registry_key = {:?}", instance_id, registry_key);
-                (sender, registry_key)
+                zoon::println!("[BRIDGE] text_input instance #{}: got blur LINK sender", instance_id);
+                sender
             }
         })
         .fuse();
 
-    let link_actor_registry = construct_context.link_actor_registry.clone();
-
     let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
-        let link_actor_registry = link_actor_registry.clone();
         async move {
             let mut change_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
             let mut key_down_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
             let mut blur_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
             let mut pending_change_events: Vec<String> = Vec::new();
 
-            // Registry subscription streams (like checkbox fix)
-            let mut change_registry_stream: Option<stream::Fuse<mpsc::UnboundedReceiver<mpsc::UnboundedSender<Value>>>> = None;
-            let mut key_down_registry_stream: Option<stream::Fuse<mpsc::UnboundedReceiver<mpsc::UnboundedSender<Value>>>> = None;
-            let mut blur_registry_stream: Option<stream::Fuse<mpsc::UnboundedReceiver<mpsc::UnboundedSender<Value>>>> = None;
-            let mut change_subscribed_key: Option<LinkRegistryKey> = None;
-            let mut key_down_subscribed_key: Option<LinkRegistryKey> = None;
-            let mut blur_subscribed_key: Option<LinkRegistryKey> = None;
-
             loop {
-                // Check registry streams for updates (if subscribed)
-                let mut change_registry_update = if let Some(ref mut rs) = change_registry_stream {
-                    rs.next().left_future()
-                } else {
-                    future::pending().right_future()
-                };
-                let mut key_down_registry_update = if let Some(ref mut rs) = key_down_registry_stream {
-                    rs.next().left_future()
-                } else {
-                    future::pending().right_future()
-                };
-                let mut blur_registry_update = if let Some(ref mut rs) = blur_registry_stream {
-                    rs.next().left_future()
-                } else {
-                    future::pending().right_future()
-                };
-
                 select! {
                     result = change_stream.next() => {
-                        if let Some((sender, registry_key)) = result {
-                            zoon::println!("[BRIDGE] text_input instance #{}: change LINK sender from stream, key={:?}", instance_id, registry_key);
+                        if let Some(sender) = result {
+                            zoon::println!("[BRIDGE] text_input instance #{}: change LINK sender from stream", instance_id);
                             change_link_value_sender = Some(sender.clone());
 
                             // Flush any pending change events
@@ -1794,89 +1762,16 @@ fn element_text_input(
                                 );
                                 let _ = sender.unbounded_send(event_value);
                             }
-
-                            // Subscribe to registry updates for this specific registry_key
-                            if let Some(ref key) = registry_key {
-                                if change_subscribed_key.as_ref() != Some(key) {
-                                    zoon::println!("[BRIDGE] text_input instance #{}: subscribing to change registry for key {:?}", instance_id, key);
-                                    change_registry_stream = Some(link_actor_registry.subscribe_senders(key.clone()).fuse());
-                                    change_subscribed_key = Some(key.clone());
-                                }
-                            }
-                        }
-                    }
-                    new_sender = change_registry_update => {
-                        // Registry notified us of a new change LINK sender
-                        if let Some(sender) = new_sender {
-                            zoon::println!("[BRIDGE] text_input instance #{}: got change LINK sender from REGISTRY update", instance_id);
-                            change_link_value_sender = Some(sender.clone());
-
-                            // Flush any pending change events
-                            for text in pending_change_events.drain(..) {
-                                zoon::println!("[BRIDGE] text_input instance #{}: Flushing buffered change event (registry): '{}'", instance_id, text);
-                                let event_value = Object::new_value(
-                                    ConstructInfo::new("text_input::change_event", None, "TextInput change event"),
-                                    construct_context.clone(),
-                                    ValueIdempotencyKey::new(),
-                                    [Variable::new_arc(
-                                        ConstructInfo::new("text_input::change_event::text", None, "change text"),
-                                        construct_context.clone(),
-                                        "text",
-                                        ValueActor::new_arc(
-                                            ConstructInfo::new("text_input::change_event::text_actor", None, "change text actor"),
-                                            ActorContext::default(),
-                                            TypedStream::infinite(stream::once(future::ready(EngineText::new_value(
-                                                ConstructInfo::new("text_input::change_event::text_value", None, "change text value"),
-                                                construct_context.clone(),
-                                                ValueIdempotencyKey::new(),
-                                                text,
-                                            ))).chain(stream::pending())),
-                                            None,
-                                        ),
-                                        parser::PersistenceId::default(),
-                                        parser::Scope::Root,
-                                    )],
-                                );
-                                let _ = sender.unbounded_send(event_value);
-                            }
                         }
                     }
                     result = key_down_stream.next() => {
-                        if let Some((sender, registry_key)) = result {
-                            zoon::println!("[BRIDGE] text_input instance #{}: key_down LINK sender from stream, key={:?}", instance_id, registry_key);
-                            key_down_link_value_sender = Some(sender);
-
-                            // Subscribe to registry updates
-                            if let Some(ref key) = registry_key {
-                                if key_down_subscribed_key.as_ref() != Some(key) {
-                                    zoon::println!("[BRIDGE] text_input instance #{}: subscribing to key_down registry for key {:?}", instance_id, key);
-                                    key_down_registry_stream = Some(link_actor_registry.subscribe_senders(key.clone()).fuse());
-                                    key_down_subscribed_key = Some(key.clone());
-                                }
-                            }
-                        }
-                    }
-                    new_sender = key_down_registry_update => {
-                        if let Some(sender) = new_sender {
-                            zoon::println!("[BRIDGE] text_input instance #{}: got key_down LINK sender from REGISTRY update", instance_id);
+                        if let Some(sender) = result {
+                            zoon::println!("[BRIDGE] text_input instance #{}: key_down LINK sender from stream", instance_id);
                             key_down_link_value_sender = Some(sender);
                         }
                     }
                     result = blur_stream.next() => {
-                        if let Some((sender, registry_key)) = result {
-                            blur_link_value_sender = Some(sender);
-
-                            // Subscribe to registry updates
-                            if let Some(ref key) = registry_key {
-                                if blur_subscribed_key.as_ref() != Some(key) {
-                                    blur_registry_stream = Some(link_actor_registry.subscribe_senders(key.clone()).fuse());
-                                    blur_subscribed_key = Some(key.clone());
-                                }
-                            }
-                        }
-                    }
-                    new_sender = blur_registry_update => {
-                        if let Some(sender) = new_sender {
+                        if let Some(sender) = result {
                             blur_link_value_sender = Some(sender);
                         }
                     }
@@ -2220,41 +2115,29 @@ fn element_checkbox(
     let click_var_stream = event_stream
         .filter_map(|value| future::ready(value.expect_object().variable("click")));
 
-    // Map to (sender, registry_key) pairs - registry_key includes the List/map prefix
-    // which makes it unique per list item, not just per LINK definition
-    let click_stream_with_key = click_var_stream.map(move |variable| {
+    // Map to sender - the Variable stream already handles uniqueness via evaluation_id
+    let click_sender_stream = click_var_stream.map(move |variable| {
         let sender = variable.expect_link_value_sender();
-        let registry_key = variable.registry_key().cloned();
-        zoon::println!("[BRIDGE] checkbox instance #{}: got click LINK sender, registry_key = {:?}", instance_id, registry_key);
-        (sender, registry_key)
+        zoon::println!("[BRIDGE] checkbox instance #{}: got click LINK sender", instance_id);
+        sender
     });
 
-    let mut click_stream_with_key = click_stream_with_key.fuse();
-    let link_actor_registry = construct_context.link_actor_registry.clone();
+    let mut click_sender_stream = click_sender_stream.fuse();
 
     let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
             let mut click_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
             let mut sender_update_count = 0usize;
-            let mut registry_stream: Option<stream::Fuse<mpsc::UnboundedReceiver<mpsc::UnboundedSender<Value>>>> = None;
-            let mut subscribed_key: Option<LinkRegistryKey> = None;
             // Buffer for clicks that arrive before LINK sender is ready
             let mut pending_clicks: usize = 0;
 
             loop {
-                // Check registry stream for updates (if subscribed)
-                let mut registry_update = if let Some(ref mut rs) = registry_stream {
-                    rs.next().left_future()
-                } else {
-                    future::pending().right_future()
-                };
-
                 select! {
-                    result = click_stream_with_key.next() => {
-                        if let Some((sender, registry_key)) = result {
+                    result = click_sender_stream.next() => {
+                        if let Some(sender) = result {
                             sender_update_count += 1;
-                            zoon::println!("[BRIDGE] checkbox instance #{}: click LINK sender #{} from stream, key={:?}", instance_id, sender_update_count, registry_key);
+                            zoon::println!("[BRIDGE] checkbox instance #{}: click LINK sender #{} from stream", instance_id, sender_update_count);
                             click_link_value_sender = Some(sender.clone());
 
                             // Send any pending clicks that were buffered
@@ -2269,40 +2152,6 @@ fn element_checkbox(
                                     );
                                     let result = sender.unbounded_send(event_value);
                                     zoon::println!("[BRIDGE] checkbox instance #{}: sent buffered click to Boon LINK, result: {:?}", instance_id, result.is_ok());
-                                }
-                                pending_clicks = 0;
-                            }
-
-                            // Subscribe to registry updates for this specific registry_key
-                            // The registry_key includes the List/map prefix, making it unique per item
-                            if let Some(ref key) = registry_key {
-                                if subscribed_key.as_ref() != Some(key) {
-                                    zoon::println!("[BRIDGE] checkbox instance #{}: subscribing to registry for key {:?}", instance_id, key);
-                                    registry_stream = Some(link_actor_registry.subscribe_senders(key.clone()).fuse());
-                                    subscribed_key = Some(key.clone());
-                                }
-                            }
-                        }
-                    }
-                    new_sender = registry_update => {
-                        // Registry notified us of a new LINK sender for our key
-                        if let Some(sender) = new_sender {
-                            sender_update_count += 1;
-                            zoon::println!("[BRIDGE] checkbox instance #{}: got LINK sender #{} from REGISTRY update", instance_id, sender_update_count);
-                            click_link_value_sender = Some(sender.clone());
-
-                            // Send any pending clicks that were buffered
-                            if pending_clicks > 0 {
-                                zoon::println!("[BRIDGE] checkbox instance #{}: sending {} buffered click(s) after registry update", instance_id, pending_clicks);
-                                for _ in 0..pending_clicks {
-                                    let event_value = Object::new_value(
-                                        ConstructInfo::new("checkbox::click_event", None, "Checkbox click event"),
-                                        construct_context.clone(),
-                                        ValueIdempotencyKey::new(),
-                                        [],
-                                    );
-                                    let result = sender.unbounded_send(event_value);
-                                    zoon::println!("[BRIDGE] checkbox instance #{}: sent buffered click to Boon LINK (registry), result: {:?}", instance_id, result.is_ok());
                                 }
                                 pending_clicks = 0;
                             }

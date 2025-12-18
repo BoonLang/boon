@@ -11,6 +11,10 @@ Boon is a reactive, dataflow-oriented programming language designed for building
 - **NEVER revert files using `git checkout` or `git restore` without explicit user confirmation.** Even if a file appears broken, ask the user first before reverting. The user may want to investigate the issue or fix it differently.
 - When debugging issues, prefer investigating and fixing over reverting.
 - **NEVER use underscore prefix (`_`) to silence "unused variable" warnings without investigating why the variable is unused.** The underscore prefix hides potential bugs where a value should be used but isn't. For example, `_argument_element` in Element API functions caused a bug where the `element` argument was silently ignored instead of being passed to the settings object. If a variable appears unused, investigate whether it's a bug before adding `_` prefix.
+- **Only use `as` for explicit type declarations, never for numeric casting.** Using `as` for numeric casting (e.g., `ulid.0 as usize`) is problematic because it silently truncates or wraps values and creates platform-dependent behavior. Instead:
+  - For fallible conversions: use `try_into()` or `TryFrom` and handle errors
+  - For type annotations: `as` is fine (e.g., `0usize` or `0 as usize`)
+  - For pointer casting in FFI: `as` is appropriate but rare in Boon
 
 ## Project Structure
 
