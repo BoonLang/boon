@@ -142,6 +142,36 @@ pub fn constant<T>(item: T) -> TypedStream<impl Stream<Item = T>, Infinite> {
     TypedStream::infinite(stream::once(future::ready(item)).chain(stream::once(future::pending())))
 }
 
+// --- Error Types ---
+
+/// Error returned by `current_value()`.
+///
+/// Distinguishes between "no value stored yet" (actor is alive but waiting)
+/// and "actor was dropped" (actor is gone).
+#[derive(Debug, Clone)]
+pub enum CurrentValueError {
+    /// Actor exists but has no stored value yet.
+    /// This happens for LINK variables waiting for user interaction (click, input, etc.).
+    NoValueYet,
+    /// Actor was dropped (navigation, WHILE branch switch, etc.).
+    /// The actor is gone and will never produce a value.
+    ActorDropped,
+}
+
+/// Error returned by `value()`.
+///
+/// Since `value()` waits for a value, the only failure mode is the actor dying
+/// before producing one.
+#[derive(Debug, Clone)]
+pub enum ValueError {
+    /// Actor was dropped before or while waiting for a value.
+    /// This can happen when:
+    /// - User navigates away without triggering the event (LINK)
+    /// - WHILE branch switches, dropping the old branch's actors
+    /// - Parent actor is dropped
+    ActorDropped,
+}
+
 // --- ActorLoop ---
 
 /// Encapsulates the async loop that makes an Actor an Actor.
@@ -738,8 +768,8 @@ impl LazyValueActor {
     /// Each call to .next() on the stream will request the next value from the actor.
     ///
     /// Takes ownership of the Arc to keep the actor alive for the subscription lifetime.
-    /// Callers should use `.clone().subscribe()` if they need to retain a reference.
-    pub fn subscribe(self: Arc<Self>) -> LazySubscription {
+    /// Callers should use `.clone().stream()` if they need to retain a reference.
+    pub fn stream(self: Arc<Self>) -> LazySubscription {
         let subscriber_id = self.subscriber_counter.fetch_add(1, Ordering::SeqCst);
         LazySubscription {
             actor: self,
@@ -1306,15 +1336,15 @@ pub struct ActorContext {
     /// each pulse from Stream/pulses is pulled one at a time, state is updated between each.
     /// Default: false (normal eager evaluation).
     pub use_lazy_actors: bool,
-    /// When true, code should use `.snapshot()` instead of `.stream()` for subscriptions.
+    /// When true, code should use `.value()` instead of `.stream()` for subscriptions.
     ///
     /// This flag propagates through function calls:
-    /// - THEN/WHEN bodies set this to `true` (snapshot context)
+    /// - THEN/WHEN bodies set this to `true` (value/snapshot context)
     /// - WHILE bodies keep this `false` (streaming context)
     /// - User-defined function bodies inherit caller's context
     ///
     /// Code that needs values (variable references, API functions, operators) checks
-    /// this flag and calls `.snapshot()` or `.stream()` accordingly.
+    /// this flag and calls `.value()` or `.stream()` accordingly.
     ///
     /// Default: false (streaming context - continuous updates).
     pub is_snapshot_context: bool,
@@ -1325,7 +1355,7 @@ pub struct ActorContext {
     /// the same function definition (they would otherwise share the same spans
     /// and overwrite each other in the global ReferenceConnector).
     pub object_locals: HashMap<parser::Span, Arc<ValueActor>>,
-    /// Prefix for persistence IDs when evaluating expressions in isolated scopes.
+    /// Scope context for Variables - either Root (top-level) or Nested (inside List/map).
     ///
     /// **IMPORTANT: When to create a new scope:**
     /// A new scope must be created when evaluating code from the SAME source position
@@ -1337,11 +1367,11 @@ pub struct ActorContext {
     /// Use `with_child_scope()` to create a properly isolated child scope.
     /// Without proper scoping, LINK variables would collide and events would be
     /// routed to wrong elements.
-    pub persistence_id_prefix: Option<String>,
+    pub scope: parser::Scope,
 }
 
 impl ActorContext {
-    /// Creates a child context with a new unique scope prefix.
+    /// Creates a child context with a new unique nested scope.
     ///
     /// Use this when evaluating code that needs isolation from siblings:
     /// - LIST items
@@ -1351,12 +1381,12 @@ impl ActorContext {
     ///
     /// The `scope_id` should be unique among siblings (e.g., "list_item_0", "map_item_abc123").
     pub fn with_child_scope(&self, scope_id: &str) -> Self {
-        let new_prefix = match &self.persistence_id_prefix {
-            Some(existing) => format!("{}:{}", existing, scope_id),
-            None => scope_id.to_string(),
+        let new_prefix = match &self.scope {
+            parser::Scope::Root => scope_id.to_string(),
+            parser::Scope::Nested(existing) => format!("{}:{}", existing, scope_id),
         };
         Self {
-            persistence_id_prefix: Some(new_prefix),
+            scope: parser::Scope::Nested(new_prefix),
             ..self.clone()
         }
     }
@@ -1401,7 +1431,7 @@ impl ActorOutputValveSignal {
         }
     }
 
-    pub fn subscribe(&self) -> impl Stream<Item = ()> {
+    pub fn stream(&self) -> impl Stream<Item = ()> {
         let (impulse_sender, impulse_receiver) = mpsc::unbounded();
         if let Err(error) = self.impulse_sender_sender.unbounded_send(impulse_sender) {
             eprintln!("Failed to subscribe to actor output valve signal: {error:#}");
@@ -1524,12 +1554,14 @@ impl<T: IntoCowStr<'static>> From<T> for ConstructId {
 
 pub struct Variable {
     construct_info: ConstructInfoComplete,
-    persistence_id: Option<parser::PersistenceId>,
-    /// Scope prefix from List/map context (ActorContext.persistence_id_prefix).
+    /// Persistence identity from parser - REQUIRED for all Variables.
+    /// Combined with scope using `persistence_id.in_scope(&scope)` to create unique keys.
+    persistence_id: parser::PersistenceId,
+    /// Scope context from List/map evaluation - either Root or Nested with a unique prefix.
     /// Combined with persistence_id to create a unique key per list item.
     /// This is how we distinguish item1.completed from item2.completed.
-    scope_prefix: Option<String>,
-    /// Registry key for LINK variables, includes persistence_id_prefix from List/map context.
+    scope: parser::Scope,
+    /// Registry key for LINK variables, includes scope from List/map context.
     /// Used by bridges to subscribe to registry updates with the correct item-unique key.
     registry_key: Option<LinkRegistryKey>,
     name: Cow<'static, str>,
@@ -1546,13 +1578,13 @@ impl Variable {
         construct_context: ConstructContext,
         name: impl Into<Cow<'static, str>>,
         value_actor: Arc<ValueActor>,
-        persistence_id: Option<parser::PersistenceId>,
-        scope_prefix: Option<String>,
+        persistence_id: parser::PersistenceId,
+        scope: parser::Scope,
     ) -> Self {
         Self {
             construct_info: construct_info.complete(ConstructType::Variable),
             persistence_id,
-            scope_prefix,
+            scope,
             registry_key: None,  // Non-LINK variables don't use registry
             name: name.into(),
             value_actor,
@@ -1566,8 +1598,8 @@ impl Variable {
         construct_context: ConstructContext,
         name: impl Into<Cow<'static, str>>,
         value_actor: Arc<ValueActor>,
-        persistence_id: Option<parser::PersistenceId>,
-        scope_prefix: Option<String>,
+        persistence_id: parser::PersistenceId,
+        scope: parser::Scope,
     ) -> Arc<Self> {
         Arc::new(Self::new(
             construct_info,
@@ -1575,7 +1607,7 @@ impl Variable {
             name,
             value_actor,
             persistence_id,
-            scope_prefix,
+            scope,
         ))
     }
 
@@ -1586,14 +1618,14 @@ impl Variable {
         construct_context: ConstructContext,
         name: impl Into<Cow<'static, str>>,
         value_actor: Arc<ValueActor>,
-        persistence_id: Option<parser::PersistenceId>,
-        scope_prefix: Option<String>,
+        persistence_id: parser::PersistenceId,
+        scope: parser::Scope,
         forwarding_loop: ActorLoop,
     ) -> Arc<Self> {
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::Variable),
             persistence_id,
-            scope_prefix,
+            scope,
             registry_key: None,  // Non-LINK variables don't use registry
             name: name.into(),
             value_actor,
@@ -1602,12 +1634,12 @@ impl Variable {
         })
     }
 
-    pub fn persistence_id(&self) -> Option<parser::PersistenceId> {
+    pub fn persistence_id(&self) -> parser::PersistenceId {
         self.persistence_id
     }
 
-    pub fn scope_prefix(&self) -> Option<&str> {
-        self.scope_prefix.as_deref()
+    pub fn scope(&self) -> &parser::Scope {
+        &self.scope
     }
 
     pub fn registry_key(&self) -> Option<&LinkRegistryKey> {
@@ -1619,7 +1651,7 @@ impl Variable {
         construct_context: ConstructContext,
         name: impl Into<Cow<'static, str>>,
         actor_context: ActorContext,
-        persistence_id: Option<parser::PersistenceId>,
+        persistence_id: parser::PersistenceId,
     ) -> Arc<Self> {
         let ConstructInfo {
             id: actor_id,
@@ -1641,25 +1673,22 @@ impl Variable {
             zoon::println!("[LINK] Received value: {} -> {:?}", variable_description_for_log, value.construct_info());
             value
         });
-        // Capture the persistence_id_prefix before actor_context is moved
-        let persistence_id_prefix = actor_context.persistence_id_prefix.clone();
+        // Capture the scope before actor_context is moved
+        let scope = actor_context.scope.clone();
         let value_actor =
-            ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_stream_with_logging), persistence_id);
+            ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_stream_with_logging), Some(persistence_id));
         let value_actor = Arc::new(value_actor);
 
         // Register with LinkActorRegistry so bridges can subscribe to sender updates
-        // Use the persistence_id_prefix from actor_context to make the key unique per list item
-        let registry_key = persistence_id.map(|pid| {
-            let key = LinkRegistryKey::new(persistence_id_prefix.clone(), pid);
-            construct_context.link_actor_registry.register(key.clone(), link_value_sender.clone(), value_actor.clone());
-            key
-        });
+        // Use the scope from actor_context to make the key unique per list item
+        let registry_key = LinkRegistryKey::new(scope.clone(), persistence_id);
+        construct_context.link_actor_registry.register(registry_key.clone(), link_value_sender.clone(), value_actor.clone());
 
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
             persistence_id,
-            scope_prefix: persistence_id_prefix,
-            registry_key,
+            scope,
+            registry_key: Some(registry_key),
             name: name.into(),
             value_actor,
             link_value_sender: Some(link_value_sender),
@@ -1684,7 +1713,7 @@ impl Variable {
         construct_context: ConstructContext,
         name: impl Into<Cow<'static, str>>,
         actor_context: ActorContext,
-        persistence_id: Option<parser::PersistenceId>,
+        persistence_id: parser::PersistenceId,
         existing_sender: mpsc::UnboundedSender<Value>,
         existing_value_actor: Arc<ValueActor>,
     ) -> Arc<Self> {
@@ -1702,21 +1731,18 @@ impl Variable {
         // Use existing sender (clone) and value_actor
         let link_value_sender = existing_sender.clone();
 
-        // Compute registry_key with current prefix (for bridge routing)
-        let persistence_id_prefix = actor_context.persistence_id_prefix.clone();
-        let registry_key = persistence_id.map(|pid| {
-            let key = LinkRegistryKey::new(persistence_id_prefix.clone(), pid);
-            // Register with the CURRENT prefix - bridges need this for routing
-            construct_context.link_actor_registry.register(key.clone(), link_value_sender.clone(), existing_value_actor.clone());
-            zoon::println!("[VARIABLE] Reusing ValueActor for LINK, registering with new key: {:?}", key);
-            key
-        });
+        // Compute registry_key with current scope (for bridge routing)
+        let scope = actor_context.scope.clone();
+        let registry_key = LinkRegistryKey::new(scope.clone(), persistence_id);
+        // Register with the CURRENT scope - bridges need this for routing
+        construct_context.link_actor_registry.register(registry_key.clone(), link_value_sender.clone(), existing_value_actor.clone());
+        zoon::println!("[VARIABLE] Reusing ValueActor for LINK, registering with new key: {:?}", registry_key);
 
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
             persistence_id,
-            scope_prefix: persistence_id_prefix,
-            registry_key,
+            scope,
+            registry_key: Some(registry_key),
             name: name.into(),
             value_actor: existing_value_actor,
             link_value_sender: Some(link_value_sender),
@@ -1739,8 +1765,8 @@ impl Variable {
         construct_info: ConstructInfo,
         construct_context: ConstructContext,
         name: impl Into<Cow<'static, str>>,
-        persistence_id: Option<parser::PersistenceId>,
-        scope_prefix: Option<String>,
+        persistence_id: parser::PersistenceId,
+        scope: parser::Scope,
         registry_key: Option<LinkRegistryKey>,
         forwarding_actor: Arc<ValueActor>,
         link_value_sender: mpsc::UnboundedSender<Value>,
@@ -1749,7 +1775,7 @@ impl Variable {
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
             persistence_id,
-            scope_prefix,
+            scope,
             registry_key,  // Pass through from the base LINK so bridges can look up with correct key
             name: name.into(),
             // Use forwarding_actor so sibling field lookups work correctly
@@ -1799,22 +1825,16 @@ impl Variable {
     }
 
     /// Sync wrapper for stream_from_now() - returns stream that emits only future values.
-    pub fn stream_from_now_stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+    ///
+    /// Use this when you need stream_from_now() semantics but can't await.
+    pub fn stream_from_now_sync(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
         stream::once(async move { self.stream_from_now().await }).flatten().boxed_local()
     }
 
-    // === Deprecated Wrappers ===
-
-    /// Deprecated: Use `stream()` instead.
-    #[deprecated(since = "0.2.0", note = "Use stream() instead")]
-    #[allow(dead_code)]
-    pub async fn subscribe(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        self.stream().await
-    }
-
-    /// Deprecated: Use `stream::once(async move { var.stream().await }).flatten()` instead.
-    #[deprecated(since = "0.2.0", note = "Use stream::once(async move { var.stream().await }).flatten() instead")]
-    pub fn subscribe_stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+    /// Sync wrapper for stream() - returns continuous stream from version 0.
+    ///
+    /// Use this when you need stream() semantics but can't await.
+    pub fn stream_sync(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
         stream::once(async move { self.stream().await }).flatten().boxed_local()
     }
 
@@ -1884,11 +1904,11 @@ impl VariableOrArgumentReference {
             root_value_actor.await
         })
             .flat_map(move |actor| {
-                // Use snapshot() or stream() based on context - type-safe subscription
+                // Use value() or stream() based on context - type-safe subscription
                 if use_snapshot {
-                    // Snapshot: convert Future to single-item Stream
-                    stream::once(actor.snapshot())
-                        .filter_map(|v| async { v })
+                    // Value: convert Future to single-item Stream
+                    stream::once(actor.value())
+                        .filter_map(|v| async { v.ok() })
                         .boxed_local()
                 } else {
                     // Streaming: continuous updates - lazy wrapper for sync context
@@ -1927,102 +1947,20 @@ impl VariableOrArgumentReference {
                     match value {
                         Value::Object(object, _) => {
                             let variable = object.expect_variable(&alias_part_for_key);
-                            // Compute key from scope_prefix + persistence_id to ensure:
-                            // - UNIQUENESS: Different list items get different keys (prefix differs)
-                            // - STABILITY: Same list item across WHILE re-renders keeps same key
-                            // NO FALLBACKS - missing identity is a bug that should be fixed at source
-                            let key = if let Some(rk) = variable.registry_key() {
-                                // LINK variable - use registry_key which already has prefix + persistence_id
-                                let key = rk.to_key();
-                                zoon::println!("[ALIAS_KEY] '.{}' LINK var with registry_key={:?}, key={}", alias_part_for_key, rk, key);
-                                key
-                            } else {
-                                // Non-LINK variable - compute key from available identity info
-                                // Priority: scope_prefix (for List/map uniqueness) + persistence_id (source code location)
-                                match (variable.scope_prefix(), variable.persistence_id()) {
-                                    (Some(prefix), Some(pid)) => {
-                                        // Inside List/map with parsed variable: use both for full identity
-                                        use std::hash::{Hash, Hasher};
-                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                        prefix.hash(&mut hasher);
-                                        pid.hash(&mut hasher);
-                                        let key = hasher.finish() as usize;
-                                        zoon::println!("[ALIAS_KEY] '.{}' var with scope_prefix+pid, key={}", alias_part_for_key, key);
-                                        key
-                                    }
-                                    (Some(prefix), None) => {
-                                        // Inside List/map with API-created variable: scope_prefix provides uniqueness
-                                        use std::hash::{Hash, Hasher};
-                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                        prefix.hash(&mut hasher);
-                                        alias_part_for_key.hash(&mut hasher); // Include field name for stability
-                                        let key = hasher.finish() as usize;
-                                        zoon::println!("[ALIAS_KEY] '.{}' API var with scope_prefix only, key={}", alias_part_for_key, key);
-                                        key
-                                    }
-                                    (None, Some(pid)) => {
-                                        // Top-level parsed variable: persistence_id alone is unique
-                                        let key = pid.to_key();
-                                        zoon::println!("[ALIAS_KEY] '.{}' top-level var with pid, key={}", alias_part_for_key, key);
-                                        key
-                                    }
-                                    (None, None) => {
-                                        // Top-level API-created variable (e.g., ElementButton.event at top-level)
-                                        // There's only one instance, so a constant key is safe
-                                        zoon::println!("[ALIAS_KEY] '.{}' API var at top-level (no identity), key=0", alias_part_for_key);
-                                        0
-                                    }
-                                }
-                            };
+                            // All Variables have required persistence_id and scope - use PersistenceId directly as key
+                            // persistence_id.in_scope(&scope) ensures uniqueness across list items
+                            let key = variable.persistence_id().in_scope(variable.scope());
+                            zoon::println!("[ALIAS_KEY] '.{}' key={}", alias_part_for_key, key);
                             key
                         }
                         Value::TaggedObject(tagged_object, _) => {
                             let variable = tagged_object.expect_variable(&alias_part_for_key);
-                            let key = if let Some(rk) = variable.registry_key() {
-                                // LINK variable - use registry_key which already has prefix + persistence_id
-                                let key = rk.to_key();
-                                zoon::println!("[ALIAS_KEY:Tagged] '.{}' LINK var with registry_key={:?}, key={}", alias_part_for_key, rk, key);
-                                key
-                            } else {
-                                // Non-LINK variable - compute key from available identity info
-                                match (variable.scope_prefix(), variable.persistence_id()) {
-                                    (Some(prefix), Some(pid)) => {
-                                        // Inside List/map with parsed variable: use both for full identity
-                                        use std::hash::{Hash, Hasher};
-                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                        prefix.hash(&mut hasher);
-                                        pid.hash(&mut hasher);
-                                        let key = hasher.finish() as usize;
-                                        zoon::println!("[ALIAS_KEY:Tagged] '.{}' var with scope_prefix+pid, prefix={:?}, pid={:?}, key={}", alias_part_for_key, prefix, pid, key);
-                                        key
-                                    }
-                                    (Some(prefix), None) => {
-                                        // Inside List/map with API-created variable: scope_prefix provides uniqueness
-                                        use std::hash::{Hash, Hasher};
-                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                        prefix.hash(&mut hasher);
-                                        alias_part_for_key.hash(&mut hasher); // Include field name for stability
-                                        let key = hasher.finish() as usize;
-                                        zoon::println!("[ALIAS_KEY:Tagged] '.{}' API var with scope_prefix only, key={}", alias_part_for_key, key);
-                                        key
-                                    }
-                                    (None, Some(pid)) => {
-                                        // Top-level parsed variable: persistence_id alone is unique
-                                        let key = pid.to_key();
-                                        zoon::println!("[ALIAS_KEY:Tagged] '.{}' top-level var with pid, key={}", alias_part_for_key, key);
-                                        key
-                                    }
-                                    (None, None) => {
-                                        // Top-level API-created variable (e.g., ElementButton.event at top-level)
-                                        // There's only one instance, so a constant key is safe
-                                        zoon::println!("[ALIAS_KEY:Tagged] '.{}' API var at top-level (no identity), key=0", alias_part_for_key);
-                                        0
-                                    }
-                                }
-                            };
+                            // All Variables have required persistence_id and scope - use PersistenceId directly as key
+                            let key = variable.persistence_id().in_scope(variable.scope());
+                            zoon::println!("[ALIAS_KEY:Tagged] '.{}' key={}", alias_part_for_key, key);
                             key
                         }
-                        _ => 0, // Non-object values get key 0 (will cause panic in map_fn anyway)
+                        _ => parser::PersistenceId::default(), // Non-object values get default key (will cause panic in map_fn anyway)
                     }
                 },
                 move |value| {
@@ -2050,16 +1988,16 @@ impl VariableOrArgumentReference {
                         let is_link = variable.registry_key().is_some();
                         let link_registry_key = variable.registry_key().cloned();
                         let variable_actor = variable.value_actor();
-                        // Use snapshot() or stream() based on context - type-safe subscription
+                        // Use value() or stream() based on context - type-safe subscription
                         if use_snapshot {
-                            // Snapshot: get one value using the type-safe Future API
+                            // Value: get one value using the type-safe Future API
                             stream::once(async move {
-                                let value = variable_actor.snapshot().await;
+                                let value = variable_actor.value().await;
                                 // Keep object and variable alive for the value's lifetime
                                 let _ = (&object, &variable);
                                 value
                             })
-                            .filter_map(|v| async { v })
+                            .filter_map(|v| async { v.ok() })
                             .boxed_local()
                         } else {
                             // Streaming: continuous updates - use stream() and keep alive
@@ -2073,11 +2011,17 @@ impl VariableOrArgumentReference {
                                             Some(s) => (s, false),
                                             None => {
                                                 zoon::println!("[ALIAS_UNFOLD] Creating new subscription for '.{}'", alias_part_log);
-                                                // For LINK variables: look up shared ValueActor from registry by FULL key
+                                                // For LINK variables: look up shared ValueActor from registry
+                                                // Try full key first (for list items), then fallback to persistence_id only
                                                 let actor = if is_link {
                                                     if let Some(key) = link_key.clone() {
-                                                        if let Some((_, shared_actor)) = registry.get(key).await {
-                                                            zoon::println!("[ALIAS_UNFOLD] Using shared ValueActor from registry for LINK '.{}'", alias_part_log);
+                                                        // First try full key lookup (prefix + persistence_id)
+                                                        if let Some((_, shared_actor)) = registry.get(key.clone()).await {
+                                                            zoon::println!("[ALIAS_UNFOLD] Using shared ValueActor from registry for LINK '{}' (full key)", alias_part_log);
+                                                            shared_actor
+                                                        // Fallback: try persistence_id only (for LINKs where prefix might differ)
+                                                        } else if let Some((_, shared_actor)) = registry.get_link_by_persistence_id(key.persistence_id).await {
+                                                            zoon::println!("[ALIAS_UNFOLD] Using shared ValueActor from registry for LINK '{}' (pid fallback)", alias_part_log);
                                                             shared_actor
                                                         } else {
                                                             zoon::println!("[ALIAS_UNFOLD] LINK '.{}' not found in registry, using variable's actor", alias_part_log);
@@ -2123,16 +2067,16 @@ impl VariableOrArgumentReference {
                         let link_registry_key = variable.registry_key().cloned();
                         let variable_actor = variable.value_actor();
                         let registry = registry.clone();
-                        // Use snapshot() or stream() based on context - type-safe subscription
+                        // Use value() or stream() based on context - type-safe subscription
                         if use_snapshot {
-                            // Snapshot: get one value using the type-safe Future API
+                            // Value: get one value using the type-safe Future API
                             stream::once(async move {
-                                let value = variable_actor.snapshot().await;
+                                let value = variable_actor.value().await;
                                 // Keep tagged_object and variable alive for the value's lifetime
                                 let _ = (&tagged_object, &variable);
                                 value
                             })
-                            .filter_map(|v| async { v })
+                            .filter_map(|v| async { v.ok() })
                             .boxed_local()
                         } else {
                             // Streaming: continuous updates - use stream() and keep alive
@@ -2146,11 +2090,17 @@ impl VariableOrArgumentReference {
                                             Some(s) => (s, false),
                                             None => {
                                                 zoon::println!("[ALIAS_UNFOLD:Tagged] Creating new subscription for '.{}'", alias_part_log);
-                                                // For LINK variables: look up shared ValueActor from registry by FULL key
+                                                // For LINK variables: look up shared ValueActor from registry
+                                                // Try full key first (for list items), then fallback to persistence_id only
                                                 let actor = if is_link {
                                                     if let Some(key) = link_key.clone() {
-                                                        if let Some((_, shared_actor)) = registry.get(key).await {
-                                                            zoon::println!("[ALIAS_UNFOLD:Tagged] Using shared ValueActor from registry for LINK '.{}'", alias_part_log);
+                                                        // First try full key lookup (prefix + persistence_id)
+                                                        if let Some((_, shared_actor)) = registry.get(key.clone()).await {
+                                                            zoon::println!("[ALIAS_UNFOLD:Tagged] Using shared ValueActor from registry for LINK '{}' (full key)", alias_part_log);
+                                                            shared_actor
+                                                        // Fallback: try persistence_id only (for LINKs where prefix might differ)
+                                                        } else if let Some((_, shared_actor)) = registry.get_link_by_persistence_id(key.persistence_id).await {
+                                                            zoon::println!("[ALIAS_UNFOLD:Tagged] Using shared ValueActor from registry for LINK '{}' (pid fallback)", alias_part_log);
                                                             shared_actor
                                                         } else {
                                                             zoon::println!("[ALIAS_UNFOLD:Tagged] LINK '.{}' not found in registry, using variable's actor", alias_part_log);
@@ -2421,27 +2371,24 @@ impl LinkConnector {
 
 // --- LinkActorRegistry ---
 
-/// Composite key for LinkActorRegistry that combines persistence_id with an optional prefix.
-/// The prefix comes from List/map evaluation context, making LINKs unique per list item.
-/// Without the prefix, all LINKs from the same source position would share the same registry entry.
+/// Composite key for LinkActorRegistry that combines persistence_id with scope.
+/// The scope comes from List/map evaluation context, making LINKs unique per list item.
+/// Without proper scoping, all LINKs from the same source position would share the same registry entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LinkRegistryKey {
-    pub prefix: Option<String>,
+    pub scope: parser::Scope,
     pub persistence_id: parser::PersistenceId,
 }
 
 impl LinkRegistryKey {
-    pub fn new(prefix: Option<String>, persistence_id: parser::PersistenceId) -> Self {
-        Self { prefix, persistence_id }
+    pub fn new(scope: parser::Scope, persistence_id: parser::PersistenceId) -> Self {
+        Self { scope, persistence_id }
     }
 
-    /// Convert to a usize key for use in switch_map_by_key.
-    /// Uses a hash of the full registry key (prefix + persistence_id) to create a unique key.
-    pub fn to_key(&self) -> usize {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.hash(&mut hasher);
-        hasher.finish() as usize
+    /// Returns the combined identity as PersistenceId for use as key.
+    /// Uses persistence_id.in_scope(&scope) to create a unique key per list item.
+    pub fn to_key(&self) -> parser::PersistenceId {
+        self.persistence_id.in_scope(&self.scope)
     }
 }
 
@@ -2648,10 +2595,10 @@ impl LinkActorRegistry {
         receiver
     }
 
-    /// Get an existing sender and ValueActor by persistence_id only (ignoring prefix).
+    /// Get an existing sender and ValueActor by persistence_id only (ignoring scope).
     ///
     /// This is the KEY method for fixing the 3rd click bug. When WHILE re-renders,
-    /// the persistence_id_prefix changes (contains ULIDs) but the persistence_id
+    /// the scope changes (contains ULIDs for nested contexts) but the persistence_id
     /// stays stable. By looking up by persistence_id alone, we can reuse the
     /// existing ValueActor instead of creating a new one.
     ///
@@ -2733,7 +2680,7 @@ impl FunctionCall {
             // Subscribe to all arguments and filter for FLUSHED values only
             let flushed_streams: Vec<_> = arguments_for_flushed
                 .iter()
-                .map(|arg| arg.clone().subscribe_stream().filter(|v| {
+                .map(|arg| arg.clone().stream_sync().filter(|v| {
                     let is_flushed = v.is_flushed();
                     std::future::ready(is_flushed)
                 }))
@@ -2805,8 +2752,8 @@ impl LatestCombinator {
 
         let value_stream =
             stream::select_all(inputs.iter().enumerate().map(|(index, value_actor)| {
-                // Use subscribe_stream() to properly handle lazy actors in HOLD body context
-                value_actor.clone().subscribe_stream().map(move |value| {
+                // Use stream_sync() to properly handle lazy actors in HOLD body context
+                value_actor.clone().stream_sync().map(move |value| {
                     // DEBUG: Log what LATEST receives from each arm
                     let value_desc = match &value {
                         Value::Text(t, _) => format!("Text('{}')", t.text()),
@@ -2908,8 +2855,8 @@ impl ThenCombinator {
         let observed_for_subscribe = observed.clone();
         let send_impulse_loop = ActorLoop::new(
             observed_for_subscribe
-                // Use subscribe_stream() to properly handle lazy actors in HOLD body context
-                .subscribe_stream()
+                // Use stream_sync() to properly handle lazy actors in HOLD body context
+                .stream_sync()
                 .scan(true, {
                     let storage = storage.clone();
                     move |first_run, value| {
@@ -2968,8 +2915,8 @@ impl ThenCombinator {
                     }
                 }),
         );
-        // Use subscribe_stream() to properly handle lazy body actors in HOLD context
-        let value_stream = body.clone().subscribe_stream().map(|mut value| {
+        // Use stream_sync() to properly handle lazy body actors in HOLD context
+        let value_stream = body.clone().stream_sync().map(|mut value| {
             value.set_idempotency_key(ValueIdempotencyKey::new());
             value
         });
@@ -3015,10 +2962,10 @@ impl BinaryOperatorCombinator {
         let construct_info = construct_info.complete(ConstructType::ValueActor);
 
         // Merge both operand streams, tracking which operand changed
-        // Use subscribe_stream() to properly handle lazy actors in HOLD body context
+        // Use stream_sync() to properly handle lazy actors in HOLD body context
         let value_stream = stream::select_all([
-            operand_a.clone().subscribe_stream().map(|v| (0usize, v)).boxed_local(),
-            operand_b.clone().subscribe_stream().map(|v| (1usize, v)).boxed_local(),
+            operand_a.clone().stream_sync().map(|v| (0usize, v)).boxed_local(),
+            operand_b.clone().stream_sync().map(|v| (1usize, v)).boxed_local(),
         ])
         .scan(
             (None::<Value>, None::<Value>),
@@ -3386,10 +3333,10 @@ impl WhenCombinator {
         let arms = Arc::new(arms);
 
         // For each input value, find the matching arm and emit its body's value
-        // Use subscribe_stream() to properly handle lazy actors in HOLD body context
+        // Use stream_sync() to properly handle lazy actors in HOLD body context
         let value_stream = input
             .clone()
-            .subscribe_stream()
+            .stream_sync()
             .flat_map({
                 let arms = arms.clone();
                 move |input_value| {
@@ -3400,7 +3347,7 @@ impl WhenCombinator {
 
                     if let Some(arm) = matched_arm {
                         // Subscribe to the matching arm's body
-                        arm.body.clone().subscribe_stream()
+                        arm.body.clone().stream_sync()
                     } else {
                         // No match - this shouldn't happen if we have a wildcard default
                         // Return an empty stream
@@ -3674,7 +3621,7 @@ impl ValueActor {
 
                 let mut output_valve_impulse_stream =
                     if let Some(output_valve_signal) = &output_valve_signal {
-                        output_valve_signal.subscribe().left_stream()
+                        output_valve_signal.stream().left_stream()
                     } else {
                         stream::pending().right_stream()
                     }
@@ -4030,7 +3977,7 @@ impl ValueActor {
 
                 let mut output_valve_impulse_stream =
                     if let Some(output_valve_signal) = &output_valve_signal {
-                        output_valve_signal.subscribe().left_stream()
+                        output_valve_signal.stream().left_stream()
                     } else {
                         stream::pending().right_stream()
                     }
@@ -4163,16 +4110,22 @@ impl ValueActor {
 
     /// Get the current stored value (async).
     ///
-    /// Returns `Some(value)` if the actor has produced a value, `None` otherwise.
-    /// This queries the actor loop via a bounded channel with backpressure.
-    pub async fn stored_value(&self) -> Option<Value> {
+    /// Returns `Ok(value)` if the actor has a stored value.
+    /// Returns `Err(NoValueYet)` if the actor exists but hasn't stored a value yet.
+    /// Returns `Err(ActorDropped)` if the actor was dropped.
+    ///
+    /// For properties with Boon-level initial values, use `.expect("reason")`.
+    /// For LINK variables (user interaction), handle the error gracefully.
+    pub async fn current_value(&self) -> Result<Value, CurrentValueError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        // Use try_send for non-blocking send (unbounded semantics)
-        if let Err(e) = self.stored_value_query_sender.unbounded_send(StoredValueQuery { reply: reply_tx }) {
-            eprintln!("Failed to send stored value query: {e:#}");
-            return None;
+        if self.stored_value_query_sender.unbounded_send(StoredValueQuery { reply: reply_tx }).is_err() {
+            return Err(CurrentValueError::ActorDropped);
         }
-        reply_rx.await.ok().flatten()
+        match reply_rx.await {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => Err(CurrentValueError::NoValueYet),
+            Err(_) => Err(CurrentValueError::ActorDropped),
+        }
     }
 
     /// Create a new ValueActor with a channel-based stream for forwarding values.
@@ -4235,7 +4188,7 @@ impl ValueActor {
                 let _ = forwarding_sender.unbounded_send(value);
             }
 
-            let mut subscription = source_actor.subscribe().await;
+            let mut subscription = source_actor.stream().await;
             while let Some(value) = subscription.next().await {
                 if forwarding_sender.unbounded_send(value).is_err() {
                     break;
@@ -4292,7 +4245,7 @@ impl ValueActor {
 
                 let mut output_valve_impulse_stream =
                     if let Some(output_valve_signal) = &output_valve_signal {
-                        output_valve_signal.subscribe().left_stream()
+                        output_valve_signal.stream().left_stream()
                     } else {
                         stream::pending().right_stream()
                     }
@@ -4425,28 +4378,35 @@ impl ValueActor {
     // === Clean Subscription API ===
     //
     // Primary methods for getting values:
-    // - snapshot() returns Future<Option<Value>> - exactly ONE value
+    // - value() returns Future<Result<Value, ValueError>> - exactly ONE value
     // - stream() returns Stream<Item=Value> - continuous updates
     //
     // Deprecated wrappers are provided for incremental migration.
 
-    /// Get exactly ONE value - the current snapshot.
+    /// Get exactly ONE value - waiting if necessary.
     ///
     /// Returns a `Future`, not a `Stream`. This makes it **impossible to misuse**:
     /// - Future resolves once → you get one value
     /// - No need for `.take(1)` - the type itself enforces single-value semantics
     ///
-    /// Use this in THEN/WHEN bodies where you need a point-in-time snapshot of values.
+    /// Use this in THEN/WHEN bodies where you need a point-in-time value.
     ///
-    /// If the actor has no value yet (version 0), waits for the first value.
-    pub async fn snapshot(self: Arc<Self>) -> Option<Value> {
+    /// Returns `Ok(value)` when a value is available.
+    /// Returns `Err(ActorDropped)` if the actor dies before producing a value.
+    ///
+    /// For LINK variables (user interaction), handle ActorDropped gracefully -
+    /// the user may navigate away without triggering the event.
+    pub async fn value(self: Arc<Self>) -> Result<Value, ValueError> {
         // If we already have a value, return it directly
         if self.version() > 0 {
-            return self.stored_value().await;
+            return self.current_value().await.map_err(|e| match e {
+                CurrentValueError::NoValueYet => unreachable!("version > 0 implies value exists"),
+                CurrentValueError::ActorDropped => ValueError::ActorDropped,
+            });
         }
         // Otherwise stream and wait for first value
         let mut s = self.stream().await;
-        s.next().await
+        s.next().await.ok_or(ValueError::ActorDropped)
     }
 
     /// Subscribe to continuous stream of all values from version 0 (async).
@@ -4459,7 +4419,7 @@ impl ValueActor {
     pub async fn stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
         // Handle lazy actors
         if let Some(ref lazy_delegate) = self.lazy_delegate {
-            return lazy_delegate.clone().subscribe().boxed_local();
+            return lazy_delegate.clone().stream().boxed_local();
         }
 
         // Wait for actor to be ready (has processed at least one value).
@@ -4503,7 +4463,7 @@ impl ValueActor {
     pub async fn stream_from_now(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
         // Handle lazy actors
         if let Some(ref lazy_delegate) = self.lazy_delegate {
-            return lazy_delegate.clone().subscribe().boxed_local();
+            return lazy_delegate.clone().stream().boxed_local();
         }
 
         // Capture current version BEFORE subscribing - this is the key difference from stream()
@@ -4532,28 +4492,17 @@ impl ValueActor {
     }
 
     /// Sync wrapper for stream_from_now() - returns stream that emits only future values.
-    pub fn stream_from_now_stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+    ///
+    /// Use this when you need stream_from_now() semantics but can't await.
+    pub fn stream_from_now_sync(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
         stream::once(async move { self.stream_from_now().await }).flatten().boxed_local()
     }
 
-    // === Deprecated Wrappers ===
-    // These are provided for incremental migration. Use stream() instead.
-
-    /// Deprecated: Use `stream()` instead.
-    #[deprecated(since = "0.2.0", note = "Use stream() instead")]
-    pub async fn subscribe(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        self.stream().await
-    }
-
-    /// Deprecated: Use `stream::once(async move { actor.stream().await }).flatten()` instead.
-    #[deprecated(since = "0.2.0", note = "Use stream::once(async move { actor.stream().await }).flatten() instead")]
-    pub fn subscribe_stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        stream::once(async move { self.stream().await }).flatten().boxed_local()
-    }
-
-    /// Deprecated: Use `stream::once(async move { actor.stream().await }).flatten()` instead.
-    #[deprecated(since = "0.2.0", note = "Use stream::once(async move { actor.stream().await }).flatten() instead")]
-    pub fn stream_stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+    /// Sync wrapper for stream() - returns continuous stream from version 0.
+    ///
+    /// Use this when you need stream() semantics but can't await.
+    /// Equivalent to: `stream::once(async move { actor.stream().await }).flatten()`
+    pub fn stream_sync(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
         stream::once(async move { self.stream().await }).flatten().boxed_local()
     }
 
@@ -4568,9 +4517,9 @@ impl ValueActor {
             return ValueUpdate::Current;
         }
         // For now, always return snapshot. Phase 4 will add diff support for LIST.
-        match self.stored_value().await {
-            Some(value) => ValueUpdate::Snapshot(value),
-            None => ValueUpdate::Current,
+        match self.current_value().await {
+            Ok(value) => ValueUpdate::Snapshot(value),
+            Err(_) => ValueUpdate::Current,
         }
     }
 }
@@ -4818,7 +4767,7 @@ impl Value {
             Value::Object(object, _) => {
                 let mut obj = serde_json::Map::new();
                 for variable in object.variables() {
-                    let value = variable.value_actor().clone().subscribe().await.next().await;
+                    let value = variable.value_actor().clone().stream().await.next().await;
                     if let Some(value) = value {
                         let json_value = Box::pin(value.to_json()).await;
                         obj.insert(variable.name().to_string(), json_value);
@@ -4830,7 +4779,7 @@ impl Value {
                 let mut obj = serde_json::Map::new();
                 obj.insert("_tag".to_string(), serde_json::Value::String(tagged_object.tag().to_string()));
                 for variable in tagged_object.variables() {
-                    let value = variable.value_actor().clone().subscribe().await.next().await;
+                    let value = variable.value_actor().clone().stream().await.next().await;
                     if let Some(value) = value {
                         let json_value = Box::pin(value.to_json()).await;
                         obj.insert(variable.name().to_string(), json_value);
@@ -4839,11 +4788,11 @@ impl Value {
                 serde_json::Value::Object(obj)
             }
             Value::List(list, _) => {
-                let first_change = list.clone().subscribe().next().await;
+                let first_change = list.clone().stream().next().await;
                 if let Some(ListChange::Replace { items }) = first_change {
                     let mut json_items = Vec::new();
                     for item in items {
-                        let value = item.clone().subscribe().await.next().await;
+                        let value = item.clone().stream().await.next().await;
                         if let Some(value) = value {
                             let json_value = Box::pin(value.to_json()).await;
                             json_items.push(json_value);
@@ -4932,8 +4881,8 @@ impl Value {
                                     construct_context.clone(),
                                     (*name).clone(),
                                     value_actor,
-                                    None,
-                                    actor_context.persistence_id_prefix.clone(),
+                                    parser::PersistenceId::new(),
+                                    actor_context.scope.clone(),
                                 )
                             })
                             .collect();
@@ -4971,8 +4920,8 @@ impl Value {
                                 construct_context.clone(),
                                 name.clone(),
                                 value_actor,
-                                None,
-                                actor_context.persistence_id_prefix.clone(),
+                                parser::PersistenceId::new(),
+                                actor_context.scope.clone(),
                             )
                         })
                         .collect();
@@ -5073,7 +5022,7 @@ pub async fn materialize_value(
             let mut materialized_vars: Vec<Arc<Variable>> = Vec::new();
             for variable in object.variables() {
                 // Await the variable's current value through subscription (proper async)
-                let var_value = variable.value_actor().clone().subscribe().await.next().await;
+                let var_value = variable.value_actor().clone().stream().await.next().await;
                 if let Some(var_value) = var_value {
                     // Recursively materialize nested values
                     let materialized = Box::pin(materialize_value(
@@ -5102,8 +5051,8 @@ pub async fn materialize_value(
                         construct_context.clone(),
                         variable.name().to_string(),
                         value_actor,
-                        None,
-                        actor_context.persistence_id_prefix.clone(),
+                        parser::PersistenceId::new(),
+                        actor_context.scope.clone(),
                     );
                     materialized_vars.push(new_var);
                 }
@@ -5118,7 +5067,7 @@ pub async fn materialize_value(
         Value::TaggedObject(tagged_object, metadata) => {
             let mut materialized_vars: Vec<Arc<Variable>> = Vec::new();
             for variable in tagged_object.variables() {
-                let var_value = variable.value_actor().clone().subscribe().await.next().await;
+                let var_value = variable.value_actor().clone().stream().await.next().await;
                 if let Some(var_value) = var_value {
                     let materialized = Box::pin(materialize_value(
                         var_value,
@@ -5144,8 +5093,8 @@ pub async fn materialize_value(
                         construct_context.clone(),
                         variable.name().to_string(),
                         value_actor,
-                        None,
-                        actor_context.persistence_id_prefix.clone(),
+                        parser::PersistenceId::new(),
+                        actor_context.scope.clone(),
                     );
                     materialized_vars.push(new_var);
                 }
@@ -5825,7 +5774,7 @@ impl List {
                 let output_valve_signal = output_valve_signal;
                 let mut output_valve_impulse_stream =
                     if let Some(output_valve_signal) = &output_valve_signal {
-                        output_valve_signal.subscribe().left_stream()
+                        output_valve_signal.stream().left_stream()
                     } else {
                         stream::pending().right_stream()
                     }
@@ -6080,8 +6029,8 @@ impl List {
     /// list reference is released.
     ///
     /// Takes ownership of the Arc to keep the list alive for the subscription lifetime.
-    /// Callers should use `.clone().subscribe()` if they need to retain a reference.
-    pub fn subscribe(self: Arc<Self>) -> ListSubscription {
+    /// Callers should use `.clone().stream()` if they need to retain a reference.
+    pub fn stream(self: Arc<Self>) -> ListSubscription {
         let (change_sender, change_receiver) = mpsc::unbounded();
         if let Err(error) = self.change_sender_sender.unbounded_send(change_sender) {
             eprintln!("Failed to subscribe to {}: {error:#}", self.construct_info);
@@ -6187,13 +6136,13 @@ impl List {
             let list_for_save = list.clone();
             let construct_storage_for_save = construct_storage;
             Task::start(async move {
-                let mut change_stream = pin!(list_for_save.clone().subscribe());
+                let mut change_stream = pin!(list_for_save.clone().stream());
                 while let Some(change) = change_stream.next().await {
                     // After any change, serialize and save the current list
                     if let ListChange::Replace { ref items } = change {
                         let mut json_items = Vec::new();
                         for item in items {
-                            if let Some(value) = item.clone().subscribe().await.next().await {
+                            if let Some(value) = item.clone().stream().await.next().await {
                                 json_items.push(value.to_json().await);
                             }
                         }
@@ -6202,10 +6151,10 @@ impl List {
                         // For incremental changes, we need to get the full list and save it
                         // This is done by getting the next Replace event after the change is applied
                         // But for simplicity, let's re-subscribe to get the current state
-                        if let Some(ListChange::Replace { items }) = list_for_save.clone().subscribe().next().await {
+                        if let Some(ListChange::Replace { items }) = list_for_save.clone().stream().next().await {
                             let mut json_items = Vec::new();
                             for item in &items {
-                                if let Some(value) = item.clone().subscribe().await.next().await {
+                                if let Some(value) = item.clone().stream().await.next().await {
                                     json_items.push(value.to_json().await);
                                 }
                             }
@@ -6822,7 +6771,7 @@ impl ListBindingFunction {
         let binding_name_for_filter_log = config.binding_name.clone();
         let binding_name_for_dedup_log = config.binding_name.clone();
         let change_stream = switch_map(
-            source_list_actor.clone().subscribe_stream()
+            source_list_actor.clone().stream_sync()
             .inspect(move |value| {
                 let value_type = match value {
                     Value::List(_, _) => "List",
@@ -6867,7 +6816,7 @@ impl ListBindingFunction {
             zoon::println!("[LIST_MAP] flat_map received new List for binding='{}': {}",
                 binding_for_log, list_info);
 
-            list.subscribe().map(move |change| {
+            list.stream().map(move |change| {
                 let change_type = match &change {
                     ListChange::Replace { items } => format!("Replace({} items)", items.len()),
                     ListChange::Push { .. } => "Push".to_string(),
@@ -6932,7 +6881,7 @@ impl ListBindingFunction {
         // But filter out re-emissions of the same list by ID to avoid cancelling
         // subscriptions unnecessarily.
         let value_stream = switch_map(
-            source_list_actor.clone().subscribe_stream().filter_map(|value| {
+            source_list_actor.clone().stream_sync().filter_map(|value| {
                 future::ready(match value {
                     Value::List(list, _) => Some(list),
                     _ => None,
@@ -6965,7 +6914,7 @@ impl ListBindingFunction {
             }
 
             // Create list change stream
-            let list_changes = list.clone().subscribe().map(RetainEvent::ListChange);
+            let list_changes = list.clone().stream().map(RetainEvent::ListChange);
 
             // Create predicate result stream
             let predicate_results = predicate_rx.map(|(idx, result)| RetainEvent::PredicateResult(idx, result));
@@ -7002,7 +6951,7 @@ impl ListBindingFunction {
                                         let tx = predicate_tx.clone();
                                         let pred_clone = predicate.clone();
                                         let task_handle = Task::start_droppable(async move {
-                                            let mut stream = pred_clone.subscribe_stream();
+                                            let mut stream = pred_clone.stream_sync();
                                             while let Some(value) = stream.next().await {
                                                 let is_true = match &value {
                                                     Value::Tag(tag, _) => tag.tag() == "True",
@@ -7029,7 +6978,7 @@ impl ListBindingFunction {
                                     let tx = predicate_tx.clone();
                                     let pred_clone = predicate.clone();
                                     let task_handle = Task::start_droppable(async move {
-                                        let mut stream = pred_clone.subscribe_stream();
+                                        let mut stream = pred_clone.stream_sync();
                                         while let Some(value) = stream.next().await {
                                             let is_true = match &value {
                                                 Value::Tag(tag, _) => tag.tag() == "True",
@@ -7119,7 +7068,7 @@ impl ListBindingFunction {
 
         // Use switch_map for proper list replacement handling
         let value_stream = switch_map(
-            source_list_actor.clone().subscribe_stream().filter_map(|value| {
+            source_list_actor.clone().stream_sync().filter_map(|value| {
                 future::ready(match value {
                     Value::List(list, _) => Some(list),
                     _ => None,
@@ -7151,7 +7100,7 @@ impl ListBindingFunction {
             }
 
             // Create list change stream
-            let list_changes = list.clone().subscribe().map(RemoveEvent::ListChange);
+            let list_changes = list.clone().stream().map(RemoveEvent::ListChange);
 
             // Create removal event stream
             let removal_events = remove_rx.map(RemoveEvent::RemoveItem);
@@ -7189,7 +7138,7 @@ impl ListBindingFunction {
                                         let tx = remove_tx.clone();
                                         let when_clone = when_actor.clone();
                                         let task_handle = Task::start_droppable(async move {
-                                            let mut stream = when_clone.stream_from_now_stream();
+                                            let mut stream = when_clone.stream_from_now_sync();
                                             // Wait for ANY emission - that triggers removal
                                             if stream.next().await.is_some() {
                                                 let _ = tx.unbounded_send(idx);
@@ -7212,7 +7161,7 @@ impl ListBindingFunction {
                                     let tx = remove_tx.clone();
                                     let when_clone = when_actor.clone();
                                     let task_handle = Task::start_droppable(async move {
-                                        let mut stream = when_clone.stream_from_now_stream();
+                                        let mut stream = when_clone.stream_from_now_sync();
                                         if stream.next().await.is_some() {
                                             let _ = tx.unbounded_send(idx);
                                         }
@@ -7295,7 +7244,7 @@ impl ListBindingFunction {
         // But filter out re-emissions of the same list by ID to avoid cancelling
         // subscriptions unnecessarily.
         let value_stream = switch_map(
-            source_list_actor.clone().subscribe_stream().filter_map(|value| {
+            source_list_actor.clone().stream_sync().filter_map(|value| {
                 future::ready(match value {
                     Value::List(list, _) => Some(list),
                     _ => None,
@@ -7323,7 +7272,7 @@ impl ListBindingFunction {
             let construct_info_id_inner = construct_info_id.clone();
             let construct_context_inner = construct_context.clone();
 
-            list.subscribe().scan(
+            list.stream().scan(
                 Vec::<(Arc<ValueActor>, Arc<ValueActor>)>::new(),
                 move |item_predicates, change| {
                     let config = config.clone();
@@ -7391,7 +7340,7 @@ impl ListBindingFunction {
                 let construct_context_map = construct_context.clone();
 
                 let predicate_streams: Vec<_> = item_predicates.iter().enumerate().map(|(idx, (_, pred))| {
-                    pred.clone().subscribe_stream().map(move |value| (idx, value))
+                    pred.clone().stream_sync().map(move |value| (idx, value))
                 }).collect();
 
                 stream::select_all(predicate_streams)
@@ -7461,7 +7410,7 @@ impl ListBindingFunction {
         let actor_context_for_result = actor_context.clone();
 
         // Create a stream that:
-        // 1. Subscribes to source list changes (subscribe_stream() yields automatically)
+        // 1. Subscribes to source list changes (stream_sync() yields automatically)
         // 2. For each item, evaluates key expression and subscribes to its changes
         // 3. When list or any key changes, emits sorted Replace
         // Use switch_map for proper list replacement handling:
@@ -7469,7 +7418,7 @@ impl ListBindingFunction {
         // But filter out re-emissions of the same list by ID to avoid cancelling
         // subscriptions unnecessarily.
         let value_stream = switch_map(
-            source_list_actor.clone().subscribe_stream().filter_map(|value| {
+            source_list_actor.clone().stream_sync().filter_map(|value| {
                 future::ready(match value {
                     Value::List(list, _) => Some(list),
                     _ => None,
@@ -7497,7 +7446,7 @@ impl ListBindingFunction {
             let construct_info_id_inner = construct_info_id.clone();
 
             // Track items and their keys
-            list.subscribe().scan(
+            list.stream().scan(
                 Vec::<(Arc<ValueActor>, Arc<ValueActor>)>::new(), // (item, key_actor)
                 move |item_keys, change| {
                     let config = config.clone();
@@ -7564,7 +7513,7 @@ impl ListBindingFunction {
                 // Subscribe to all keys and emit sorted list when any changes
                 let key_streams: Vec<_> = item_keys.iter().enumerate().map(|(idx, (item, key_actor))| {
                     let item = item.clone();
-                    key_actor.clone().subscribe_stream().map(move |value| (idx, item.clone(), value))
+                    key_actor.clone().stream_sync().map(move |value| (idx, item.clone(), value))
                 }).collect();
 
                 stream::select_all(key_streams)
@@ -7660,13 +7609,13 @@ impl ListBindingFunction {
             // Last resort: use construct_info.id (may not be stable)
             format!("{:?}", item_actor.construct_info.id)
         };
-        zoon::println!("[LIST_MAP] transform_item: binding='{}', scope_id='{}', parent_prefix={:?}",
-            config.binding_name, scope_id, actor_context.persistence_id_prefix);
+        zoon::println!("[LIST_MAP] transform_item: binding='{}', scope_id='{}', parent_scope={:?}",
+            config.binding_name, scope_id, actor_context.scope);
         let new_actor_context = ActorContext {
             parameters: new_params,
             ..actor_context.with_child_scope(&scope_id)
         };
-        zoon::println!("[LIST_MAP] transform_item: new_prefix={:?}", new_actor_context.persistence_id_prefix);
+        zoon::println!("[LIST_MAP] transform_item: new_scope={:?}", new_actor_context.scope);
 
         // Evaluate the transform expression with the binding in scope
         // Pass the function registry snapshot to enable user-defined function calls

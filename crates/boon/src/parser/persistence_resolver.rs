@@ -113,10 +113,19 @@ impl PersistenceId {
         Self(value)
     }
 
-    /// Convert to a usize key for use in switch_map_by_key.
-    pub fn to_key(&self) -> usize {
-        // On 64-bit systems, use lower bits. On 32-bit, this truncates but still provides good distribution.
-        self.0 as usize
+    /// Combine this ID with a scope to create a unique ID for this instance.
+    /// Root scope returns self unchanged.
+    /// Nested scope XORs with hash of the prefix for uniqueness.
+    pub fn in_scope(&self, scope: &Scope) -> Self {
+        match scope {
+            Scope::Root => *self,
+            Scope::Nested(prefix) => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                prefix.hash(&mut hasher);
+                Self::from_raw(self.0 ^ hasher.finish() as u128)
+            }
+        }
     }
 }
 
@@ -124,6 +133,17 @@ impl Default for PersistenceId {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Scope context for Variables - either at root level or nested in List/map.
+/// Used to create unique persistence identities for items inside collections.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub enum Scope {
+    /// Top-level context, not inside any List/map
+    #[default]
+    Root,
+    /// Nested inside List/map with a unique prefix
+    Nested(String),
 }
 
 impl std::fmt::Display for PersistenceId {

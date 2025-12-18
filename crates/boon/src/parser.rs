@@ -31,7 +31,7 @@ mod scope_resolver;
 pub use scope_resolver::{Referenceables, resolve_references};
 
 mod persistence_resolver;
-pub use persistence_resolver::{Persistence, PersistenceId, PersistenceStatus, resolve_persistence};
+pub use persistence_resolver::{Persistence, PersistenceId, PersistenceStatus, Scope, resolve_persistence};
 
 mod source;
 pub use source::{SourceCode, StrSlice};
