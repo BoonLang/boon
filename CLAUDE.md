@@ -415,6 +415,44 @@ API functions that return streams should:
 - **Use channels for synchronous-like behavior** - If you need to ensure ordering or immediate processing, use mpsc channels and let the async runtime handle scheduling
 - **Reason**: Sync operations assume single-threaded execution. Boon's actor model must work across threads, processes, and network boundaries
 
+### NO FALLBACKS IN KEY/IDENTITY LOGIC
+
+**NEVER use fallback patterns in identity/key computation.** Fallbacks are time bombs:
+- They hide bugs by making code "work" with wrong semantics
+- They break silently when edge cases arise
+- They make debugging extremely difficult (which code path was taken?)
+
+**Bad pattern - NEVER DO THIS:**
+```rust
+if let Some(a) = preferred_identity() {
+    a.to_key()
+} else if let Some(b) = fallback_identity() {  // TIME BOMB!
+    b.to_key()
+} else {
+    Arc::as_ptr() as usize  // ANOTHER TIME BOMB!
+}
+```
+
+**Good pattern - Fail explicitly:**
+```rust
+match (scope_prefix(), persistence_id()) {
+    (Some(prefix), Some(pid)) => compute_key(prefix, pid),
+    _ => panic!("Bug: missing identity for variable '{}'", name),
+}
+```
+
+If identity information is missing, it's a BUG that should be fixed at the source, not papered over with fallbacks.
+
+**Why this matters for Boon**: The `switch_map_by_key` function uses keys to decide when to recreate subscriptions in reactive pipelines. If different items get the same key (due to fallback logic), they'll share subscriptions and events will propagate incorrectly across unrelated items.
+
+### READ MZOON OUTPUT FOR COMPILE ERRORS
+
+**ALWAYS check mzoon's terminal output when looking for compile errors.** The playground uses mzoon for auto-compilation:
+- mzoon auto-recompiles when Rust files change
+- Compile errors appear in mzoon's stdout/stderr
+- Do NOT run `cargo build` separately - it duplicates work and may conflict
+- Use the Boon Browser MCP `boon_playground_status` tool if available
+
 ### Lazy vs Eager Evaluation (LazyValueActor)
 
 **The Problem**: ValueActor eagerly polls its source stream in an internal loop, decoupling producers from consumers. This breaks sequential state updates in HOLD:

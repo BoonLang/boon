@@ -16,6 +16,7 @@ wasm-bindgen-test = "0.3.19"
 chumsky = { version = "0.11", features = ["pratt", "serde"] }
 ariadne = "0.5"
 pin-project = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json_any_key = "2.0.0"
 
 ulid = { version = "1.2.0", features = ["serde"] }

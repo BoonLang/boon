@@ -1788,6 +1788,7 @@ fn element_text_input(
                                             None,
                                         ),
                                         None,
+                                        None, // scope_prefix: not applicable for bridge-created events
                                     )],
                                 );
                                 let _ = sender.unbounded_send(event_value);
@@ -1832,6 +1833,7 @@ fn element_text_input(
                                             None,
                                         ),
                                         None,
+                                        None, // scope_prefix: not applicable for bridge-created events
                                     )],
                                 );
                                 let _ = sender.unbounded_send(event_value);
@@ -1902,6 +1904,7 @@ fn element_text_input(
                                         None,
                                     ),
                                     None,
+                                    None, // scope_prefix: not applicable for bridge-created events
                                 )],
                             );
                             let _ = sender.unbounded_send(event_value);
@@ -1935,6 +1938,7 @@ fn element_text_input(
                                         None,
                                     ),
                                     None,
+                                    None, // scope_prefix: not applicable for bridge-created events
                                 )],
                             );
                             let send_result = sender.unbounded_send(event_value);

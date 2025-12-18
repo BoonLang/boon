@@ -55,6 +55,7 @@ pub fn function_document_new(
     let [argument_root] = arguments.as_slice() else {
         panic!("Unexpected argument count")
     };
+    let scope_prefix = actor_context.persistence_id_prefix.clone();
     Object::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -73,6 +74,7 @@ pub fn function_document_new(
             "root_element",
             argument_root.clone(),
             None,
+            scope_prefix,
         )],
     )
 }
@@ -97,6 +99,7 @@ pub fn function_element_stripe(
         arguments.as_slice() else {
             panic!("Element/stripe requires 5 arguments, got {}", arguments.len());
         };
+    let scope_prefix = actor_context.persistence_id_prefix.clone();
     TaggedObject::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -134,6 +137,7 @@ pub fn function_element_stripe(
                         "element",
                         argument_element.clone(),
                         None,
+                        scope_prefix.clone(),
                     ),
                     Variable::new_arc(
                         ConstructInfo::new(
@@ -145,6 +149,7 @@ pub fn function_element_stripe(
                         "direction",
                         argument_direction.clone(),
                         None,
+                        scope_prefix.clone(),
                     ),
                     Variable::new_arc(
                         ConstructInfo::new(
@@ -156,6 +161,7 @@ pub fn function_element_stripe(
                         "gap",
                         argument_gap.clone(),
                         None,
+                        scope_prefix.clone(),
                     ),
                     Variable::new_arc(
                         ConstructInfo::new(
@@ -167,6 +173,7 @@ pub fn function_element_stripe(
                         "style",
                         argument_style.clone(),
                         None,
+                        scope_prefix.clone(),
                     ),
                     Variable::new_arc(
                         ConstructInfo::new(
@@ -178,10 +185,12 @@ pub fn function_element_stripe(
                         "items",
                         argument_items.clone(),
                         None,
+                        scope_prefix.clone(),
                     ),
                 ],
             ),
             None,
+            scope_prefix,
         )],
     )
 }
@@ -203,6 +212,7 @@ pub fn function_element_container(
     let [argument_element, argument_style, argument_child] = arguments.as_slice() else {
         panic!("Element/container expects 3 arguments")
     };
+    let scope_prefix = actor_context.persistence_id_prefix.clone();
     TaggedObject::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -240,6 +250,7 @@ pub fn function_element_container(
                         "element",
                         argument_element.clone(),
                         None,
+                        scope_prefix.clone(),
                     ),
                     Variable::new_arc(
                         ConstructInfo::new(
@@ -251,6 +262,7 @@ pub fn function_element_container(
                         "style",
                         argument_style.clone(),
                         None,
+                        scope_prefix.clone(),
                     ),
                     Variable::new_arc(
                         ConstructInfo::new(
@@ -262,10 +274,12 @@ pub fn function_element_container(
                         "child",
                         argument_child.clone(),
                         None,
+                        scope_prefix.clone(),
                     ),
                 ],
             ),
             None,
+            scope_prefix,
         )],
     )
 }
@@ -287,6 +301,7 @@ pub fn function_element_stack(
     let [argument_element, argument_style, argument_layers] = arguments.as_slice() else {
         panic!("Element/stack requires 3 arguments, got {}", arguments.len());
     };
+    let scope_prefix = actor_context.persistence_id_prefix.clone();
     TaggedObject::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -324,6 +339,7 @@ pub fn function_element_stack(
                         "element",
                         argument_element.clone(),
                         None,
+                        scope_prefix.clone(),
                     ),
                     Variable::new_arc(
                         ConstructInfo::new(
@@ -335,6 +351,7 @@ pub fn function_element_stack(
                         "style",
                         argument_style.clone(),
                         None,
+                        scope_prefix.clone(),
                     ),
                     Variable::new_arc(
                         ConstructInfo::new(
@@ -346,10 +363,12 @@ pub fn function_element_stack(
                         "layers",
                         argument_layers.clone(),
                         None,
+                        scope_prefix.clone(),
                     ),
                 ],
             ),
             None,
+            scope_prefix,
         )],
     )
 }
@@ -375,6 +394,7 @@ pub fn function_element_button(
     let [argument_element, argument_style, argument_label] = arguments.as_slice() else {
         panic!("Unexpected argument count")
     };
+    let scope_prefix = actor_context.persistence_id_prefix.clone();
     // Create a derived actor that extracts `event` from argument_element
     // This allows direct access via `.event` instead of `.element.event`
     let event_stream = argument_element
@@ -421,6 +441,7 @@ pub fn function_element_button(
                 "element",
                 argument_element.clone(),
                 None,
+                scope_prefix.clone(),
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -432,6 +453,7 @@ pub fn function_element_button(
                 "event",
                 event_actor,
                 None,
+                scope_prefix.clone(),
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -461,6 +483,7 @@ pub fn function_element_button(
                             "style",
                             argument_style.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -472,10 +495,12 @@ pub fn function_element_button(
                             "label",
                             argument_label.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                     ],
                 ),
                 None,
+                scope_prefix,
             ),
         ],
     )
@@ -503,6 +528,7 @@ pub fn function_element_text_input(
     else {
         panic!("Element/text_input expects 6 arguments")
     };
+    let scope_prefix = actor_context.persistence_id_prefix.clone();
 
     // Create a derived actor that extracts `event` from argument_element
     // This allows direct access via `.event` instead of `.element.event`
@@ -552,6 +578,7 @@ pub fn function_element_text_input(
                 "element",
                 argument_element.clone(),
                 None,
+                scope_prefix.clone(),
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -563,6 +590,7 @@ pub fn function_element_text_input(
                 "event",
                 event_actor,
                 None,
+                scope_prefix.clone(),
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -574,6 +602,7 @@ pub fn function_element_text_input(
                 "text",
                 argument_text.clone(),
                 None,
+                scope_prefix.clone(),
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -603,6 +632,7 @@ pub fn function_element_text_input(
                             "style",
                             argument_style.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -614,6 +644,7 @@ pub fn function_element_text_input(
                             "label",
                             argument_label.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -625,6 +656,7 @@ pub fn function_element_text_input(
                             "text",
                             argument_text.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -636,6 +668,7 @@ pub fn function_element_text_input(
                             "placeholder",
                             argument_placeholder.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -647,10 +680,12 @@ pub fn function_element_text_input(
                             "focus",
                             argument_focus.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                     ],
                 ),
                 None,
+                scope_prefix,
             ),
         ],
     )
@@ -668,7 +703,7 @@ pub fn function_element_text_input(
 pub fn function_element_checkbox(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     function_call_id: ConstructId,
-    _function_call_persistence_id: PersistenceId,
+    function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
@@ -676,6 +711,20 @@ pub fn function_element_checkbox(
         arguments.as_slice()
     else {
         panic!("Element/checkbox expects 5 arguments")
+    };
+    let scope_prefix = actor_context.persistence_id_prefix.clone();
+
+    // Combine function_call_persistence_id with actor_context prefix to get unique ID per list item.
+    // This ensures that each checkbox in a List/map gets a unique persistence_id for its child
+    // Variables, which is needed for stable switch_map_by_key keys in alias chains like `.event`.
+    let effective_persistence_id = if let Some(ref prefix) = actor_context.persistence_id_prefix {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        prefix.hash(&mut hasher);
+        let prefix_hash = hasher.finish() as u128;
+        PersistenceId::from_raw(function_call_persistence_id.as_u128() ^ prefix_hash)
+    } else {
+        function_call_persistence_id
     };
 
     // Create a derived actor that extracts `event` from argument_element
@@ -703,7 +752,7 @@ pub fn function_element_checkbox(
         ),
         actor_context.clone(),
         TypedStream::infinite(event_stream.chain(stream::pending())),
-        None,
+        Some(effective_persistence_id.with_child_index(8)),
     );
 
     TaggedObject::new_constant(
@@ -725,7 +774,8 @@ pub fn function_element_checkbox(
                 construct_context.clone(),
                 "element",
                 argument_element.clone(),
-                None,
+                Some(effective_persistence_id.with_child_index(1)),
+                scope_prefix.clone(),
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -736,7 +786,8 @@ pub fn function_element_checkbox(
                 construct_context.clone(),
                 "event",
                 event_actor,
-                None,
+                Some(effective_persistence_id.with_child_index(9)),
+                scope_prefix.clone(),
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -765,7 +816,8 @@ pub fn function_element_checkbox(
                             construct_context.clone(),
                             "style",
                             argument_style.clone(),
-                            None,
+                            Some(effective_persistence_id.with_child_index(4)),
+                            scope_prefix.clone(),
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -776,7 +828,8 @@ pub fn function_element_checkbox(
                             construct_context.clone(),
                             "label",
                             argument_label.clone(),
-                            None,
+                            Some(effective_persistence_id.with_child_index(5)),
+                            scope_prefix.clone(),
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -787,7 +840,8 @@ pub fn function_element_checkbox(
                             construct_context.clone(),
                             "checked",
                             argument_checked.clone(),
-                            None,
+                            Some(effective_persistence_id.with_child_index(6)),
+                            scope_prefix.clone(),
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -798,11 +852,13 @@ pub fn function_element_checkbox(
                             construct_context,
                             "icon",
                             argument_icon.clone(),
-                            None,
+                            Some(effective_persistence_id.with_child_index(7)),
+                            scope_prefix.clone(),
                         ),
                     ],
                 ),
-                None,
+                Some(effective_persistence_id.with_child_index(2)),
+                scope_prefix,
             ),
         ],
     )
@@ -825,6 +881,7 @@ pub fn function_element_label(
     let [argument_element, argument_style, argument_label] = arguments.as_slice() else {
         panic!("Element/label expects 3 arguments")
     };
+    let scope_prefix = actor_context.persistence_id_prefix.clone();
 
     // Create a derived actor that extracts `event` from argument_element
     // This allows direct access via `.event` instead of `.element.event`
@@ -872,6 +929,7 @@ pub fn function_element_label(
                 "element",
                 argument_element.clone(),
                 None,
+                scope_prefix.clone(),
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -883,6 +941,7 @@ pub fn function_element_label(
                 "event",
                 event_actor,
                 None,
+                scope_prefix.clone(),
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -912,6 +971,7 @@ pub fn function_element_label(
                             "style",
                             argument_style.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -923,10 +983,12 @@ pub fn function_element_label(
                             "label",
                             argument_label.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                     ],
                 ),
                 None,
+                scope_prefix,
             ),
         ],
     )
@@ -949,6 +1011,7 @@ pub fn function_element_paragraph(
     let [argument_element, argument_style, argument_contents] = arguments.as_slice() else {
         panic!("Element/paragraph expects 3 arguments")
     };
+    let scope_prefix = actor_context.persistence_id_prefix.clone();
     TaggedObject::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -969,6 +1032,7 @@ pub fn function_element_paragraph(
                 "element",
                 argument_element.clone(),
                 None,
+                scope_prefix.clone(),
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -998,6 +1062,7 @@ pub fn function_element_paragraph(
                             "style",
                             argument_style.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -1009,10 +1074,12 @@ pub fn function_element_paragraph(
                             "contents",
                             argument_contents.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                     ],
                 ),
                 None,
+                scope_prefix,
             ),
         ],
     )
@@ -1039,6 +1106,7 @@ pub fn function_element_link(
     else {
         panic!("Element/link expects 5 arguments")
     };
+    let scope_prefix = actor_context.persistence_id_prefix.clone();
     TaggedObject::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -1059,6 +1127,7 @@ pub fn function_element_link(
                 "element",
                 argument_element.clone(),
                 None,
+                scope_prefix.clone(),
             ),
             Variable::new_arc(
                 ConstructInfo::new(
@@ -1088,6 +1157,7 @@ pub fn function_element_link(
                             "style",
                             argument_style.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -1099,6 +1169,7 @@ pub fn function_element_link(
                             "label",
                             argument_label.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -1110,6 +1181,7 @@ pub fn function_element_link(
                             "to",
                             argument_to.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                         Variable::new_arc(
                             ConstructInfo::new(
@@ -1121,10 +1193,12 @@ pub fn function_element_link(
                             "new_tab",
                             argument_new_tab.clone(),
                             None,
+                            scope_prefix.clone(),
                         ),
                     ],
                 ),
                 None,
+                scope_prefix,
             ),
         ],
     )
@@ -2276,11 +2350,12 @@ pub fn function_scene_new(
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
-    _actor_context: ActorContext,
+    actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let [argument_root] = arguments.as_slice() else {
         panic!("Unexpected argument count for Scene/new")
     };
+    let scope_prefix = actor_context.persistence_id_prefix.clone();
     // Scene/new returns an empty object - the actual rendering is handled by the element tree
     Object::new_constant(
         ConstructInfo::new(
@@ -2300,6 +2375,7 @@ pub fn function_scene_new(
             "root_element",
             argument_root.clone(),
             None,
+            scope_prefix,
         )],
     )
 }

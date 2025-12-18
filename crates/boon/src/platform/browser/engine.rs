@@ -1456,6 +1456,10 @@ impl ConstructInfoComplete {
     pub fn id(&self) -> ConstructId {
         self.id.clone()
     }
+
+    pub fn persistence(&self) -> Option<&parser::Persistence> {
+        self.persistence.as_ref()
+    }
 }
 
 impl std::fmt::Display for ConstructInfoComplete {
@@ -1521,6 +1525,10 @@ impl<T: IntoCowStr<'static>> From<T> for ConstructId {
 pub struct Variable {
     construct_info: ConstructInfoComplete,
     persistence_id: Option<parser::PersistenceId>,
+    /// Scope prefix from List/map context (ActorContext.persistence_id_prefix).
+    /// Combined with persistence_id to create a unique key per list item.
+    /// This is how we distinguish item1.completed from item2.completed.
+    scope_prefix: Option<String>,
     /// Registry key for LINK variables, includes persistence_id_prefix from List/map context.
     /// Used by bridges to subscribe to registry updates with the correct item-unique key.
     registry_key: Option<LinkRegistryKey>,
@@ -1539,10 +1547,12 @@ impl Variable {
         name: impl Into<Cow<'static, str>>,
         value_actor: Arc<ValueActor>,
         persistence_id: Option<parser::PersistenceId>,
+        scope_prefix: Option<String>,
     ) -> Self {
         Self {
             construct_info: construct_info.complete(ConstructType::Variable),
             persistence_id,
+            scope_prefix,
             registry_key: None,  // Non-LINK variables don't use registry
             name: name.into(),
             value_actor,
@@ -1557,6 +1567,7 @@ impl Variable {
         name: impl Into<Cow<'static, str>>,
         value_actor: Arc<ValueActor>,
         persistence_id: Option<parser::PersistenceId>,
+        scope_prefix: Option<String>,
     ) -> Arc<Self> {
         Arc::new(Self::new(
             construct_info,
@@ -1564,6 +1575,7 @@ impl Variable {
             name,
             value_actor,
             persistence_id,
+            scope_prefix,
         ))
     }
 
@@ -1575,11 +1587,13 @@ impl Variable {
         name: impl Into<Cow<'static, str>>,
         value_actor: Arc<ValueActor>,
         persistence_id: Option<parser::PersistenceId>,
+        scope_prefix: Option<String>,
         forwarding_loop: ActorLoop,
     ) -> Arc<Self> {
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::Variable),
             persistence_id,
+            scope_prefix,
             registry_key: None,  // Non-LINK variables don't use registry
             name: name.into(),
             value_actor,
@@ -1590,6 +1604,10 @@ impl Variable {
 
     pub fn persistence_id(&self) -> Option<parser::PersistenceId> {
         self.persistence_id
+    }
+
+    pub fn scope_prefix(&self) -> Option<&str> {
+        self.scope_prefix.as_deref()
     }
 
     pub fn registry_key(&self) -> Option<&LinkRegistryKey> {
@@ -1640,9 +1658,67 @@ impl Variable {
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
             persistence_id,
+            scope_prefix: persistence_id_prefix,
             registry_key,
             name: name.into(),
             value_actor,
+            link_value_sender: Some(link_value_sender),
+            forwarding_loop: None,
+        })
+    }
+
+    /// Create a LINK variable that reuses an existing sender and ValueActor.
+    ///
+    /// This is the KEY fix for the 3rd click bug. When WHILE re-renders:
+    /// 1. The persistence_id stays stable
+    /// 2. The prefix changes (contains ULIDs)
+    /// 3. Without reuse, a NEW ValueActor is created
+    /// 4. Subscriptions to the OLD ValueActor break
+    ///
+    /// By reusing the existing ValueActor:
+    /// - All senders (clones) write to the same receiver
+    /// - All subscriptions point to the same ValueActor
+    /// - No subscription breakage on re-render
+    pub fn new_link_arc_reusing(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        name: impl Into<Cow<'static, str>>,
+        actor_context: ActorContext,
+        persistence_id: Option<parser::PersistenceId>,
+        existing_sender: mpsc::UnboundedSender<Value>,
+        existing_value_actor: Arc<ValueActor>,
+    ) -> Arc<Self> {
+        let ConstructInfo {
+            id: actor_id,
+            persistence,
+            description: variable_description,
+        } = construct_info;
+        let construct_info = ConstructInfo::new(
+            actor_id.with_child_id("wrapped Variable (reused)"),
+            persistence,
+            variable_description,
+        );
+
+        // Use existing sender (clone) and value_actor
+        let link_value_sender = existing_sender.clone();
+
+        // Compute registry_key with current prefix (for bridge routing)
+        let persistence_id_prefix = actor_context.persistence_id_prefix.clone();
+        let registry_key = persistence_id.map(|pid| {
+            let key = LinkRegistryKey::new(persistence_id_prefix.clone(), pid);
+            // Register with the CURRENT prefix - bridges need this for routing
+            construct_context.link_actor_registry.register(key.clone(), link_value_sender.clone(), existing_value_actor.clone());
+            zoon::println!("[VARIABLE] Reusing ValueActor for LINK, registering with new key: {:?}", key);
+            key
+        });
+
+        Arc::new(Self {
+            construct_info: construct_info.complete(ConstructType::LinkVariable),
+            persistence_id,
+            scope_prefix: persistence_id_prefix,
+            registry_key,
+            name: name.into(),
+            value_actor: existing_value_actor,
             link_value_sender: Some(link_value_sender),
             forwarding_loop: None,
         })
@@ -1664,6 +1740,7 @@ impl Variable {
         construct_context: ConstructContext,
         name: impl Into<Cow<'static, str>>,
         persistence_id: Option<parser::PersistenceId>,
+        scope_prefix: Option<String>,
         registry_key: Option<LinkRegistryKey>,
         forwarding_actor: Arc<ValueActor>,
         link_value_sender: mpsc::UnboundedSender<Value>,
@@ -1672,6 +1749,7 @@ impl Variable {
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
             persistence_id,
+            scope_prefix,
             registry_key,  // Pass through from the base LINK so bridges can look up with correct key
             name: name.into(),
             // Use forwarding_actor so sibling field lookups work correctly
@@ -1787,6 +1865,8 @@ impl VariableOrArgumentReference {
         let construct_info = construct_info.complete(ConstructType::VariableOrArgumentReference);
         // Capture context flags before closures
         let use_snapshot = actor_context.is_snapshot_context;
+        // Capture registry for LINK ValueActor lookups - this is the KEY fix for the 3rd click bug
+        let link_registry = construct_context.link_actor_registry.clone();
         let mut skip_alias_parts = 0;
         let alias_parts = match alias {
             static_expression::Alias::WithoutPassed {
@@ -1826,6 +1906,8 @@ impl VariableOrArgumentReference {
             let alias_part_for_log = alias_part.clone();
             let alias_part_for_key = alias_part.clone();
             let idx_for_log = idx;
+            // Clone registry for this iteration's closure
+            let registry_for_map = link_registry.clone();
 
             // Process each field in the path using switch_map_by_key semantics:
             // Use the Variable's Arc pointer as the key - if the same Variable is returned
@@ -1835,25 +1917,117 @@ impl VariableOrArgumentReference {
             // objects change but the inner LINK Variables may be the same. If we unconditionally
             // dropped subscriptions, events could be lost during the recreation window.
             //
-            // The key_fn extracts the Variable pointer from the Value before deciding to switch.
+            // The key_fn extracts a stable key from the Variable to determine if subscription
+            // should be recreated. Using registry_key (for LINK variables) or persistence_id
+            // ensures stability across WHILE arm switches - the same logical variable keeps
+            // the same key even if it gets a new Arc wrapper.
             value_stream = switch_map_by_key(
                 value_stream,
                 move |value: &Value| {
-                    // Extract Variable pointer as key - same Variable = same key = keep subscription
                     match value {
                         Value::Object(object, _) => {
                             let variable = object.expect_variable(&alias_part_for_key);
-                            Arc::as_ptr(&variable) as usize
+                            // Compute key from scope_prefix + persistence_id to ensure:
+                            // - UNIQUENESS: Different list items get different keys (prefix differs)
+                            // - STABILITY: Same list item across WHILE re-renders keeps same key
+                            // NO FALLBACKS - missing identity is a bug that should be fixed at source
+                            let key = if let Some(rk) = variable.registry_key() {
+                                // LINK variable - use registry_key which already has prefix + persistence_id
+                                let key = rk.to_key();
+                                zoon::println!("[ALIAS_KEY] '.{}' LINK var with registry_key={:?}, key={}", alias_part_for_key, rk, key);
+                                key
+                            } else {
+                                // Non-LINK variable - compute key from available identity info
+                                // Priority: scope_prefix (for List/map uniqueness) + persistence_id (source code location)
+                                match (variable.scope_prefix(), variable.persistence_id()) {
+                                    (Some(prefix), Some(pid)) => {
+                                        // Inside List/map with parsed variable: use both for full identity
+                                        use std::hash::{Hash, Hasher};
+                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                        prefix.hash(&mut hasher);
+                                        pid.hash(&mut hasher);
+                                        let key = hasher.finish() as usize;
+                                        zoon::println!("[ALIAS_KEY] '.{}' var with scope_prefix+pid, key={}", alias_part_for_key, key);
+                                        key
+                                    }
+                                    (Some(prefix), None) => {
+                                        // Inside List/map with API-created variable: scope_prefix provides uniqueness
+                                        use std::hash::{Hash, Hasher};
+                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                        prefix.hash(&mut hasher);
+                                        alias_part_for_key.hash(&mut hasher); // Include field name for stability
+                                        let key = hasher.finish() as usize;
+                                        zoon::println!("[ALIAS_KEY] '.{}' API var with scope_prefix only, key={}", alias_part_for_key, key);
+                                        key
+                                    }
+                                    (None, Some(pid)) => {
+                                        // Top-level parsed variable: persistence_id alone is unique
+                                        let key = pid.to_key();
+                                        zoon::println!("[ALIAS_KEY] '.{}' top-level var with pid, key={}", alias_part_for_key, key);
+                                        key
+                                    }
+                                    (None, None) => {
+                                        // Top-level API-created variable (e.g., ElementButton.event at top-level)
+                                        // There's only one instance, so a constant key is safe
+                                        zoon::println!("[ALIAS_KEY] '.{}' API var at top-level (no identity), key=0", alias_part_for_key);
+                                        0
+                                    }
+                                }
+                            };
+                            key
                         }
                         Value::TaggedObject(tagged_object, _) => {
                             let variable = tagged_object.expect_variable(&alias_part_for_key);
-                            Arc::as_ptr(&variable) as usize
+                            let key = if let Some(rk) = variable.registry_key() {
+                                // LINK variable - use registry_key which already has prefix + persistence_id
+                                let key = rk.to_key();
+                                zoon::println!("[ALIAS_KEY:Tagged] '.{}' LINK var with registry_key={:?}, key={}", alias_part_for_key, rk, key);
+                                key
+                            } else {
+                                // Non-LINK variable - compute key from available identity info
+                                match (variable.scope_prefix(), variable.persistence_id()) {
+                                    (Some(prefix), Some(pid)) => {
+                                        // Inside List/map with parsed variable: use both for full identity
+                                        use std::hash::{Hash, Hasher};
+                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                        prefix.hash(&mut hasher);
+                                        pid.hash(&mut hasher);
+                                        let key = hasher.finish() as usize;
+                                        zoon::println!("[ALIAS_KEY:Tagged] '.{}' var with scope_prefix+pid, prefix={:?}, pid={:?}, key={}", alias_part_for_key, prefix, pid, key);
+                                        key
+                                    }
+                                    (Some(prefix), None) => {
+                                        // Inside List/map with API-created variable: scope_prefix provides uniqueness
+                                        use std::hash::{Hash, Hasher};
+                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                        prefix.hash(&mut hasher);
+                                        alias_part_for_key.hash(&mut hasher); // Include field name for stability
+                                        let key = hasher.finish() as usize;
+                                        zoon::println!("[ALIAS_KEY:Tagged] '.{}' API var with scope_prefix only, key={}", alias_part_for_key, key);
+                                        key
+                                    }
+                                    (None, Some(pid)) => {
+                                        // Top-level parsed variable: persistence_id alone is unique
+                                        let key = pid.to_key();
+                                        zoon::println!("[ALIAS_KEY:Tagged] '.{}' top-level var with pid, key={}", alias_part_for_key, key);
+                                        key
+                                    }
+                                    (None, None) => {
+                                        // Top-level API-created variable (e.g., ElementButton.event at top-level)
+                                        // There's only one instance, so a constant key is safe
+                                        zoon::println!("[ALIAS_KEY:Tagged] '.{}' API var at top-level (no identity), key=0", alias_part_for_key);
+                                        0
+                                    }
+                                }
+                            };
+                            key
                         }
                         _ => 0, // Non-object values get key 0 (will cause panic in map_fn anyway)
                     }
                 },
                 move |value| {
                 let alias_part = alias_part.clone();
+                let registry = registry_for_map.clone();
                 zoon::println!("[ALIAS:{}] switch_map_by_key triggered for '.{}', value type: {}",
                     idx_for_log, alias_part_for_log,
                     match &value {
@@ -1868,6 +2042,13 @@ impl VariableOrArgumentReference {
                 match value {
                     Value::Object(object, _) => {
                         let variable = object.expect_variable(&alias_part);
+                        // For LINK variables: get the shared ValueActor from registry by full registry_key
+                        // This is the KEY FIX for the 3rd click bug - ensures all subscriptions
+                        // go to the SAME ValueActor even when WHILE re-renders create new Variable instances
+                        // NOTE: Must use FULL registry_key (prefix + persistence_id), not just persistence_id,
+                        // to distinguish list items created from the same source position
+                        let is_link = variable.registry_key().is_some();
+                        let link_registry_key = variable.registry_key().cloned();
                         let variable_actor = variable.value_actor();
                         // Use snapshot() or stream() based on context - type-safe subscription
                         if use_snapshot {
@@ -1884,15 +2065,30 @@ impl VariableOrArgumentReference {
                             // Streaming: continuous updates - use stream() and keep alive
                             let alias_part_for_log = alias_part.clone();
                             stream::unfold(
-                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), object, variable),
-                                move |(subscription_opt, actor_opt, object, variable)| {
+                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), object, variable, registry, is_link, link_registry_key),
+                                move |(subscription_opt, actor_opt, object, variable, registry, is_link, link_key)| {
                                     let alias_part_log = alias_part_for_log.clone();
                                     async move {
                                         let (mut subscription, is_new) = match subscription_opt {
                                             Some(s) => (s, false),
                                             None => {
                                                 zoon::println!("[ALIAS_UNFOLD] Creating new subscription for '.{}'", alias_part_log);
-                                                let actor = actor_opt.unwrap();
+                                                // For LINK variables: look up shared ValueActor from registry by FULL key
+                                                let actor = if is_link {
+                                                    if let Some(key) = link_key.clone() {
+                                                        if let Some((_, shared_actor)) = registry.get(key).await {
+                                                            zoon::println!("[ALIAS_UNFOLD] Using shared ValueActor from registry for LINK '.{}'", alias_part_log);
+                                                            shared_actor
+                                                        } else {
+                                                            zoon::println!("[ALIAS_UNFOLD] LINK '.{}' not found in registry, using variable's actor", alias_part_log);
+                                                            actor_opt.unwrap()
+                                                        }
+                                                    } else {
+                                                        actor_opt.unwrap()
+                                                    }
+                                                } else {
+                                                    actor_opt.unwrap()
+                                                };
                                                 (actor.stream().await, true)
                                             }
                                         };
@@ -1912,7 +2108,7 @@ impl VariableOrArgumentReference {
                                         } else {
                                             zoon::println!("[ALIAS_UNFOLD] '.{}' subscription ended (None)", alias_part_log);
                                         }
-                                        value.map(|value| (value, (Some(subscription), None, object, variable)))
+                                        value.map(|value| (value, (Some(subscription), None, object, variable, registry, is_link, link_key)))
                                     }
                                 }
                             ).boxed_local()
@@ -1920,7 +2116,13 @@ impl VariableOrArgumentReference {
                     }
                     Value::TaggedObject(tagged_object, _) => {
                         let variable = tagged_object.expect_variable(&alias_part);
+                        // For LINK variables: get the shared ValueActor from registry by FULL key
+                        // NOTE: Must use FULL registry_key (prefix + persistence_id), not just persistence_id,
+                        // to distinguish list items created from the same source position
+                        let is_link = variable.registry_key().is_some();
+                        let link_registry_key = variable.registry_key().cloned();
                         let variable_actor = variable.value_actor();
+                        let registry = registry.clone();
                         // Use snapshot() or stream() based on context - type-safe subscription
                         if use_snapshot {
                             // Snapshot: get one value using the type-safe Future API
@@ -1936,15 +2138,30 @@ impl VariableOrArgumentReference {
                             // Streaming: continuous updates - use stream() and keep alive
                             let alias_part_for_log = alias_part.clone();
                             stream::unfold(
-                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), tagged_object, variable),
-                                move |(subscription_opt, actor_opt, tagged_object, variable)| {
+                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), tagged_object, variable, registry, is_link, link_registry_key),
+                                move |(subscription_opt, actor_opt, tagged_object, variable, registry, is_link, link_key)| {
                                     let alias_part_log = alias_part_for_log.clone();
                                     async move {
                                         let (mut subscription, is_new) = match subscription_opt {
                                             Some(s) => (s, false),
                                             None => {
                                                 zoon::println!("[ALIAS_UNFOLD:Tagged] Creating new subscription for '.{}'", alias_part_log);
-                                                let actor = actor_opt.unwrap();
+                                                // For LINK variables: look up shared ValueActor from registry by FULL key
+                                                let actor = if is_link {
+                                                    if let Some(key) = link_key.clone() {
+                                                        if let Some((_, shared_actor)) = registry.get(key).await {
+                                                            zoon::println!("[ALIAS_UNFOLD:Tagged] Using shared ValueActor from registry for LINK '.{}'", alias_part_log);
+                                                            shared_actor
+                                                        } else {
+                                                            zoon::println!("[ALIAS_UNFOLD:Tagged] LINK '.{}' not found in registry, using variable's actor", alias_part_log);
+                                                            actor_opt.unwrap()
+                                                        }
+                                                    } else {
+                                                        actor_opt.unwrap()
+                                                    }
+                                                } else {
+                                                    actor_opt.unwrap()
+                                                };
                                                 (actor.stream().await, true)
                                             }
                                         };
@@ -1964,7 +2181,7 @@ impl VariableOrArgumentReference {
                                         } else {
                                             zoon::println!("[ALIAS_UNFOLD:Tagged] '.{}' subscription ended (None)", alias_part_log);
                                         }
-                                        value.map(|value| (value, (Some(subscription), None, tagged_object, variable)))
+                                        value.map(|value| (value, (Some(subscription), None, tagged_object, variable, registry, is_link, link_key)))
                                     }
                                 }
                             ).boxed_local()
@@ -2217,12 +2434,31 @@ impl LinkRegistryKey {
     pub fn new(prefix: Option<String>, persistence_id: parser::PersistenceId) -> Self {
         Self { prefix, persistence_id }
     }
+
+    /// Convert to a usize key for use in switch_map_by_key.
+    /// Uses a hash of the full registry key (prefix + persistence_id) to create a unique key.
+    pub fn to_key(&self) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish() as usize
+    }
 }
 
 /// Registry for sharing LINK value_actors by persistence_id.
 /// When multiple LINK variables are created with the same persistence_id
 /// (e.g., during WHILE re-renders), they share the same value_actor.
 /// This ensures events sent to any LINK sender reach the same subscribers.
+///
+/// ## Key Design: ValueActor Reuse
+///
+/// The registry maintains TWO indexes:
+/// 1. **By full registry_key** (prefix + persistence_id) - for sender routing to bridges
+/// 2. **By persistence_id only** - for ValueActor reuse across re-renders
+///
+/// When WHILE re-renders, the prefix changes (contains ULIDs) but persistence_id stays stable.
+/// By reusing the same ValueActor for the same persistence_id, subscribers remain connected
+/// even when the LINK variable is recreated.
 pub struct LinkActorRegistry {
     insert_sender: mpsc::UnboundedSender<(
         LinkRegistryKey,
@@ -2237,6 +2473,12 @@ pub struct LinkActorRegistry {
         LinkRegistryKey,
         mpsc::UnboundedSender<mpsc::UnboundedSender<Value>>,
     )>,
+    /// Channel for looking up sender+ValueActor by persistence_id only (ignoring prefix).
+    /// This enables ValueActor reuse when WHILE re-renders with different prefix.
+    get_link_by_pid_sender: mpsc::UnboundedSender<(
+        parser::PersistenceId,
+        oneshot::Sender<Option<(mpsc::UnboundedSender<Value>, Arc<ValueActor>)>>,
+    )>,
     actor_loop: ActorLoop,
 }
 
@@ -2248,14 +2490,28 @@ impl LinkActorRegistry {
             LinkRegistryKey,
             mpsc::UnboundedSender<mpsc::UnboundedSender<Value>>,
         )>();
+        let (get_link_by_pid_sender, mut get_link_by_pid_receiver) = mpsc::unbounded::<(
+            parser::PersistenceId,
+            oneshot::Sender<Option<(mpsc::UnboundedSender<Value>, Arc<ValueActor>)>>,
+        )>();
 
         Self {
             insert_sender,
             get_sender,
             subscribe_sender,
+            get_link_by_pid_sender,
             actor_loop: ActorLoop::new(async move {
                 let mut registry = HashMap::<
                     LinkRegistryKey,
+                    (mpsc::UnboundedSender<Value>, Arc<ValueActor>),
+                >::new();
+                // Secondary index: persistence_id → (sender, ValueActor) for reuse across re-renders
+                // This is the KEY fix for the 3rd click bug - when WHILE re-renders,
+                // the prefix changes but persistence_id stays stable, so we can reuse
+                // the same ValueActor and keep subscribers connected.
+                // We store the sender too so new LINK variables can clone it.
+                let mut links_by_pid = HashMap::<
+                    parser::PersistenceId,
                     (mpsc::UnboundedSender<Value>, Arc<ValueActor>),
                 >::new();
                 // Subscribers waiting for sender updates
@@ -2270,15 +2526,34 @@ impl LinkActorRegistry {
                             match result {
                                 Some((registry_key, sender, value_actor)) => {
                                     zoon::println!("[REGISTRY] Registering LINK with key: {:?}", registry_key);
-                                    // Notify subscribers of new sender
-                                    if let Some(subs) = subscribers.get_mut(&registry_key) {
-                                        let sub_count = subs.len();
-                                        subs.retain(|sub| sub.unbounded_send(sender.clone()).is_ok());
-                                        zoon::println!("[REGISTRY] Notified {}/{} subscribers for key: {:?}", subs.len(), sub_count, registry_key);
+                                    // Add to secondary index (by persistence_id only)
+                                    // Note: This stores only the FIRST entry per persistence_id.
+                                    // This is used for ValueActor lookup across re-renders.
+                                    let pid = registry_key.persistence_id;
+                                    if !links_by_pid.contains_key(&pid) {
+                                        zoon::println!("[REGISTRY] Adding LINK to pid index for: {:?}", pid);
+                                        links_by_pid.insert(pid, (sender.clone(), value_actor.clone()));
                                     } else {
-                                        zoon::println!("[REGISTRY] No subscribers yet for key: {:?}", registry_key);
+                                        zoon::println!("[REGISTRY] Pid index already has LINK for: {:?}", pid);
                                     }
-                                    registry.insert(registry_key, (sender, value_actor));
+                                    // IMPORTANT: Only insert if this is the FIRST registration for this key.
+                                    // If an entry already exists, DON'T overwrite it!
+                                    // This is the KEY FIX for the 3rd click bug:
+                                    // - When WHILE re-renders, a NEW LINK is created with the same registry_key
+                                    // - The bridge should continue using the FIRST sender
+                                    // - All events go to the FIRST ValueActor, which has subscribers
+                                    if !registry.contains_key(&registry_key) {
+                                        zoon::println!("[REGISTRY] Adding FIRST entry for key: {:?}", registry_key);
+                                        // Notify subscribers of the new sender (only for first registration)
+                                        if let Some(subs) = subscribers.get_mut(&registry_key) {
+                                            let sub_count = subs.len();
+                                            subs.retain(|sub| sub.unbounded_send(sender.clone()).is_ok());
+                                            zoon::println!("[REGISTRY] Notified {}/{} subscribers for key: {:?}", subs.len(), sub_count, registry_key);
+                                        }
+                                        registry.insert(registry_key, (sender, value_actor));
+                                    } else {
+                                        zoon::println!("[REGISTRY] Key already exists, keeping FIRST entry: {:?}", registry_key);
+                                    }
                                 }
                                 None => break,
                             }
@@ -2292,10 +2567,33 @@ impl LinkActorRegistry {
                                 None => break,
                             }
                         }
+                        result = get_link_by_pid_receiver.next() => {
+                            match result {
+                                Some((pid, reply)) => {
+                                    let link = links_by_pid.get(&pid).cloned();
+                                    zoon::println!("[REGISTRY] Lookup by pid {:?}: found={}", pid, link.is_some());
+                                    let _ = reply.send(link);
+                                }
+                                None => break,
+                            }
+                        }
                         result = subscribe_receiver.next() => {
                             match result {
                                 Some((registry_key, sender_channel)) => {
                                     zoon::println!("[REGISTRY] Subscribe request for key: {:?}", registry_key);
+
+                                    // Clean up dead subscribers before adding new one.
+                                    // Dead subscribers accumulate when WHILE switches arms -
+                                    // old checkbox bridges are dropped but their subscriber
+                                    // entries remain until this cleanup.
+                                    if let Some(subs) = subscribers.get_mut(&registry_key) {
+                                        let before = subs.len();
+                                        subs.retain(|sub| !sub.is_closed());
+                                        if subs.len() < before {
+                                            zoon::println!("[REGISTRY] Cleaned {} dead subscribers for key: {:?}", before - subs.len(), registry_key);
+                                        }
+                                    }
+
                                     // Send current sender if exists
                                     if let Some((sender, _)) = registry.get(&registry_key) {
                                         let _ = sender_channel.unbounded_send(sender.clone());
@@ -2313,6 +2611,7 @@ impl LinkActorRegistry {
                     }
                 }
                 drop(registry);
+                drop(links_by_pid);
                 drop(subscribers);
                 if LOG_DROPS_AND_LOOP_ENDS {
                     println!("LinkActorRegistry loop ended");
@@ -2347,6 +2646,27 @@ impl LinkActorRegistry {
         let (sender_channel, receiver) = mpsc::unbounded();
         let _ = self.subscribe_sender.unbounded_send((key, sender_channel));
         receiver
+    }
+
+    /// Get an existing sender and ValueActor by persistence_id only (ignoring prefix).
+    ///
+    /// This is the KEY method for fixing the 3rd click bug. When WHILE re-renders,
+    /// the persistence_id_prefix changes (contains ULIDs) but the persistence_id
+    /// stays stable. By looking up by persistence_id alone, we can reuse the
+    /// existing ValueActor instead of creating a new one.
+    ///
+    /// Returns (sender, value_actor) so the caller can clone the sender and reuse
+    /// the same ValueActor. This ensures:
+    /// - All senders (clones) write to the same receiver → same ValueActor
+    /// - All subscriptions point to the same ValueActor
+    /// - No subscription breakage on re-render
+    pub async fn get_link_by_persistence_id(
+        &self,
+        persistence_id: parser::PersistenceId,
+    ) -> Option<(mpsc::UnboundedSender<Value>, Arc<ValueActor>)> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        let _ = self.get_link_by_pid_sender.unbounded_send((persistence_id, reply_sender));
+        reply_receiver.await.ok().flatten()
     }
 }
 
@@ -2393,7 +2713,7 @@ impl FunctionCall {
         let persistence_id = construct_info
             .persistence
             .map(|p| p.id)
-            .unwrap_or_else(Ulid::new);
+            .unwrap_or_else(parser::PersistenceId::new);
 
         let value_stream = definition(
             arguments.clone(),
@@ -2480,7 +2800,7 @@ impl LatestCombinator {
         let persistent_id = construct_info
             .persistence
             .map(|p| p.id)
-            .unwrap_or_else(Ulid::new);
+            .unwrap_or_else(parser::PersistenceId::new);
         let storage = construct_context.construct_storage.clone();
 
         let value_stream =
@@ -2582,7 +2902,7 @@ impl ThenCombinator {
         let persistent_id = construct_info
             .persistence
             .map(|p| p.id)
-            .unwrap_or_else(Ulid::new);
+            .unwrap_or_else(parser::PersistenceId::new);
         let storage = construct_context.construct_storage.clone();
 
         let observed_for_subscribe = observed.clone();
@@ -3383,16 +3703,21 @@ impl ValueActor {
                                     let (mut tx, rx) = mpsc::channel(32);
 
                                     // Send historical values from starting_version
-                                    for value in value_history.get_values_since(starting_version).0 {
+                                    let historical_values = value_history.get_values_since(starting_version).0;
+                                    let history_count = historical_values.len();
+                                    let mut sent_count = 0;
+                                    for value in historical_values {
                                         // Best effort - if channel full, subscriber is too slow
-                                        let _ = tx.try_send(value.clone());
+                                        if tx.try_send(value.clone()).is_ok() {
+                                            sent_count += 1;
+                                        }
                                     }
 
                                     // Add to live subscribers list
                                     subscribers.push(tx);
                                     if construct_info.description.contains("Link") || construct_info.description.contains("click") {
-                                        zoon::println!("[SUBSCRIBE:inst#{}] Added sender, count now: {} for: {}",
-                                            actor_instance_id, subscribers.len(), construct_info.description);
+                                        zoon::println!("[SUBSCRIBE:inst#{}] Added sender, count now: {}, history_count: {}, sent: {}, current_version: {} for: {}",
+                                            actor_instance_id, subscribers.len(), history_count, sent_count, current_version.load(Ordering::SeqCst), construct_info.description);
                                     }
 
                                     // Reply with the receiver
@@ -3411,9 +3736,13 @@ impl ValueActor {
                                 let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                 value_history.add(new_version, value.clone());
 
-                                // Push value to all subscribers
+                                // Push value to all subscribers (only remove on disconnect, not backpressure)
                                 subscribers.retain_mut(|tx| {
-                                    tx.try_send(value.clone()).is_ok()
+                                    match tx.try_send(value.clone()) {
+                                        Ok(()) => true,
+                                        Err(e) if e.is_disconnected() => false,
+                                        Err(_) => true,
+                                    }
                                 });
                             }
                         }
@@ -3442,9 +3771,13 @@ impl ValueActor {
                                     let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                     value_history.add(new_version, value.clone());
 
-                                    // Push value to all subscribers
+                                    // Push value to all subscribers (only remove on disconnect, not backpressure)
                                     subscribers.retain_mut(|tx| {
-                                        tx.try_send(value.clone()).is_ok()
+                                        match tx.try_send(value.clone()) {
+                                            Ok(()) => true,
+                                            Err(e) if e.is_disconnected() => false,
+                                            Err(_) => true,
+                                        }
                                     });
                                 }
                                 ActorMessage::MigrateTo { target, transform } => {
@@ -3497,13 +3830,23 @@ impl ValueActor {
                             value_history.add(new_version, new_value.clone());
 
                             // Push value to all subscribers
+                            // Only remove on Disconnected (receiver dropped), NOT on Full (backpressure)
                             let sub_count_before = subscribers.len();
+                            let is_link_or_click = construct_info.description.contains("Link") || construct_info.description.contains("click");
+                            let mut ok_count = 0;
+                            let mut full_count = 0;
+                            let mut disconnected_count = 0;
                             subscribers.retain_mut(|tx| {
-                                tx.try_send(new_value.clone()).is_ok()
+                                match tx.try_send(new_value.clone()) {
+                                    Ok(()) => { ok_count += 1; true }
+                                    Err(e) if e.is_disconnected() => { disconnected_count += 1; false } // Remove dead subscribers
+                                    Err(e) if e.is_full() => { full_count += 1; true } // Keep on backpressure (Full)
+                                    Err(_) => true,
+                                }
                             });
-                            if construct_info.description.contains("Link") || construct_info.description.contains("click") {
-                                zoon::println!("[VALUE_ACTOR:inst#{}] Pushed to {}/{} subscribers: {}",
-                                    actor_instance_id, subscribers.len(), sub_count_before, construct_info.description);
+                            if is_link_or_click {
+                                zoon::println!("[VALUE_ACTOR:inst#{}] Pushed to {}/{} subscribers (ok={}, full={}, disconnected={}): {}",
+                                    actor_instance_id, subscribers.len(), sub_count_before, ok_count, full_count, disconnected_count, construct_info.description);
                             }
 
                             // Handle migration forwarding
@@ -3729,7 +4072,7 @@ impl ValueActor {
                                 stream_ever_produced = true;
                                 let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                 value_history.add(new_version, value.clone());
-                                subscribers.retain_mut(|tx| tx.try_send(value.clone()).is_ok());
+                                subscribers.retain_mut(|tx| match tx.try_send(value.clone()) { Ok(()) => true, Err(e) if e.is_disconnected() => false, Err(_) => true });
                             }
                         }
 
@@ -3747,7 +4090,7 @@ impl ValueActor {
                                     stream_ever_produced = true;
                                     let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                     value_history.add(new_version, value.clone());
-                                    subscribers.retain_mut(|tx| tx.try_send(value.clone()).is_ok());
+                                    subscribers.retain_mut(|tx| match tx.try_send(value.clone()) { Ok(()) => true, Err(e) if e.is_disconnected() => false, Err(_) => true });
                                 }
                                 _ => {}
                             }
@@ -3771,7 +4114,7 @@ impl ValueActor {
                             let is_click_related = construct_str.contains("click") || construct_str.contains("checkbox");
                             let sub_count_before = subscribers.len();
 
-                            subscribers.retain_mut(|tx| tx.try_send(new_value.clone()).is_ok());
+                            subscribers.retain_mut(|tx| match tx.try_send(new_value.clone()) { Ok(()) => true, Err(e) if e.is_disconnected() => false, Err(_) => true });
 
                             if is_click_related {
                                 zoon::println!("[BROADCAST] {} -> {} subscribers before, {} after",
@@ -3930,6 +4273,7 @@ impl ValueActor {
         let _ = ready_tx.send(()); // Fire immediately
         let ready_signal = ready_rx.shared();
 
+        let actor_instance_id = ACTOR_INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
             let current_version = current_version.clone();
@@ -3975,12 +4319,19 @@ impl ValueActor {
                                     let _ = reply.send(rx);
                                 } else {
                                     let (mut tx, rx) = mpsc::channel(32);
-                                    for value in value_history.get_values_since(starting_version).0 {
-                                        let _ = tx.try_send(value.clone());
+                                    let historical_values = value_history.get_values_since(starting_version).0;
+                                    let history_count = historical_values.len();
+                                    let mut sent_count = 0;
+                                    for value in historical_values {
+                                        if tx.try_send(value.clone()).is_ok() {
+                                            sent_count += 1;
+                                        }
                                     }
                                     subscribers.push(tx);
-                                    zoon::println!("[SUBSCRIBE:InitVal] Added sender, count now: {} for: {} (id: {:?})",
-                                        subscribers.len(), construct_info.description, construct_info.id);
+                                    if construct_info.description.contains("Link") || construct_info.description.contains("click") {
+                                        zoon::println!("[SUBSCRIBE:InitVal:inst#{}] Added sender, count now: {}, history: {}, sent: {}, version: {} for: {}",
+                                            actor_instance_id, subscribers.len(), history_count, sent_count, current_version.load(Ordering::SeqCst), construct_info.description);
+                                    }
                                     let _ = reply.send(rx);
                                 }
                             }
@@ -3991,7 +4342,14 @@ impl ValueActor {
                                 let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                 value_history.add(new_version, value.clone());
                                 let sub_count_before = subscribers.len();
-                                subscribers.retain_mut(|tx| tx.try_send(value.clone()).is_ok());
+                                // Only remove on Disconnected (receiver dropped), NOT on Full (backpressure)
+                                subscribers.retain_mut(|tx| {
+                                    match tx.try_send(value.clone()) {
+                                        Ok(()) => true,
+                                        Err(e) if e.is_disconnected() => false,
+                                        Err(_) => true,
+                                    }
+                                });
                                 if sub_count_before > 0 || construct_info.description.contains("click") {
                                     zoon::println!("[VALUE_ACTOR:InitVal] Pushed to {}/{} subscribers: {} (id: {:?})",
                                         subscribers.len(), sub_count_before, construct_info.description, construct_info.id);
@@ -4005,7 +4363,7 @@ impl ValueActor {
                                 ActorMessage::StreamValue(new_value) => {
                                     let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                     value_history.add(new_version, new_value.clone());
-                                    subscribers.retain_mut(|tx| tx.try_send(new_value.clone()).is_ok());
+                                    subscribers.retain_mut(|tx| match tx.try_send(new_value.clone()) { Ok(()) => true, Err(e) if e.is_disconnected() => false, Err(_) => true });
                                 }
                                 ActorMessage::Shutdown => break,
                                 _ => {}
@@ -4020,7 +4378,7 @@ impl ValueActor {
                             if let Some(new_value) = new_value {
                                 let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                 value_history.add(new_version, new_value.clone());
-                                subscribers.retain_mut(|tx| tx.try_send(new_value.clone()).is_ok());
+                                subscribers.retain_mut(|tx| match tx.try_send(new_value.clone()) { Ok(()) => true, Err(e) if e.is_disconnected() => false, Err(_) => true });
                             } else {
                                 stream_ended = true;
                             }
@@ -4300,7 +4658,7 @@ impl ListDiffSubscription {
 
 // --- ValueIdempotencyKey ---
 
-pub type ValueIdempotencyKey = Ulid;
+pub type ValueIdempotencyKey = parser::PersistenceId;
 
 // --- ValueMetadata ---
 
@@ -4378,7 +4736,7 @@ impl Value {
     /// Create a FLUSHED wrapper around this value
     pub fn into_flushed(self) -> Value {
         let metadata = ValueMetadata {
-            idempotency_key: Ulid::new(),
+            idempotency_key: parser::PersistenceId::new(),
         };
         Value::Flushed(Box::new(self), metadata)
     }
@@ -4566,7 +4924,7 @@ impl Value {
                                     value,
                                     construct_id.with_child_id(format!("value_{name}")),
                                     construct_context.clone(),
-                                    Ulid::new(),
+                                    parser::PersistenceId::new(),
                                     actor_context.clone(),
                                 );
                                 Variable::new_arc(
@@ -4575,6 +4933,7 @@ impl Value {
                                     (*name).clone(),
                                     value_actor,
                                     None,
+                                    actor_context.persistence_id_prefix.clone(),
                                 )
                             })
                             .collect();
@@ -4604,7 +4963,7 @@ impl Value {
                                 value,
                                 construct_id.with_child_id(format!("value_{name}")),
                                 construct_context.clone(),
-                                Ulid::new(),
+                                parser::PersistenceId::new(),
                                 actor_context.clone(),
                             );
                             Variable::new_arc(
@@ -4613,6 +4972,7 @@ impl Value {
                                 name.clone(),
                                 value_actor,
                                 None,
+                                actor_context.persistence_id_prefix.clone(),
                             )
                         })
                         .collect();
@@ -4632,7 +4992,7 @@ impl Value {
                             item,
                             construct_id.with_child_id(format!("item_{i}")),
                             construct_context.clone(),
-                            Ulid::new(),
+                            parser::PersistenceId::new(),
                             actor_context.clone(),
                         )
                     })
@@ -4743,6 +5103,7 @@ pub async fn materialize_value(
                         variable.name().to_string(),
                         value_actor,
                         None,
+                        actor_context.persistence_id_prefix.clone(),
                     );
                     materialized_vars.push(new_var);
                 }
@@ -4784,6 +5145,7 @@ pub async fn materialize_value(
                         variable.name().to_string(),
                         value_actor,
                         None,
+                        actor_context.persistence_id_prefix.clone(),
                     );
                     materialized_vars.push(new_var);
                 }
@@ -5797,7 +6159,7 @@ impl List {
                                 &json_items[i],
                                 actor_id_for_load.with_child_id(format!("loaded_item_{i}")),
                                 construct_context_for_load.clone(),
-                                Ulid::new(),
+                                parser::PersistenceId::new(),
                                 actor_context_for_load.clone(),
                             )
                         }
@@ -7271,22 +7633,40 @@ impl ListBindingFunction {
         construct_context: ConstructContext,
         actor_context: ActorContext,
     ) -> Arc<ValueActor> {
-        zoon::println!("[LIST_MAP] transform_item called for binding '{}'", config.binding_name);
-
         // Create a new ActorContext with the binding variable set
         let binding_name = config.binding_name.to_string();
         let mut new_params = actor_context.parameters.clone();
 
         new_params.insert(binding_name.clone(), item_actor.clone());
 
-        // Use with_child_scope to create a properly isolated scope for this list item
+        // Use with_child_scope to create a properly isolated scope for this list item.
         // This ensures LINKs inside the transform expression have unique persistence IDs
         // per item, preventing cross-item contamination when List/map is used.
-        let scope_id = format!("{:?}", item_actor.construct_info.id);
+        //
+        // IMPORTANT: Use persistence_id (if available) instead of construct_info.id!
+        // - persistence_id is STABLE across WHILE re-renders (derived from source position)
+        // - construct_info.id changes on each re-render (contains runtime ULIDs)
+        //
+        // This is the KEY FIX for the 3rd click bug: by making scope_id stable,
+        // the full LinkRegistryKey (prefix + persistence_id) stays the same for the
+        // same list item after WHILE re-renders, so subscriptions remain valid.
+        let scope_id = if let Some(pid) = item_actor.persistence_id() {
+            // Use stable persistence_id - stays same across WHILE re-renders
+            format!("pid:{}", pid.as_u128())
+        } else if let Some(persistence) = item_actor.construct_info.persistence() {
+            // Fallback: use persistence_id from construct_info if available
+            format!("pid:{}", persistence.id.as_u128())
+        } else {
+            // Last resort: use construct_info.id (may not be stable)
+            format!("{:?}", item_actor.construct_info.id)
+        };
+        zoon::println!("[LIST_MAP] transform_item: binding='{}', scope_id='{}', parent_prefix={:?}",
+            config.binding_name, scope_id, actor_context.persistence_id_prefix);
         let new_actor_context = ActorContext {
             parameters: new_params,
             ..actor_context.with_child_scope(&scope_id)
         };
+        zoon::println!("[LIST_MAP] transform_item: new_prefix={:?}", new_actor_context.persistence_id_prefix);
 
         // Evaluate the transform expression with the binding in scope
         // Pass the function registry snapshot to enable user-defined function calls

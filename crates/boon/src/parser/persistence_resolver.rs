@@ -2,11 +2,136 @@ use super::{ArithmeticOperator, Comparator, Expression, Literal, ParseError, Spa
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json_any_key::*;
 use ulid::Ulid;
 use zoon::{WebStorage, eprintln, local_storage};
 
-pub type PersistenceId = Ulid;
+/// Hierarchical persistence identity stored as a single u128.
+///
+/// The ID supports hierarchical derivation:
+/// - Root elements get a fresh Ulid from the parser
+/// - List/map items derive child IDs by combining parent with child Ulid
+///
+/// This ensures every variable has a complete, unique identity
+/// without needing a separate prefix field, while remaining Copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PersistenceId(u128);
+
+impl Serialize for PersistenceId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Serialize as ULID string for backwards compatibility and readability
+        let ulid = Ulid::from(self.0);
+        ulid.to_string().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PersistenceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::{self, Visitor};
+
+        struct PersistenceIdVisitor;
+
+        impl<'de> Visitor<'de> for PersistenceIdVisitor {
+            type Value = PersistenceId;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a ULID string or u128")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<PersistenceId, E>
+            where
+                E: de::Error,
+            {
+                // Parse ULID string (old format)
+                Ulid::from_string(value)
+                    .map(|ulid| PersistenceId(ulid.0))
+                    .map_err(|_| E::custom(format!("invalid ULID string: {}", value)))
+            }
+
+            fn visit_u128<E>(self, value: u128) -> Result<PersistenceId, E>
+            where
+                E: de::Error,
+            {
+                Ok(PersistenceId(value))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<PersistenceId, E>
+            where
+                E: de::Error,
+            {
+                // Handle small numbers that might be serialized as u64
+                Ok(PersistenceId(value as u128))
+            }
+        }
+
+        deserializer.deserialize_any(PersistenceIdVisitor)
+    }
+}
+
+impl PersistenceId {
+    /// Create a new root-level persistence ID (used by parser)
+    pub fn new() -> Self {
+        Self(Ulid::new().0)
+    }
+
+    /// Create a persistence ID from an existing Ulid
+    pub fn from_ulid(id: Ulid) -> Self {
+        Self(id.0)
+    }
+
+    /// Create a new persistence ID by combining with a child Ulid.
+    /// Used by List/map to create unique IDs per item.
+    /// The combination is deterministic: same parent + same child = same result.
+    pub fn with_child(&self, child_id: Ulid) -> Self {
+        // XOR with rotated child to ensure good mixing
+        Self(self.0 ^ child_id.0.rotate_left(64))
+    }
+
+    /// Create a new persistence ID by appending a child index.
+    /// Used by API functions to create unique IDs for child variables.
+    pub fn with_child_index(&self, index: u32) -> Self {
+        // Mix index into the ID using rotation to spread bits
+        let index_bits = (index as u128) | ((index as u128) << 32) | ((index as u128) << 64) | ((index as u128) << 96);
+        Self(self.0 ^ index_bits.rotate_left(37))
+    }
+
+    /// Get the raw u128 value
+    pub fn as_u128(&self) -> u128 {
+        self.0
+    }
+
+    /// Create a persistence ID from a raw u128 value.
+    /// Used when combining persistence_id with other context (like list prefix hash).
+    pub fn from_raw(value: u128) -> Self {
+        Self(value)
+    }
+
+    /// Convert to a usize key for use in switch_map_by_key.
+    pub fn to_key(&self) -> usize {
+        // On 64-bit systems, use lower bits. On 32-bit, this truncates but still provides good distribution.
+        self.0 as usize
+    }
+}
+
+impl Default for PersistenceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for PersistenceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Display as hex for compactness
+        write!(f, "{:032x}", self.0)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Persistence {
@@ -117,7 +242,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     errors,
                 );
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -183,7 +308,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                             errors,
                         );
                     } else {
-                        let id: Ulid = PersistenceId::new();
+                        let id = PersistenceId::new();
                         new_span_id_pairs.insert(*span, id);
                         *persistence = Some(Persistence {
                             id,
@@ -199,7 +324,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     }
                 }
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -211,7 +336,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                         node: variable,
                         persistence,
                     } = variable;
-                    let id: Ulid = PersistenceId::new();
+                    let id = PersistenceId::new();
                     new_span_id_pairs.insert(*span, id);
                     *persistence = Some(Persistence {
                         id,
@@ -284,7 +409,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                             errors,
                         );
                     } else {
-                        let id: Ulid = PersistenceId::new();
+                        let id = PersistenceId::new();
                         new_span_id_pairs.insert(*span, id);
                         *persistence = Some(Persistence {
                             id,
@@ -300,7 +425,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     }
                 }
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -312,7 +437,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                         node: variable,
                         persistence,
                     } = variable;
-                    let id: Ulid = PersistenceId::new();
+                    let id = PersistenceId::new();
                     new_span_id_pairs.insert(*span, id);
                     *persistence = Some(Persistence {
                         id,
@@ -398,7 +523,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                             }
                         }
                     } else {
-                        let id: Ulid = PersistenceId::new();
+                        let id = PersistenceId::new();
                         new_span_id_pairs.insert(*span, id);
                         *persistence = Some(Persistence {
                             id,
@@ -416,7 +541,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     }
                 }
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -428,7 +553,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     node: argument,
                 } in arguments
                 {
-                    let id: Ulid = PersistenceId::new();
+                    let id = PersistenceId::new();
                     new_span_id_pairs.insert(*span, id);
                     *persistence = Some(Persistence {
                         id,
@@ -497,7 +622,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                             errors,
                         );
                     } else {
-                        let id: Ulid = PersistenceId::new();
+                        let id = PersistenceId::new();
                         new_span_id_pairs.insert(*span, id);
                         *persistence = Some(Persistence {
                             id,
@@ -520,7 +645,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     errors,
                 );
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -532,7 +657,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                         node: variable,
                         persistence,
                     } = variable;
-                    let id: Ulid = PersistenceId::new();
+                    let id = PersistenceId::new();
                     new_span_id_pairs.insert(*span, id);
                     *persistence = Some(Persistence {
                         id,
@@ -586,7 +711,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     }
                 }
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -600,7 +725,7 @@ fn set_persistence<'a, 'code, 'old_code>(
         Expression::Map { entries } => {
             // For maps, just assign new persistence IDs to all entries
             // (More sophisticated comparison would require comparing keys)
-            let id: Ulid = PersistenceId::new();
+            let id = PersistenceId::new();
             new_span_id_pairs.insert(*span, id);
             *persistence = Some(Persistence {
                 id,
@@ -653,7 +778,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     }
                 }
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -690,7 +815,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     errors,
                 );
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -701,7 +826,7 @@ fn set_persistence<'a, 'code, 'old_code>(
         }
         Expression::When { arms } => {
             // For When expressions, assign a new ID (arms have non-Spanned bodies)
-            let id: Ulid = PersistenceId::new();
+            let id = PersistenceId::new();
             new_span_id_pairs.insert(*span, id);
             *persistence = Some(Persistence {
                 id,
@@ -710,7 +835,7 @@ fn set_persistence<'a, 'code, 'old_code>(
         }
         Expression::While { arms } => {
             // For While expressions, assign a new ID (arms have non-Spanned bodies)
-            let id: Ulid = PersistenceId::new();
+            let id = PersistenceId::new();
             new_span_id_pairs.insert(*span, id);
             *persistence = Some(Persistence {
                 id,
@@ -748,7 +873,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                 );
                 set_persistence(to, &[old_to], &old_span_id_pairs, new_span_id_pairs, errors);
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -759,7 +884,7 @@ fn set_persistence<'a, 'code, 'old_code>(
             }
         }
         Expression::ArithmeticOperator(op) => {
-            let id: Ulid = PersistenceId::new();
+            let id = PersistenceId::new();
             new_span_id_pairs.insert(*span, id);
             *persistence = Some(Persistence {
                 id,
@@ -780,7 +905,7 @@ fn set_persistence<'a, 'code, 'old_code>(
             }
         }
         Expression::Comparator(cmp) => {
-            let id: Ulid = PersistenceId::new();
+            let id = PersistenceId::new();
             new_span_id_pairs.insert(*span, id);
             *persistence = Some(Persistence {
                 id,
@@ -834,7 +959,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     errors,
                 );
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -845,7 +970,7 @@ fn set_persistence<'a, 'code, 'old_code>(
         }
         Expression::LinkSetter { alias: _ } => {
             // LinkSetter just needs a persistence ID like Alias
-            let id: Ulid = PersistenceId::new();
+            let id = PersistenceId::new();
             new_span_id_pairs.insert(*span, id);
             *persistence = Some(Persistence {
                 id,
@@ -872,7 +997,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     status: PersistenceStatus::Unchanged,
                 });
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -916,7 +1041,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     status: PersistenceStatus::Unchanged,
                 });
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -942,7 +1067,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     status: PersistenceStatus::Unchanged,
                 });
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -968,7 +1093,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     status: PersistenceStatus::Unchanged,
                 });
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -978,7 +1103,7 @@ fn set_persistence<'a, 'code, 'old_code>(
         }
         Expression::TextLiteral { parts: _ } => {
             // TextLiteral is like a Literal - just assign a new ID
-            let id: Ulid = PersistenceId::new();
+            let id = PersistenceId::new();
             new_span_id_pairs.insert(*span, id);
             *persistence = Some(Persistence {
                 id,
@@ -1011,7 +1136,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     errors,
                 );
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -1046,7 +1171,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     errors,
                 );
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -1081,7 +1206,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     errors,
                 );
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -1117,7 +1242,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     errors,
                 );
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -1152,7 +1277,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     errors,
                 );
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -1198,7 +1323,7 @@ fn set_persistence<'a, 'code, 'old_code>(
                     }
                 }
             } else {
-                let id: Ulid = PersistenceId::new();
+                let id = PersistenceId::new();
                 new_span_id_pairs.insert(*span, id);
                 *persistence = Some(Persistence {
                     id,
@@ -1211,7 +1336,7 @@ fn set_persistence<'a, 'code, 'old_code>(
         }
         // FieldAccess is a terminal expression - just assign a new ID
         Expression::FieldAccess { .. } => {
-            let id: Ulid = PersistenceId::new();
+            let id = PersistenceId::new();
             new_span_id_pairs.insert(*span, id);
             *persistence = Some(Persistence {
                 id,

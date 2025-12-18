@@ -402,6 +402,7 @@ dependencies = [
  "chumsky",
  "getrandom 0.3.1",
  "pin-project",
+ "serde",
  "serde_json_any_key",
  "ulid",
  "zoon",
