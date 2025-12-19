@@ -5565,13 +5565,10 @@ impl List {
                         change = change_stream.next() => {
                             let Some(change) = change else { break };
                             if output_valve_signal.is_none() {
+                                // Send to all change subscribers, silently removing any that are gone.
+                                // Subscribers being dropped is normal during WHILE arm switches.
                                 change_senders.retain(|change_sender| {
-                                    if let Err(error) = change_sender.unbounded_send(change.clone()) {
-                                        eprintln!("Failed to send new {construct_info} change to subscriber: {error:#}");
-                                        false
-                                    } else {
-                                        true
-                                    }
+                                    change_sender.unbounded_send(change.clone()).is_ok()
                                 });
                             }
 
@@ -5601,10 +5598,10 @@ impl List {
                         change_sender = change_sender_receiver.select_next_some() => {
                             if output_valve_signal.is_none() {
                                 if let Some(list) = list.as_ref() {
+                                    // Send initial state to new subscriber.
+                                    // If receiver is already gone (race during WHILE switch), just skip.
                                     let first_change_to_send = ListChange::Replace { items: list.clone() };
-                                    if let Err(error) = change_sender.unbounded_send(first_change_to_send) {
-                                        eprintln!("Failed to send {construct_info} change to subscriber: {error:#}");
-                                    } else {
+                                    if change_sender.unbounded_send(first_change_to_send).is_ok() {
                                         change_senders.push(change_sender);
                                     }
                                 } else {
@@ -5619,14 +5616,10 @@ impl List {
                                 break
                             }
                             if let Some(list) = list.as_ref() {
+                                // Send to all subscribers on impulse, silently removing dropped ones.
                                 change_senders.retain(|change_sender| {
                                     let change_to_send = ListChange::Replace { items: list.clone() };
-                                    if let Err(error) = change_sender.unbounded_send(change_to_send) {
-                                        eprintln!("Failed to send {construct_info} change to subscriber on impulse: {error:#}");
-                                        false
-                                    } else {
-                                        true
-                                    }
+                                    change_sender.unbounded_send(change_to_send).is_ok()
                                 });
                             }
                         }
