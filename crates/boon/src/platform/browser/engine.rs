@@ -1,6 +1,3 @@
-// @TODO remove
-#![allow(dead_code)]
-
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -41,7 +38,7 @@ use zoon::{eprintln, println};
 /// - Subscriber dropped before all events are processed
 /// - ValueActor dropped while subscriptions are still active
 /// - Extra owned data not properly keeping actors alive
-const LOG_DROPS_AND_LOOP_ENDS: bool = true;
+const LOG_DROPS_AND_LOOP_ENDS: bool = false;
 
 // --- TypedStream ---
 
@@ -219,8 +216,6 @@ impl ActorLoop {
 /// # Implementation
 /// Uses `stream::unfold()` for a pure demand-driven stream (no Task spawn).
 /// State is threaded through the unfold closure, making this a pure stream combinator.
-static SWITCH_MAP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 pub fn switch_map<S, F, U>(outer: S, f: F) -> LocalBoxStream<'static, U::Item>
 where
     S: Stream + 'static,
@@ -230,20 +225,17 @@ where
 {
     use zoon::futures_util::stream::FusedStream;
 
-    let switch_id = SWITCH_MAP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
     // Use type aliases to avoid complex generic inference issues
     type FusedOuter<T> = stream::Fuse<LocalBoxStream<'static, T>>;
     type FusedInner<T> = stream::Fuse<LocalBoxStream<'static, T>>;
 
-    // State as tuple: (outer_stream, inner_stream_opt, map_fn, switch_id, pending_outer_value)
+    // State as tuple: (outer_stream, inner_stream_opt, map_fn, pending_outer_value)
     // pending_outer_value: When outer emits while inner is active, we store the outer value
     // and drain the inner stream before switching. This prevents losing in-flight events.
-    let initial: (FusedOuter<S::Item>, Option<FusedInner<U::Item>>, F, usize, Option<S::Item>) = (
+    let initial: (FusedOuter<S::Item>, Option<FusedInner<U::Item>>, F, Option<S::Item>) = (
         outer.boxed_local().fuse(),
         None,
         f,
-        switch_id,
         None, // pending_outer_value
     );
 
@@ -252,7 +244,7 @@ where
         use std::task::Poll;
 
         // Destructure state - we need to rebuild it for the return
-        let (mut outer_stream, mut inner_opt, map_fn, switch_id, mut pending_outer) = state;
+        let (mut outer_stream, mut inner_opt, map_fn, mut pending_outer) = state;
 
         loop {
             // If we have a pending outer value and the inner stream is done/empty, switch now
@@ -285,7 +277,7 @@ where
                                     if let Some(item) = inner_item {
                                         // Inner had a ready item - emit it and store outer for later
                                         pending_outer = Some(new_outer_value);
-                                        return Some((item, (outer_stream, inner_opt, map_fn, switch_id, pending_outer)));
+                                        return Some((item, (outer_stream, inner_opt, map_fn, pending_outer)));
                                     } else {
                                         // No ready items in inner - safe to switch now
                                         drop(inner_opt.take());
@@ -295,7 +287,7 @@ where
                                 None => {
                                     // Outer ended - drain inner then finish
                                     while let Some(item) = inner.next().await {
-                                        return Some((item, (outer_stream, inner_opt, map_fn, switch_id, None)));
+                                        return Some((item, (outer_stream, inner_opt, map_fn, None)));
                                     }
                                     return None;
                                 }
@@ -304,7 +296,7 @@ where
                         Either::Right((inner_opt_val, _)) => {
                             match inner_opt_val {
                                 Some(item) => {
-                                    return Some((item, (outer_stream, inner_opt, map_fn, switch_id, pending_outer)));
+                                    return Some((item, (outer_stream, inner_opt, map_fn, pending_outer)));
                                 }
                                 None => {
                                     // Inner ended - clear it
@@ -359,19 +351,16 @@ where
 {
     use zoon::futures_util::stream::FusedStream;
 
-    let switch_id = SWITCH_MAP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
     type FusedOuter<T> = stream::Fuse<LocalBoxStream<'static, T>>;
     type FusedInner<T> = stream::Fuse<LocalBoxStream<'static, T>>;
 
-    // State: (outer_stream, inner_stream_opt, map_fn, key_fn, switch_id, current_key, pending_outer)
+    // State: (outer_stream, inner_stream_opt, map_fn, key_fn, current_key, pending_outer)
     // pending_outer stores the latest outer value when key changed but we couldn't switch
     let initial: (
         FusedOuter<S::Item>,
         Option<FusedInner<U::Item>>,
         F,
         Box<dyn Fn(&S::Item) -> K>,
-        usize,
         Option<K>,
         Option<S::Item>,
     ) = (
@@ -379,7 +368,6 @@ where
         None,
         f,
         Box::new(key_fn),
-        switch_id,
         None,
         None,
     );
@@ -387,7 +375,7 @@ where
     stream::unfold(initial, |state| async move {
         use zoon::futures_util::future::Either;
 
-        let (mut outer_stream, mut inner_opt, map_fn, key_fn, switch_id, mut current_key, mut pending_outer) = state;
+        let (mut outer_stream, mut inner_opt, map_fn, key_fn, mut current_key, mut pending_outer) = state;
 
         loop {
             match &mut inner_opt {
@@ -414,7 +402,7 @@ where
                                 None => {
                                     // Outer ended - drain inner then finish
                                     while let Some(item) = inner.next().await {
-                                        return Some((item, (outer_stream, inner_opt, map_fn, key_fn, switch_id, current_key, pending_outer)));
+                                        return Some((item, (outer_stream, inner_opt, map_fn, key_fn, current_key, pending_outer)));
                                     }
                                     return None;
                                 }
@@ -423,7 +411,7 @@ where
                         Either::Right((inner_opt_val, _)) => {
                             match inner_opt_val {
                                 Some(item) => {
-                                    return Some((item, (outer_stream, inner_opt, map_fn, key_fn, switch_id, current_key, pending_outer)));
+                                    return Some((item, (outer_stream, inner_opt, map_fn, key_fn, current_key, pending_outer)));
                                 }
                                 None => {
                                     // Inner stream ended - the Variable we subscribed to was dropped.
@@ -1598,10 +1586,6 @@ pub struct Variable {
     /// Combined with persistence_id to create a unique key per list item.
     /// This is how we distinguish item1.completed from item2.completed.
     scope: parser::Scope,
-    /// Unique ID generated when this Variable is created.
-    /// Each re-evaluation of an expression creates a new Variable with new evaluation_id.
-    /// Used in subscription keys to detect Variable recreation (e.g., WHILE re-render).
-    evaluation_id: ulid::Ulid,
     name: Cow<'static, str>,
     value_actor: Arc<ValueActor>,
     link_value_sender: Option<mpsc::UnboundedSender<Value>>,
@@ -1623,7 +1607,6 @@ impl Variable {
             construct_info: construct_info.complete(ConstructType::Variable),
             persistence_id,
             scope,
-            evaluation_id: ulid::Ulid::new(),
             name: name.into(),
             value_actor,
             link_value_sender: None,
@@ -1664,7 +1647,6 @@ impl Variable {
             construct_info: construct_info.complete(ConstructType::Variable),
             persistence_id,
             scope,
-            evaluation_id: ulid::Ulid::new(),
             name: name.into(),
             value_actor,
             link_value_sender: None,
@@ -1678,10 +1660,6 @@ impl Variable {
 
     pub fn scope(&self) -> &parser::Scope {
         &self.scope
-    }
-
-    pub fn evaluation_id(&self) -> ulid::Ulid {
-        self.evaluation_id
     }
 
     pub fn new_link_arc(
@@ -1716,7 +1694,6 @@ impl Variable {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
             persistence_id,
             scope,
-            evaluation_id: ulid::Ulid::new(),
             name: name.into(),
             value_actor,
             link_value_sender: Some(link_value_sender),
@@ -1727,7 +1704,7 @@ impl Variable {
     /// Create a LINK variable that reuses an existing sender and ValueActor.
     ///
     /// NOTE: This function is currently unused but kept for potential future use.
-    /// The evaluation_id fix in subscription keys handles WHILE re-render correctly.
+    /// The subscription key logic handles WHILE re-render correctly.
     pub fn new_link_arc_reusing(
         construct_info: ConstructInfo,
         construct_context: ConstructContext,
@@ -1756,7 +1733,6 @@ impl Variable {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
             persistence_id,
             scope,
-            evaluation_id: ulid::Ulid::new(),
             name: name.into(),
             value_actor: existing_value_actor,
             link_value_sender: Some(link_value_sender),
@@ -1789,7 +1765,6 @@ impl Variable {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
             persistence_id,
             scope,
-            evaluation_id: ulid::Ulid::new(),
             name: name.into(),
             // Use forwarding_actor so sibling field lookups work correctly
             value_actor: forwarding_actor,
@@ -1946,18 +1921,9 @@ impl VariableOrArgumentReference {
             //
             // The key uses persistence_id.in_scope(scope):
             // - persistence_id + scope: distinguishes list items from each other
-            // - NO evaluation_id: we want to KEEP existing subscriptions when Values re-evaluate
+            // - We keep existing subscriptions when Values re-evaluate (same key = keep subscription)
             //
-            // Why NOT include evaluation_id:
-            // When Element/checkbox re-evaluates (e.g., due to checked state change), a new
-            // internal click LINK Variable is created. But the bridge's DOM element is still
-            // connected to the OLD click LINK. If we switch subscriptions to the new LINK,
-            // events from the bridge would be lost (sent to old LINK, but subscribed to new).
-            //
-            // By keeping the same key, we keep the existing subscription to the old LINK,
-            // which is what the bridge is connected to. Events continue to flow correctly.
-            //
-            // WHILE re-render still works because:
+            // WHILE re-render works because:
             // 1. When WHILE switches away from an arm, old Variables are dropped
             // 2. Subscription stream ends (receiver gone)
             // 3. switch_map_by_key resets the key when inner stream ends
@@ -2368,23 +2334,16 @@ impl PassThroughConnector {
                         result = op_receiver.next() => {
                             match result {
                                 Some(PassThroughOp::Register { key, value_sender, actor }) => {
-                                    println!("[PASS_THROUGH] Registered key: {:?}", key.persistence_id);
                                     pass_throughs.insert(key, (value_sender, actor, Vec::new()));
                                 }
                                 Some(PassThroughOp::Forward { key, value }) => {
                                     if let Some((sender, _, _)) = pass_throughs.get(&key) {
-                                        println!("[PASS_THROUGH] Forwarding value to key: {:?}", key.persistence_id);
                                         let _ = sender.unbounded_send(value);
-                                    } else {
-                                        println!("[PASS_THROUGH] No pass-through found for key: {:?}", key.persistence_id);
                                     }
                                 }
                                 Some(PassThroughOp::AddForwarder { key, forwarder }) => {
                                     if let Some((_, _, forwarders)) = pass_throughs.get_mut(&key) {
-                                        println!("[PASS_THROUGH] Adding forwarder for key: {:?}", key.persistence_id);
                                         forwarders.push(forwarder);
-                                    } else {
-                                        println!("[PASS_THROUGH] No pass-through found for forwarder key: {:?}", key.persistence_id);
                                     }
                                 }
                                 None => {
@@ -2455,106 +2414,6 @@ impl PassThroughConnector {
         let (response_sender, response_receiver) = oneshot::channel();
         let _ = self.sender_getter_sender.unbounded_send((key, response_sender));
         response_receiver.await.ok().flatten()
-    }
-}
-
-// --- LinkVariableConnector ---
-
-/// Key for identifying LINK variables: persistence_id + scope
-pub type LinkVariableKey = PassThroughKey;
-
-/// Stores LINK variable data for reuse across re-evaluations
-struct LinkVariableData {
-    sender: mpsc::UnboundedSender<Value>,
-    value_actor: Arc<ValueActor>,
-}
-
-enum LinkVariableOp {
-    /// Register a new LINK variable with its sender and value actor
-    Register {
-        key: LinkVariableKey,
-        sender: mpsc::UnboundedSender<Value>,
-        value_actor: Arc<ValueActor>,
-    },
-}
-
-/// Actor for stabilizing LINK variables across re-evaluations.
-/// When an Object containing a LINK is re-evaluated (e.g., Element/checkbox result),
-/// this ensures the same LINK sender and value_actor are reused instead of creating new ones.
-/// This is critical because:
-/// - Bridge subscribes to the FIRST LINK's sender when checkbox is created
-/// - HOLD's subscription switches to NEW LINK's value_actor via switch_map_by_key
-/// - Without stable LINKs, clicks go to old sender that has no subscribers
-pub struct LinkVariableConnector {
-    op_sender: mpsc::UnboundedSender<LinkVariableOp>,
-    getter_sender: mpsc::UnboundedSender<(LinkVariableKey, oneshot::Sender<Option<LinkVariableData>>)>,
-    actor_loop: ActorLoop,
-}
-
-impl LinkVariableConnector {
-    pub fn new() -> Self {
-        let (op_sender, op_receiver) = mpsc::unbounded();
-        let (getter_sender, getter_receiver) = mpsc::unbounded();
-
-        Self {
-            op_sender,
-            getter_sender,
-            actor_loop: ActorLoop::new(async move {
-                let mut link_variables = HashMap::<LinkVariableKey, LinkVariableData>::new();
-                let mut op_receiver = op_receiver.fuse();
-                let mut getter_receiver = getter_receiver.fuse();
-                let mut channels_closed = 0u8;
-
-                loop {
-                    select! {
-                        result = op_receiver.next() => {
-                            match result {
-                                Some(LinkVariableOp::Register { key, sender, value_actor }) => {
-                                    println!("[LINK_VAR] Registered key: {:?}", key.persistence_id);
-                                    link_variables.insert(key, LinkVariableData { sender, value_actor });
-                                }
-                                None => {
-                                    channels_closed += 1;
-                                    if channels_closed >= 2 { break; }
-                                }
-                            }
-                        }
-                        result = getter_receiver.next() => {
-                            match result {
-                                Some((key, response_sender)) => {
-                                    let data = link_variables.get(&key).map(|d| LinkVariableData {
-                                        sender: d.sender.clone(),
-                                        value_actor: d.value_actor.clone(),
-                                    });
-                                    let _ = response_sender.send(data);
-                                }
-                                None => {
-                                    channels_closed += 1;
-                                    if channels_closed >= 2 { break; }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                drop(link_variables);
-                if LOG_DROPS_AND_LOOP_ENDS {
-                    println!("LinkVariableConnector loop ended");
-                }
-            }),
-        }
-    }
-
-    /// Register a new LINK variable
-    pub fn register(&self, key: LinkVariableKey, sender: mpsc::UnboundedSender<Value>, value_actor: Arc<ValueActor>) {
-        let _ = self.op_sender.unbounded_send(LinkVariableOp::Register { key, sender, value_actor });
-    }
-
-    /// Get an existing LINK variable if it exists
-    pub async fn get(&self, key: LinkVariableKey) -> Option<(mpsc::UnboundedSender<Value>, Arc<ValueActor>)> {
-        let (response_sender, response_receiver) = oneshot::channel();
-        let _ = self.getter_sender.unbounded_send((key, response_sender));
-        response_receiver.await.ok().flatten().map(|d| (d.sender, d.value_actor))
     }
 }
 
@@ -6460,8 +6319,6 @@ pub struct ListBindingConfig {
     pub link_connector: Arc<LinkConnector>,
     /// Pass-through connector for stable LINK pass-throughs
     pub pass_through_connector: Arc<PassThroughConnector>,
-    /// Link variable connector for stable LINK variables
-    pub link_variable_connector: Arc<LinkVariableConnector>,
     /// Source code for creating borrowed expressions
     pub source_code: SourceCode,
     /// Function registry snapshot for resolving user-defined functions
@@ -7523,7 +7380,6 @@ impl ListBindingFunction {
             config.reference_connector.clone(),
             config.link_connector.clone(),
             config.pass_through_connector.clone(),
-            config.link_variable_connector.clone(),
             config.source_code.clone(),
             config.function_registry_snapshot.clone(),
         ) {

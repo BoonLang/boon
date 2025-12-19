@@ -53,7 +53,6 @@ pub struct EvaluationContext {
     pub reference_connector: Weak<ReferenceConnector>,
     pub link_connector: Weak<LinkConnector>,
     pub pass_through_connector: Weak<PassThroughConnector>,
-    pub link_variable_connector: Weak<LinkVariableConnector>,
     pub module_loader: ModuleLoader,
     pub source_code: SourceCode,
     /// Optional snapshot of function registry for nested evaluations (closures).
@@ -70,7 +69,6 @@ impl EvaluationContext {
         reference_connector: Arc<ReferenceConnector>,
         link_connector: Arc<LinkConnector>,
         pass_through_connector: Arc<PassThroughConnector>,
-        link_variable_connector: Arc<LinkVariableConnector>,
         module_loader: ModuleLoader,
         source_code: SourceCode,
     ) -> Self {
@@ -80,7 +78,6 @@ impl EvaluationContext {
             reference_connector: Arc::downgrade(&reference_connector),
             link_connector: Arc::downgrade(&link_connector),
             pass_through_connector: Arc::downgrade(&pass_through_connector),
-            link_variable_connector: Arc::downgrade(&link_variable_connector),
             module_loader,
             source_code,
             function_registry_snapshot: None,
@@ -164,12 +161,6 @@ impl EvaluationContext {
     /// Returns None if the connector has been dropped (program shutting down).
     pub fn try_pass_through_connector(&self) -> Option<Arc<PassThroughConnector>> {
         self.pass_through_connector.upgrade()
-    }
-
-    /// Try to upgrade the weak link_variable_connector to a strong Arc.
-    /// Returns None if the connector has been dropped (program shutting down).
-    pub fn try_link_variable_connector(&self) -> Option<Arc<LinkVariableConnector>> {
-        self.link_variable_connector.upgrade()
     }
 }
 
@@ -2086,13 +2077,11 @@ fn process_work_item(
 
                     let is_reeval = existing_sender.is_some();
                     if is_reeval {
-                        println!("[LINK_PASS_THROUGH] Re-evaluation - forwarding to existing pass-through");
                         // On re-evaluation, store the forwarder actor to keep it alive
                         if let (Some(conn), Ok(forwarder)) = (&connector_for_stream, forwarder_rx.await) {
                             conn.add_forwarder(pass_through_key_for_forwarder_storage, forwarder);
                         }
                     } else {
-                        println!("[LINK_PASS_THROUGH] First evaluation - registering pass-through");
                         // Register this pass-through (first evaluation only)
                         // Wait for the actor to be created and sent to us
                         if let (Some(conn), Ok(actor)) = (&connector_for_stream, actor_rx.await) {
@@ -2235,7 +2224,6 @@ fn process_work_item(
                         reference_connector: ctx.reference_connector,
                         link_connector: ctx.link_connector,
                         pass_through_connector: ctx.pass_through_connector,
-                        link_variable_connector: ctx.link_variable_connector,
                         function_registry_snapshot: ctx.function_registry_snapshot,
                         module_loader: ctx.module_loader,
                         source_code: ctx.source_code,
@@ -2421,7 +2409,6 @@ fn build_then_actor(
     let reference_connector_for_then = ctx.reference_connector.clone();
     let link_connector_for_then = ctx.link_connector.clone();
     let pass_through_connector_for_then = ctx.pass_through_connector.clone();
-    let link_variable_connector_for_then = ctx.link_variable_connector.clone();
     let function_registry_for_then = function_registry_snapshot;
     let module_loader_for_then = ctx.module_loader.clone();
     let source_code_for_then = ctx.source_code.clone();
@@ -2442,7 +2429,6 @@ fn build_then_actor(
         let reference_connector_clone = reference_connector_for_then.clone();
         let link_connector_clone = link_connector_for_then.clone();
         let pass_through_connector_clone = pass_through_connector_for_then.clone();
-        let link_variable_connector_clone = link_variable_connector_for_then.clone();
         let function_registry_clone = function_registry_for_then.clone();
         let module_loader_clone = module_loader_for_then.clone();
         let source_code_clone = source_code_for_then.clone();
@@ -2530,7 +2516,6 @@ fn build_then_actor(
                 reference_connector: reference_connector_clone,
                 link_connector: link_connector_clone,
                 pass_through_connector: pass_through_connector_clone,
-                link_variable_connector: link_variable_connector_clone,
                 module_loader: module_loader_clone,
                 source_code: source_code_clone,
                 function_registry_snapshot: Some(function_registry_clone),
@@ -2674,7 +2659,6 @@ fn build_when_actor(
     let reference_connector_for_when = ctx.reference_connector.clone();
     let link_connector_for_when = ctx.link_connector.clone();
     let pass_through_connector_for_when = ctx.pass_through_connector.clone();
-    let link_variable_connector_for_when = ctx.link_variable_connector.clone();
     let function_registry_for_when = function_registry_snapshot;
     let module_loader_for_when = ctx.module_loader.clone();
     let source_code_for_when = ctx.source_code.clone();
@@ -2692,7 +2676,6 @@ fn build_when_actor(
         let reference_connector_clone = reference_connector_for_when.clone();
         let link_connector_clone = link_connector_for_when.clone();
         let pass_through_connector_clone = pass_through_connector_for_when.clone();
-        let link_variable_connector_clone = link_variable_connector_for_when.clone();
         let function_registry_clone = function_registry_for_when.clone();
         let module_loader_clone = module_loader_for_when.clone();
         let source_code_clone = source_code_for_when.clone();
@@ -2788,7 +2771,6 @@ fn build_when_actor(
                         reference_connector: reference_connector_clone.clone(),
                         link_connector: link_connector_clone.clone(),
                         pass_through_connector: pass_through_connector_clone.clone(),
-                        link_variable_connector: link_variable_connector_clone.clone(),
                         module_loader: module_loader_clone.clone(),
                         source_code: source_code_clone.clone(),
                         function_registry_snapshot: Some(function_registry_clone.clone()),
@@ -2875,7 +2857,6 @@ fn build_while_actor(
     let reference_connector_for_while = ctx.reference_connector.clone();
     let link_connector_for_while = ctx.link_connector.clone();
     let pass_through_connector_for_while = ctx.pass_through_connector.clone();
-    let link_variable_connector_for_while = ctx.link_variable_connector.clone();
     let function_registry_for_while = function_registry_snapshot;
     let module_loader_for_while = ctx.module_loader.clone();
     let source_code_for_while = ctx.source_code.clone();
@@ -2898,7 +2879,6 @@ fn build_while_actor(
         let reference_connector_clone = reference_connector_for_while.clone();
         let link_connector_clone = link_connector_for_while.clone();
         let pass_through_connector_clone = pass_through_connector_for_while.clone();
-        let link_variable_connector_clone = link_variable_connector_for_while.clone();
         let function_registry_clone = function_registry_for_while.clone();
         let module_loader_clone = module_loader_for_while.clone();
         let source_code_clone = source_code_for_while.clone();
@@ -2999,7 +2979,6 @@ fn build_while_actor(
                     reference_connector: reference_connector_clone,
                     link_connector: link_connector_clone,
                     pass_through_connector: pass_through_connector_clone,
-                    link_variable_connector: link_variable_connector_clone,
                     module_loader: module_loader_clone,
                     source_code: source_code_clone,
                     function_registry_snapshot: Some(function_registry_clone),
@@ -3446,7 +3425,6 @@ fn build_hold_actor(
         reference_connector: ctx.reference_connector.clone(),
         link_connector: ctx.link_connector.clone(),
         pass_through_connector: ctx.pass_through_connector.clone(),
-        link_variable_connector: ctx.link_variable_connector.clone(),
         function_registry_snapshot: ctx.function_registry_snapshot.clone(),
         module_loader: ctx.module_loader.clone(),
         source_code: ctx.source_code.clone(),
@@ -4063,8 +4041,6 @@ fn build_list_binding_function(
         .ok_or_else(|| "LinkConnector dropped - program shutting down".to_string())?;
     let pass_through_connector = ctx.try_pass_through_connector()
         .ok_or_else(|| "PassThroughConnector dropped - program shutting down".to_string())?;
-    let link_variable_connector = ctx.try_link_variable_connector()
-        .ok_or_else(|| "LinkVariableConnector dropped - program shutting down".to_string())?;
     let config = ListBindingConfig {
         binding_name,
         transform_expr,
@@ -4072,7 +4048,6 @@ fn build_list_binding_function(
         reference_connector,
         link_connector,
         pass_through_connector,
-        link_variable_connector,
         source_code: ctx.source_code.clone(),
         function_registry_snapshot: ctx.function_registry_snapshot.clone(),
     };
@@ -4203,7 +4178,6 @@ fn call_function(
                     reference_connector: ctx_for_closure.reference_connector.clone(),
                     link_connector: ctx_for_closure.link_connector.clone(),
                     pass_through_connector: ctx_for_closure.pass_through_connector.clone(),
-                    link_variable_connector: ctx_for_closure.link_variable_connector.clone(),
                     module_loader: ctx_for_closure.module_loader.clone(),
                     source_code: ctx_for_closure.source_code.clone(),
                     function_registry_snapshot: ctx_for_closure.function_registry_snapshot.clone(),
@@ -4272,7 +4246,6 @@ fn call_function(
             reference_connector: ctx.reference_connector,
             link_connector: ctx.link_connector,
             pass_through_connector: ctx.pass_through_connector,
-            link_variable_connector: ctx.link_variable_connector,
             function_registry_snapshot: ctx.function_registry_snapshot,
             module_loader: ctx.module_loader,
             source_code: ctx.source_code,
@@ -4794,7 +4767,7 @@ pub fn evaluate(
 ) -> Result<(Arc<Object>, ConstructContext), String> {
     let function_registry = FunctionRegistry::new();
     let module_loader = ModuleLoader::default();
-    let (obj, ctx, _, _, _, _, _, _) = evaluate_with_registry(
+    let (obj, ctx, _, _, _, _, _) = evaluate_with_registry(
         source_code,
         expressions,
         states_local_storage_key,
@@ -4816,9 +4789,8 @@ pub fn evaluate(
 /// - `Arc<ReferenceConnector>`: Connector for variable references (MUST be dropped when done!)
 /// - `Arc<LinkConnector>`: Connector for LINK variables (MUST be dropped when done!)
 /// - `Arc<PassThroughConnector>`: Connector for LINK pass-throughs (MUST be dropped when done!)
-/// - `Arc<LinkVariableConnector>`: Connector for stable LINK variables (MUST be dropped when done!)
 ///
-/// IMPORTANT: The ReferenceConnector, LinkConnector, PassThroughConnector, and LinkVariableConnector
+/// IMPORTANT: The ReferenceConnector, LinkConnector, and PassThroughConnector
 /// MUST be dropped when the program is finished (e.g., when switching examples) to allow actors
 /// to be cleaned up. These connectors hold strong references to all top-level actors.
 pub fn evaluate_with_registry(
@@ -4828,7 +4800,7 @@ pub fn evaluate_with_registry(
     virtual_fs: VirtualFilesystem,
     mut function_registry: FunctionRegistry,
     module_loader: ModuleLoader,
-) -> Result<(Arc<Object>, ConstructContext, FunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>, Arc<PassThroughConnector>, Arc<LinkVariableConnector>), String> {
+) -> Result<(Arc<Object>, ConstructContext, FunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>, Arc<PassThroughConnector>), String> {
     let construct_context = ConstructContext {
         construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
         virtual_fs,
@@ -4837,7 +4809,6 @@ pub fn evaluate_with_registry(
     let reference_connector = Arc::new(ReferenceConnector::new());
     let link_connector = Arc::new(LinkConnector::new());
     let pass_through_connector = Arc::new(PassThroughConnector::new());
-    let link_variable_connector = Arc::new(LinkVariableConnector::new());
 
     // First pass: collect function definitions and variables
     let mut variables = Vec::new();
@@ -4888,7 +4859,6 @@ pub fn evaluate_with_registry(
                 reference_connector.clone(),
                 link_connector.clone(),
                 pass_through_connector.clone(),
-                link_variable_connector.clone(),
                 &function_registry,
                 module_loader.clone(),
                 source_code.clone(),
@@ -4901,7 +4871,7 @@ pub fn evaluate_with_registry(
         construct_context.clone(),
         evaluated_variables?,
     );
-    Ok((root_object, construct_context, function_registry, module_loader, reference_connector, link_connector, pass_through_connector, link_variable_connector))
+    Ok((root_object, construct_context, function_registry, module_loader, reference_connector, link_connector, pass_through_connector))
 }
 
 /// Evaluates a static variable into a Variable.
@@ -4912,7 +4882,6 @@ fn static_spanned_variable_into_variable(
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
     pass_through_connector: Arc<PassThroughConnector>,
-    link_variable_connector: Arc<LinkVariableConnector>,
     function_registry: &FunctionRegistry,
     module_loader: ModuleLoader,
     source_code: SourceCode,
@@ -4953,7 +4922,6 @@ fn static_spanned_variable_into_variable(
                 reference_connector.clone(),
                 link_connector.clone(),
                 pass_through_connector.clone(),
-                link_variable_connector.clone(),
                 function_registry,
                 module_loader,
                 source_code,
@@ -5014,7 +4982,6 @@ pub fn evaluate_static_expression(
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
     pass_through_connector: Arc<PassThroughConnector>,
-    link_variable_connector: Arc<LinkVariableConnector>,
     source_code: SourceCode,
 ) -> Result<Arc<ValueActor>, String> {
     evaluate_static_expression_with_registry(
@@ -5024,7 +4991,6 @@ pub fn evaluate_static_expression(
         reference_connector,
         link_connector,
         pass_through_connector,
-        link_variable_connector,
         source_code,
         None,
     )
@@ -5039,7 +5005,6 @@ pub fn evaluate_static_expression_with_registry(
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
     pass_through_connector: Arc<PassThroughConnector>,
-    link_variable_connector: Arc<LinkVariableConnector>,
     source_code: SourceCode,
     function_registry_snapshot: Option<Arc<FunctionRegistry>>,
 ) -> Result<Arc<ValueActor>, String> {
@@ -5054,7 +5019,6 @@ pub fn evaluate_static_expression_with_registry(
         reference_connector,
         link_connector,
         pass_through_connector,
-        link_variable_connector,
         &registry,
         ModuleLoader::default(),
         source_code,
@@ -5072,7 +5036,6 @@ fn static_spanned_expression_into_value_actor(
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
     pass_through_connector: Arc<PassThroughConnector>,
-    link_variable_connector: Arc<LinkVariableConnector>,
     function_registry: &FunctionRegistry,
     module_loader: ModuleLoader,
     source_code: SourceCode,
@@ -5091,7 +5054,6 @@ fn static_spanned_expression_into_value_actor(
         reference_connector: Arc::downgrade(&reference_connector),
         link_connector: Arc::downgrade(&link_connector),
         pass_through_connector: Arc::downgrade(&pass_through_connector),
-        link_variable_connector: Arc::downgrade(&link_variable_connector),
         module_loader,
         source_code,
         function_registry_snapshot: snapshot,

@@ -2054,7 +2054,7 @@ fn element_checkbox(
     let click_var_stream = event_stream
         .filter_map(|value| future::ready(value.expect_object().variable("click")));
 
-    // Map to sender - the Variable stream already handles uniqueness via evaluation_id
+    // Map to sender - the Variable stream already handles uniqueness via persistence_id + scope
     // Chain with pending() to prevent stream termination causing busy-polling in select!
     let click_sender_stream = click_var_stream.map(move |variable| {
         variable.expect_link_value_sender()
