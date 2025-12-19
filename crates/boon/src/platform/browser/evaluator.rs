@@ -1132,13 +1132,10 @@ fn schedule_expression(
             let path_strs: Vec<String> = path.iter().map(|s| s.to_string()).collect();
             let path_strs_ref: Vec<&str> = path_strs.iter().map(|s| s.as_str()).collect();
 
-            zoon::println!("[EVAL:FunctionCall] path={:?}", path_strs);
-
             // Special handling for List binding functions (map, retain, remove, every, any, sort_by)
             // These need the unevaluated expression to evaluate per-item with bindings
             match path_strs_ref.as_slice() {
                 ["List", "map"] | ["List", "retain"] | ["List", "remove"] | ["List", "every"] | ["List", "any"] | ["List", "sort_by"] => {
-                    zoon::println!("[EVAL:ListBinding] Detected List binding function: {:?}", path_strs);
                     // Handle List binding functions specially - don't pre-evaluate transform expression
                     if let Some(actor) = build_list_binding_function(
                         &path_strs,
@@ -2117,9 +2114,6 @@ fn process_work_item(
                     // Check if subscription scope is cancelled (e.g., WHILE arm switched)
                     sub.take_while(move |_| {
                         let is_active = subscription_scope.as_ref().map_or(true, |s| !s.is_cancelled());
-                        if !is_active {
-                            zoon::println!("[LINK_SETTER] scope cancelled, stopping forwarding");
-                        }
                         future::ready(is_active)
                     })
                     .map(move |value| {
@@ -2464,15 +2458,6 @@ fn build_then_actor(
             if let Some(ref permit) = permit_clone {
                 permit.acquire().await;
             }
-
-            // DEBUG: Log the value that triggered THEN
-            let value_desc = match &value {
-                Value::Text(t, _) => format!("Text('{}')", t.text()),
-                Value::Number(n, _) => format!("Number({})", n.number()),
-                Value::Tag(_, _) => "Tag".to_string(),
-                _ => "Other".to_string(),
-            };
-            zoon::println!("[THEN:eval_body] THEN body triggered with value: {}", value_desc);
 
             let value_actor = ValueActor::new_arc(
                 ConstructInfo::new(
@@ -2897,18 +2882,17 @@ fn build_while_actor(
     let persistence_for_while = persistence.clone();
     let span_for_while = span;
 
-    // Track the current subscription scope - when arm switches, we cancel the old scope
-    // to terminate all streams created within that arm (List/map, LinkSetter, etc.)
-    let current_scope: Arc<std::sync::Mutex<Option<Arc<SubscriptionScope>>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let current_scope_for_while = current_scope.clone();
-
     // Use switch_map for proper WHILE semantics - when input changes, cancel old arm and switch to new one.
     // This is essential for reactive UI: when `current_page` changes from `Home` to `About`,
     // we must STOP rendering Home content and START rendering About content.
     // Regular flatten() would merge both streams, causing both to render.
+    //
+    // The subscription scope cancellation is handled by ScopeGuard:
+    // - Each arm creates a ScopeGuard that holds the scope
+    // - The guard is kept alive in the stream
+    // - When switch_map drops the old inner stream, the guard is dropped
+    // - The guard's Drop impl cancels the scope, terminating all subscriptions in that arm
     let stream = switch_map(piped.clone().stream_sync(), move |value| {
-        let current_scope_clone = current_scope_for_while.clone();
         let actor_context_clone = actor_context_for_while.clone();
         let construct_context_clone = construct_context_for_while.clone();
         let reference_connector_clone = reference_connector_for_while.clone();
@@ -2935,15 +2919,10 @@ fn build_while_actor(
             }
 
             if let Some((arm_idx, arm, bindings)) = matched_arm_with_bindings {
-                // Cancel the old subscription scope (if any) to terminate all streams from previous arm
-                // This prevents inactive arms from processing updates (e.g., List/map continuing to run)
-                if let Some(old_scope) = current_scope_clone.lock().unwrap().take() {
-                    old_scope.cancel();
-                }
-
                 // Create a new subscription scope for this arm
+                // The ScopeGuard will cancel the scope when dropped (when switch_map drops the inner stream)
                 let arm_scope = Arc::new(SubscriptionScope::new());
-                *current_scope_clone.lock().unwrap() = Some(arm_scope.clone());
+                let scope_guard = ScopeGuard::new(arm_scope.clone());
 
                 let value_actor = ValueActor::new_arc(
                     ConstructInfo::new(
@@ -3029,14 +3008,21 @@ fn build_while_actor(
                 match evaluate_expression(arm.body.clone(), new_ctx) {
                     Ok(Some(result_actor)) => {
                         // Use stream() for continuous streaming semantics
-                        result_actor.stream().await.boxed_local()
+                        // Wrap the stream to keep scope_guard alive - when this stream is dropped
+                        // (by switch_map switching to new arm), the guard is dropped, cancelling scope
+                        let body_stream = result_actor.stream().await;
+                        stream::unfold((body_stream, Some(scope_guard)), |(mut s, guard)| async move {
+                            s.next().await.map(|v| (v, (s, guard)))
+                        }).boxed_local()
                     }
                     Ok(None) => {
-                        // SKIP - return finite empty stream (switch_map handles this)
+                        // SKIP - scope_guard dropped here, scope cancelled immediately
+                        drop(scope_guard);
                         stream::empty().boxed_local()
                     }
                     Err(_e) => {
-                        // Error evaluating body - return empty stream
+                        // Error evaluating body - scope_guard dropped here, scope cancelled
+                        drop(scope_guard);
                         stream::empty().boxed_local()
                     }
                 }
@@ -3169,14 +3155,10 @@ fn build_field_access_actor(
         }
 
         // Start by getting the first value from the piped stream
-        zoon::println!("[FieldAccess] Starting field access for path {:?}", path_strings);
         let mut piped_subscription = _piped_ref.stream().await.fuse();
-        zoon::println!("[FieldAccess] Waiting for initial piped value...");
         let Some(initial_piped_value) = piped_subscription.next().await else {
-            zoon::println!("[FieldAccess] Piped subscription returned None - returning early");
             return;
         };
-        zoon::println!("[FieldAccess] Got initial piped value");
 
         // Find the first LINK field in the path (excluding the last field)
         // This is the field we need to watch for changes
@@ -3201,7 +3183,6 @@ fn build_field_access_actor(
                 Value::Object(obj, _) => obj.variable(field_name),
                 Value::TaggedObject(tagged, _) => tagged.variable(field_name),
                 _ => {
-                    zoon::println!("FieldAccess: Cannot access field '{}' on non-object", field_name);
                     return;
                 }
             };
@@ -3233,16 +3214,12 @@ fn build_field_access_actor(
 
         // Now we have current_value pointing to the object containing the final field
         // Get the subscription for the final field
-        zoon::println!("[FieldAccess] About to get final field subscription for '{}'", final_field);
         let Some((final_is_link, final_subscription)) = get_final_link_subscription(&current_value, &final_field).await else {
-            zoon::println!("[FieldAccess] Failed to get final field subscription - returning early");
             return;
         };
-        zoon::println!("[FieldAccess] Final field '{}' is_link: {}", final_field, final_is_link);
 
         if !final_is_link {
             // Final field is not a LINK - just emit one value and we're done
-            zoon::println!("[FieldAccess] Final field is not a LINK, emitting one value and returning");
             let mut sub = final_subscription;
             if let Some(val) = sub.next().await {
                 let _ = field_sender.unbounded_send(val);
@@ -3253,28 +3230,22 @@ fn build_field_access_actor(
         // Final field IS a LINK - we need to stay subscribed and watch for intermediate changes
         let mut final_sub = final_subscription.fuse();
 
-        zoon::println!("[FieldAccess] Starting loop for path {:?}, first_link_idx={:?}, intermediate_fields={:?}",
-            path_strings, first_link_idx, intermediate_fields);
-
         loop {
             if let Some(ref mut first_link_sub) = first_link_subscription {
                 // We have an intermediate LINK to watch
                 select! {
                     final_value = final_sub.next() => {
                         if let Some(val) = final_value {
-                            zoon::println!("[FieldAccess] Forwarding value from final LINK");
                             if field_sender.unbounded_send(val).is_err() {
                                 return;
                             }
                         } else {
-                            zoon::println!("[FieldAccess] Final subscription ended");
                             break; // Final subscription ended
                         }
                     }
                     first_link_value = first_link_sub.next() => {
                         if let Some(new_value) = first_link_value {
                             // First LINK emitted a new value - re-navigate from here
-                            zoon::println!("[FieldAccess] First LINK emitted new value - re-navigating through {:?}", fields_after_first_link);
                             // Navigate through remaining intermediate fields
                             let nav_result = navigate_path(new_value, &fields_after_first_link).await;
 
@@ -3288,7 +3259,6 @@ fn build_field_access_actor(
                             }
                             // Continue loop with new final subscription
                         } else {
-                            zoon::println!("[FieldAccess] First LINK subscription ended - breaking loop");
                             break; // First LINK subscription ended
                         }
                     }
@@ -3499,9 +3469,7 @@ fn build_hold_actor(
     // For lazy actors, this enables demand-driven evaluation where HOLD pulls values
     // one at a time and updates state between each pull (sequential state updates).
     let body_subscription = body_result.clone().stream_sync();
-    let state_param_for_log = state_param.clone();
     let state_update_stream = body_subscription.map(move |new_value| {
-        zoon::println!("[HOLD] Body produced value for '{}': {:?}", state_param_for_log, new_value.construct_info());
         // Send to state channel so body can see it on next event
         let _ = state_sender_for_update.unbounded_send(new_value.clone());
         // DIRECTLY update state_actor's stored value - bypass async channel delay.

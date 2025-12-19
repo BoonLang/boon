@@ -31,26 +31,6 @@ pub fn object_with_document_to_element_signal(
 }
 
 fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElOrText {
-    // Debug logging for all values reaching bridge
-    match &value {
-        Value::TaggedObject(tagged_object, _) => {
-            zoon::println!("[BRIDGE] value_to_element: TaggedObject tag={}", tagged_object.tag());
-        }
-        Value::Tag(tag, _) => {
-            zoon::println!("[BRIDGE] value_to_element: Tag={}", tag.tag());
-        }
-        Value::Text(text, _) => {
-            let t = text.text();
-            if t.len() < 50 {
-                zoon::println!("[BRIDGE] value_to_element: Text={}", t);
-            } else {
-                zoon::println!("[BRIDGE] value_to_element: Text (len={})", t.len());
-            }
-        }
-        other => {
-            zoon::println!("[BRIDGE] value_to_element: {:?}", std::mem::discriminant(other));
-        }
-    }
     match value {
         Value::Text(text, _) => zoon::Text::new(text.text()).unify(),
         Value::Number(number, _) => zoon::Text::new(number.number()).unify(),
@@ -68,10 +48,7 @@ fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElO
             "ElementButton" => element_button(tagged_object, construct_context).unify(),
             "ElementTextInput" => element_text_input(tagged_object, construct_context).unify(),
             "ElementCheckbox" => element_checkbox(tagged_object, construct_context).unify(),
-            "ElementLabel" => {
-                zoon::println!("[BRIDGE] value_to_element: DISPATCHING to element_label");
-                element_label(tagged_object, construct_context).unify()
-            },
+            "ElementLabel" => element_label(tagged_object, construct_context).unify(),
             "ElementParagraph" => element_paragraph(tagged_object, construct_context).unify(),
             "ElementLink" => element_link(tagged_object, construct_context).unify(),
             other => panic!("Element cannot be created from the tagged object with tag '{other}'"),
@@ -1293,7 +1270,6 @@ fn element_button(
                 select! {
                     new_press_link_value_sender = press_stream.next() => {
                         if let Some(new_press_link_value_sender) = new_press_link_value_sender {
-                            zoon::println!("[BRIDGE] event_handler: press LINK sender set up (ready to receive events)");
                             press_link_value_sender = Some(new_press_link_value_sender);
                         }
                     }
@@ -1304,7 +1280,6 @@ fn element_button(
                     }
                     press_event = press_event_receiver.select_next_some() => {
                         if let Some(press_link_value_sender) = press_link_value_sender.as_ref() {
-                            zoon::println!("[BRIDGE] event_handler: Received press event from MoonZoon");
                             let press_event_object_value = Object::new_value(
                                 ConstructInfo::new(format!("bridge::element_button::press_event, version: {press_event_object_value_version}"), None, "Button press event"),
                                 construct_context.clone(),
@@ -1312,13 +1287,9 @@ fn element_button(
                                 [],
                             );
                             press_event_object_value_version += 1;
-                            let result = press_link_value_sender.unbounded_send(press_event_object_value);
-                            zoon::println!("[BRIDGE] event_handler: Sent press event to Boon engine LINK, result: {}", result.is_ok());
-                            if let Err(error) = result {
+                            if let Err(error) = press_link_value_sender.unbounded_send(press_event_object_value) {
                                 eprintln!("Failed to send button press event to event press link variable: {error}");
                             }
-                        } else {
-                            zoon::println!("[BRIDGE] event_handler: Press event received but no LINK sender set up yet");
                         }
                     }
                     is_hovered = hovered_receiver.select_next_some() => {
@@ -1635,12 +1606,9 @@ fn element_button(
         }))
         // @TODO Handle press event only when it's defined in Boon code? Add `.on_press_signal` to Zoon?
         .on_press(move || {
-            zoon::println!("[BRIDGE] on_press CLOSURE CALLED!");
             let press_event: PressEvent = ();
             if let Err(error) = press_event_sender.unbounded_send(press_event) {
                 eprintln!("Failed to send button press event from on_press handler: {error}");
-            } else {
-                zoon::println!("[BRIDGE] on_press: sent event successfully");
             }
         })
         .on_hovered_change(move |is_hovered| {
@@ -1668,11 +1636,6 @@ fn element_text_input(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static TEXT_INPUT_INSTANCE_COUNTER: AtomicU32 = AtomicU32::new(0);
-    let instance_id = TEXT_INPUT_INSTANCE_COUNTER.fetch_add(1, Ordering::SeqCst);
-    zoon::println!("[BRIDGE] element_text_input CREATED, instance #{}", instance_id);
-
     type ChangeEvent = String;
     type KeyDownEvent = String;
     type BlurEvent = ();
@@ -1691,11 +1654,7 @@ fn element_text_input(
         .filter_map(|value| future::ready(value.expect_object().variable("event")))
         .flat_map(|variable| variable.stream_sync())
         .filter_map(|value| future::ready(value.expect_object().variable("change")))
-        .map(move |variable| {
-            let sender = variable.expect_link_value_sender();
-            zoon::println!("[BRIDGE] text_input instance #{}: got change LINK sender", instance_id);
-            sender
-        })
+        .map(move |variable| variable.expect_link_value_sender())
         .chain(stream::pending())
         .fuse();
 
@@ -1705,14 +1664,7 @@ fn element_text_input(
         .filter_map(|value| future::ready(value.expect_object().variable("event")))
         .flat_map(|variable| variable.stream_sync())
         .filter_map(|value| future::ready(value.expect_object().variable("key_down")))
-        .map({
-            let instance_id = instance_id;
-            move |variable| {
-                let sender = variable.expect_link_value_sender();
-                zoon::println!("[BRIDGE] text_input instance #{}: got key_down LINK sender", instance_id);
-                sender
-            }
-        })
+        .map(move |variable| variable.expect_link_value_sender())
         .chain(stream::pending())
         .fuse();
 
@@ -1721,14 +1673,7 @@ fn element_text_input(
         .filter_map(|value| future::ready(value.expect_object().variable("event")))
         .flat_map(|variable| variable.stream_sync())
         .filter_map(|value| future::ready(value.expect_object().variable("blur")))
-        .map({
-            let instance_id = instance_id;
-            move |variable| {
-                let sender = variable.expect_link_value_sender();
-                zoon::println!("[BRIDGE] text_input instance #{}: got blur LINK sender", instance_id);
-                sender
-            }
-        })
+        .map(move |variable| variable.expect_link_value_sender())
         .chain(stream::pending())
         .fuse();
 
@@ -1744,12 +1689,10 @@ fn element_text_input(
                 select! {
                     result = change_stream.next() => {
                         if let Some(sender) = result {
-                            zoon::println!("[BRIDGE] text_input instance #{}: change LINK sender from stream", instance_id);
                             change_link_value_sender = Some(sender.clone());
 
                             // Flush any pending change events
                             for text in pending_change_events.drain(..) {
-                                zoon::println!("[BRIDGE] text_input instance #{}: Flushing buffered change event: '{}'", instance_id, text);
                                 let event_value = Object::new_value(
                                     ConstructInfo::new("text_input::change_event", None, "TextInput change event"),
                                     construct_context.clone(),
@@ -1779,7 +1722,6 @@ fn element_text_input(
                     }
                     result = key_down_stream.next() => {
                         if let Some(sender) = result {
-                            zoon::println!("[BRIDGE] text_input instance #{}: key_down LINK sender from stream", instance_id);
                             key_down_link_value_sender = Some(sender);
                         }
                     }
@@ -1789,9 +1731,7 @@ fn element_text_input(
                         }
                     }
                     text = change_event_receiver.select_next_some() => {
-                        zoon::println!("[BRIDGE] event_handler: Received change event with text: '{}'", text);
                         if let Some(sender) = change_link_value_sender.as_ref() {
-                            zoon::println!("[BRIDGE] event_handler: LINK sender exists, sending change event");
                             let event_value = Object::new_value(
                                 ConstructInfo::new("text_input::change_event", None, "TextInput change event"),
                                 construct_context.clone(),
@@ -1818,14 +1758,11 @@ fn element_text_input(
                             );
                             let _ = sender.unbounded_send(event_value);
                         } else {
-                            zoon::println!("[BRIDGE] event_handler: LINK not ready, buffering change event");
                             pending_change_events.push(text);
                         }
                     }
                     key = key_down_event_receiver.select_next_some() => {
-                        zoon::println!("[BRIDGE] event_handler: Received key '{}' from channel (from MoonZoon)", key);
                         if let Some(sender) = key_down_link_value_sender.as_ref() {
-                            zoon::println!("[BRIDGE] event_handler: LINK sender exists, creating event object for key '{}'", key);
                             let event_value = Object::new_value(
                                 ConstructInfo::new("text_input::key_down_event", None, "TextInput key_down event"),
                                 construct_context.clone(),
@@ -1850,10 +1787,7 @@ fn element_text_input(
                                     parser::Scope::Root,
                                 )],
                             );
-                            let send_result = sender.unbounded_send(event_value);
-                            zoon::println!("[BRIDGE] event_handler: Sent key '{}' event to Boon engine LINK, result: {:?}", key, send_result.is_ok());
-                        } else {
-                            zoon::println!("[BRIDGE] event_handler: WARNING - key '{}' received but NO LINK sender set up!", key);
+                            let _ = sender.unbounded_send(event_value);
                         }
                     }
                     _blur = blur_event_receiver.select_next_some() => {
@@ -2065,9 +1999,7 @@ fn element_text_input(
         .on_change({
             let sender = change_event_sender.clone();
             move |text| {
-                zoon::println!("[BRIDGE] TextInput on_change called with text: '{}'", text);
-                let result = sender.unbounded_send(text.clone());
-                zoon::println!("[BRIDGE] TextInput on_change send result: {:?}", result.is_ok());
+                let _ = sender.unbounded_send(text.clone());
             }
         })
         .on_key_down_event({
@@ -2078,9 +2010,7 @@ fn element_text_input(
                     Key::Escape => "Escape".to_string(),
                     Key::Other(k) => k.clone(),
                 };
-                zoon::println!("[BRIDGE] on_key_down_event: MoonZoon received key '{}' from DOM", key_name);
-                let send_result = sender.unbounded_send(key_name.clone());
-                zoon::println!("[BRIDGE] on_key_down_event: Sent '{}' to channel, result: {:?}", key_name, send_result.is_ok());
+                let _ = sender.unbounded_send(key_name);
             }
         })
         .on_blur({
@@ -2109,10 +2039,6 @@ fn element_checkbox(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
-    static CHECKBOX_INSTANCE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let instance_id = CHECKBOX_INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    zoon::println!("[BRIDGE] element_checkbox CREATED, instance #{}", instance_id);
-
     type ClickEvent = ();
 
     let (click_event_sender, mut click_event_receiver) = mpsc::unbounded::<ClickEvent>();
@@ -2131,11 +2057,7 @@ fn element_checkbox(
     // Map to sender - the Variable stream already handles uniqueness via evaluation_id
     // Chain with pending() to prevent stream termination causing busy-polling in select!
     let click_sender_stream = click_var_stream.map(move |variable| {
-        let sender = variable.expect_link_value_sender();
-        let scope = format!("{:?}", variable.scope());
-        let eval_id = variable.evaluation_id();
-        zoon::println!("[BRIDGE] checkbox instance #{}: got click LINK sender, scope={}, eval_id={}", instance_id, scope, eval_id);
-        sender
+        variable.expect_link_value_sender()
     });
 
     let mut click_sender_stream = click_sender_stream.chain(stream::pending()).fuse();
@@ -2144,7 +2066,6 @@ fn element_checkbox(
         let construct_context = construct_context.clone();
         async move {
             let mut click_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
-            let mut sender_update_count = 0usize;
             // Buffer for clicks that arrive before LINK sender is ready
             let mut pending_clicks: usize = 0;
 
@@ -2152,29 +2073,22 @@ fn element_checkbox(
                 select! {
                     result = click_sender_stream.next() => {
                         if let Some(sender) = result {
-                            sender_update_count += 1;
-                            zoon::println!("[BRIDGE] checkbox instance #{}: click LINK sender #{} from stream", instance_id, sender_update_count);
                             click_link_value_sender = Some(sender.clone());
 
                             // Send any pending clicks that were buffered
-                            if pending_clicks > 0 {
-                                zoon::println!("[BRIDGE] checkbox instance #{}: sending {} buffered click(s)", instance_id, pending_clicks);
-                                for _ in 0..pending_clicks {
-                                    let event_value = Object::new_value(
-                                        ConstructInfo::new("checkbox::click_event", None, "Checkbox click event"),
-                                        construct_context.clone(),
-                                        ValueIdempotencyKey::new(),
-                                        [],
-                                    );
-                                    let result = sender.unbounded_send(event_value);
-                                    zoon::println!("[BRIDGE] checkbox instance #{}: sent buffered click to Boon LINK, result: {:?}", instance_id, result.is_ok());
-                                }
-                                pending_clicks = 0;
+                            for _ in 0..pending_clicks {
+                                let event_value = Object::new_value(
+                                    ConstructInfo::new("checkbox::click_event", None, "Checkbox click event"),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    [],
+                                );
+                                let _ = sender.unbounded_send(event_value);
                             }
+                            pending_clicks = 0;
                         }
                     }
                     _click = click_event_receiver.select_next_some() => {
-                        zoon::println!("[BRIDGE] checkbox instance #{}: on_click using sender #{}", instance_id, sender_update_count);
                         if let Some(sender) = click_link_value_sender.as_ref() {
                             let event_value = Object::new_value(
                                 ConstructInfo::new("checkbox::click_event", None, "Checkbox click event"),
@@ -2182,12 +2096,10 @@ fn element_checkbox(
                                 ValueIdempotencyKey::new(),
                                 [],
                             );
-                            let result = sender.unbounded_send(event_value);
-                            zoon::println!("[BRIDGE] checkbox instance #{}: sent click event to Boon LINK, result: {:?}", instance_id, result.is_ok());
+                            let _ = sender.unbounded_send(event_value);
                         } else {
                             // Buffer the click to send when sender becomes available
                             pending_clicks += 1;
-                            zoon::println!("[BRIDGE] checkbox instance #{}: buffering click (pending: {}), waiting for LINK sender", instance_id, pending_clicks);
                         }
                     }
                 }
@@ -2226,7 +2138,6 @@ fn element_checkbox(
             }
         })
         .after_remove(move |_| {
-            zoon::println!("[BRIDGE] checkbox #{} after_remove called", instance_id);
             drop(event_handler_loop)
         })
 }
@@ -2236,11 +2147,6 @@ fn element_label(
     construct_context: ConstructContext,
 ) -> impl Element {
     type DoubleClickEvent = ();
-
-    // Instance counter for debugging
-    static INSTANCE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let instance_id = INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    zoon::println!("[BRIDGE] element_label CREATED, instance #{}", instance_id);
 
     let (double_click_sender, mut double_click_receiver) = mpsc::unbounded::<DoubleClickEvent>();
     let (hovered_sender, _hovered_receiver) = mpsc::unbounded::<bool>();
@@ -2261,28 +2167,17 @@ fn element_label(
         .stream_sync()
         .filter_map(move |value| {
             let obj = value.expect_object();
-            let event_var = obj.variable("event");
-            zoon::println!("[BRIDGE] element_label #{}: got element value, has_event={}", instance_id, event_var.is_some());
-            future::ready(event_var)
+            future::ready(obj.variable("event"))
         })
-        .flat_map(move |variable| {
-            zoon::println!("[BRIDGE] element_label #{}: subscribing to event variable", instance_id);
-            variable.stream_sync()
-        });
+        .flat_map(move |variable| variable.stream_sync());
 
     // Chain with pending() to prevent stream termination causing busy-polling in select!
     let mut double_click_stream = event_stream
         .filter_map(move |value| {
             let obj = value.expect_object();
-            let double_click_var = obj.variable("double_click");
-            zoon::println!("[BRIDGE] element_label #{}: got event value, has_double_click={}", instance_id, double_click_var.is_some());
-            future::ready(double_click_var)
+            future::ready(obj.variable("double_click"))
         })
-        .map(move |variable| {
-            let has_sender = variable.link_value_sender().is_some();
-            zoon::println!("[BRIDGE] element_label #{}: got double_click variable, has_sender={}", instance_id, has_sender);
-            variable.expect_link_value_sender()
-        })
+        .map(move |variable| variable.expect_link_value_sender())
         .chain(stream::pending())
         .fuse();
 
@@ -2292,15 +2187,11 @@ fn element_label(
             let mut double_click_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
             let mut _hovered_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
             let mut hovered_stream = hovered_stream.fuse();
-            zoon::println!("[BRIDGE] element_label #{}: event_handler_loop started", instance_id);
             loop {
                 select! {
                     new_sender = double_click_stream.next() => {
                         if let Some(sender) = new_sender {
-                            zoon::println!("[BRIDGE] element_label #{}: GOT double_click sender!", instance_id);
                             double_click_link_value_sender = Some(sender);
-                        } else {
-                            zoon::println!("[BRIDGE] element_label #{}: double_click_stream returned None", instance_id);
                         }
                     }
                     new_sender = hovered_stream.next() => {
@@ -2309,7 +2200,6 @@ fn element_label(
                         }
                     }
                     _click = double_click_receiver.select_next_some() => {
-                        zoon::println!("[BRIDGE] element_label #{}: double_click received! has_sender={}", instance_id, double_click_link_value_sender.is_some());
                         if let Some(sender) = double_click_link_value_sender.as_ref() {
                             let event_value = Object::new_value(
                                 ConstructInfo::new("label::double_click_event", None, "Label double_click event"),
@@ -2317,8 +2207,7 @@ fn element_label(
                                 ValueIdempotencyKey::new(),
                                 [],
                             );
-                            let result = sender.unbounded_send(event_value);
-                            zoon::println!("[BRIDGE] element_label #{}: sent event to LINK, result={:?}", instance_id, result.is_ok());
+                            let _ = sender.unbounded_send(event_value);
                         }
                     }
                 }

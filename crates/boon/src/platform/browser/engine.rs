@@ -142,24 +142,6 @@ pub fn constant<T>(item: T) -> TypedStream<impl Stream<Item = T>, Infinite> {
     TypedStream::infinite(stream::once(future::ready(item)).chain(stream::once(future::pending())))
 }
 
-/// Extract the WHILE arm Ulid from a scope string.
-/// Scope format: "...:while_arm_ULID:..." or "while_arm_ULID:..."
-/// Returns the Ulid string if found, None otherwise.
-fn extract_while_arm_from_scope(scope: &parser::Scope) -> Option<String> {
-    match scope {
-        parser::Scope::Root => None,
-        parser::Scope::Nested(s) => {
-            // Find "while_arm_" and extract the Ulid that follows
-            for part in s.split(':') {
-                if let Some(ulid) = part.strip_prefix("while_arm_") {
-                    return Some(ulid.to_string());
-                }
-            }
-            None
-        }
-    }
-}
-
 // --- Error Types ---
 
 /// Error returned by `current_value()`.
@@ -275,7 +257,6 @@ where
         loop {
             // If we have a pending outer value and the inner stream is done/empty, switch now
             if let Some(pending_value) = pending_outer.take() {
-                zoon::println!("[SWITCH_MAP:{}] Switching to pending outer value (inner drained)", switch_id);
                 inner_opt = Some(map_fn(pending_value).boxed_local().fuse());
                 continue;
             }
@@ -287,13 +268,11 @@ where
                     let inner_fut = inner.next();
 
                     match future::select(pin!(outer_fut), pin!(inner_fut)).await {
-                        Either::Left((outer_opt, inner_fut_incomplete)) => {
+                        Either::Left((outer_opt, _inner_fut_incomplete)) => {
                             match outer_opt {
                                 Some(new_outer_value) => {
                                     // Outer emitted - but don't switch immediately!
                                     // First, try to drain any ready items from inner stream.
-                                    zoon::println!("[SWITCH_MAP:{}] Outer value arrived, draining inner before switch", switch_id);
-
                                     // Poll the inner stream once to check for ready items
                                     // We use poll_fn to do a non-blocking check
                                     let inner_item = std::future::poll_fn(|cx| {
@@ -305,21 +284,16 @@ where
 
                                     if let Some(item) = inner_item {
                                         // Inner had a ready item - emit it and store outer for later
-                                        zoon::println!("[SWITCH_MAP:{}] Drained item from inner, storing outer for later", switch_id);
                                         pending_outer = Some(new_outer_value);
                                         return Some((item, (outer_stream, inner_opt, map_fn, switch_id, pending_outer)));
                                     } else {
                                         // No ready items in inner - safe to switch now
-                                        // Drop the old inner stream explicitly for logging
-                                        zoon::println!("[SWITCH_MAP:{}] Inner empty, DROPPING old inner and switching", switch_id);
                                         drop(inner_opt.take());
-                                        zoon::println!("[SWITCH_MAP:{}] Old inner dropped, creating new inner", switch_id);
                                         inner_opt = Some(map_fn(new_outer_value).boxed_local().fuse());
                                     }
                                 }
                                 None => {
                                     // Outer ended - drain inner then finish
-                                    zoon::println!("[SWITCH_MAP:{}] Outer ended, draining inner", switch_id);
                                     while let Some(item) = inner.next().await {
                                         return Some((item, (outer_stream, inner_opt, map_fn, switch_id, None)));
                                     }
@@ -330,12 +304,10 @@ where
                         Either::Right((inner_opt_val, _)) => {
                             match inner_opt_val {
                                 Some(item) => {
-                                    zoon::println!("[SWITCH_MAP:{}] Inner stream emitted value", switch_id);
                                     return Some((item, (outer_stream, inner_opt, map_fn, switch_id, pending_outer)));
                                 }
                                 None => {
                                     // Inner ended - clear it
-                                    zoon::println!("[SWITCH_MAP:{}] Inner stream ended, waiting for new outer value", switch_id);
                                     inner_opt = None;
                                 }
                             }
@@ -345,12 +317,10 @@ where
                 _ => {
                     // No active inner stream - wait for outer value
                     match outer_stream.next().await {
-                        Some(_value) => {
-                            zoon::println!("[SWITCH_MAP:{}] Initial outer value, creating inner stream", switch_id);
-                            inner_opt = Some(map_fn(_value).boxed_local().fuse());
+                        Some(value) => {
+                            inner_opt = Some(map_fn(value).boxed_local().fuse());
                         }
                         None => {
-                            zoon::println!("[SWITCH_MAP:{}] Outer ended with no active inner", switch_id);
                             return None; // Outer ended
                         }
                     }
@@ -432,26 +402,17 @@ where
                                 Some(new_outer_value) => {
                                     let new_key = key_fn(&new_outer_value);
 
-                                    // Check if key changed
-                                    let key_changed = current_key.as_ref().map_or(true, |k| k != &new_key);
-
                                     // ALWAYS recreate inner subscription when new outer value arrives.
                                     // Even with same key, the outer VALUE might contain different internal
                                     // Variables (e.g., when WHILE re-evaluates and creates new Element/checkbox
                                     // with new internal click LINK). We must follow the new value's internal
                                     // structure to get the correct Variables.
-                                    if key_changed {
-                                        zoon::println!("[SWITCH_MAP_BY_KEY:{}] Key changed from {:?} to {:?}, recreating", switch_id, current_key, new_key);
-                                    } else {
-                                        zoon::println!("[SWITCH_MAP_BY_KEY:{}] Same key {:?}, but new outer value - recreating to follow new internals", switch_id, new_key);
-                                    }
                                     current_key = Some(new_key);
                                     inner_opt = Some(map_fn(new_outer_value).boxed_local().fuse());
                                     pending_outer = None;
                                 }
                                 None => {
                                     // Outer ended - drain inner then finish
-                                    zoon::println!("[SWITCH_MAP_BY_KEY:{}] Outer ended, draining inner", switch_id);
                                     while let Some(item) = inner.next().await {
                                         return Some((item, (outer_stream, inner_opt, map_fn, key_fn, switch_id, current_key, pending_outer)));
                                     }
@@ -467,7 +428,6 @@ where
                                 None => {
                                     // Inner stream ended - the Variable we subscribed to was dropped.
                                     // Wait for next outer value to create new subscription.
-                                    zoon::println!("[SWITCH_MAP_BY_KEY:{}] Inner stream ended, waiting for new outer value", switch_id);
                                     inner_opt = None;
                                     current_key = None;
                                 }
@@ -478,14 +438,12 @@ where
                 _ => {
                     // No active inner stream - wait for outer value
                     match outer_stream.next().await {
-                        Some(_value) => {
-                            let new_key = key_fn(&_value);
-                            zoon::println!("[SWITCH_MAP_BY_KEY:{}] Initial outer value with key {:?}, creating inner stream", switch_id, new_key);
+                        Some(value) => {
+                            let new_key = key_fn(&value);
                             current_key = Some(new_key);
-                            inner_opt = Some(map_fn(_value).boxed_local().fuse());
+                            inner_opt = Some(map_fn(value).boxed_local().fuse());
                         }
                         None => {
-                            zoon::println!("[SWITCH_MAP_BY_KEY:{}] Outer ended with no active inner", switch_id);
                             return None;
                         }
                     }
@@ -996,18 +954,11 @@ pub struct PushSubscription {
     receiver: mpsc::Receiver<Value>,
     /// Keeps the actor alive for the subscription lifetime
     _actor: Arc<ValueActor>,
-    /// Debug ID for tracking drops
-    debug_id: usize,
 }
-
-static PUSH_SUBSCRIPTION_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static ACTOR_INSTANCE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl PushSubscription {
     fn new(receiver: mpsc::Receiver<Value>, actor: Arc<ValueActor>) -> Self {
-        let debug_id = PUSH_SUBSCRIPTION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        zoon::println!("[PUSH_SUB:{}] Created for: {} (id: {:?})", debug_id, actor.construct_info.description, actor.construct_info.id);
-        Self { receiver, _actor: actor, debug_id }
+        Self { receiver, _actor: actor }
     }
 }
 
@@ -1016,12 +967,6 @@ impl Stream for PushSubscription {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.receiver).poll_next(cx)
-    }
-}
-
-impl Drop for PushSubscription {
-    fn drop(&mut self) {
-        zoon::println!("[PUSH_SUB:{}] DROPPED for: {}", self.debug_id, self._actor.construct_info.description);
     }
 }
 
@@ -1361,6 +1306,25 @@ impl Default for SubscriptionScope {
     }
 }
 
+/// Guard that cancels a SubscriptionScope when dropped.
+/// Used to tie scope lifecycle to stream lifecycle - when the stream is dropped
+/// (e.g., by switch_map switching to a new inner stream), the scope is cancelled.
+pub struct ScopeGuard {
+    scope: Arc<SubscriptionScope>,
+}
+
+impl ScopeGuard {
+    pub fn new(scope: Arc<SubscriptionScope>) -> Self {
+        Self { scope }
+    }
+}
+
+impl Drop for ScopeGuard {
+    fn drop(&mut self) {
+        self.scope.cancel();
+    }
+}
+
 // --- ActorContext ---
 
 #[derive(Default, Clone)]
@@ -1510,12 +1474,6 @@ impl ActorOutputValveSignal {
             eprintln!("Failed to subscribe to actor output valve signal: {error:#}");
         }
         impulse_receiver
-    }
-
-    /// Check if the valve signal has been closed (actor loop ended).
-    /// Used by LinkSetter to avoid forwarding values from inactive WHILE arms.
-    pub fn is_closed(&self) -> bool {
-        self.impulse_sender_sender.is_closed()
     }
 }
 
@@ -1738,7 +1696,6 @@ impl Variable {
             persistence,
             description: variable_description,
         } = construct_info;
-        let variable_description_for_log = variable_description.clone();
         let construct_info = ConstructInfo::new(
             actor_id.with_child_id("wrapped Variable"),
             persistence,
@@ -1749,14 +1706,10 @@ impl Variable {
                 .complete(ConstructType::ValueActor);
         let (link_value_sender, link_value_receiver) = mpsc::unbounded::<Value>();
         // UnboundedReceiver is infinite - it never terminates unless sender is dropped
-        let link_stream_with_logging = link_value_receiver.map(move |value| {
-            zoon::println!("[LINK] Received value: {} -> {:?}", variable_description_for_log, value.construct_info());
-            value
-        });
         // Capture the scope before actor_context is moved
         let scope = actor_context.scope.clone();
         let value_actor =
-            ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_stream_with_logging), Some(persistence_id));
+            ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_value_receiver), Some(persistence_id));
         let value_actor = Arc::new(value_actor);
 
         Arc::new(Self {
@@ -2035,19 +1988,13 @@ impl VariableOrArgumentReference {
                             let variable = object.expect_variable(&alias_part_for_key);
                             let pid = variable.persistence_id();
                             let scope = variable.scope();
-                            let key = pid.in_scope(scope);
-                            zoon::println!("[ALIAS_KEY] field='{}', var='{}', scope={:?}, key={}",
-                                alias_part_for_key, variable.name(), scope, key.as_u128());
-                            key
+                            pid.in_scope(scope)
                         }
                         Value::TaggedObject(tagged_object, _) => {
                             let variable = tagged_object.expect_variable(&alias_part_for_key);
                             let pid = variable.persistence_id();
                             let scope = variable.scope();
-                            let key = pid.in_scope(scope);
-                            zoon::println!("[ALIAS_KEY] field='{}', var='{}', scope={:?}, key={}",
-                                alias_part_for_key, variable.name(), scope, key.as_u128());
-                            key
+                            pid.in_scope(scope)
                         }
                         // Non-object values get default key (will cause panic in map_fn anyway)
                         _ => parser::PersistenceId::default(),
@@ -2106,36 +2053,18 @@ impl VariableOrArgumentReference {
                             .boxed_local()
                         } else {
                             // Streaming: continuous updates - use stream() and keep alive
-                            let alias_part_for_log = alias_part.clone();
                             stream::unfold(
                                 (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), tagged_object, variable),
                                 move |(subscription_opt, actor_opt, tagged_object, variable)| {
-                                    let alias_part_log = alias_part_for_log.clone();
                                     async move {
-                                        let (mut subscription, is_new) = match subscription_opt {
-                                            Some(s) => (s, false),
+                                        let mut subscription = match subscription_opt {
+                                            Some(s) => s,
                                             None => {
-                                                zoon::println!("[ALIAS_UNFOLD:Tagged] Creating new subscription for '.{}'", alias_part_log);
                                                 let actor = actor_opt.unwrap();
-                                                (actor.stream().await, true)
+                                                actor.stream().await
                                             }
                                         };
-                                        zoon::println!("[ALIAS_UNFOLD:Tagged] Waiting for value from '.{}' (new_sub={})", alias_part_log, is_new);
                                         let value = subscription.next().await;
-                                        if let Some(ref v) = value {
-                                            let type_name = match v {
-                                                Value::Object(_, _) => "Object",
-                                                Value::TaggedObject(t, _) => t.tag(),
-                                                Value::Text(_, _) => "Text",
-                                                Value::Tag(t, _) => t.tag(),
-                                                Value::Number(_, _) => "Number",
-                                                Value::List(_, _) => "List",
-                                                Value::Flushed(_, _) => "Flushed",
-                                            };
-                                            zoon::println!("[ALIAS_UNFOLD:Tagged] Got value from '.{}': {}", alias_part_log, type_name);
-                                        } else {
-                                            zoon::println!("[ALIAS_UNFOLD:Tagged] '.{}' subscription ended (None)", alias_part_log);
-                                        }
                                         value.map(|value| (value, (Some(subscription), None, tagged_object, variable)))
                                     }
                                 }
@@ -2896,12 +2825,6 @@ impl ThenCombinator {
                         .observed_idempotency_key
                         .is_some_and(|key| key == idempotency_key);
 
-                    // DEBUG: Log idempotency key comparison for THEN
-                    zoon::println!("[THEN:idem] incoming_key={:?}, stored_key={:?}, skip={}",
-                        idempotency_key,
-                        state.observed_idempotency_key,
-                        skip_value);
-
                     if !skip_value {
                         state.observed_idempotency_key = Some(idempotency_key);
                     }
@@ -3620,7 +3543,6 @@ impl ValueActor {
             let output_valve_signal = actor_context.output_valve_signal;
             // Keep inputs alive in the spawned task
             let _inputs = inputs.clone();
-            let actor_instance_id = ACTOR_INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             async move {
                 // Actor-local state (no Mutex needed!)
@@ -3674,10 +3596,6 @@ impl ValueActor {
 
                                     // Add to live subscribers list
                                     subscribers.push(tx);
-                                    if construct_info.description.contains("Link") || construct_info.description.contains("click") {
-                                        zoon::println!("[SUBSCRIBE:inst#{}] Added sender, count now: {}, history_count: {}, sent: {}, current_version: {} for: {}",
-                                            actor_instance_id, subscribers.len(), history_count, sent_count, current_version.load(Ordering::SeqCst), construct_info.description);
-                                    }
 
                                     // Reply with the receiver
                                     let _ = reply.send(rx);
@@ -3790,23 +3708,14 @@ impl ValueActor {
 
                             // Push value to all subscribers
                             // Only remove on Disconnected (receiver dropped), NOT on Full (backpressure)
-                            let sub_count_before = subscribers.len();
-                            let is_link_or_click = construct_info.description.contains("Link") || construct_info.description.contains("click");
-                            let mut ok_count = 0;
-                            let mut full_count = 0;
-                            let mut disconnected_count = 0;
                             subscribers.retain_mut(|tx| {
                                 match tx.try_send(new_value.clone()) {
-                                    Ok(()) => { ok_count += 1; true }
-                                    Err(e) if e.is_disconnected() => { disconnected_count += 1; false } // Remove dead subscribers
-                                    Err(e) if e.is_full() => { full_count += 1; true } // Keep on backpressure (Full)
+                                    Ok(()) => true,
+                                    Err(e) if e.is_disconnected() => false, // Remove dead subscribers
+                                    Err(e) if e.is_full() => true, // Keep on backpressure (Full)
                                     Err(_) => true,
                                 }
                             });
-                            if is_link_or_click {
-                                zoon::println!("[VALUE_ACTOR:inst#{}] Pushed to {}/{} subscribers (ok={}, full={}, disconnected={}): {}",
-                                    actor_instance_id, subscribers.len(), sub_count_before, ok_count, full_count, disconnected_count, construct_info.description);
-                            }
 
                             // Handle migration forwarding
                             if let MigrationState::Migrating { buffered_writes, target, .. } = &mut migration_state {
@@ -4002,10 +3911,6 @@ impl ValueActor {
                 let migration_state = MigrationState::Normal;
 
                 loop {
-                    // Check if this is a click-related actor (for debug logging)
-                    let construct_str = construct_info.to_string();
-                    let is_click_related = construct_str.contains("click") || construct_str.contains("checkbox");
-
                     select! {
                         req = subscription_receiver.next() => {
                             if let Some(SubscriptionRequest { reply, starting_version }) = req {
@@ -4019,8 +3924,6 @@ impl ValueActor {
                                         let _ = tx.try_send(value.clone());
                                     }
                                     subscribers.push(tx);
-                                    zoon::println!("[SUBSCRIBE:Lazy] Added sender, count now: {} for: {}",
-                                        subscribers.len(), construct_str);
                                     let _ = reply.send(rx);
                                 }
                             }
@@ -4068,17 +3971,7 @@ impl ValueActor {
                             let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                             value_history.add(new_version, new_value.clone());
 
-                            // Debug logging for click-related actors
-                            let construct_str = construct_info.to_string();
-                            let is_click_related = construct_str.contains("click") || construct_str.contains("checkbox");
-                            let sub_count_before = subscribers.len();
-
                             subscribers.retain_mut(|tx| match tx.try_send(new_value.clone()) { Ok(()) => true, Err(e) if e.is_disconnected() => false, Err(_) => true });
-
-                            if is_click_related {
-                                zoon::println!("[BROADCAST] {} -> {} subscribers before, {} after",
-                                    construct_str, sub_count_before, subscribers.len());
-                            }
                         }
 
                         impulse = output_valve_impulse_stream.next() => {
@@ -4238,7 +4131,6 @@ impl ValueActor {
         let _ = ready_tx.send(()); // Fire immediately
         let ready_signal = ready_rx.shared();
 
-        let actor_instance_id = ACTOR_INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
             let current_version = current_version.clone();
@@ -4284,19 +4176,10 @@ impl ValueActor {
                                     let _ = reply.send(rx);
                                 } else {
                                     let (mut tx, rx) = mpsc::channel(32);
-                                    let historical_values = value_history.get_values_since(starting_version).0;
-                                    let history_count = historical_values.len();
-                                    let mut sent_count = 0;
-                                    for value in historical_values {
-                                        if tx.try_send(value.clone()).is_ok() {
-                                            sent_count += 1;
-                                        }
+                                    for value in value_history.get_values_since(starting_version).0 {
+                                        let _ = tx.try_send(value.clone());
                                     }
                                     subscribers.push(tx);
-                                    if construct_info.description.contains("Link") || construct_info.description.contains("click") {
-                                        zoon::println!("[SUBSCRIBE:InitVal:inst#{}] Added sender, count now: {}, history: {}, sent: {}, version: {} for: {}",
-                                            actor_instance_id, subscribers.len(), history_count, sent_count, current_version.load(Ordering::SeqCst), construct_info.description);
-                                    }
                                     let _ = reply.send(rx);
                                 }
                             }
@@ -4306,7 +4189,6 @@ impl ValueActor {
                             if let Some(value) = value {
                                 let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                 value_history.add(new_version, value.clone());
-                                let sub_count_before = subscribers.len();
                                 // Only remove on Disconnected (receiver dropped), NOT on Full (backpressure)
                                 subscribers.retain_mut(|tx| {
                                     match tx.try_send(value.clone()) {
@@ -4315,10 +4197,6 @@ impl ValueActor {
                                         Err(_) => true,
                                     }
                                 });
-                                if sub_count_before > 0 || construct_info.description.contains("click") {
-                                    zoon::println!("[VALUE_ACTOR:InitVal] Pushed to {}/{} subscribers: {} (id: {:?})",
-                                        subscribers.len(), sub_count_before, construct_info.description, construct_info.id);
-                                }
                             }
                         }
 
@@ -6692,16 +6570,6 @@ impl ListBindingFunction {
         source_list_actor: Arc<ValueActor>,
         config: ListBindingConfig,
     ) -> Arc<ValueActor> {
-        let op_name = match config.operation {
-            ListBindingOperation::Map => "Map",
-            ListBindingOperation::Retain => "Retain",
-            ListBindingOperation::Remove => "Remove",
-            ListBindingOperation::Every => "Every",
-            ListBindingOperation::Any => "Any",
-            ListBindingOperation::SortBy => "SortBy",
-        };
-        zoon::println!("[LIST_BINDING] new_arc_value_actor called: binding='{}', operation={}, source={}",
-            config.binding_name, op_name, source_list_actor.construct_info);
         let construct_info = construct_info.complete(ConstructType::FunctionCall);
         let config = Arc::new(config);
 
@@ -6773,46 +6641,23 @@ impl ListBindingFunction {
         source_list_actor: Arc<ValueActor>,
         config: Arc<ListBindingConfig>,
     ) -> Arc<ValueActor> {
-        zoon::println!("[LIST_MAP] create_map_actor: binding='{}', source={}",
-            config.binding_name, source_list_actor.construct_info);
-
         let config_for_stream = config.clone();
         let construct_context_for_stream = construct_context.clone();
         let actor_context_for_stream = actor_context.clone();
 
         // Clone subscription scope for scope cancellation check
         let subscription_scope = actor_context.subscription_scope.clone();
-        let binding_name_for_scope_log = config.binding_name.clone();
 
         // Use switch_map for proper list replacement handling:
         // When source emits a new list, cancel old subscription and start fresh.
         // But filter out re-emissions of the same list by ID to avoid cancelling
         // LINK connections unnecessarily.
-        let binding_name_for_filter_log = config.binding_name.clone();
-        let binding_name_for_dedup_log = config.binding_name.clone();
         let change_stream = switch_map(
             source_list_actor.clone().stream_sync()
             // Check if subscription scope is cancelled (e.g., WHILE arm switched)
             .take_while(move |_| {
                 let is_active = subscription_scope.as_ref().map_or(true, |s| !s.is_cancelled());
-                if !is_active {
-                    zoon::println!("[LIST_MAP] scope cancelled for binding='{}', stopping subscription",
-                        binding_name_for_scope_log);
-                }
                 future::ready(is_active)
-            })
-            .inspect(move |value| {
-                let value_type = match value {
-                    Value::List(_, _) => "List",
-                    Value::Object(_, _) => "Object",
-                    Value::TaggedObject(_, _) => "TaggedObject",
-                    Value::Text(_, _) => "Text",
-                    Value::Tag(_, _) => "Tag",
-                    Value::Number(_, _) => "Number",
-                    Value::Flushed(_, _) => "Flushed",
-                };
-                zoon::println!("[LIST_MAP] source emitted value for binding='{}': {}",
-                    binding_name_for_filter_log, value_type);
             })
             .filter_map(move |value| {
                 future::ready(match value {
@@ -6825,12 +6670,8 @@ impl ListBindingFunction {
                 let list_id = list.construct_info.id.clone();
                 if prev_id.as_ref() == Some(&list_id) {
                     // Same list re-emitted, skip to avoid cancelling LINK connections
-                    zoon::println!("[LIST_MAP] skipping duplicate list for binding='{}', id={:?}",
-                        binding_name_for_dedup_log, list_id);
                     future::ready(Some(None))
                 } else {
-                    zoon::println!("[LIST_MAP] new list for binding='{}', id={:?} (prev={:?})",
-                        binding_name_for_dedup_log, list_id, prev_id);
                     *prev_id = Some(list_id);
                     future::ready(Some(Some(list)))
                 }
@@ -6840,27 +6681,10 @@ impl ListBindingFunction {
             let config = config_for_stream.clone();
             let construct_context = construct_context_for_stream.clone();
             let actor_context = actor_context_for_stream.clone();
-            let binding_for_log = config.binding_name.clone();
-            let list_info = list.construct_info.to_string();
-            zoon::println!("[LIST_MAP] flat_map received new List for binding='{}': {}",
-                binding_for_log, list_info);
 
             // Use scan to track list length for proper Push index assignment.
             // The length is updated after each change is processed.
             list.stream().scan(0usize, move |length, change| {
-                let change_type = match &change {
-                    ListChange::Replace { items } => format!("Replace({} items)", items.len()),
-                    ListChange::Push { .. } => "Push".to_string(),
-                    ListChange::Pop => "Pop".to_string(),
-                    ListChange::InsertAt { index, .. } => format!("InsertAt({})", index),
-                    ListChange::RemoveAt { index } => format!("RemoveAt({})", index),
-                    ListChange::UpdateAt { index, .. } => format!("UpdateAt({})", index),
-                    ListChange::Clear => "Clear".to_string(),
-                    ListChange::Move { old_index, new_index } => format!("Move({} -> {})", old_index, new_index),
-                };
-                zoon::println!("[LIST_MAP] received change '{}' for binding='{}', source={}, current_length={}",
-                    change_type, binding_for_log, list_info, *length);
-
                 let (transformed_change, new_length) = Self::transform_list_change_for_map(
                     change,
                     *length,
@@ -7047,7 +6871,6 @@ impl ListBindingFunction {
                             }
                         }
                         RetainEvent::PredicateResult(idx, is_true) => {
-                            zoon::println!("[RETAIN] PredicateResult: idx={}, is_true={}", idx, is_true);
                             if idx < items.len() {
                                 items[idx].2 = Some(is_true);
                             }
@@ -7066,7 +6889,6 @@ impl ListBindingFunction {
                                 }
                             })
                             .collect();
-                        zoon::println!("[RETAIN] Emitting filtered list with {} items", filtered.len());
                         future::ready(Some(Some(ListChange::Replace { items: filtered })))
                     } else {
                         future::ready(Some(None))
@@ -7241,7 +7063,6 @@ impl ListBindingFunction {
                             future::ready(Some(Some(ListChange::Replace { items: current })))
                         }
                         RemoveEvent::RemoveItem(idx) => {
-                            zoon::println!("[REMOVE] RemoveItem event for idx={}", idx);
                             // Mark the item as removed
                             if let Some(item_entry) = items.iter_mut().find(|(i, _, _, _, _)| *i == idx) {
                                 item_entry.3 = true; // Mark as removed
@@ -7251,7 +7072,6 @@ impl ListBindingFunction {
                                 .filter(|(_, _, _, removed, _)| !removed)
                                 .map(|(_, item, _, _, _)| item.clone())
                                 .collect();
-                            zoon::println!("[REMOVE] Emitting list with {} remaining items", remaining.len());
                             future::ready(Some(Some(ListChange::Replace { items: remaining })))
                         }
                     }
@@ -7689,13 +7509,10 @@ impl ListBindingFunction {
             format!("{:?}", item_actor.construct_info.id)
         };
         let scope_id = format!("list_item_{}_{}", index, pid_suffix);
-        zoon::println!("[LIST_MAP] transform_item: binding='{}', scope_id='{}', parent_scope={:?}",
-            config.binding_name, scope_id, actor_context.scope);
         let new_actor_context = ActorContext {
             parameters: new_params,
             ..actor_context.with_child_scope(&scope_id)
         };
-        zoon::println!("[LIST_MAP] transform_item: new_scope={:?}", new_actor_context.scope);
 
         // Evaluate the transform expression with the binding in scope
         // Pass the function registry snapshot to enable user-defined function calls
