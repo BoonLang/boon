@@ -1,6 +1,3 @@
-// @TODO remove
-#![allow(dead_code)]
-
 use chumsky::{input::ValueInput, pratt::*, prelude::*};
 use std::cell::Cell;
 use std::fmt;

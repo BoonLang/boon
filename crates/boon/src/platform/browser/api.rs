@@ -1324,7 +1324,7 @@ pub fn function_timer_interval(
                     let construct_context = construct_context.clone();
                     async move {
                         // @TODO How to properly resolve resuming? Only if it's a longer interval?
-                        Timer::sleep(milliseconds.round() as u32).await;
+                        Timer::sleep(milliseconds.round().max(0.0).min(u32::MAX as f64) as u32).await;
                         let output_value = Object::new_value(
                             ConstructInfo::new(function_call_id.with_child_id("Timer/interval result v.{result_version}"), None, "Timer/interval(.. ) -> [..]"),
                             construct_context.clone(),
@@ -2060,17 +2060,10 @@ impl Default for LogOptions {
     }
 }
 
-use std::cell::Cell;
-
-thread_local! {
-    /// Current timeout for log value resolution (used by recursive resolve functions)
-    static LOG_TIMEOUT_MS: Cell<u32> = const { Cell::new(LOG_VALUE_DEFAULT_TIMEOUT_MS) };
-}
-
 /// Async function to resolve a Value to string for logging.
 /// Awaits nested actors with timeout - shows `?` for values that don't arrive in time.
 /// Uses Pin<Box<...>> for recursive calls to break infinite type recursion.
-fn resolve_value_for_log(value: Value) -> Pin<Box<dyn Future<Output = String>>> {
+fn resolve_value_for_log(value: Value, timeout_ms: u32) -> Pin<Box<dyn Future<Output = String>>> {
     Box::pin(async move {
         match value {
             Value::Text(text, _) => text.text().to_string(),
@@ -2080,7 +2073,7 @@ fn resolve_value_for_log(value: Value) -> Pin<Box<dyn Future<Output = String>>> 
                 let mut fields = Vec::new();
                 for variable in object.variables() {
                     let name = variable.name().to_string();
-                    let field_value = resolve_actor_value_for_log(variable.value_actor()).await;
+                    let field_value = resolve_actor_value_for_log(variable.value_actor(), timeout_ms).await;
                     fields.push(format!("{}: {}", name, field_value));
                 }
                 format!("[{}]", fields.join(", "))
@@ -2089,7 +2082,7 @@ fn resolve_value_for_log(value: Value) -> Pin<Box<dyn Future<Output = String>>> 
                 let mut fields = Vec::new();
                 for variable in tagged.variables() {
                     let name = variable.name().to_string();
-                    let field_value = resolve_actor_value_for_log(variable.value_actor()).await;
+                    let field_value = resolve_actor_value_for_log(variable.value_actor(), timeout_ms).await;
                     fields.push(format!("{}: {}", name, field_value));
                 }
                 format!("{}[{}]", tagged.tag(), fields.join(", "))
@@ -2097,7 +2090,7 @@ fn resolve_value_for_log(value: Value) -> Pin<Box<dyn Future<Output = String>>> 
             Value::List(list, _) => {
                 let mut items = Vec::new();
                 for (_item_id, item_actor) in list.snapshot().await {
-                    let item_value = resolve_actor_value_for_log(item_actor).await;
+                    let item_value = resolve_actor_value_for_log(item_actor, timeout_ms).await;
                     items.push(item_value);
                 }
                 if items.is_empty() {
@@ -2106,16 +2099,14 @@ fn resolve_value_for_log(value: Value) -> Pin<Box<dyn Future<Output = String>>> 
                     format!("LIST {{ {} }}", items.join(", "))
                 }
             }
-            Value::Flushed(inner, _) => format!("Flushed[{}]", resolve_value_for_log(*inner).await),
+            Value::Flushed(inner, _) => format!("Flushed[{}]", resolve_value_for_log(*inner, timeout_ms).await),
         }
     })
 }
 
 /// Async function to get value from a ValueActor for logging with timeout.
 /// Returns `?` if no value arrives within the timeout.
-/// Uses the timeout from LOG_TIMEOUT_MS thread-local.
-fn resolve_actor_value_for_log(actor: Arc<ValueActor>) -> Pin<Box<dyn Future<Output = String>>> {
-    let timeout_ms = LOG_TIMEOUT_MS.get();
+fn resolve_actor_value_for_log(actor: Arc<ValueActor>, timeout_ms: u32) -> Pin<Box<dyn Future<Output = String>>> {
     Box::pin(async move {
         use zoon::futures_util::StreamExt;
 
@@ -2128,7 +2119,7 @@ fn resolve_actor_value_for_log(actor: Arc<ValueActor>) -> Pin<Box<dyn Future<Out
         select! {
             value = get_value.fuse() => {
                 if let Some(value) = value {
-                    resolve_value_for_log(value).await
+                    resolve_value_for_log(value, timeout_ms).await
                 } else {
                     "?".to_string()
                 }
@@ -2141,12 +2132,8 @@ fn resolve_actor_value_for_log(actor: Arc<ValueActor>) -> Pin<Box<dyn Future<Out
 }
 
 /// Resolve a value for logging with a specific timeout.
-/// Sets the thread-local timeout before resolving.
 async fn resolve_value_for_log_with_timeout(value: Value, timeout_ms: u32) -> String {
-    LOG_TIMEOUT_MS.set(timeout_ms);
-    let result = resolve_value_for_log(value).await;
-    LOG_TIMEOUT_MS.set(LOG_VALUE_DEFAULT_TIMEOUT_MS); // Reset to default
-    result
+    resolve_value_for_log(value, timeout_ms).await
 }
 
 /// Helper to extract log options from a 'with' object parameter.
@@ -2181,11 +2168,11 @@ async fn extract_log_options_from_with(with_actor: Arc<ValueActor>) -> LogOption
                     if tagged.tag() == "Duration" {
                         if let Some(seconds_var) = tagged.variable("seconds") {
                             if let Some(Value::Number(num, _)) = seconds_var.value_actor().stream().await.next().await {
-                                options.timeout_ms = (num.number() * 1000.0) as u32;
+                                options.timeout_ms = (num.number() * 1000.0).max(0.0).min(u32::MAX as f64) as u32;
                             }
                         } else if let Some(milliseconds_var) = tagged.variable("milliseconds") {
                             if let Some(Value::Number(num, _)) = milliseconds_var.value_actor().stream().await.next().await {
-                                options.timeout_ms = num.number() as u32;
+                                options.timeout_ms = num.number().max(0.0).min(u32::MAX as f64) as u32;
                             }
                         }
                     }
@@ -2558,7 +2545,7 @@ pub fn function_stream_skip(
                         match count_value {
                             Some(value) => {
                                 skip_count = match &value {
-                                    Value::Number(num, _) => num.number() as usize,
+                                    Value::Number(num, _) => num.number().max(0.0).min(usize::MAX as f64) as usize,
                                     _ => 0,
                                 };
                                 count_received = true;
@@ -2581,7 +2568,7 @@ pub fn function_stream_skip(
                         match count_value {
                             Some(value) => {
                                 skip_count = match &value {
-                                    Value::Number(num, _) => num.number() as usize,
+                                    Value::Number(num, _) => num.number().max(0.0).min(usize::MAX as f64) as usize,
                                     _ => 0,
                                 };
                                 skipped = 0; // Reset on count change
@@ -2671,7 +2658,7 @@ pub fn function_stream_take(
                         match count_value {
                             Some(value) => {
                                 take_count = match &value {
-                                    Value::Number(num, _) => num.number() as usize,
+                                    Value::Number(num, _) => num.number().max(0.0).min(usize::MAX as f64) as usize,
                                     _ => 0,
                                 };
                                 count_received = true;
@@ -2694,7 +2681,7 @@ pub fn function_stream_take(
                         match count_value {
                             Some(value) => {
                                 take_count = match &value {
-                                    Value::Number(num, _) => num.number() as usize,
+                                    Value::Number(num, _) => num.number().max(0.0).min(usize::MAX as f64) as usize,
                                     _ => 0,
                                 };
                                 taken = 0; // Reset on count change
@@ -2861,7 +2848,7 @@ pub fn function_stream_debounce(
         loop {
             if pending.is_some() && duration_ms > 0.0 {
                 // Have pending value and valid duration - race timer vs new input
-                let mut timer = Box::pin(Timer::sleep(duration_ms.round() as u32).fuse());
+                let mut timer = Box::pin(Timer::sleep(duration_ms.round().max(0.0).min(u32::MAX as f64) as u32).fuse());
 
                 select! {
                     new_value = input_stream.next() => {

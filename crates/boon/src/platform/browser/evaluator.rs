@@ -118,22 +118,6 @@ impl EvaluationContext {
         })
     }
 
-    /// Create a derived context with sequential processing enabled.
-    pub fn with_sequential_processing(&self, sequential: bool) -> Self {
-        self.with_actor_context(ActorContext {
-            sequential_processing: sequential,
-            ..self.actor_context.clone()
-        })
-    }
-
-    /// Create a derived context with backpressure permit.
-    pub fn with_backpressure_permit(&self, permit: Option<BackpressurePermit>) -> Self {
-        self.with_actor_context(ActorContext {
-            backpressure_permit: permit,
-            ..self.actor_context.clone()
-        })
-    }
-
     /// Create a derived context with lazy actor mode.
     /// When use_lazy_actors is true, expression evaluation creates LazyValueActors
     /// instead of eager ValueActors. Lazy actors only poll their source stream
@@ -2553,15 +2537,6 @@ fn build_then_actor(
                             async move { v.ok() }
                         })
                         .map(move |mut result_value| {
-                        // DEBUG: Log the result value from THEN body
-                        let result_desc = match &result_value {
-                            Value::Text(t, _) => format!("Text('{}')", t.text()),
-                            Value::Number(n, _) => format!("Number({})", n.number()),
-                            Value::Tag(_, _) => "Tag".to_string(),
-                            _ => "Other".to_string(),
-                        };
-                        let _ = result_desc;  // Used for debugging
-
                         // Keep value_actor alive while stream is consumed
                         let _ = &value_actor;
                         result_value.set_idempotency_key(ValueIdempotencyKey::new());
@@ -2683,17 +2658,6 @@ fn build_when_actor(
         let arms_clone = arms.clone();
 
         Box::pin(async move {
-            // DEBUG: Log the value that triggered WHEN
-            let value_desc = match &value {
-                Value::Text(t, _) => format!("Text('{}')", t.text()),
-                Value::Number(n, _) => format!("Number({})", n.number()),
-                Value::Tag(tag, _) => format!("Tag('{}')", tag.tag()),
-                Value::Object(_, _) => "Object".to_string(),
-                Value::TaggedObject(tagged, _) => format!("TaggedObject('{}')", tagged.tag()),
-                _ => "Other".to_string(),
-            };
-            let _ = value_desc;  // Used for debugging
-
             // Try to match against each arm
             for arm in &arms_clone {
                 // Use async pattern matching to properly extract bindings from Objects
@@ -4337,30 +4301,6 @@ async fn match_pattern(
 
     let mut bindings = HashMap::new();
 
-    // Debug: log pattern and value types
-    let pattern_type = match pattern {
-        static_expression::Pattern::WildCard => "WildCard".to_string(),
-        static_expression::Pattern::Alias { name } => format!("Alias({})", name.as_str()),
-        static_expression::Pattern::Literal(lit) => match lit {
-            static_expression::Literal::Number(n) => format!("Literal::Number({})", n),
-            static_expression::Literal::Tag(t) => format!("Literal::Tag({})", t.as_str()),
-            static_expression::Literal::Text(t) => format!("Literal::Text({})", t.as_str()),
-        },
-        static_expression::Pattern::TaggedObject { tag, .. } => format!("TaggedObject({})", tag.as_str()),
-        static_expression::Pattern::Object { .. } => "Object".to_string(),
-        static_expression::Pattern::List { .. } => "List".to_string(),
-        static_expression::Pattern::Map { .. } => "Map".to_string(),
-    };
-    let value_type = match value {
-        Value::Number(n, _) => format!("Number({})", n.number()),
-        Value::Text(t, _) => format!("Text({})", t.text()),
-        Value::Tag(t, _) => format!("Tag({})", t.tag()),
-        Value::TaggedObject(to, _) => format!("TaggedObject({})", to.tag()),
-        Value::Object(_, _) => "Object".to_string(),
-        Value::List(_, _) => "List".to_string(),
-        Value::Flushed(_, _) => "Flushed".to_string(),
-    };
-
     match pattern {
         static_expression::Pattern::WildCard => Some(bindings),
 
@@ -4487,22 +4427,39 @@ async fn match_pattern(
         }
 
         static_expression::Pattern::List { items } => {
-            // TODO: List pattern matching needs special handling since List is a complex
-            // reactive type with diff-based updates. For now, we don't support extracting
-            // individual items from List patterns.
-            // SLEEPING BOMB: This will silently match Lists without extracting bindings!
-            if let Value::List(_list, _) = value {
-                let _ = items;
+            if let Value::List(list, _) = value {
+                // Get the current snapshot of list items
+                let snapshot = list.snapshot().await;
+
+                // Require exact length match (no REST patterns supported yet)
+                if items.len() != snapshot.len() {
+                    return None;
+                }
+
+                // Match each pattern against corresponding list item
+                for (item_pattern, (_item_id, item_actor)) in items.iter().zip(snapshot.iter()) {
+                    // Get the current value from the item actor
+                    if let Some(item_value) = item_actor.stream().await.next().await {
+                        // Recursively match the pattern
+                        if let Some(nested_bindings) = Box::pin(match_pattern(item_pattern, &item_value)).await {
+                            bindings.extend(nested_bindings);
+                        } else {
+                            return None; // Pattern didn't match
+                        }
+                    } else {
+                        return None; // Couldn't get item value
+                    }
+                }
                 Some(bindings)
             } else {
                 None
             }
         }
 
-        static_expression::Pattern::Map { entries } => {
-            // Map pattern matching - simplified for now
-            let _ = entries;
-            Some(bindings)
+        static_expression::Pattern::Map { entries: _ } => {
+            // Map type not implemented in Value enum yet.
+            // Return None (no match) rather than silently succeeding with empty bindings.
+            None
         }
     }
 }

@@ -483,32 +483,18 @@ fn element_stripe(
 
     let settings_variable = tagged_object.expect_variable("settings");
 
-    // In the flat_map closures below, the settings Object is extracted as a temporary
-    // and dropped at the end of the closure. We need to keep the Object alive to prevent
-    // its Variables (direction, style, items) from being dropped.
-    // Solution: Store the Object when we first receive it and keep it in a shared cell.
-    let settings_object: std::sync::Arc<std::sync::Mutex<Option<Arc<Object>>>> = Default::default();
-    let settings_object_for_direction = settings_object.clone();
-    let settings_object_for_gap = settings_object.clone();
-    let settings_object_for_items = settings_object.clone();
-
-    // Similarly, we need to keep the items List value alive to prevent the underlying
-    // ValueActor ("Persistent list wrapper") from being dropped during flat_map processing.
-    let items_list_value: std::sync::Arc<std::sync::Mutex<Option<Value>>> = Default::default();
-    let items_list_value_for_stream = items_list_value.clone();
-
-    // Keep item ValueActors alive - each item's FunctionCall actor needs to survive
-    // so that its arguments (like List/map actors) stay alive for the element's lifetime.
-    let item_actors: std::sync::Arc<std::sync::Mutex<Vec<Arc<ValueActor>>>> = Default::default();
-    let item_actors_for_stream = item_actors.clone();
+    // NOTE: The flat_map closures below extract Objects/Variables from Values.
+    // These are Arc-wrapped, so when we call `expect_variable()`, we get an Arc<Variable>
+    // that stays alive independently of the parent Object. The stream keeps the Variable
+    // alive for its lifetime, and signal::from_stream keeps the stream alive for the
+    // element's lifetime. No Mutex needed.
 
     let direction_stream = settings_variable
         .clone()
         .stream_sync()
-        .flat_map(move |value| {
+        .flat_map(|value| {
             let object = value.expect_object();
-            // Keep the Object alive by storing it
-            *settings_object_for_direction.lock().unwrap() = Some(object.clone());
+            // object.expect_variable returns Arc<Variable> which is kept alive by the stream
             object.expect_variable("direction").stream_sync()
         })
         .map(|direction| match direction.expect_tag().tag() {
@@ -520,9 +506,8 @@ fn element_stripe(
     let gap_stream = settings_variable
         .clone()
         .stream_sync()
-        .flat_map(move |value| {
+        .flat_map(|value| {
             let object = value.expect_object();
-            *settings_object_for_gap.lock().unwrap() = Some(object.clone());
             object.expect_variable("gap").stream_sync()
         })
         .filter_map(|value| {
@@ -1012,15 +997,12 @@ fn element_stripe(
 
     let items_vec_diff_stream = settings_variable
         .stream_sync()
-        .flat_map(move |value| {
+        .flat_map(|value| {
             let object = value.expect_object();
-            // Keep the Object alive by storing it
-            *settings_object_for_items.lock().unwrap() = Some(object.clone());
             object.expect_variable("items").stream_sync()
         })
-        .flat_map(move |value| {
-            // Keep the Value alive to prevent its underlying structures from being dropped
-            *items_list_value_for_stream.lock().unwrap() = Some(value.clone());
+        .flat_map(|value| {
+            // value.expect_list() returns Arc<List> which is kept alive by the stream
             value.expect_list().stream()
         })
         .map(list_change_to_vec_diff);
@@ -1029,10 +1011,7 @@ fn element_stripe(
         .direction_signal(signal::from_stream(direction_stream).map(Option::unwrap_or_default))
         .items_signal_vec(VecDiffStreamSignalVec(items_vec_diff_stream).map_signal(
             move |value_actor| {
-                // Keep the value_actor alive for the lifetime of the element.
-                // This ensures that nested elements (like inner stripes with List/map)
-                // keep their argument actors alive.
-                item_actors_for_stream.lock().unwrap().push(value_actor.clone());
+                // value_actor is kept alive by the stream_sync() → signal::from_stream chain
                 signal::from_stream(value_actor.stream_sync().map({
                     let construct_context = construct_context.clone();
                     move |value| value_to_element(value, construct_context.clone())
@@ -1061,12 +1040,9 @@ fn element_stripe(
                 .style_signal("border-top", border_top_signal)
                 .style_signal("align-items", align_items_signal)
         })
-        // Keep tagged_object, settings_object, items_list_value, and item_actors alive for the lifetime of this element
+        // Keep tagged_object alive for the lifetime of this element
         .after_remove(move |_| {
             drop(tagged_object);
-            drop(settings_object);
-            drop(items_list_value);
-            drop(item_actors);
             drop(hovered_handler_loop);
         })
 }
@@ -1077,24 +1053,17 @@ fn element_stack(
 ) -> impl Element {
     let settings_variable = tagged_object.expect_variable("settings");
 
-    // Keep the settings Object alive to prevent its Variables from being dropped
-    let settings_object: std::sync::Arc<std::sync::Mutex<Option<Arc<Object>>>> = Default::default();
-    let settings_object_for_layers = settings_object.clone();
-
-    // Keep the layers List value alive
-    let layers_list_value: std::sync::Arc<std::sync::Mutex<Option<Value>>> = Default::default();
-    let layers_list_value_for_stream = layers_list_value.clone();
+    // NOTE: Arc-wrapped Objects/Variables stay alive through the stream chain.
+    // No Mutex needed - expect_variable returns Arc<Variable>, expect_list returns Arc<List>.
 
     let layers_vec_diff_stream = settings_variable
         .clone()
         .stream_sync()
-        .flat_map(move |value| {
+        .flat_map(|value| {
             let object = value.expect_object();
-            *settings_object_for_layers.lock().unwrap() = Some(object.clone());
             object.expect_variable("layers").stream_sync()
         })
-        .flat_map(move |value| {
-            *layers_list_value_for_stream.lock().unwrap() = Some(value.clone());
+        .flat_map(|value| {
             value.expect_list().stream()
         })
         .map(list_change_to_vec_diff);
@@ -1160,11 +1129,9 @@ fn element_stack(
                 }))
             },
         ))
-        // Keep tagged_object, settings_object, and layers_list_value alive
+        // Keep tagged_object alive for the lifetime of this element
         .after_remove(move |_| {
             drop(tagged_object);
-            drop(settings_object);
-            drop(layers_list_value);
         })
 }
 

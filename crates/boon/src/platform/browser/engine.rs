@@ -323,125 +323,6 @@ where
     .boxed_local()
 }
 
-/// A key-aware switch_map that only switches the inner stream when appropriate.
-///
-/// Key behavior:
-/// - When inner stream is ALIVE and receiving values: NEVER switch, even if key changes
-/// - When inner stream ENDS: use latest outer value to create new inner stream
-/// - When no inner stream exists: create from first outer value
-///
-/// This is critical for LINK subscriptions in alias paths like `item.elements.checkbox.event.click`.
-/// When both WHILE arms (All and Active) can update the same LINK Variable, we must keep
-/// the subscription to the ACTIVE arm's element, ignoring updates from inactive arms.
-///
-/// The inner stream ends when the arm's actors are dropped (WHILE switches away).
-/// Only then do we switch to whatever element is currently connected to the LINK.
-pub fn switch_map_by_key<S, K, F, U>(
-    outer: S,
-    key_fn: impl Fn(&S::Item) -> K + 'static,
-    f: F,
-) -> LocalBoxStream<'static, U::Item>
-where
-    S: Stream + 'static,
-    K: PartialEq + Clone + std::fmt::Debug + 'static,
-    F: Fn(S::Item) -> U + 'static,
-    U: Stream + 'static,
-    S::Item: Clone + 'static,
-    U::Item: 'static,
-{
-    use zoon::futures_util::stream::FusedStream;
-
-    type FusedOuter<T> = stream::Fuse<LocalBoxStream<'static, T>>;
-    type FusedInner<T> = stream::Fuse<LocalBoxStream<'static, T>>;
-
-    // State: (outer_stream, inner_stream_opt, map_fn, key_fn, current_key, pending_outer)
-    // pending_outer stores the latest outer value when key changed but we couldn't switch
-    let initial: (
-        FusedOuter<S::Item>,
-        Option<FusedInner<U::Item>>,
-        F,
-        Box<dyn Fn(&S::Item) -> K>,
-        Option<K>,
-        Option<S::Item>,
-    ) = (
-        outer.boxed_local().fuse(),
-        None,
-        f,
-        Box::new(key_fn),
-        None,
-        None,
-    );
-
-    stream::unfold(initial, |state| async move {
-        use zoon::futures_util::future::Either;
-
-        let (mut outer_stream, mut inner_opt, map_fn, key_fn, mut current_key, mut pending_outer) = state;
-
-        loop {
-            match &mut inner_opt {
-                Some(inner) if !inner.is_terminated() => {
-                    // Both streams active - race between them
-                    let outer_fut = outer_stream.next();
-                    let inner_fut = inner.next();
-
-                    match future::select(pin!(outer_fut), pin!(inner_fut)).await {
-                        Either::Left((outer_opt, _)) => {
-                            match outer_opt {
-                                Some(new_outer_value) => {
-                                    let new_key = key_fn(&new_outer_value);
-
-                                    // ALWAYS recreate inner subscription when new outer value arrives.
-                                    // Even with same key, the outer VALUE might contain different internal
-                                    // Variables (e.g., when WHILE re-evaluates and creates new Element/checkbox
-                                    // with new internal click LINK). We must follow the new value's internal
-                                    // structure to get the correct Variables.
-                                    current_key = Some(new_key);
-                                    inner_opt = Some(map_fn(new_outer_value).boxed_local().fuse());
-                                    pending_outer = None;
-                                }
-                                None => {
-                                    // Outer ended - drain inner then finish
-                                    while let Some(item) = inner.next().await {
-                                        return Some((item, (outer_stream, inner_opt, map_fn, key_fn, current_key, pending_outer)));
-                                    }
-                                    return None;
-                                }
-                            }
-                        }
-                        Either::Right((inner_opt_val, _)) => {
-                            match inner_opt_val {
-                                Some(item) => {
-                                    return Some((item, (outer_stream, inner_opt, map_fn, key_fn, current_key, pending_outer)));
-                                }
-                                None => {
-                                    // Inner stream ended - the Variable we subscribed to was dropped.
-                                    // Wait for next outer value to create new subscription.
-                                    inner_opt = None;
-                                    current_key = None;
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    // No active inner stream - wait for outer value
-                    match outer_stream.next().await {
-                        Some(value) => {
-                            let new_key = key_fn(&value);
-                            current_key = Some(new_key);
-                            inner_opt = Some(map_fn(value).boxed_local().fuse());
-                        }
-                        None => {
-                            return None;
-                        }
-                    }
-                }
-            }
-        }
-    })
-    .boxed_local()
-}
-
 // --- BackpressuredStream ---
 
 /// Stream combinator with demand-based backpressure.
@@ -1701,45 +1582,6 @@ impl Variable {
         })
     }
 
-    /// Create a LINK variable that reuses an existing sender and ValueActor.
-    ///
-    /// NOTE: This function is currently unused but kept for potential future use.
-    /// The subscription key logic handles WHILE re-render correctly.
-    pub fn new_link_arc_reusing(
-        construct_info: ConstructInfo,
-        construct_context: ConstructContext,
-        name: impl Into<Cow<'static, str>>,
-        actor_context: ActorContext,
-        persistence_id: parser::PersistenceId,
-        existing_sender: mpsc::UnboundedSender<Value>,
-        existing_value_actor: Arc<ValueActor>,
-    ) -> Arc<Self> {
-        let ConstructInfo {
-            id: actor_id,
-            persistence,
-            description: variable_description,
-        } = construct_info;
-        let construct_info = ConstructInfo::new(
-            actor_id.with_child_id("wrapped Variable (reused)"),
-            persistence,
-            variable_description,
-        );
-
-        // Use existing sender (clone) and value_actor
-        let link_value_sender = existing_sender.clone();
-        let scope = actor_context.scope.clone();
-
-        Arc::new(Self {
-            construct_info: construct_info.complete(ConstructType::LinkVariable),
-            persistence_id,
-            scope,
-            name: name.into(),
-            value_actor: existing_value_actor,
-            link_value_sender: Some(link_value_sender),
-            forwarding_loop: None,
-        })
-    }
-
     /// Create a new LINK variable with a forwarding actor for sibling field access.
     /// This is used when a LINK is referenced by another field in the same Object.
     /// The forwarding actor was pre-created and registered with ReferenceConnector,
@@ -1909,63 +1751,18 @@ impl VariableOrArgumentReference {
         for (idx, alias_part) in parts_vec.into_iter().enumerate() {
             let alias_part = alias_part.to_string();
             let _is_last = idx == num_parts - 1;
-            let alias_part_for_key = alias_part.clone();
 
-            // Process each field in the path using switch_map_by_key semantics:
-            // Key uses persistence_id.in_scope(scope) - if the same Variable is returned
-            // (same persistence_id + scope), we keep the existing subscription.
-            //
-            // This is critical for LINK subscriptions: when filter changes in HOLD, the outer
-            // objects change but the inner LINK Variables may be the same. If we unconditionally
-            // dropped subscriptions, events could be lost during the recreation window.
-            //
-            // The key uses persistence_id.in_scope(scope):
-            // - persistence_id + scope: distinguishes list items from each other
-            // - We keep existing subscriptions when Values re-evaluate (same key = keep subscription)
+            // Process each field in the path using switch_map.
+            // switch_map switches to a new inner stream whenever the outer emits.
+            // It drains any in-flight items before switching to prevent losing events.
             //
             // WHILE re-render works because:
             // 1. When WHILE switches away from an arm, old Variables are dropped
             // 2. Subscription stream ends (receiver gone)
-            // 3. switch_map_by_key resets the key when inner stream ends
+            // 3. switch_map creates new subscription when outer emits again
             // 4. When WHILE switches back, new Variables get new subscription
-            value_stream = switch_map_by_key(
+            value_stream = switch_map(
                 value_stream,
-                move |value: &Value| {
-                    // Key uses persistence_id.in_scope(scope):
-                    // - persistence_id: unique per variable within source code
-                    // - scope: includes List item context AND WHILE arm index
-                    //
-                    // When WHILE switches to a different arm, scope changes (arm_idx differs),
-                    // so keys differ, causing subscription switch to new Variables.
-                    // When state changes within the same arm, scope stays same, so
-                    // subscriptions don't switch unnecessarily - the bridge keeps sending
-                    // to the same LINK Variable that we're subscribed to.
-                    //
-                    // Key = persistence_id.in_scope(scope), with WHILE arm compatibility check.
-                    // - persistence_id: from parser, unique per source code position
-                    // - scope: includes WHILE arm Ulid and List item context
-                    //
-                    // Simple key: persistence_id.in_scope(scope)
-                    // With stable WHILE arm scope (using arm index instead of Ulid),
-                    // the same logical element has the same key across re-evaluations.
-                    // This ensures HOLD subscribes to the same Variable that bridge is using.
-                    match value {
-                        Value::Object(object, _) => {
-                            let variable = object.expect_variable(&alias_part_for_key);
-                            let pid = variable.persistence_id();
-                            let scope = variable.scope();
-                            pid.in_scope(scope)
-                        }
-                        Value::TaggedObject(tagged_object, _) => {
-                            let variable = tagged_object.expect_variable(&alias_part_for_key);
-                            let pid = variable.persistence_id();
-                            let scope = variable.scope();
-                            pid.in_scope(scope)
-                        }
-                        // Non-object values get default key (will cause panic in map_fn anyway)
-                        _ => parser::PersistenceId::default(),
-                    }
-                },
                 move |value| {
                 let alias_part = alias_part.clone();
                 match value {
