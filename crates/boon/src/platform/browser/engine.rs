@@ -530,7 +530,10 @@ impl<S> BackpressuredStream<S> {
 
     /// Signal initial demand (call once after creation to start flow).
     pub fn signal_initial_demand(&self) {
-        let _ = self.demand_tx.try_send(());
+        // Bounded(1) channel - if full, demand already signaled
+        if let Err(e) = self.demand_tx.try_send(()) {
+            log::trace!("[BACKPRESSURED_STREAM] Initial demand signal failed: {e}");
+        }
     }
 }
 
@@ -615,7 +618,10 @@ impl BackpressureCoordinator {
             // Process requests sequentially - this IS the permit
             while let Some(request) = request_rx.next().await {
                 // Grant permit to requester
-                let _ = request.grant_tx.send(());
+                if request.grant_tx.send(()).is_err() {
+                    // Requester dropped - they gave up waiting, continue to next
+                    continue;
+                }
 
                 // Wait for completion signal (release) before processing next request
                 // This ensures state is updated before next body evaluation
@@ -656,8 +662,10 @@ impl BackpressureCoordinator {
             return;
         }
 
-        // Wait for grant
-        let _ = grant_rx.await;
+        // Wait for grant (if coordinator dropped, we just proceed - shutdown case)
+        if grant_rx.await.is_err() {
+            log::trace!("[BACKPRESSURE] Grant channel closed during acquire");
+        }
     }
 
     /// Release the permit, allowing the next acquire to proceed.
@@ -819,8 +827,10 @@ impl LazyValueActor {
                 }
             }
 
-            // Send response to subscriber
-            let _ = request.response_tx.send(value);
+            // Send response to subscriber (subscriber may have dropped)
+            if request.response_tx.send(value).is_err() {
+                log::trace!("[LAZY_ACTOR] Subscriber dropped before receiving value");
+            }
         }
 
         if LOG_DROPS_AND_LOOP_ENDS {
@@ -1107,7 +1117,9 @@ impl VirtualFilesystem {
                     FsRequest::ReadText { path, reply } => {
                         let normalized = Self::normalize_path(&path);
                         let result = files.get(&normalized).cloned();
-                        let _ = reply.send(result);
+                        if reply.send(result).is_err() {
+                            log::trace!("[VFS] ReadText reply receiver dropped for {}", path);
+                        }
                     }
                     FsRequest::WriteText { path, content } => {
                         let normalized = Self::normalize_path(&path);
@@ -1116,12 +1128,16 @@ impl VirtualFilesystem {
                     FsRequest::Exists { path, reply } => {
                         let normalized = Self::normalize_path(&path);
                         let exists = files.contains_key(&normalized);
-                        let _ = reply.send(exists);
+                        if reply.send(exists).is_err() {
+                            log::trace!("[VFS] Exists reply receiver dropped for {}", path);
+                        }
                     }
                     FsRequest::Delete { path, reply } => {
                         let normalized = Self::normalize_path(&path);
                         let was_present = files.remove(&normalized).is_some();
-                        let _ = reply.send(was_present);
+                        if reply.send(was_present).is_err() {
+                            log::trace!("[VFS] Delete reply receiver dropped for {}", path);
+                        }
                     }
                     FsRequest::ListDirectory { path, reply } => {
                         let normalized = Self::normalize_path(&path);
@@ -1152,7 +1168,9 @@ impl VirtualFilesystem {
                         // Remove duplicates and sort
                         entries.sort();
                         entries.dedup();
-                        let _ = reply.send(entries);
+                        if reply.send(entries).is_err() {
+                            log::trace!("[VFS] ListDirectory reply receiver dropped for {}", path);
+                        }
                     }
                 }
             }
@@ -1167,10 +1185,13 @@ impl VirtualFilesystem {
     /// Read text content from a file (async)
     pub async fn read_text(&self, path: &str) -> Option<String> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.request_sender.send(FsRequest::ReadText {
+        if let Err(e) = self.request_sender.send(FsRequest::ReadText {
             path: path.to_string(),
             reply: tx,
-        }).await;
+        }).await {
+            log::warn!("[VFS] Failed to send ReadText request for {}: {e}", path);
+            return None;
+        }
         rx.await.ok().flatten()
     }
 
@@ -1188,30 +1209,39 @@ impl VirtualFilesystem {
     /// List entries in a directory (async)
     pub async fn list_directory(&self, path: &str) -> Vec<String> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.request_sender.send(FsRequest::ListDirectory {
+        if let Err(e) = self.request_sender.send(FsRequest::ListDirectory {
             path: path.to_string(),
             reply: tx,
-        }).await;
+        }).await {
+            log::warn!("[VFS] Failed to send ListDirectory request for {}: {e}", path);
+            return Vec::new();
+        }
         rx.await.unwrap_or_default()
     }
 
     /// Check if a file exists (async)
     pub async fn exists(&self, path: &str) -> bool {
         let (tx, rx) = oneshot::channel();
-        let _ = self.request_sender.send(FsRequest::Exists {
+        if let Err(e) = self.request_sender.send(FsRequest::Exists {
             path: path.to_string(),
             reply: tx,
-        }).await;
+        }).await {
+            log::warn!("[VFS] Failed to send Exists request for {}: {e}", path);
+            return false;
+        }
         rx.await.unwrap_or(false)
     }
 
     /// Delete a file (async)
     pub async fn delete(&self, path: &str) -> bool {
         let (tx, rx) = oneshot::channel();
-        let _ = self.request_sender.send(FsRequest::Delete {
+        if let Err(e) = self.request_sender.send(FsRequest::Delete {
             path: path.to_string(),
             reply: tx,
-        }).await;
+        }).await {
+            log::warn!("[VFS] Failed to send Delete request for {}: {e}", path);
+            return false;
+        }
         rx.await.unwrap_or(false)
     }
 
@@ -1981,8 +2011,8 @@ impl VariableOrArgumentReference {
                             // Value: get one value using the type-safe Future API
                             stream::once(async move {
                                 let value = variable_actor.value().await;
-                                // Keep object and variable alive for the value's lifetime
-                                let _ = (&object, &variable);
+                                // Prevent drop: captured by `async move`, lives until Future completes
+                                let _keepalive = (&object, &variable);
                                 value
                             })
                             .filter_map(|v| async { v.ok() })
@@ -2015,8 +2045,8 @@ impl VariableOrArgumentReference {
                             // Value: get one value using the type-safe Future API
                             stream::once(async move {
                                 let value = variable_actor.value().await;
-                                // Keep tagged_object and variable alive for the value's lifetime
-                                let _ = (&tagged_object, &variable);
+                                // Prevent drop: captured by `async move`, lives until Future completes
+                                let _keepalive = (&tagged_object, &variable);
                                 value
                             })
                             .filter_map(|v| async { v.ok() })
@@ -2346,7 +2376,9 @@ impl PassThroughConnector {
                                 }
                                 Some(PassThroughOp::Forward { key, value }) => {
                                     if let Some((sender, _, _)) = pass_throughs.get(&key) {
-                                        let _ = sender.unbounded_send(value);
+                                        if let Err(e) = sender.unbounded_send(value) {
+                                            log::debug!("[PASS_THROUGH] Forward failed for key {:?}: {e}", key);
+                                        }
                                     }
                                 }
                                 Some(PassThroughOp::AddForwarder { key, forwarder }) => {
@@ -2364,7 +2396,9 @@ impl PassThroughConnector {
                             match result {
                                 Some((key, response_sender)) => {
                                     let actor = pass_throughs.get(&key).map(|(_, actor, _)| actor.clone());
-                                    let _ = response_sender.send(actor);
+                                    if response_sender.send(actor).is_err() {
+                                        log::trace!("[PASS_THROUGH] Getter reply receiver dropped for key {:?}", key);
+                                    }
                                 }
                                 None => {
                                     channels_closed += 1;
@@ -2376,7 +2410,9 @@ impl PassThroughConnector {
                             match result {
                                 Some((key, response_sender)) => {
                                     let sender = pass_throughs.get(&key).map(|(sender, _, _)| sender.clone());
-                                    let _ = response_sender.send(sender);
+                                    if response_sender.send(sender).is_err() {
+                                        log::trace!("[PASS_THROUGH] Sender getter reply receiver dropped for key {:?}", key);
+                                    }
                                 }
                                 None => {
                                     channels_closed += 1;
@@ -2397,30 +2433,42 @@ impl PassThroughConnector {
 
     /// Register a new pass-through actor
     pub fn register(&self, key: PassThroughKey, value_sender: mpsc::UnboundedSender<Value>, actor: Arc<ValueActor>) {
-        let _ = self.op_sender.try_send(PassThroughOp::Register { key, value_sender, actor });
+        if let Err(e) = self.op_sender.try_send(PassThroughOp::Register { key, value_sender, actor }) {
+            log::warn!("[PASS_THROUGH] Failed to send Register: {e}");
+        }
     }
 
     /// Forward a value to an existing pass-through
     pub fn forward(&self, key: PassThroughKey, value: Value) {
-        let _ = self.op_sender.try_send(PassThroughOp::Forward { key, value });
+        if let Err(e) = self.op_sender.try_send(PassThroughOp::Forward { key, value }) {
+            log::debug!("[PASS_THROUGH] Failed to send Forward: {e}");
+        }
     }
 
     /// Add a forwarder to keep alive for an existing pass-through
     pub fn add_forwarder(&self, key: PassThroughKey, forwarder: Arc<ValueActor>) {
-        let _ = self.op_sender.try_send(PassThroughOp::AddForwarder { key, forwarder });
+        if let Err(e) = self.op_sender.try_send(PassThroughOp::AddForwarder { key, forwarder }) {
+            log::warn!("[PASS_THROUGH] Failed to send AddForwarder: {e}");
+        }
     }
 
     /// Get an existing pass-through actor if it exists
     pub async fn get(&self, key: PassThroughKey) -> Option<Arc<ValueActor>> {
         let (response_sender, response_receiver) = oneshot::channel();
-        let _ = self.getter_sender.try_send((key, response_sender));
+        if let Err(e) = self.getter_sender.try_send((key, response_sender)) {
+            log::warn!("[PASS_THROUGH] Failed to send getter request: {e}");
+            return None;
+        }
         response_receiver.await.ok().flatten()
     }
 
     /// Get the value sender for an existing pass-through
     pub async fn get_sender(&self, key: PassThroughKey) -> Option<mpsc::UnboundedSender<Value>> {
         let (response_sender, response_receiver) = oneshot::channel();
-        let _ = self.sender_getter_sender.try_send((key, response_sender));
+        if let Err(e) = self.sender_getter_sender.try_send((key, response_sender)) {
+            log::warn!("[PASS_THROUGH] Failed to send sender getter request: {e}");
+            return None;
+        }
         response_receiver.await.ok().flatten()
     }
 }
@@ -2561,20 +2609,7 @@ impl LatestCombinator {
         let value_stream =
             stream::select_all(inputs.iter().enumerate().map(|(index, value_actor)| {
                 // Use stream_sync() to properly handle lazy actors in HOLD body context
-                value_actor.clone().stream_sync().map(move |value| {
-                    // DEBUG: Log what LATEST receives from each arm
-                    let value_desc = match &value {
-                        Value::Text(t, _) => format!("Text('{}')", t.text()),
-                        Value::Tag(t, _) => format!("Tag('{}')", t.tag()),
-                        Value::Object(_, _) => "Object".to_string(),
-                        Value::TaggedObject(t, _) => format!("TaggedObject('{}')", t.tag()),
-                        Value::Number(n, _) => format!("Number({})", n.number()),
-                        Value::List(_, _) => "List".to_string(),
-                        Value::Flushed(_, _) => "Flushed".to_string(),
-                    };
-                    let _ = value_desc;  // Used for debugging
-                    (index, value)
-                })
+                value_actor.clone().stream_sync().map(move |value| (index, value))
             }))
             .scan(true, {
                 let storage = storage.clone();
@@ -3449,7 +3484,9 @@ impl ValueActor {
                                 if stream_ended && !stream_ever_produced {
                                     let (tx, rx) = mpsc::channel(1);
                                     drop(tx); // Close immediately
-                                    let _ = reply.send(rx);
+                                    if reply.send(rx).is_err() {
+                                        log::trace!("[VALUE_ACTOR] Subscription reply receiver dropped (SKIP case)");
+                                    }
                                 } else {
                                     // Create channel for this subscriber (capacity 32 for buffering)
                                     let (mut tx, rx) = mpsc::channel(32);
@@ -3469,7 +3506,9 @@ impl ValueActor {
                                     subscribers.push(tx);
 
                                     // Reply with the receiver
-                                    let _ = reply.send(rx);
+                                    if reply.send(rx).is_err() {
+                                        log::trace!("[VALUE_ACTOR] Subscription reply receiver dropped");
+                                    }
                                 }
                             }
                         }
@@ -3479,7 +3518,10 @@ impl ValueActor {
                             if let Some(value) = value {
                                 if !stream_ever_produced {
                                     stream_ever_produced = true;
-                                    if let Some(tx) = ready_tx.take() { let _ = tx.send(()); }
+                                    if let Some(tx) = ready_tx.take() {
+                                        // Ready signal receiver dropped is fine - caller may not care about readiness
+                                        tx.send(()).ok();
+                                    }
                                 }
                                 let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                 value_history.add(new_version, value.clone());
@@ -3499,7 +3541,9 @@ impl ValueActor {
                         query = stored_value_query_receiver.next() => {
                             if let Some(StoredValueQuery { reply }) = query {
                                 let current_value = value_history.get_latest();
-                                let _ = reply.send(current_value);
+                                if reply.send(current_value).is_err() {
+                                    log::trace!("[VALUE_ACTOR] Stored value query reply receiver dropped");
+                                }
                             }
                         }
 
@@ -3514,7 +3558,10 @@ impl ValueActor {
                                     // Value received from migration source
                                     if !stream_ever_produced {
                                         stream_ever_produced = true;
-                                        if let Some(tx) = ready_tx.take() { let _ = tx.send(()); }
+                                        if let Some(tx) = ready_tx.take() {
+                                            // Ready signal receiver dropped is fine - caller may not care about readiness
+                                            tx.send(()).ok();
+                                        }
                                     }
                                     let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                                     value_history.add(new_version, value.clone());
@@ -3572,7 +3619,10 @@ impl ValueActor {
 
                             if !stream_ever_produced {
                                 stream_ever_produced = true;
-                                if let Some(tx) = ready_tx.take() { let _ = tx.send(()); }
+                                if let Some(tx) = ready_tx.take() {
+                                    // Ready signal receiver dropped is fine - caller may not care about readiness
+                                    tx.send(()).ok();
+                                }
                             }
                             let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
                             value_history.add(new_version, new_value.clone());
@@ -3591,7 +3641,9 @@ impl ValueActor {
                             // Handle migration forwarding
                             if let MigrationState::Migrating { buffered_writes, target, .. } = &mut migration_state {
                                 buffered_writes.push(new_value.clone());
-                                let _ = target.send_message(ActorMessage::StreamValue(new_value));
+                                if let Err(e) = target.send_message(ActorMessage::StreamValue(new_value)) {
+                                    log::debug!("[VALUE_ACTOR] Migration forward failed: {e}");
+                                }
                             }
                         }
 
@@ -3748,7 +3800,8 @@ impl ValueActor {
 
         // Oneshot channel for ready signal - immediately fire since we have initial value
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
-        let _ = ready_tx.send(()); // Fire immediately
+        // Fire immediately - receiver will always be there since we just created it
+        ready_tx.send(()).ok();
         let ready_signal = ready_rx.shared();
 
         let actor_loop = ActorLoop::new({
@@ -3789,14 +3842,19 @@ impl ValueActor {
                                 if stream_ended && !stream_ever_produced {
                                     let (tx, rx) = mpsc::channel(1);
                                     drop(tx);
-                                    let _ = reply.send(rx);
+                                    if reply.send(rx).is_err() {
+                                        log::trace!("[VALUE_ACTOR] Subscription reply receiver dropped (SKIP case)");
+                                    }
                                 } else {
                                     let (mut tx, rx) = mpsc::channel(32);
                                     for value in value_history.get_values_since(starting_version).0 {
-                                        let _ = tx.try_send(value.clone());
+                                        // Best effort historical send - if full, skip
+                                        tx.try_send(value.clone()).ok();
                                     }
                                     subscribers.push(tx);
-                                    let _ = reply.send(rx);
+                                    if reply.send(rx).is_err() {
+                                        log::trace!("[VALUE_ACTOR] Subscription reply receiver dropped");
+                                    }
                                 }
                             }
                         }
@@ -3813,7 +3871,9 @@ impl ValueActor {
                         query = stored_value_query_receiver.next() => {
                             if let Some(StoredValueQuery { reply }) = query {
                                 let current_value = value_history.get_latest();
-                                let _ = reply.send(current_value);
+                                if reply.send(current_value).is_err() {
+                                    log::trace!("[VALUE_ACTOR] Stored value query reply receiver dropped");
+                                }
                             }
                         }
 
@@ -3962,7 +4022,10 @@ impl ValueActor {
         ActorLoop::new(async move {
             // Send initial value first (awaiting if needed)
             if let Some(value) = initial_value_future.await {
-                let _ = forwarding_sender.unbounded_send(value);
+                if let Err(e) = forwarding_sender.unbounded_send(value) {
+                    log::debug!("[VALUE_ACTOR] Initial forwarding failed: {e}");
+                    return;
+                }
             }
 
             let mut subscription = source_actor.stream().await;
@@ -4000,7 +4063,8 @@ impl ValueActor {
 
         // Oneshot channel for ready signal - immediately fire since we have initial value
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
-        let _ = ready_tx.send(()); // Fire immediately
+        // Fire immediately - receiver will always be there since we just created it
+        ready_tx.send(()).ok();
         let ready_signal = ready_rx.shared();
 
         let actor_loop = ActorLoop::new({
@@ -4036,7 +4100,9 @@ impl ValueActor {
                     select! {
                         query = stored_value_query_receiver.next() => {
                             if let Some(StoredValueQuery { reply }) = query {
-                                let _ = reply.send(value_history.get_latest());
+                                if reply.send(value_history.get_latest()).is_err() {
+                                    log::trace!("[VALUE_ACTOR] Stored value query reply receiver dropped");
+                                }
                             }
                         }
 
@@ -4045,14 +4111,19 @@ impl ValueActor {
                                 if stream_ended && !stream_ever_produced {
                                     let (tx, rx) = mpsc::channel(1);
                                     drop(tx);
-                                    let _ = reply.send(rx);
+                                    if reply.send(rx).is_err() {
+                                        log::trace!("[VALUE_ACTOR] Subscription reply receiver dropped (SKIP case)");
+                                    }
                                 } else {
                                     let (mut tx, rx) = mpsc::channel(32);
                                     for value in value_history.get_values_since(starting_version).0 {
-                                        let _ = tx.try_send(value.clone());
+                                        // Best effort historical send - if full, skip
+                                        tx.try_send(value.clone()).ok();
                                     }
                                     subscribers.push(tx);
-                                    let _ = reply.send(rx);
+                                    if reply.send(rx).is_err() {
+                                        log::trace!("[VALUE_ACTOR] Subscription reply receiver dropped");
+                                    }
                                 }
                             }
                         }
@@ -4187,8 +4258,10 @@ impl ValueActor {
         // This ensures constant() values are in value_history before we subscribe.
         // The ready_signal fires when the actor loop processes its first value.
         if self.version() == 0 {
-            // Clone the shared future and await it - ignoring errors (sender dropped means actor dead)
-            let _ = self.ready_signal.clone().await;
+            // Clone the shared future and await it - errors mean sender dropped (actor dead)
+            if self.ready_signal.clone().await.is_err() {
+                log::trace!("[VALUE_ACTOR] Ready signal sender dropped - actor may be dead");
+            }
         }
 
         // Send subscription request to actor loop
@@ -5557,11 +5630,15 @@ impl List {
                                 match query {
                                     DiffHistoryQuery::GetUpdateSince { subscriber_version, reply } => {
                                         let update = diff_history.get_update_since(subscriber_version);
-                                        let _ = reply.send(update);
+                                        if reply.send(update).is_err() {
+                                            log::trace!("[LIST] GetUpdateSince reply receiver dropped");
+                                        }
                                     }
                                     DiffHistoryQuery::Snapshot { reply } => {
                                         let snapshot = diff_history.snapshot().to_vec();
-                                        let _ = reply.send(snapshot);
+                                        if reply.send(snapshot).is_err() {
+                                            log::trace!("[LIST] Snapshot reply receiver dropped");
+                                        }
                                     }
                                 }
                             }
@@ -5571,7 +5648,8 @@ impl List {
                         sender = notify_sender_receiver.next() => {
                             if let Some(mut sender) = sender {
                                 // Immediately notify - subscriber will check version and see current diffs if any
-                                let _ = sender.try_send(());
+                                // May fail if subscriber dropped immediately, which is fine
+                                sender.try_send(()).ok();
                                 notify_senders.push(sender);
                             }
                         }
@@ -5664,19 +5742,25 @@ impl List {
     /// Returns diffs if subscriber is close, snapshot if too far behind.
     pub async fn get_update_since(&self, subscriber_version: u64) -> ValueUpdate {
         let (tx, rx) = oneshot::channel();
-        let _ = self.diff_query_sender.try_send(DiffHistoryQuery::GetUpdateSince {
+        if let Err(e) = self.diff_query_sender.try_send(DiffHistoryQuery::GetUpdateSince {
             subscriber_version,
             reply: tx,
-        });
+        }) {
+            log::debug!("[LIST] Failed to send GetUpdateSince query: {e}");
+            return ValueUpdate::Current;
+        }
         rx.await.unwrap_or(ValueUpdate::Current)
     }
 
     /// Get current snapshot of items with their stable IDs (async).
     pub async fn snapshot(&self) -> Vec<(ItemId, Arc<ValueActor>)> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.diff_query_sender.try_send(DiffHistoryQuery::Snapshot {
+        if let Err(e) = self.diff_query_sender.try_send(DiffHistoryQuery::Snapshot {
             reply: tx,
-        });
+        }) {
+            log::debug!("[LIST] Failed to send Snapshot query: {e}");
+            return Vec::new();
+        }
         rx.await.unwrap_or_default()
     }
 
@@ -6885,7 +6969,10 @@ impl ListBindingFunction {
                                             let mut stream = when_clone.stream_from_now_sync();
                                             // Wait for ANY emission - that triggers removal
                                             if stream.next().await.is_some() {
-                                                let _ = tx.send(idx).await;
+                                                // Channel may be closed if filter was removed - that's fine
+                                                if let Err(e) = tx.send(idx).await {
+                                                    log::trace!("[LIST] Filter remove send failed: {e}");
+                                                }
                                             }
                                         });
                                         (idx, item.clone(), when_actor, false, Some(task_handle))
@@ -6908,7 +6995,10 @@ impl ListBindingFunction {
                                     let task_handle = Task::start_droppable(async move {
                                         let mut stream = when_clone.stream_from_now_sync();
                                         if stream.next().await.is_some() {
-                                            let _ = tx.send(idx).await;
+                                            // Channel may be closed if filter was removed - that's fine
+                                            if let Err(e) = tx.send(idx).await {
+                                                log::trace!("[LIST] Filter remove send failed: {e}");
+                                            }
                                         }
                                     });
                                     items.push((idx, item, when_actor, false, Some(task_handle)));

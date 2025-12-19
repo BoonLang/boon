@@ -2092,14 +2092,20 @@ fn process_work_item(
                     .map(move |value| {
                         // Forward to LINK
                         if let Some(ref sender) = link_sender {
-                            let _ = sender.unbounded_send(value.clone());
+                            if let Err(e) = sender.unbounded_send(value.clone()) {
+                                log::debug!("[LINK_SETTER] Failed to forward to LINK: {e}");
+                            }
                         }
                         // Forward to existing pass-through (if re-evaluation)
                         if let Some(ref sender) = existing_sender {
-                            let _ = sender.unbounded_send(value.clone());
+                            if let Err(e) = sender.unbounded_send(value.clone()) {
+                                log::debug!("[LINK_SETTER] Failed to forward to existing pass-through: {e}");
+                            }
                         }
                         // Forward to our channel (only matters on first evaluation)
-                        let _ = value_tx.unbounded_send(value.clone());
+                        if let Err(e) = value_tx.unbounded_send(value.clone()) {
+                            log::debug!("[LINK_SETTER] Failed to forward to value channel: {e}");
+                        }
                         value
                     })
                 });
@@ -2117,7 +2123,9 @@ fn process_work_item(
                 );
 
                 // Send forwarder to async setup for storage on re-evaluation
-                let _ = forwarder_tx.send(forwarder_actor.clone());
+                if forwarder_tx.send(forwarder_actor.clone()).is_err() {
+                    log::trace!("[LINK_SETTER] Forwarder receiver dropped");
+                }
 
                 // Create pass-through actor that emits from the channel
                 // Keep forwarder_actor alive via inputs
@@ -2135,7 +2143,9 @@ fn process_work_item(
                 );
 
                 // Send actor to forwarder for registration (if first evaluation)
-                let _ = actor_tx.send(pass_through_actor.clone());
+                if actor_tx.send(pass_through_actor.clone()).is_err() {
+                    log::trace!("[LINK_SETTER] Actor receiver dropped");
+                }
 
                 // Create relay actor that subscribes to EXISTING pass-through (if any)
                 // This ensures any new downstream code receives values from the stable pass-through
@@ -2530,15 +2540,15 @@ fn build_then_actor(
                     let hold_callback_for_map = hold_callback_clone.clone();
                     let result_stream = stream::once(result_actor.value())
                         .filter_map(move |v| {
-                            // Keep actors and context alive while waiting for value
-                            let _ = &result_actor_keepalive;
-                            let _ = &value_actor_keepalive;
-                            let _ = &context_keepalive;
+                            // Prevent drop: these are captured by the `move` closure and live as long as the stream combinator
+                            let _result_actor_keepalive = &result_actor_keepalive;
+                            let _value_actor_keepalive = &value_actor_keepalive;
+                            let _context_keepalive = &context_keepalive;
                             async move { v.ok() }
                         })
                         .map(move |mut result_value| {
-                        // Keep value_actor alive while stream is consumed
-                        let _ = &value_actor;
+                        // Prevent drop: captured by `move` closure, lives as long as stream combinator
+                        let _value_actor = &value_actor;
                         result_value.set_idempotency_key(ValueIdempotencyKey::new());
                         // CRITICAL: Call HOLD's callback synchronously if present.
                         // This updates state_actor and releases the permit BEFORE this stream yields,
@@ -2750,9 +2760,9 @@ fn build_when_actor(
                             let result_stream = stream::once(result_actor.value())
                                 .filter_map(|v| async { v.ok() })
                                 .map(move |mut result_value| {
-                                    // Keep value_actor and result_actor alive while stream is consumed
-                                    let _ = &value_actor;
-                                    let _ = &result_actor_keepalive;
+                                    // Prevent drop: captured by `move` closure, lives as long as stream combinator
+                                    let _value_actor = &value_actor;
+                                    let _result_actor_keepalive = &result_actor_keepalive;
                                     result_value.set_idempotency_key(ValueIdempotencyKey::new());
                                     result_value
                                 });
@@ -3165,7 +3175,9 @@ fn build_field_access_actor(
             // Final field is not a LINK - just emit one value and we're done
             let mut sub = final_subscription;
             if let Some(val) = sub.next().await {
-                let _ = field_sender.unbounded_send(val);
+                if let Err(e) = field_sender.unbounded_send(val) {
+                    log::debug!("[FIELD_ACCESS] Failed to send final value: {e}");
+                }
             }
             return;
         }
@@ -3272,7 +3284,8 @@ fn build_field_access_actor(
 
     // Wrap the receiver stream to keep the actor loop alive
     let subscription_stream = field_receiver.map(move |value| {
-        let _ = &field_access_loop; // Keep actor loop alive
+        // Prevent drop: captured by `move` closure, lives as long as stream combinator
+        let _field_access_loop = &field_access_loop;
         value
     });
 
@@ -3413,7 +3426,9 @@ fn build_hold_actor(
     let body_subscription = body_result.clone().stream_sync();
     let state_update_stream = body_subscription.map(move |new_value| {
         // Send to state channel so body can see it on next event
-        let _ = state_sender_for_update.unbounded_send(new_value.clone());
+        if let Err(e) = state_sender_for_update.unbounded_send(new_value.clone()) {
+            log::debug!("[HOLD] Failed to send state update: {e}");
+        }
         // DIRECTLY update state_actor's stored value - bypass async channel delay.
         // This ensures the next THEN body evaluation reads the fresh state value.
         // NOTE: The callback already updates state_actor, but we update here too
@@ -3437,8 +3452,8 @@ fn build_hold_actor(
     let driver_loop_holder: Arc<std::sync::OnceLock<ActorLoop>> = Arc::new(std::sync::OnceLock::new());
     let driver_loop_holder_for_stream = driver_loop_holder.clone();
     let output_stream = stream::poll_fn(move |_cx| {
-        // Keep the Arc<OnceLock> alive - when this is dropped, the ActorLoop is dropped
-        let _ = &driver_loop_holder_for_stream;
+        // Prevent drop: captured by `move` closure - when dropped, the ActorLoop is dropped
+        let _driver_loop_holder = &driver_loop_holder_for_stream;
         Poll::Pending::<Option<Value>>
     });
     let output = ValueActor::new_arc_with_inputs(
@@ -3478,7 +3493,9 @@ fn build_hold_actor(
             }
         } else {
             // Subsequent values (reset): send to state_receiver
-            let _ = state_sender_for_reset.unbounded_send(value.clone());
+            if let Err(e) = state_sender_for_reset.unbounded_send(value.clone()) {
+                log::debug!("[HOLD] Failed to send state reset: {e}");
+            }
             // Store value directly to output
             // Use weak reference to avoid circular reference
             if let Some(output) = output_weak_for_initial.upgrade() {
@@ -3518,7 +3535,9 @@ fn build_hold_actor(
         }
     });
     // Store driver loop in the OnceLock - it will be dropped when the output stream is dropped
-    let _ = driver_loop_holder.set(driver_loop);
+    if driver_loop_holder.set(driver_loop).is_err() {
+        log::warn!("[HOLD] Driver loop holder already set - this is a bug");
+    }
 
     Ok(Some(output))
 }
@@ -4527,10 +4546,14 @@ impl ModuleLoader {
                         base_dir = dir;
                     }
                     ModuleLoaderRequest::GetBaseDir { reply } => {
-                        let _ = reply.send(base_dir.clone());
+                        if reply.send(base_dir.clone()).is_err() {
+                            log::trace!("[MODULE_LOADER] GetBaseDir reply receiver dropped");
+                        }
                     }
                     ModuleLoaderRequest::GetCached { name, reply } => {
-                        let _ = reply.send(cache.get(&name).cloned());
+                        if reply.send(cache.get(&name).cloned()).is_err() {
+                            log::trace!("[MODULE_LOADER] GetCached reply receiver dropped for {}", name);
+                        }
                     }
                     ModuleLoaderRequest::Cache { name, data } => {
                         cache.insert(name, data);
@@ -4547,29 +4570,39 @@ impl ModuleLoader {
 
     /// Set the base directory for module resolution (fire-and-forget).
     pub fn set_base_dir(&self, dir: impl Into<String>) {
-        let _ = self.request_sender.try_send(ModuleLoaderRequest::SetBaseDir(dir.into()));
+        if let Err(e) = self.request_sender.try_send(ModuleLoaderRequest::SetBaseDir(dir.into())) {
+            log::warn!("[MODULE_LOADER] Failed to send SetBaseDir: {e}");
+        }
     }
 
     /// Get the base directory (async).
     pub async fn base_dir(&self) -> String {
         let (tx, rx) = oneshot::channel();
-        let _ = self.request_sender.try_send(ModuleLoaderRequest::GetBaseDir { reply: tx });
+        if let Err(e) = self.request_sender.try_send(ModuleLoaderRequest::GetBaseDir { reply: tx }) {
+            log::warn!("[MODULE_LOADER] Failed to send GetBaseDir: {e}");
+            return String::new();
+        }
         rx.await.unwrap_or_default()
     }
 
     /// Get a cached module (async).
     async fn get_cached(&self, name: &str) -> Option<ModuleData> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.request_sender.try_send(ModuleLoaderRequest::GetCached {
+        if let Err(e) = self.request_sender.try_send(ModuleLoaderRequest::GetCached {
             name: name.to_string(),
             reply: tx,
-        });
+        }) {
+            log::debug!("[MODULE_LOADER] Failed to send GetCached for {}: {e}", name);
+            return None;
+        }
         rx.await.ok().flatten()
     }
 
     /// Cache a module (fire-and-forget).
     fn cache(&self, name: String, data: ModuleData) {
-        let _ = self.request_sender.try_send(ModuleLoaderRequest::Cache { name, data });
+        if let Err(e) = self.request_sender.try_send(ModuleLoaderRequest::Cache { name: name.clone(), data }) {
+            log::warn!("[MODULE_LOADER] Failed to cache module {}: {e}", name);
+        }
     }
 
     /// Load a module by name (e.g., "Theme", "Professional", "Assets")

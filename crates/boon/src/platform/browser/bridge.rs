@@ -473,7 +473,9 @@ fn element_stripe(
                                 ValueIdempotencyKey::new(),
                                 hover_tag,
                             );
-                            let _ = sender.unbounded_send(event_value);
+                            if let Err(e) = sender.unbounded_send(event_value) {
+                                log::trace!("[DOM] stripe::hovered event send failed: {e}");
+                            }
                         }
                     }
                 }
@@ -1019,7 +1021,9 @@ fn element_stripe(
             },
         ))
         .on_hovered_change(move |is_hovered| {
-            let _ = hovered_sender.unbounded_send(is_hovered);
+            if let Err(e) = hovered_sender.unbounded_send(is_hovered) {
+                log::trace!("[DOM] hovered change event send failed: {e}");
+            }
         })
         .update_raw_el(|raw_el| {
             raw_el
@@ -1268,7 +1272,9 @@ fn element_button(
                                 ValueIdempotencyKey::new(),
                                 hover_tag,
                             );
-                            let _ = sender.unbounded_send(event_value);
+                            if let Err(e) = sender.unbounded_send(event_value) {
+                                log::trace!("[DOM] button::hovered event send failed: {e}");
+                            }
                         }
                     }
                 }
@@ -1579,7 +1585,9 @@ fn element_button(
             }
         })
         .on_hovered_change(move |is_hovered| {
-            let _ = hovered_sender.unbounded_send(is_hovered);
+            if let Err(e) = hovered_sender.unbounded_send(is_hovered) {
+                log::trace!("[DOM] hovered change event send failed: {e}");
+            }
         })
         .update_raw_el(|raw_el| {
             raw_el
@@ -1683,7 +1691,9 @@ fn element_text_input(
                                         parser::Scope::Root,
                                     )],
                                 );
-                                let _ = sender.unbounded_send(event_value);
+                                if let Err(e) = sender.unbounded_send(event_value) {
+                                    log::trace!("[DOM] text_input::hovered event send failed: {e}");
+                                }
                             }
                         }
                     }
@@ -1723,7 +1733,9 @@ fn element_text_input(
                                     parser::Scope::Root,
                                 )],
                             );
-                            let _ = sender.unbounded_send(event_value);
+                            if let Err(e) = sender.unbounded_send(event_value) {
+                                log::trace!("[DOM] text_input::change event send failed: {e}");
+                            }
                         } else {
                             pending_change_events.push(text);
                         }
@@ -1754,7 +1766,9 @@ fn element_text_input(
                                     parser::Scope::Root,
                                 )],
                             );
-                            let _ = sender.unbounded_send(event_value);
+                            if let Err(e) = sender.unbounded_send(event_value) {
+                                log::trace!("[DOM] text_input::key_down event send failed: {e}");
+                            }
                         }
                     }
                     _blur = blur_event_receiver.select_next_some() => {
@@ -1765,7 +1779,9 @@ fn element_text_input(
                                 ValueIdempotencyKey::new(),
                                 [],
                             );
-                            let _ = sender.unbounded_send(event_value);
+                            if let Err(e) = sender.unbounded_send(event_value) {
+                                log::trace!("[DOM] text_input::blur event send failed: {e}");
+                            }
                         }
                     }
                 }
@@ -1966,7 +1982,9 @@ fn element_text_input(
         .on_change({
             let sender = change_event_sender.clone();
             move |text| {
-                let _ = sender.unbounded_send(text.clone());
+                if let Err(e) = sender.unbounded_send(text.clone()) {
+                    log::trace!("[DOM] text_input on_change event send failed: {e}");
+                }
             }
         })
         .on_key_down_event({
@@ -1977,13 +1995,17 @@ fn element_text_input(
                     Key::Escape => "Escape".to_string(),
                     Key::Other(k) => k.clone(),
                 };
-                let _ = sender.unbounded_send(key_name);
+                if let Err(e) = sender.unbounded_send(key_name) {
+                    log::trace!("[DOM] text_input on_key_down event send failed: {e}");
+                }
             }
         })
         .on_blur({
             let sender = blur_event_sender.clone();
             move || {
-                let _ = sender.unbounded_send(());
+                if let Err(e) = sender.unbounded_send(()) {
+                    log::trace!("[DOM] text_input on_blur event send failed: {e}");
+                }
             }
         })
         .focus_signal(focus_signal)
@@ -2050,7 +2072,9 @@ fn element_checkbox(
                                     ValueIdempotencyKey::new(),
                                     [],
                                 );
-                                let _ = sender.unbounded_send(event_value);
+                                if let Err(e) = sender.unbounded_send(event_value) {
+                                    log::trace!("[DOM] checkbox pending click event send failed: {e}");
+                                }
                             }
                             pending_clicks = 0;
                         }
@@ -2063,7 +2087,9 @@ fn element_checkbox(
                                 ValueIdempotencyKey::new(),
                                 [],
                             );
-                            let _ = sender.unbounded_send(event_value);
+                            if let Err(e) = sender.unbounded_send(event_value) {
+                                log::trace!("[DOM] checkbox click event send failed: {e}");
+                            }
                         } else {
                             // Buffer the click to send when sender becomes available
                             pending_clicks += 1;
@@ -2101,7 +2127,9 @@ fn element_checkbox(
         .on_click({
             let sender = click_event_sender.clone();
             move || {
-                let _ = sender.unbounded_send(());
+                if let Err(e) = sender.unbounded_send(()) {
+                    log::trace!("[DOM] checkbox on_click event send failed: {e}");
+                }
             }
         })
         .after_remove(move |_| {
@@ -2174,7 +2202,9 @@ fn element_label(
                                 ValueIdempotencyKey::new(),
                                 [],
                             );
-                            let _ = sender.unbounded_send(event_value);
+                            if let Err(e) = sender.unbounded_send(event_value) {
+                                log::trace!("[DOM] label::double_click event send failed: {e}");
+                            }
                         }
                     }
                 }
@@ -2258,7 +2288,9 @@ fn element_label(
         .on_double_click({
             let sender = double_click_sender.clone();
             move || {
-                let _ = sender.unbounded_send(());
+                if let Err(e) = sender.unbounded_send(()) {
+                    log::trace!("[DOM] label on_double_click event send failed: {e}");
+                }
             }
         })
         .after_remove(move |_| drop(event_handler_loop))
@@ -2326,7 +2358,9 @@ fn element_link(
                                 ValueIdempotencyKey::new(),
                                 hover_tag,
                             );
-                            let _ = sender.unbounded_send(event_value);
+                            if let Err(e) = sender.unbounded_send(event_value) {
+                                log::trace!("[DOM] link::hovered event send failed: {e}");
+                            }
                         }
                     }
                 }
@@ -2397,7 +2431,9 @@ fn element_link(
         .to_signal(signal::from_stream(to_stream).map(|t| t.unwrap_or_default()))
         .new_tab(NewTab::new())
         .on_hovered_change(move |is_hovered| {
-            let _ = hovered_sender.unbounded_send(is_hovered);
+            if let Err(e) = hovered_sender.unbounded_send(is_hovered) {
+                log::trace!("[DOM] hovered change event send failed: {e}");
+            }
         })
         .update_raw_el(|raw_el| {
             raw_el.style_signal("text-decoration", underline_signal)

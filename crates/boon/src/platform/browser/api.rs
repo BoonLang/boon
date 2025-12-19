@@ -1937,14 +1937,18 @@ pub fn function_router_route(
 
     // Send initial route
     let initial_path = get_current_pathname();
-    let _ = route_sender.try_send(initial_path);
+    if let Err(e) = route_sender.try_send(initial_path) {
+        log::debug!("[ROUTER] Failed to send initial route: {e}");
+    }
 
     // Set up popstate listener for browser back/forward navigation
     let popstate_closure: Closure<dyn Fn()> = Closure::new({
         let route_sender = route_sender.clone();
         move || {
             let path = get_current_pathname();
-            let _ = route_sender.try_send(path);
+            if let Err(e) = route_sender.try_send(path) {
+                log::debug!("[ROUTER] Failed to send popstate route: {e}");
+            }
         }
     });
 
@@ -1962,8 +1966,8 @@ pub fn function_router_route(
 
     // Convert route strings to Text values
     route_receiver.map(move |path| {
-        // Keep closure alive
-        let _ = &popstate_closure;
+        // Prevent drop: captured by `move` closure, lives as long as stream combinator
+        let _popstate_closure = &popstate_closure;
         Text::new_value(
             ConstructInfo::new(function_call_id.with_child_id(0), None, "Router/route"),
             construct_context.clone(),
@@ -2004,7 +2008,9 @@ pub fn function_router_go_to(
             // Notify route listeners about the change
             ROUTE_SENDER.with(|cell| {
                 if let Some(sender) = cell.borrow().as_ref() {
-                    let _ = sender.try_send(route);
+                    if let Err(e) = sender.try_send(route) {
+                        log::debug!("[ROUTER] Failed to send go_to route: {e}");
+                    }
                 }
             });
         }
