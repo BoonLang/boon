@@ -96,6 +96,9 @@ pub enum Command {
 
     /// Click button by index in preview pane (0-indexed, buttons only)
     ClickButton { index: u32 },
+
+    /// Click any element by its text content
+    ClickByText { text: String, exact: bool },
 }
 
 /// Response from Extension to CLI via Server

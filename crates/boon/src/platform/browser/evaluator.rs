@@ -9,6 +9,7 @@ use chumsky::input::{Input as ChumskyInput, Stream as ChumskyStream};
 use ulid::Ulid;
 use zoon::futures_channel::oneshot;
 use zoon::futures_util::select;
+use zoon::futures_util::future;
 use zoon::futures_util::stream::{self, LocalBoxStream};
 use zoon::{Stream, StreamExt, println, eprintln, mpsc};
 
@@ -51,6 +52,8 @@ pub struct EvaluationContext {
     pub actor_context: ActorContext,
     pub reference_connector: Weak<ReferenceConnector>,
     pub link_connector: Weak<LinkConnector>,
+    pub pass_through_connector: Weak<PassThroughConnector>,
+    pub link_variable_connector: Weak<LinkVariableConnector>,
     pub module_loader: ModuleLoader,
     pub source_code: SourceCode,
     /// Optional snapshot of function registry for nested evaluations (closures).
@@ -66,6 +69,8 @@ impl EvaluationContext {
         actor_context: ActorContext,
         reference_connector: Arc<ReferenceConnector>,
         link_connector: Arc<LinkConnector>,
+        pass_through_connector: Arc<PassThroughConnector>,
+        link_variable_connector: Arc<LinkVariableConnector>,
         module_loader: ModuleLoader,
         source_code: SourceCode,
     ) -> Self {
@@ -74,6 +79,8 @@ impl EvaluationContext {
             actor_context,
             reference_connector: Arc::downgrade(&reference_connector),
             link_connector: Arc::downgrade(&link_connector),
+            pass_through_connector: Arc::downgrade(&pass_through_connector),
+            link_variable_connector: Arc::downgrade(&link_variable_connector),
             module_loader,
             source_code,
             function_registry_snapshot: None,
@@ -151,6 +158,18 @@ impl EvaluationContext {
     /// Returns None if the connector has been dropped (program shutting down).
     pub fn try_link_connector(&self) -> Option<Arc<LinkConnector>> {
         self.link_connector.upgrade()
+    }
+
+    /// Try to upgrade the weak pass_through_connector to a strong Arc.
+    /// Returns None if the connector has been dropped (program shutting down).
+    pub fn try_pass_through_connector(&self) -> Option<Arc<PassThroughConnector>> {
+        self.pass_through_connector.upgrade()
+    }
+
+    /// Try to upgrade the weak link_variable_connector to a strong Arc.
+    /// Returns None if the connector has been dropped (program shutting down).
+    pub fn try_link_variable_connector(&self) -> Option<Arc<LinkVariableConnector>> {
+        self.link_variable_connector.upgrade()
     }
 }
 
@@ -2014,50 +2033,178 @@ fn process_work_item(
                 // When you do `element |> LINK { store.path }`, the element is:
                 // 1. Sent to the LINK variable at store.path
                 // 2. Passed through unchanged for downstream use
+                //
+                // IMPORTANT: The pass-through must be STABLE across re-evaluations!
+                // When Element re-evaluates (e.g., checkbox state changes), it creates a NEW
+                // internal LINK actor. But downstream components (stripe) are subscribed to
+                // the OLD pass-through. If we create a new pass-through each time, events
+                // get lost. Solution: use PassThroughConnector to maintain stable pass-throughs.
+                //
+                // KEY FIX: On re-evaluation, we return a "relay" actor that subscribes to the
+                // EXISTING pass-through and forwards its values. This ensures that any new
+                // downstream code that uses the "current" result will receive values from
+                // the stable pass-through.
 
-                // Start an actor loop to forward piped values to the target LINK variable
-                let alias_for_task = alias.node.clone();
-                let ctx_for_task = new_ctx.clone();
-                let prev_actor_for_task = prev_actor.clone();
+                // Build key for stable pass-through lookup
+                let persistence_id = expr.persistence.as_ref()
+                    .expect("LinkSetter should have persistence_id from resolver")
+                    .id
+                    .clone();
+                let pass_through_key = PassThroughKey {
+                    persistence_id,
+                    scope: new_ctx.actor_context.scope.clone(),
+                };
 
-                let forwarding_loop = ActorLoop::new(async move {
-                    // Get the target LINK sender by traversing the alias path
-                    let link_sender = get_link_sender_from_alias(
-                        alias_for_task,
-                        ctx_for_task,
-                    ).await;
+                // Create stable pass-through with mpsc channel
+                let (value_tx, value_rx) = mpsc::unbounded::<Value>();
 
-                    if let Some(sender) = link_sender {
-                        // Forward all values from piped actor to the LINK
-                        let mut piped_stream = prev_actor_for_task.stream().await;
-                        while let Some(value) = piped_stream.next().await {
-                            if sender.unbounded_send(value).is_err() {
-                                break;
-                            }
+                // Create forwarder stream using async setup + flat_map pattern
+                let alias_for_stream = alias.node.clone();
+                let ctx_for_stream = new_ctx.clone();
+                let prev_actor_for_stream = prev_actor.clone();
+                let value_tx_for_stream = value_tx.clone();
+                let value_tx_for_registration = value_tx.clone();
+                let pass_through_key_for_stream = pass_through_key.clone();
+                let pass_through_key_for_registration = pass_through_key.clone();
+                let pass_through_key_for_forwarder_storage = pass_through_key.clone();
+                let connector_for_stream: Option<Arc<PassThroughConnector>> = new_ctx.try_pass_through_connector().map(|c| c.clone());
+
+                // Oneshot channel to pass the pass_through_actor to the forwarder for registration
+                let (actor_tx, actor_rx) = oneshot::channel::<Arc<ValueActor>>();
+
+                // Oneshot channel to pass forwarder actor for storage on re-evaluation
+                let (forwarder_tx, forwarder_rx) = oneshot::channel::<Arc<ValueActor>>();
+
+                // Get subscription scope to check if our context is still active
+                // When WHILE switches arms, the old arm's scope is cancelled
+                let subscription_scope_for_stream = new_ctx.actor_context.subscription_scope.clone();
+
+                // Async setup: get LINK sender, check for existing pass-through, subscribe to prev_actor
+                let setup_stream = stream::once(async move {
+                    // Check if existing pass-through exists FIRST (before any registration)
+                    let existing_sender: Option<mpsc::UnboundedSender<Value>> = match &connector_for_stream {
+                        Some(conn) => conn.get_sender(pass_through_key_for_stream.clone()).await,
+                        None => None,
+                    };
+
+                    let is_reeval = existing_sender.is_some();
+                    if is_reeval {
+                        println!("[LINK_PASS_THROUGH] Re-evaluation - forwarding to existing pass-through");
+                        // On re-evaluation, store the forwarder actor to keep it alive
+                        if let (Some(conn), Ok(forwarder)) = (&connector_for_stream, forwarder_rx.await) {
+                            conn.add_forwarder(pass_through_key_for_forwarder_storage, forwarder);
+                        }
+                    } else {
+                        println!("[LINK_PASS_THROUGH] First evaluation - registering pass-through");
+                        // Register this pass-through (first evaluation only)
+                        // Wait for the actor to be created and sent to us
+                        if let (Some(conn), Ok(actor)) = (&connector_for_stream, actor_rx.await) {
+                            conn.register(pass_through_key_for_registration, value_tx_for_registration, actor);
                         }
                     }
+
+                    // Get link sender (async)
+                    let link_sender = get_link_sender_from_alias(alias_for_stream, ctx_for_stream).await;
+
+                    // Subscribe to prev_actor
+                    let sub = prev_actor_for_stream.clone().stream().await;
+
+                    (link_sender, existing_sender, sub, value_tx_for_stream, subscription_scope_for_stream)
                 });
 
-                // Create a wrapper stream that keeps the forwarding loop alive
-                // The actor loop is captured in the map closure
-                let wrapper_stream = prev_actor.clone().stream_sync().map(move |value| {
-                    // Keep actor loop alive by referencing it (compiler will capture it)
-                    let _ = &forwarding_loop;
-                    value
+                // Flatten setup into value forwarding stream
+                let forwarder_stream = setup_stream.flat_map(|(link_sender, existing_sender, sub, value_tx, subscription_scope)| {
+                    // Check if subscription scope is cancelled (e.g., WHILE arm switched)
+                    sub.take_while(move |_| {
+                        let is_active = subscription_scope.as_ref().map_or(true, |s| !s.is_cancelled());
+                        if !is_active {
+                            zoon::println!("[LINK_SETTER] scope cancelled, stopping forwarding");
+                        }
+                        future::ready(is_active)
+                    })
+                    .map(move |value| {
+                        // Forward to LINK
+                        if let Some(ref sender) = link_sender {
+                            let _ = sender.unbounded_send(value.clone());
+                        }
+                        // Forward to existing pass-through (if re-evaluation)
+                        if let Some(ref sender) = existing_sender {
+                            let _ = sender.unbounded_send(value.clone());
+                        }
+                        // Forward to our channel (only matters on first evaluation)
+                        let _ = value_tx.unbounded_send(value.clone());
+                        value
+                    })
                 });
 
-                let wrapper_actor = ValueActor::new_arc(
+                // Create forwarder actor - this does the actual forwarding work
+                let forwarder_actor = ValueActor::new_arc(
                     ConstructInfo::new(
-                        "LinkSetter pass-through",
+                        "LinkSetter forwarder",
                         expr.persistence.clone(),
-                        format!("{:?}; LinkSetter pass-through", expr.span),
+                        format!("{:?}; LinkSetter forwarder", expr.span),
                     ),
                     new_ctx.actor_context.clone(),
-                    TypedStream::infinite(wrapper_stream),
+                    TypedStream::infinite(forwarder_stream.chain(stream::pending())),
                     None,
                 );
 
-                state.store(result_slot, wrapper_actor);
+                // Send forwarder to async setup for storage on re-evaluation
+                let _ = forwarder_tx.send(forwarder_actor.clone());
+
+                // Create pass-through actor that emits from the channel
+                // Keep forwarder_actor alive via inputs
+                let pass_through_stream = value_rx.chain(stream::pending());
+                let pass_through_actor = ValueActor::new_arc_with_inputs(
+                    ConstructInfo::new(
+                        "LinkSetter stable pass-through",
+                        expr.persistence.clone(),
+                        format!("{:?}; LinkSetter stable pass-through", expr.span),
+                    ),
+                    new_ctx.actor_context.clone(),
+                    TypedStream::infinite(pass_through_stream),
+                    None,
+                    vec![forwarder_actor],
+                );
+
+                // Send actor to forwarder for registration (if first evaluation)
+                let _ = actor_tx.send(pass_through_actor.clone());
+
+                // Create relay actor that subscribes to EXISTING pass-through (if any)
+                // This ensures any new downstream code receives values from the stable pass-through
+                let connector_for_relay = new_ctx.try_pass_through_connector().map(|c| c.clone());
+                let pass_through_key_for_relay = pass_through_key.clone();
+                let relay_stream = stream::once(async move {
+                    // Try to get existing actor
+                    match &connector_for_relay {
+                        Some(conn) => conn.get(pass_through_key_for_relay).await,
+                        None => None,
+                    }
+                }).filter_map(|opt_actor| future::ready(opt_actor))
+                .flat_map(|existing_actor| {
+                    existing_actor.stream_sync()
+                });
+
+                // Merge: on first eval, relay_stream is empty (no existing actor), so pass_through emits.
+                // On re-eval, relay_stream forwards from existing actor.
+                let merged_stream = stream::select(
+                    pass_through_actor.clone().stream_sync(),
+                    relay_stream,
+                );
+
+                let result_actor = ValueActor::new_arc_with_inputs(
+                    ConstructInfo::new(
+                        "LinkSetter result (pass-through or relay)",
+                        expr.persistence.clone(),
+                        format!("{:?}; LinkSetter result", expr.span),
+                    ),
+                    new_ctx.actor_context.clone(),
+                    TypedStream::infinite(merged_stream.chain(stream::pending())),
+                    None,
+                    vec![pass_through_actor],
+                );
+
+                state.store(result_slot, result_actor);
             } else {
                 // For non-FunctionCall expressions, just schedule normally
                 schedule_expression(state, expr, new_ctx, result_slot)?;
@@ -2089,9 +2236,12 @@ fn process_work_item(
                             is_snapshot_context: ctx.actor_context.is_snapshot_context,
                             object_locals: ctx.actor_context.object_locals,
                             scope: ctx.actor_context.scope,
+                            subscription_scope: ctx.actor_context.subscription_scope.clone(),
                         },
                         reference_connector: ctx.reference_connector,
                         link_connector: ctx.link_connector,
+                        pass_through_connector: ctx.pass_through_connector,
+                        link_variable_connector: ctx.link_variable_connector,
                         function_registry_snapshot: ctx.function_registry_snapshot,
                         module_loader: ctx.module_loader,
                         source_code: ctx.source_code,
@@ -2276,6 +2426,8 @@ fn build_then_actor(
     let actor_context_for_then = ctx.actor_context.clone();
     let reference_connector_for_then = ctx.reference_connector.clone();
     let link_connector_for_then = ctx.link_connector.clone();
+    let pass_through_connector_for_then = ctx.pass_through_connector.clone();
+    let link_variable_connector_for_then = ctx.link_variable_connector.clone();
     let function_registry_for_then = function_registry_snapshot;
     let module_loader_for_then = ctx.module_loader.clone();
     let source_code_for_then = ctx.source_code.clone();
@@ -2295,6 +2447,8 @@ fn build_then_actor(
         let construct_context_clone = construct_context_for_then.clone();
         let reference_connector_clone = reference_connector_for_then.clone();
         let link_connector_clone = link_connector_for_then.clone();
+        let pass_through_connector_clone = pass_through_connector_for_then.clone();
+        let link_variable_connector_clone = link_variable_connector_for_then.clone();
         let function_registry_clone = function_registry_for_then.clone();
         let module_loader_clone = module_loader_for_then.clone();
         let source_code_clone = source_code_for_then.clone();
@@ -2382,6 +2536,7 @@ fn build_then_actor(
                 // Inherit object_locals - THEN body may reference Object sibling fields
                 object_locals: actor_context_clone.object_locals.clone(),
                 scope: actor_context_clone.scope.clone(),
+                subscription_scope: actor_context_clone.subscription_scope.clone(),
             };
 
             let new_ctx = EvaluationContext {
@@ -2389,6 +2544,8 @@ fn build_then_actor(
                 actor_context: new_actor_context.clone(),
                 reference_connector: reference_connector_clone,
                 link_connector: link_connector_clone,
+                pass_through_connector: pass_through_connector_clone,
+                link_variable_connector: link_variable_connector_clone,
                 module_loader: module_loader_clone,
                 source_code: source_code_clone,
                 function_registry_snapshot: Some(function_registry_clone),
@@ -2406,10 +2563,25 @@ fn build_then_actor(
                     // value() returns a Future that resolves to exactly ONE value,
                     // making it impossible to accidentally create ongoing subscriptions.
                     // This is critical for THEN bodies which should produce exactly ONE value per input.
+                    //
+                    // CRITICAL: Keepalive must be in filter_map, NOT in map!
+                    // If value() returns Err, filter_map filters it out and map closure never runs.
+                    // This would cause actors to be dropped before value() completes.
+                    //
+                    // We also need to keep new_actor_context alive because result_actor may
+                    // have subscriptions to frozen_parameters contained within it.
                     let result_actor_keepalive = result_actor.clone();
+                    let value_actor_keepalive = value_actor.clone();
+                    let context_keepalive = new_actor_context.clone();
                     let hold_callback_for_map = hold_callback_clone.clone();
                     let result_stream = stream::once(result_actor.value())
-                        .filter_map(|v| async { v.ok() })
+                        .filter_map(move |v| {
+                            // Keep actors and context alive while waiting for value
+                            let _ = &result_actor_keepalive;
+                            let _ = &value_actor_keepalive;
+                            let _ = &context_keepalive;
+                            async move { v.ok() }
+                        })
                         .map(move |mut result_value| {
                         // DEBUG: Log the result value from THEN body
                         let result_desc = match &result_value {
@@ -2420,9 +2592,8 @@ fn build_then_actor(
                         };
                         let _ = result_desc;  // Used for debugging
 
-                        // Keep value_actor and result_actor alive while stream is consumed
+                        // Keep value_actor alive while stream is consumed
                         let _ = &value_actor;
-                        let _ = &result_actor_keepalive;
                         result_value.set_idempotency_key(ValueIdempotencyKey::new());
                         // CRITICAL: Call HOLD's callback synchronously if present.
                         // This updates state_actor and releases the permit BEFORE this stream yields,
@@ -2517,6 +2688,8 @@ fn build_when_actor(
     let actor_context_for_when = ctx.actor_context.clone();
     let reference_connector_for_when = ctx.reference_connector.clone();
     let link_connector_for_when = ctx.link_connector.clone();
+    let pass_through_connector_for_when = ctx.pass_through_connector.clone();
+    let link_variable_connector_for_when = ctx.link_variable_connector.clone();
     let function_registry_for_when = function_registry_snapshot;
     let module_loader_for_when = ctx.module_loader.clone();
     let source_code_for_when = ctx.source_code.clone();
@@ -2533,6 +2706,8 @@ fn build_when_actor(
         let construct_context_clone = construct_context_for_when.clone();
         let reference_connector_clone = reference_connector_for_when.clone();
         let link_connector_clone = link_connector_for_when.clone();
+        let pass_through_connector_clone = pass_through_connector_for_when.clone();
+        let link_variable_connector_clone = link_variable_connector_for_when.clone();
         let function_registry_clone = function_registry_for_when.clone();
         let module_loader_clone = module_loader_for_when.clone();
         let source_code_clone = source_code_for_when.clone();
@@ -2619,6 +2794,7 @@ fn build_when_actor(
                         // Inherit object_locals - WHEN body may reference Object sibling fields
                         object_locals: actor_context_clone.object_locals.clone(),
                         scope: actor_context_clone.scope.clone(),
+                        subscription_scope: actor_context_clone.subscription_scope.clone(),
                     };
 
                     let new_ctx = EvaluationContext {
@@ -2626,6 +2802,8 @@ fn build_when_actor(
                         actor_context: new_actor_context.clone(),
                         reference_connector: reference_connector_clone.clone(),
                         link_connector: link_connector_clone.clone(),
+                        pass_through_connector: pass_through_connector_clone.clone(),
+                        link_variable_connector: link_variable_connector_clone.clone(),
                         module_loader: module_loader_clone.clone(),
                         source_code: source_code_clone.clone(),
                         function_registry_snapshot: Some(function_registry_clone.clone()),
@@ -2711,21 +2889,32 @@ fn build_while_actor(
     let actor_context_for_while = ctx.actor_context.clone();
     let reference_connector_for_while = ctx.reference_connector.clone();
     let link_connector_for_while = ctx.link_connector.clone();
+    let pass_through_connector_for_while = ctx.pass_through_connector.clone();
+    let link_variable_connector_for_while = ctx.link_variable_connector.clone();
     let function_registry_for_while = function_registry_snapshot;
     let module_loader_for_while = ctx.module_loader.clone();
     let source_code_for_while = ctx.source_code.clone();
     let persistence_for_while = persistence.clone();
     let span_for_while = span;
 
+    // Track the current subscription scope - when arm switches, we cancel the old scope
+    // to terminate all streams created within that arm (List/map, LinkSetter, etc.)
+    let current_scope: Arc<std::sync::Mutex<Option<Arc<SubscriptionScope>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let current_scope_for_while = current_scope.clone();
+
     // Use switch_map for proper WHILE semantics - when input changes, cancel old arm and switch to new one.
     // This is essential for reactive UI: when `current_page` changes from `Home` to `About`,
     // we must STOP rendering Home content and START rendering About content.
     // Regular flatten() would merge both streams, causing both to render.
     let stream = switch_map(piped.clone().stream_sync(), move |value| {
+        let current_scope_clone = current_scope_for_while.clone();
         let actor_context_clone = actor_context_for_while.clone();
         let construct_context_clone = construct_context_for_while.clone();
         let reference_connector_clone = reference_connector_for_while.clone();
         let link_connector_clone = link_connector_for_while.clone();
+        let pass_through_connector_clone = pass_through_connector_for_while.clone();
+        let link_variable_connector_clone = link_variable_connector_for_while.clone();
         let function_registry_clone = function_registry_for_while.clone();
         let module_loader_clone = module_loader_for_while.clone();
         let source_code_clone = source_code_for_while.clone();
@@ -2737,15 +2926,25 @@ fn build_while_actor(
         // any async work and the forwarded body stream) and start a new one.
         stream::once(async move {
             // Find matching arm using async pattern matching
-            let mut matched_arm_with_bindings: Option<(&static_expression::Arm, HashMap<String, Value>)> = None;
-            for arm in &arms_clone {
+            let mut matched_arm_with_bindings: Option<(usize, &static_expression::Arm, HashMap<String, Value>)> = None;
+            for (arm_idx, arm) in arms_clone.iter().enumerate() {
                 if let Some(bindings) = match_pattern(&arm.pattern, &value).await {
-                    matched_arm_with_bindings = Some((arm, bindings));
+                    matched_arm_with_bindings = Some((arm_idx, arm, bindings));
                     break;
                 }
             }
 
-            if let Some((arm, bindings)) = matched_arm_with_bindings {
+            if let Some((arm_idx, arm, bindings)) = matched_arm_with_bindings {
+                // Cancel the old subscription scope (if any) to terminate all streams from previous arm
+                // This prevents inactive arms from processing updates (e.g., List/map continuing to run)
+                if let Some(old_scope) = current_scope_clone.lock().unwrap().take() {
+                    old_scope.cancel();
+                }
+
+                // Create a new subscription scope for this arm
+                let arm_scope = Arc::new(SubscriptionScope::new());
+                *current_scope_clone.lock().unwrap() = Some(arm_scope.clone());
+
                 let value_actor = ValueActor::new_arc(
                     ConstructInfo::new(
                         "WHILE input value".to_string(),
@@ -2786,7 +2985,33 @@ fn build_while_actor(
                     is_snapshot_context: false,
                     // Inherit object_locals - WHILE body may reference Object sibling fields
                     object_locals: actor_context_clone.object_locals.clone(),
-                    scope: actor_context_clone.scope.clone(),
+                    // Use ARM INDEX for scope, not Ulid. This keeps the scope STABLE
+                    // across re-evaluations of the same arm, so subscription keys remain
+                    // consistent with what the bridge is connected to.
+                    //
+                    // When WHILE re-evaluates:
+                    // 1. Old Variables are dropped (their actors stop)
+                    // 2. New Variables are created with same scope (same arm index)
+                    // 3. Bridge stays connected to OLD Variable's sender
+                    // 4. HOLD's subscription key is same, but inner stream ends when old Variable drops
+                    // 5. switch_map_by_key creates new subscription when next value arrives
+                    //
+                    // The key insight: we want HOLD to subscribe to the Variable that bridge
+                    // is connected to. Using stable scope (arm index) ensures key consistency.
+                    scope: {
+                        use super::super::super::parser::Scope;
+                        let scope_id = format!("while_arm_{}", arm_idx);
+                        match &actor_context_clone.scope {
+                            Scope::Root => Scope::Nested(scope_id),
+                            Scope::Nested(existing) => {
+                                Scope::Nested(format!("{}:{}", existing, scope_id))
+                            }
+                        }
+                    },
+                    // Set the subscription scope for this WHILE arm
+                    // All subscriptions created within this arm will check this scope
+                    // and terminate when it's cancelled (on arm switch)
+                    subscription_scope: Some(arm_scope.clone()),
                 };
 
                 let new_ctx = EvaluationContext {
@@ -2794,6 +3019,8 @@ fn build_while_actor(
                     actor_context: new_actor_context,
                     reference_connector: reference_connector_clone,
                     link_connector: link_connector_clone,
+                    pass_through_connector: pass_through_connector_clone,
+                    link_variable_connector: link_variable_connector_clone,
                     module_loader: module_loader_clone,
                     source_code: source_code_clone,
                     function_registry_snapshot: Some(function_registry_clone),
@@ -2802,7 +3029,7 @@ fn build_while_actor(
                 match evaluate_expression(arm.body.clone(), new_ctx) {
                     Ok(Some(result_actor)) => {
                         // Use stream() for continuous streaming semantics
-                        result_actor.stream().await
+                        result_actor.stream().await.boxed_local()
                     }
                     Ok(None) => {
                         // SKIP - return finite empty stream (switch_map handles this)
@@ -3239,6 +3466,7 @@ fn build_hold_actor(
         // Inherit object_locals - HOLD body may reference Object sibling fields
         object_locals: ctx.actor_context.object_locals.clone(),
         scope: ctx.actor_context.scope.clone(),
+        subscription_scope: ctx.actor_context.subscription_scope.clone(),
     };
 
     // Create new context for body evaluation
@@ -3247,6 +3475,8 @@ fn build_hold_actor(
         actor_context: body_actor_context,
         reference_connector: ctx.reference_connector.clone(),
         link_connector: ctx.link_connector.clone(),
+        pass_through_connector: ctx.pass_through_connector.clone(),
+        link_variable_connector: ctx.link_variable_connector.clone(),
         function_registry_snapshot: ctx.function_registry_snapshot.clone(),
         module_loader: ctx.module_loader.clone(),
         source_code: ctx.source_code.clone(),
@@ -3863,12 +4093,18 @@ fn build_list_binding_function(
         .ok_or_else(|| "ReferenceConnector dropped - program shutting down".to_string())?;
     let link_connector = ctx.try_link_connector()
         .ok_or_else(|| "LinkConnector dropped - program shutting down".to_string())?;
+    let pass_through_connector = ctx.try_pass_through_connector()
+        .ok_or_else(|| "PassThroughConnector dropped - program shutting down".to_string())?;
+    let link_variable_connector = ctx.try_link_variable_connector()
+        .ok_or_else(|| "LinkVariableConnector dropped - program shutting down".to_string())?;
     let config = ListBindingConfig {
         binding_name,
         transform_expr,
         operation,
         reference_connector,
         link_connector,
+        pass_through_connector,
+        link_variable_connector,
         source_code: ctx.source_code.clone(),
         function_registry_snapshot: ctx.function_registry_snapshot.clone(),
     };
@@ -3990,6 +4226,7 @@ fn call_function(
                     // Clear object_locals - function body is a new scope
                     object_locals: HashMap::new(),
                     scope: ctx_for_closure.actor_context.scope.clone(),
+                    subscription_scope: ctx_for_closure.actor_context.subscription_scope.clone(),
                 };
 
                 let new_ctx = EvaluationContext {
@@ -3997,6 +4234,8 @@ fn call_function(
                     actor_context: new_actor_context,
                     reference_connector: ctx_for_closure.reference_connector.clone(),
                     link_connector: ctx_for_closure.link_connector.clone(),
+                    pass_through_connector: ctx_for_closure.pass_through_connector.clone(),
+                    link_variable_connector: ctx_for_closure.link_variable_connector.clone(),
                     module_loader: ctx_for_closure.module_loader.clone(),
                     source_code: ctx_for_closure.source_code.clone(),
                     function_registry_snapshot: ctx_for_closure.function_registry_snapshot.clone(),
@@ -4056,6 +4295,7 @@ fn call_function(
             // Clear object_locals - function body is a new scope
             object_locals: HashMap::new(),
             scope: ctx.actor_context.scope.clone(),
+            subscription_scope: ctx.actor_context.subscription_scope.clone(),
         };
 
         let new_ctx = EvaluationContext {
@@ -4063,6 +4303,8 @@ fn call_function(
             actor_context: new_actor_context,
             reference_connector: ctx.reference_connector,
             link_connector: ctx.link_connector,
+            pass_through_connector: ctx.pass_through_connector,
+            link_variable_connector: ctx.link_variable_connector,
             function_registry_snapshot: ctx.function_registry_snapshot,
             module_loader: ctx.module_loader,
             source_code: ctx.source_code,
@@ -4127,6 +4369,7 @@ fn call_function(
                 // Clear object_locals - function call is a new scope
                 object_locals: HashMap::new(),
                 scope: ctx.actor_context.scope.clone(),
+                subscription_scope: ctx.actor_context.subscription_scope.clone(),
             };
 
             Ok(Some(FunctionCall::new_arc_value_actor(
@@ -4583,7 +4826,7 @@ pub fn evaluate(
 ) -> Result<(Arc<Object>, ConstructContext), String> {
     let function_registry = FunctionRegistry::new();
     let module_loader = ModuleLoader::default();
-    let (obj, ctx, _, _, _, _) = evaluate_with_registry(
+    let (obj, ctx, _, _, _, _, _, _) = evaluate_with_registry(
         source_code,
         expressions,
         states_local_storage_key,
@@ -4604,10 +4847,12 @@ pub fn evaluate(
 /// - `ModuleLoader`: Module loader for imports
 /// - `Arc<ReferenceConnector>`: Connector for variable references (MUST be dropped when done!)
 /// - `Arc<LinkConnector>`: Connector for LINK variables (MUST be dropped when done!)
+/// - `Arc<PassThroughConnector>`: Connector for LINK pass-throughs (MUST be dropped when done!)
+/// - `Arc<LinkVariableConnector>`: Connector for stable LINK variables (MUST be dropped when done!)
 ///
-/// IMPORTANT: The ReferenceConnector and LinkConnector MUST be dropped when the program
-/// is finished (e.g., when switching examples) to allow actors to be cleaned up.
-/// These connectors hold strong references to all top-level actors.
+/// IMPORTANT: The ReferenceConnector, LinkConnector, PassThroughConnector, and LinkVariableConnector
+/// MUST be dropped when the program is finished (e.g., when switching examples) to allow actors
+/// to be cleaned up. These connectors hold strong references to all top-level actors.
 pub fn evaluate_with_registry(
     source_code: SourceCode,
     expressions: Vec<static_expression::Spanned<static_expression::Expression>>,
@@ -4615,7 +4860,7 @@ pub fn evaluate_with_registry(
     virtual_fs: VirtualFilesystem,
     mut function_registry: FunctionRegistry,
     module_loader: ModuleLoader,
-) -> Result<(Arc<Object>, ConstructContext, FunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>), String> {
+) -> Result<(Arc<Object>, ConstructContext, FunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>, Arc<PassThroughConnector>, Arc<LinkVariableConnector>), String> {
     let construct_context = ConstructContext {
         construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
         virtual_fs,
@@ -4623,6 +4868,8 @@ pub fn evaluate_with_registry(
     let actor_context = ActorContext::default();
     let reference_connector = Arc::new(ReferenceConnector::new());
     let link_connector = Arc::new(LinkConnector::new());
+    let pass_through_connector = Arc::new(PassThroughConnector::new());
+    let link_variable_connector = Arc::new(LinkVariableConnector::new());
 
     // First pass: collect function definitions and variables
     let mut variables = Vec::new();
@@ -4672,6 +4919,8 @@ pub fn evaluate_with_registry(
                 actor_context.clone(),
                 reference_connector.clone(),
                 link_connector.clone(),
+                pass_through_connector.clone(),
+                link_variable_connector.clone(),
                 &function_registry,
                 module_loader.clone(),
                 source_code.clone(),
@@ -4684,7 +4933,7 @@ pub fn evaluate_with_registry(
         construct_context.clone(),
         evaluated_variables?,
     );
-    Ok((root_object, construct_context, function_registry, module_loader, reference_connector, link_connector))
+    Ok((root_object, construct_context, function_registry, module_loader, reference_connector, link_connector, pass_through_connector, link_variable_connector))
 }
 
 /// Evaluates a static variable into a Variable.
@@ -4694,6 +4943,8 @@ fn static_spanned_variable_into_variable(
     actor_context: ActorContext,
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
+    pass_through_connector: Arc<PassThroughConnector>,
+    link_variable_connector: Arc<LinkVariableConnector>,
     function_registry: &FunctionRegistry,
     module_loader: ModuleLoader,
     source_code: SourceCode,
@@ -4733,6 +4984,8 @@ fn static_spanned_variable_into_variable(
                 actor_context.clone(),
                 reference_connector.clone(),
                 link_connector.clone(),
+                pass_through_connector.clone(),
+                link_variable_connector.clone(),
                 function_registry,
                 module_loader,
                 source_code,
@@ -4792,6 +5045,8 @@ pub fn evaluate_static_expression(
     actor_context: ActorContext,
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
+    pass_through_connector: Arc<PassThroughConnector>,
+    link_variable_connector: Arc<LinkVariableConnector>,
     source_code: SourceCode,
 ) -> Result<Arc<ValueActor>, String> {
     evaluate_static_expression_with_registry(
@@ -4800,6 +5055,8 @@ pub fn evaluate_static_expression(
         actor_context,
         reference_connector,
         link_connector,
+        pass_through_connector,
+        link_variable_connector,
         source_code,
         None,
     )
@@ -4813,6 +5070,8 @@ pub fn evaluate_static_expression_with_registry(
     actor_context: ActorContext,
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
+    pass_through_connector: Arc<PassThroughConnector>,
+    link_variable_connector: Arc<LinkVariableConnector>,
     source_code: SourceCode,
     function_registry_snapshot: Option<Arc<FunctionRegistry>>,
 ) -> Result<Arc<ValueActor>, String> {
@@ -4826,6 +5085,8 @@ pub fn evaluate_static_expression_with_registry(
         actor_context,
         reference_connector,
         link_connector,
+        pass_through_connector,
+        link_variable_connector,
         &registry,
         ModuleLoader::default(),
         source_code,
@@ -4842,6 +5103,8 @@ fn static_spanned_expression_into_value_actor(
     actor_context: ActorContext,
     reference_connector: Arc<ReferenceConnector>,
     link_connector: Arc<LinkConnector>,
+    pass_through_connector: Arc<PassThroughConnector>,
+    link_variable_connector: Arc<LinkVariableConnector>,
     function_registry: &FunctionRegistry,
     module_loader: ModuleLoader,
     source_code: SourceCode,
@@ -4859,6 +5122,8 @@ fn static_spanned_expression_into_value_actor(
         actor_context,
         reference_connector: Arc::downgrade(&reference_connector),
         link_connector: Arc::downgrade(&link_connector),
+        pass_through_connector: Arc::downgrade(&pass_through_connector),
+        link_variable_connector: Arc::downgrade(&link_variable_connector),
         module_loader,
         source_code,
         function_registry_snapshot: snapshot,

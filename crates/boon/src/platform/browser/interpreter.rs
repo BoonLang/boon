@@ -17,7 +17,7 @@ use crate::parser::{
     reset_expression_depth, resolve_persistence, resolve_references, span_at, static_expression,
 };
 use crate::platform::browser::{
-    engine::{ConstructContext, LinkConnector, Object, ReferenceConnector, VirtualFilesystem},
+    engine::{ConstructContext, LinkConnector, LinkVariableConnector, Object, PassThroughConnector, ReferenceConnector, VirtualFilesystem},
     evaluator::{evaluate_with_registry, FunctionRegistry, ModuleLoader},
 };
 
@@ -33,7 +33,7 @@ pub fn run(
     old_code_local_storage_key: impl Into<Cow<'static, str>>,
     old_span_id_pairs_local_storage_key: impl Into<Cow<'static, str>>,
     virtual_fs: VirtualFilesystem,
-) -> Option<(Arc<Object>, ConstructContext, Arc<ReferenceConnector>, Arc<LinkConnector>)> {
+) -> Option<(Arc<Object>, ConstructContext, Arc<ReferenceConnector>, Arc<LinkConnector>, Arc<PassThroughConnector>, Arc<LinkVariableConnector>)> {
     println!("*** BOON INTERPRETER VERSION 2025-12-08-A ***");
     let states_local_storage_key = states_local_storage_key.into();
     let old_code_local_storage_key = old_code_local_storage_key.into();
@@ -135,8 +135,8 @@ pub fn run(
         function_registry,
         module_loader,
     ) {
-        Ok((root_object, construct_context, _registry, _module_loader, reference_connector, link_connector)) => {
-            Some((root_object, construct_context, reference_connector, link_connector))
+        Ok((root_object, construct_context, _registry, _module_loader, reference_connector, link_connector, pass_through_connector, link_variable_connector)) => {
+            Some((root_object, construct_context, reference_connector, link_connector, pass_through_connector, link_variable_connector))
         }
         Err(error) => {
             println!("[Evaluation Error]");
@@ -190,7 +190,7 @@ pub fn run_with_registry(
     old_span_id_pairs_local_storage_key: impl Into<Cow<'static, str>>,
     virtual_fs: VirtualFilesystem,
     function_registry: Option<FunctionRegistry>,
-) -> Option<(Arc<Object>, ConstructContext, FunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>)> {
+) -> Option<(Arc<Object>, ConstructContext, FunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>, Arc<PassThroughConnector>, Arc<LinkVariableConnector>)> {
     println!("*** BOON INTERPRETER VERSION 2025-12-15-PARSER-DEBUG ***");
     let states_local_storage_key = states_local_storage_key.into();
     let old_code_local_storage_key = old_code_local_storage_key.into();
@@ -282,8 +282,8 @@ pub fn run_with_registry(
         registry,
         module_loader,
     ) {
-        Ok((root_object, construct_context, registry, module_loader, reference_connector, link_connector)) => {
-            Some((root_object, construct_context, registry, module_loader, reference_connector, link_connector))
+        Ok((root_object, construct_context, registry, module_loader, reference_connector, link_connector, pass_through_connector, link_variable_connector)) => {
+            Some((root_object, construct_context, registry, module_loader, reference_connector, link_connector, pass_through_connector, link_variable_connector))
         }
         Err(error) => {
             println!("[Evaluation Error]");

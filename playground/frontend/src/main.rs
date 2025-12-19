@@ -1309,7 +1309,7 @@ impl Playground {
             None,
         );
         drop(source_code);
-        if let Some((object, construct_context, _registry, _module_loader, reference_connector, link_connector)) = evaluation_result {
+        if let Some((object, construct_context, _registry, _module_loader, reference_connector, link_connector, pass_through_connector, link_variable_connector)) = evaluation_result {
             El::new()
                 .child_signal(object_with_document_to_element_signal(
                     object.clone(),
@@ -1320,6 +1320,8 @@ impl Playground {
                     drop(object);
                     drop(reference_connector);
                     drop(link_connector);
+                    drop(pass_through_connector);
+                    drop(link_variable_connector);
                 })
                 .unify()
         } else {

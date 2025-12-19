@@ -962,25 +962,148 @@ async function handleCommand(id, command) {
         }
 
       case 'clickButton':
-        // Click a button by index (0-indexed) in the preview pane, excluding checkboxes
+        // Click a button by index (0-indexed) in the preview pane
+        // Since Boon/Zoon buttons don't have role="button", we find elements by looking at
+        // leaf elements (elements with no children that have text) and clickable appearance
         try {
-          const buttonElements = await cdpQuerySelectorAll(tab.id,
-            '[data-boon-panel="preview"] [role="button"]');
-          // Filter out checkboxes (they also have role="button" sometimes or are inside buttons)
-          const checkboxes = await cdpQuerySelectorAll(tab.id,
-            '[data-boon-panel="preview"] [role="checkbox"]');
-          const checkboxCenters = new Set(checkboxes.map(c => `${c.centerX},${c.centerY}`));
-          const pureButtons = buttonElements.filter(b => !checkboxCenters.has(`${b.centerX},${b.centerY}`));
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { elements: [], error: 'Preview panel not found' };
 
+              // Find all elements in preview
+              const allElements = preview.querySelectorAll('*');
+              const buttons = [];
+
+              allElements.forEach((el) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return;
+
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return;
+
+                // Get direct text content (text nodes that are direct children)
+                let directText = '';
+                for (const node of el.childNodes) {
+                  if (node.nodeType === Node.TEXT_NODE) {
+                    directText += node.textContent;
+                  }
+                }
+                directText = directText.trim();
+
+                // Consider it a button-like element if:
+                // 1. Has direct text content (leaf element with text)
+                // 2. Has pointer cursor OR has click handlers
+                // 3. Is relatively small (not a container)
+                const hasPointerCursor = style.cursor === 'pointer';
+                const isSmall = rect.width < 300 && rect.height < 100;
+                const hasText = directText.length > 0 && directText.length < 50;
+
+                if (hasText && isSmall && hasPointerCursor) {
+                  buttons.push({
+                    text: directText,
+                    x: Math.round(rect.x),
+                    y: Math.round(rect.y),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                    centerX: Math.round(rect.x + rect.width / 2),
+                    centerY: Math.round(rect.y + rect.height / 2)
+                  });
+                }
+              });
+
+              return { elements: buttons };
+            })()
+          `);
+
+          const buttons = result.elements || [];
           const buttonIndex = command.index;
-          if (buttonIndex >= pureButtons.length) {
-            return { type: 'error', message: `Button index ${buttonIndex} out of range (found ${pureButtons.length} buttons)` };
+          if (buttonIndex >= buttons.length) {
+            return { type: 'error', message: `Button index ${buttonIndex} out of range (found ${buttons.length} buttons)` };
           }
-          const button = pureButtons[buttonIndex];
+          const button = buttons[buttonIndex];
           await cdpClickAt(tab.id, button.centerX, button.centerY);
           return { type: 'success', data: { index: buttonIndex, text: button.text, x: button.centerX, y: button.centerY } };
         } catch (e) {
           return { type: 'error', message: `Click button failed: ${e.message}` };
+        }
+
+      case 'clickByText':
+        // Click any element by its text content (more flexible than clickButton)
+        try {
+          const searchText = command.text;
+          const exact = command.exact || false;
+
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const searchText = ${JSON.stringify(searchText)};
+              const exact = ${exact};
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { found: false, error: 'Preview panel not found' };
+
+              // Find all elements and look for matching text
+              const allElements = preview.querySelectorAll('*');
+              let bestMatch = null;
+              let bestMatchSize = Infinity;
+
+              allElements.forEach((el) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return;
+
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return;
+
+                // Check direct text content
+                let directText = '';
+                for (const node of el.childNodes) {
+                  if (node.nodeType === Node.TEXT_NODE) {
+                    directText += node.textContent;
+                  }
+                }
+                directText = directText.trim();
+
+                // Check for match
+                let matches = false;
+                if (exact) {
+                  matches = directText === searchText;
+                } else {
+                  matches = directText.includes(searchText);
+                }
+
+                if (matches) {
+                  // Prefer smaller elements (more specific match)
+                  const size = rect.width * rect.height;
+                  if (size < bestMatchSize) {
+                    bestMatchSize = size;
+                    bestMatch = {
+                      text: directText,
+                      x: Math.round(rect.x),
+                      y: Math.round(rect.y),
+                      width: Math.round(rect.width),
+                      height: Math.round(rect.height),
+                      centerX: Math.round(rect.x + rect.width / 2),
+                      centerY: Math.round(rect.y + rect.height / 2)
+                    };
+                  }
+                }
+              });
+
+              if (bestMatch) {
+                return { found: true, element: bestMatch };
+              }
+              return { found: false, error: 'No element found with text: ' + searchText };
+            })()
+          `);
+
+          if (!result.found) {
+            return { type: 'error', message: result.error || 'Element not found' };
+          }
+
+          const element = result.element;
+          await cdpClickAt(tab.id, element.centerX, element.centerY);
+          return { type: 'success', data: { text: element.text, x: element.centerX, y: element.centerY } };
+        } catch (e) {
+          return { type: 'error', message: `Click by text failed: ${e.message}` };
         }
 
       // ============ Legacy commands still using executeScript ============

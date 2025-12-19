@@ -3,7 +3,7 @@ FUNCTION make_counter() {
     [
         button: LINK
         count: 0 |> HOLD state {
-            button.event.press |> THEN { state |> Math/add(that: 1) }
+            button.event.press |> THEN { state + 1 }
         }
     ]
 }

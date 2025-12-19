@@ -467,6 +467,29 @@ fn get_tools() -> Vec<Tool> {
                 "required": ["index"]
             }),
         },
+        Tool {
+            name: "boon_click_button".to_string(),
+            description: "Click a button in the preview panel by index (0-indexed). Buttons are detected by role='button' attribute or button tag.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "integer",
+                        "description": "The button index (0-indexed)"
+                    }
+                },
+                "required": ["index"]
+            }),
+        },
+        Tool {
+            name: "boon_debug_elements".to_string(),
+            description: "Debug tool: Get raw preview elements data to inspect what's available for clicking.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
     ]
 }
 
@@ -553,6 +576,75 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
             }
             Response::Error { message } => Err(format!("Click checkbox failed: {}", message)),
             _ => Ok(format!("Clicked checkbox {}", index)),
+        };
+    }
+
+    // Handle click-button
+    if name == "boon_click_button" {
+        let index = args
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .ok_or("index parameter required")? as u32;
+
+        let response = ws_server::send_command_to_server(ws_port, Command::ClickButton { index })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        return match response {
+            Response::Success { data } => {
+                if let Some(d) = data {
+                    Ok(format!("Clicked button {}: {}", index, serde_json::to_string_pretty(&d).unwrap_or_default()))
+                } else {
+                    Ok(format!("Clicked button {}", index))
+                }
+            }
+            Response::Error { message } => Err(format!("Click button failed: {}", message)),
+            _ => Ok(format!("Clicked button {}", index)),
+        };
+    }
+
+    // Handle debug-elements
+    if name == "boon_debug_elements" {
+        let response = ws_server::send_command_to_server(ws_port, Command::GetPreviewElements)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        return match response {
+            Response::PreviewElements { data } => {
+                // Filter to show only elements with text content
+                let mut output = String::new();
+                output.push_str("=== Preview Elements with Text ===\n\n");
+
+                if let Some(elements) = data.get("elements").and_then(|v| v.as_array()) {
+                    for (i, elem) in elements.iter().enumerate() {
+                        let direct_text = elem.get("directText").and_then(|v| v.as_str()).unwrap_or("");
+                        let full_text = elem.get("fullText").and_then(|v| v.as_str()).unwrap_or("");
+                        let tag = elem.get("tagName").and_then(|v| v.as_str()).unwrap_or("?");
+                        let role = elem.get("role").and_then(|v| v.as_str());
+                        let x = elem.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let y = elem.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let w = elem.get("width").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let h = elem.get("height").and_then(|v| v.as_i64()).unwrap_or(0);
+
+                        // Only show elements with some text
+                        if !direct_text.is_empty() || !full_text.is_empty() {
+                            output.push_str(&format!(
+                                "[{}] <{}{}> at ({},{}) {}x{}\n  directText: {:?}\n  fullText: {:?}\n\n",
+                                i,
+                                tag,
+                                role.map(|r| format!(" role={}", r)).unwrap_or_default(),
+                                x, y, w, h,
+                                direct_text,
+                                full_text
+                            ));
+                        }
+                    }
+                }
+
+                Ok(output)
+            }
+            Response::Error { message } => Err(format!("Failed to get elements: {}", message)),
+            _ => Err("Unexpected response".to_string()),
         };
     }
 
@@ -904,39 +996,26 @@ async fn get_filtered_console(
 
 /// Click an element by its text content
 async fn click_element_by_text(text: &str, exact: bool, ws_port: u16) -> Result<String, String> {
-    // First get preview elements
-    let response = ws_server::send_command_to_server(ws_port, Command::GetPreviewElements)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Use the new ClickByText command which searches directly in the extension
+    let response = ws_server::send_command_to_server(
+        ws_port,
+        Command::ClickByText { text: text.to_string(), exact },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     match response {
-        Response::PreviewElements { data } => {
-            if let Some((x, y, width, height)) = find_element_bounds_by_text(&data, text, exact) {
-                let click_x = x + width / 2;
-                let click_y = y + height / 2;
-
-                // Click at the center of the element
-                let response = ws_server::send_command_to_server(
-                    ws_port,
-                    Command::ClickAt { x: click_x, y: click_y },
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-
-                match response {
-                    Response::Success { .. } => Ok(format!(
-                        "Clicked '{}' at ({}, {})",
-                        text, click_x, click_y
-                    )),
-                    Response::Error { message } => Err(format!("Click failed: {}", message)),
-                    _ => Ok(format!("Clicked '{}' at ({}, {})", text, click_x, click_y)),
-                }
+        Response::Success { data } => {
+            if let Some(d) = data {
+                let x = d.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+                let y = d.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+                Ok(format!("Clicked '{}' at ({}, {})", text, x, y))
             } else {
-                Err(format!("No element found containing text '{}'", text))
+                Ok(format!("Clicked '{}'", text))
             }
         }
-        Response::Error { message } => Err(format!("Failed to get elements: {}", message)),
-        _ => Err("Unexpected response from GetPreviewElements".to_string()),
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response".to_string()),
     }
 }
 
@@ -982,16 +1061,35 @@ async fn dblclick_element_by_text(text: &str, exact: bool, ws_port: u16) -> Resu
 fn find_element_bounds_by_text(value: &Value, text: &str, exact: bool) -> Option<(i32, i32, i32, i32)> {
     match value {
         Value::Object(obj) => {
-            // Check if this element has matching text (in 'text' or 'html' field)
+            // Check if this element has matching text
+            // Try multiple field names: directText, fullText, text, html (background.js uses directText/fullText)
             let has_match = {
-                // Try 'text' field first
-                if let Some(elem_text) = obj.get("text").and_then(|t| t.as_str()) {
+                // Try 'directText' field first (used by getPreviewElements in background.js)
+                if let Some(elem_text) = obj.get("directText").and_then(|t| t.as_str()) {
+                    if !elem_text.is_empty() {
+                        if exact {
+                            elem_text.trim() == text
+                        } else {
+                            elem_text.contains(text)
+                        }
+                    } else {
+                        false
+                    }
+                // Then try 'fullText' field (includes child text content)
+                } else if let Some(elem_text) = obj.get("fullText").and_then(|t| t.as_str()) {
                     if exact {
                         elem_text.trim() == text
                     } else {
                         elem_text.contains(text)
                     }
-                // Then try 'html' field (preview elements use this)
+                // Then try 'text' field (older format)
+                } else if let Some(elem_text) = obj.get("text").and_then(|t| t.as_str()) {
+                    if exact {
+                        elem_text.trim() == text
+                    } else {
+                        elem_text.contains(text)
+                    }
+                // Finally try 'html' field
                 } else if let Some(html) = obj.get("html").and_then(|t| t.as_str()) {
                     // Extract text content from HTML (simple extraction between > and <)
                     if exact {
@@ -1024,9 +1122,9 @@ fn find_element_bounds_by_text(value: &Value, text: &str, exact: bool) -> Option
                 }
             }
 
-            // Search in other object values
+            // Search in other object values (skip text fields to avoid re-matching)
             for (key, val) in obj {
-                if key != "text" && key != "children" {
+                if key != "text" && key != "directText" && key != "fullText" && key != "html" && key != "children" {
                     if let Some(result) = find_element_bounds_by_text(val, text, exact) {
                         return Some(result);
                     }

@@ -472,7 +472,8 @@ fn element_stripe(
             let obj = value.expect_object();
             future::ready(obj.variable("hovered"))
         })
-        .map(|variable| variable.expect_link_value_sender());
+        .map(|variable| variable.expect_link_value_sender())
+        .chain(stream::pending());
 
     let hovered_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
@@ -1261,6 +1262,8 @@ fn element_button(
     let element_variable = tagged_object.expect_variable("element");
 
     // Set up press event handler - use same subscription pattern as text_input
+    // Chain with pending() to prevent stream termination, which would cause busy-polling
+    // in the select! loop (fused stream returns Ready(None) immediately when exhausted)
     let mut press_stream = element_variable
         .clone()
         .stream_sync()
@@ -1268,13 +1271,16 @@ fn element_button(
         .flat_map(|variable| variable.stream_sync())
         .filter_map(|value| future::ready(value.expect_object().variable("press")))
         .map(|variable| variable.expect_link_value_sender())
+        .chain(stream::pending())
         .fuse();
 
     // Set up hovered link if element field exists with hovered property
+    // Chain with pending() to prevent stream termination (same as press_stream)
     let hovered_stream = element_variable
         .stream_sync()
         .filter_map(|value| future::ready(value.expect_object().variable("hovered")))
-        .map(|variable| variable.expect_link_value_sender());
+        .map(|variable| variable.expect_link_value_sender())
+        .chain(stream::pending());
 
     let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
@@ -1629,9 +1635,12 @@ fn element_button(
         }))
         // @TODO Handle press event only when it's defined in Boon code? Add `.on_press_signal` to Zoon?
         .on_press(move || {
+            zoon::println!("[BRIDGE] on_press CLOSURE CALLED!");
             let press_event: PressEvent = ();
             if let Err(error) = press_event_sender.unbounded_send(press_event) {
                 eprintln!("Failed to send button press event from on_press handler: {error}");
+            } else {
+                zoon::println!("[BRIDGE] on_press: sent event successfully");
             }
         })
         .on_hovered_change(move |is_hovered| {
@@ -1675,6 +1684,7 @@ fn element_text_input(
     let element_variable = tagged_object.expect_variable("element");
 
     // Set up event handlers - create separate subscriptions for each event type
+    // Chain with pending() to prevent stream termination causing busy-polling in select!
     let mut change_stream = element_variable
         .clone()
         .stream_sync()
@@ -1686,6 +1696,7 @@ fn element_text_input(
             zoon::println!("[BRIDGE] text_input instance #{}: got change LINK sender", instance_id);
             sender
         })
+        .chain(stream::pending())
         .fuse();
 
     let mut key_down_stream = element_variable
@@ -1702,6 +1713,7 @@ fn element_text_input(
                 sender
             }
         })
+        .chain(stream::pending())
         .fuse();
 
     let mut blur_stream = element_variable
@@ -1717,6 +1729,7 @@ fn element_text_input(
                 sender
             }
         })
+        .chain(stream::pending())
         .fuse();
 
     let event_handler_loop = ActorLoop::new({
@@ -2116,13 +2129,16 @@ fn element_checkbox(
         .filter_map(|value| future::ready(value.expect_object().variable("click")));
 
     // Map to sender - the Variable stream already handles uniqueness via evaluation_id
+    // Chain with pending() to prevent stream termination causing busy-polling in select!
     let click_sender_stream = click_var_stream.map(move |variable| {
         let sender = variable.expect_link_value_sender();
-        zoon::println!("[BRIDGE] checkbox instance #{}: got click LINK sender", instance_id);
+        let scope = format!("{:?}", variable.scope());
+        let eval_id = variable.evaluation_id();
+        zoon::println!("[BRIDGE] checkbox instance #{}: got click LINK sender, scope={}, eval_id={}", instance_id, scope, eval_id);
         sender
     });
 
-    let mut click_sender_stream = click_sender_stream.fuse();
+    let mut click_sender_stream = click_sender_stream.chain(stream::pending()).fuse();
 
     let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
@@ -2209,7 +2225,10 @@ fn element_checkbox(
                 let _ = sender.unbounded_send(());
             }
         })
-        .after_remove(move |_| drop(event_handler_loop))
+        .after_remove(move |_| {
+            zoon::println!("[BRIDGE] checkbox #{} after_remove called", instance_id);
+            drop(event_handler_loop)
+        })
 }
 
 fn element_label(
@@ -2229,11 +2248,13 @@ fn element_label(
     let element_variable = tagged_object.expect_variable("element");
 
     // Set up hovered link
+    // Chain with pending() to prevent stream termination causing busy-polling in select!
     let hovered_stream = element_variable
         .clone()
         .stream_sync()
         .filter_map(|value| future::ready(value.expect_object().variable("hovered")))
-        .map(|variable| variable.expect_link_value_sender());
+        .map(|variable| variable.expect_link_value_sender())
+        .chain(stream::pending());
 
     // Set up double_click event
     let event_stream = element_variable
@@ -2249,6 +2270,7 @@ fn element_label(
             variable.stream_sync()
         });
 
+    // Chain with pending() to prevent stream termination causing busy-polling in select!
     let mut double_click_stream = event_stream
         .filter_map(move |value| {
             let obj = value.expect_object();
@@ -2261,6 +2283,7 @@ fn element_label(
             zoon::println!("[BRIDGE] element_label #{}: got double_click variable, has_sender={}", instance_id, has_sender);
             variable.expect_link_value_sender()
         })
+        .chain(stream::pending())
         .fuse();
 
     let event_handler_loop = ActorLoop::new({
@@ -2420,10 +2443,12 @@ fn element_link(
     let element_variable = tagged_object.expect_variable("element");
 
     // Set up hovered handler
+    // Chain with pending() to prevent stream termination causing busy-polling in select!
     let mut hovered_stream = element_variable
         .stream_sync()
         .filter_map(|value| future::ready(value.expect_object().variable("hovered")))
         .map(|variable| variable.expect_link_value_sender())
+        .chain(stream::pending())
         .fuse();
 
     let event_handler_loop = ActorLoop::new({

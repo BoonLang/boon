@@ -726,23 +726,29 @@ fn find_element_by_text(data: &serde_json::Value, text: &str, exact: bool) -> Op
 fn find_element_by_text_recursive(value: &serde_json::Value, text: &str, exact: bool) -> Option<ElementBounds> {
     match value {
         serde_json::Value::Object(obj) => {
-            // Check if this element has matching text (in 'text' or 'html' field)
+            // Check if this element has matching text
+            // GetPreviewElements returns 'directText' (direct child text nodes) and 'fullText' (all text content)
             let has_match = {
-                // Try 'text' field first
-                if let Some(elem_text) = obj.get("text").and_then(|t| t.as_str()) {
+                // Try 'directText' field first (more precise match)
+                if let Some(elem_text) = obj.get("directText").and_then(|t| t.as_str()) {
                     if exact {
                         elem_text.trim() == text
                     } else {
                         elem_text.contains(text)
                     }
-                // Then try 'html' field (preview elements use this)
-                } else if let Some(html) = obj.get("html").and_then(|t| t.as_str()) {
-                    // Extract text content from HTML (simple extraction between > and <)
+                // Then try 'fullText' field
+                } else if let Some(elem_text) = obj.get("fullText").and_then(|t| t.as_str()) {
                     if exact {
-                        // For exact match, look for >text< pattern
-                        html.contains(&format!(">{}<", text)) || html.contains(&format!(">{}\"", text))
+                        elem_text.trim() == text
                     } else {
-                        html.contains(text)
+                        elem_text.contains(text)
+                    }
+                // Legacy: Try 'text' field
+                } else if let Some(elem_text) = obj.get("text").and_then(|t| t.as_str()) {
+                    if exact {
+                        elem_text.trim() == text
+                    } else {
+                        elem_text.contains(text)
                     }
                 } else {
                     false

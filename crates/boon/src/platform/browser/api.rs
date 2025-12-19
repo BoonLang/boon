@@ -55,7 +55,7 @@ pub fn function_document_new(
     let [argument_root] = arguments.as_slice() else {
         panic!("Unexpected argument count")
     };
-    let scoped_id = function_call_persistence_id.in_scope(&actor_context.scope);
+    let scoped_id = function_call_persistence_id;
     Object::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -99,7 +99,7 @@ pub fn function_element_stripe(
         arguments.as_slice() else {
             panic!("Element/stripe requires 5 arguments, got {}", arguments.len());
         };
-    let scoped_id = function_call_persistence_id.in_scope(&actor_context.scope);
+    let scoped_id = function_call_persistence_id;
     TaggedObject::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -212,7 +212,7 @@ pub fn function_element_container(
     let [argument_element, argument_style, argument_child] = arguments.as_slice() else {
         panic!("Element/container expects 3 arguments")
     };
-    let scoped_id = function_call_persistence_id.in_scope(&actor_context.scope);
+    let scoped_id = function_call_persistence_id;
     TaggedObject::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -301,7 +301,7 @@ pub fn function_element_stack(
     let [argument_element, argument_style, argument_layers] = arguments.as_slice() else {
         panic!("Element/stack requires 3 arguments, got {}", arguments.len());
     };
-    let scoped_id = function_call_persistence_id.in_scope(&actor_context.scope);
+    let scoped_id = function_call_persistence_id;
     TaggedObject::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -394,7 +394,7 @@ pub fn function_element_button(
     let [argument_element, argument_style, argument_label] = arguments.as_slice() else {
         panic!("Unexpected argument count")
     };
-    let scoped_id = function_call_persistence_id.in_scope(&actor_context.scope);
+    let scoped_id = function_call_persistence_id;
     // Create a derived actor that extracts `event` from argument_element
     // This allows direct access via `.event` instead of `.element.event`
     let event_stream = argument_element
@@ -528,7 +528,7 @@ pub fn function_element_text_input(
     else {
         panic!("Element/text_input expects 6 arguments")
     };
-    let scoped_id = function_call_persistence_id.in_scope(&actor_context.scope);
+    let scoped_id = function_call_persistence_id;
 
     // Create a derived actor that extracts `event` from argument_element
     // This allows direct access via `.event` instead of `.element.event`
@@ -712,7 +712,7 @@ pub fn function_element_checkbox(
     else {
         panic!("Element/checkbox expects 5 arguments")
     };
-    let scoped_id = function_call_persistence_id.in_scope(&actor_context.scope);
+    let scoped_id = function_call_persistence_id;
 
     // Create a derived actor that extracts `event` from argument_element
     // This allows direct access via `.event` instead of `.element.event`
@@ -868,7 +868,7 @@ pub fn function_element_label(
     let [argument_element, argument_style, argument_label] = arguments.as_slice() else {
         panic!("Element/label expects 3 arguments")
     };
-    let scoped_id = function_call_persistence_id.in_scope(&actor_context.scope);
+    let scoped_id = function_call_persistence_id;
 
     // Create a derived actor that extracts `event` from argument_element
     // This allows direct access via `.event` instead of `.element.event`
@@ -998,7 +998,7 @@ pub fn function_element_paragraph(
     let [argument_element, argument_style, argument_contents] = arguments.as_slice() else {
         panic!("Element/paragraph expects 3 arguments")
     };
-    let scoped_id = function_call_persistence_id.in_scope(&actor_context.scope);
+    let scoped_id = function_call_persistence_id;
     TaggedObject::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -1093,7 +1093,7 @@ pub fn function_element_link(
     else {
         panic!("Element/link expects 5 arguments")
     };
-    let scoped_id = function_call_persistence_id.in_scope(&actor_context.scope);
+    let scoped_id = function_call_persistence_id;
     TaggedObject::new_constant(
         ConstructInfo::new(
             function_call_id.with_child_id(0),
@@ -2342,7 +2342,7 @@ pub fn function_scene_new(
     let [argument_root] = arguments.as_slice() else {
         panic!("Unexpected argument count for Scene/new")
     };
-    let scoped_id = function_call_persistence_id.in_scope(&actor_context.scope);
+    let scoped_id = function_call_persistence_id;
     // Scene/new returns an empty object - the actual rendering is handled by the element tree
     Object::new_constant(
         ConstructInfo::new(
