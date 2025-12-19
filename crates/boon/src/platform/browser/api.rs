@@ -1932,19 +1932,19 @@ pub fn function_router_route(
     construct_context: ConstructContext,
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
-    // Create a channel for route changes
-    let (route_sender, route_receiver) = mpsc::unbounded::<String>();
+    // Create a bounded channel for route changes (8 should be plenty for navigation)
+    let (route_sender, route_receiver) = mpsc::channel::<String>(8);
 
     // Send initial route
     let initial_path = get_current_pathname();
-    let _ = route_sender.unbounded_send(initial_path);
+    let _ = route_sender.try_send(initial_path);
 
     // Set up popstate listener for browser back/forward navigation
     let popstate_closure: Closure<dyn Fn()> = Closure::new({
         let route_sender = route_sender.clone();
         move || {
             let path = get_current_pathname();
-            let _ = route_sender.unbounded_send(path);
+            let _ = route_sender.try_send(path);
         }
     });
 
@@ -1975,7 +1975,7 @@ pub fn function_router_route(
 
 // Thread-local storage for route sender (allows go_to to trigger route updates)
 thread_local! {
-    static ROUTE_SENDER: std::cell::RefCell<Option<mpsc::UnboundedSender<String>>> = std::cell::RefCell::new(None);
+    static ROUTE_SENDER: std::cell::RefCell<Option<mpsc::Sender<String>>> = std::cell::RefCell::new(None);
 }
 
 /// Router/go_to(route) -> []
@@ -2004,7 +2004,7 @@ pub fn function_router_go_to(
             // Notify route listeners about the change
             ROUTE_SENDER.with(|cell| {
                 if let Some(sender) = cell.borrow().as_ref() {
-                    let _ = sender.unbounded_send(route);
+                    let _ = sender.try_send(route);
                 }
             });
         }

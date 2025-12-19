@@ -3341,10 +3341,10 @@ fn build_hold_actor(
     // Clone for the synchronous callback that THEN will use
     let state_actor_for_callback = state_actor;
 
-    // Create backpressure permit for synchronizing THEN with state updates.
-    // Initial count = 1 allows first body evaluation to start.
+    // Create backpressure coordinator for synchronizing THEN with state updates.
+    // The coordinator uses message-based coordination (no shared atomics/Mutex).
     // HOLD's callback releases permit after each state update, allowing next body to run.
-    let backpressure_permit = BackpressurePermit::new(1);
+    let backpressure_permit = BackpressureCoordinator::new();
     let permit_for_callback = backpressure_permit.clone();
 
     // Create callback for THEN to update HOLD's state synchronously.
@@ -4502,7 +4502,7 @@ enum ModuleLoaderRequest {
 /// Uses actor model with channels - no locks, no RefCell.
 #[derive(Clone)]
 pub struct ModuleLoader {
-    request_sender: mpsc::UnboundedSender<ModuleLoaderRequest>,
+    request_sender: NamedChannel<ModuleLoaderRequest>,
     _actor_loop: Arc<ActorLoop>,
 }
 
@@ -4514,7 +4514,7 @@ impl Default for ModuleLoader {
 
 impl ModuleLoader {
     pub fn new(base_dir: impl Into<String>) -> Self {
-        let (tx, mut rx) = mpsc::unbounded::<ModuleLoaderRequest>();
+        let (tx, mut rx) = NamedChannel::new("module_loader.requests", 16);
         let initial_base_dir = base_dir.into();
 
         let actor_loop = ActorLoop::new(async move {
@@ -4547,20 +4547,20 @@ impl ModuleLoader {
 
     /// Set the base directory for module resolution (fire-and-forget).
     pub fn set_base_dir(&self, dir: impl Into<String>) {
-        let _ = self.request_sender.unbounded_send(ModuleLoaderRequest::SetBaseDir(dir.into()));
+        let _ = self.request_sender.try_send(ModuleLoaderRequest::SetBaseDir(dir.into()));
     }
 
     /// Get the base directory (async).
     pub async fn base_dir(&self) -> String {
         let (tx, rx) = oneshot::channel();
-        let _ = self.request_sender.unbounded_send(ModuleLoaderRequest::GetBaseDir { reply: tx });
+        let _ = self.request_sender.try_send(ModuleLoaderRequest::GetBaseDir { reply: tx });
         rx.await.unwrap_or_default()
     }
 
     /// Get a cached module (async).
     async fn get_cached(&self, name: &str) -> Option<ModuleData> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.request_sender.unbounded_send(ModuleLoaderRequest::GetCached {
+        let _ = self.request_sender.try_send(ModuleLoaderRequest::GetCached {
             name: name.to_string(),
             reply: tx,
         });
@@ -4569,7 +4569,7 @@ impl ModuleLoader {
 
     /// Cache a module (fire-and-forget).
     fn cache(&self, name: String, data: ModuleData) {
-        let _ = self.request_sender.unbounded_send(ModuleLoaderRequest::Cache { name, data });
+        let _ = self.request_sender.try_send(ModuleLoaderRequest::Cache { name, data });
     }
 
     /// Load a module by name (e.g., "Theme", "Professional", "Assets")

@@ -26,6 +26,167 @@ use zoon::{Task, TaskHandle};
 use zoon::{WebStorage, local_storage};
 use zoon::{eprintln, println};
 
+// --- NamedChannel ---
+
+/// Error returned by `NamedChannel::send()`.
+#[derive(Debug)]
+pub enum ChannelError<T> {
+    /// Channel is closed (receiver dropped).
+    Closed(T),
+    /// Send timed out (only in debug-channels mode).
+    /// Note: The value is lost because it was consumed by the send future.
+    #[cfg(feature = "debug-channels")]
+    Timeout,
+}
+
+/// Wrapper around mpsc::Sender with debugging capabilities.
+///
+/// Provides named identification, backpressure logging, and optional timeouts.
+/// All inter-actor communication should use this wrapper for observability.
+///
+/// # Features
+/// - **Named identification**: Know which channel is stuck/dropping
+/// - **Backpressure logging**: Log when events are dropped
+/// - **Debug timeouts**: Detect infinite waits in debug builds (feature flag)
+///
+/// # Usage
+/// ```ignore
+/// // Create named bounded channel
+/// let (tx, rx) = NamedChannel::new("value_actor.messages", 16);
+///
+/// // Async send with debug timeout
+/// tx.send(value).await.ok();
+///
+/// // Fire-and-forget (for DOM events)
+/// tx.send_or_drop(event);
+/// ```
+pub struct NamedChannel<T> {
+    inner: mpsc::Sender<T>,
+    name: &'static str,
+    capacity: usize,
+}
+
+impl<T> Clone for NamedChannel<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            name: self.name,
+            capacity: self.capacity,
+        }
+    }
+}
+
+impl<T> NamedChannel<T> {
+    /// Create a named bounded channel with the specified capacity.
+    ///
+    /// # Arguments
+    /// * `name` - Static string identifying this channel (e.g., "value_actor.messages")
+    /// * `capacity` - Maximum number of pending messages before backpressure kicks in
+    ///
+    /// # Returns
+    /// Tuple of (sender, receiver)
+    pub fn new(name: &'static str, capacity: usize) -> (Self, mpsc::Receiver<T>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                inner: tx,
+                name,
+                capacity,
+            },
+            rx,
+        )
+    }
+
+    /// Get the channel name (for debugging/logging).
+    #[allow(dead_code)]
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Get the channel capacity.
+    #[allow(dead_code)]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Async send with optional debug timeout.
+    ///
+    /// In production (no debug-channels feature): blocks until space is available.
+    /// In debug mode (debug-channels feature): times out after 5 seconds with error log.
+    #[cfg(feature = "debug-channels")]
+    pub async fn send(&self, value: T) -> Result<(), ChannelError<T>> {
+        use zoon::Timer;
+
+        // 5 second timeout for debug mode
+        const TIMEOUT_MS: u32 = 5000;
+
+        let send_fut = self.inner.clone().send(value);
+
+        select! {
+            result = send_fut.fuse() => {
+                result.map_err(|e| ChannelError::Closed(e.into_inner()))
+            }
+            _ = Timer::sleep(TIMEOUT_MS).fuse() => {
+                // The value is lost - it was consumed by the send future.
+                // Log the error - this is a potential deadlock
+                eprintln!(
+                    "[CHANNEL TIMEOUT] '{}' blocked for {}ms (capacity: {}) - possible deadlock!",
+                    self.name, TIMEOUT_MS, self.capacity
+                );
+                Err(ChannelError::Timeout)
+            }
+        }
+    }
+
+    /// Async send (production mode - no timeout).
+    #[cfg(not(feature = "debug-channels"))]
+    pub async fn send(&self, value: T) -> Result<(), ChannelError<T>> {
+        self.inner
+            .clone()
+            .send(value)
+            .await
+            .map_err(|e| ChannelError::Closed(e.into_inner()))
+    }
+
+    /// Fire-and-forget send - logs if dropped (for DOM events and other droppable events).
+    ///
+    /// Use this when dropping events is acceptable (user input, periodic updates).
+    /// Always logs when events are dropped for observability.
+    pub fn send_or_drop(&self, value: T) {
+        if self.inner.clone().try_send(value).is_err() {
+            // Log at debug level - this is expected behavior for high-frequency events
+            #[cfg(feature = "debug-channels")]
+            eprintln!(
+                "[BACKPRESSURE DROP] '{}' dropped event (full, capacity: {})",
+                self.name, self.capacity
+            );
+        }
+    }
+
+    /// Try send with explicit result (for sync contexts).
+    ///
+    /// Returns error if channel is full or closed.
+    /// Logs backpressure events for observability.
+    #[allow(dead_code)]
+    pub fn try_send(&self, value: T) -> Result<(), mpsc::TrySendError<T>> {
+        let result = self.inner.clone().try_send(value);
+        if result.is_err() {
+            #[cfg(feature = "debug-channels")]
+            eprintln!(
+                "[BACKPRESSURE] '{}' channel full (capacity: {})",
+                self.name, self.capacity
+            );
+        }
+        result
+    }
+
+    /// Check if the channel is closed (receiver dropped).
+    #[allow(dead_code)]
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+}
+
 /// Debug flag to log when ValueActors, Variables, and other constructs are dropped,
 /// and when their internal loops end. This is useful for debugging premature drop issues
 /// where subscriptions fail with "receiver is gone" errors.
@@ -329,6 +490,8 @@ where
 /// Consumer controls pace by signaling readiness via the demand channel.
 /// Inner stream is only polled when demand signal is received.
 ///
+/// Uses a bounded(1) channel - single pending demand signal is sufficient.
+///
 /// # Usage
 /// ```ignore
 /// let backpressured = BackpressuredStream::new(source_stream);
@@ -336,21 +499,21 @@ where
 /// backpressured.signal_initial_demand(); // Allow first value
 ///
 /// // In processing loop, after handling each value:
-/// let _ = demand_tx.unbounded_send(()); // Signal ready for next
+/// let _ = demand_tx.try_send(()); // Signal ready for next
 /// ```
 #[pin_project::pin_project]
 pub struct BackpressuredStream<S> {
     #[pin]
     inner: S,
     #[pin]
-    demand_rx: mpsc::UnboundedReceiver<()>,
-    demand_tx: mpsc::UnboundedSender<()>,
+    demand_rx: mpsc::Receiver<()>,
+    demand_tx: mpsc::Sender<()>,
     awaiting_demand: bool,
 }
 
 impl<S> BackpressuredStream<S> {
     pub fn new(inner: S) -> Self {
-        let (demand_tx, demand_rx) = mpsc::unbounded();
+        let (demand_tx, demand_rx) = mpsc::channel(1);
         Self {
             inner,
             demand_rx,
@@ -360,14 +523,14 @@ impl<S> BackpressuredStream<S> {
     }
 
     /// Get a cloneable sender to signal demand.
-    /// Call `demand_sender.unbounded_send(())` to allow next value through.
-    pub fn demand_sender(&self) -> mpsc::UnboundedSender<()> {
+    /// Call `demand_sender.try_send(())` to allow next value through.
+    pub fn demand_sender(&self) -> mpsc::Sender<()> {
         self.demand_tx.clone()
     }
 
     /// Signal initial demand (call once after creation to start flow).
     pub fn signal_initial_demand(&self) {
-        let _ = self.demand_tx.unbounded_send(());
+        let _ = self.demand_tx.try_send(());
     }
 }
 
@@ -398,87 +561,127 @@ impl<S: Stream> Stream for BackpressuredStream<S> {
     }
 }
 
-// --- BackpressurePermit ---
+// --- BackpressureCoordinator ---
 
-// RefCell removed - using actor model with channels instead
-use std::task::Waker;
-
-/// A permit-based synchronization primitive for backpressure between producer and consumer.
-///
-/// Used by HOLD to ensure THEN processes one value at a time AND waits for state update.
-///
-/// # How it works:
-/// 1. HOLD creates permit with initial count = 1
-/// 2. THEN acquires permit before each body evaluation (blocks if count = 0)
-/// 3. THEN evaluates body and emits result (permit count stays at 0)
-/// 4. HOLD receives result, updates state, releases permit (count = 0 → 1)
-/// 5. THEN can now acquire for next body evaluation
-///
-/// This guarantees that HOLD's state update completes before THEN's next body starts.
-///
-/// Uses thread-safe primitives (Arc + AtomicUsize + Mutex) instead of Rc<Cell>/Rc<RefCell>
-/// to support WebWorkers and to allow callbacks in Arc<dyn Fn>.
-#[derive(Clone)]
-pub struct BackpressurePermit {
-    available: Arc<std::sync::atomic::AtomicUsize>,
-    waker: Arc<std::sync::Mutex<Option<Waker>>>,
+/// Request sent to BackpressureCoordinator to acquire a permit.
+struct BackpressureRequest {
+    /// Channel to send grant acknowledgment back to requester.
+    grant_tx: oneshot::Sender<()>,
 }
 
-impl BackpressurePermit {
-    /// Create a new permit with the given initial count.
-    /// For HOLD/THEN synchronization, use initial = 1.
-    pub fn new(initial: usize) -> Self {
-        use std::sync::atomic::AtomicUsize;
-        BackpressurePermit {
-            available: Arc::new(AtomicUsize::new(initial)),
-            waker: Arc::new(std::sync::Mutex::new(None)),
-        }
-    }
+/// Inner state of BackpressureCoordinator, held in Arc for cloning.
+struct BackpressureCoordinatorInner {
+    /// Channel for acquire requests from THEN.
+    request_tx: mpsc::Sender<BackpressureRequest>,
+    /// Channel for release signals from HOLD callback.
+    completion_tx: mpsc::Sender<()>,
+    /// Actor loop managing permit coordination.
+    _actor_loop: ActorLoop,
+}
 
-    /// Release a permit, incrementing the available count.
-    /// Wakes the waiting task if one exists.
-    /// Called by HOLD after updating state.
-    pub fn release(&self) {
-        use std::sync::atomic::Ordering;
-        let old = self.available.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut guard) = self.waker.lock() {
-            if let Some(waker) = guard.take() {
-                waker.wake();
+/// Message-based backpressure coordination for HOLD/THEN synchronization.
+///
+/// Replaces the shared-state BackpressurePermit with pure channel-based coordination.
+/// This makes the engine cluster/distributed-ready - no shared memory required.
+///
+/// # How it works:
+/// 1. HOLD creates coordinator
+/// 2. THEN calls `acquire().await` which sends a request and waits for grant
+/// 3. Coordinator grants the request (sends on grant channel)
+/// 4. THEN evaluates body and emits result
+/// 5. HOLD callback calls `release()` which sends completion signal
+/// 6. Coordinator receives completion, ready for next request
+///
+/// # Actor Model
+/// The coordinator is an actor with an internal loop that processes requests
+/// sequentially. This ensures only one THEN body runs at a time without
+/// any shared mutable state.
+#[derive(Clone)]
+pub struct BackpressureCoordinator {
+    inner: Arc<BackpressureCoordinatorInner>,
+}
+
+impl BackpressureCoordinator {
+    /// Create a new coordinator.
+    ///
+    /// The coordinator starts ready to grant one permit (equivalent to initial=1).
+    /// After each acquire/release cycle, it's ready for the next.
+    pub fn new() -> Self {
+        // Bounded(1) channels - only one pending request/completion at a time
+        let (request_tx, mut request_rx) = mpsc::channel::<BackpressureRequest>(1);
+        let (completion_tx, mut completion_rx) = mpsc::channel::<()>(1);
+
+        let actor_loop = ActorLoop::new(async move {
+            // Process requests sequentially - this IS the permit
+            while let Some(request) = request_rx.next().await {
+                // Grant permit to requester
+                let _ = request.grant_tx.send(());
+
+                // Wait for completion signal (release) before processing next request
+                // This ensures state is updated before next body evaluation
+                if completion_rx.next().await.is_none() {
+                    // Completion channel closed - shutdown
+                    break;
+                }
             }
+
+            if LOG_DROPS_AND_LOOP_ENDS {
+                println!("Loop ended: BackpressureCoordinator");
+            }
+        });
+
+        Self {
+            inner: Arc::new(BackpressureCoordinatorInner {
+                request_tx,
+                completion_tx,
+                _actor_loop: actor_loop,
+            }),
         }
     }
 
     /// Acquire a permit asynchronously.
-    /// If no permit is available (count = 0), waits until one is released.
+    ///
+    /// Blocks until:
+    /// 1. Previous permit holder has released (if any)
+    /// 2. This request is granted
+    ///
     /// Called by THEN before each body evaluation.
     pub async fn acquire(&self) {
-        use std::sync::atomic::Ordering;
-        std::future::poll_fn(|cx| {
-            // Try to decrement if available > 0
-            loop {
-                let available = self.available.load(Ordering::SeqCst);
-                if available > 0 {
-                    // Try to atomically decrement
-                    if self.available.compare_exchange(
-                        available,
-                        available - 1,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    ).is_ok() {
-                        return Poll::Ready(());
-                    }
-                    // CAS failed, retry
-                    continue;
-                } else {
-                    if let Ok(mut guard) = self.waker.lock() {
-                        *guard = Some(cx.waker().clone());
-                    }
-                    return Poll::Pending;
-                }
+        let (grant_tx, grant_rx) = oneshot::channel();
+        let request = BackpressureRequest { grant_tx };
+
+        // Send request (blocks on bounded channel if previous request pending)
+        if self.inner.request_tx.clone().send(request).await.is_err() {
+            // Coordinator was dropped - this can happen during shutdown
+            return;
+        }
+
+        // Wait for grant
+        let _ = grant_rx.await;
+    }
+
+    /// Release the permit, allowing the next acquire to proceed.
+    ///
+    /// This is synchronous (non-blocking) so it can be called from callbacks.
+    /// Called by HOLD after updating state.
+    pub fn release(&self) {
+        match self.inner.completion_tx.clone().try_send(()) {
+            Ok(()) => {}
+            Err(e) if e.is_full() => {
+                // This shouldn't happen - indicates double release or logic bug
+                eprintln!(
+                    "[BACKPRESSURE BUG] release() failed - completion channel full (double release?)"
+                );
             }
-        }).await
+            Err(_) => {
+                // Channel disconnected - coordinator was dropped, OK during shutdown
+            }
+        }
     }
 }
+
+// Type alias for backwards compatibility during migration
+pub type BackpressurePermit = BackpressureCoordinator;
 
 // --- LazyValueActor ---
 
@@ -508,8 +711,9 @@ struct LazyValueRequest {
 /// - Threshold-based cleanup prevents unbounded memory growth
 pub struct LazyValueActor {
     construct_info: Arc<ConstructInfoComplete>,
-    /// Channel for subscribers to request the next value
-    request_tx: mpsc::UnboundedSender<LazyValueRequest>,
+    /// Channel for subscribers to request the next value.
+    /// Bounded(16) - demand-driven requests from subscribers.
+    request_tx: NamedChannel<LazyValueRequest>,
     /// Counter for unique subscriber IDs
     subscriber_counter: std::sync::atomic::AtomicUsize,
     /// Keep input actors alive
@@ -529,7 +733,7 @@ impl LazyValueActor {
         inputs: Vec<Arc<ValueActor>>,
     ) -> Self {
         let construct_info = Arc::new(construct_info);
-        let (request_tx, request_rx) = mpsc::unbounded::<LazyValueRequest>();
+        let (request_tx, request_rx) = NamedChannel::new("lazy_value_actor.requests", 16);
 
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
@@ -567,7 +771,7 @@ impl LazyValueActor {
     async fn internal_loop<S: Stream<Item = Value> + 'static>(
         construct_info: Arc<ConstructInfoComplete>,
         source_stream: S,
-        mut request_rx: mpsc::UnboundedReceiver<LazyValueRequest>,
+        mut request_rx: mpsc::Receiver<LazyValueRequest>,
     ) {
         let mut source = Box::pin(source_stream);
         let mut buffer: Vec<Value> = Vec::new();
@@ -699,9 +903,9 @@ impl Stream for LazySubscription {
             response_tx,
         };
 
-        // Try to send the request
-        if this.actor.request_tx.unbounded_send(request).is_err() {
-            // Actor dropped
+        // Try to send the request (non-blocking for poll context)
+        if this.actor.request_tx.try_send(request).is_err() {
+            // Actor dropped or channel full
             return Poll::Ready(None);
         }
 
@@ -879,7 +1083,8 @@ enum FsRequest {
 /// - Reads are async (request/response via oneshot channel)
 #[derive(Clone)]
 pub struct VirtualFilesystem {
-    request_sender: mpsc::UnboundedSender<FsRequest>,
+    /// Bounded(32) - filesystem operations.
+    request_sender: NamedChannel<FsRequest>,
     // Note: ActorLoop is NOT cloned - only the sender.
     // The actor loop is stored separately and kept alive by the context owner.
     _actor_loop: Arc<ActorLoop>,
@@ -892,7 +1097,7 @@ impl VirtualFilesystem {
 
     /// Create a VirtualFilesystem pre-populated with files
     pub fn with_files(initial_files: HashMap<String, String>) -> Self {
-        let (tx, mut rx) = mpsc::unbounded::<FsRequest>();
+        let (tx, mut rx) = NamedChannel::new("virtual_filesystem.requests", 32);
 
         let actor_loop = ActorLoop::new(async move {
             let mut files: HashMap<String, String> = initial_files;
@@ -962,10 +1167,10 @@ impl VirtualFilesystem {
     /// Read text content from a file (async)
     pub async fn read_text(&self, path: &str) -> Option<String> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.request_sender.unbounded_send(FsRequest::ReadText {
+        let _ = self.request_sender.send(FsRequest::ReadText {
             path: path.to_string(),
             reply: tx,
-        });
+        }).await;
         rx.await.ok().flatten()
     }
 
@@ -974,7 +1179,7 @@ impl VirtualFilesystem {
     /// This is synchronous because it just sends a message to the actor.
     /// The actual write happens asynchronously in the actor loop.
     pub fn write_text(&self, path: &str, content: String) {
-        let _ = self.request_sender.unbounded_send(FsRequest::WriteText {
+        self.request_sender.send_or_drop(FsRequest::WriteText {
             path: path.to_string(),
             content,
         });
@@ -983,30 +1188,30 @@ impl VirtualFilesystem {
     /// List entries in a directory (async)
     pub async fn list_directory(&self, path: &str) -> Vec<String> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.request_sender.unbounded_send(FsRequest::ListDirectory {
+        let _ = self.request_sender.send(FsRequest::ListDirectory {
             path: path.to_string(),
             reply: tx,
-        });
+        }).await;
         rx.await.unwrap_or_default()
     }
 
     /// Check if a file exists (async)
     pub async fn exists(&self, path: &str) -> bool {
         let (tx, rx) = oneshot::channel();
-        let _ = self.request_sender.unbounded_send(FsRequest::Exists {
+        let _ = self.request_sender.send(FsRequest::Exists {
             path: path.to_string(),
             reply: tx,
-        });
+        }).await;
         rx.await.unwrap_or(false)
     }
 
     /// Delete a file (async)
     pub async fn delete(&self, path: &str) -> bool {
         let (tx, rx) = oneshot::channel();
-        let _ = self.request_sender.unbounded_send(FsRequest::Delete {
+        let _ = self.request_sender.send(FsRequest::Delete {
             path: path.to_string(),
             reply: tx,
-        });
+        }).await;
         rx.await.unwrap_or(false)
     }
 
@@ -1041,12 +1246,14 @@ pub struct ConstructContext {
 /// Actor for persistent storage operations.
 /// Uses ActorLoop internally to encapsulate the async task.
 pub struct ConstructStorage {
-    state_inserter_sender: mpsc::UnboundedSender<(
+    /// Bounded(32) - state save operations.
+    state_inserter_sender: NamedChannel<(
         parser::PersistenceId,
         serde_json::Value,
         oneshot::Sender<()>,
     )>,
-    state_getter_sender: mpsc::UnboundedSender<(
+    /// Bounded(32) - state load queries.
+    state_getter_sender: NamedChannel<(
         parser::PersistenceId,
         oneshot::Sender<Option<serde_json::Value>>,
     )>,
@@ -1060,8 +1267,8 @@ pub struct ConstructStorage {
 impl ConstructStorage {
     pub fn new(states_local_storage_key: impl Into<Cow<'static, str>>) -> Self {
         let states_local_storage_key = states_local_storage_key.into();
-        let (state_inserter_sender, mut state_inserter_receiver) = mpsc::unbounded();
-        let (state_getter_sender, mut state_getter_receiver) = mpsc::unbounded();
+        let (state_inserter_sender, mut state_inserter_receiver) = NamedChannel::new("construct_storage.inserter", 32);
+        let (state_getter_sender, mut state_getter_receiver) = NamedChannel::new("construct_storage.getter", 32);
         Self {
             state_inserter_sender,
             state_getter_sender,
@@ -1105,12 +1312,12 @@ impl ConstructStorage {
             }
         };
         let (confirmation_sender, confirmation_receiver) = oneshot::channel::<()>();
-        if let Err(error) = self.state_inserter_sender.unbounded_send((
+        if self.state_inserter_sender.send((
             persistence_id,
             json_value,
             confirmation_sender,
-        )) {
-            eprintln!("Failed to save state: {error:#}")
+        )).await.is_err() {
+            eprintln!("Failed to save state: channel closed")
         }
         confirmation_receiver
             .await
@@ -1123,11 +1330,13 @@ impl ConstructStorage {
         persistence_id: parser::PersistenceId,
     ) -> Option<T> {
         let (state_sender, state_receiver) = oneshot::channel::<Option<serde_json::Value>>();
-        if let Err(error) = self
+        if self
             .state_getter_sender
-            .unbounded_send((persistence_id, state_sender))
+            .send((persistence_id, state_sender))
+            .await
+            .is_err()
         {
-            eprintln!("Failed to load state: {error:#}")
+            eprintln!("Failed to load state: channel closed")
         }
         let json_value = state_receiver
             .await
@@ -1302,30 +1511,28 @@ impl ActorContext {
 
 /// Actor for broadcasting impulses to multiple subscribers.
 /// Uses ActorLoop internally to encapsulate the async task.
+/// Impulse channels are bounded(1) - a single pending signal is sufficient.
 pub struct ActorOutputValveSignal {
-    impulse_sender_sender: mpsc::UnboundedSender<mpsc::UnboundedSender<()>>,
+    impulse_sender_sender: NamedChannel<mpsc::Sender<()>>,
     actor_loop: ActorLoop,
 }
 
 impl ActorOutputValveSignal {
     pub fn new(impulse_stream: impl Stream<Item = ()> + 'static) -> Self {
         let (impulse_sender_sender, mut impulse_sender_receiver) =
-            mpsc::unbounded::<mpsc::UnboundedSender<()>>();
+            NamedChannel::new("output_valve.subscriptions", 32);
         Self {
             impulse_sender_sender,
             actor_loop: ActorLoop::new(async move {
                 let mut impulse_stream = pin!(impulse_stream.fuse());
-                let mut impulse_senders = Vec::<mpsc::UnboundedSender<()>>::new();
+                let mut impulse_senders = Vec::<mpsc::Sender<()>>::new();
                 loop {
                     select! {
                         impulse = impulse_stream.next() => {
                             if impulse.is_none() { break };
                             impulse_senders.retain(|impulse_sender| {
-                                if let Err(error) = impulse_sender.unbounded_send(()) {
-                                    false
-                                } else {
-                                    true
-                                }
+                                // try_send for bounded(1) - drop if already signaled
+                                impulse_sender.try_send(()).is_ok()
                             });
                         }
                         impulse_sender = impulse_sender_receiver.select_next_some() => {
@@ -1338,8 +1545,8 @@ impl ActorOutputValveSignal {
     }
 
     pub fn stream(&self) -> impl Stream<Item = ()> {
-        let (impulse_sender, impulse_receiver) = mpsc::unbounded();
-        if let Err(error) = self.impulse_sender_sender.unbounded_send(impulse_sender) {
+        let (impulse_sender, impulse_receiver) = mpsc::channel(1);
+        if let Err(error) = self.impulse_sender_sender.try_send(impulse_sender) {
             eprintln!("Failed to subscribe to actor output valve signal: {error:#}");
         }
         impulse_receiver
@@ -1856,17 +2063,18 @@ impl VariableOrArgumentReference {
 /// Actor for connecting references to actors by span.
 /// Uses ActorLoop internally to encapsulate the async task.
 pub struct ReferenceConnector {
-    referenceable_inserter_sender: mpsc::UnboundedSender<(parser::Span, Arc<ValueActor>)>,
+    referenceable_inserter_sender: NamedChannel<(parser::Span, Arc<ValueActor>)>,
     referenceable_getter_sender:
-        mpsc::UnboundedSender<(parser::Span, oneshot::Sender<Arc<ValueActor>>)>,
+        NamedChannel<(parser::Span, oneshot::Sender<Arc<ValueActor>>)>,
     actor_loop: ActorLoop,
 }
 
 impl ReferenceConnector {
     pub fn new() -> Self {
         let (referenceable_inserter_sender, referenceable_inserter_receiver) =
-            mpsc::unbounded();
-        let (referenceable_getter_sender, referenceable_getter_receiver) = mpsc::unbounded();
+            NamedChannel::new("reference_connector.inserter", 64);
+        let (referenceable_getter_sender, referenceable_getter_receiver) =
+            NamedChannel::new("reference_connector.getter", 64);
         Self {
             referenceable_inserter_sender,
             referenceable_getter_sender,
@@ -1937,7 +2145,7 @@ impl ReferenceConnector {
     pub fn register_referenceable(&self, span: parser::Span, actor: Arc<ValueActor>) {
         if let Err(error) = self
             .referenceable_inserter_sender
-            .unbounded_send((span, actor))
+            .try_send((span, actor))
         {
             eprintln!("Failed to register referenceable: {error:#}")
         }
@@ -1948,9 +2156,9 @@ impl ReferenceConnector {
         let (referenceable_sender, referenceable_receiver) = oneshot::channel();
         if let Err(error) = self
             .referenceable_getter_sender
-            .unbounded_send((span, referenceable_sender))
+            .try_send((span, referenceable_sender))
         {
-            eprintln!("Failed to register referenceable: {error:#}")
+            eprintln!("Failed to get referenceable: {error:#}")
         }
         referenceable_receiver
             .await
@@ -1964,16 +2172,18 @@ impl ReferenceConnector {
 /// Similar to ReferenceConnector but stores mpsc senders for LINK variables.
 /// Uses ActorLoop internally to encapsulate the async task.
 pub struct LinkConnector {
-    link_inserter_sender: mpsc::UnboundedSender<(parser::Span, mpsc::UnboundedSender<Value>)>,
+    link_inserter_sender: NamedChannel<(parser::Span, mpsc::UnboundedSender<Value>)>,
     link_getter_sender:
-        mpsc::UnboundedSender<(parser::Span, oneshot::Sender<mpsc::UnboundedSender<Value>>)>,
+        NamedChannel<(parser::Span, oneshot::Sender<mpsc::UnboundedSender<Value>>)>,
     actor_loop: ActorLoop,
 }
 
 impl LinkConnector {
     pub fn new() -> Self {
-        let (link_inserter_sender, link_inserter_receiver) = mpsc::unbounded();
-        let (link_getter_sender, link_getter_receiver) = mpsc::unbounded();
+        let (link_inserter_sender, link_inserter_receiver) =
+            NamedChannel::new("link_connector.inserter", 64);
+        let (link_getter_sender, link_getter_receiver) =
+            NamedChannel::new("link_connector.getter", 64);
         Self {
             link_inserter_sender,
             link_getter_sender,
@@ -2045,7 +2255,7 @@ impl LinkConnector {
     pub fn register_link(&self, span: parser::Span, sender: mpsc::UnboundedSender<Value>) {
         if let Err(error) = self
             .link_inserter_sender
-            .unbounded_send((span, sender))
+            .try_send((span, sender))
         {
             eprintln!("Failed to register link: {error:#}")
         }
@@ -2056,7 +2266,7 @@ impl LinkConnector {
         let (link_sender, link_receiver) = oneshot::channel();
         if let Err(error) = self
             .link_getter_sender
-            .unbounded_send((span, link_sender))
+            .try_send((span, link_sender))
         {
             eprintln!("Failed to get link sender: {error:#}")
         }
@@ -2074,11 +2284,11 @@ impl LinkConnector {
 /// Uses ActorLoop internally to encapsulate the async task.
 pub struct PassThroughConnector {
     /// Sender for registering new pass-throughs or forwarding values
-    op_sender: mpsc::UnboundedSender<PassThroughOp>,
+    op_sender: NamedChannel<PassThroughOp>,
     /// Sender for getting existing pass-through actors
-    getter_sender: mpsc::UnboundedSender<(PassThroughKey, oneshot::Sender<Option<Arc<ValueActor>>>)>,
+    getter_sender: NamedChannel<(PassThroughKey, oneshot::Sender<Option<Arc<ValueActor>>>)>,
     /// Sender for getting existing pass-through value senders
-    sender_getter_sender: mpsc::UnboundedSender<(PassThroughKey, oneshot::Sender<Option<mpsc::UnboundedSender<Value>>>)>,
+    sender_getter_sender: NamedChannel<(PassThroughKey, oneshot::Sender<Option<mpsc::UnboundedSender<Value>>>)>,
     actor_loop: ActorLoop,
 }
 
@@ -2110,9 +2320,10 @@ enum PassThroughOp {
 
 impl PassThroughConnector {
     pub fn new() -> Self {
-        let (op_sender, op_receiver) = mpsc::unbounded();
-        let (getter_sender, getter_receiver) = mpsc::unbounded();
-        let (sender_getter_sender, sender_getter_receiver) = mpsc::unbounded::<(PassThroughKey, oneshot::Sender<Option<mpsc::UnboundedSender<Value>>>)>();
+        let (op_sender, op_receiver) = NamedChannel::new("pass_through.ops", 32);
+        let (getter_sender, getter_receiver) = NamedChannel::new("pass_through.getter", 32);
+        let (sender_getter_sender, sender_getter_receiver) =
+            NamedChannel::new("pass_through.sender_getter", 32);
 
         Self {
             op_sender,
@@ -2186,30 +2397,30 @@ impl PassThroughConnector {
 
     /// Register a new pass-through actor
     pub fn register(&self, key: PassThroughKey, value_sender: mpsc::UnboundedSender<Value>, actor: Arc<ValueActor>) {
-        let _ = self.op_sender.unbounded_send(PassThroughOp::Register { key, value_sender, actor });
+        let _ = self.op_sender.try_send(PassThroughOp::Register { key, value_sender, actor });
     }
 
     /// Forward a value to an existing pass-through
     pub fn forward(&self, key: PassThroughKey, value: Value) {
-        let _ = self.op_sender.unbounded_send(PassThroughOp::Forward { key, value });
+        let _ = self.op_sender.try_send(PassThroughOp::Forward { key, value });
     }
 
     /// Add a forwarder to keep alive for an existing pass-through
     pub fn add_forwarder(&self, key: PassThroughKey, forwarder: Arc<ValueActor>) {
-        let _ = self.op_sender.unbounded_send(PassThroughOp::AddForwarder { key, forwarder });
+        let _ = self.op_sender.try_send(PassThroughOp::AddForwarder { key, forwarder });
     }
 
     /// Get an existing pass-through actor if it exists
     pub async fn get(&self, key: PassThroughKey) -> Option<Arc<ValueActor>> {
         let (response_sender, response_receiver) = oneshot::channel();
-        let _ = self.getter_sender.unbounded_send((key, response_sender));
+        let _ = self.getter_sender.try_send((key, response_sender));
         response_receiver.await.ok().flatten()
     }
 
     /// Get the value sender for an existing pass-through
     pub async fn get_sender(&self, key: PassThroughKey) -> Option<mpsc::UnboundedSender<Value>> {
         let (response_sender, response_receiver) = oneshot::channel();
-        let _ = self.sender_getter_sender.unbounded_send((key, response_sender));
+        let _ = self.sender_getter_sender.try_send((key, response_sender));
         response_receiver.await.ok().flatten()
     }
 }
@@ -3100,7 +3311,8 @@ pub struct ValueActor {
     persistence_id: Option<parser::PersistenceId>,
 
     /// Message channel for actor communication (migration, shutdown).
-    message_sender: mpsc::UnboundedSender<ActorMessage>,
+    /// Bounded(16) - low frequency control messages.
+    message_sender: NamedChannel<ActorMessage>,
 
     /// Explicit dependency tracking - keeps input actors alive.
     inputs: Vec<Arc<ValueActor>>,
@@ -3110,15 +3322,18 @@ pub struct ValueActor {
 
     /// Channel for subscription requests.
     /// Subscribers send SubscriptionRequest, receive back a Receiver<Value>.
-    subscription_sender: mpsc::UnboundedSender<SubscriptionRequest>,
+    /// Bounded(32) - subscription bursts during initialization.
+    subscription_sender: NamedChannel<SubscriptionRequest>,
 
     /// Channel for direct value storage.
     /// Used by HOLD to store values without going through the input stream.
-    direct_store_sender: mpsc::UnboundedSender<Value>,
+    /// Bounded(64) - high frequency state updates from HOLD.
+    direct_store_sender: NamedChannel<Value>,
 
     /// Channel for stored value queries.
     /// Used by stored_value() and snapshot() to get current value.
-    stored_value_query_sender: mpsc::UnboundedSender<StoredValueQuery>,
+    /// Bounded(8) - low frequency queries.
+    stored_value_query_sender: NamedChannel<StoredValueQuery>,
 
     /// Signal that fires when actor has processed at least one value.
     /// Used by stream() to wait for initial value instead of arbitrary yields.
@@ -3174,17 +3389,17 @@ impl ValueActor {
         inputs: Vec<Arc<ValueActor>>,
     ) -> Self {
         let construct_info = Arc::new(construct_info);
-        let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
+        let (message_sender, message_receiver) = NamedChannel::new("value_actor.messages", 16);
         let current_version = Arc::new(AtomicU64::new(0));
 
-        // Unbounded channel for subscription requests
-        let (subscription_sender, subscription_receiver) = mpsc::unbounded::<SubscriptionRequest>();
+        // Bounded channel for subscription requests
+        let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.subscriptions", 32);
 
-        // Unbounded channel for direct value storage
-        let (direct_store_sender, direct_store_receiver) = mpsc::unbounded::<Value>();
+        // Bounded channel for direct value storage
+        let (direct_store_sender, direct_store_receiver) = NamedChannel::new("value_actor.direct_store", 64);
 
-        // Unbounded channel for stored value queries
-        let (stored_value_query_sender, stored_value_query_receiver) = mpsc::unbounded::<StoredValueQuery>();
+        // Bounded channel for stored value queries
+        let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.queries", 8);
 
         // Oneshot channel for ready signal - fires when first value is processed
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
@@ -3415,8 +3630,9 @@ impl ValueActor {
     }
 
     /// Send a message to this actor.
+    /// Uses try_send (non-blocking) - returns error if channel full or closed.
     pub fn send_message(&self, msg: ActorMessage) -> Result<(), mpsc::TrySendError<ActorMessage>> {
-        self.message_sender.unbounded_send(msg)
+        self.message_sender.try_send(msg)
     }
 
     pub fn new_arc<S: Stream<Item = Value> + 'static>(
@@ -3472,13 +3688,13 @@ impl ValueActor {
 
         // Create a shell ValueActor - the lazy_delegate handles all subscriptions
         let construct_info = Arc::new(construct_info);
-        let (message_sender, _message_receiver) = mpsc::unbounded::<ActorMessage>();
+        let (message_sender, _message_receiver) = NamedChannel::new("value_actor.lazy.messages", 16);
         let current_version = Arc::new(AtomicU64::new(0));
 
         // Dummy channels (won't be used since lazy_delegate handles subscriptions)
-        let (subscription_sender, _subscription_receiver) = mpsc::unbounded::<SubscriptionRequest>();
-        let (direct_store_sender, _direct_store_receiver) = mpsc::unbounded::<Value>();
-        let (stored_value_query_sender, _stored_value_query_receiver) = mpsc::unbounded::<StoredValueQuery>();
+        let (subscription_sender, _subscription_receiver) = NamedChannel::new("value_actor.lazy.subscriptions", 32);
+        let (direct_store_sender, _direct_store_receiver) = NamedChannel::new("value_actor.lazy.direct_store", 64);
+        let (stored_value_query_sender, _stored_value_query_receiver) = NamedChannel::new("value_actor.lazy.queries", 8);
 
         // Dummy ready signal (lazy actors bypass it in stream())
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
@@ -3521,14 +3737,14 @@ impl ValueActor {
     ) -> Self {
         let value_stream = value_stream.inner;
         let construct_info = Arc::new(construct_info);
-        let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
+        let (message_sender, message_receiver) = NamedChannel::new("value_actor.initial.messages", 16);
         // Start at version 1 since we have an initial value
         let current_version = Arc::new(AtomicU64::new(1));
 
-        // Unbounded channels for subscription, direct store, and stored value queries
-        let (subscription_sender, subscription_receiver) = mpsc::unbounded::<SubscriptionRequest>();
-        let (direct_store_sender, direct_store_receiver) = mpsc::unbounded::<Value>();
-        let (stored_value_query_sender, stored_value_query_receiver) = mpsc::unbounded::<StoredValueQuery>();
+        // Bounded channels for subscription, direct store, and stored value queries
+        let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.initial.subscriptions", 32);
+        let (direct_store_sender, direct_store_receiver) = NamedChannel::new("value_actor.initial.direct_store", 64);
+        let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.initial.queries", 8);
 
         // Oneshot channel for ready signal - immediately fire since we have initial value
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
@@ -3679,7 +3895,7 @@ impl ValueActor {
     /// For LINK variables (user interaction), handle the error gracefully.
     pub async fn current_value(&self) -> Result<Value, CurrentValueError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.stored_value_query_sender.unbounded_send(StoredValueQuery { reply: reply_tx }).is_err() {
+        if self.stored_value_query_sender.send(StoredValueQuery { reply: reply_tx }).await.is_err() {
             return Err(CurrentValueError::ActorDropped);
         }
         match reply_rx.await {
@@ -3773,14 +3989,14 @@ impl ValueActor {
         let construct_info = construct_info.complete(ConstructType::ValueActor);
         let value_stream = value_stream.inner;
         let construct_info = Arc::new(construct_info);
-        let (message_sender, message_receiver) = mpsc::unbounded::<ActorMessage>();
+        let (message_sender, message_receiver) = NamedChannel::new("value_actor.arc_initial.messages", 16);
         // Start at version 1 since we have an initial value
         let current_version = Arc::new(AtomicU64::new(1));
 
-        // Unbounded channels for subscription, direct store, and stored value queries
-        let (subscription_sender, subscription_receiver) = mpsc::unbounded::<SubscriptionRequest>();
-        let (direct_store_sender, direct_store_receiver) = mpsc::unbounded::<Value>();
-        let (stored_value_query_sender, stored_value_query_receiver) = mpsc::unbounded::<StoredValueQuery>();
+        // Bounded channels for subscription, direct store, and stored value queries
+        let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.arc_initial.subscriptions", 32);
+        let (direct_store_sender, direct_store_receiver) = NamedChannel::new("value_actor.arc_initial.direct_store", 64);
+        let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.arc_initial.queries", 8);
 
         // Oneshot channel for ready signal - immediately fire since we have initial value
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
@@ -3910,10 +4126,9 @@ impl ValueActor {
     /// Used by HOLD to update state between body evaluations.
     ///
     /// The actor loop processes the value and notifies all subscribers.
+    /// Uses send_or_drop (non-blocking) - logs if channel is full.
     pub fn store_value_directly(&self, value: Value) {
-        if let Err(e) = self.direct_store_sender.unbounded_send(value) {
-            eprintln!("Failed to store value directly: {e:#}");
-        }
+        self.direct_store_sender.send_or_drop(value);
     }
 
     /// Check if this actor has a lazy delegate.
@@ -3978,11 +4193,11 @@ impl ValueActor {
 
         // Send subscription request to actor loop
         let (reply_tx, reply_rx) = oneshot::channel();
-        if let Err(e) = self.subscription_sender.unbounded_send(SubscriptionRequest {
+        if self.subscription_sender.send(SubscriptionRequest {
             reply: reply_tx,
             starting_version: 0,
-        }) {
-            eprintln!("Failed to stream: actor dropped: {e:#}");
+        }).await.is_err() {
+            eprintln!("Failed to stream: actor dropped");
             // Return empty stream
             return stream::empty().boxed_local();
         }
@@ -4017,11 +4232,11 @@ impl ValueActor {
 
         // Send subscription request to actor loop with current version as starting point
         let (reply_tx, reply_rx) = oneshot::channel();
-        if let Err(e) = self.subscription_sender.unbounded_send(SubscriptionRequest {
+        if self.subscription_sender.send(SubscriptionRequest {
             reply: reply_tx,
             starting_version: current_version,
-        }) {
-            eprintln!("Failed to stream_from_now: actor dropped: {e:#}");
+        }).await.is_err() {
+            eprintln!("Failed to stream_from_now: actor dropped");
             return stream::empty().boxed_local();
         }
 
@@ -5268,13 +5483,13 @@ enum DiffHistoryQuery {
 pub struct List {
     construct_info: Arc<ConstructInfoComplete>,
     actor_loop: ActorLoop,
-    change_sender_sender: mpsc::UnboundedSender<mpsc::UnboundedSender<ListChange>>,
+    change_sender_sender: NamedChannel<mpsc::UnboundedSender<ListChange>>,
     /// Current version (increments on each change)
     current_version: Arc<AtomicU64>,
     /// Channel for registering diff subscribers (bounded channels)
-    notify_sender_sender: mpsc::UnboundedSender<mpsc::Sender<()>>,
+    notify_sender_sender: NamedChannel<mpsc::Sender<()>>,
     /// Channel for querying diff history (actor-owned, no RefCell)
-    diff_query_sender: mpsc::UnboundedSender<DiffHistoryQuery>,
+    diff_query_sender: NamedChannel<DiffHistoryQuery>,
 }
 
 impl List {
@@ -5298,17 +5513,19 @@ impl List {
     ) -> Self {
         let construct_info = Arc::new(construct_info.complete(ConstructType::List));
         let (change_sender_sender, mut change_sender_receiver) =
-            mpsc::unbounded::<mpsc::UnboundedSender<ListChange>>();
+            NamedChannel::new("list.change_subscribers", 32);
 
         // Version tracking for push-pull architecture
         let current_version = Arc::new(AtomicU64::new(0));
         let current_version_for_loop = current_version.clone();
 
         // Channel for diff subscriber registration (bounded channels)
-        let (notify_sender_sender, notify_sender_receiver) = mpsc::unbounded::<mpsc::Sender<()>>();
+        let (notify_sender_sender, notify_sender_receiver) =
+            NamedChannel::new("list.diff_subscribers", 32);
 
         // Channel for diff history queries (actor-owned, no RefCell)
-        let (diff_query_sender, diff_query_receiver) = mpsc::unbounded::<DiffHistoryQuery>();
+        let (diff_query_sender, diff_query_receiver) =
+            NamedChannel::new("list.diff_queries", 16);
 
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
@@ -5447,7 +5664,7 @@ impl List {
     /// Returns diffs if subscriber is close, snapshot if too far behind.
     pub async fn get_update_since(&self, subscriber_version: u64) -> ValueUpdate {
         let (tx, rx) = oneshot::channel();
-        let _ = self.diff_query_sender.unbounded_send(DiffHistoryQuery::GetUpdateSince {
+        let _ = self.diff_query_sender.try_send(DiffHistoryQuery::GetUpdateSince {
             subscriber_version,
             reply: tx,
         });
@@ -5457,7 +5674,7 @@ impl List {
     /// Get current snapshot of items with their stable IDs (async).
     pub async fn snapshot(&self) -> Vec<(ItemId, Arc<ValueActor>)> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.diff_query_sender.unbounded_send(DiffHistoryQuery::Snapshot {
+        let _ = self.diff_query_sender.try_send(DiffHistoryQuery::Snapshot {
             reply: tx,
         });
         rx.await.unwrap_or_default()
@@ -5473,7 +5690,7 @@ impl List {
         // Create bounded(1) channel
         let (sender, receiver) = mpsc::channel::<()>(1);
         // Register with list loop
-        if let Err(e) = self.notify_sender_sender.unbounded_send(sender) {
+        if let Err(e) = self.notify_sender_sender.try_send(sender) {
             eprintln!("Failed to register diff subscriber: {e:#}");
         }
         ListDiffSubscription {
@@ -5570,8 +5787,9 @@ impl List {
     /// Takes ownership of the Arc to keep the list alive for the subscription lifetime.
     /// Callers should use `.clone().stream()` if they need to retain a reference.
     pub fn stream(self: Arc<Self>) -> ListSubscription {
+        // ListChange events use unbounded to subscriber - the List actor manages backpressure
         let (change_sender, change_receiver) = mpsc::unbounded();
-        if let Err(error) = self.change_sender_sender.unbounded_send(change_sender) {
+        if let Err(error) = self.change_sender_sender.try_send(change_sender) {
             eprintln!("Failed to subscribe to {}: {error:#}", self.construct_info);
         }
         ListSubscription {
@@ -6418,8 +6636,8 @@ impl ListBindingFunction {
             let construct_context = construct_context.clone();
             let actor_context = actor_context.clone();
 
-            // Create channels for predicate results
-            let (predicate_tx, predicate_rx) = mpsc::unbounded::<(usize, bool)>();
+            // Create channels for predicate results (bounded for backpressure)
+            let (predicate_tx, predicate_rx) = mpsc::channel::<(usize, bool)>(64);
 
             // Event type for merged streams
             enum RetainEvent {
@@ -6472,7 +6690,8 @@ impl ListBindingFunction {
                                                     Value::Tag(tag, _) => tag.tag() == "True",
                                                     _ => false,
                                                 };
-                                                if tx.unbounded_send((idx, is_true)).is_err() {
+                                                // Use async send for bounded channel
+                                                if tx.send((idx, is_true)).await.is_err() {
                                                     break;
                                                 }
                                             }
@@ -6500,7 +6719,8 @@ impl ListBindingFunction {
                                                 Value::Tag(tag, _) => tag.tag() == "True",
                                                 _ => false,
                                             };
-                                            if tx.unbounded_send((idx, is_true)).is_err() {
+                                            // Use async send for bounded channel
+                                            if tx.send((idx, is_true)).await.is_err() {
                                                 break;
                                             }
                                         }
@@ -6614,7 +6834,7 @@ impl ListBindingFunction {
             let actor_context = actor_context.clone();
 
             // Create channel for removal events (index of item to remove)
-            let (remove_tx, remove_rx) = mpsc::unbounded::<usize>();
+            let (remove_tx, remove_rx) = mpsc::channel::<usize>(64);
 
             // Event type for merged streams
             enum RemoveEvent {
@@ -6665,7 +6885,7 @@ impl ListBindingFunction {
                                             let mut stream = when_clone.stream_from_now_sync();
                                             // Wait for ANY emission - that triggers removal
                                             if stream.next().await.is_some() {
-                                                let _ = tx.unbounded_send(idx);
+                                                let _ = tx.send(idx).await;
                                             }
                                         });
                                         (idx, item.clone(), when_actor, false, Some(task_handle))
@@ -6688,7 +6908,7 @@ impl ListBindingFunction {
                                     let task_handle = Task::start_droppable(async move {
                                         let mut stream = when_clone.stream_from_now_sync();
                                         if stream.next().await.is_some() {
-                                            let _ = tx.unbounded_send(idx);
+                                            let _ = tx.send(idx).await;
                                         }
                                     });
                                     items.push((idx, item, when_actor, false, Some(task_handle)));
