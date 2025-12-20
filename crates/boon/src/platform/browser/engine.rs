@@ -1665,7 +1665,6 @@ pub enum ConstructType {
     VariableOrArgumentReference,
     FunctionCall,
     LatestCombinator,
-    ThenCombinator,
     ValueActor,
     LazyValueActor,
     Object,
@@ -2677,115 +2676,6 @@ impl LatestCombinator {
     }
 }
 
-// --- ThenCombinator ---
-
-pub struct ThenCombinator {}
-
-impl ThenCombinator {
-    pub fn new_arc_value_actor(
-        construct_info: ConstructInfo,
-        construct_context: ConstructContext,
-        actor_context: ActorContext,
-        observed: Arc<ValueActor>,
-        impulse_sender: mpsc::UnboundedSender<()>,
-        body: Arc<ValueActor>,
-    ) -> Arc<ValueActor> {
-        #[derive(Default, Copy, Clone, Serialize, Deserialize)]
-        #[serde(crate = "serde")]
-        struct State {
-            observed_idempotency_key: Option<ValueIdempotencyKey>,
-        }
-
-        let construct_info = construct_info.complete(ConstructType::ThenCombinator);
-        // If persistence is None (e.g., for dynamically evaluated expressions),
-        // generate a fresh persistence ID at runtime
-        let persistent_id = construct_info
-            .persistence
-            .map(|p| p.id)
-            .unwrap_or_else(parser::PersistenceId::new);
-        let storage = construct_context.construct_storage.clone();
-
-        let observed_for_subscribe = observed.clone();
-        let send_impulse_loop = ActorLoop::new(
-            observed_for_subscribe
-                // Use stream_sync() to properly handle lazy actors in HOLD body context
-                .stream_sync()
-                .scan(true, {
-                    let storage = storage.clone();
-                    move |first_run, value| {
-                        let storage = storage.clone();
-                        let previous_first_run = *first_run;
-                        *first_run = false;
-                        async move {
-                            if previous_first_run {
-                                Some((
-                                    storage.clone().load_state::<State>(persistent_id).await,
-                                    value,
-                                ))
-                            } else {
-                                Some((None, value))
-                            }
-                        }
-                    }
-                })
-                .scan(State::default(), move |state, (new_state, value)| {
-                    if let Some(new_state) = new_state {
-                        *state = new_state;
-                    }
-                    let idempotency_key = value.idempotency_key();
-                    let skip_value = state
-                        .observed_idempotency_key
-                        .is_some_and(|key| key == idempotency_key);
-
-                    if !skip_value {
-                        state.observed_idempotency_key = Some(idempotency_key);
-                    }
-                    let state = *state;
-                    let storage = storage.clone();
-                    async move {
-                        if skip_value {
-                            Some(None)
-                        } else {
-                            storage.save_state(persistent_id, &state).await;
-                            Some(Some(value))
-                        }
-                    }
-                })
-                .filter_map(future::ready)
-                .for_each({
-                    let construct_info = construct_info.clone();
-                    move |_| {
-                        if let Err(error) = impulse_sender.unbounded_send(()) {
-                            zoon::eprintln!("Failed to send impulse in {construct_info}: {error:#}")
-                        }
-                        future::ready(())
-                    }
-                }),
-        );
-        // Use stream_sync() to properly handle lazy body actors in HOLD context
-        let value_stream = body.clone().stream_sync().map(|mut value| {
-            value.set_idempotency_key(ValueIdempotencyKey::new());
-            value
-        });
-        // Subscription-based streams are infinite (subscriptions never terminate first)
-        // Keep both observed and body alive as explicit dependencies
-        // Also include the impulse actor loop in the stream state to keep it alive
-        let value_stream = stream::unfold(
-            (value_stream, send_impulse_loop, observed.clone()),
-            |(mut inner_stream, actor_loop, observed)| async move {
-                inner_stream.next().await.map(|value| (value, (inner_stream, actor_loop, observed)))
-            }
-        );
-        Arc::new(ValueActor::new_with_inputs(
-            construct_info,
-            actor_context,
-            TypedStream::infinite(value_stream),
-            None,
-            vec![observed, body],
-        ))
-    }
-}
-
 // --- BinaryOperatorCombinator ---
 
 /// Combines two value streams using a binary operation.
@@ -3148,130 +3038,6 @@ fn get_number(value: &Value) -> f64 {
             "Expected Number for arithmetic operation, got {}",
             other.construct_info()
         ),
-    }
-}
-
-// --- WhenCombinator ---
-
-/// Pattern matching combinator for WHEN expressions.
-/// Matches an input value against patterns and returns the first matching arm's result.
-pub struct WhenCombinator {}
-
-/// A compiled arm for WHEN matching.
-pub struct CompiledArm {
-    pub matcher: Box<dyn Fn(&Value) -> bool + Send + Sync>,
-    pub body: Arc<ValueActor>,
-}
-
-impl WhenCombinator {
-    /// Creates a ValueActor for WHEN pattern matching.
-    /// The arms are tried in order; first matching pattern's body is returned.
-    pub fn new_arc_value_actor(
-        construct_info: ConstructInfo,
-        _construct_context: ConstructContext,
-        actor_context: ActorContext,
-        input: Arc<ValueActor>,
-        arms: Vec<CompiledArm>,
-    ) -> Arc<ValueActor> {
-        let construct_info = construct_info.complete(ConstructType::ValueActor);
-
-        // Collect all arm bodies as dependencies to keep them alive
-        let arm_bodies: Vec<Arc<ValueActor>> = arms.iter().map(|arm| arm.body.clone()).collect();
-        let arms = Arc::new(arms);
-
-        // For each input value, find the matching arm and emit its body's value
-        // Use stream_sync() to properly handle lazy actors in HOLD body context
-        let value_stream = input
-            .clone()
-            .stream_sync()
-            .flat_map({
-                let arms = arms.clone();
-                move |input_value| {
-                    // Find the first matching arm
-                    let matched_arm = arms
-                        .iter()
-                        .find(|arm| (arm.matcher)(&input_value));
-
-                    if let Some(arm) = matched_arm {
-                        // Subscribe to the matching arm's body
-                        arm.body.clone().stream_sync()
-                    } else {
-                        // No match - this shouldn't happen if we have a wildcard default
-                        // Return an empty stream
-                        stream::empty().boxed_local()
-                    }
-                }
-            });
-
-        // Subscription-based streams are infinite (subscriptions never terminate first)
-        // Keep input and all arm bodies alive as explicit dependencies
-        let mut inputs = vec![input];
-        inputs.extend(arm_bodies);
-        Arc::new(ValueActor::new_with_inputs(
-            construct_info,
-            actor_context,
-            TypedStream::infinite(value_stream),
-            None,
-            inputs,
-        ))
-    }
-}
-
-/// Create a matcher function for a pattern.
-pub fn pattern_to_matcher(pattern: &crate::parser::Pattern) -> Box<dyn Fn(&Value) -> bool + Send + Sync> {
-    match pattern {
-        crate::parser::Pattern::WildCard => {
-            Box::new(|_| true)
-        }
-        crate::parser::Pattern::Literal(lit) => {
-            match lit {
-                crate::parser::Literal::Number(n) => {
-                    let n = *n;
-                    Box::new(move |v| {
-                        matches!(v, Value::Number(num, _) if num.number() == n)
-                    })
-                }
-                crate::parser::Literal::Tag(tag) => {
-                    let tag = tag.to_string();
-                    Box::new(move |v| {
-                        match v {
-                            Value::Tag(t, _) => t.tag() == tag,
-                            Value::TaggedObject(to, _) => to.tag == tag,
-                            _ => false,
-                        }
-                    })
-                }
-                crate::parser::Literal::Text(text) => {
-                    let text = text.to_string();
-                    Box::new(move |v| {
-                        matches!(v, Value::Text(t, _) if t.text() == text)
-                    })
-                }
-            }
-        }
-        crate::parser::Pattern::Alias { name: _ } => {
-            // Alias just binds the value, so it always matches
-            // (Variable binding will be handled separately)
-            Box::new(|_| true)
-        }
-        crate::parser::Pattern::TaggedObject { tag, variables: _ } => {
-            let tag = tag.to_string();
-            Box::new(move |v| {
-                matches!(v, Value::TaggedObject(to, _) if to.tag == tag)
-            })
-        }
-        crate::parser::Pattern::Object { variables: _ } => {
-            // Object pattern matches any object
-            Box::new(|v| matches!(v, Value::Object(_, _)))
-        }
-        crate::parser::Pattern::List { items: _ } => {
-            // List pattern matches any list (detailed matching would check items)
-            Box::new(|v| matches!(v, Value::List(_, _)))
-        }
-        crate::parser::Pattern::Map { entries: _ } => {
-            // Map pattern - not fully supported yet
-            Box::new(|_| false)
-        }
     }
 }
 
@@ -4394,7 +4160,7 @@ pub enum ValueUpdate {
 
 /// Bounded-channel subscription for List that returns diffs.
 ///
-/// Unlike the legacy ListSubscription which queues ListChange in unbounded channels,
+/// Unlike ListSubscription which queues ListChange events,
 /// this uses bounded(1) channels and pulls data on demand.
 pub struct ListDiffSubscription {
     list: Arc<List>,
