@@ -7,11 +7,11 @@ All inter-actor communication uses bounded, named channels with explicit backpre
 | Category | Done | TODO | Notes |
 |----------|------|------|-------|
 | engine.rs (core actors) | 20 | 0 | ✅ Complete |
-| engine.rs (additional) | 2 | 1 | LINK ✅, forwarding ✅, List changes (needs async restructure) |
+| engine.rs (additional) | 3 | 0 | ✅ Complete (LINK, forwarding, List changes) |
 | evaluator.rs | 4 | 0 | ✅ Complete (WHILE, object fields, HOLD state) |
 | bridge.rs (DOM events) | 10 | 0 | ✅ Complete - all use `send_or_drop()` |
 | api.rs | 1 | 0 | ✅ Complete |
-| **Total** | **37** | **1** | List.changes requires async loop restructure |
+| **Total** | **38** | **0** | ✅ All channels converted to bounded |
 
 ## Overview
 
@@ -150,7 +150,7 @@ All DOM event channels use `send_or_drop()` - dropping events is acceptable for 
 |-----------|--------------|----------|----------|--------|
 | LINK | `link.values` | 128 | send_or_drop | ✅ |
 | Forwarding | `forwarding.values` | 64 | block | ✅ |
-| List | `list.changes` | 64 | block | ❌ TODO (requires async restructure) |
+| List | `list.changes` | 64 | try_send (keep if full) | ✅ |
 
 ### api.rs
 

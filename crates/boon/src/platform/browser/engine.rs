@@ -5566,7 +5566,7 @@ enum DiffHistoryQuery {
 pub struct List {
     construct_info: Arc<ConstructInfoComplete>,
     actor_loop: ActorLoop,
-    change_sender_sender: NamedChannel<mpsc::UnboundedSender<ListChange>>,
+    change_sender_sender: NamedChannel<NamedChannel<ListChange>>,
     /// Current version (increments on each change)
     current_version: Arc<AtomicU64>,
     /// Channel for registering diff subscribers (bounded channels)
@@ -5596,7 +5596,7 @@ impl List {
     ) -> Self {
         let construct_info = Arc::new(construct_info.complete(ConstructType::List));
         let (change_sender_sender, mut change_sender_receiver) =
-            NamedChannel::<mpsc::UnboundedSender<ListChange>>::new("list.change_subscribers", 32);
+            NamedChannel::<NamedChannel<ListChange>>::new("list.change_subscribers", 32);
 
         // Version tracking for push-pull architecture
         let current_version = Arc::new(AtomicU64::new(0));
@@ -5628,7 +5628,7 @@ impl List {
                 let mut change_stream = pin!(change_stream.fuse());
                 let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
                 let mut diff_query_receiver = pin!(diff_query_receiver.fuse());
-                let mut change_senders = Vec::<mpsc::UnboundedSender<ListChange>>::new();
+                let mut change_senders = Vec::<NamedChannel<ListChange>>::new();
                 // Diff subscriber notification senders (bounded channels)
                 let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
                 let mut list = None;
@@ -5669,8 +5669,12 @@ impl List {
                             if output_valve_signal.is_none() {
                                 // Send to all change subscribers, silently removing any that are gone.
                                 // Subscribers being dropped is normal during WHILE arm switches.
+                                // Keep senders that are just full (backpressure), remove disconnected.
                                 change_senders.retain(|change_sender| {
-                                    change_sender.unbounded_send(change.clone()).is_ok()
+                                    match change_sender.try_send(change.clone()) {
+                                        Ok(()) => true,
+                                        Err(e) => !e.is_disconnected(),
+                                    }
                                 });
                             }
 
@@ -5703,8 +5707,10 @@ impl List {
                                     // Send initial state to new subscriber.
                                     // If receiver is already gone (race during WHILE switch), just skip.
                                     let first_change_to_send = ListChange::Replace { items: list.clone() };
-                                    if change_sender.unbounded_send(first_change_to_send).is_ok() {
-                                        change_senders.push(change_sender);
+                                    match change_sender.try_send(first_change_to_send) {
+                                        Ok(()) => change_senders.push(change_sender),
+                                        Err(e) if !e.is_disconnected() => change_senders.push(change_sender),
+                                        Err(_) => {} // Disconnected, don't add
                                     }
                                 } else {
                                     change_senders.push(change_sender);
@@ -5719,9 +5725,13 @@ impl List {
                             }
                             if let Some(list) = list.as_ref() {
                                 // Send to all subscribers on impulse, silently removing dropped ones.
+                                // Keep senders that are just full (backpressure), remove disconnected.
                                 change_senders.retain(|change_sender| {
                                     let change_to_send = ListChange::Replace { items: list.clone() };
-                                    change_sender.unbounded_send(change_to_send).is_ok()
+                                    match change_sender.try_send(change_to_send) {
+                                        Ok(()) => true,
+                                        Err(e) => !e.is_disconnected(),
+                                    }
                                 });
                             }
                         }
@@ -5881,8 +5891,8 @@ impl List {
     /// Takes ownership of the Arc to keep the list alive for the subscription lifetime.
     /// Callers should use `.clone().stream()` if they need to retain a reference.
     pub fn stream(self: Arc<Self>) -> ListSubscription {
-        // ListChange events use unbounded to subscriber - the List actor manages backpressure
-        let (change_sender, change_receiver) = mpsc::unbounded();
+        // ListChange events use bounded channel with backpressure - keeps senders that are just full
+        let (change_sender, change_receiver) = NamedChannel::new("list.changes", 64);
         if let Err(error) = self.change_sender_sender.try_send(change_sender) {
             zoon::eprintln!("Failed to subscribe to {}: {error:#}", self.construct_info);
         }
@@ -6047,7 +6057,7 @@ impl Drop for List {
 /// The `_list` field holds an `Arc<List>` reference that is automatically
 /// dropped when the subscription stream is dropped, ensuring proper lifecycle management.
 pub struct ListSubscription {
-    receiver: mpsc::UnboundedReceiver<ListChange>,
+    receiver: mpsc::Receiver<ListChange>,
     _list: Arc<List>,
 }
 
