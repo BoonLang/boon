@@ -40,13 +40,13 @@ store: [
     }
         |> List/append(item: item_to_add)
         -- First List/remove: individual X button clicks
-        |> List/remove(item, when: item.elements.remove_button.event.press)
+        |> List/remove(item, on: item.elements.remove_button.event.press)
         -- Second List/remove: clear completed button
-        |> List/remove(item, when: elements.clear_completed_button.event.press |> THEN {
+        |> List/remove(item, on: elements.clear_completed_button.event.press |> THEN {
             item.completed |> WHEN { True => [], False => SKIP }
         })
-    active_items: items |> List/retain(item, condition: item.completed |> Bool/not())
-    completed_items: items |> List/retain(item, condition: item.completed)
+    active_items: items |> List/retain(item, if: item.completed |> Bool/not())
+    completed_items: items |> List/retain(item, if: item.completed)
 ]
 
 FUNCTION create_item(id, name) {

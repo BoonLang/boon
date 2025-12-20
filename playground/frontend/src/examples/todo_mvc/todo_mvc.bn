@@ -9,7 +9,6 @@ store: [
         toggle_all_checkbox: LINK
         new_todo_title_text_input: LINK
     ]
-    -- Simple filter state using HOLD (no routing)
     selected_filter: All |> HOLD state {
         LATEST {
             elements.filter_buttons.all.event.press |> THEN { All }
@@ -17,19 +16,6 @@ store: [
             elements.filter_buttons.completed.event.press |> THEN { Completed }
         }
     }
-    -- Toggle all state: when clicked, set all todos to this value
-    -- If any are not completed -> True (mark all completed)
-    -- If all are completed -> False (mark all not completed)
-    all_completed: active_todos |> List/is_empty()
-    toggle_all_target: elements.toggle_all_checkbox.event.click |> THEN {
-        -- If all are completed, we want to uncomplete all (False)
-        -- If some are not completed, we want to complete all (True)
-        all_completed |> Bool/not()
-    }
-    -- Three separate filtered lists
-    all_todos: todos
-    active_todos: todos |> List/retain(item, condition: item.completed |> Bool/not())
-    completed_todos: todos |> List/retain(item, condition: item.completed)
     title_to_add: elements.new_todo_title_text_input.event.key_down.key |> WHEN {
         Enter => BLOCK {
             trimmed: elements.new_todo_title_text_input.text |> Text/trim()
@@ -37,25 +23,24 @@ store: [
         }
         __ => SKIP
     }
-    -- Create todo Objects with id, title, completed fields
-    -- Use PASS to pass toggle_all_target as streaming context, not as a snapshot argument
-    todo_to_add: title_to_add |> WHEN { t => new_todo(title: t, PASS: [toggle_all: toggle_all_target]) }
-    -- Reactive list operations
-    -- List/append adds new todos, List/remove handles both:
-    -- 1. Individual X button clicks (direct event)
-    -- 2. Clear completed button (event triggers check of item.completed)
-    todos: LIST { new_todo(title: TEXT { Buy groceries }, PASS: [toggle_all: toggle_all_target]), new_todo(title: TEXT { Clean room }, PASS: [toggle_all: toggle_all_target]) }
-        |> List/append(item: todo_to_add)
-        |> List/remove(item, when: item.todo_elements.remove_todo_button.event.press)
-        |> List/remove(item, when: elements.remove_completed_button.event.press |> THEN {
+    todos:
+        LIST {
+            new_todo(title: TEXT { Buy groceries })
+            new_todo(title: TEXT { Clean room })
+        }
+        |> List/append(item: title_to_add |> new_todo())
+        |> List/remove(item, on: item.todo_elements.remove_todo_button.event.press)
+        |> List/remove(item, on: elements.remove_completed_button.event.press |> THEN {
             item.completed |> WHEN { True => [], False => SKIP }
         })
+    active_todos: todos |> List/retain(item, if: item.completed |> Bool/not())
+    all_completed: active_todos |> List/is_empty()
+    completed_todos: todos |> List/retain(item, if: item.completed)
     -- Simplified for debugging
     selected_todo_id: None
 ]
 
 -- Create a new todo with reactive completed state
--- toggle_all stream is passed via PASSED context, not as a parameter
 FUNCTION new_todo(title) {
     [
         todo_elements: [
@@ -104,8 +89,12 @@ FUNCTION new_todo(title) {
                 todo_elements.todo_checkbox.event.click |> THEN {
                     state |> Bool/not()
                 }
-                -- Toggle via toggle all checkbox (set to target value from PASSED)
-                PASSED.toggle_all
+                -- Toggle via toggle all checkbox
+                store.elements.toggle_all_checkbox.event.click |> THEN {
+                    -- If all are completed, we want to uncomplete all (False)
+                    -- If some are not completed, we want to complete all (True)
+                    store.all_completed |> Bool/not()
+                }
             }
         }
     ]
@@ -238,8 +227,8 @@ FUNCTION new_todo_title_text_input() {
             padding: [column: 19, left: 60, right: 16]
             font: [size: 24, color: Oklch[lightness: 0.42]]
             background: [color: Oklch[alpha: 0.003]]
-            shadows: LIST { 
-                [direction: Inwards, y: -2, blur: 1, color: Oklch[alpha: 0.03]] 
+            shadows: LIST {
+                [direction: Inwards, y: -2, blur: 1, color: Oklch[alpha: 0.03]]
             }
         ]
         label: Hidden[text: TEXT { What needs to be done? }]
@@ -320,29 +309,23 @@ FUNCTION todo_item(todo) {
 
 -- Render todo Objects based on selected filter
 FUNCTION todos_element() {
-    PASSED.store.selected_filter |> WHILE {
-        All => Element/stripe(
+    Element/stripe(
             element: [tag: Ul]
             direction: Column
             gap: 0
             style: []
-            items: PASSED.store.all_todos |> List/map(item, new: todo_item(todo: item))
-        )
-        Active => Element/stripe(
-            element: [tag: Ul]
-            direction: Column
-            gap: 0
-            style: []
-            items: PASSED.store.active_todos |> List/map(item, new: todo_item(todo: item))
-        )
-        Completed => Element/stripe(
-            element: [tag: Ul]
-            direction: Column
-            gap: 0
-            style: []
-            items: PASSED.store.completed_todos |> List/map(item, new: todo_item(todo: item))
-        )
-    }
+            items:
+                PASSED.store.todos
+                |> List/retain(
+                    item
+                    if: PASSED.store.selected_filter |> WHILE {
+                        All => True
+                        Active => item.completed |> Bool/not()
+                        Completed => item.completed
+                    }
+                )
+                |> List/map(item, new: todo_item(todo: item))
+    )
 }
 
 FUNCTION toggle_all_checkbox() {
@@ -511,7 +494,7 @@ FUNCTION filter_button(filter) {
                             chroma: 0.165
                             hue: 25.36
                             alpha: alpha
-                        ] 
+                        ]
                     ]
                     False => NoOutline
                 }

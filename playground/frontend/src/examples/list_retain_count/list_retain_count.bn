@@ -65,7 +65,7 @@ FUNCTION retain_count_label() {
         style: []
         label: BLOCK {
             count: PASSED.store.items
-                |> List/retain(item, condition: True)
+                |> List/retain(item, if: True)
                 |> List/count()
             TEXT { Retain count: {count} }
         }

@@ -344,8 +344,8 @@ Using `PersistenceId` instead of index enables **chained List/remove operations*
 ```boon
 items: LIST { A, B }
     |> List/append(item: new_item)
-    |> List/remove(item, when: item.remove_button.press)  -- First remove
-    |> List/remove(item, when: clear_completed_button.press |> THEN {
+    |> List/remove(item, on: item.remove_button.press)  -- First remove
+    |> List/remove(item, on: clear_completed_button.press |> THEN {
         item.completed |> WHEN { True => [], False => SKIP }
     })  -- Second remove
 ```

@@ -26,7 +26,7 @@ store: [
     }
     -- List/retain causes the bug when switching WHILE arms
     all_items: items
-    active_items: items |> List/retain(item, condition: item.checked |> Bool/not())
+    active_items: items |> List/retain(item, if: item.checked |> Bool/not())
 ]
 
 -- Pattern from todo_mvc: HOLD with LATEST, one arm for checkbox, one for toggle_all

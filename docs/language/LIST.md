@@ -221,7 +221,7 @@ todos: LIST {}
     |> List/append(item: 123)
     |> List/append(item: 345)
     |> List/append(item: 1)
-    |> List/retain(item, condition: item > 1)
+    |> List/retain(item, if: item > 1)
 -- Result: todos contains [123, 345] - the 1 is gone forever
 ```
 
@@ -233,7 +233,7 @@ This is useful for:
 ```boon
 todos: LIST { todo1, todo2 }
     |> List/append(item: new_todo)
-    |> List/retain(item, condition: LATEST {
+    |> List/retain(item, if: LATEST {
         True  -- Default: keep all items
         clear_button.event.press |> THEN { item.completed |> Bool/not() }
     })
@@ -254,7 +254,7 @@ todos: LIST {}
 -- todos contains [123, 345, 1]
 
 -- Filtered view (does NOT modify todos)
-large_todos: todos |> List/retain(item, condition: item > 200)
+large_todos: todos |> List/retain(item, if: item > 200)
 -- large_todos contains [345]
 -- todos still contains [123, 345, 1]
 ```
@@ -270,8 +270,8 @@ This is useful for:
 todos: LIST {} |> List/append(item: new_todo)
 
 -- Filtered views (non-destructive)
-active_todos: todos |> List/retain(item, condition: item.completed |> Bool/not())
-completed_todos: todos |> List/retain(item, condition: item.completed)
+active_todos: todos |> List/retain(item, if: item.completed |> Bool/not())
+completed_todos: todos |> List/retain(item, if: item.completed)
 
 -- Display based on selected tab
 visible_todos: selected_tab |> WHILE {
