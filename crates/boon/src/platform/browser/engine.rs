@@ -1291,12 +1291,8 @@ pub struct ConstructContext {
 /// Actor for persistent storage operations.
 /// Uses ActorLoop internally to encapsulate the async task.
 pub struct ConstructStorage {
-    /// Bounded(32) - state save operations.
-    state_inserter_sender: NamedChannel<(
-        parser::PersistenceId,
-        serde_json::Value,
-        oneshot::Sender<()>,
-    )>,
+    /// Bounded(32) - state save operations (fire-and-forget).
+    state_inserter_sender: NamedChannel<(parser::PersistenceId, serde_json::Value)>,
     /// Bounded(32) - state load queries.
     state_getter_sender: NamedChannel<(
         parser::PersistenceId,
@@ -1325,14 +1321,11 @@ impl ConstructStorage {
                 };
                 loop {
                     select! {
-                        (persistence_id, json_value, confirmation_sender) = state_inserter_receiver.select_next_some() => {
+                        (persistence_id, json_value) = state_inserter_receiver.select_next_some() => {
                             // @TODO remove `.to_string()` call when LocalStorage is replaced with IndexedDB (?)
                             states.insert(persistence_id.to_string(), json_value);
                             if let Err(error) = local_storage().insert(&states_local_storage_key, &states) {
                                 zoon::eprintln!("Failed to save states: {error:#}");
-                            }
-                            if confirmation_sender.send(()).is_err() {
-                                zoon::eprintln!("Failed to send save confirmation from construct storage");
                             }
                         },
                         (persistence_id, state_sender) = state_getter_receiver.select_next_some() => {
@@ -1348,25 +1341,20 @@ impl ConstructStorage {
         }
     }
 
-    pub async fn save_state<T: Serialize>(&self, persistence_id: parser::PersistenceId, state: &T) {
+    /// Save state to persistent storage (fire-and-forget).
+    ///
+    /// This is synchronous - the actor persists asynchronously.
+    /// Uses send_or_drop() which logs in debug mode if channel is full.
+    pub fn save_state<T: Serialize>(&self, persistence_id: parser::PersistenceId, state: &T) {
         let json_value = match serde_json::to_value(state) {
             Ok(json_value) => json_value,
             Err(error) => {
-                zoon::eprintln!("Failed to save state: {error:#}");
+                zoon::eprintln!("Failed to serialize state: {error:#}");
                 return;
             }
         };
-        let (confirmation_sender, confirmation_receiver) = oneshot::channel::<()>();
-        if self.state_inserter_sender.send((
-            persistence_id,
-            json_value,
-            confirmation_sender,
-        )).await.is_err() {
-            zoon::eprintln!("Failed to save state: channel closed")
-        }
-        confirmation_receiver
-            .await
-            .expect("Failed to get confirmation from ConstructStorage")
+        // Fire-and-forget - actor persists asynchronously
+        self.state_inserter_sender.send_or_drop((persistence_id, json_value));
     }
 
     // @TODO is &self enough?
@@ -2650,7 +2638,7 @@ impl LatestCombinator {
                     if skip_value {
                         Some(None)
                     } else {
-                        storage.save_state(persistent_id, &state).await;
+                        storage.save_state(persistent_id, &state);
                         Some(Some(value))
                     }
                 }
@@ -4002,7 +3990,8 @@ impl ValueActor {
         let (tx, rx) = mpsc::channel(32);
 
         // Send setup to actor (best effort - if actor is dead, rx will be empty)
-        let _ = self.subscription_sender.try_send(SubscriptionSetup {
+        // Uses send_or_drop() which logs in debug mode if channel is full
+        self.subscription_sender.send_or_drop(SubscriptionSetup {
             sender: tx,
             starting_version: 0,
         });
@@ -4033,7 +4022,8 @@ impl ValueActor {
         let (tx, rx) = mpsc::channel(32);
 
         // Send setup to actor with current version as starting point
-        let _ = self.subscription_sender.try_send(SubscriptionSetup {
+        // Uses send_or_drop() which logs in debug mode if channel is full
+        self.subscription_sender.send_or_drop(SubscriptionSetup {
             sender: tx,
             starting_version: current_version,
         });
@@ -5749,7 +5739,7 @@ impl List {
                                             json_items.push(value.to_json().await);
                                         }
                                     }
-                                    construct_storage_for_save.save_state(persistence_id, &json_items).await;
+                                    construct_storage_for_save.save_state(persistence_id, &json_items);
                                 } else {
                                     // For incremental changes, we need to get the full list and save it
                                     let mut list_stream = pin!(list_for_save.clone().stream());
@@ -5761,7 +5751,7 @@ impl List {
                                                 json_items.push(value.to_json().await);
                                             }
                                         }
-                                        construct_storage_for_save.save_state(persistence_id, &json_items).await;
+                                        construct_storage_for_save.save_state(persistence_id, &json_items);
                                     }
                                 }
                             }

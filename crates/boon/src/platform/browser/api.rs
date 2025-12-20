@@ -1259,9 +1259,7 @@ pub fn function_math_sum(
                     if skip_value {
                         Some(None)
                     } else {
-                        storage
-                            .save_state(function_call_persistence_id, &state)
-                            .await;
+                        storage.save_state(function_call_persistence_id, &state);
                         Some(Some((
                             state.sum,
                             state.output_value_idempotency_key.unwrap(),

@@ -72,6 +72,55 @@ pub struct NamedChannel<T> {
 - **Behavior**: `.try_send()` returns immediately with result
 - **When full**: Caller decides (usually ignore or log)
 
+## Request-Response vs Fire-and-Forget
+
+### When Request-Response (oneshot) is REQUIRED
+
+Use oneshot channels when:
+- **READ operations** - Caller needs data back (can't proceed without it)
+- **Sequential ordering** - Next operation depends on previous result
+- **Demand-driven polling** - Each value is explicitly requested (e.g., LazyValueActor)
+
+Examples:
+- `StoredValueQuery` - needs current value from actor
+- `VirtualFilesystem.read_text()` - needs file content
+- `ConstructStorage.load_state()` - needs stored state
+- `BackpressureCoordinator.acquire()` - must wait for grant
+
+### When Fire-and-Forget Works
+
+Use fire-and-forget when:
+- **WRITE operations** - Eventual consistency is acceptable
+- **Subscriptions** - Caller creates channel, sends sender, uses receiver immediately
+- **Event notifications** - Dropping under load is acceptable
+
+Examples:
+- `ConstructStorage.save_state()` - persist asynchronously
+- `VirtualFilesystem.write_text()` - write asynchronously
+- Subscription setup - caller creates (tx, rx), sends tx, returns rx
+
+### Fire-and-Forget Pattern (Subscriptions)
+
+```rust
+// 1. Caller creates channel
+let (tx, rx) = mpsc::channel(32);
+
+// 2. Send sender to actor (best-effort with logging)
+actor_channel.send_or_drop(Setup { sender: tx });
+
+// 3. Return receiver immediately - no await needed
+rx
+
+// 4. If caller dropped → actor sees tx disconnect → cleanup
+```
+
+### Error Handling Rules
+
+- **NEVER** use `let _ =` to swallow channel errors
+- Use `send_or_drop()` for acceptable drops (logs in debug mode)
+- Use `try_send()` when caller needs to handle failure explicitly
+- Use `send().await` for must-deliver messages
+
 ## Debug Mode
 
 Enable with: `cargo build --features debug-channels` (enabled by default)
@@ -102,7 +151,7 @@ To disable for production: `cargo build --no-default-features`
 | ValueActor | `value_actor.direct_store` | 64 | block | ✅ |
 | ValueActor | `value_actor.queries` | 8 | block | ✅ |
 | LazyValueActor | `lazy_value_actor.requests` | 16 | block | ✅ |
-| ConstructStorage | `construct_storage.inserter` | 32 | block | ✅ |
+| ConstructStorage | `construct_storage.inserter` | 32 | send_or_drop | ✅ |
 | ConstructStorage | `construct_storage.getter` | 32 | block | ✅ |
 | VirtualFilesystem | `virtual_fs.requests` | 32 | block | ✅ |
 | ReferenceConnector | `reference_connector.inserter` | 64 | try_send | ✅ |

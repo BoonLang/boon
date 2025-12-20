@@ -419,6 +419,42 @@ API functions that return streams should:
 - **Use channels for synchronous-like behavior** - If you need to ensure ordering or immediate processing, use mpsc channels and let the async runtime handle scheduling
 - **Reason**: Sync operations assume single-threaded execution. Boon's actor model must work across threads, processes, and network boundaries
 
+### Fire-and-Forget Pattern
+
+For subscriptions and write operations where eventual consistency is acceptable:
+
+**Bad (swallows errors):**
+```rust
+let _ = channel.try_send(value);  // NEVER DO THIS
+```
+
+**Good (logs when dropping):**
+```rust
+channel.send_or_drop(value);  // Logs in debug mode via NamedChannel
+```
+
+**Fire-and-forget subscription pattern:**
+```rust
+// 1. Caller creates channel
+let (tx, rx) = mpsc::channel(32);
+
+// 2. Send sender to actor (best-effort with logging)
+actor_channel.send_or_drop(Setup { sender: tx });
+
+// 3. Return receiver immediately - no await needed
+rx
+```
+
+**When confirmation is required (READ operations):**
+```rust
+// Only for operations that need data back
+let (reply_tx, reply_rx) = oneshot::channel();
+channel.send(Request { reply: reply_tx }).await?;
+let data = reply_rx.await?;  // Caller needs this data
+```
+
+See `docs/engine/CHANNELS.md` for complete documentation on channel patterns.
+
 ### NO FALLBACKS IN KEY/IDENTITY LOGIC
 
 **NEVER use fallback patterns in identity/key computation.** Fallbacks are time bombs:
