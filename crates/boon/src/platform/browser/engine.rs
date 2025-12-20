@@ -6550,8 +6550,8 @@ impl ListBindingFunction {
                                                         );
                                                         predicates.insert(pid.clone(), pred.clone());
 
-                                                        // Query initial value (use current_value to avoid subscription churn)
-                                                        if let Ok(value) = pred.current_value().await {
+                                                        // Query initial value (use .value() to wait for reactive predicates)
+                                                        if let Ok(value) = pred.clone().value().await {
                                                             let is_true = matches!(&value, Value::Tag(tag, _) if tag.tag() == "True");
                                                             predicate_results.insert(pid, is_true);
                                                         }
@@ -6594,8 +6594,8 @@ impl ListBindingFunction {
                                                 items.push(item);
                                                 predicates.insert(pid.clone(), pred.clone());
 
-                                                // Query new predicate value directly (use current_value to avoid subscription churn)
-                                                let is_true = if let Ok(value) = pred.current_value().await {
+                                                // Query new predicate value (use .value() to wait for reactive predicates)
+                                                let is_true = if let Ok(value) = pred.clone().value().await {
                                                     matches!(&value, Value::Tag(tag, _) if tag.tag() == "True")
                                                 } else {
                                                     false
@@ -6741,8 +6741,8 @@ impl ListBindingFunction {
                                                 );
                                                 predicates.insert(pid.clone(), pred.clone());
 
-                                                // Query initial value (use current_value to avoid subscription churn)
-                                                if let Ok(value) = pred.current_value().await {
+                                                // Query initial value (use .value() to wait for reactive predicates)
+                                                if let Ok(value) = pred.clone().value().await {
                                                     let is_true = matches!(&value, Value::Tag(tag, _) if tag.tag() == "True");
                                                     predicate_results.insert(pid, is_true);
                                                 }

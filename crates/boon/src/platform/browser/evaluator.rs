@@ -3007,19 +3007,21 @@ async fn extract_field_path(value: &Value, path: &[String]) -> Option<Value> {
         match &current {
             Value::Object(object, _) => {
                 let variable_actor = object.expect_variable(field_name).value_actor();
-                if let Ok(val) = variable_actor.current_value().await {
+                // Use value() to wait for first value if not yet stored
+                if let Ok(val) = variable_actor.clone().value().await {
                     current = val;
                 } else {
-                    // Field actor doesn't have a stored value yet
+                    // Field actor dropped
                     return None;
                 }
             }
             Value::TaggedObject(tagged_object, _) => {
                 let variable_actor = tagged_object.expect_variable(field_name).value_actor();
-                if let Ok(val) = variable_actor.current_value().await {
+                // Use value() to wait for first value if not yet stored
+                if let Ok(val) = variable_actor.clone().value().await {
                     current = val;
                 } else {
-                    // Field actor doesn't have a stored value yet
+                    // Field actor dropped
                     return None;
                 }
             }
@@ -3081,8 +3083,8 @@ fn build_field_access_actor(
                 };
                 if let Some(var) = variable {
                     let value_actor = var.value_actor();
-                    // Use value() instead of stream().next() to avoid subscription churn
-                    current = value_actor.current_value().await.ok()?;
+                    // Use value() to wait for first value if not yet stored
+                    current = value_actor.clone().value().await.ok()?;
                 } else {
                     return None;
                 }

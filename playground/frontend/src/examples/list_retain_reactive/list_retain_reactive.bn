@@ -13,6 +13,8 @@ store: [
             False => True
         }
     )
+    -- Pre-compute count (TEXT interpolation doesn't support pipe expressions)
+    filtered_count: filtered |> List/count()
 ]
 
 document: Document/new(root: Element/stripe(
@@ -30,7 +32,7 @@ document: Document/new(root: Element/stripe(
         Element/label(
             element: []
             style: []
-            label: TEXT { Filtered count: {store.filtered |> List/count()} }
+            label: TEXT { Filtered count: {store.filtered_count} }
         )
 
         Element/stripe(
