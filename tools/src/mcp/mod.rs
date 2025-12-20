@@ -490,6 +490,48 @@ fn get_tools() -> Vec<Tool> {
                 "required": []
             }),
         },
+        Tool {
+            name: "boon_focus_input".to_string(),
+            description: "Focus an input element in the preview panel by index (0-indexed). Use before typing text.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "integer",
+                        "description": "The input index (0-indexed). First input is index 0."
+                    }
+                },
+                "required": ["index"]
+            }),
+        },
+        Tool {
+            name: "boon_type_text".to_string(),
+            description: "Type text into the currently focused element. Use boon_focus_input first to focus an input.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text to type"
+                    }
+                },
+                "required": ["text"]
+            }),
+        },
+        Tool {
+            name: "boon_press_key".to_string(),
+            description: "Press a special key. Supported keys: Enter, Escape, Tab, Backspace, Delete.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "The key to press (Enter, Escape, Tab, Backspace, Delete)"
+                    }
+                },
+                "required": ["key"]
+            }),
+        },
     ]
 }
 
@@ -600,6 +642,68 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
             }
             Response::Error { message } => Err(format!("Click button failed: {}", message)),
             _ => Ok(format!("Clicked button {}", index)),
+        };
+    }
+
+    // Handle focus-input
+    if name == "boon_focus_input" {
+        let index = args
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .ok_or("index parameter required")? as u32;
+
+        let response = ws_server::send_command_to_server(ws_port, Command::FocusInput { index })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        return match response {
+            Response::Success { data } => {
+                if let Some(d) = data {
+                    Ok(format!("Focused input {}: {}", index, serde_json::to_string_pretty(&d).unwrap_or_default()))
+                } else {
+                    Ok(format!("Focused input {}", index))
+                }
+            }
+            Response::Error { message } => Err(format!("Focus input failed: {}", message)),
+            _ => Ok(format!("Focused input {}", index)),
+        };
+    }
+
+    // Handle type-text
+    if name == "boon_type_text" {
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or("text parameter required")?
+            .to_string();
+
+        let response = ws_server::send_command_to_server(ws_port, Command::TypeText { text: text.clone() })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        return match response {
+            Response::Success { .. } => Ok(format!("Typed: {}", text)),
+            Response::Error { message } => Err(format!("Type text failed: {}", message)),
+            _ => Ok(format!("Typed: {}", text)),
+        };
+    }
+
+    // Handle press-key
+    if name == "boon_press_key" {
+        let key = args
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or("key parameter required")?
+            .to_string();
+
+        let response = ws_server::send_command_to_server(ws_port, Command::PressKey { key: key.clone() })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        return match response {
+            Response::Success { .. } => Ok(format!("Pressed: {}", key)),
+            Response::Error { message } => Err(format!("Press key failed: {}", message)),
+            _ => Ok(format!("Pressed: {}", key)),
         };
     }
 

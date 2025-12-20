@@ -2762,7 +2762,7 @@ fn build_when_actor(
                             // This is critical for WHEN bodies which should produce exactly ONE value per input.
                             let result_actor_keepalive = result_actor.clone();
                             let result_stream = stream::once(result_actor.value())
-                                .filter_map(|v| async { v.ok() })
+                                .filter_map(|v| future::ready(v.ok()))
                                 .map(move |mut result_value| {
                                     // Prevent drop: captured by `move` closure, lives as long as stream combinator
                                     let _value_actor = &value_actor;
@@ -2776,7 +2776,7 @@ fn build_when_actor(
                             // SKIP - return finite empty stream (flatten_unordered removes it cleanly)
                             return Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>;
                         }
-                        Err(_e) => {
+                        Err(_) => {
                             return Box::pin(stream::empty()) as Pin<Box<dyn Stream<Item = Value>>>;
                         }
                     }

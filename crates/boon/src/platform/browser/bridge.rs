@@ -1646,6 +1646,7 @@ fn element_text_input(
             let mut key_down_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut blur_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut pending_change_events: Vec<String> = Vec::new();
+            let mut pending_key_down_events: Vec<String> = Vec::new();
 
             loop {
                 select! {
@@ -1684,7 +1685,35 @@ fn element_text_input(
                     }
                     result = key_down_stream.next() => {
                         if let Some(sender) = result {
-                            key_down_link_value_sender = Some(sender);
+                            key_down_link_value_sender = Some(sender.clone());
+
+                            // Flush any pending key_down events
+                            for key in pending_key_down_events.drain(..) {
+                                let event_value = Object::new_value(
+                                    ConstructInfo::new("text_input::key_down_event", None, "TextInput key_down event"),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    [Variable::new_arc(
+                                        ConstructInfo::new("text_input::key_down_event::key", None, "key_down key"),
+                                        construct_context.clone(),
+                                        "key",
+                                        ValueActor::new_arc(
+                                            ConstructInfo::new("text_input::key_down_event::key_actor", None, "key_down key actor"),
+                                            ActorContext::default(),
+                                            TypedStream::infinite(stream::once(future::ready(EngineTag::new_value(
+                                                ConstructInfo::new("text_input::key_down_event::key_value", None, "key_down key value"),
+                                                construct_context.clone(),
+                                                ValueIdempotencyKey::new(),
+                                                key.clone(),
+                                            ))).chain(stream::pending())),
+                                            None,
+                                        ),
+                                        parser::PersistenceId::default(),
+                                        parser::Scope::Root,
+                                    )],
+                                );
+                                sender.send_or_drop(event_value);
+                            }
                         }
                     }
                     result = blur_stream.next() => {
@@ -1750,6 +1779,8 @@ fn element_text_input(
                                 )],
                             );
                             sender.send_or_drop(event_value);
+                        } else {
+                            pending_key_down_events.push(key);
                         }
                     }
                     _blur = blur_event_receiver.select_next_some() => {

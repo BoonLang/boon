@@ -99,6 +99,15 @@ pub enum Command {
 
     /// Click any element by its text content
     ClickByText { text: String, exact: bool },
+
+    /// Focus an input element by index in preview pane (0-indexed)
+    FocusInput { index: u32 },
+
+    /// Type text into the currently focused element
+    TypeText { text: String },
+
+    /// Press a special key (Enter, Escape, Tab, Backspace, Delete)
+    PressKey { key: String },
 }
 
 /// Response from Extension to CLI via Server

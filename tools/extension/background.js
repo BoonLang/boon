@@ -1106,6 +1106,64 @@ async function handleCommand(id, command) {
           return { type: 'error', message: `Click by text failed: ${e.message}` };
         }
 
+      case 'focusInput':
+        // Focus an input element in the preview panel by index
+        try {
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { found: false, error: 'Preview panel not found' };
+
+              const inputs = preview.querySelectorAll('input, textarea, [contenteditable="true"]');
+              const inputIndex = ${command.index};
+              if (inputIndex >= inputs.length) {
+                return { found: false, error: 'Input index ' + inputIndex + ' out of range (found ' + inputs.length + ' inputs)' };
+              }
+
+              const input = inputs[inputIndex];
+              input.focus();
+              input.click();
+
+              const rect = input.getBoundingClientRect();
+              return {
+                found: true,
+                index: inputIndex,
+                type: input.type || input.tagName.toLowerCase(),
+                x: Math.round(rect.x + rect.width / 2),
+                y: Math.round(rect.y + rect.height / 2)
+              };
+            })()
+          `);
+
+          if (!result.found) {
+            return { type: 'error', message: result.error || 'Input not found' };
+          }
+
+          // Also click via CDP to ensure focus
+          await cdpClickAt(tab.id, result.x, result.y);
+          return { type: 'success', data: result };
+        } catch (e) {
+          return { type: 'error', message: `Focus input failed: ${e.message}` };
+        }
+
+      case 'typeText':
+        // Type text into the currently focused element using CDP
+        try {
+          await cdpTypeText(tab.id, command.text);
+          return { type: 'success', data: { text: command.text } };
+        } catch (e) {
+          return { type: 'error', message: `Type text failed: ${e.message}` };
+        }
+
+      case 'pressKey':
+        // Press a special key using JavaScript dispatchEvent (triggers web_sys listeners)
+        try {
+          const result = await jsDispatchKeyEvent(tab.id, command.key);
+          return { type: 'success', data: result };
+        } catch (e) {
+          return { type: 'error', message: `Press key failed: ${e.message}` };
+        }
+
       // ============ Legacy commands still using executeScript ============
 
       case 'getDOM':
