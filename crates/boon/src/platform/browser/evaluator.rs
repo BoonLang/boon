@@ -11,7 +11,7 @@ use zoon::futures_channel::oneshot;
 use zoon::futures_util::select;
 use zoon::futures_util::future;
 use zoon::futures_util::stream::{self, LocalBoxStream};
-use zoon::{Stream, StreamExt, mpsc};
+use zoon::{Stream, StreamExt, SinkExt, mpsc};
 
 /// Yields control to the executor, allowing other tasks to run.
 /// This is a simple implementation that returns Pending once and schedules a wake.
@@ -301,7 +301,7 @@ pub enum WorkItem {
     /// Connect forwarding actors to their evaluated results.
     /// Used for referenced function arguments.
     ConnectForwardingActors {
-        connections: Vec<(SlotId, mpsc::UnboundedSender<Value>)>,
+        connections: Vec<(SlotId, NamedChannel<Value>)>,
     },
 }
 
@@ -339,7 +339,7 @@ pub struct ObjectVariableData {
     /// For referenced fields, holds a pre-created forwarding actor and its sender.
     /// This allows the actor to be registered with ReferenceConnector before
     /// the field expression is evaluated, fixing forward reference race conditions.
-    pub forwarding_actor: Option<(Arc<ValueActor>, mpsc::UnboundedSender<Value>)>,
+    pub forwarding_actor: Option<(Arc<ValueActor>, NamedChannel<Value>)>,
 }
 
 /// Holds the state of an ongoing work queue evaluation.
@@ -1131,7 +1131,7 @@ fn schedule_expression(
                     let mut passed_slot = None;
                     let mut passed_context: Option<SlotId> = None;
                     // Track forwarding actors for referenced arguments
-                    let mut forwarding_connections: Vec<(SlotId, mpsc::UnboundedSender<Value>)> = Vec::new();
+                    let mut forwarding_connections: Vec<(SlotId, NamedChannel<Value>)> = Vec::new();
 
                     // Build arg_locals map from forwarding actors
                     // This allows subsequent arguments to resolve references locally
@@ -2027,8 +2027,8 @@ fn process_work_item(
                     scope: new_ctx.actor_context.scope.clone(),
                 };
 
-                // Create stable pass-through with mpsc channel
-                let (value_tx, value_rx) = mpsc::unbounded::<Value>();
+                // Create stable pass-through with bounded mpsc channel
+                let (value_tx, value_rx) = mpsc::channel::<Value>(64);
 
                 // Create forwarder stream using async setup + flat_map pattern
                 let alias_for_stream = alias.node.clone();
@@ -2054,7 +2054,7 @@ fn process_work_item(
                 // Async setup: get LINK sender, check for existing pass-through, subscribe to prev_actor
                 let setup_stream = stream::once(async move {
                     // Check if existing pass-through exists FIRST (before any registration)
-                    let existing_sender: Option<mpsc::UnboundedSender<Value>> = match &connector_for_stream {
+                    let existing_sender: Option<mpsc::Sender<Value>> = match &connector_for_stream {
                         Some(conn) => conn.get_sender(pass_through_key_for_stream.clone()).await,
                         None => None,
                     };
@@ -2089,24 +2089,28 @@ fn process_work_item(
                         let is_active = subscription_scope.as_ref().map_or(true, |s| !s.is_cancelled());
                         future::ready(is_active)
                     })
-                    .map(move |value| {
-                        // Forward to LINK
-                        if let Some(ref sender) = link_sender {
-                            if let Err(e) = sender.unbounded_send(value.clone()) {
-                                zoon::println!("[LINK_SETTER] Failed to forward to LINK: {e}");
+                    .then(move |value| {
+                        // Clone senders for async block
+                        let link_sender = link_sender.clone();
+                        let mut existing_sender = existing_sender.clone();
+                        let mut value_tx = value_tx.clone();
+                        async move {
+                            // Forward to LINK
+                            if let Some(ref sender) = link_sender {
+                                sender.send_or_drop(value.clone());
                             }
-                        }
-                        // Forward to existing pass-through (if re-evaluation)
-                        if let Some(ref sender) = existing_sender {
-                            if let Err(e) = sender.unbounded_send(value.clone()) {
-                                zoon::println!("[LINK_SETTER] Failed to forward to existing pass-through: {e}");
+                            // Forward to existing pass-through with backpressure (if re-evaluation)
+                            if let Some(ref mut sender) = existing_sender {
+                                if let Err(e) = sender.send(value.clone()).await {
+                                    zoon::println!("[LINK_SETTER] Failed to forward to existing pass-through: {e}");
+                                }
                             }
+                            // Forward to our channel with backpressure (only matters on first evaluation)
+                            if let Err(e) = value_tx.send(value.clone()).await {
+                                zoon::println!("[LINK_SETTER] Failed to forward to value channel: {e}");
+                            }
+                            value
                         }
-                        // Forward to our channel (only matters on first evaluation)
-                        if let Err(e) = value_tx.unbounded_send(value.clone()) {
-                            zoon::println!("[LINK_SETTER] Failed to forward to value channel: {e}");
-                        }
-                        value
                     })
                 });
 
@@ -3061,7 +3065,7 @@ fn build_field_access_actor(
     // 1. Navigate through path fields, tracking LINK fields we encounter
     // 2. Subscribe to the final field (if LINK, stay subscribed)
     // 3. Watch for changes in intermediate LINKs - when one changes, re-navigate from that point
-    let (field_sender, field_receiver) = mpsc::unbounded::<Value>();
+    let (mut field_sender, field_receiver) = mpsc::channel::<Value>(32);
     let piped_for_loop = piped.clone();
 
     let field_access_loop = ActorLoop::new(async move {
@@ -3175,7 +3179,7 @@ fn build_field_access_actor(
             // Final field is not a LINK - just emit one value and we're done
             let mut sub = final_subscription;
             if let Some(val) = sub.next().await {
-                if let Err(e) = field_sender.unbounded_send(val) {
+                if let Err(e) = field_sender.try_send(val) {
                     zoon::println!("[FIELD_ACCESS] Failed to send final value: {e}");
                 }
             }
@@ -3191,7 +3195,7 @@ fn build_field_access_actor(
                 select! {
                     final_value = final_sub.next() => {
                         if let Some(val) = final_value {
-                            if field_sender.unbounded_send(val).is_err() {
+                            if field_sender.try_send(val).is_err() {
                                 return;
                             }
                         } else {
@@ -3258,7 +3262,7 @@ fn build_field_access_actor(
                 select! {
                     final_value = final_sub.next() => {
                         if let Some(val) = final_value {
-                            if field_sender.unbounded_send(val).is_err() {
+                            if field_sender.try_send(val).is_err() {
                                 return;
                             }
                         } else {
@@ -3319,9 +3323,9 @@ fn build_hold_actor(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
 ) -> Result<Option<Arc<ValueActor>>, String> {
-    // Use a channel to hold current state value and broadcast updates
-    // Note: UnboundedSender::unbounded_send takes &self, so we can just clone the sender
-    let (state_sender, state_receiver) = zoon::futures_channel::mpsc::unbounded::<Value>();
+    // Use a bounded channel to hold current state value and broadcast updates
+    // Note: Sender::try_send takes &self, so we can just clone the sender
+    let (state_sender, state_receiver) = zoon::futures_channel::mpsc::channel::<Value>(16);
     let state_sender_for_update = state_sender.clone();
     let state_sender_for_reset = state_sender.clone();
 
@@ -3424,20 +3428,24 @@ fn build_hold_actor(
     // For lazy actors, this enables demand-driven evaluation where HOLD pulls values
     // one at a time and updates state between each pull (sequential state updates).
     let body_subscription = body_result.clone().stream_sync();
-    let state_update_stream = body_subscription.map(move |new_value| {
-        // Send to state channel so body can see it on next event
-        if let Err(e) = state_sender_for_update.unbounded_send(new_value.clone()) {
-            zoon::println!("[HOLD] Failed to send state update: {e}");
+    let state_update_stream = body_subscription.then(move |new_value| {
+        let mut state_sender = state_sender_for_update.clone();
+        let state_actor = state_actor_for_update.clone();
+        async move {
+            // Send to state channel with backpressure so body can see it on next event
+            if let Err(e) = state_sender.send(new_value.clone()).await {
+                zoon::println!("[HOLD] Failed to send state update: {e}");
+            }
+            // DIRECTLY update state_actor's stored value - bypass async channel delay.
+            // This ensures the next THEN body evaluation reads the fresh state value.
+            // NOTE: The callback already updates state_actor, but we update here too
+            // for cases where the value flows through without callback (e.g., non-THEN body).
+            state_actor.store_value_directly(new_value.clone());
+            // NOTE: Do NOT release permit here! The hold_state_update_callback already
+            // releases it after THEN's body evaluation. Releasing twice would cause
+            // permit count to grow, defeating backpressure and allowing parallel processing.
+            new_value
         }
-        // DIRECTLY update state_actor's stored value - bypass async channel delay.
-        // This ensures the next THEN body evaluation reads the fresh state value.
-        // NOTE: The callback already updates state_actor, but we update here too
-        // for cases where the value flows through without callback (e.g., non-THEN body).
-        state_actor_for_update.store_value_directly(new_value.clone());
-        // NOTE: Do NOT release permit here! The hold_state_update_callback already
-        // releases it after THEN's body evaluation. Releasing twice would cause
-        // permit count to grow, defeating backpressure and allowing parallel processing.
-        new_value
     });
 
     // Create output actor FIRST with a pending stream (stays alive, no async stream processing).
@@ -3483,28 +3491,33 @@ fn build_hold_actor(
     // Use AtomicBool instead of Rc<RefCell<bool>> for lock-free flag.
     let is_first_input = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let output_weak_for_initial = Arc::downgrade(&output);
-    let initial_stream = initial_actor.clone().stream_sync().map(move |value| {
-        // swap() atomically reads AND sets to false in one operation
-        let is_first = is_first_input.swap(false, std::sync::atomic::Ordering::SeqCst);
-        if is_first {
-            // First value: state_actor gets it via take(1) and store to output
-            if let Some(output) = output_weak_for_initial.upgrade() {
-                output.store_value_directly(value.clone());
+    let initial_stream = initial_actor.clone().stream_sync().then(move |value| {
+        let is_first_input = is_first_input.clone();
+        let output_weak = output_weak_for_initial.clone();
+        let mut state_sender = state_sender_for_reset.clone();
+        async move {
+            // swap() atomically reads AND sets to false in one operation
+            let is_first = is_first_input.swap(false, std::sync::atomic::Ordering::SeqCst);
+            if is_first {
+                // First value: state_actor gets it via take(1) and store to output
+                if let Some(output) = output_weak.upgrade() {
+                    output.store_value_directly(value.clone());
+                }
+            } else {
+                // Subsequent values (reset): send to state_receiver with backpressure
+                if let Err(e) = state_sender.send(value.clone()).await {
+                    zoon::println!("[HOLD] Failed to send state reset: {e}");
+                }
+                // Store value directly to output
+                // Use weak reference to avoid circular reference
+                if let Some(output) = output_weak.upgrade() {
+                    output.store_value_directly(value.clone());
+                }
             }
-        } else {
-            // Subsequent values (reset): send to state_receiver
-            if let Err(e) = state_sender_for_reset.unbounded_send(value.clone()) {
-                zoon::println!("[HOLD] Failed to send state reset: {e}");
-            }
-            // Store value directly to output
-            // Use weak reference to avoid circular reference
-            if let Some(output) = output_weak_for_initial.upgrade() {
-                output.store_value_directly(value.clone());
-            }
+            // Always pass through as HOLD output
+            value
         }
-        // Always pass through as HOLD output
-        value
-    });
+    }).boxed_local();
 
     // Modify state_update_stream to also store values directly to output
     // IMPORTANT: Use Weak<ValueActor> to avoid circular reference!
@@ -3515,7 +3528,7 @@ fn build_hold_actor(
             output.store_value_directly(value.clone());
         }
         value
-    });
+    }).boxed_local();
 
     // Combine: input stream sets/resets state, body updates state
     // Use select to merge both streams - any emission from input resets state
@@ -3604,7 +3617,7 @@ fn build_text_literal_actor(
                         let actor = ref_connector.referenceable(ref_span_copy).await;
                         let mut subscription = actor.stream().await;
                         while let Some(value) = subscription.next().await {
-                            if base_sender.unbounded_send(value).is_err() {
+                            if base_sender.send(value).await.is_err() {
                                 break;
                             }
                         }
@@ -3691,7 +3704,7 @@ fn build_text_literal_actor(
                             if let Some(final_actor) = current_value_actor {
                                 let mut subscription = final_actor.stream().await;
                                 while let Some(value) = subscription.next().await {
-                                    if field_sender.unbounded_send(value).is_err() {
+                                    if field_sender.send(value).await.is_err() {
                                         break;
                                     }
                                 }
@@ -3853,7 +3866,7 @@ fn build_link_setter_actor(
 async fn get_link_sender_from_alias(
     alias: static_expression::Alias,
     ctx: EvaluationContext,
-) -> Option<mpsc::UnboundedSender<Value>> {
+) -> Option<NamedChannel<Value>> {
     match alias {
         static_expression::Alias::WithPassed { extra_parts } => {
             // Start from PASSED value and traverse extra_parts

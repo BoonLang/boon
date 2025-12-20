@@ -1717,7 +1717,7 @@ pub struct Variable {
     scope: parser::Scope,
     name: Cow<'static, str>,
     value_actor: Arc<ValueActor>,
-    link_value_sender: Option<mpsc::UnboundedSender<Value>>,
+    link_value_sender: Option<NamedChannel<Value>>,
     /// Holds the forwarding actor loop for referenced fields (fixes forward reference race).
     /// The ActorLoop must be kept alive to prevent the forwarding task from being cancelled.
     forwarding_loop: Option<ActorLoop>,
@@ -1811,8 +1811,7 @@ impl Variable {
         let actor_construct_info =
             ConstructInfo::new(actor_id.clone(), persistence, "Link variable value actor")
                 .complete(ConstructType::ValueActor);
-        let (link_value_sender, link_value_receiver) = mpsc::unbounded::<Value>();
-        // UnboundedReceiver is infinite - it never terminates unless sender is dropped
+        let (link_value_sender, link_value_receiver) = NamedChannel::new("link.values", 128);
         // Capture the scope before actor_context is moved
         let scope = actor_context.scope.clone();
         let value_actor =
@@ -1848,7 +1847,7 @@ impl Variable {
         persistence_id: parser::PersistenceId,
         scope: parser::Scope,
         forwarding_actor: Arc<ValueActor>,
-        link_value_sender: mpsc::UnboundedSender<Value>,
+        link_value_sender: NamedChannel<Value>,
         forwarding_loop: ActorLoop,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -1924,11 +1923,11 @@ impl Variable {
         &self.name
     }
 
-    pub fn link_value_sender(&self) -> Option<mpsc::UnboundedSender<Value>> {
+    pub fn link_value_sender(&self) -> Option<NamedChannel<Value>> {
         self.link_value_sender.clone()
     }
 
-    pub fn expect_link_value_sender(&self) -> mpsc::UnboundedSender<Value> {
+    pub fn expect_link_value_sender(&self) -> NamedChannel<Value> {
         if let Some(link_value_sender) = self.link_value_sender.clone() {
             link_value_sender
         } else {
@@ -2213,9 +2212,9 @@ impl ReferenceConnector {
 /// Similar to ReferenceConnector but stores mpsc senders for LINK variables.
 /// Uses ActorLoop internally to encapsulate the async task.
 pub struct LinkConnector {
-    link_inserter_sender: NamedChannel<(parser::Span, mpsc::UnboundedSender<Value>)>,
+    link_inserter_sender: NamedChannel<(parser::Span, NamedChannel<Value>)>,
     link_getter_sender:
-        NamedChannel<(parser::Span, oneshot::Sender<mpsc::UnboundedSender<Value>>)>,
+        NamedChannel<(parser::Span, oneshot::Sender<NamedChannel<Value>>)>,
     actor_loop: ActorLoop,
 }
 
@@ -2229,9 +2228,9 @@ impl LinkConnector {
             link_inserter_sender,
             link_getter_sender,
             actor_loop: ActorLoop::new(async move {
-                let mut links = HashMap::<parser::Span, mpsc::UnboundedSender<Value>>::new();
+                let mut links = HashMap::<parser::Span, NamedChannel<Value>>::new();
                 let mut link_senders =
-                    HashMap::<parser::Span, Vec<oneshot::Sender<mpsc::UnboundedSender<Value>>>>::new();
+                    HashMap::<parser::Span, Vec<oneshot::Sender<NamedChannel<Value>>>>::new();
                 // Track whether channels are closed
                 let mut inserter_closed = false;
                 let mut getter_closed = false;
@@ -2293,7 +2292,7 @@ impl LinkConnector {
     }
 
     /// Register a LINK variable's sender with its span.
-    pub fn register_link(&self, span: parser::Span, sender: mpsc::UnboundedSender<Value>) {
+    pub fn register_link(&self, span: parser::Span, sender: NamedChannel<Value>) {
         if let Err(error) = self
             .link_inserter_sender
             .try_send((span, sender))
@@ -2303,7 +2302,7 @@ impl LinkConnector {
     }
 
     /// Get a LINK variable's sender by its span.
-    pub async fn link_sender(self: Arc<Self>, span: parser::Span) -> mpsc::UnboundedSender<Value> {
+    pub async fn link_sender(self: Arc<Self>, span: parser::Span) -> NamedChannel<Value> {
         let (link_sender, link_receiver) = oneshot::channel();
         if let Err(error) = self
             .link_getter_sender
@@ -2329,7 +2328,7 @@ pub struct PassThroughConnector {
     /// Sender for getting existing pass-through actors
     getter_sender: NamedChannel<(PassThroughKey, oneshot::Sender<Option<Arc<ValueActor>>>)>,
     /// Sender for getting existing pass-through value senders
-    sender_getter_sender: NamedChannel<(PassThroughKey, oneshot::Sender<Option<mpsc::UnboundedSender<Value>>>)>,
+    sender_getter_sender: NamedChannel<(PassThroughKey, oneshot::Sender<Option<mpsc::Sender<Value>>>)>,
     actor_loop: ActorLoop,
 }
 
@@ -2344,7 +2343,7 @@ enum PassThroughOp {
     /// Register a new pass-through with its value sender
     Register {
         key: PassThroughKey,
-        value_sender: mpsc::UnboundedSender<Value>,
+        value_sender: mpsc::Sender<Value>,
         actor: Arc<ValueActor>,
     },
     /// Forward a value to an existing pass-through
@@ -2372,7 +2371,7 @@ impl PassThroughConnector {
             sender_getter_sender,
             actor_loop: ActorLoop::new(async move {
                 // (sender, actor, forwarders) - forwarders kept alive for the lifetime of the pass-through
-                let mut pass_throughs = HashMap::<PassThroughKey, (mpsc::UnboundedSender<Value>, Arc<ValueActor>, Vec<Arc<ValueActor>>)>::new();
+                let mut pass_throughs = HashMap::<PassThroughKey, (mpsc::Sender<Value>, Arc<ValueActor>, Vec<Arc<ValueActor>>)>::new();
                 let mut op_receiver = op_receiver.fuse();
                 let mut getter_receiver = getter_receiver.fuse();
                 let mut sender_getter_receiver = sender_getter_receiver.fuse();
@@ -2386,8 +2385,8 @@ impl PassThroughConnector {
                                     pass_throughs.insert(key, (value_sender, actor, Vec::new()));
                                 }
                                 Some(PassThroughOp::Forward { key, value }) => {
-                                    if let Some((sender, _, _)) = pass_throughs.get(&key) {
-                                        if let Err(e) = sender.unbounded_send(value) {
+                                    if let Some((sender, _, _)) = pass_throughs.get_mut(&key) {
+                                        if let Err(e) = sender.send(value).await {
                                             zoon::println!("[PASS_THROUGH] Forward failed for key {:?}: {e}", key);
                                         }
                                     }
@@ -2443,7 +2442,7 @@ impl PassThroughConnector {
     }
 
     /// Register a new pass-through actor
-    pub fn register(&self, key: PassThroughKey, value_sender: mpsc::UnboundedSender<Value>, actor: Arc<ValueActor>) {
+    pub fn register(&self, key: PassThroughKey, value_sender: mpsc::Sender<Value>, actor: Arc<ValueActor>) {
         if let Err(e) = self.op_sender.try_send(PassThroughOp::Register { key, value_sender, actor }) {
             zoon::eprintln!("[PASS_THROUGH] Failed to send Register: {e}");
         }
@@ -2474,7 +2473,7 @@ impl PassThroughConnector {
     }
 
     /// Get the value sender for an existing pass-through
-    pub async fn get_sender(&self, key: PassThroughKey) -> Option<mpsc::UnboundedSender<Value>> {
+    pub async fn get_sender(&self, key: PassThroughKey) -> Option<mpsc::Sender<Value>> {
         let (response_sender, response_receiver) = oneshot::channel();
         if let Err(e) = self.sender_getter_sender.try_send((key, response_sender)) {
             zoon::eprintln!("[PASS_THROUGH] Failed to send sender getter request: {e}");
@@ -3991,8 +3990,8 @@ impl ValueActor {
         construct_info: ConstructInfo,
         actor_context: ActorContext,
         persistence_id: Option<parser::PersistenceId>,
-    ) -> (Arc<Self>, mpsc::UnboundedSender<Value>) {
-        let (sender, receiver) = mpsc::unbounded::<Value>();
+    ) -> (Arc<Self>, NamedChannel<Value>) {
+        let (sender, receiver) = NamedChannel::new("forwarding.values", 64);
         let stream = TypedStream::infinite(receiver);
         let actor = Self::new_arc(
             construct_info,
@@ -4026,14 +4025,14 @@ impl ValueActor {
     /// // Store actor_loop to keep forwarding alive
     /// ```
     pub fn connect_forwarding(
-        forwarding_sender: mpsc::UnboundedSender<Value>,
+        forwarding_sender: NamedChannel<Value>,
         source_actor: Arc<ValueActor>,
         initial_value_future: impl Future<Output = Option<Value>> + 'static,
     ) -> ActorLoop {
         ActorLoop::new(async move {
             // Send initial value first (awaiting if needed)
             if let Some(value) = initial_value_future.await {
-                if let Err(e) = forwarding_sender.unbounded_send(value) {
+                if let Err(e) = forwarding_sender.send(value).await {
                     zoon::println!("[VALUE_ACTOR] Initial forwarding failed: {e}");
                     return;
                 }
@@ -4041,7 +4040,7 @@ impl ValueActor {
 
             let mut subscription = source_actor.stream().await;
             while let Some(value) = subscription.next().await {
-                if forwarding_sender.unbounded_send(value).is_err() {
+                if forwarding_sender.send(value).await.is_err() {
                     break;
                 }
             }

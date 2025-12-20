@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use zoon::futures_util::{future, select, stream, StreamExt};
-use zoon::futures_channel::mpsc;
 use zoon::*;
 
 use super::engine::{
-    ActorContext, ActorLoop, ConstructContext, ConstructInfo, ListChange, Object,
+    ActorContext, ActorLoop, ConstructContext, ConstructInfo, ListChange, NamedChannel, Object,
     TaggedObject, TypedStream, Value, ValueActor, ValueIdempotencyKey, Variable,
     Text as EngineText, Tag as EngineTag,
 };
@@ -433,7 +432,7 @@ fn element_stripe(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
-    let (hovered_sender, mut hovered_receiver) = mpsc::unbounded::<bool>();
+    let (hovered_sender, mut hovered_receiver) = NamedChannel::new("element.hovered", 2);
 
     // Set up hovered link if element field exists with hovered property
     // Access element through settings, like other properties (style, direction, etc.)
@@ -455,7 +454,7 @@ fn element_stripe(
     let hovered_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
-            let mut hovered_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
+            let mut hovered_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut hovered_stream = hovered_stream.fuse();
             loop {
                 select! {
@@ -473,9 +472,7 @@ fn element_stripe(
                                 ValueIdempotencyKey::new(),
                                 hover_tag,
                             );
-                            if let Err(e) = sender.unbounded_send(event_value) {
-                                zoon::println!("[DOM] stripe::hovered event send failed: {e}");
-                            }
+                            sender.send_or_drop(event_value);
                         }
                     }
                 }
@@ -1021,9 +1018,7 @@ fn element_stripe(
             },
         ))
         .on_hovered_change(move |is_hovered| {
-            if let Err(e) = hovered_sender.unbounded_send(is_hovered) {
-                zoon::println!("[DOM] hovered change event send failed: {e}");
-            }
+            hovered_sender.send_or_drop(is_hovered);
         })
         .update_raw_el(|raw_el| {
             raw_el
@@ -1204,8 +1199,8 @@ fn element_button(
 ) -> impl Element {
     type PressEvent = ();
 
-    let (press_event_sender, mut press_event_receiver) = mpsc::unbounded::<PressEvent>();
-    let (hovered_sender, mut hovered_receiver) = mpsc::unbounded::<bool>();
+    let (press_event_sender, mut press_event_receiver) = NamedChannel::new("button.press_event", 8);
+    let (hovered_sender, mut hovered_receiver) = NamedChannel::new("button.hovered", 2);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -1233,8 +1228,8 @@ fn element_button(
     let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
-            let mut press_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
-            let mut hovered_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
+            let mut press_link_value_sender: Option<NamedChannel<Value>> = None;
+            let mut hovered_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut press_event_object_value_version = 0u64;
             let mut hovered_stream = hovered_stream.fuse();
             loop {
@@ -1258,9 +1253,7 @@ fn element_button(
                                 [],
                             );
                             press_event_object_value_version += 1;
-                            if let Err(error) = press_link_value_sender.unbounded_send(press_event_object_value) {
-                                zoon::eprintln!("Failed to send button press event to event press link variable: {error}");
-                            }
+                            press_link_value_sender.send_or_drop(press_event_object_value);
                         }
                     }
                     is_hovered = hovered_receiver.select_next_some() => {
@@ -1272,9 +1265,7 @@ fn element_button(
                                 ValueIdempotencyKey::new(),
                                 hover_tag,
                             );
-                            if let Err(e) = sender.unbounded_send(event_value) {
-                                zoon::println!("[DOM] button::hovered event send failed: {e}");
-                            }
+                            sender.send_or_drop(event_value);
                         }
                     }
                 }
@@ -1580,14 +1571,10 @@ fn element_button(
         // @TODO Handle press event only when it's defined in Boon code? Add `.on_press_signal` to Zoon?
         .on_press(move || {
             let press_event: PressEvent = ();
-            if let Err(error) = press_event_sender.unbounded_send(press_event) {
-                zoon::eprintln!("Failed to send button press event from on_press handler: {error}");
-            }
+            press_event_sender.send_or_drop(press_event);
         })
         .on_hovered_change(move |is_hovered| {
-            if let Err(e) = hovered_sender.unbounded_send(is_hovered) {
-                zoon::println!("[DOM] hovered change event send failed: {e}");
-            }
+            hovered_sender.send_or_drop(is_hovered);
         })
         .update_raw_el(|raw_el| {
             raw_el
@@ -1615,9 +1602,9 @@ fn element_text_input(
     type KeyDownEvent = String;
     type BlurEvent = ();
 
-    let (change_event_sender, mut change_event_receiver) = mpsc::unbounded::<ChangeEvent>();
-    let (key_down_event_sender, mut key_down_event_receiver) = mpsc::unbounded::<KeyDownEvent>();
-    let (blur_event_sender, mut blur_event_receiver) = mpsc::unbounded::<BlurEvent>();
+    let (change_event_sender, mut change_event_receiver) = NamedChannel::new("text_input.change", 16);
+    let (key_down_event_sender, mut key_down_event_receiver) = NamedChannel::<String>::new("text_input.key_down", 32);
+    let (blur_event_sender, mut blur_event_receiver) = NamedChannel::new("text_input.blur", 8);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -1655,9 +1642,9 @@ fn element_text_input(
     let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
-            let mut change_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
-            let mut key_down_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
-            let mut blur_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
+            let mut change_link_value_sender: Option<NamedChannel<Value>> = None;
+            let mut key_down_link_value_sender: Option<NamedChannel<Value>> = None;
+            let mut blur_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut pending_change_events: Vec<String> = Vec::new();
 
             loop {
@@ -1691,9 +1678,7 @@ fn element_text_input(
                                         parser::Scope::Root,
                                     )],
                                 );
-                                if let Err(e) = sender.unbounded_send(event_value) {
-                                    zoon::println!("[DOM] text_input::hovered event send failed: {e}");
-                                }
+                                sender.send_or_drop(event_value);
                             }
                         }
                     }
@@ -1733,9 +1718,7 @@ fn element_text_input(
                                     parser::Scope::Root,
                                 )],
                             );
-                            if let Err(e) = sender.unbounded_send(event_value) {
-                                zoon::println!("[DOM] text_input::change event send failed: {e}");
-                            }
+                            sender.send_or_drop(event_value);
                         } else {
                             pending_change_events.push(text);
                         }
@@ -1766,9 +1749,7 @@ fn element_text_input(
                                     parser::Scope::Root,
                                 )],
                             );
-                            if let Err(e) = sender.unbounded_send(event_value) {
-                                zoon::println!("[DOM] text_input::key_down event send failed: {e}");
-                            }
+                            sender.send_or_drop(event_value);
                         }
                     }
                     _blur = blur_event_receiver.select_next_some() => {
@@ -1779,9 +1760,7 @@ fn element_text_input(
                                 ValueIdempotencyKey::new(),
                                 [],
                             );
-                            if let Err(e) = sender.unbounded_send(event_value) {
-                                zoon::println!("[DOM] text_input::blur event send failed: {e}");
-                            }
+                            sender.send_or_drop(event_value);
                         }
                     }
                 }
@@ -1982,9 +1961,7 @@ fn element_text_input(
         .on_change({
             let sender = change_event_sender.clone();
             move |text| {
-                if let Err(e) = sender.unbounded_send(text.clone()) {
-                    zoon::println!("[DOM] text_input on_change event send failed: {e}");
-                }
+                sender.send_or_drop(text.clone());
             }
         })
         .on_key_down_event({
@@ -1995,17 +1972,13 @@ fn element_text_input(
                     Key::Escape => "Escape".to_string(),
                     Key::Other(k) => k.clone(),
                 };
-                if let Err(e) = sender.unbounded_send(key_name) {
-                    zoon::println!("[DOM] text_input on_key_down event send failed: {e}");
-                }
+                sender.send_or_drop(key_name);
             }
         })
         .on_blur({
             let sender = blur_event_sender.clone();
             move || {
-                if let Err(e) = sender.unbounded_send(()) {
-                    zoon::println!("[DOM] text_input on_blur event send failed: {e}");
-                }
+                sender.send_or_drop(());
             }
         })
         .focus_signal(focus_signal)
@@ -2030,7 +2003,7 @@ fn element_checkbox(
 ) -> impl Element {
     type ClickEvent = ();
 
-    let (click_event_sender, mut click_event_receiver) = mpsc::unbounded::<ClickEvent>();
+    let (click_event_sender, mut click_event_receiver) = NamedChannel::new("checkbox.click", 8);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -2054,7 +2027,7 @@ fn element_checkbox(
     let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
-            let mut click_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
+            let mut click_link_value_sender: Option<NamedChannel<Value>> = None;
             // Buffer for clicks that arrive before LINK sender is ready
             let mut pending_clicks: usize = 0;
 
@@ -2072,9 +2045,7 @@ fn element_checkbox(
                                     ValueIdempotencyKey::new(),
                                     [],
                                 );
-                                if let Err(e) = sender.unbounded_send(event_value) {
-                                    zoon::println!("[DOM] checkbox pending click event send failed: {e}");
-                                }
+                                sender.send_or_drop(event_value);
                             }
                             pending_clicks = 0;
                         }
@@ -2087,9 +2058,7 @@ fn element_checkbox(
                                 ValueIdempotencyKey::new(),
                                 [],
                             );
-                            if let Err(e) = sender.unbounded_send(event_value) {
-                                zoon::println!("[DOM] checkbox click event send failed: {e}");
-                            }
+                            sender.send_or_drop(event_value);
                         } else {
                             // Buffer the click to send when sender becomes available
                             pending_clicks += 1;
@@ -2127,9 +2096,7 @@ fn element_checkbox(
         .on_click({
             let sender = click_event_sender.clone();
             move || {
-                if let Err(e) = sender.unbounded_send(()) {
-                    zoon::println!("[DOM] checkbox on_click event send failed: {e}");
-                }
+                sender.send_or_drop(());
             }
         })
         .after_remove(move |_| {
@@ -2143,8 +2110,8 @@ fn element_label(
 ) -> impl Element {
     type DoubleClickEvent = ();
 
-    let (double_click_sender, mut double_click_receiver) = mpsc::unbounded::<DoubleClickEvent>();
-    let (hovered_sender, _hovered_receiver) = mpsc::unbounded::<bool>();
+    let (double_click_sender, mut double_click_receiver) = NamedChannel::new("double_click.event", 8);
+    let (hovered_sender, _hovered_receiver) = NamedChannel::<bool>::new("double_click.hovered", 2);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -2179,8 +2146,8 @@ fn element_label(
     let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
-            let mut double_click_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
-            let mut _hovered_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
+            let mut double_click_link_value_sender: Option<NamedChannel<Value>> = None;
+            let mut _hovered_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut hovered_stream = hovered_stream.fuse();
             loop {
                 select! {
@@ -2202,9 +2169,7 @@ fn element_label(
                                 ValueIdempotencyKey::new(),
                                 [],
                             );
-                            if let Err(e) = sender.unbounded_send(event_value) {
-                                zoon::println!("[DOM] label::double_click event send failed: {e}");
-                            }
+                            sender.send_or_drop(event_value);
                         }
                     }
                 }
@@ -2288,9 +2253,7 @@ fn element_label(
         .on_double_click({
             let sender = double_click_sender.clone();
             move || {
-                if let Err(e) = sender.unbounded_send(()) {
-                    zoon::println!("[DOM] label on_double_click event send failed: {e}");
-                }
+                sender.send_or_drop(());
             }
         })
         .after_remove(move |_| drop(event_handler_loop))
@@ -2326,7 +2289,7 @@ fn element_link(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
-    let (hovered_sender, mut hovered_receiver) = mpsc::unbounded::<bool>();
+    let (hovered_sender, mut hovered_receiver) = NamedChannel::new("link.hovered", 2);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -2342,7 +2305,7 @@ fn element_link(
     let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
-            let mut hovered_link_value_sender: Option<mpsc::UnboundedSender<Value>> = None;
+            let mut hovered_link_value_sender: Option<NamedChannel<Value>> = None;
 
             loop {
                 select! {
@@ -2358,9 +2321,7 @@ fn element_link(
                                 ValueIdempotencyKey::new(),
                                 hover_tag,
                             );
-                            if let Err(e) = sender.unbounded_send(event_value) {
-                                zoon::println!("[DOM] link::hovered event send failed: {e}");
-                            }
+                            sender.send_or_drop(event_value);
                         }
                     }
                 }
@@ -2431,9 +2392,7 @@ fn element_link(
         .to_signal(signal::from_stream(to_stream).map(|t| t.unwrap_or_default()))
         .new_tab(NewTab::new())
         .on_hovered_change(move |is_hovered| {
-            if let Err(e) = hovered_sender.unbounded_send(is_hovered) {
-                zoon::println!("[DOM] hovered change event send failed: {e}");
-            }
+            hovered_sender.send_or_drop(is_hovered);
         })
         .update_raw_el(|raw_el| {
             raw_el.style_signal("text-decoration", underline_signal)

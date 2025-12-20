@@ -2,6 +2,17 @@
 
 All inter-actor communication uses bounded, named channels with explicit backpressure handling.
 
+## Migration Progress
+
+| Category | Done | TODO | Notes |
+|----------|------|------|-------|
+| engine.rs (core actors) | 20 | 0 | ✅ Complete |
+| engine.rs (additional) | 2 | 1 | LINK ✅, forwarding ✅, List changes (needs async restructure) |
+| evaluator.rs | 4 | 0 | ✅ Complete (WHILE, object fields, HOLD state) |
+| bridge.rs (DOM events) | 10 | 0 | ✅ Complete - all use `send_or_drop()` |
+| api.rs | 1 | 0 | ✅ Complete |
+| **Total** | **37** | **1** | List.changes requires async loop restructure |
+
 ## Overview
 
 The Boon engine uses an actor model where components communicate via message-passing channels. This architecture enables:
@@ -82,42 +93,70 @@ To disable for production: `cargo build --no-default-features`
 
 ## Channel Registry
 
-### engine.rs
+### engine.rs (core actors)
 
-| Component | Channel Name | Capacity | Strategy |
-|-----------|--------------|----------|----------|
-| ValueActor | `value_actor.messages` | 16 | block |
-| ValueActor | `value_actor.subscriptions` | 32 | block |
-| ValueActor | `value_actor.direct_store` | 64 | block |
-| ValueActor | `value_actor.queries` | 8 | block |
-| LazyValueActor | `lazy_value_actor.requests` | 16 | block |
-| ConstructStorage | `construct_storage.inserter` | 32 | block |
-| ConstructStorage | `construct_storage.getter` | 32 | block |
-| VirtualFilesystem | `virtual_fs.requests` | 32 | block |
-| ReferenceConnector | `reference_connector.inserter` | 64 | try_send |
-| ReferenceConnector | `reference_connector.getter` | 64 | try_send |
-| LinkConnector | `link_connector.inserter` | 64 | try_send |
-| LinkConnector | `link_connector.getter` | 64 | try_send |
-| PassThroughConnector | `pass_through.ops` | 32 | try_send |
-| PassThroughConnector | `pass_through.getter` | 32 | try_send |
-| PassThroughConnector | `pass_through.sender_getter` | 32 | try_send |
-| ActorOutputValveSignal | `output_valve.subscriptions` | 32 | try_send |
-| List | `list.change_subscribers` | 32 | try_send |
-| List | `list.diff_subscribers` | 32 | try_send |
-| List | `list.diff_queries` | 16 | try_send |
-| BackpressuredStream | (demand signal) | 1 | try_send |
+| Component | Channel Name | Capacity | Strategy | Status |
+|-----------|--------------|----------|----------|--------|
+| ValueActor | `value_actor.messages` | 16 | block | ✅ |
+| ValueActor | `value_actor.subscriptions` | 32 | block | ✅ |
+| ValueActor | `value_actor.direct_store` | 64 | block | ✅ |
+| ValueActor | `value_actor.queries` | 8 | block | ✅ |
+| LazyValueActor | `lazy_value_actor.requests` | 16 | block | ✅ |
+| ConstructStorage | `construct_storage.inserter` | 32 | block | ✅ |
+| ConstructStorage | `construct_storage.getter` | 32 | block | ✅ |
+| VirtualFilesystem | `virtual_fs.requests` | 32 | block | ✅ |
+| ReferenceConnector | `reference_connector.inserter` | 64 | try_send | ✅ |
+| ReferenceConnector | `reference_connector.getter` | 64 | try_send | ✅ |
+| LinkConnector | `link_connector.inserter` | 64 | try_send | ✅ |
+| LinkConnector | `link_connector.getter` | 64 | try_send | ✅ |
+| PassThroughConnector | `pass_through.ops` | 32 | try_send | ✅ |
+| PassThroughConnector | `pass_through.getter` | 32 | try_send | ✅ |
+| PassThroughConnector | `pass_through.sender_getter` | 32 | try_send | ✅ |
+| ActorOutputValveSignal | `output_valve.subscriptions` | 32 | try_send | ✅ |
+| List | `list.change_subscribers` | 32 | try_send | ✅ |
+| List | `list.diff_subscribers` | 32 | try_send | ✅ |
+| List | `list.diff_queries` | 16 | try_send | ✅ |
+| BackpressuredStream | (demand signal) | 1 | try_send | ✅ |
 
 ### evaluator.rs
 
-| Component | Channel Name | Capacity | Strategy |
-|-----------|--------------|----------|----------|
-| ModuleLoader | `module_loader.requests` | 16 | try_send |
+| Component | Channel Name | Capacity | Strategy | Status |
+|-----------|--------------|----------|----------|--------|
+| ModuleLoader | `module_loader.requests` | 16 | try_send | ✅ |
+| WHILE | `while.pass_through` | 64 | block | ✅ |
+| Object fields | `object.field_stream` | 32 | block | ✅ |
+| HOLD state | `hold.state_updates` | 16 | block | ✅ |
+
+### bridge.rs (DOM Events)
+
+All DOM event channels use `send_or_drop()` - dropping events is acceptable for UI responsiveness.
+
+| Component | Channel Name | Capacity | Strategy | Status |
+|-----------|--------------|----------|----------|--------|
+| Element | `element.hovered` | 2 | send_or_drop | ✅ |
+| Button | `button.press_event` | 8 | send_or_drop | ✅ |
+| Button | `button.hovered` | 2 | send_or_drop | ✅ |
+| TextInput | `text_input.change` | 16 | send_or_drop | ✅ |
+| TextInput | `text_input.key_down` | 32 | send_or_drop | ✅ |
+| TextInput | `text_input.blur` | 8 | send_or_drop | ✅ |
+| Checkbox | `checkbox.click` | 8 | send_or_drop | ✅ |
+| DoubleClick | `double_click.event` | 8 | send_or_drop | ✅ |
+| DoubleClick | `double_click.hovered` | 2 | send_or_drop | ✅ |
+| Link | `link.hovered` | 2 | send_or_drop | ✅ |
+
+### engine.rs (additional)
+
+| Component | Channel Name | Capacity | Strategy | Status |
+|-----------|--------------|----------|----------|--------|
+| LINK | `link.values` | 128 | send_or_drop | ✅ |
+| Forwarding | `forwarding.values` | 64 | block | ✅ |
+| List | `list.changes` | 64 | block | ❌ TODO (requires async restructure) |
 
 ### api.rs
 
-| Component | Channel Name | Capacity | Strategy |
-|-----------|--------------|----------|----------|
-| Router | (route changes) | 8 | try_send |
+| Component | Channel Name | Capacity | Strategy | Status |
+|-----------|--------------|----------|----------|--------|
+| Router | (route changes) | 8 | try_send | ✅ |
 
 ## BackpressureCoordinator
 
