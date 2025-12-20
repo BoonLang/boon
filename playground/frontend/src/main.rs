@@ -87,7 +87,6 @@ static EXAMPLE_DATAS: [ExampleData; 24] = [
     make_example_data!("switch_hold_test"),
     make_example_data!("filter_checkbox_bug"),
     make_example_data!("chained_list_remove_bug"),
-    make_example_data!("then_freeze_bug"),
 ];
 
 #[derive(Clone, Copy)]

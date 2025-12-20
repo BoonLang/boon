@@ -2,13 +2,22 @@
 -- Bug: When two List/remove are chained, the second's removal state is lost
 -- on upstream changes (like Push), causing cleared items to reappear.
 --
--- Reproduction steps:
+-- Test Scenario 1 (pre-created item):
 -- 1. Check "Item A" checkbox (marks as completed)
 -- 2. Click "Clear completed" button
 -- 3. Add a new item via "Add Item" button
 -- 4. Click "X" to remove the new item
 -- Expected: List shows only "Item B"
 -- Actual (BUG): "Item A" reappears (checked)
+--
+-- Test Scenario 2 (dynamically added item):
+-- 1. Add new item via "Add Item" button
+-- 2. Check the NEW item (marks as completed)
+-- 3. Click "Clear completed" button
+-- 4. Add another new item via "Add Item" button
+-- 5. Click "X" to remove the second new item
+-- Expected: Only Item A and Item B remain
+-- Actual (BUG): First new item reappears (checked)
 --
 -- Root cause: ListChange::Replace from upstream List/remove reset downstream
 -- state without preserving which items were already marked as removed.
@@ -18,7 +27,7 @@ store: [
         add_button: LINK
         clear_completed_button: LINK
     ]
-    next_id: 1 |> HOLD state {
+    next_id: 2 |> HOLD state {
         elements.add_button.event.press |> THEN { state + 1 }
     }
     item_to_add: elements.add_button.event.press |> THEN {
@@ -139,9 +148,13 @@ document: Document/new(root: Element/stripe(
             gap: 5
             style: [font: [size: 12, color: Oklch[lightness: 0.6]]]
             items: LIST {
-                Element/label(element: [], style: [], label: TEXT { Test: 1. Check Item A, 2. Clear completed, 3. Add Item, 4. X remove new item })
+                Element/label(element: [], style: [font: [weight: Bold]], label: TEXT { Test 1 (pre-created): })
+                Element/label(element: [], style: [], label: TEXT { 1. Check Item A, 2. Clear completed, 3. Add Item, 4. X remove new item })
                 Element/label(element: [], style: [], label: TEXT { Pass: Only Item B remains })
-                Element/label(element: [], style: [], label: TEXT { Fail: Item A reappears (checked) })
+                Element/label(element: [], style: [], label: TEXT { })
+                Element/label(element: [], style: [font: [weight: Bold]], label: TEXT { Test 2 (dynamic): })
+                Element/label(element: [], style: [], label: TEXT { 1. Add Item, 2. Check new item, 3. Clear, 4. Add Item, 5. X remove })
+                Element/label(element: [], style: [], label: TEXT { Pass: Only Item A and Item B remain })
             }
         )
     }
