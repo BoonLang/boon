@@ -2,7 +2,7 @@ use std::future;
 use std::sync::Arc;
 
 use zoon::Timer;
-use zoon::futures_util::{select, stream::{self, LocalBoxStream, Stream, StreamExt}, FutureExt};
+use zoon::futures_util::{select, stream::{self, LocalBoxStream, Stream, StreamExt}, FutureExt, SinkExt};
 use zoon::futures_channel::mpsc;
 use zoon::{Deserialize, Serialize, serde};
 use zoon::{window, history, Closure, JsValue, UnwrapThrowExt, JsCast, SendWrapper};
@@ -2207,11 +2207,13 @@ pub fn function_log_info(
     let value_actor = arguments[0].clone();
     let with_actor = arguments.get(1).cloned();
 
-    value_actor.stream_sync().map(move |value| {
-        let with_actor = with_actor.clone();
-        let value_clone = value.clone();
-        // Spawn async task to resolve all nested values and log
-        zoon::Task::start(async move {
+    // Create a bounded channel for log requests - actor model compliant pattern
+    let (log_sender, log_receiver) = mpsc::channel::<(Value, Option<Arc<ValueActor>>)>(16);
+
+    // Create an ActorLoop that processes log messages
+    let log_actor = ActorLoop::new(async move {
+        let mut receiver = log_receiver;
+        while let Some((value, with_actor)) = receiver.next().await {
             // Extract options (label and timeout) from 'with' object
             let options = if let Some(with) = with_actor {
                 extract_log_options_from_with(with).await
@@ -2219,18 +2221,36 @@ pub fn function_log_info(
                 LogOptions::default()
             };
             // Resolve value with the configured timeout
-            let value_str = resolve_value_for_log_with_timeout(value_clone, options.timeout_ms).await;
+            let value_str = resolve_value_for_log_with_timeout(value, options.timeout_ms).await;
             // Log with or without label
             match options.label {
                 Some(label) if !label.is_empty() => zoon::println!("[INFO] {}: {}", label, value_str),
                 _ => zoon::println!("[INFO] {}", value_str),
             }
-        });
-        // Pass through the input value immediately for chaining
-        value
-    })
-    // Chain with pending() to keep stream alive forever - prevents actor termination
-    .chain(stream::pending())
+        }
+    });
+
+    // Use unfold to emit values while keeping the log actor alive
+    let value_stream = value_actor.stream_sync();
+    stream::unfold(
+        (value_stream.boxed_local(), log_sender, Some(log_actor)),
+        move |(mut stream, mut sender, actor)| {
+            let with_actor = with_actor.clone();
+            async move {
+                if let Some(value) = stream.next().await {
+                    // Send log request to the actor (backpressure if channel full)
+                    if sender.send((value.clone(), with_actor)).await.is_err() {
+                        zoon::eprintln!("[Log/info] Failed to send log request - receiver dropped");
+                    }
+                    Some((value, (stream, sender, actor)))
+                } else {
+                    // Input stream ended - keep actor alive with pending
+                    let _keep_alive = &actor;
+                    future::pending::<Option<(Value, (LocalBoxStream<'static, Value>, mpsc::Sender<(Value, Option<Arc<ValueActor>>)>, Option<ActorLoop>))>>().await
+                }
+            }
+        }
+    )
 }
 
 /// Log/error(value: T) -> T
@@ -2250,11 +2270,13 @@ pub fn function_log_error(
     let value_actor = arguments[0].clone();
     let with_actor = arguments.get(1).cloned();
 
-    value_actor.stream_sync().map(move |value| {
-        let with_actor = with_actor.clone();
-        let value_clone = value.clone();
-        // Spawn async task to resolve all nested values and log
-        zoon::Task::start(async move {
+    // Create a bounded channel for log requests - actor model compliant pattern
+    let (log_sender, log_receiver) = mpsc::channel::<(Value, Option<Arc<ValueActor>>)>(16);
+
+    // Create an ActorLoop that processes log messages
+    let log_actor = ActorLoop::new(async move {
+        let mut receiver = log_receiver;
+        while let Some((value, with_actor)) = receiver.next().await {
             // Extract options (label and timeout) from 'with' object
             let options = if let Some(with) = with_actor {
                 extract_log_options_from_with(with).await
@@ -2262,18 +2284,36 @@ pub fn function_log_error(
                 LogOptions::default()
             };
             // Resolve value with the configured timeout
-            let value_str = resolve_value_for_log_with_timeout(value_clone, options.timeout_ms).await;
+            let value_str = resolve_value_for_log_with_timeout(value, options.timeout_ms).await;
             // Log with or without label
             match options.label {
                 Some(label) if !label.is_empty() => zoon::eprintln!("[ERROR] {}: {}", label, value_str),
                 _ => zoon::eprintln!("[ERROR] {}", value_str),
             }
-        });
-        // Pass through the input value immediately for chaining
-        value
-    })
-    // Chain with pending() to keep stream alive forever - prevents actor termination
-    .chain(stream::pending())
+        }
+    });
+
+    // Use unfold to emit values while keeping the log actor alive
+    let value_stream = value_actor.stream_sync();
+    stream::unfold(
+        (value_stream.boxed_local(), log_sender, Some(log_actor)),
+        move |(mut stream, mut sender, actor)| {
+            let with_actor = with_actor.clone();
+            async move {
+                if let Some(value) = stream.next().await {
+                    // Send log request to the actor (backpressure if channel full)
+                    if sender.send((value.clone(), with_actor)).await.is_err() {
+                        zoon::eprintln!("[Log/error] Failed to send log request - receiver dropped");
+                    }
+                    Some((value, (stream, sender, actor)))
+                } else {
+                    // Input stream ended - keep actor alive with pending
+                    let _keep_alive = &actor;
+                    future::pending::<Option<(Value, (LocalBoxStream<'static, Value>, mpsc::Sender<(Value, Option<Arc<ValueActor>>)>, Option<ActorLoop>))>>().await
+                }
+            }
+        }
+    )
 }
 
 // --- Build functions ---

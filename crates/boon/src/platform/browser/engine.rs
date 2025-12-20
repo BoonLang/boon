@@ -5342,6 +5342,8 @@ pub struct List {
     notify_sender_sender: NamedChannel<mpsc::Sender<()>>,
     /// Channel for querying diff history (actor-owned, no RefCell)
     diff_query_sender: NamedChannel<DiffHistoryQuery>,
+    /// Optional persistence actor loop - keeps alive for list's lifetime
+    persistence_loop: Option<ActorLoop>,
 }
 
 impl List {
@@ -5519,7 +5521,13 @@ impl List {
             current_version,
             notify_sender_sender,
             diff_query_sender,
+            persistence_loop: None,
         }
+    }
+
+    /// Set the persistence actor loop. The loop will be kept alive for the list's lifetime.
+    pub fn set_persistence_loop(&mut self, loop_: ActorLoop) {
+        self.persistence_loop = Some(loop_);
     }
 
     /// Get current version.
@@ -5706,96 +5714,147 @@ impl List {
 
         // Create a stream that:
         // 1. First emits loaded items from storage (or code items if nothing saved)
-        // 2. Then wraps further changes to save them
+        // 2. Then keeps the persistence loop alive
         let construct_context_for_load = construct_context.clone();
         let actor_context_for_load = actor_context.clone();
         let actor_id_for_load = actor_id.clone();
 
-        let value_stream = stream::once(async move {
-            // Try to load from storage
-            let loaded_items: Option<Vec<serde_json::Value>> = construct_storage
-                .clone()
-                .load_state(persistence_id)
-                .await;
+        // State for unfold: Some(init_data) means not yet initialized, None means already initialized
+        enum InitState {
+            NotInitialized {
+                construct_storage: Arc<ConstructStorage>,
+                persistence_id: parser::PersistenceId,
+                code_items: Vec<Arc<ValueActor>>,
+                actor_id: ConstructId,
+                persistence_data: parser::Persistence,
+                construct_context: ConstructContext,
+                actor_context: ActorContext,
+                idempotency_key: ValueIdempotencyKey,
+            },
+            Initialized {
+                persistence_loop: ActorLoop,
+            },
+        }
 
-            let initial_items = if let Some(json_items) = loaded_items {
-                // Merge code_items with loaded_items:
-                // - Use code_items for their reactivity
-                // - If storage has MORE items than code, load extras from JSON
-                // - If code has MORE items than storage, use the code items
-                let code_items_len = code_items.len();
-                let json_items_len = json_items.len();
-                let max_len = code_items_len.max(json_items_len);
+        let value_stream = stream::unfold(
+            InitState::NotInitialized {
+                construct_storage,
+                persistence_id,
+                code_items,
+                actor_id: actor_id_for_load,
+                persistence_data,
+                construct_context: construct_context_for_load,
+                actor_context: actor_context_for_load,
+                idempotency_key,
+            },
+            |state| async move {
+                match state {
+                    InitState::NotInitialized {
+                        construct_storage,
+                        persistence_id,
+                        code_items,
+                        actor_id,
+                        persistence_data,
+                        construct_context,
+                        actor_context,
+                        idempotency_key,
+                    } => {
+                        // Try to load from storage (clone the Arc since load_state takes ownership)
+                        let loaded_items: Option<Vec<serde_json::Value>> = construct_storage
+                            .clone()
+                            .load_state(persistence_id)
+                            .await;
 
-                (0..max_len)
-                    .map(|i| {
-                        if i < code_items_len {
-                            // Use code item for reactivity
-                            code_items[i].clone()
+                        let initial_items = if let Some(json_items) = loaded_items {
+                            // Merge code_items with loaded_items:
+                            // - Use code_items for their reactivity
+                            // - If storage has MORE items than code, load extras from JSON
+                            // - If code has MORE items than storage, use the code items
+                            let code_items_len = code_items.len();
+                            let json_items_len = json_items.len();
+                            let max_len = code_items_len.max(json_items_len);
+
+                            (0..max_len)
+                                .map(|i| {
+                                    if i < code_items_len {
+                                        // Use code item for reactivity
+                                        code_items[i].clone()
+                                    } else {
+                                        // Load extra items from JSON (beyond code_items)
+                                        value_actor_from_json(
+                                            &json_items[i],
+                                            actor_id.with_child_id(format!("loaded_item_{i}")),
+                                            construct_context.clone(),
+                                            parser::PersistenceId::new(),
+                                            actor_context.clone(),
+                                        )
+                                    }
+                                })
+                                .collect()
                         } else {
-                            // Load extra items from JSON (beyond code_items)
-                            value_actor_from_json(
-                                &json_items[i],
-                                actor_id_for_load.with_child_id(format!("loaded_item_{i}")),
-                                construct_context_for_load.clone(),
-                                parser::PersistenceId::new(),
-                                actor_context_for_load.clone(),
-                            )
-                        }
-                    })
-                    .collect()
-            } else {
-                // Use code-defined items
-                code_items
-            };
+                            // Use code-defined items
+                            code_items
+                        };
 
-            // Create the inner list
-            let inner_construct_info = ConstructInfo::new(
-                actor_id_for_load.with_child_id("persistent_list"),
-                Some(persistence_data),
-                "Persistent List",
-            );
-            let list = List::new_arc(
-                inner_construct_info,
-                construct_context_for_load.clone(),
-                actor_context_for_load.clone(),
-                initial_items,
-            );
+                        // Create the inner list
+                        let inner_construct_info = ConstructInfo::new(
+                            actor_id.with_child_id("persistent_list"),
+                            Some(persistence_data),
+                            "Persistent List",
+                        );
+                        let list = List::new(
+                            inner_construct_info,
+                            construct_context.clone(),
+                            actor_context.clone(),
+                            initial_items,
+                        );
 
-            // Start a background task to save changes
-            let list_for_save = list.clone();
-            let construct_storage_for_save = construct_storage;
-            Task::start(async move {
-                let mut change_stream = pin!(list_for_save.clone().stream());
-                while let Some(change) = change_stream.next().await {
-                    // After any change, serialize and save the current list
-                    if let ListChange::Replace { ref items } = change {
-                        let mut json_items = Vec::new();
-                        for item in items {
-                            if let Some(value) = item.clone().stream().await.next().await {
-                                json_items.push(value.to_json().await);
-                            }
-                        }
-                        construct_storage_for_save.save_state(persistence_id, &json_items).await;
-                    } else {
-                        // For incremental changes, we need to get the full list and save it
-                        // This is done by getting the next Replace event after the change is applied
-                        // But for simplicity, let's re-subscribe to get the current state
-                        if let Some(ListChange::Replace { items }) = list_for_save.clone().stream().next().await {
-                            let mut json_items = Vec::new();
-                            for item in &items {
-                                if let Some(value) = item.clone().stream().await.next().await {
-                                    json_items.push(value.to_json().await);
+                        // Create persistence actor loop to save changes
+                        // Using ActorLoop instead of Task::start for pure actor model compliance
+                        let list_arc = Arc::new(list);
+                        let list_for_save = list_arc.clone();
+                        let construct_storage_for_save = construct_storage;
+                        let persistence_loop = ActorLoop::new(async move {
+                            let mut change_stream = pin!(list_for_save.clone().stream());
+                            while let Some(change) = change_stream.next().await {
+                                // After any change, serialize and save the current list
+                                if let ListChange::Replace { ref items } = change {
+                                    let mut json_items = Vec::new();
+                                    for item in items {
+                                        // ValueActor::stream() returns a Future, await it to get the Stream
+                                        if let Some(value) = item.clone().stream().await.next().await {
+                                            json_items.push(value.to_json().await);
+                                        }
+                                    }
+                                    construct_storage_for_save.save_state(persistence_id, &json_items).await;
+                                } else {
+                                    // For incremental changes, we need to get the full list and save it
+                                    let mut list_stream = pin!(list_for_save.clone().stream());
+                                    if let Some(ListChange::Replace { items }) = list_stream.next().await {
+                                        let mut json_items = Vec::new();
+                                        for item in &items {
+                                            // ValueActor::stream() returns a Future, await it to get the Stream
+                                            if let Some(value) = item.clone().stream().await.next().await {
+                                                json_items.push(value.to_json().await);
+                                            }
+                                        }
+                                        construct_storage_for_save.save_state(persistence_id, &json_items).await;
+                                    }
                                 }
                             }
-                            construct_storage_for_save.save_state(persistence_id, &json_items).await;
-                        }
+                        });
+
+                        let value = Value::List(list_arc, ValueMetadata { idempotency_key });
+                        Some((value, InitState::Initialized { persistence_loop }))
+                    }
+                    InitState::Initialized { persistence_loop } => {
+                        // Keep persistence loop alive forever - never emit another value
+                        let _keep_alive = persistence_loop;
+                        future::pending::<Option<(Value, InitState)>>().await
                     }
                 }
-            });
-
-            Value::List(list, ValueMetadata { idempotency_key })
-        }).chain(stream::pending());
+            }
+        );
 
         let actor_construct_info = ConstructInfo::new(
             actor_id,
