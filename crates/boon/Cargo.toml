@@ -26,6 +26,9 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 # zoon = { path = "../../../MoonZoon/crates/zoon" }
 zoon = { git = "https://github.com/MoonZoon/MoonZoon", rev = "19c6cf6b4d07cd27bee7758977ef1ea4d5b9933d" }
 
+# Enable `sink` feature for Sender to implement Sink trait (required for async .send())
+futures-channel = { version = "0.3", features = ["sink"] }
+
 [features]
 default = ["debug-channels"]
 

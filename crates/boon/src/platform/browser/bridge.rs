@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use zoon::futures_util::{future, select, stream, StreamExt};
 use zoon::futures_channel::mpsc;
-use zoon::{eprintln, *};
+use zoon::*;
 
 use super::engine::{
     ActorContext, ActorLoop, ConstructContext, ConstructInfo, ListChange, Object,
@@ -59,12 +59,12 @@ fn value_to_element(value: Value, construct_context: ConstructContext) -> RawElO
         }
         Value::Object(obj, _) => {
             // Object can't be rendered as element - render as debug info
-            eprintln!("Warning: Object value passed to element context - rendering as empty. Object has {} variables", obj.variables().len());
+            zoon::eprintln!("Warning: Object value passed to element context - rendering as empty. Object has {} variables", obj.variables().len());
             El::new().unify()
         }
         Value::List(_list, _) => {
             // List can't be rendered as a single element - render as debug info
-            eprintln!("Warning: List value passed to element context - rendering as empty");
+            zoon::eprintln!("Warning: List value passed to element context - rendering as empty");
             El::new().unify()
         }
     }
@@ -474,7 +474,7 @@ fn element_stripe(
                                 hover_tag,
                             );
                             if let Err(e) = sender.unbounded_send(event_value) {
-                                log::trace!("[DOM] stripe::hovered event send failed: {e}");
+                                zoon::println!("[DOM] stripe::hovered event send failed: {e}");
                             }
                         }
                     }
@@ -1022,7 +1022,7 @@ fn element_stripe(
         ))
         .on_hovered_change(move |is_hovered| {
             if let Err(e) = hovered_sender.unbounded_send(is_hovered) {
-                log::trace!("[DOM] hovered change event send failed: {e}");
+                zoon::println!("[DOM] hovered change event send failed: {e}");
             }
         })
         .update_raw_el(|raw_el| {
@@ -1259,7 +1259,7 @@ fn element_button(
                             );
                             press_event_object_value_version += 1;
                             if let Err(error) = press_link_value_sender.unbounded_send(press_event_object_value) {
-                                eprintln!("Failed to send button press event to event press link variable: {error}");
+                                zoon::eprintln!("Failed to send button press event to event press link variable: {error}");
                             }
                         }
                     }
@@ -1273,7 +1273,7 @@ fn element_button(
                                 hover_tag,
                             );
                             if let Err(e) = sender.unbounded_send(event_value) {
-                                log::trace!("[DOM] button::hovered event send failed: {e}");
+                                zoon::println!("[DOM] button::hovered event send failed: {e}");
                             }
                         }
                     }
@@ -1581,12 +1581,12 @@ fn element_button(
         .on_press(move || {
             let press_event: PressEvent = ();
             if let Err(error) = press_event_sender.unbounded_send(press_event) {
-                eprintln!("Failed to send button press event from on_press handler: {error}");
+                zoon::eprintln!("Failed to send button press event from on_press handler: {error}");
             }
         })
         .on_hovered_change(move |is_hovered| {
             if let Err(e) = hovered_sender.unbounded_send(is_hovered) {
-                log::trace!("[DOM] hovered change event send failed: {e}");
+                zoon::println!("[DOM] hovered change event send failed: {e}");
             }
         })
         .update_raw_el(|raw_el| {
@@ -1692,7 +1692,7 @@ fn element_text_input(
                                     )],
                                 );
                                 if let Err(e) = sender.unbounded_send(event_value) {
-                                    log::trace!("[DOM] text_input::hovered event send failed: {e}");
+                                    zoon::println!("[DOM] text_input::hovered event send failed: {e}");
                                 }
                             }
                         }
@@ -1734,7 +1734,7 @@ fn element_text_input(
                                 )],
                             );
                             if let Err(e) = sender.unbounded_send(event_value) {
-                                log::trace!("[DOM] text_input::change event send failed: {e}");
+                                zoon::println!("[DOM] text_input::change event send failed: {e}");
                             }
                         } else {
                             pending_change_events.push(text);
@@ -1767,7 +1767,7 @@ fn element_text_input(
                                 )],
                             );
                             if let Err(e) = sender.unbounded_send(event_value) {
-                                log::trace!("[DOM] text_input::key_down event send failed: {e}");
+                                zoon::println!("[DOM] text_input::key_down event send failed: {e}");
                             }
                         }
                     }
@@ -1780,7 +1780,7 @@ fn element_text_input(
                                 [],
                             );
                             if let Err(e) = sender.unbounded_send(event_value) {
-                                log::trace!("[DOM] text_input::blur event send failed: {e}");
+                                zoon::println!("[DOM] text_input::blur event send failed: {e}");
                             }
                         }
                     }
@@ -1983,7 +1983,7 @@ fn element_text_input(
             let sender = change_event_sender.clone();
             move |text| {
                 if let Err(e) = sender.unbounded_send(text.clone()) {
-                    log::trace!("[DOM] text_input on_change event send failed: {e}");
+                    zoon::println!("[DOM] text_input on_change event send failed: {e}");
                 }
             }
         })
@@ -1996,7 +1996,7 @@ fn element_text_input(
                     Key::Other(k) => k.clone(),
                 };
                 if let Err(e) = sender.unbounded_send(key_name) {
-                    log::trace!("[DOM] text_input on_key_down event send failed: {e}");
+                    zoon::println!("[DOM] text_input on_key_down event send failed: {e}");
                 }
             }
         })
@@ -2004,7 +2004,7 @@ fn element_text_input(
             let sender = blur_event_sender.clone();
             move || {
                 if let Err(e) = sender.unbounded_send(()) {
-                    log::trace!("[DOM] text_input on_blur event send failed: {e}");
+                    zoon::println!("[DOM] text_input on_blur event send failed: {e}");
                 }
             }
         })
@@ -2073,7 +2073,7 @@ fn element_checkbox(
                                     [],
                                 );
                                 if let Err(e) = sender.unbounded_send(event_value) {
-                                    log::trace!("[DOM] checkbox pending click event send failed: {e}");
+                                    zoon::println!("[DOM] checkbox pending click event send failed: {e}");
                                 }
                             }
                             pending_clicks = 0;
@@ -2088,7 +2088,7 @@ fn element_checkbox(
                                 [],
                             );
                             if let Err(e) = sender.unbounded_send(event_value) {
-                                log::trace!("[DOM] checkbox click event send failed: {e}");
+                                zoon::println!("[DOM] checkbox click event send failed: {e}");
                             }
                         } else {
                             // Buffer the click to send when sender becomes available
@@ -2128,7 +2128,7 @@ fn element_checkbox(
             let sender = click_event_sender.clone();
             move || {
                 if let Err(e) = sender.unbounded_send(()) {
-                    log::trace!("[DOM] checkbox on_click event send failed: {e}");
+                    zoon::println!("[DOM] checkbox on_click event send failed: {e}");
                 }
             }
         })
@@ -2203,7 +2203,7 @@ fn element_label(
                                 [],
                             );
                             if let Err(e) = sender.unbounded_send(event_value) {
-                                log::trace!("[DOM] label::double_click event send failed: {e}");
+                                zoon::println!("[DOM] label::double_click event send failed: {e}");
                             }
                         }
                     }
@@ -2289,7 +2289,7 @@ fn element_label(
             let sender = double_click_sender.clone();
             move || {
                 if let Err(e) = sender.unbounded_send(()) {
-                    log::trace!("[DOM] label on_double_click event send failed: {e}");
+                    zoon::println!("[DOM] label on_double_click event send failed: {e}");
                 }
             }
         })
@@ -2359,7 +2359,7 @@ fn element_link(
                                 hover_tag,
                             );
                             if let Err(e) = sender.unbounded_send(event_value) {
-                                log::trace!("[DOM] link::hovered event send failed: {e}");
+                                zoon::println!("[DOM] link::hovered event send failed: {e}");
                             }
                         }
                     }
@@ -2432,7 +2432,7 @@ fn element_link(
         .new_tab(NewTab::new())
         .on_hovered_change(move |is_hovered| {
             if let Err(e) = hovered_sender.unbounded_send(is_hovered) {
-                log::trace!("[DOM] hovered change event send failed: {e}");
+                zoon::println!("[DOM] hovered change event send failed: {e}");
             }
         })
         .update_raw_el(|raw_el| {

@@ -1933,12 +1933,12 @@ pub fn function_router_route(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     // Create a bounded channel for route changes (8 should be plenty for navigation)
-    let (route_sender, route_receiver) = mpsc::channel::<String>(8);
+    let (mut route_sender, route_receiver) = mpsc::channel::<String>(8);
 
     // Send initial route
     let initial_path = get_current_pathname();
     if let Err(e) = route_sender.try_send(initial_path) {
-        log::debug!("[ROUTER] Failed to send initial route: {e}");
+        zoon::println!("[ROUTER] Failed to send initial route: {e}");
     }
 
     // Set up popstate listener for browser back/forward navigation
@@ -1946,8 +1946,8 @@ pub fn function_router_route(
         let route_sender = route_sender.clone();
         move || {
             let path = get_current_pathname();
-            if let Err(e) = route_sender.try_send(path) {
-                log::debug!("[ROUTER] Failed to send popstate route: {e}");
+            if let Err(e) = route_sender.clone().try_send(path) {
+                zoon::println!("[ROUTER] Failed to send popstate route: {e}");
             }
         }
     });
@@ -2007,9 +2007,9 @@ pub fn function_router_go_to(
 
             // Notify route listeners about the change
             ROUTE_SENDER.with(|cell| {
-                if let Some(sender) = cell.borrow().as_ref() {
+                if let Some(sender) = cell.borrow_mut().as_mut() {
                     if let Err(e) = sender.try_send(route) {
-                        log::debug!("[ROUTER] Failed to send go_to route: {e}");
+                        zoon::println!("[ROUTER] Failed to send go_to route: {e}");
                     }
                 }
             });
@@ -2163,7 +2163,7 @@ async fn extract_log_options_from_with(with_actor: Arc<ValueActor>) -> LogOption
         // Extract label
         if let Some(label_var) = obj.variable("label") {
             if let Some(label_value) = label_var.value_actor().stream().await.next().await {
-                options.label = Some(resolve_value_for_log(label_value).await);
+                options.label = Some(resolve_value_for_log(label_value, options.timeout_ms).await);
             }
         }
 

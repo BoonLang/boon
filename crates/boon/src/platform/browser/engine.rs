@@ -24,19 +24,29 @@ use zoon::futures_util::stream::{self, LocalBoxStream, Stream, StreamExt};
 use zoon::{Deserialize, DeserializeOwned, Serialize, serde, serde_json};
 use zoon::{Task, TaskHandle};
 use zoon::{WebStorage, local_storage};
-use zoon::{eprintln, println};
+use zoon::futures_util::SinkExt;
 
 // --- NamedChannel ---
 
 /// Error returned by `NamedChannel::send()`.
+/// Note: The value is lost because it was consumed by the send future.
 #[derive(Debug)]
-pub enum ChannelError<T> {
+pub enum ChannelError {
     /// Channel is closed (receiver dropped).
-    Closed(T),
+    Closed,
     /// Send timed out (only in debug-channels mode).
-    /// Note: The value is lost because it was consumed by the send future.
     #[cfg(feature = "debug-channels")]
     Timeout,
+}
+
+impl std::fmt::Display for ChannelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChannelError::Closed => write!(f, "channel closed"),
+            #[cfg(feature = "debug-channels")]
+            ChannelError::Timeout => write!(f, "send timeout"),
+        }
+    }
 }
 
 /// Wrapper around mpsc::Sender with debugging capabilities.
@@ -114,22 +124,23 @@ impl<T> NamedChannel<T> {
     /// In production (no debug-channels feature): blocks until space is available.
     /// In debug mode (debug-channels feature): times out after 5 seconds with error log.
     #[cfg(feature = "debug-channels")]
-    pub async fn send(&self, value: T) -> Result<(), ChannelError<T>> {
+    pub async fn send(&self, value: T) -> Result<(), ChannelError> {
         use zoon::Timer;
 
         // 5 second timeout for debug mode
         const TIMEOUT_MS: u32 = 5000;
 
-        let send_fut = self.inner.clone().send(value);
+        let mut sender = self.inner.clone();
+        let send_fut = sender.send(value);
 
         select! {
             result = send_fut.fuse() => {
-                result.map_err(|e| ChannelError::Closed(e.into_inner()))
+                result.map_err(|_e| ChannelError::Closed)
             }
             _ = Timer::sleep(TIMEOUT_MS).fuse() => {
                 // The value is lost - it was consumed by the send future.
                 // Log the error - this is a potential deadlock
-                eprintln!(
+                zoon::eprintln!(
                     "[CHANNEL TIMEOUT] '{}' blocked for {}ms (capacity: {}) - possible deadlock!",
                     self.name, TIMEOUT_MS, self.capacity
                 );
@@ -140,12 +151,12 @@ impl<T> NamedChannel<T> {
 
     /// Async send (production mode - no timeout).
     #[cfg(not(feature = "debug-channels"))]
-    pub async fn send(&self, value: T) -> Result<(), ChannelError<T>> {
+    pub async fn send(&self, value: T) -> Result<(), ChannelError> {
         self.inner
             .clone()
             .send(value)
             .await
-            .map_err(|e| ChannelError::Closed(e.into_inner()))
+            .map_err(|_e| ChannelError::Closed)
     }
 
     /// Fire-and-forget send - logs if dropped (for DOM events and other droppable events).
@@ -156,7 +167,7 @@ impl<T> NamedChannel<T> {
         if self.inner.clone().try_send(value).is_err() {
             // Log at debug level - this is expected behavior for high-frequency events
             #[cfg(feature = "debug-channels")]
-            eprintln!(
+            zoon::eprintln!(
                 "[BACKPRESSURE DROP] '{}' dropped event (full, capacity: {})",
                 self.name, self.capacity
             );
@@ -172,7 +183,7 @@ impl<T> NamedChannel<T> {
         let result = self.inner.clone().try_send(value);
         if result.is_err() {
             #[cfg(feature = "debug-channels")]
-            eprintln!(
+            zoon::eprintln!(
                 "[BACKPRESSURE] '{}' channel full (capacity: {})",
                 self.name, self.capacity
             );
@@ -531,8 +542,8 @@ impl<S> BackpressuredStream<S> {
     /// Signal initial demand (call once after creation to start flow).
     pub fn signal_initial_demand(&self) {
         // Bounded(1) channel - if full, demand already signaled
-        if let Err(e) = self.demand_tx.try_send(()) {
-            log::trace!("[BACKPRESSURED_STREAM] Initial demand signal failed: {e}");
+        if let Err(e) = self.demand_tx.clone().try_send(()) {
+            zoon::println!("[BACKPRESSURED_STREAM] Initial demand signal failed: {e}");
         }
     }
 }
@@ -632,7 +643,7 @@ impl BackpressureCoordinator {
             }
 
             if LOG_DROPS_AND_LOOP_ENDS {
-                println!("Loop ended: BackpressureCoordinator");
+                zoon::println!("Loop ended: BackpressureCoordinator");
             }
         });
 
@@ -664,7 +675,7 @@ impl BackpressureCoordinator {
 
         // Wait for grant (if coordinator dropped, we just proceed - shutdown case)
         if grant_rx.await.is_err() {
-            log::trace!("[BACKPRESSURE] Grant channel closed during acquire");
+            zoon::println!("[BACKPRESSURE] Grant channel closed during acquire");
         }
     }
 
@@ -677,7 +688,7 @@ impl BackpressureCoordinator {
             Ok(()) => {}
             Err(e) if e.is_full() => {
                 // This shouldn't happen - indicates double release or logic bug
-                eprintln!(
+                zoon::eprintln!(
                     "[BACKPRESSURE BUG] release() failed - completion channel full (double release?)"
                 );
             }
@@ -829,12 +840,12 @@ impl LazyValueActor {
 
             // Send response to subscriber (subscriber may have dropped)
             if request.response_tx.send(value).is_err() {
-                log::trace!("[LAZY_ACTOR] Subscriber dropped before receiving value");
+                zoon::println!("[LAZY_ACTOR] Subscriber dropped before receiving value");
             }
         }
 
         if LOG_DROPS_AND_LOOP_ENDS {
-            println!("LazyValueActor loop ended: {}", construct_info);
+            zoon::println!("LazyValueActor loop ended: {}", construct_info);
         }
     }
 
@@ -863,7 +874,7 @@ impl LazyValueActor {
 impl Drop for LazyValueActor {
     fn drop(&mut self) {
         if LOG_DROPS_AND_LOOP_ENDS {
-            println!("Dropped LazyValueActor: {}", self.construct_info);
+            zoon::println!("Dropped LazyValueActor: {}", self.construct_info);
         }
     }
 }
@@ -1118,7 +1129,7 @@ impl VirtualFilesystem {
                         let normalized = Self::normalize_path(&path);
                         let result = files.get(&normalized).cloned();
                         if reply.send(result).is_err() {
-                            log::trace!("[VFS] ReadText reply receiver dropped for {}", path);
+                            zoon::println!("[VFS] ReadText reply receiver dropped for {}", path);
                         }
                     }
                     FsRequest::WriteText { path, content } => {
@@ -1129,14 +1140,14 @@ impl VirtualFilesystem {
                         let normalized = Self::normalize_path(&path);
                         let exists = files.contains_key(&normalized);
                         if reply.send(exists).is_err() {
-                            log::trace!("[VFS] Exists reply receiver dropped for {}", path);
+                            zoon::println!("[VFS] Exists reply receiver dropped for {}", path);
                         }
                     }
                     FsRequest::Delete { path, reply } => {
                         let normalized = Self::normalize_path(&path);
                         let was_present = files.remove(&normalized).is_some();
                         if reply.send(was_present).is_err() {
-                            log::trace!("[VFS] Delete reply receiver dropped for {}", path);
+                            zoon::println!("[VFS] Delete reply receiver dropped for {}", path);
                         }
                     }
                     FsRequest::ListDirectory { path, reply } => {
@@ -1169,7 +1180,7 @@ impl VirtualFilesystem {
                         entries.sort();
                         entries.dedup();
                         if reply.send(entries).is_err() {
-                            log::trace!("[VFS] ListDirectory reply receiver dropped for {}", path);
+                            zoon::println!("[VFS] ListDirectory reply receiver dropped for {}", path);
                         }
                     }
                 }
@@ -1189,7 +1200,7 @@ impl VirtualFilesystem {
             path: path.to_string(),
             reply: tx,
         }).await {
-            log::warn!("[VFS] Failed to send ReadText request for {}: {e}", path);
+            zoon::eprintln!("[VFS] Failed to send ReadText request for {}: {e}", path);
             return None;
         }
         rx.await.ok().flatten()
@@ -1213,7 +1224,7 @@ impl VirtualFilesystem {
             path: path.to_string(),
             reply: tx,
         }).await {
-            log::warn!("[VFS] Failed to send ListDirectory request for {}: {e}", path);
+            zoon::eprintln!("[VFS] Failed to send ListDirectory request for {}: {e}", path);
             return Vec::new();
         }
         rx.await.unwrap_or_default()
@@ -1226,7 +1237,7 @@ impl VirtualFilesystem {
             path: path.to_string(),
             reply: tx,
         }).await {
-            log::warn!("[VFS] Failed to send Exists request for {}: {e}", path);
+            zoon::eprintln!("[VFS] Failed to send Exists request for {}: {e}", path);
             return false;
         }
         rx.await.unwrap_or(false)
@@ -1239,7 +1250,7 @@ impl VirtualFilesystem {
             path: path.to_string(),
             reply: tx,
         }).await {
-            log::warn!("[VFS] Failed to send Delete request for {}: {e}", path);
+            zoon::eprintln!("[VFS] Failed to send Delete request for {}: {e}", path);
             return false;
         }
         rx.await.unwrap_or(false)
@@ -1314,17 +1325,17 @@ impl ConstructStorage {
                             // @TODO remove `.to_string()` call when LocalStorage is replaced with IndexedDB (?)
                             states.insert(persistence_id.to_string(), json_value);
                             if let Err(error) = local_storage().insert(&states_local_storage_key, &states) {
-                                eprintln!("Failed to save states: {error:#}");
+                                zoon::eprintln!("Failed to save states: {error:#}");
                             }
                             if confirmation_sender.send(()).is_err() {
-                                eprintln!("Failed to send save confirmation from construct storage");
+                                zoon::eprintln!("Failed to send save confirmation from construct storage");
                             }
                         },
                         (persistence_id, state_sender) = state_getter_receiver.select_next_some() => {
                             // @TODO Cheaper cloning? Replace get with remove?
                             let state = states.get(&persistence_id.to_string()).cloned();
                             if state_sender.send(state).is_err() {
-                                eprintln!("Failed to send state from construct storage");
+                                zoon::eprintln!("Failed to send state from construct storage");
                             }
                         }
                     }
@@ -1337,7 +1348,7 @@ impl ConstructStorage {
         let json_value = match serde_json::to_value(state) {
             Ok(json_value) => json_value,
             Err(error) => {
-                eprintln!("Failed to save state: {error:#}");
+                zoon::eprintln!("Failed to save state: {error:#}");
                 return;
             }
         };
@@ -1347,7 +1358,7 @@ impl ConstructStorage {
             json_value,
             confirmation_sender,
         )).await.is_err() {
-            eprintln!("Failed to save state: channel closed")
+            zoon::eprintln!("Failed to save state: channel closed")
         }
         confirmation_receiver
             .await
@@ -1366,7 +1377,7 @@ impl ConstructStorage {
             .await
             .is_err()
         {
-            eprintln!("Failed to load state: channel closed")
+            zoon::eprintln!("Failed to load state: channel closed")
         }
         let json_value = state_receiver
             .await
@@ -1560,7 +1571,7 @@ impl ActorOutputValveSignal {
                     select! {
                         impulse = impulse_stream.next() => {
                             if impulse.is_none() { break };
-                            impulse_senders.retain(|impulse_sender| {
+                            impulse_senders.retain_mut(|impulse_sender| {
                                 // try_send for bounded(1) - drop if already signaled
                                 impulse_sender.try_send(()).is_ok()
                             });
@@ -1577,7 +1588,7 @@ impl ActorOutputValveSignal {
     pub fn stream(&self) -> impl Stream<Item = ()> {
         let (impulse_sender, impulse_receiver) = mpsc::channel(1);
         if let Err(error) = self.impulse_sender_sender.try_send(impulse_sender) {
-            eprintln!("Failed to subscribe to actor output valve signal: {error:#}");
+            zoon::eprintln!("Failed to subscribe to actor output valve signal: {error:#}");
         }
         impulse_receiver
     }
@@ -1932,7 +1943,7 @@ impl Variable {
 impl Drop for Variable {
     fn drop(&mut self) {
         if LOG_DROPS_AND_LOOP_ENDS {
-            println!("Dropped: {}", self.construct_info);
+            zoon::println!("Dropped: {}", self.construct_info);
         }
     }
 }
@@ -2126,7 +2137,7 @@ impl ReferenceConnector {
                                     if let Some(senders) = referenceable_senders.remove(&span) {
                                         for sender in senders {
                                             if sender.send(actor.clone()).is_err() {
-                                                eprintln!("Failed to send referenceable actor from reference connector");
+                                                zoon::eprintln!("Failed to send referenceable actor from reference connector");
                                             }
                                         }
                                     }
@@ -2146,7 +2157,7 @@ impl ReferenceConnector {
                                 Some((span, referenceable_sender)) => {
                                     if let Some(actor) = referenceables.get(&span) {
                                         if referenceable_sender.send(actor.clone()).is_err() {
-                                            eprintln!("Failed to send referenceable actor from reference connector");
+                                            zoon::eprintln!("Failed to send referenceable actor from reference connector");
                                         }
                                     } else {
                                         referenceable_senders.entry(span).or_default().push(referenceable_sender);
@@ -2166,7 +2177,7 @@ impl ReferenceConnector {
                 // Explicitly drop the referenceables to ensure actors are cleaned up
                 drop(referenceables);
                 if LOG_DROPS_AND_LOOP_ENDS {
-                    println!("ReferenceConnector loop ended - all actors dropped");
+                    zoon::println!("ReferenceConnector loop ended - all actors dropped");
                 }
             }),
         }
@@ -2177,7 +2188,7 @@ impl ReferenceConnector {
             .referenceable_inserter_sender
             .try_send((span, actor))
         {
-            eprintln!("Failed to register referenceable: {error:#}")
+            zoon::eprintln!("Failed to register referenceable: {error:#}")
         }
     }
 
@@ -2188,7 +2199,7 @@ impl ReferenceConnector {
             .referenceable_getter_sender
             .try_send((span, referenceable_sender))
         {
-            eprintln!("Failed to get referenceable: {error:#}")
+            zoon::eprintln!("Failed to get referenceable: {error:#}")
         }
         referenceable_receiver
             .await
@@ -2235,7 +2246,7 @@ impl LinkConnector {
                                     if let Some(senders) = link_senders.remove(&span) {
                                         for link_sender in senders {
                                             if link_sender.send(sender.clone()).is_err() {
-                                                eprintln!("Failed to send link sender from link connector");
+                                                zoon::eprintln!("Failed to send link sender from link connector");
                                             }
                                         }
                                     }
@@ -2255,7 +2266,7 @@ impl LinkConnector {
                                 Some((span, link_sender)) => {
                                     if let Some(sender) = links.get(&span) {
                                         if link_sender.send(sender.clone()).is_err() {
-                                            eprintln!("Failed to send link sender from link connector");
+                                            zoon::eprintln!("Failed to send link sender from link connector");
                                         }
                                     } else {
                                         link_senders.entry(span).or_default().push(link_sender);
@@ -2275,7 +2286,7 @@ impl LinkConnector {
                 // Explicitly drop the links to ensure channels are cleaned up
                 drop(links);
                 if LOG_DROPS_AND_LOOP_ENDS {
-                    println!("LinkConnector loop ended - all links dropped");
+                    zoon::println!("LinkConnector loop ended - all links dropped");
                 }
             }),
         }
@@ -2287,7 +2298,7 @@ impl LinkConnector {
             .link_inserter_sender
             .try_send((span, sender))
         {
-            eprintln!("Failed to register link: {error:#}")
+            zoon::eprintln!("Failed to register link: {error:#}")
         }
     }
 
@@ -2298,7 +2309,7 @@ impl LinkConnector {
             .link_getter_sender
             .try_send((span, link_sender))
         {
-            eprintln!("Failed to get link sender: {error:#}")
+            zoon::eprintln!("Failed to get link sender: {error:#}")
         }
         link_receiver
             .await
@@ -2377,7 +2388,7 @@ impl PassThroughConnector {
                                 Some(PassThroughOp::Forward { key, value }) => {
                                     if let Some((sender, _, _)) = pass_throughs.get(&key) {
                                         if let Err(e) = sender.unbounded_send(value) {
-                                            log::debug!("[PASS_THROUGH] Forward failed for key {:?}: {e}", key);
+                                            zoon::println!("[PASS_THROUGH] Forward failed for key {:?}: {e}", key);
                                         }
                                     }
                                 }
@@ -2397,7 +2408,7 @@ impl PassThroughConnector {
                                 Some((key, response_sender)) => {
                                     let actor = pass_throughs.get(&key).map(|(_, actor, _)| actor.clone());
                                     if response_sender.send(actor).is_err() {
-                                        log::trace!("[PASS_THROUGH] Getter reply receiver dropped for key {:?}", key);
+                                        zoon::println!("[PASS_THROUGH] Getter reply receiver dropped for key {:?}", key);
                                     }
                                 }
                                 None => {
@@ -2411,7 +2422,7 @@ impl PassThroughConnector {
                                 Some((key, response_sender)) => {
                                     let sender = pass_throughs.get(&key).map(|(sender, _, _)| sender.clone());
                                     if response_sender.send(sender).is_err() {
-                                        log::trace!("[PASS_THROUGH] Sender getter reply receiver dropped for key {:?}", key);
+                                        zoon::println!("[PASS_THROUGH] Sender getter reply receiver dropped for key {:?}", key);
                                     }
                                 }
                                 None => {
@@ -2425,7 +2436,7 @@ impl PassThroughConnector {
 
                 drop(pass_throughs);
                 if LOG_DROPS_AND_LOOP_ENDS {
-                    println!("PassThroughConnector loop ended");
+                    zoon::println!("PassThroughConnector loop ended");
                 }
             }),
         }
@@ -2434,21 +2445,21 @@ impl PassThroughConnector {
     /// Register a new pass-through actor
     pub fn register(&self, key: PassThroughKey, value_sender: mpsc::UnboundedSender<Value>, actor: Arc<ValueActor>) {
         if let Err(e) = self.op_sender.try_send(PassThroughOp::Register { key, value_sender, actor }) {
-            log::warn!("[PASS_THROUGH] Failed to send Register: {e}");
+            zoon::eprintln!("[PASS_THROUGH] Failed to send Register: {e}");
         }
     }
 
     /// Forward a value to an existing pass-through
     pub fn forward(&self, key: PassThroughKey, value: Value) {
         if let Err(e) = self.op_sender.try_send(PassThroughOp::Forward { key, value }) {
-            log::debug!("[PASS_THROUGH] Failed to send Forward: {e}");
+            zoon::println!("[PASS_THROUGH] Failed to send Forward: {e}");
         }
     }
 
     /// Add a forwarder to keep alive for an existing pass-through
     pub fn add_forwarder(&self, key: PassThroughKey, forwarder: Arc<ValueActor>) {
         if let Err(e) = self.op_sender.try_send(PassThroughOp::AddForwarder { key, forwarder }) {
-            log::warn!("[PASS_THROUGH] Failed to send AddForwarder: {e}");
+            zoon::eprintln!("[PASS_THROUGH] Failed to send AddForwarder: {e}");
         }
     }
 
@@ -2456,7 +2467,7 @@ impl PassThroughConnector {
     pub async fn get(&self, key: PassThroughKey) -> Option<Arc<ValueActor>> {
         let (response_sender, response_receiver) = oneshot::channel();
         if let Err(e) = self.getter_sender.try_send((key, response_sender)) {
-            log::warn!("[PASS_THROUGH] Failed to send getter request: {e}");
+            zoon::eprintln!("[PASS_THROUGH] Failed to send getter request: {e}");
             return None;
         }
         response_receiver.await.ok().flatten()
@@ -2466,7 +2477,7 @@ impl PassThroughConnector {
     pub async fn get_sender(&self, key: PassThroughKey) -> Option<mpsc::UnboundedSender<Value>> {
         let (response_sender, response_receiver) = oneshot::channel();
         if let Err(e) = self.sender_getter_sender.try_send((key, response_sender)) {
-            log::warn!("[PASS_THROUGH] Failed to send sender getter request: {e}");
+            zoon::eprintln!("[PASS_THROUGH] Failed to send sender getter request: {e}");
             return None;
         }
         response_receiver.await.ok().flatten()
@@ -2746,7 +2757,7 @@ impl ThenCombinator {
                     let construct_info = construct_info.clone();
                     move |_| {
                         if let Err(error) = impulse_sender.unbounded_send(()) {
-                            eprintln!("Failed to send impulse in {construct_info}: {error:#}")
+                            zoon::eprintln!("Failed to send impulse in {construct_info}: {error:#}")
                         }
                         future::ready(())
                     }
@@ -3431,7 +3442,7 @@ impl ValueActor {
         let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.subscriptions", 32);
 
         // Bounded channel for direct value storage
-        let (direct_store_sender, direct_store_receiver) = NamedChannel::new("value_actor.direct_store", 64);
+        let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new("value_actor.direct_store", 64);
 
         // Bounded channel for stored value queries
         let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.queries", 8);
@@ -3485,7 +3496,7 @@ impl ValueActor {
                                     let (tx, rx) = mpsc::channel(1);
                                     drop(tx); // Close immediately
                                     if reply.send(rx).is_err() {
-                                        log::trace!("[VALUE_ACTOR] Subscription reply receiver dropped (SKIP case)");
+                                        zoon::println!("[VALUE_ACTOR] Subscription reply receiver dropped (SKIP case)");
                                     }
                                 } else {
                                     // Create channel for this subscriber (capacity 32 for buffering)
@@ -3507,7 +3518,7 @@ impl ValueActor {
 
                                     // Reply with the receiver
                                     if reply.send(rx).is_err() {
-                                        log::trace!("[VALUE_ACTOR] Subscription reply receiver dropped");
+                                        zoon::println!("[VALUE_ACTOR] Subscription reply receiver dropped");
                                     }
                                 }
                             }
@@ -3542,7 +3553,7 @@ impl ValueActor {
                             if let Some(StoredValueQuery { reply }) = query {
                                 let current_value = value_history.get_latest();
                                 if reply.send(current_value).is_err() {
-                                    log::trace!("[VALUE_ACTOR] Stored value query reply receiver dropped");
+                                    zoon::println!("[VALUE_ACTOR] Stored value query reply receiver dropped");
                                 }
                             }
                         }
@@ -3642,7 +3653,7 @@ impl ValueActor {
                             if let MigrationState::Migrating { buffered_writes, target, .. } = &mut migration_state {
                                 buffered_writes.push(new_value.clone());
                                 if let Err(e) = target.send_message(ActorMessage::StreamValue(new_value)) {
-                                    log::debug!("[VALUE_ACTOR] Migration forward failed: {e}");
+                                    zoon::println!("[VALUE_ACTOR] Migration forward failed: {e}");
                                 }
                             }
                         }
@@ -3660,7 +3671,7 @@ impl ValueActor {
                 drop(_inputs);
 
                 if LOG_DROPS_AND_LOOP_ENDS {
-                    println!("Loop ended {construct_info}");
+                    zoon::println!("Loop ended {construct_info}");
                 }
             }
         });
@@ -3795,7 +3806,7 @@ impl ValueActor {
 
         // Bounded channels for subscription, direct store, and stored value queries
         let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.initial.subscriptions", 32);
-        let (direct_store_sender, direct_store_receiver) = NamedChannel::new("value_actor.initial.direct_store", 64);
+        let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new("value_actor.initial.direct_store", 64);
         let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.initial.queries", 8);
 
         // Oneshot channel for ready signal - immediately fire since we have initial value
@@ -3843,7 +3854,7 @@ impl ValueActor {
                                     let (tx, rx) = mpsc::channel(1);
                                     drop(tx);
                                     if reply.send(rx).is_err() {
-                                        log::trace!("[VALUE_ACTOR] Subscription reply receiver dropped (SKIP case)");
+                                        zoon::println!("[VALUE_ACTOR] Subscription reply receiver dropped (SKIP case)");
                                     }
                                 } else {
                                     let (mut tx, rx) = mpsc::channel(32);
@@ -3853,7 +3864,7 @@ impl ValueActor {
                                     }
                                     subscribers.push(tx);
                                     if reply.send(rx).is_err() {
-                                        log::trace!("[VALUE_ACTOR] Subscription reply receiver dropped");
+                                        zoon::println!("[VALUE_ACTOR] Subscription reply receiver dropped");
                                     }
                                 }
                             }
@@ -3872,7 +3883,7 @@ impl ValueActor {
                             if let Some(StoredValueQuery { reply }) = query {
                                 let current_value = value_history.get_latest();
                                 if reply.send(current_value).is_err() {
-                                    log::trace!("[VALUE_ACTOR] Stored value query reply receiver dropped");
+                                    zoon::println!("[VALUE_ACTOR] Stored value query reply receiver dropped");
                                 }
                             }
                         }
@@ -3915,7 +3926,7 @@ impl ValueActor {
                 drop(_inputs);
 
                 if LOG_DROPS_AND_LOOP_ENDS {
-                    println!("Loop ended {construct_info}");
+                    zoon::println!("Loop ended {construct_info}");
                 }
             }
         });
@@ -4023,7 +4034,7 @@ impl ValueActor {
             // Send initial value first (awaiting if needed)
             if let Some(value) = initial_value_future.await {
                 if let Err(e) = forwarding_sender.unbounded_send(value) {
-                    log::debug!("[VALUE_ACTOR] Initial forwarding failed: {e}");
+                    zoon::println!("[VALUE_ACTOR] Initial forwarding failed: {e}");
                     return;
                 }
             }
@@ -4058,7 +4069,7 @@ impl ValueActor {
 
         // Bounded channels for subscription, direct store, and stored value queries
         let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.arc_initial.subscriptions", 32);
-        let (direct_store_sender, direct_store_receiver) = NamedChannel::new("value_actor.arc_initial.direct_store", 64);
+        let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new("value_actor.arc_initial.direct_store", 64);
         let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.arc_initial.queries", 8);
 
         // Oneshot channel for ready signal - immediately fire since we have initial value
@@ -4101,7 +4112,7 @@ impl ValueActor {
                         query = stored_value_query_receiver.next() => {
                             if let Some(StoredValueQuery { reply }) = query {
                                 if reply.send(value_history.get_latest()).is_err() {
-                                    log::trace!("[VALUE_ACTOR] Stored value query reply receiver dropped");
+                                    zoon::println!("[VALUE_ACTOR] Stored value query reply receiver dropped");
                                 }
                             }
                         }
@@ -4112,7 +4123,7 @@ impl ValueActor {
                                     let (tx, rx) = mpsc::channel(1);
                                     drop(tx);
                                     if reply.send(rx).is_err() {
-                                        log::trace!("[VALUE_ACTOR] Subscription reply receiver dropped (SKIP case)");
+                                        zoon::println!("[VALUE_ACTOR] Subscription reply receiver dropped (SKIP case)");
                                     }
                                 } else {
                                     let (mut tx, rx) = mpsc::channel(32);
@@ -4122,7 +4133,7 @@ impl ValueActor {
                                     }
                                     subscribers.push(tx);
                                     if reply.send(rx).is_err() {
-                                        log::trace!("[VALUE_ACTOR] Subscription reply receiver dropped");
+                                        zoon::println!("[VALUE_ACTOR] Subscription reply receiver dropped");
                                     }
                                 }
                             }
@@ -4172,7 +4183,7 @@ impl ValueActor {
                     }
                 }
                 if LOG_DROPS_AND_LOOP_ENDS {
-                    println!("Loop ended {construct_info}");
+                    zoon::println!("Loop ended {construct_info}");
                 }
             }
         });
@@ -4260,7 +4271,7 @@ impl ValueActor {
         if self.version() == 0 {
             // Clone the shared future and await it - errors mean sender dropped (actor dead)
             if self.ready_signal.clone().await.is_err() {
-                log::trace!("[VALUE_ACTOR] Ready signal sender dropped - actor may be dead");
+                zoon::println!("[VALUE_ACTOR] Ready signal sender dropped - actor may be dead");
             }
         }
 
@@ -4270,7 +4281,7 @@ impl ValueActor {
             reply: reply_tx,
             starting_version: 0,
         }).await.is_err() {
-            eprintln!("Failed to stream: actor dropped");
+            zoon::eprintln!("Failed to stream: actor dropped");
             // Return empty stream
             return stream::empty().boxed_local();
         }
@@ -4281,7 +4292,7 @@ impl ValueActor {
                 PushSubscription::new(receiver, self).boxed_local()
             }
             Err(_) => {
-                eprintln!("Failed to stream: actor dropped before reply");
+                zoon::eprintln!("Failed to stream: actor dropped before reply");
                 stream::empty().boxed_local()
             }
         }
@@ -4309,7 +4320,7 @@ impl ValueActor {
             reply: reply_tx,
             starting_version: current_version,
         }).await.is_err() {
-            eprintln!("Failed to stream_from_now: actor dropped");
+            zoon::eprintln!("Failed to stream_from_now: actor dropped");
             return stream::empty().boxed_local();
         }
 
@@ -4319,7 +4330,7 @@ impl ValueActor {
                 PushSubscription::new(receiver, self).boxed_local()
             }
             Err(_) => {
-                eprintln!("Failed to stream_from_now: actor dropped before reply");
+                zoon::eprintln!("Failed to stream_from_now: actor dropped before reply");
                 stream::empty().boxed_local()
             }
         }
@@ -4361,7 +4372,7 @@ impl ValueActor {
 impl Drop for ValueActor {
     fn drop(&mut self) {
         if LOG_DROPS_AND_LOOP_ENDS {
-            println!("Dropped: {}", self.construct_info);
+            zoon::println!("Dropped: {}", self.construct_info);
         }
     }
 }
@@ -5078,7 +5089,7 @@ impl Object {
 impl Drop for Object {
     fn drop(&mut self) {
         if LOG_DROPS_AND_LOOP_ENDS {
-            println!("Dropped: {}", self.construct_info);
+            zoon::println!("Dropped: {}", self.construct_info);
         }
     }
 }
@@ -5220,7 +5231,7 @@ impl TaggedObject {
 impl Drop for TaggedObject {
     fn drop(&mut self) {
         if LOG_DROPS_AND_LOOP_ENDS {
-            println!("Dropped: {}", self.construct_info);
+            zoon::println!("Dropped: {}", self.construct_info);
         }
     }
 }
@@ -5325,7 +5336,7 @@ impl Text {
 impl Drop for Text {
     fn drop(&mut self) {
         if LOG_DROPS_AND_LOOP_ENDS {
-            println!("Dropped: {}", self.construct_info);
+            zoon::println!("Dropped: {}", self.construct_info);
         }
     }
 }
@@ -5430,7 +5441,7 @@ impl Tag {
 impl Drop for Tag {
     fn drop(&mut self) {
         if LOG_DROPS_AND_LOOP_ENDS {
-            println!("Dropped: {}", self.construct_info);
+            zoon::println!("Dropped: {}", self.construct_info);
         }
     }
 }
@@ -5535,7 +5546,7 @@ impl Number {
 impl Drop for Number {
     fn drop(&mut self) {
         if LOG_DROPS_AND_LOOP_ENDS {
-            println!("Dropped: {}", self.construct_info);
+            zoon::println!("Dropped: {}", self.construct_info);
         }
     }
 }
@@ -5586,7 +5597,7 @@ impl List {
     ) -> Self {
         let construct_info = Arc::new(construct_info.complete(ConstructType::List));
         let (change_sender_sender, mut change_sender_receiver) =
-            NamedChannel::new("list.change_subscribers", 32);
+            NamedChannel::<mpsc::UnboundedSender<ListChange>>::new("list.change_subscribers", 32);
 
         // Version tracking for push-pull architecture
         let current_version = Arc::new(AtomicU64::new(0));
@@ -5594,11 +5605,11 @@ impl List {
 
         // Channel for diff subscriber registration (bounded channels)
         let (notify_sender_sender, notify_sender_receiver) =
-            NamedChannel::new("list.diff_subscribers", 32);
+            NamedChannel::<mpsc::Sender<()>>::new("list.diff_subscribers", 32);
 
         // Channel for diff history queries (actor-owned, no RefCell)
         let (diff_query_sender, diff_query_receiver) =
-            NamedChannel::new("list.diff_queries", 16);
+            NamedChannel::<DiffHistoryQuery>::new("list.diff_queries", 16);
 
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
@@ -5631,13 +5642,13 @@ impl List {
                                     DiffHistoryQuery::GetUpdateSince { subscriber_version, reply } => {
                                         let update = diff_history.get_update_since(subscriber_version);
                                         if reply.send(update).is_err() {
-                                            log::trace!("[LIST] GetUpdateSince reply receiver dropped");
+                                            zoon::println!("[LIST] GetUpdateSince reply receiver dropped");
                                         }
                                     }
                                     DiffHistoryQuery::Snapshot { reply } => {
                                         let snapshot = diff_history.snapshot().to_vec();
                                         if reply.send(snapshot).is_err() {
-                                            log::trace!("[LIST] Snapshot reply receiver dropped");
+                                            zoon::println!("[LIST] Snapshot reply receiver dropped");
                                         }
                                     }
                                 }
@@ -5718,7 +5729,7 @@ impl List {
                     }
                 }
                 if LOG_DROPS_AND_LOOP_ENDS {
-                    println!("Loop ended {construct_info}");
+                    zoon::println!("Loop ended {construct_info}");
                 }
                 drop(extra_owned_data);
             }
@@ -5746,7 +5757,7 @@ impl List {
             subscriber_version,
             reply: tx,
         }) {
-            log::debug!("[LIST] Failed to send GetUpdateSince query: {e}");
+            zoon::println!("[LIST] Failed to send GetUpdateSince query: {e}");
             return ValueUpdate::Current;
         }
         rx.await.unwrap_or(ValueUpdate::Current)
@@ -5758,7 +5769,7 @@ impl List {
         if let Err(e) = self.diff_query_sender.try_send(DiffHistoryQuery::Snapshot {
             reply: tx,
         }) {
-            log::debug!("[LIST] Failed to send Snapshot query: {e}");
+            zoon::println!("[LIST] Failed to send Snapshot query: {e}");
             return Vec::new();
         }
         rx.await.unwrap_or_default()
@@ -5775,7 +5786,7 @@ impl List {
         let (sender, receiver) = mpsc::channel::<()>(1);
         // Register with list loop
         if let Err(e) = self.notify_sender_sender.try_send(sender) {
-            eprintln!("Failed to register diff subscriber: {e:#}");
+            zoon::eprintln!("Failed to register diff subscriber: {e:#}");
         }
         ListDiffSubscription {
             last_seen_version: 0,
@@ -5874,7 +5885,7 @@ impl List {
         // ListChange events use unbounded to subscriber - the List actor manages backpressure
         let (change_sender, change_receiver) = mpsc::unbounded();
         if let Err(error) = self.change_sender_sender.try_send(change_sender) {
-            eprintln!("Failed to subscribe to {}: {error:#}", self.construct_info);
+            zoon::eprintln!("Failed to subscribe to {}: {error:#}", self.construct_info);
         }
         ListSubscription {
             receiver: change_receiver,
@@ -6026,7 +6037,7 @@ impl List {
 impl Drop for List {
     fn drop(&mut self) {
         if LOG_DROPS_AND_LOOP_ENDS {
-            println!("Dropped: {}", self.construct_info);
+            zoon::println!("Dropped: {}", self.construct_info);
         }
     }
 }
@@ -6254,14 +6265,14 @@ impl ListChange {
                 if index <= vec.len() {
                     vec.insert(index, item);
                 } else {
-                    eprintln!("ListChange::InsertAt index {} out of bounds (len: {})", index, vec.len());
+                    zoon::eprintln!("ListChange::InsertAt index {} out of bounds (len: {})", index, vec.len());
                 }
             }
             Self::UpdateAt { index, item } => {
                 if index < vec.len() {
                     vec[index] = item;
                 } else {
-                    eprintln!("ListChange::UpdateAt index {} out of bounds (len: {})", index, vec.len());
+                    zoon::eprintln!("ListChange::UpdateAt index {} out of bounds (len: {})", index, vec.len());
                 }
             }
             Self::Push { item } => {
@@ -6271,7 +6282,7 @@ impl ListChange {
                 if index < vec.len() {
                     vec.remove(index);
                 } else {
-                    eprintln!("ListChange::RemoveAt index {} out of bounds (len: {})", index, vec.len());
+                    zoon::eprintln!("ListChange::RemoveAt index {} out of bounds (len: {})", index, vec.len());
                 }
             }
             Self::Move {
@@ -6283,12 +6294,12 @@ impl ListChange {
                     let insert_index = new_index.min(vec.len());
                     vec.insert(insert_index, item);
                 } else {
-                    eprintln!("ListChange::Move old_index {} out of bounds (len: {})", old_index, vec.len());
+                    zoon::eprintln!("ListChange::Move old_index {} out of bounds (len: {})", old_index, vec.len());
                 }
             }
             Self::Pop => {
                 if vec.pop().is_none() {
-                    eprintln!("ListChange::Pop on empty vec");
+                    zoon::eprintln!("ListChange::Pop on empty vec");
                 }
             }
             Self::Clear => {
@@ -6361,7 +6372,7 @@ impl ListChange {
                     // Return as Insert with same ID (effectively a move)
                     ListDiff::Insert { id, after, value }
                 } else {
-                    eprintln!("ListChange::Move old_index {} out of bounds in to_diff (snapshot len: {})", old_index, snapshot.len());
+                    zoon::eprintln!("ListChange::Move old_index {} out of bounds in to_diff (snapshot len: {})", old_index, snapshot.len());
                     // Return a no-op by replacing with current snapshot
                     ListDiff::Replace {
                         items: snapshot.iter().map(|(id, v)| (*id, v.clone())).collect()
@@ -6765,7 +6776,7 @@ impl ListBindingFunction {
                                             actor_context.clone(),
                                         );
                                         // Spawn a task to forward predicate results - store handle to keep alive
-                                        let tx = predicate_tx.clone();
+                                        let mut tx = predicate_tx.clone();
                                         let pred_clone = predicate.clone();
                                         let task_handle = Task::start_droppable(async move {
                                             let mut stream = pred_clone.stream_sync();
@@ -6774,7 +6785,6 @@ impl ListBindingFunction {
                                                     Value::Tag(tag, _) => tag.tag() == "True",
                                                     _ => false,
                                                 };
-                                                // Use async send for bounded channel
                                                 if tx.send((idx, is_true)).await.is_err() {
                                                     break;
                                                 }
@@ -6794,7 +6804,7 @@ impl ListBindingFunction {
                                         actor_context.clone(),
                                     );
                                     // Spawn a task to forward predicate results - store handle to keep alive
-                                    let tx = predicate_tx.clone();
+                                    let mut tx = predicate_tx.clone();
                                     let pred_clone = predicate.clone();
                                     let task_handle = Task::start_droppable(async move {
                                         let mut stream = pred_clone.stream_sync();
@@ -6803,7 +6813,6 @@ impl ListBindingFunction {
                                                 Value::Tag(tag, _) => tag.tag() == "True",
                                                 _ => false,
                                             };
-                                            // Use async send for bounded channel
                                             if tx.send((idx, is_true)).await.is_err() {
                                                 break;
                                             }
@@ -6963,7 +6972,7 @@ impl ListBindingFunction {
                                         );
                                         // Spawn task to listen for `when` event
                                         // Use stream_from_now_stream to avoid replaying historical events
-                                        let tx = remove_tx.clone();
+                                        let mut tx = remove_tx.clone();
                                         let when_clone = when_actor.clone();
                                         let task_handle = Task::start_droppable(async move {
                                             let mut stream = when_clone.stream_from_now_sync();
@@ -6971,7 +6980,7 @@ impl ListBindingFunction {
                                             if stream.next().await.is_some() {
                                                 // Channel may be closed if filter was removed - that's fine
                                                 if let Err(e) = tx.send(idx).await {
-                                                    log::trace!("[LIST] Filter remove send failed: {e}");
+                                                    zoon::println!("[LIST] Filter remove send failed: {e}");
                                                 }
                                             }
                                         });
@@ -6990,14 +6999,14 @@ impl ListBindingFunction {
                                     );
                                     // Spawn task to listen for `when` event
                                     // Use stream_from_now_stream to avoid replaying historical events
-                                    let tx = remove_tx.clone();
+                                    let mut tx = remove_tx.clone();
                                     let when_clone = when_actor.clone();
                                     let task_handle = Task::start_droppable(async move {
                                         let mut stream = when_clone.stream_from_now_sync();
                                         if stream.next().await.is_some() {
                                             // Channel may be closed if filter was removed - that's fine
                                             if let Err(e) = tx.send(idx).await {
-                                                log::trace!("[LIST] Filter remove send failed: {e}");
+                                                zoon::println!("[LIST] Filter remove send failed: {e}");
                                             }
                                         }
                                     });
@@ -7485,7 +7494,7 @@ impl ListBindingFunction {
         ) {
             Ok(result_actor) => result_actor,
             Err(e) => {
-                eprintln!("Error evaluating transform expression: {e}");
+                zoon::eprintln!("Error evaluating transform expression: {e}");
                 // Return the original item as fallback
                 item_actor
             }

@@ -11,7 +11,7 @@ use zoon::futures_channel::oneshot;
 use zoon::futures_util::select;
 use zoon::futures_util::future;
 use zoon::futures_util::stream::{self, LocalBoxStream};
-use zoon::{Stream, StreamExt, println, eprintln, mpsc};
+use zoon::{Stream, StreamExt, mpsc};
 
 /// Yields control to the executor, allowing other tasks to run.
 /// This is a simple implementation that returns Pending once and schedules a wake.
@@ -2093,18 +2093,18 @@ fn process_work_item(
                         // Forward to LINK
                         if let Some(ref sender) = link_sender {
                             if let Err(e) = sender.unbounded_send(value.clone()) {
-                                log::debug!("[LINK_SETTER] Failed to forward to LINK: {e}");
+                                zoon::println!("[LINK_SETTER] Failed to forward to LINK: {e}");
                             }
                         }
                         // Forward to existing pass-through (if re-evaluation)
                         if let Some(ref sender) = existing_sender {
                             if let Err(e) = sender.unbounded_send(value.clone()) {
-                                log::debug!("[LINK_SETTER] Failed to forward to existing pass-through: {e}");
+                                zoon::println!("[LINK_SETTER] Failed to forward to existing pass-through: {e}");
                             }
                         }
                         // Forward to our channel (only matters on first evaluation)
                         if let Err(e) = value_tx.unbounded_send(value.clone()) {
-                            log::debug!("[LINK_SETTER] Failed to forward to value channel: {e}");
+                            zoon::println!("[LINK_SETTER] Failed to forward to value channel: {e}");
                         }
                         value
                     })
@@ -2124,7 +2124,7 @@ fn process_work_item(
 
                 // Send forwarder to async setup for storage on re-evaluation
                 if forwarder_tx.send(forwarder_actor.clone()).is_err() {
-                    log::trace!("[LINK_SETTER] Forwarder receiver dropped");
+                    zoon::println!("[LINK_SETTER] Forwarder receiver dropped");
                 }
 
                 // Create pass-through actor that emits from the channel
@@ -2144,7 +2144,7 @@ fn process_work_item(
 
                 // Send actor to forwarder for registration (if first evaluation)
                 if actor_tx.send(pass_through_actor.clone()).is_err() {
-                    log::trace!("[LINK_SETTER] Actor receiver dropped");
+                    zoon::println!("[LINK_SETTER] Actor receiver dropped");
                 }
 
                 // Create relay actor that subscribes to EXISTING pass-through (if any)
@@ -3176,7 +3176,7 @@ fn build_field_access_actor(
             let mut sub = final_subscription;
             if let Some(val) = sub.next().await {
                 if let Err(e) = field_sender.unbounded_send(val) {
-                    log::debug!("[FIELD_ACCESS] Failed to send final value: {e}");
+                    zoon::println!("[FIELD_ACCESS] Failed to send final value: {e}");
                 }
             }
             return;
@@ -3427,7 +3427,7 @@ fn build_hold_actor(
     let state_update_stream = body_subscription.map(move |new_value| {
         // Send to state channel so body can see it on next event
         if let Err(e) = state_sender_for_update.unbounded_send(new_value.clone()) {
-            log::debug!("[HOLD] Failed to send state update: {e}");
+            zoon::println!("[HOLD] Failed to send state update: {e}");
         }
         // DIRECTLY update state_actor's stored value - bypass async channel delay.
         // This ensures the next THEN body evaluation reads the fresh state value.
@@ -3494,7 +3494,7 @@ fn build_hold_actor(
         } else {
             // Subsequent values (reset): send to state_receiver
             if let Err(e) = state_sender_for_reset.unbounded_send(value.clone()) {
-                log::debug!("[HOLD] Failed to send state reset: {e}");
+                zoon::println!("[HOLD] Failed to send state reset: {e}");
             }
             // Store value directly to output
             // Use weak reference to avoid circular reference
@@ -3536,7 +3536,7 @@ fn build_hold_actor(
     });
     // Store driver loop in the OnceLock - it will be dropped when the output stream is dropped
     if driver_loop_holder.set(driver_loop).is_err() {
-        log::warn!("[HOLD] Driver loop holder already set - this is a bug");
+        zoon::eprintln!("[HOLD] Driver loop holder already set - this is a bug");
     }
 
     Ok(Some(output))
@@ -4458,7 +4458,7 @@ async fn match_pattern(
                 // Match each pattern against corresponding list item
                 for (item_pattern, (_item_id, item_actor)) in items.iter().zip(snapshot.iter()) {
                     // Get the current value from the item actor
-                    if let Some(item_value) = item_actor.stream().await.next().await {
+                    if let Some(item_value) = item_actor.clone().stream().await.next().await {
                         // Recursively match the pattern
                         if let Some(nested_bindings) = Box::pin(match_pattern(item_pattern, &item_value)).await {
                             bindings.extend(nested_bindings);
@@ -4547,12 +4547,12 @@ impl ModuleLoader {
                     }
                     ModuleLoaderRequest::GetBaseDir { reply } => {
                         if reply.send(base_dir.clone()).is_err() {
-                            log::trace!("[MODULE_LOADER] GetBaseDir reply receiver dropped");
+                            zoon::println!("[MODULE_LOADER] GetBaseDir reply receiver dropped");
                         }
                     }
                     ModuleLoaderRequest::GetCached { name, reply } => {
                         if reply.send(cache.get(&name).cloned()).is_err() {
-                            log::trace!("[MODULE_LOADER] GetCached reply receiver dropped for {}", name);
+                            zoon::println!("[MODULE_LOADER] GetCached reply receiver dropped for {}", name);
                         }
                     }
                     ModuleLoaderRequest::Cache { name, data } => {
@@ -4571,7 +4571,7 @@ impl ModuleLoader {
     /// Set the base directory for module resolution (fire-and-forget).
     pub fn set_base_dir(&self, dir: impl Into<String>) {
         if let Err(e) = self.request_sender.try_send(ModuleLoaderRequest::SetBaseDir(dir.into())) {
-            log::warn!("[MODULE_LOADER] Failed to send SetBaseDir: {e}");
+            zoon::eprintln!("[MODULE_LOADER] Failed to send SetBaseDir: {e}");
         }
     }
 
@@ -4579,7 +4579,7 @@ impl ModuleLoader {
     pub async fn base_dir(&self) -> String {
         let (tx, rx) = oneshot::channel();
         if let Err(e) = self.request_sender.try_send(ModuleLoaderRequest::GetBaseDir { reply: tx }) {
-            log::warn!("[MODULE_LOADER] Failed to send GetBaseDir: {e}");
+            zoon::eprintln!("[MODULE_LOADER] Failed to send GetBaseDir: {e}");
             return String::new();
         }
         rx.await.unwrap_or_default()
@@ -4592,7 +4592,7 @@ impl ModuleLoader {
             name: name.to_string(),
             reply: tx,
         }) {
-            log::debug!("[MODULE_LOADER] Failed to send GetCached for {}: {e}", name);
+            zoon::println!("[MODULE_LOADER] Failed to send GetCached for {}: {e}", name);
             return None;
         }
         rx.await.ok().flatten()
@@ -4601,7 +4601,7 @@ impl ModuleLoader {
     /// Cache a module (fire-and-forget).
     fn cache(&self, name: String, data: ModuleData) {
         if let Err(e) = self.request_sender.try_send(ModuleLoaderRequest::Cache { name: name.clone(), data }) {
-            log::warn!("[MODULE_LOADER] Failed to cache module {}: {e}", name);
+            zoon::eprintln!("[MODULE_LOADER] Failed to cache module {}: {e}", name);
         }
     }
 
@@ -4646,7 +4646,7 @@ impl ModuleLoader {
 
         for path in paths_to_try {
             if let Some(source_code) = virtual_fs.read_text(&path).await {
-                println!("[ModuleLoader] Loading module '{}' from '{}'", module_name, path);
+                zoon::println!("[ModuleLoader] Loading module '{}' from '{}'", module_name, path);
                 if let Some(module_data) = parse_module(&path, &source_code) {
                     // Cache the module
                     self.cache(module_name.to_string(), module_data.clone());
@@ -4655,7 +4655,7 @@ impl ModuleLoader {
             }
         }
 
-        eprintln!("[ModuleLoader] Could not find module '{}' (tried from base '{}')", module_name, base);
+        zoon::eprintln!("[ModuleLoader] Could not find module '{}' (tried from base '{}')", module_name, base);
         None
     }
 
@@ -4689,7 +4689,7 @@ fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
     // Lexer
     let (tokens, errors) = lexer().parse(source_code).into_output_errors();
     if !errors.is_empty() {
-        eprintln!("[ModuleLoader] Lex errors in '{}': {:?}", filename, errors.len());
+        zoon::eprintln!("[ModuleLoader] Lex errors in '{}': {:?}", filename, errors.len());
         return None;
     }
     let mut tokens = tokens?;
@@ -4703,7 +4703,7 @@ fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
         ))
         .into_output_errors();
     if !errors.is_empty() {
-        eprintln!("[ModuleLoader] Parse errors in '{}': {:?}", filename, errors.len());
+        zoon::eprintln!("[ModuleLoader] Parse errors in '{}': {:?}", filename, errors.len());
         return None;
     }
     let ast = ast?;
@@ -4712,7 +4712,7 @@ fn parse_module(filename: &str, source_code: &str) -> Option<ModuleData> {
     let ast = match resolve_references(ast) {
         Ok(ast) => ast,
         Err(errors) => {
-            eprintln!("[ModuleLoader] Reference errors in '{}': {:?}", filename, errors.len());
+            zoon::eprintln!("[ModuleLoader] Reference errors in '{}': {:?}", filename, errors.len());
             return None;
         }
     };
