@@ -462,8 +462,7 @@ FUNCTION panel_footer() {
 
 -- Count only active (non-completed) items
 FUNCTION active_items_count_text() {
-    PASSED.store.todos
-        |> List/retain(item, condition: item.completed |> Bool/not())
+    PASSED.store.active_todos
         |> List/count()
         |> WHEN { count => BLOCK {
             maybe_s: count == 1 |> Bool/not() |> WHEN { True => TEXT { s }, False => Text/empty() }

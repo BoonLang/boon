@@ -6570,15 +6570,17 @@ impl ListBindingFunction {
             let actor_context = actor_context.clone();
 
             // Use stream::unfold with select for fine-grained control
-            // This avoids recreating all streams on every list change
+            // Uses PersistenceId-based tracking to avoid index shift bugs on Remove/Pop
 
             // State: (items, predicates, predicate_results, list_stream, merged_predicate_stream)
+            // Note: Using HashMap keyed by PersistenceId for predicates and results
+            // to avoid index misalignment when items are removed
             type RetainState = (
-                Vec<Arc<ValueActor>>,                    // items
-                Vec<Arc<ValueActor>>,                    // predicates
-                Vec<Option<bool>>,                       // predicate_results
+                Vec<Arc<ValueActor>>,                    // items (order matters for output)
+                HashMap<parser::PersistenceId, Arc<ValueActor>>,  // predicates by PersistenceId
+                HashMap<parser::PersistenceId, bool>,    // predicate_results by PersistenceId
                 Pin<Box<dyn Stream<Item = ListChange>>>, // list_stream
-                Option<Pin<Box<dyn Stream<Item = (usize, bool)>>>>, // merged predicates
+                Option<Pin<Box<dyn Stream<Item = (parser::PersistenceId, bool)>>>>, // merged predicates
             );
 
             let list_stream: Pin<Box<dyn Stream<Item = ListChange>>> = Box::pin(list.stream());
@@ -6586,10 +6588,10 @@ impl ListBindingFunction {
             stream::unfold(
                 (
                     Vec::<Arc<ValueActor>>::new(),
-                    Vec::<Arc<ValueActor>>::new(),
-                    Vec::<Option<bool>>::new(),
+                    HashMap::<parser::PersistenceId, Arc<ValueActor>>::new(),
+                    HashMap::<parser::PersistenceId, bool>::new(),
                     list_stream,
-                    None::<Pin<Box<dyn Stream<Item = (usize, bool)>>>>,
+                    None::<Pin<Box<dyn Stream<Item = (parser::PersistenceId, bool)>>>>,
                     config,
                     construct_context,
                     actor_context,
@@ -6607,20 +6609,12 @@ impl ListBindingFunction {
 
                                 match future::select(pin!(list_next), pin!(pred_next)).await {
                                     Either::Left((Some(change), _)) => {
-                                        // List structure changed - need to rebuild predicates
+                                        // List structure changed
                                         match change {
                                             ListChange::Replace { items: new_items } => {
                                                 items = new_items.clone();
-                                                predicates = new_items.iter().enumerate().map(|(idx, item)| {
-                                                    Self::transform_item(
-                                                        item.clone(),
-                                                        idx,
-                                                        &config,
-                                                        construct_context.clone(),
-                                                        actor_context.clone(),
-                                                    )
-                                                }).collect();
-                                                predicate_results = vec![None; items.len()];
+                                                predicates.clear();
+                                                predicate_results.clear();
 
                                                 // Rebuild merged predicate stream
                                                 if items.is_empty() {
@@ -6630,22 +6624,33 @@ impl ListBindingFunction {
                                                         (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
                                                     ));
                                                 } else {
-                                                    // Query initial values directly (no channel overhead)
-                                                    for (idx, pred) in predicates.iter().enumerate() {
+                                                    // Build predicates keyed by PersistenceId
+                                                    for (idx, item) in new_items.iter().enumerate() {
+                                                        let pid = item.persistence_id();
+                                                        let pred = Self::transform_item(
+                                                            item.clone(),
+                                                            idx,
+                                                            &config,
+                                                            construct_context.clone(),
+                                                            actor_context.clone(),
+                                                        );
+                                                        predicates.insert(pid.clone(), pred.clone());
+
+                                                        // Query initial value
                                                         if let Ok(value) = pred.clone().value().await {
                                                             let is_true = matches!(&value, Value::Tag(tag, _) if tag.tag() == "True");
-                                                            predicate_results[idx] = Some(is_true);
+                                                            predicate_results.insert(pid, is_true);
                                                         }
                                                     }
 
-                                                    // Use stream_from_now_sync for future updates only
+                                                    // Use stream_from_now_sync for future updates, keyed by PersistenceId
                                                     let pred_streams: Vec<_> = predicates.iter()
-                                                        .enumerate()
-                                                        .map(|(idx, pred)| {
+                                                        .map(|(pid, pred)| {
+                                                            let pid = pid.clone();
                                                             pred.clone().stream_from_now_sync()
                                                                 .map(move |v| {
                                                                     let is_true = matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
-                                                                    (idx, is_true)
+                                                                    (pid.clone(), is_true)
                                                                 })
                                                         })
                                                         .collect();
@@ -6653,8 +6658,8 @@ impl ListBindingFunction {
 
                                                     // Emit initial filtered result immediately
                                                     let filtered: Vec<_> = items.iter()
-                                                        .zip(predicate_results.iter())
-                                                        .filter_map(|(item, r)| if r == &Some(true) { Some(item.clone()) } else { None })
+                                                        .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
+                                                        .cloned()
                                                         .collect();
                                                     return Some((
                                                         Some(ListChange::Replace { items: filtered }),
@@ -6664,6 +6669,7 @@ impl ListBindingFunction {
                                             }
                                             ListChange::Push { item } => {
                                                 let idx = items.len();
+                                                let pid = item.persistence_id();
                                                 let pred = Self::transform_item(
                                                     item.clone(),
                                                     idx,
@@ -6672,7 +6678,7 @@ impl ListBindingFunction {
                                                     actor_context.clone(),
                                                 );
                                                 items.push(item);
-                                                predicates.push(pred.clone());
+                                                predicates.insert(pid.clone(), pred.clone());
 
                                                 // Query new predicate value directly
                                                 let is_true = if let Ok(value) = pred.clone().value().await {
@@ -6680,25 +6686,26 @@ impl ListBindingFunction {
                                                 } else {
                                                     false
                                                 };
-                                                predicate_results.push(Some(is_true));
+                                                predicate_results.insert(pid.clone(), is_true);
 
-                                                // Use stream_from_now_sync for future updates only
-                                                let pred_streams: Vec<_> = predicates.iter()
-                                                    .enumerate()
-                                                    .map(|(idx, pred)| {
-                                                        pred.clone().stream_from_now_sync()
-                                                            .map(move |v| {
-                                                                let is_true = matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
-                                                                (idx, is_true)
-                                                            })
-                                                    })
-                                                    .collect();
-                                                merged_predicates = Some(Box::pin(stream::select_all(pred_streams)));
+                                                // Create stream for the new predicate only
+                                                let new_pred_stream = pred.stream_from_now_sync()
+                                                    .map(move |v| {
+                                                        let is_true = matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
+                                                        (pid.clone(), is_true)
+                                                    });
+
+                                                // Merge new stream with existing using stream::select (O(1) operation)
+                                                if let Some(existing) = merged_predicates.take() {
+                                                    merged_predicates = Some(Box::pin(stream::select(existing, new_pred_stream)));
+                                                } else {
+                                                    merged_predicates = Some(Box::pin(new_pred_stream));
+                                                }
 
                                                 // Emit updated filtered result
                                                 let filtered: Vec<_> = items.iter()
-                                                    .zip(predicate_results.iter())
-                                                    .filter_map(|(item, r)| if r == &Some(true) { Some(item.clone()) } else { None })
+                                                    .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
+                                                    .cloned()
                                                     .collect();
                                                 return Some((
                                                     Some(ListChange::Replace { items: filtered }),
@@ -6706,61 +6713,50 @@ impl ListBindingFunction {
                                                 ));
                                             }
                                             ListChange::Remove { id } => {
-                                                // Find item by PersistenceId
-                                                if let Some(index) = items.iter().position(|item| item.persistence_id() == id) {
-                                                    items.remove(index);
-                                                    predicates.remove(index);
-                                                    predicate_results.remove(index);
+                                                // Remove item and its predicate by PersistenceId
+                                                items.retain(|item| item.persistence_id() != id);
+                                                predicates.remove(&id);
+                                                predicate_results.remove(&id);
 
-                                                    if items.is_empty() {
-                                                        merged_predicates = None;
-                                                        return Some((
-                                                            Some(ListChange::Replace { items: vec![] }),
-                                                            (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
-                                                        ));
-                                                    } else {
-                                                        // DON'T rebuild streams - keep existing merged_predicates
-                                                        // Stale updates from removed indices will be ignored (idx >= len check below)
+                                                // DON'T rebuild streams - stale updates for removed PersistenceIds
+                                                // will be automatically ignored (HashMap lookup returns None)
 
-                                                        // Emit filtered result (predicate_results already cached)
-                                                        let filtered: Vec<_> = items.iter()
-                                                            .zip(predicate_results.iter())
-                                                            .filter_map(|(item, r)| if r == &Some(true) { Some(item.clone()) } else { None })
-                                                            .collect();
-                                                        return Some((
-                                                            Some(ListChange::Replace { items: filtered }),
-                                                            (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
-                                                        ));
-                                                    }
+                                                if items.is_empty() {
+                                                    merged_predicates = None;
                                                 }
-                                                continue;
+
+                                                // Emit filtered result
+                                                let filtered: Vec<_> = items.iter()
+                                                    .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
+                                                    .cloned()
+                                                    .collect();
+                                                return Some((
+                                                    Some(ListChange::Replace { items: filtered }),
+                                                    (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
+                                                ));
                                             }
                                             ListChange::Pop => {
-                                                if !items.is_empty() {
-                                                    items.pop();
-                                                    predicates.pop();
-                                                    predicate_results.pop();
+                                                if let Some(popped_item) = items.pop() {
+                                                    let pid = popped_item.persistence_id();
+                                                    predicates.remove(&pid);
+                                                    predicate_results.remove(&pid);
+
+                                                    // DON'T rebuild streams - stale updates for removed PersistenceIds
+                                                    // will be automatically ignored (HashMap lookup returns None)
 
                                                     if items.is_empty() {
                                                         merged_predicates = None;
-                                                        return Some((
-                                                            Some(ListChange::Replace { items: vec![] }),
-                                                            (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
-                                                        ));
-                                                    } else {
-                                                        // DON'T rebuild streams - keep existing merged_predicates
-                                                        // Stale updates from popped indices will be ignored (idx >= len check below)
-
-                                                        // Emit filtered result (predicate_results already cached)
-                                                        let filtered: Vec<_> = items.iter()
-                                                            .zip(predicate_results.iter())
-                                                            .filter_map(|(item, r)| if r == &Some(true) { Some(item.clone()) } else { None })
-                                                            .collect();
-                                                        return Some((
-                                                            Some(ListChange::Replace { items: filtered }),
-                                                            (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
-                                                        ));
                                                     }
+
+                                                    // Emit filtered result
+                                                    let filtered: Vec<_> = items.iter()
+                                                        .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
+                                                        .cloned()
+                                                        .collect();
+                                                    return Some((
+                                                        Some(ListChange::Replace { items: filtered }),
+                                                        (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
+                                                    ));
                                                 }
                                                 continue;
                                             }
@@ -6781,17 +6777,16 @@ impl ListBindingFunction {
                                         // List stream ended
                                         return None;
                                     }
-                                    Either::Right((Some((idx, is_true)), _)) => {
-                                        // Predicate update
-                                        if idx < predicate_results.len() {
-                                            predicate_results[idx] = Some(is_true);
-                                        }
+                                    Either::Right((Some((pid, is_true)), _)) => {
+                                        // Predicate update - use PersistenceId lookup
+                                        // Stale updates for removed items will be ignored (contains_key returns false)
+                                        if predicate_results.contains_key(&pid) {
+                                            predicate_results.insert(pid, is_true);
 
-                                        // Emit if all predicates evaluated
-                                        if predicate_results.iter().all(|r| r.is_some()) {
+                                            // Emit updated filtered result
                                             let filtered: Vec<_> = items.iter()
-                                                .zip(predicate_results.iter())
-                                                .filter_map(|(item, r)| if r == &Some(true) { Some(item.clone()) } else { None })
+                                                .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
+                                                .cloned()
                                                 .collect();
                                             return Some((
                                                 Some(ListChange::Replace { items: filtered }),
@@ -6811,16 +6806,8 @@ impl ListBindingFunction {
                                 match list_stream.next().await {
                                     Some(ListChange::Replace { items: new_items }) => {
                                         items = new_items.clone();
-                                        predicates = new_items.iter().enumerate().map(|(idx, item)| {
-                                            Self::transform_item(
-                                                item.clone(),
-                                                idx,
-                                                &config,
-                                                construct_context.clone(),
-                                                actor_context.clone(),
-                                            )
-                                        }).collect();
-                                        predicate_results = vec![None; items.len()];
+                                        predicates.clear();
+                                        predicate_results.clear();
 
                                         if items.is_empty() {
                                             return Some((
@@ -6828,22 +6815,33 @@ impl ListBindingFunction {
                                                 (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
                                             ));
                                         } else {
-                                            // Query initial values directly (no channel overhead)
-                                            for (idx, pred) in predicates.iter().enumerate() {
+                                            // Build predicates keyed by PersistenceId
+                                            for (idx, item) in new_items.iter().enumerate() {
+                                                let pid = item.persistence_id();
+                                                let pred = Self::transform_item(
+                                                    item.clone(),
+                                                    idx,
+                                                    &config,
+                                                    construct_context.clone(),
+                                                    actor_context.clone(),
+                                                );
+                                                predicates.insert(pid.clone(), pred.clone());
+
+                                                // Query initial value
                                                 if let Ok(value) = pred.clone().value().await {
                                                     let is_true = matches!(&value, Value::Tag(tag, _) if tag.tag() == "True");
-                                                    predicate_results[idx] = Some(is_true);
+                                                    predicate_results.insert(pid, is_true);
                                                 }
                                             }
 
-                                            // Use stream_from_now_sync for future updates only
+                                            // Use stream_from_now_sync for future updates, keyed by PersistenceId
                                             let pred_streams: Vec<_> = predicates.iter()
-                                                .enumerate()
-                                                .map(|(idx, pred)| {
+                                                .map(|(pid, pred)| {
+                                                    let pid = pid.clone();
                                                     pred.clone().stream_from_now_sync()
                                                         .map(move |v| {
                                                             let is_true = matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
-                                                            (idx, is_true)
+                                                            (pid.clone(), is_true)
                                                         })
                                                 })
                                                 .collect();
@@ -6851,8 +6849,8 @@ impl ListBindingFunction {
 
                                             // Emit initial filtered result immediately
                                             let filtered: Vec<_> = items.iter()
-                                                .zip(predicate_results.iter())
-                                                .filter_map(|(item, r)| if r == &Some(true) { Some(item.clone()) } else { None })
+                                                .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
+                                                .cloned()
                                                 .collect();
                                             return Some((
                                                 Some(ListChange::Replace { items: filtered }),
