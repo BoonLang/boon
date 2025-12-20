@@ -1817,7 +1817,7 @@ impl Variable {
         // Capture the scope before actor_context is moved
         let scope = actor_context.scope.clone();
         let value_actor =
-            ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_value_receiver), Some(persistence_id));
+            ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_value_receiver), persistence_id);
         let value_actor = Arc::new(value_actor);
 
         Arc::new(Self {
@@ -2094,7 +2094,7 @@ impl VariableOrArgumentReference {
             construct_info,
             actor_context,
             TypedStream::infinite(value_stream),
-            None,
+            parser::PersistenceId::new(),
         ))
     }
 }
@@ -2575,7 +2575,7 @@ impl FunctionCall {
             ValueActor::new_arc_lazy(
                 construct_info,
                 combined_stream,
-                None,
+                parser::PersistenceId::new(),
                 inputs,
             )
         } else {
@@ -2583,7 +2583,7 @@ impl FunctionCall {
                 construct_info,
                 actor_context,
                 TypedStream::infinite(combined_stream),
-                None,
+                parser::PersistenceId::new(),
                 inputs,
             ))
         }
@@ -2672,7 +2672,7 @@ impl LatestCombinator {
             construct_info,
             actor_context,
             TypedStream::infinite(value_stream),
-            None,
+            parser::PersistenceId::new(),
             inputs,
         ))
     }
@@ -2736,7 +2736,7 @@ impl BinaryOperatorCombinator {
             construct_info,
             actor_context,
             TypedStream::infinite(value_stream),
-            None,
+            parser::PersistenceId::new(),
             vec![operand_a, operand_b],
         ))
     }
@@ -3121,7 +3121,7 @@ impl ValueHistory {
 /// 3. Only shutting down via explicit Shutdown message
 pub struct ValueActor {
     construct_info: Arc<ConstructInfoComplete>,
-    persistence_id: Option<parser::PersistenceId>,
+    persistence_id: parser::PersistenceId,
 
     /// Message channel for actor communication (migration, shutdown).
     /// Bounded(16) - low frequency control messages.
@@ -3179,7 +3179,7 @@ impl ValueActor {
         construct_info: ConstructInfoComplete,
         actor_context: ActorContext,
         value_stream: TypedStream<S, Infinite>,
-        persistence_id: Option<parser::PersistenceId>,
+        persistence_id: parser::PersistenceId,
     ) -> Self {
         Self::new_with_inputs(
             construct_info,
@@ -3198,7 +3198,7 @@ impl ValueActor {
         construct_info: ConstructInfoComplete,
         actor_context: ActorContext,
         value_stream: TypedStream<S, Infinite>,
-        persistence_id: Option<parser::PersistenceId>,
+        persistence_id: parser::PersistenceId,
         inputs: Vec<Arc<ValueActor>>,
     ) -> Self {
         let construct_info = Arc::new(construct_info);
@@ -3469,7 +3469,7 @@ impl ValueActor {
         construct_info: ConstructInfo,
         actor_context: ActorContext,
         value_stream: TypedStream<S, Infinite>,
-        persistence_id: Option<parser::PersistenceId>,
+        persistence_id: parser::PersistenceId,
     ) -> Arc<Self> {
         Arc::new(Self::new(
             construct_info.complete(ConstructType::ValueActor),
@@ -3484,7 +3484,7 @@ impl ValueActor {
         construct_info: ConstructInfo,
         actor_context: ActorContext,
         value_stream: TypedStream<S, Infinite>,
-        persistence_id: Option<parser::PersistenceId>,
+        persistence_id: parser::PersistenceId,
         inputs: Vec<Arc<ValueActor>>,
     ) -> Arc<Self> {
         Arc::new(Self::new_with_inputs(
@@ -3506,7 +3506,7 @@ impl ValueActor {
     pub fn new_arc_lazy<S: Stream<Item = Value> + 'static>(
         construct_info: ConstructInfoComplete,
         value_stream: S,
-        persistence_id: Option<parser::PersistenceId>,
+        persistence_id: parser::PersistenceId,
         inputs: Vec<Arc<ValueActor>>,
     ) -> Arc<Self> {
         // Create the lazy actor that does the actual work
@@ -3561,7 +3561,7 @@ impl ValueActor {
         construct_info: ConstructInfoComplete,
         actor_context: ActorContext,
         value_stream: TypedStream<S, Infinite>,
-        persistence_id: Option<parser::PersistenceId>,
+        persistence_id: parser::PersistenceId,
         initial_value: Value,
         inputs: Vec<Arc<ValueActor>>,
     ) -> Self {
@@ -3714,7 +3714,7 @@ impl ValueActor {
         }
     }
 
-    pub fn persistence_id(&self) -> Option<parser::PersistenceId> {
+    pub fn persistence_id(&self) -> parser::PersistenceId {
         self.persistence_id
     }
 
@@ -3757,7 +3757,7 @@ impl ValueActor {
     pub fn new_arc_forwarding(
         construct_info: ConstructInfo,
         actor_context: ActorContext,
-        persistence_id: Option<parser::PersistenceId>,
+        persistence_id: parser::PersistenceId,
     ) -> (Arc<Self>, NamedChannel<Value>) {
         let (sender, receiver) = NamedChannel::new("forwarding.values", 64);
         let stream = TypedStream::infinite(receiver);
@@ -3824,7 +3824,7 @@ impl ValueActor {
         construct_info: ConstructInfo,
         actor_context: ActorContext,
         value_stream: TypedStream<S, Infinite>,
-        persistence_id: Option<parser::PersistenceId>,
+        persistence_id: parser::PersistenceId,
         initial_value: Value,
     ) -> Arc<Self> {
         let construct_info = construct_info.complete(ConstructType::ValueActor);
@@ -4607,7 +4607,7 @@ pub fn value_actor_from_json(
         actor_construct_info,
         actor_context,
         constant(value),
-        None,
+        parser::PersistenceId::new(),
     ))
 }
 
@@ -4651,7 +4651,7 @@ pub async fn materialize_value(
                         ).complete(ConstructType::ValueActor),
                         actor_context.clone(),
                         constant(materialized),
-                        None,
+                        parser::PersistenceId::new(),
                     ));
                     // Create new Variable with the constant actor
                     let new_var = Variable::new_arc(
@@ -4694,7 +4694,7 @@ pub async fn materialize_value(
                         ).complete(ConstructType::ValueActor),
                         actor_context.clone(),
                         constant(materialized),
-                        None,
+                        parser::PersistenceId::new(),
                     ));
                     let new_var = Variable::new_arc(
                         ConstructInfo::new(
@@ -4827,7 +4827,7 @@ impl Object {
             actor_construct_info,
             actor_context,
             value_stream,
-            None,
+            parser::PersistenceId::new(),
             initial_value,
         )
     }
@@ -4965,7 +4965,7 @@ impl TaggedObject {
             actor_construct_info,
             actor_context,
             value_stream,
-            None,
+            parser::PersistenceId::new(),
             initial_value,
         )
     }
@@ -5090,7 +5090,7 @@ impl Text {
             actor_construct_info,
             actor_context,
             value_stream,
-            None,
+            parser::PersistenceId::new(),
             initial_value,
         )
     }
@@ -5195,7 +5195,7 @@ impl Tag {
             actor_construct_info,
             actor_context,
             value_stream,
-            None,
+            parser::PersistenceId::new(),
             initial_value,
         )
     }
@@ -5300,7 +5300,7 @@ impl Number {
             actor_construct_info,
             actor_context,
             value_stream,
-            None,
+            parser::PersistenceId::new(),
             initial_value,
         )
     }
@@ -5654,7 +5654,7 @@ impl List {
             actor_construct_info,
             actor_context,
             value_stream,
-            None,
+            parser::PersistenceId::new(),
         ))
     }
 
@@ -5865,7 +5865,7 @@ impl List {
             actor_construct_info,
             actor_context,
             TypedStream::infinite(value_stream),
-            None,
+            parser::PersistenceId::new(),
         ))
     }
 }
@@ -6084,7 +6084,7 @@ pub enum ListChange {
     Replace { items: Vec<Arc<ValueActor>> },
     InsertAt { index: usize, item: Arc<ValueActor> },
     UpdateAt { index: usize, item: Arc<ValueActor> },
-    RemoveAt { index: usize },
+    Remove { id: parser::PersistenceId },
     Move { old_index: usize, new_index: usize },
     Push { item: Arc<ValueActor> },
     Pop,
@@ -6114,12 +6114,11 @@ impl ListChange {
             Self::Push { item } => {
                 vec.push(item);
             }
-            Self::RemoveAt { index } => {
-                if index < vec.len() {
-                    vec.remove(index);
-                } else {
-                    zoon::eprintln!("ListChange::RemoveAt index {} out of bounds (len: {})", index, vec.len());
+            Self::Remove { id } => {
+                if let Some(pos) = vec.iter().position(|item| item.persistence_id() == id) {
+                    vec.remove(pos);
                 }
+                // Silently ignore if item not found - it may have already been removed
             }
             Self::Move {
                 old_index,
@@ -6185,9 +6184,13 @@ impl ListChange {
                     value: item.clone(),
                 }
             }
-            Self::RemoveAt { index } => {
-                let id = snapshot.get(*index).map(|(id, _)| *id).unwrap_or_else(ItemId::new);
-                ListDiff::Remove { id }
+            Self::Remove { id: persistence_id } => {
+                // Find ItemId by matching PersistenceId in snapshot
+                let item_id = snapshot.iter()
+                    .find(|(_, actor)| actor.persistence_id() == *persistence_id)
+                    .map(|(id, _)| *id)
+                    .unwrap_or_else(ItemId::new);
+                ListDiff::Remove { id: item_id }
             }
             Self::Move { old_index, new_index } => {
                 // Move is Remove + Insert
@@ -6474,16 +6477,21 @@ impl ListBindingFunction {
             })
             .filter_map(future::ready),
             move |list| {
+            use std::collections::HashMap;
             let config = config_for_stream.clone();
             let construct_context = construct_context_for_stream.clone();
             let actor_context = actor_context_for_stream.clone();
 
-            // Use scan to track list length for proper Push index assignment.
-            // The length is updated after each change is processed.
-            list.stream().scan(0usize, move |length, change| {
-                let (transformed_change, new_length) = Self::transform_list_change_for_map(
+            // Track both length AND mapping from original PersistenceIds to mapped PersistenceIds.
+            // This is needed because mapped items get new PersistenceIds, so Remove { id }
+            // must be translated to use the mapped item's PersistenceId.
+            type MapState = (usize, HashMap<parser::PersistenceId, parser::PersistenceId>);
+            list.stream().scan((0usize, HashMap::new()), move |state: &mut MapState, change| {
+                let (length, pid_map) = state;
+                let (transformed_change, new_length) = Self::transform_list_change_for_map_with_tracking(
                     change,
                     *length,
+                    pid_map,
                     &config,
                     construct_context.clone(),
                     actor_context.clone(),
@@ -6511,7 +6519,7 @@ impl ListBindingFunction {
                 Arc::new(list),
                 ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
             )),
-            None,
+            parser::PersistenceId::new(),
         ))
     }
 
@@ -6697,8 +6705,9 @@ impl ListBindingFunction {
                                                     (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
                                                 ));
                                             }
-                                            ListChange::RemoveAt { index } => {
-                                                if index < items.len() {
+                                            ListChange::Remove { id } => {
+                                                // Find item by PersistenceId
+                                                if let Some(index) = items.iter().position(|item| item.persistence_id() == id) {
                                                     items.remove(index);
                                                     predicates.remove(index);
                                                     predicate_results.remove(index);
@@ -6880,11 +6889,12 @@ impl ListBindingFunction {
                 Arc::new(list),
                 ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
             )),
-            None,
+            parser::PersistenceId::new(),
         ))
     }
 
     /// Creates a remove actor that removes items when their `when` event fires.
+    /// Tracks removed items by PersistenceId so they don't reappear on upstream Replace.
     fn create_remove_actor(
         construct_info: ConstructInfoComplete,
         construct_context: ConstructContext,
@@ -6892,6 +6902,8 @@ impl ListBindingFunction {
         source_list_actor: Arc<ValueActor>,
         config: Arc<ListBindingConfig>,
     ) -> Arc<ValueActor> {
+        use std::collections::HashSet;
+
         // Clone for use after the chain
         let actor_context_for_list = actor_context.clone();
         let actor_context_for_result = actor_context.clone();
@@ -6929,13 +6941,13 @@ impl ListBindingFunction {
             let construct_context = construct_context.clone();
             let actor_context = actor_context.clone();
 
-            // Create channel for removal events (index of item to remove)
-            let (remove_tx, remove_rx) = mpsc::channel::<usize>(64);
+            // Create channel for removal events (PersistenceId of item to remove)
+            let (remove_tx, remove_rx) = mpsc::channel::<parser::PersistenceId>(64);
 
             // Event type for merged streams
             enum RemoveEvent {
                 ListChange(ListChange),
-                RemoveItem(usize),
+                RemoveItem(parser::PersistenceId),
             }
 
             // Create list change stream
@@ -6944,29 +6956,42 @@ impl ListBindingFunction {
             // Create removal event stream
             let removal_events = remove_rx.map(RemoveEvent::RemoveItem);
 
+            // State: track items and which PersistenceIds have been removed by THIS List/remove
+            // removed_persistence_ids is bounded: items are removed from this set when they're
+            // removed from upstream (no longer in Replace payload or via Remove { id }).
+            type ItemEntry = (usize, Arc<ValueActor>, Arc<ValueActor>, Option<TaskHandle>);
+            // (internal_idx, item, when_actor, task_handle)
+
             // Merge list changes and removal events
             stream::select(list_changes, removal_events).scan(
                 (
-                    Vec::<(usize, Arc<ValueActor>, Arc<ValueActor>, bool, Option<TaskHandle>)>::new(), // (original_idx, item, when_actor, removed, task_handle)
+                    Vec::<ItemEntry>::new(),
+                    HashSet::<parser::PersistenceId>::new(), // removed_persistence_ids
                     remove_tx,
                     config.clone(),
                     construct_context.clone(),
                     actor_context.clone(),
-                    0usize, // next_idx for assigning unique IDs
+                    0usize, // next_idx for assigning unique internal IDs
                 ),
                 move |state, event| {
-                    let (items, remove_tx, config, construct_context, actor_context, next_idx) = state;
+                    let (items, removed_pids, remove_tx, config, construct_context, actor_context, next_idx) = state;
 
                     match event {
                         RemoveEvent::ListChange(change) => {
                             match change {
                                 ListChange::Replace { items: new_items } => {
-                                    // Simple approach: rebuild everything fresh on Replace.
-                                    // This is slower but reliable - no Arc::as_ptr (Rust-specific, not portable).
-                                    // When upstream sends Replace, it's providing the new authoritative list.
-                                    // Items removed upstream won't be in that list.
+                                    // Filter out items we've already removed (by PersistenceId)
+                                    // and rebuild tracking for remaining items
                                     items.clear();
+                                    let mut filtered_items = Vec::new();
+
                                     for item in new_items.iter() {
+                                        let persistence_id = item.persistence_id();
+                                        if removed_pids.contains(&persistence_id) {
+                                            // This item was removed by this List/remove, skip it
+                                            continue;
+                                        }
+
                                         let idx = *next_idx;
                                         *next_idx += 1;
                                         let when_actor = Self::transform_item(
@@ -6984,15 +7009,29 @@ impl ListBindingFunction {
                                             // Wait for ANY emission - that triggers removal
                                             if stream.next().await.is_some() {
                                                 // Channel may be closed if filter was removed - that's fine
-                                                if let Err(e) = tx.send(idx).await {
-                                                    zoon::println!("[LIST] Filter remove send failed: {e}");
-                                                }
+                                                let _ = tx.send(persistence_id).await;
                                             }
                                         });
-                                        items.push((idx, item.clone(), when_actor, false, Some(task_handle)));
+                                        items.push((idx, item.clone(), when_actor, Some(task_handle)));
+                                        filtered_items.push(item.clone());
                                     }
+
+                                    // Clean up removed_pids: remove entries for items no longer in upstream
+                                    // This ensures bounded growth - we only track items that exist upstream
+                                    let upstream_pids: HashSet<_> = new_items.iter()
+                                        .map(|item| item.persistence_id())
+                                        .collect();
+                                    removed_pids.retain(|pid| upstream_pids.contains(pid));
+
+                                    return future::ready(Some(Some(ListChange::Replace { items: filtered_items })));
                                 }
                                 ListChange::Push { item } => {
+                                    let persistence_id = item.persistence_id();
+                                    // If this item was previously removed, don't add it back
+                                    if removed_pids.contains(&persistence_id) {
+                                        return future::ready(Some(None));
+                                    }
+
                                     let idx = *next_idx;
                                     *next_idx += 1;
                                     let when_actor = Self::transform_item(
@@ -7003,47 +7042,55 @@ impl ListBindingFunction {
                                         actor_context.clone(),
                                     );
                                     // Spawn task to listen for `when` event
-                                    // Use stream_from_now_stream to avoid replaying historical events
                                     let mut tx = remove_tx.clone();
                                     let when_clone = when_actor.clone();
                                     let task_handle = Task::start_droppable(async move {
                                         let mut stream = when_clone.stream_from_now_sync();
                                         if stream.next().await.is_some() {
-                                            // Channel may be closed if filter was removed - that's fine
-                                            if let Err(e) = tx.send(idx).await {
-                                                zoon::println!("[LIST] Filter remove send failed: {e}");
-                                            }
+                                            let _ = tx.send(persistence_id).await;
                                         }
                                     });
-                                    items.push((idx, item, when_actor, false, Some(task_handle)));
+                                    items.push((idx, item.clone(), when_actor, Some(task_handle)));
+                                    return future::ready(Some(Some(ListChange::Push { item })));
+                                }
+                                ListChange::Remove { id } => {
+                                    // Upstream removed an item - remove from our tracking
+                                    // Also remove from removed_pids (item is gone from upstream)
+                                    removed_pids.remove(&id);
+                                    if let Some(pos) = items.iter().position(|(_, item, _, _)| item.persistence_id() == id) {
+                                        items.remove(pos);
+                                    }
+                                    // Forward the Remove downstream
+                                    return future::ready(Some(Some(ListChange::Remove { id })));
                                 }
                                 ListChange::Clear => {
                                     items.clear();
+                                    removed_pids.clear();
                                     *next_idx = 0;
+                                    return future::ready(Some(Some(ListChange::Clear)));
                                 }
                                 ListChange::Pop => {
-                                    items.pop();
+                                    if let Some((_, item, _, _)) = items.pop() {
+                                        // If this was a removed item, take it out of tracking
+                                        removed_pids.remove(&item.persistence_id());
+                                    }
+                                    return future::ready(Some(Some(ListChange::Pop)));
                                 }
-                                _ => {}
+                                _ => {
+                                    return future::ready(Some(None));
+                                }
                             }
-                            // Emit current list state (all non-removed items)
-                            let current: Vec<Arc<ValueActor>> = items.iter()
-                                .filter(|(_, _, _, removed, _)| !removed)
-                                .map(|(_, item, _, _, _)| item.clone())
-                                .collect();
-                            future::ready(Some(Some(ListChange::Replace { items: current })))
                         }
-                        RemoveEvent::RemoveItem(idx) => {
-                            // Mark the item as removed
-                            if let Some(item_entry) = items.iter_mut().find(|(i, _, _, _, _)| *i == idx) {
-                                item_entry.3 = true; // Mark as removed
+                        RemoveEvent::RemoveItem(persistence_id) => {
+                            // Local removal triggered by `when` event
+                            if let Some(pos) = items.iter().position(|(_, item, _, _)| item.persistence_id() == persistence_id) {
+                                items.remove(pos);
+                                // Track this removal so item doesn't reappear on upstream Replace
+                                removed_pids.insert(persistence_id);
+                                // Emit identity-based Remove
+                                return future::ready(Some(Some(ListChange::Remove { id: persistence_id })));
                             }
-                            // Emit updated list without removed items
-                            let remaining: Vec<Arc<ValueActor>> = items.iter()
-                                .filter(|(_, _, _, removed, _)| !removed)
-                                .map(|(_, item, _, _, _)| item.clone())
-                                .collect();
-                            future::ready(Some(Some(ListChange::Replace { items: remaining })))
+                            return future::ready(Some(None));
                         }
                     }
                 }
@@ -7068,7 +7115,7 @@ impl ListBindingFunction {
                 Arc::new(list),
                 ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
             )),
-            None,
+            parser::PersistenceId::new(),
         ))
     }
 
@@ -7165,9 +7212,10 @@ impl ListBindingFunction {
                         ListChange::Pop => {
                             item_predicates.pop();
                         }
-                        ListChange::RemoveAt { index } => {
-                            if *index < item_predicates.len() {
-                                item_predicates.remove(*index);
+                        ListChange::Remove { id } => {
+                            // Find item by PersistenceId
+                            if let Some(index) = item_predicates.iter().position(|(item, _)| item.persistence_id() == *id) {
+                                item_predicates.remove(index);
                             }
                         }
                         _ => {}
@@ -7249,7 +7297,7 @@ impl ListBindingFunction {
             construct_info,
             actor_context_for_result,
             TypedStream::infinite(value_stream),
-            None,
+            parser::PersistenceId::new(),
         ))
     }
 
@@ -7358,9 +7406,10 @@ impl ListBindingFunction {
                                 item_keys.insert(*index, (item.clone(), key_actor));
                             }
                         }
-                        ListChange::RemoveAt { index } => {
-                            if *index < item_keys.len() {
-                                item_keys.remove(*index);
+                        ListChange::Remove { id } => {
+                            // Find item by PersistenceId
+                            if let Some(index) = item_keys.iter().position(|(item, _)| item.persistence_id() == *id) {
+                                item_keys.remove(index);
                             }
                         }
                         ListChange::Clear => {
@@ -7443,7 +7492,7 @@ impl ListBindingFunction {
                 Arc::new(list),
                 ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
             )),
-            None,
+            parser::PersistenceId::new(),
         ))
     }
 
@@ -7472,13 +7521,7 @@ impl ListBindingFunction {
         // Without the index, items from `LIST { fn(), fn(), fn() }` all get the same scope
         // because they share the same persistence_id (from the function's return object AST position).
         // This caused the list_object_state bug where clicking any button incremented all counters.
-        let pid_suffix = if let Some(pid) = item_actor.persistence_id() {
-            format!("{}", pid.as_u128())
-        } else if let Some(persistence) = item_actor.construct_info.persistence() {
-            format!("{}", persistence.id.as_u128())
-        } else {
-            format!("{:?}", item_actor.construct_info.id)
-        };
+        let pid_suffix = format!("{}", item_actor.persistence_id().as_u128());
         let scope_id = format!("list_item_{}_{}", index, pid_suffix);
         let new_actor_context = ActorContext {
             parameters: new_params,
@@ -7489,15 +7532,31 @@ impl ListBindingFunction {
         // Pass the function registry snapshot to enable user-defined function calls
         match evaluate_static_expression_with_registry(
             &config.transform_expr,
-            construct_context,
-            new_actor_context,
+            construct_context.clone(),
+            new_actor_context.clone(),
             config.reference_connector.clone(),
             config.link_connector.clone(),
             config.pass_through_connector.clone(),
             config.source_code.clone(),
             config.function_registry_snapshot.clone(),
         ) {
-            Ok(result_actor) => result_actor,
+            Ok(result_actor) => {
+                // IMPORTANT: The result_actor's PersistenceId comes from AST position,
+                // which is the same for all items mapped by the same expression.
+                // We need unique PersistenceIds for identity-based Remove to work.
+                // Wrap the result in a new ValueActor with the ORIGINAL item's PersistenceId.
+                let original_pid = item_actor.persistence_id();
+                ValueActor::new_arc(
+                    ConstructInfo::new(
+                        result_actor.construct_info.id.clone().with_child_id("mapped"),
+                        None,
+                        "List/map mapped item",
+                    ),
+                    new_actor_context,
+                    TypedStream::infinite(result_actor.stream_sync()),
+                    original_pid,  // Preserve original PersistenceId!
+                )
+            }
             Err(e) => {
                 zoon::eprintln!("Error evaluating transform expression: {e}");
                 // Return the original item as fallback
@@ -7569,10 +7628,108 @@ impl ListBindingFunction {
                 (ListChange::Push { item: transformed_item }, current_length + 1)
             }
             // These operations don't involve new items, pass through with updated length
-            ListChange::RemoveAt { index } => (ListChange::RemoveAt { index }, current_length.saturating_sub(1)),
+            ListChange::Remove { id } => (ListChange::Remove { id }, current_length.saturating_sub(1)),
             ListChange::Move { old_index, new_index } => (ListChange::Move { old_index, new_index }, current_length),
             ListChange::Pop => (ListChange::Pop, current_length.saturating_sub(1)),
             ListChange::Clear => (ListChange::Clear, 0),
+        }
+    }
+
+    /// Like transform_list_change_for_map but tracks the mapping from original
+    /// PersistenceIds to mapped PersistenceIds. This is necessary because Remove { id }
+    /// uses the original item's PersistenceId, but the output list contains mapped items
+    /// with different PersistenceIds.
+    fn transform_list_change_for_map_with_tracking(
+        change: ListChange,
+        current_length: usize,
+        pid_map: &mut std::collections::HashMap<parser::PersistenceId, parser::PersistenceId>,
+        config: &ListBindingConfig,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+    ) -> (ListChange, usize) {
+        match change {
+            ListChange::Replace { items } => {
+                let new_length = items.len();
+                // Clear old mapping and build new one
+                pid_map.clear();
+                let transformed_items: Vec<Arc<ValueActor>> = items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let original_pid = item.persistence_id();
+                        let transformed = Self::transform_item(
+                            item,
+                            index,
+                            config,
+                            construct_context.clone(),
+                            actor_context.clone(),
+                        );
+                        let mapped_pid = transformed.persistence_id();
+                        pid_map.insert(original_pid, mapped_pid);
+                        transformed
+                    })
+                    .collect();
+                (ListChange::Replace { items: transformed_items }, new_length)
+            }
+            ListChange::InsertAt { index, item } => {
+                let original_pid = item.persistence_id();
+                let transformed_item = Self::transform_item(
+                    item,
+                    index,
+                    config,
+                    construct_context,
+                    actor_context,
+                );
+                let mapped_pid = transformed_item.persistence_id();
+                pid_map.insert(original_pid, mapped_pid);
+                (ListChange::InsertAt { index, item: transformed_item }, current_length + 1)
+            }
+            ListChange::UpdateAt { index, item } => {
+                let original_pid = item.persistence_id();
+                let transformed_item = Self::transform_item(
+                    item,
+                    index,
+                    config,
+                    construct_context,
+                    actor_context,
+                );
+                let mapped_pid = transformed_item.persistence_id();
+                pid_map.insert(original_pid, mapped_pid);
+                (ListChange::UpdateAt { index, item: transformed_item }, current_length)
+            }
+            ListChange::Push { item } => {
+                let original_pid = item.persistence_id();
+                let transformed_item = Self::transform_item(
+                    item,
+                    current_length,
+                    config,
+                    construct_context,
+                    actor_context,
+                );
+                let mapped_pid = transformed_item.persistence_id();
+                pid_map.insert(original_pid, mapped_pid);
+                (ListChange::Push { item: transformed_item }, current_length + 1)
+            }
+            ListChange::Remove { id } => {
+                // Translate the original PersistenceId to the mapped PersistenceId
+                if let Some(mapped_pid) = pid_map.remove(&id) {
+                    (ListChange::Remove { id: mapped_pid }, current_length.saturating_sub(1))
+                } else {
+                    // Item not found in mapping - this shouldn't happen, but pass through
+                    zoon::println!("[List/map] WARNING: Remove for unknown PersistenceId {:?}", id);
+                    (ListChange::Remove { id }, current_length.saturating_sub(1))
+                }
+            }
+            ListChange::Move { old_index, new_index } => (ListChange::Move { old_index, new_index }, current_length),
+            ListChange::Pop => {
+                // Pop removes the last item, but we don't know its PersistenceId here
+                // This is a limitation - Pop should be avoided with identity-based Remove
+                (ListChange::Pop, current_length.saturating_sub(1))
+            }
+            ListChange::Clear => {
+                pid_map.clear();
+                (ListChange::Clear, 0)
+            }
         }
     }
 }

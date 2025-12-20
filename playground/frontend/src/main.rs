@@ -63,7 +63,7 @@ macro_rules! make_example_data {
     }};
 }
 
-static EXAMPLE_DATAS: [ExampleData; 24] = [
+static EXAMPLE_DATAS: [ExampleData; 23] = [
     make_example_data!("minimal"),
     make_example_data!("hello_world"),
     make_example_data!("interval"),

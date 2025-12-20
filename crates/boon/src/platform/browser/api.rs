@@ -418,7 +418,7 @@ pub fn function_element_button(
         ),
         actor_context.clone(),
         TypedStream::infinite(event_stream.chain(stream::pending())),
-        None,
+        PersistenceId::new(),
     );
 
     TaggedObject::new_constant(
@@ -555,7 +555,7 @@ pub fn function_element_text_input(
         ),
         actor_context.clone(),
         TypedStream::infinite(event_stream.chain(stream::pending())),
-        None,
+        PersistenceId::new(),
     );
 
     TaggedObject::new_constant(
@@ -739,7 +739,7 @@ pub fn function_element_checkbox(
         ),
         actor_context.clone(),
         TypedStream::infinite(event_stream.chain(stream::pending())),
-        None,
+        PersistenceId::new(),
     );
 
     TaggedObject::new_constant(
@@ -893,7 +893,7 @@ pub fn function_element_label(
         ),
         actor_context.clone(),
         TypedStream::infinite(event_stream.chain(stream::pending())),
-        None,
+        PersistenceId::new(),
     );
 
     TaggedObject::new_constant(
@@ -1730,7 +1730,7 @@ pub fn function_list_append(
                 ),
                 actor_context_for_append.clone(),
                 constant(value),
-                None,
+                PersistenceId::new(),
             );
             TaggedChange::FromAppend(ListChange::Push { item: new_item_actor })
         });

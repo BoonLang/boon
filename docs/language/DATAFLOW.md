@@ -328,11 +328,29 @@ Lists have their own subscription model separate from ValueActor.
 pub enum ListChange {
     Replace { items: Vec<Arc<ValueActor>> },
     Push { item: Arc<ValueActor> },
-    Insert { index: usize, item: Arc<ValueActor> },
-    Remove { index: usize },
-    // ... more operations
+    InsertAt { index: usize, item: Arc<ValueActor> },
+    UpdateAt { index: usize, item: Arc<ValueActor> },
+    Remove { id: PersistenceId },  // Identity-based, not index-based
+    Move { old_index: usize, new_index: usize },
+    Pop,
+    Clear,
 }
 ```
+
+**Why identity-based Remove?**
+
+Using `PersistenceId` instead of index enables **chained List/remove operations** to work correctly:
+
+```boon
+items: LIST { A, B }
+    |> List/append(item: new_item)
+    |> List/remove(item, when: item.remove_button.press)  -- First remove
+    |> List/remove(item, when: clear_completed_button.press |> THEN {
+        item.completed |> WHEN { True => [], False => SKIP }
+    })  -- Second remove
+```
+
+Each `List/remove` tracks removed items by `PersistenceId` in a `HashSet`. When upstream emits `Replace`, downstream filters out items it already removed. This prevents cleared items from reappearing when upstream changes trigger a Replace event.
 
 **When LIST is input to THEN:**
 

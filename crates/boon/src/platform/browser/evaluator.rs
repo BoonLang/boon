@@ -814,7 +814,7 @@ fn schedule_expression(
                             format!("{}: (forwarding field)", name),
                         ),
                         ctx.actor_context.clone(),
-                        Some(var_persistence_id),
+                        var_persistence_id,
                     );
                     // Store in object_locals for local resolution
                     object_locals.insert(var_span, actor.clone());
@@ -915,7 +915,7 @@ fn schedule_expression(
                             format!("{}: (forwarding field)", name),
                         ),
                         ctx.actor_context.clone(),
-                        Some(var_persistence_id),
+                        var_persistence_id,
                     );
                     // Store in object_locals for local resolution
                     object_locals.insert(var_span, actor.clone());
@@ -1013,7 +1013,7 @@ fn schedule_expression(
                             format!("{}: (forwarding field)", name),
                         ),
                         ctx.actor_context.clone(),
-                        Some(var_persistence_id),
+                        var_persistence_id,
                     );
                     // Store in object_locals for local resolution
                     object_locals.insert(var_span, actor.clone());
@@ -1167,7 +1167,7 @@ fn schedule_expression(
                                     format!("{}; (forwarding argument)", arg_span),
                                 ),
                                 ctx.actor_context.clone(),
-                                None,
+                                PersistenceId::new(),
                             );
                             // Store in arg_locals for local resolution
                             // This prevents overwrites when same function is called multiple times
@@ -1279,7 +1279,7 @@ fn schedule_expression(
                 ),
                 ctx.actor_context,
                 TypedStream::infinite(stream::pending::<Value>()),
-                Some(persistence_id),
+                persistence_id,
             );
             state.store(result_slot, actor);
         }
@@ -1912,7 +1912,7 @@ fn process_work_item(
                     ).complete(ConstructType::ValueActor),
                     ActorContext::default(),
                     TypedStream::infinite(value_stream),
-                    None,
+                    PersistenceId::new(),
                 ));
                 state.store(result_slot, wrapper);
             } else {
@@ -2119,7 +2119,7 @@ fn process_work_item(
                     ),
                     new_ctx.actor_context.clone(),
                     TypedStream::infinite(forwarder_stream.chain(stream::pending())),
-                    None,
+                    PersistenceId::new(),
                 );
 
                 // Send forwarder to async setup for storage on re-evaluation
@@ -2138,7 +2138,7 @@ fn process_work_item(
                     ),
                     new_ctx.actor_context.clone(),
                     TypedStream::infinite(pass_through_stream),
-                    None,
+                    PersistenceId::new(),
                     vec![forwarder_actor],
                 );
 
@@ -2177,7 +2177,7 @@ fn process_work_item(
                     ),
                     new_ctx.actor_context.clone(),
                     TypedStream::infinite(merged_stream.chain(stream::pending())),
-                    None,
+                    PersistenceId::new(),
                     vec![pass_through_actor],
                 );
 
@@ -2248,7 +2248,7 @@ fn process_work_item(
                     let wrapper = ValueActor::new_arc(
                         ConstructInfo::new(
                             format!("PersistenceId: {:?}", persistence.as_ref().map(|p| p.id)),
-                            persistence,
+                            persistence.clone(),
                             format!("{}; {}(..) (with forwarding)", span, path.join("/")),
                         ),
                         ctx.actor_context.clone(),
@@ -2256,7 +2256,7 @@ fn process_work_item(
                             // Keep _loops alive in scan state
                             async move { Some(value) }
                         })),
-                        None,
+                        persistence.map(|p| p.id).unwrap_or_else(PersistenceId::new),
                     );
                     state.store(result_slot, wrapper);
                 } else {
@@ -2447,7 +2447,7 @@ fn build_then_actor(
                 ),
                 actor_context_clone.clone(),
                 constant(value),
-                None,
+                PersistenceId::new(),
             );
 
             // CRITICAL FIX: Freeze parameters for SNAPSHOT semantics.
@@ -2477,7 +2477,7 @@ fn build_then_actor(
                         ),
                         actor_context_clone.clone(),
                         constant(current_value),
-                        None,
+                        PersistenceId::new(),
                     );
                     frozen_parameters.insert(name.clone(), frozen_actor);
                 } else {
@@ -2605,7 +2605,7 @@ fn build_then_actor(
                 format!("{span}; THEN {{..}}"),
             ).complete(ConstructType::ValueActor),
             flattened_stream,
-            Some(persistence_id),
+            persistence_id,
             vec![piped],  // Keep piped actor alive
         ))
     } else {
@@ -2617,7 +2617,7 @@ fn build_then_actor(
             ),
             ctx.actor_context,
             TypedStream::infinite(flattened_stream),
-            Some(persistence_id),
+            persistence_id,
             vec![piped],  // Keep piped actor alive
         ))
     }
@@ -2680,7 +2680,7 @@ fn build_when_actor(
                         ),
                         actor_context_clone.clone(),
                         constant(value.clone()),
-                        None,
+                        PersistenceId::new(),
                     );
 
                     // CRITICAL FIX: Freeze parameters for SNAPSHOT semantics (same as THEN).
@@ -2697,7 +2697,7 @@ fn build_when_actor(
                                 ),
                                 actor_context_clone.clone(),
                                 constant(current_value),
-                                None,
+                                PersistenceId::new(),
                             );
                             frozen_parameters.insert(name.clone(), frozen_actor);
                         } else {
@@ -2716,7 +2716,7 @@ fn build_when_actor(
                             ),
                             actor_context_clone.clone(),
                             constant(bound_value),
-                            None,
+                            PersistenceId::new(),
                         );
                         parameters.insert(name, bound_actor);
                     }
@@ -2809,7 +2809,7 @@ fn build_when_actor(
         ),
         ctx.actor_context,
         TypedStream::infinite(flattened_stream),
-        Some(persistence_id),
+        persistence_id,
         vec![piped],  // Keep piped actor alive
     ))
 }
@@ -2886,7 +2886,7 @@ fn build_while_actor(
                     ),
                     actor_context_clone.clone(),
                     constant(value),
-                    None,
+                    PersistenceId::new(),
                 );
 
                 let mut parameters = actor_context_clone.parameters.clone();
@@ -2899,7 +2899,7 @@ fn build_while_actor(
                         ),
                         actor_context_clone.clone(),
                         constant(bound_value),
-                        None,
+                        PersistenceId::new(),
                     );
                     parameters.insert(name, bound_actor);
                 }
@@ -2994,7 +2994,7 @@ fn build_while_actor(
         ),
         ctx.actor_context,
         TypedStream::infinite(stream),
-        Some(persistence_id),
+        persistence_id,
         vec![piped],  // Keep piped actor alive
     ))
 }
@@ -3298,7 +3298,7 @@ fn build_field_access_actor(
         ),
         ctx.actor_context,
         TypedStream::infinite(subscription_stream),
-        Some(persistence_id),
+        persistence_id,
         vec![piped],  // Keep piped actor alive
     ))
 }
@@ -3342,7 +3342,7 @@ fn build_hold_actor(
         ),
         ctx.actor_context.clone(),
         TypedStream::infinite(state_stream),
-        None,
+        PersistenceId::new(),
     );
 
     // Bind the state parameter in the context so body can reference it
@@ -3468,7 +3468,7 @@ fn build_hold_actor(
         ),
         ctx.actor_context,
         TypedStream::infinite(output_stream),
-        Some(persistence_id),
+        persistence_id,
         vec![body_result.clone(), initial_actor.clone()],
     );
 
@@ -3606,7 +3606,7 @@ fn build_text_literal_actor(
                             format!("{span}; TextInterpolation base for '{}'", base_name),
                         ),
                         ctx.actor_context.clone(),
-                        None,
+                        PersistenceId::new(),
                     );
 
                     let actor_loop = ActorLoop::new(async move {
@@ -3637,7 +3637,7 @@ fn build_text_literal_actor(
                                 format!("{span}; TextInterpolation for '{}'", var_name),
                             ),
                             ctx.actor_context.clone(),
-                            None,
+                            PersistenceId::new(),
                         );
 
                         let actor_loop = ActorLoop::new(async move {
@@ -3813,7 +3813,7 @@ fn build_text_literal_actor(
             ),
             ctx.actor_context,
             TypedStream::infinite(text_value_stream),
-            Some(persistence_id),
+            persistence_id,
         ))
     }
 }
@@ -3852,7 +3852,7 @@ fn build_link_setter_actor(
         ),
         ctx.actor_context,
         TypedStream::infinite(stream),
-        Some(persistence_id),
+        persistence_id,
     ))
 }
 
@@ -4140,7 +4140,7 @@ fn call_function(
                     ),
                     ctx_for_closure.actor_context.clone(),
                     constant(piped_value),
-                    None,
+                    PersistenceId::new(),
                 );
 
                 // Bind the constant value actor to the parameter
@@ -4203,7 +4203,7 @@ fn call_function(
                 ),
                 ctx.actor_context.clone(),
                 TypedStream::infinite(result_stream),
-                None,
+                persistence_id,
             );
 
             return Ok(Some(wrapper_actor));
@@ -4257,7 +4257,7 @@ fn call_function(
                     ),
                     ctx.actor_context,
                     TypedStream::infinite(result_actor.stream_sync()),
-                    None,
+                    persistence_id,
                     arg_actors,  // Keep argument actors alive
                 );
                 return Ok(Some(wrapper));

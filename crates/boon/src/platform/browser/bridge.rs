@@ -1002,9 +1002,8 @@ fn element_stripe(
         })
         .flat_map(|value| {
             // value.expect_list() returns Arc<List> which is kept alive by the stream
-            value.expect_list().stream()
-        })
-        .map(list_change_to_vec_diff);
+            list_change_to_vec_diff_stream(value.expect_list().stream())
+        });
 
     Stripe::new()
         .direction_signal(signal::from_stream(direction_stream).map(Option::unwrap_or_default))
@@ -1063,9 +1062,8 @@ fn element_stack(
             object.expect_variable("layers").stream_sync()
         })
         .flat_map(|value| {
-            value.expect_list().stream()
-        })
-        .map(list_change_to_vec_diff);
+            list_change_to_vec_diff_stream(value.expect_list().stream())
+        });
 
     // Create individual style streams directly from settings
     let settings_variable_2 = tagged_object.expect_variable("settings");
@@ -1673,7 +1671,7 @@ fn element_text_input(
                                                 ValueIdempotencyKey::new(),
                                                 text,
                                             ))).chain(stream::pending())),
-                                            None,
+                                            parser::PersistenceId::new(),
                                         ),
                                         parser::PersistenceId::default(),
                                         parser::Scope::Root,
@@ -1706,7 +1704,7 @@ fn element_text_input(
                                                 ValueIdempotencyKey::new(),
                                                 key.clone(),
                                             ))).chain(stream::pending())),
-                                            None,
+                                            parser::PersistenceId::new(),
                                         ),
                                         parser::PersistenceId::default(),
                                         parser::Scope::Root,
@@ -1741,7 +1739,7 @@ fn element_text_input(
                                             ValueIdempotencyKey::new(),
                                             text,
                                         ))).chain(stream::pending())),
-                                        None,
+                                        parser::PersistenceId::new(),
                                     ),
                                     parser::PersistenceId::default(),
                                     parser::Scope::Root,
@@ -1772,7 +1770,7 @@ fn element_text_input(
                                             ValueIdempotencyKey::new(),
                                             key.clone(),
                                         ))).chain(stream::pending())),
-                                        None,
+                                        parser::PersistenceId::new(),
                                     ),
                                     parser::PersistenceId::default(),
                                     parser::Scope::Root,
@@ -2299,8 +2297,7 @@ fn element_paragraph(
     let contents_vec_diff_stream = settings_variable
         .stream_sync()
         .flat_map(|value| value.expect_object().expect_variable("contents").stream_sync())
-        .flat_map(|value| value.expect_list().stream())
-        .map(list_change_to_vec_diff);
+        .flat_map(|value| list_change_to_vec_diff_stream(value.expect_list().stream()));
 
     Paragraph::new()
         .update_raw_el(|raw_el| {
@@ -2454,22 +2451,71 @@ where
     }
 }
 
-fn list_change_to_vec_diff(change: ListChange) -> VecDiff<Arc<ValueActor>> {
-    match change {
-        ListChange::Replace { items } => VecDiff::Replace { values: items },
-        ListChange::InsertAt { index, item } => VecDiff::InsertAt { index, value: item },
-        ListChange::UpdateAt { index, item } => VecDiff::UpdateAt { index, value: item },
-        ListChange::RemoveAt { index } => VecDiff::RemoveAt { index },
-        ListChange::Move {
-            old_index,
-            new_index,
-        } => VecDiff::Move {
-            old_index,
-            new_index,
+/// Converts a ListChange stream to a VecDiff stream for UI rendering.
+/// Tracks the list state internally to convert identity-based Remove to index-based RemoveAt.
+fn list_change_to_vec_diff_stream(
+    change_stream: impl Stream<Item = ListChange>,
+) -> impl Stream<Item = VecDiff<Arc<ValueActor>>> {
+    use futures_signals::signal_vec::VecDiff;
+
+    change_stream.scan(
+        Vec::<Arc<ValueActor>>::new(),
+        move |items, change| {
+            let vec_diff = match change {
+                ListChange::Replace { items: new_items } => {
+                    *items = new_items.clone();
+                    VecDiff::Replace { values: new_items }
+                }
+                ListChange::InsertAt { index, item } => {
+                    if index <= items.len() {
+                        items.insert(index, item.clone());
+                    }
+                    VecDiff::InsertAt { index, value: item }
+                }
+                ListChange::UpdateAt { index, item } => {
+                    if index < items.len() {
+                        items[index] = item.clone();
+                    }
+                    VecDiff::UpdateAt { index, value: item }
+                }
+                ListChange::Remove { id } => {
+                    // Find index by PersistenceId
+                    if let Some(index) = items.iter().position(|item| item.persistence_id() == id) {
+                        items.remove(index);
+                        VecDiff::RemoveAt { index }
+                    } else {
+                        // Item not found - emit a no-op Replace with current items
+                        // This shouldn't happen in normal operation
+                        VecDiff::Replace { values: items.clone() }
+                    }
+                }
+                ListChange::Move { old_index, new_index } => {
+                    if old_index < items.len() {
+                        let item = items.remove(old_index);
+                        let insert_index = if new_index > old_index {
+                            new_index.saturating_sub(1).min(items.len())
+                        } else {
+                            new_index.min(items.len())
+                        };
+                        items.insert(insert_index, item);
+                    }
+                    VecDiff::Move { old_index, new_index }
+                }
+                ListChange::Push { item } => {
+                    items.push(item.clone());
+                    VecDiff::Push { value: item }
+                }
+                ListChange::Pop => {
+                    items.pop();
+                    VecDiff::Pop {}
+                }
+                ListChange::Clear => {
+                    items.clear();
+                    VecDiff::Clear {}
+                }
+            };
+            future::ready(Some(vec_diff))
         },
-        ListChange::Push { item } => VecDiff::Push { value: item },
-        ListChange::Pop => VecDiff::Pop {},
-        ListChange::Clear => VecDiff::Clear {},
-    }
+    )
 }
 
