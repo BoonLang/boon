@@ -397,18 +397,20 @@ pub fn function_element_button(
     let scoped_id = function_call_persistence_id;
     // Create a derived actor that extracts `event` from argument_element
     // This allows direct access via `.event` instead of `.element.event`
-    let event_stream = argument_element
-        .clone()
-        .stream_sync()
-        .filter_map(|value| {
-            // value is Object [event: [...]]
-            future::ready(value.expect_object().variable("event"))
-        })
-        .then(|event_variable| async move {
-            // Subscribe to get the event object values [press: LINK]
-            event_variable.stream().await
-        })
-        .flatten();
+    // Use current_value() since argument_element is a constant object that doesn't change
+    let event_stream = stream::once({
+        let argument_element = argument_element.clone();
+        async move {
+            // Get element value once (it's a constant argument)
+            let element_value = argument_element.current_value().await.ok()?;
+            // Extract the event variable
+            let event_variable = element_value.expect_object().variable("event")?;
+            // Subscribe to events using stream_safe() for cancellation safety
+            Some(event_variable.value_actor().stream())
+        }
+    })
+    .filter_map(future::ready)
+    .flatten();
 
     let event_actor = ValueActor::new_arc(
         ConstructInfo::new(
@@ -532,20 +534,20 @@ pub fn function_element_text_input(
 
     // Create a derived actor that extracts `event` from argument_element
     // This allows direct access via `.event` instead of `.element.event`
-    let argument_element_for_event = argument_element.clone();
-    let event_stream = stream::once(async move {
-        argument_element_for_event
-            .stream().await
-            .filter_map(|value| {
-                // value is Object [event: [...]]
-                future::ready(value.expect_object().variable("event"))
-            })
-            .then(|event_variable| async move {
-                // Subscribe to get the event object values [change: LINK, key_down: LINK]
-                event_variable.stream().await
-            })
-            .flatten()
-    }).flatten();
+    // Use current_value() since argument_element is a constant object that doesn't change
+    let event_stream = stream::once({
+        let argument_element = argument_element.clone();
+        async move {
+            // Get element value once (it's a constant argument)
+            let element_value = argument_element.current_value().await.ok()?;
+            // Extract the event variable
+            let event_variable = element_value.expect_object().variable("event")?;
+            // Subscribe to events using stream_safe() for cancellation safety
+            Some(event_variable.value_actor().stream())
+        }
+    })
+    .filter_map(future::ready)
+    .flatten();
 
     let event_actor = ValueActor::new_arc(
         ConstructInfo::new(
@@ -716,20 +718,20 @@ pub fn function_element_checkbox(
 
     // Create a derived actor that extracts `event` from argument_element
     // This allows direct access via `.event` instead of `.element.event`
-    let argument_element_for_event = argument_element.clone();
-    let event_stream = stream::once(async move {
-        argument_element_for_event
-            .stream().await
-            .filter_map(|value| {
-                // value is Object [event: [...]]
-                future::ready(value.expect_object().variable("event"))
-            })
-            .then(|event_variable| async move {
-                // Subscribe to get the event object values [click: LINK]
-                event_variable.stream().await
-            })
-            .flatten()
-    }).flatten();
+    // Use current_value() since argument_element is a constant object that doesn't change
+    let event_stream = stream::once({
+        let argument_element = argument_element.clone();
+        async move {
+            // Get element value once (it's a constant argument)
+            let element_value = argument_element.current_value().await.ok()?;
+            // Extract the event variable
+            let event_variable = element_value.expect_object().variable("event")?;
+            // Subscribe to events using stream_safe() for cancellation safety
+            Some(event_variable.value_actor().stream())
+        }
+    })
+    .filter_map(future::ready)
+    .flatten();
 
     let event_actor = ValueActor::new_arc(
         ConstructInfo::new(
@@ -872,18 +874,20 @@ pub fn function_element_label(
 
     // Create a derived actor that extracts `event` from argument_element
     // This allows direct access via `.event` instead of `.element.event`
-    let event_stream = argument_element
-        .clone()
-        .stream_sync()
-        .filter_map(|value| {
-            // value is Object [event: [...]]
-            future::ready(value.expect_object().variable("event"))
-        })
-        .then(|event_variable| async move {
-            // Subscribe to get the event object values [double_click: LINK]
-            event_variable.stream().await
-        })
-        .flatten();
+    // Use current_value() since argument_element is a constant object that doesn't change
+    let event_stream = stream::once({
+        let argument_element = argument_element.clone();
+        async move {
+            // Get element value once (it's a constant argument)
+            let element_value = argument_element.current_value().await.ok()?;
+            // Extract the event variable
+            let event_variable = element_value.expect_object().variable("event")?;
+            // Subscribe to events using stream_safe() for cancellation safety
+            Some(event_variable.value_actor().stream())
+        }
+    })
+    .filter_map(future::ready)
+    .flatten();
 
     let event_actor = ValueActor::new_arc(
         ConstructInfo::new(
@@ -1225,7 +1229,7 @@ pub fn function_math_sum(
     })
         .filter_map(future::ready)
         .chain(stream::once(async move {
-            argument_increment_for_chain.stream().await.map(|value| State {
+            argument_increment_for_chain.stream().map(|value| State {
                 input_value_idempotency_key: Some(value.idempotency_key()),
                 sum: value.expect_number().number(),
                 output_value_idempotency_key: None,
@@ -1303,13 +1307,13 @@ pub fn function_timer_interval(
     };
     let argument_duration_for_stream = argument_duration.clone();
     stream::once(async move {
-        argument_duration_for_stream.stream().await
+        argument_duration_for_stream.stream()
             .then(|value| async move {
                 let duration_object = value.expect_tagged_object("Duration");
                 if let Some(seconds) = duration_object.variable("seconds") {
-                    seconds.stream().await.map(|value| value.expect_number().number() * 1000.).left_stream()
+                    seconds.stream().map(|value| value.expect_number().number() * 1000.).left_stream()
                 } else if let Some(milliseconds) = duration_object.variable("milliseconds") {
-                    milliseconds.stream().await.map(|value| value.expect_number().number()).right_stream()
+                    milliseconds.stream().map(|value| value.expect_number().number()).right_stream()
                 } else {
                     panic!("Failed to get property 'seconds' or 'milliseconds' from tagged object 'Duration'");
                 }
@@ -1383,7 +1387,7 @@ pub fn function_text_trim(
     let [argument_text] = arguments.as_slice() else {
         panic!("Text/trim expects 1 argument")
     };
-    argument_text.clone().stream_sync().map(move |value| {
+    argument_text.clone().stream().map(move |value| {
         let text = match &value {
             Value::Text(t, _) => t.text(),
             _ => panic!("Text/trim expects a Text value"),
@@ -1408,7 +1412,7 @@ pub fn function_text_is_empty(
     let [argument_text] = arguments.as_slice() else {
         panic!("Text/is_empty expects 1 argument")
     };
-    argument_text.clone().stream_sync().map(move |value| {
+    argument_text.clone().stream().map(move |value| {
         let text = match &value {
             Value::Text(t, _) => t.text(),
             _ => panic!("Text/is_empty expects a Text value"),
@@ -1434,7 +1438,7 @@ pub fn function_text_is_not_empty(
     let [argument_text] = arguments.as_slice() else {
         panic!("Text/is_not_empty expects 1 argument")
     };
-    argument_text.clone().stream_sync().map(move |value| {
+    argument_text.clone().stream().map(move |value| {
         let text = match &value {
             Value::Text(t, _) => t.text(),
             _ => panic!("Text/is_not_empty expects a Text value"),
@@ -1462,7 +1466,7 @@ pub fn function_bool_not(
     let [argument_value] = arguments.as_slice() else {
         panic!("Bool/not expects 1 argument")
     };
-    argument_value.clone().stream_sync().map(move |value| {
+    argument_value.clone().stream().map(move |value| {
         let is_true = match &value {
             Value::Tag(tag, _) => tag.tag() == "True",
             _ => panic!("Bool/not expects a Tag (True/False)"),
@@ -1492,7 +1496,7 @@ pub fn function_bool_toggle(
 
     // Get initial value and toggle on each 'when' event
     let initial = argument_value.clone();
-    let when_stream = argument_when.stream_sync();
+    let when_stream = argument_when.stream();
 
     stream::once(async move {
         // Get initial boolean state
@@ -1503,7 +1507,7 @@ pub fn function_bool_toggle(
         // This is a simplified implementation - real implementation would need state
         argument_value.clone()
     }))
-    .then(|actor| async move { actor.stream().await })
+    .then(|actor| async move { actor.stream() })
     .flatten()
     .scan(None::<bool>, move |state, value| {
         let is_true = match &value {
@@ -1538,8 +1542,8 @@ pub fn function_bool_or(
     let that_actor = arguments[1].clone();
 
     // Combine both boolean streams using select
-    let this_stream = this_actor.stream_sync().map(|v| (true, v));
-    let that_stream = that_actor.stream_sync().map(|v| (false, v));
+    let this_stream = this_actor.stream().map(|v| (true, v));
+    let that_stream = that_actor.stream().map(|v| (false, v));
 
     stream::select(this_stream, that_stream)
         .scan((None::<bool>, None::<bool>), move |state, (is_this, value)| {
@@ -1585,7 +1589,7 @@ pub fn function_list_is_empty(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
-    list_actor.stream_sync().filter_map(move |value| {
+    list_actor.stream().filter_map(move |value| {
         let result = match &value {
             Value::List(list, _) => Some(list.clone()),
             _ => None,
@@ -1618,7 +1622,7 @@ pub fn function_list_count(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
-    list_actor.stream_sync().filter_map(move |value| {
+    list_actor.stream().filter_map(move |value| {
         let result = match &value {
             Value::List(list, _) => Some(list.clone()),
             _ => None,
@@ -1650,7 +1654,7 @@ pub fn function_list_not_empty(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
-    list_actor.stream_sync().filter_map(move |value| {
+    list_actor.stream().filter_map(move |value| {
         let result = match &value {
             Value::List(list, _) => Some(list.clone()),
             _ => None,
@@ -1688,7 +1692,7 @@ pub fn function_list_append(
 
     // If item argument is SKIP (not provided), just forward the list unchanged
     if arguments.len() < 2 {
-        return list_actor.stream_sync().left_stream();
+        return list_actor.stream().left_stream();
     }
 
     let item_actor = arguments[1].clone();
@@ -1710,14 +1714,14 @@ pub fn function_list_append(
             FromAppend(ListChange),
         }
 
-        let list_changes = list_actor.clone().stream_sync().filter_map(|value| {
+        let list_changes = list_actor.clone().stream().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
                 _ => None,
             })
         }).flat_map(|list| list.stream()).map(TaggedChange::FromList);
 
-        let append_changes = item_actor.clone().stream_sync().map(move |value| {
+        let append_changes = item_actor.clone().stream().map(move |value| {
             // When item stream produces a value, create a new constant ValueActor
             // containing that specific value and push it.
             // Note: SKIP is not a Value - it's a stream behavior where streams end without
@@ -1802,7 +1806,7 @@ pub fn function_list_clear(
 
     // If trigger argument is not provided, just forward the list unchanged
     if arguments.len() < 2 {
-        return list_actor.stream_sync().left_stream();
+        return list_actor.stream().left_stream();
     }
 
     let trigger_actor = arguments[1].clone();
@@ -1816,7 +1820,7 @@ pub fn function_list_clear(
             Clear,
         }
 
-        let list_changes = list_actor.clone().stream_sync().filter_map(|value| {
+        let list_changes = list_actor.clone().stream().filter_map(|value| {
             future::ready(match value {
                 Value::List(list, _) => Some(list),
                 _ => None,
@@ -1824,7 +1828,7 @@ pub fn function_list_clear(
         }).flat_map(|list| list.stream()).map(TaggedChange::FromList);
 
         // When trigger stream emits any value, emit Clear
-        let clear_changes = trigger_actor.clone().stream_sync().map(|_value| {
+        let clear_changes = trigger_actor.clone().stream().map(|_value| {
             TaggedChange::Clear
         });
 
@@ -1893,7 +1897,7 @@ pub fn function_list_latest(
 ) -> impl Stream<Item = Value> {
     let list_actor = arguments[0].clone();
 
-    list_actor.stream_sync().filter_map(|value| {
+    list_actor.stream().filter_map(|value| {
         future::ready(match value {
             Value::List(list, _) => Some(list),
             _ => None,
@@ -1909,7 +1913,7 @@ pub fn function_list_latest(
             future::ready(Some(items.clone()))
         }).flat_map(move |items| {
             // Merge all item streams
-            let streams: Vec<_> = items.iter().map(|item| item.clone().stream_sync()).collect();
+            let streams: Vec<_> = items.iter().map(|item| item.clone().stream()).collect();
             stream::select_all(streams)
         })
     })
@@ -1993,7 +1997,7 @@ pub fn function_router_go_to(
 ) -> impl Stream<Item = Value> {
     let route_actor = arguments[0].clone();
 
-    route_actor.stream_sync().map(move |value| {
+    route_actor.stream().map(move |value| {
         let route = match &value {
             Value::Text(text, _) => text.text().to_string(),
             _ => "/".to_string(),
@@ -2118,7 +2122,7 @@ fn resolve_actor_value_for_log(actor: Arc<ValueActor>, timeout_ms: u32) -> Pin<B
 
         // Race subscription against timeout
         let get_value = async {
-            actor.stream().await.next().await
+            actor.stream().next().await
         };
         let timeout = Timer::sleep(timeout_ms);
 
@@ -2153,7 +2157,7 @@ async fn extract_log_options_from_with(with_actor: Arc<ValueActor>) -> LogOption
     let mut options = LogOptions::default();
 
     // Get the 'with' object value
-    let with_value = match with_actor.stream().await.next().await {
+    let with_value = match with_actor.stream().next().await {
         Some(v) => v,
         None => return options,
     };
@@ -2162,22 +2166,22 @@ async fn extract_log_options_from_with(with_actor: Arc<ValueActor>) -> LogOption
     if let Value::Object(obj, _) = with_value {
         // Extract label
         if let Some(label_var) = obj.variable("label") {
-            if let Some(label_value) = label_var.value_actor().stream().await.next().await {
+            if let Some(label_value) = label_var.value_actor().stream().next().await {
                 options.label = Some(resolve_value_for_log(label_value, options.timeout_ms).await);
             }
         }
 
         // Extract timeout from Duration[seconds: N] or Duration[milliseconds: N]
         if let Some(timeout_var) = obj.variable("timeout") {
-            if let Some(timeout_value) = timeout_var.value_actor().stream().await.next().await {
+            if let Some(timeout_value) = timeout_var.value_actor().stream().next().await {
                 if let Value::TaggedObject(tagged, _) = timeout_value {
                     if tagged.tag() == "Duration" {
                         if let Some(seconds_var) = tagged.variable("seconds") {
-                            if let Some(Value::Number(num, _)) = seconds_var.value_actor().stream().await.next().await {
+                            if let Some(Value::Number(num, _)) = seconds_var.value_actor().stream().next().await {
                                 options.timeout_ms = (num.number() * 1000.0).max(0.0).min(u32::MAX as f64) as u32;
                             }
                         } else if let Some(milliseconds_var) = tagged.variable("milliseconds") {
-                            if let Some(Value::Number(num, _)) = milliseconds_var.value_actor().stream().await.next().await {
+                            if let Some(Value::Number(num, _)) = milliseconds_var.value_actor().stream().next().await {
                                 options.timeout_ms = num.number().max(0.0).min(u32::MAX as f64) as u32;
                             }
                         }
@@ -2231,7 +2235,7 @@ pub fn function_log_info(
     });
 
     // Use unfold to emit values while keeping the log actor alive
-    let value_stream = value_actor.stream_sync();
+    let value_stream = value_actor.stream();
     stream::unfold(
         (value_stream.boxed_local(), log_sender, Some(log_actor)),
         move |(mut stream, mut sender, actor)| {
@@ -2294,7 +2298,7 @@ pub fn function_log_error(
     });
 
     // Use unfold to emit values while keeping the log actor alive
-    let value_stream = value_actor.stream_sync();
+    let value_stream = value_actor.stream();
     stream::unfold(
         (value_stream.boxed_local(), log_sender, Some(log_actor)),
         move |(mut stream, mut sender, actor)| {
@@ -2345,7 +2349,7 @@ pub fn function_build_fail(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let error_actor = arguments[0].clone();
-    error_actor.stream_sync().map(move |value| {
+    error_actor.stream().map(move |value| {
         let _error_message = match &value {
             Value::Text(text, _) => text.text().to_string(),
             _ => "Unknown build error".to_string(),
@@ -2465,7 +2469,7 @@ pub fn function_file_read_text(
     _actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let path_actor = arguments[0].clone();
-    path_actor.stream_sync().then(move |value| {
+    path_actor.stream().then(move |value| {
         let construct_context = construct_context.clone();
         let function_call_id = function_call_id.clone();
         async move {
@@ -2501,14 +2505,14 @@ pub fn function_file_write_text(
     let content_actor = arguments[1].clone();
 
     let construct_context_clone = construct_context.clone();
-    path_actor.stream_sync().flat_map(move |path_value| {
+    path_actor.stream().flat_map(move |path_value| {
         let path = match &path_value {
             Value::Text(text, _) => text.text().to_string(),
             _ => String::new(),
         };
         let function_call_id = function_call_id.clone();
         let construct_context = construct_context_clone.clone();
-        content_actor.clone().stream_sync().map(move |content_value| {
+        content_actor.clone().stream().map(move |content_value| {
             let content = match &content_value {
                 Value::Text(text, _) => text.text().to_string(),
                 _ => String::new(),
@@ -2564,11 +2568,11 @@ pub fn function_stream_skip(
         // Subscribe on first iteration
         let mut stream_sub = match stream_sub_opt {
             Some(s) => s,
-            None => stream_actor.clone().stream().await.boxed_local().fuse(),
+            None => stream_actor.clone().stream().boxed_local().fuse(),
         };
         let mut count_sub = match count_sub_opt {
             Some(s) => s,
-            None => count_actor.clone().stream().await.boxed_local().fuse(),
+            None => count_actor.clone().stream().boxed_local().fuse(),
         };
 
         loop {
@@ -2678,11 +2682,11 @@ pub fn function_stream_take(
         // Subscribe on first iteration
         let mut stream_sub = match stream_sub_opt {
             Some(s) => s,
-            None => stream_actor.clone().stream().await.boxed_local().fuse(),
+            None => stream_actor.clone().stream().boxed_local().fuse(),
         };
         let mut count_sub = match count_sub_opt {
             Some(s) => s,
-            None => count_actor.clone().stream().await.boxed_local().fuse(),
+            None => count_actor.clone().stream().boxed_local().fuse(),
         };
 
         loop {
@@ -2764,7 +2768,7 @@ pub fn function_stream_distinct(
 ) -> impl Stream<Item = Value> {
     let stream_actor = arguments[0].clone();
 
-    stream_actor.stream_sync().scan(None::<ValueIdempotencyKey>, move |last_key, value| {
+    stream_actor.stream().scan(None::<ValueIdempotencyKey>, move |last_key, value| {
         let current_key = value.idempotency_key();
         let should_emit = last_key.map_or(true, |k| k != current_key);
         *last_key = Some(current_key);
@@ -2820,7 +2824,7 @@ pub fn function_stream_pulses(
     };
 
     // Subscribe to count actor and generate pulses for each count value
-    count_actor.stream_sync().flat_map(move |v| stream::iter(make_pulses(&v)))
+    count_actor.stream().flat_map(move |v| stream::iter(make_pulses(&v)))
 }
 
 /// Stream/debounce(duration) -> Stream<Value>
@@ -2845,19 +2849,19 @@ pub fn function_stream_debounce(
     fn extract_duration_ms(value: &Value) -> f64 {
         let duration_object = value.clone().expect_tagged_object("Duration");
         if let Some(seconds) = duration_object.variable("seconds") {
-            let mut sub = seconds.value_actor().stream_sync();
+            let mut sub = seconds.value_actor().stream();
             if let Some(value) = sub.next().now_or_never().flatten() {
                 return value.expect_number().number() * 1000.0;
             }
         }
         if let Some(ms) = duration_object.variable("ms") {
-            let mut sub = ms.value_actor().stream_sync();
+            let mut sub = ms.value_actor().stream();
             if let Some(value) = sub.next().now_or_never().flatten() {
                 return value.expect_number().number();
             }
         }
         if let Some(milliseconds) = duration_object.variable("milliseconds") {
-            let mut sub = milliseconds.value_actor().stream_sync();
+            let mut sub = milliseconds.value_actor().stream();
             if let Some(value) = sub.next().now_or_never().flatten() {
                 return value.expect_number().number();
             }
@@ -2884,11 +2888,11 @@ pub fn function_stream_debounce(
         // Subscribe on first iteration
         let mut input_stream = match input_opt {
             Some(s) => s,
-            None => stream_actor.clone().stream().await.boxed_local().fuse(),
+            None => stream_actor.clone().stream().boxed_local().fuse(),
         };
         let mut duration_stream = match duration_opt {
             Some(s) => s,
-            None => duration_actor.clone().stream().await.boxed_local().fuse(),
+            None => duration_actor.clone().stream().boxed_local().fuse(),
         };
 
         loop {
@@ -2959,7 +2963,7 @@ pub fn function_directory_entries(
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let path_actor = arguments[0].clone();
-    path_actor.stream_sync().then(move |value| {
+    path_actor.stream().then(move |value| {
         let construct_context = construct_context.clone();
         let function_call_id = function_call_id.clone();
         let actor_context = actor_context.clone();

@@ -1899,7 +1899,7 @@ fn process_work_item(
                     |(subscription_opt, actor_opt, obj)| async move {
                         let mut subscription = match subscription_opt {
                             Some(s) => s,
-                            None => actor_opt.unwrap().stream().await,
+                            None => actor_opt.unwrap().stream(),
                         };
                         subscription.next().await.map(|value| (value, (Some(subscription), None, obj)))
                     },
@@ -2073,7 +2073,7 @@ fn process_work_item(
                     let link_sender = get_link_sender_from_alias(alias_for_stream, ctx_for_stream).await;
 
                     // Subscribe to prev_actor
-                    let sub = prev_actor_for_stream.clone().stream().await;
+                    let sub = prev_actor_for_stream.clone().stream();
 
                     (link_sender, existing_sender, sub, value_tx_for_stream, subscription_scope_for_stream)
                 });
@@ -2159,13 +2159,13 @@ fn process_work_item(
                     }
                 }).filter_map(|opt_actor| future::ready(opt_actor))
                 .flat_map(|existing_actor| {
-                    existing_actor.stream_sync()
+                    existing_actor.stream()
                 });
 
                 // Merge: on first eval, relay_stream is empty (no existing actor), so pass_through emits.
                 // On re-eval, relay_stream forwards from existing actor.
                 let merged_stream = stream::select(
-                    pass_through_actor.clone().stream_sync(),
+                    pass_through_actor.clone().stream(),
                     relay_stream,
                 );
 
@@ -2252,7 +2252,7 @@ fn process_work_item(
                             format!("{}; {}(..) (with forwarding)", span, path.join("/")),
                         ),
                         ctx.actor_context.clone(),
-                        TypedStream::infinite(actor.stream_sync().scan(forwarding_loops, |_loops, value| {
+                        TypedStream::infinite(actor.stream().scan(forwarding_loops, |_loops, value| {
                             // Keep _loops alive in scan state
                             async move { Some(value) }
                         })),
@@ -2583,13 +2583,13 @@ fn build_then_actor(
 
     let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if backpressure_permit.is_some() || sequential {
         // For sequential mode, use regular flatten (processes one stream at a time)
-        let stream = piped.clone().stream_sync()
+        let stream = piped.clone().stream()
             .then(eval_body)
             .flatten();
         Box::pin(stream)
     } else {
         // For non-sequential mode, use flatten_unordered for concurrent processing
-        let stream = piped.clone().stream_sync()
+        let stream = piped.clone().stream()
             .then(eval_body)
             .flatten_unordered(None);
         Box::pin(stream)
@@ -2787,14 +2787,14 @@ fn build_when_actor(
     // never emits (SKIP case), others can still produce values
     let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if backpressure_permit.is_some() || sequential {
         // For sequential mode, use regular flatten (processes one stream at a time)
-        let stream = piped.clone().stream_sync()
+        let stream = piped.clone().stream()
             .then(eval_body)
             .flatten();
         Box::pin(stream)
     } else {
         // For non-sequential mode, use flatten_unordered for concurrent processing
         // None = unlimited concurrency
-        let stream = piped.clone().stream_sync()
+        let stream = piped.clone().stream()
             .then(eval_body)
             .flatten_unordered(None);
         Box::pin(stream)
@@ -2847,7 +2847,7 @@ fn build_while_actor(
     // - The guard is kept alive in the stream
     // - When switch_map drops the old inner stream, the guard is dropped
     // - The guard's Drop impl cancels the scope, terminating all subscriptions in that arm
-    let stream = switch_map(piped.clone().stream_sync(), move |value| {
+    let stream = switch_map(piped.clone().stream(), move |value| {
         let actor_context_clone = actor_context_for_while.clone();
         let construct_context_clone = construct_context_for_while.clone();
         let reference_connector_clone = reference_connector_for_while.clone();
@@ -2963,7 +2963,7 @@ fn build_while_actor(
                         // Use stream() for continuous streaming semantics
                         // Wrap the stream to keep scope_guard alive - when this stream is dropped
                         // (by switch_map switching to new arm), the guard is dropped, cancelling scope
-                        let body_stream = result_actor.stream().await;
+                        let body_stream = result_actor.stream();
                         stream::unfold((body_stream, Some(scope_guard)), |(mut s, guard)| async move {
                             s.next().await.map(|v| (v, (s, guard)))
                         }).boxed_local()
@@ -3081,8 +3081,8 @@ fn build_field_access_actor(
                 };
                 if let Some(var) = variable {
                     let value_actor = var.value_actor();
-                    let mut sub = value_actor.stream().await;
-                    current = sub.next().await?;
+                    // Use value() instead of stream().next() to avoid subscription churn
+                    current = value_actor.current_value().await.ok()?;
                 } else {
                     return None;
                 }
@@ -3103,12 +3103,12 @@ fn build_field_access_actor(
             let var = variable?;
             let is_link = var.link_value_sender().is_some();
             let value_actor = var.value_actor();
-            let subscription = value_actor.stream().await;
+            let subscription = value_actor.stream();
             Some((is_link, subscription))
         }
 
         // Start by getting the first value from the piped stream
-        let mut piped_subscription = _piped_ref.stream().await.fuse();
+        let mut piped_subscription = _piped_ref.stream().fuse();
         let Some(initial_piped_value) = piped_subscription.next().await else {
             return;
         };
@@ -3147,14 +3147,14 @@ fn build_field_access_actor(
                     // Found the first LINK - subscribe to it
                     first_link_idx = Some(idx);
                     let value_actor = var.value_actor();
-                    first_link_subscription = Some(value_actor.stream().await.fuse());
+                    first_link_subscription = Some(value_actor.stream().fuse());
                     fields_before_first_link = intermediate_fields[..idx].to_vec();
                     fields_after_first_link = intermediate_fields[idx + 1..].to_vec();
                 }
 
                 // Get the current value from this field
                 let value_actor = var.value_actor();
-                let mut sub = value_actor.stream().await;
+                let mut sub = value_actor.stream();
                 if let Some(val) = sub.next().await {
                     current_value = val;
                 } else {
@@ -3234,11 +3234,11 @@ fn build_field_access_actor(
 
                                     if let Some(var) = first_link_var {
                                         let value_actor = var.value_actor();
-                                        *first_link_sub = value_actor.clone().stream().await.fuse();
+                                        *first_link_sub = value_actor.clone().stream().fuse();
 
                                         // Get first value and navigate to final field
-                                        let mut temp_sub = value_actor.stream().await;
-                                        if let Some(first_val) = temp_sub.next().await {
+                                        // Use value() instead of stream().next() to avoid subscription churn
+                                        if let Ok(first_val) = value_actor.value().await {
                                             if let Some(nav_value) = navigate_path(first_val, &fields_after_first_link).await {
                                                 if let Some((_, new_final_sub)) = get_final_link_subscription(&nav_value, &final_field).await {
                                                     final_sub = new_final_sub.fuse();
@@ -3329,7 +3329,7 @@ fn build_hold_actor(
     // This is what the state_param references
     //
     // State stream: first value from initial_actor, then updates from state_receiver
-    let state_stream = initial_actor.clone().stream_sync()
+    let state_stream = initial_actor.clone().stream()
         .take(1)  // Get the first initial value
         .chain(state_receiver);  // Then listen for updates and resets
 
@@ -3423,7 +3423,7 @@ fn build_hold_actor(
     // Subscribe to body - handles both lazy and eager actors.
     // For lazy actors, this enables demand-driven evaluation where HOLD pulls values
     // one at a time and updates state between each pull (sequential state updates).
-    let body_subscription = body_result.clone().stream_sync();
+    let body_subscription = body_result.clone().stream();
     let state_update_stream = body_subscription.then(move |new_value| {
         let mut state_sender = state_sender_for_update.clone();
         let state_actor = state_actor_for_update.clone();
@@ -3487,7 +3487,7 @@ fn build_hold_actor(
     // Use AtomicBool instead of Rc<RefCell<bool>> for lock-free flag.
     let is_first_input = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let output_weak_for_initial = Arc::downgrade(&output);
-    let initial_stream = initial_actor.clone().stream_sync().then(move |value| {
+    let initial_stream = initial_actor.clone().stream().then(move |value| {
         let is_first_input = is_first_input.clone();
         let output_weak = output_weak_for_initial.clone();
         let mut state_sender = state_sender_for_reset.clone();
@@ -3611,7 +3611,7 @@ fn build_text_literal_actor(
 
                     let actor_loop = ActorLoop::new(async move {
                         let actor = ref_connector.referenceable(ref_span_copy).await;
-                        let mut subscription = actor.stream().await;
+                        let mut subscription = actor.stream();
                         while let Some(value) = subscription.next().await {
                             if base_sender.send(value).await.is_err() {
                                 break;
@@ -3643,7 +3643,7 @@ fn build_text_literal_actor(
                         let actor_loop = ActorLoop::new(async move {
                             // First, wait for base actor to have a value so we can navigate to the field
                             let base_value = {
-                                let mut sub = base_actor.stream().await;
+                                let mut sub = base_actor.stream();
                                 sub.next().await
                             };
 
@@ -3698,7 +3698,7 @@ fn build_text_literal_actor(
 
                             // Now subscribe to the final field's value actor
                             if let Some(final_actor) = current_value_actor {
-                                let mut subscription = final_actor.stream().await;
+                                let mut subscription = final_actor.stream();
                                 while let Some(value) = subscription.next().await {
                                     if field_sender.send(value).await.is_err() {
                                         break;
@@ -3743,7 +3743,7 @@ fn build_text_literal_actor(
         // Each time any part emits, we need to recombine
         let part_subscriptions: Vec<_> = part_actors
             .iter()
-            .map(|(_, actor)| actor.clone().stream_sync())
+            .map(|(_, actor)| actor.clone().stream())
             .collect();
 
         // For simplicity, use select_all and latest values approach
@@ -3839,7 +3839,7 @@ fn build_link_setter_actor(
     )?;
 
     // Create a stream that forwards the alias values through a link setter
-    let stream = alias_actor.stream_sync().map(move |value| {
+    let stream = alias_actor.stream().map(move |value| {
         // Forward the value through the link connector
         value
     });
@@ -3868,8 +3868,8 @@ async fn get_link_sender_from_alias(
             // Start from PASSED value and traverse extra_parts
             let passed = ctx.actor_context.passed.as_ref()?;
 
-            // Subscribe to get the first value from PASSED
-            let mut current_value = passed.clone().stream().await.next().await?;
+            // Get the first value from PASSED (use value() to avoid subscription churn)
+            let mut current_value = passed.clone().current_value().await.ok()?;
 
             // Traverse the path
             for (i, part) in extra_parts.iter().enumerate() {
@@ -3895,8 +3895,8 @@ async fn get_link_sender_from_alias(
                     }
                     return sender;
                 } else {
-                    // Not at the end yet, subscribe to get the next value
-                    current_value = variable.clone().stream().await.next().await?;
+                    // Not at the end yet, get next value (use value() to avoid subscription churn)
+                    current_value = variable.value_actor().current_value().await.ok()?;
                 }
             }
 
@@ -3940,8 +3940,8 @@ async fn get_link_sender_from_alias(
                 return None;
             }
 
-            // Get the first value
-            let mut current_value = root_actor.stream().await.next().await?;
+            // Get the first value (use value() to avoid subscription churn)
+            let mut current_value = root_actor.current_value().await.ok()?;
 
             // Traverse the remaining path (skip first part since we already resolved it)
             for (i, part) in parts.iter().skip(1).enumerate() {
@@ -3967,8 +3967,8 @@ async fn get_link_sender_from_alias(
                     }
                     return sender;
                 } else {
-                    // Not at the end yet, subscribe to get the next value
-                    current_value = variable.clone().stream().await.next().await?;
+                    // Not at the end yet, get next value (use value() to avoid subscription churn)
+                    current_value = variable.value_actor().current_value().await.ok()?;
                 }
             }
 
@@ -4130,7 +4130,7 @@ fn call_function(
             // 1. Subscribes to the piped input
             // 2. For each value from piped, evaluates the function body with that value
             // 3. If piped never produces values (SKIP), this stream also never produces values
-            let result_stream = piped_for_closure.stream_sync().flat_map(move |piped_value| {
+            let result_stream = piped_for_closure.stream().flat_map(move |piped_value| {
                 // Create a constant actor for this specific piped value
                 let value_actor = ValueActor::new_arc(
                     ConstructInfo::new(
@@ -4256,7 +4256,7 @@ fn call_function(
                         format!("{span}; {}(..) (with args)", full_path),
                     ),
                     ctx.actor_context,
-                    TypedStream::infinite(result_actor.stream_sync()),
+                    TypedStream::infinite(result_actor.stream()),
                     persistence_id,
                     arg_actors,  // Keep argument actors alive
                 );
@@ -4373,7 +4373,7 @@ async fn match_pattern(
                         // Find the variable in the tagged object by name
                         if let Some(variable) = to.variables().iter().find(|v| v.name() == var_name) {
                             // Await the current value from the reactive actor
-                            if let Some(field_value) = variable.value_actor().stream().await.next().await {
+                            if let Some(field_value) = variable.value_actor().current_value().await.ok() {
                                 // Handle nested patterns if present
                                 if let Some(ref nested_pattern) = pattern_var.value {
                                     // Recursively match nested pattern
@@ -4414,7 +4414,7 @@ async fn match_pattern(
                     // Find the variable in the object by name
                     if let Some(variable) = variables.iter().find(|v| v.name() == var_name) {
                         // Await the current value from the reactive actor
-                        if let Some(field_value) = variable.value_actor().stream().await.next().await {
+                        if let Some(field_value) = variable.value_actor().current_value().await.ok() {
                             // Handle nested patterns if present
                             if let Some(ref nested_pattern) = pattern_var.value {
                                 // Recursively match nested pattern
@@ -4467,7 +4467,7 @@ async fn match_pattern(
                 // Match each pattern against corresponding list item
                 for (item_pattern, (_item_id, item_actor)) in items.iter().zip(snapshot.iter()) {
                     // Get the current value from the item actor
-                    if let Some(item_value) = item_actor.clone().stream().await.next().await {
+                    if let Some(item_value) = item_actor.clone().current_value().await.ok() {
                         // Recursively match the pattern
                         if let Some(nested_bindings) = Box::pin(match_pattern(item_pattern, &item_value)).await {
                             bindings.extend(nested_bindings);

@@ -1036,12 +1036,13 @@ impl Default for MigrationState {
 
 // --- Subscription Registration (Push-Based Model) ---
 
-/// Request for subscribing to a ValueActor.
-/// The actor loop will send back a Receiver<Value> through the oneshot channel.
-pub struct SubscriptionRequest {
-    /// Channel to receive the value receiver back
-    pub reply: oneshot::Sender<mpsc::Receiver<Value>>,
-    /// Starting version - 0 means all history
+/// Fire-and-forget subscription setup.
+/// The caller creates the channel and sends the sender to the actor.
+/// No reply needed - the data channel IS the acknowledgment.
+pub struct SubscriptionSetup {
+    /// The sender half of the subscription channel (caller keeps receiver)
+    pub sender: mpsc::Sender<Value>,
+    /// Starting version - 0 means all history, current_version means future only
     pub starting_version: u64,
 }
 
@@ -1866,7 +1867,7 @@ impl Variable {
         })
     }
 
-    /// Subscribe to this variable's value stream (async).
+    /// Subscribe to this variable's value stream.
     ///
     /// This method keeps the Variable alive for the lifetime of the returned stream.
     /// This is important because:
@@ -1874,9 +1875,11 @@ impl Variable {
     /// - The Variable may be the only reference keeping dependent actors alive
     ///
     /// Takes ownership of the Arc to keep the Variable alive for the subscription lifetime.
-    /// Callers should use `.clone().stream().await` if they need to retain a reference.
-    pub async fn stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        let subscription = self.value_actor.clone().stream().await;
+    /// Callers should use `.clone().stream()` if they need to retain a reference.
+    ///
+    /// This is synchronous and cancellation-safe.
+    pub fn stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        let subscription = self.value_actor.clone().stream();
         // Subscription keeps the actor alive; we also need to keep the Variable alive
         stream::unfold(
             (subscription, self),
@@ -1886,14 +1889,16 @@ impl Variable {
         ).boxed_local()
     }
 
-    /// Subscribe to future values only - skips historical replay (async).
+    /// Subscribe to future values only - skips historical replay.
     ///
     /// Use this for event triggers (THEN, WHEN, List/remove) where historical
     /// events should NOT be replayed.
     ///
     /// Takes ownership of the Arc to keep the Variable alive for the subscription lifetime.
-    pub async fn stream_from_now(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        let subscription = self.value_actor.clone().stream_from_now().await;
+    ///
+    /// This is synchronous and cancellation-safe.
+    pub fn stream_from_now(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+        let subscription = self.value_actor.clone().stream_from_now();
         // Subscription keeps the actor alive; we also need to keep the Variable alive
         stream::unfold(
             (subscription, self),
@@ -1901,20 +1906,6 @@ impl Variable {
                 subscription.next().await.map(|value| (value, (subscription, variable)))
             }
         ).boxed_local()
-    }
-
-    /// Sync wrapper for stream_from_now() - returns stream that emits only future values.
-    ///
-    /// Use this when you need stream_from_now() semantics but can't await.
-    pub fn stream_from_now_sync(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        stream::once(async move { self.stream_from_now().await }).flatten().boxed_local()
-    }
-
-    /// Sync wrapper for stream() - returns continuous stream from version 0.
-    ///
-    /// Use this when you need stream() semantics but can't await.
-    pub fn stream_sync(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        stream::once(async move { self.stream().await }).flatten().boxed_local()
     }
 
     pub fn value_actor(&self) -> Arc<ValueActor> {
@@ -1988,7 +1979,7 @@ impl VariableOrArgumentReference {
         } else {
             // Streaming: continuous updates
             stream::once(async move { root_value_actor.await })
-                .then(|actor| async move { actor.stream().await })
+                .then(|actor| async move { actor.stream() })
                 .flatten()
                 .boxed_local()
         };
@@ -2038,7 +2029,7 @@ impl VariableOrArgumentReference {
                                             Some(s) => s,
                                             None => {
                                                 let actor = actor_opt.unwrap();
-                                                actor.stream().await
+                                                actor.stream()
                                             }
                                         };
                                         let value = subscription.next().await;
@@ -2072,7 +2063,7 @@ impl VariableOrArgumentReference {
                                             Some(s) => s,
                                             None => {
                                                 let actor = actor_opt.unwrap();
-                                                actor.stream().await
+                                                actor.stream()
                                             }
                                         };
                                         let value = subscription.next().await;
@@ -2547,7 +2538,7 @@ impl FunctionCall {
             // Subscribe to all arguments and filter for FLUSHED values only
             let flushed_streams: Vec<_> = arguments_for_flushed
                 .iter()
-                .map(|arg| arg.clone().stream_sync().filter(|v| {
+                .map(|arg| arg.clone().stream().filter(|v| {
                     let is_flushed = v.is_flushed();
                     std::future::ready(is_flushed)
                 }))
@@ -2619,8 +2610,8 @@ impl LatestCombinator {
 
         let value_stream =
             stream::select_all(inputs.iter().enumerate().map(|(index, value_actor)| {
-                // Use stream_sync() to properly handle lazy actors in HOLD body context
-                value_actor.clone().stream_sync().map(move |value| (index, value))
+                // Use stream() to properly handle lazy actors in HOLD body context
+                value_actor.clone().stream().map(move |value| (index, value))
             }))
             .scan(true, {
                 let storage = storage.clone();
@@ -2701,10 +2692,10 @@ impl BinaryOperatorCombinator {
         let construct_info = construct_info.complete(ConstructType::ValueActor);
 
         // Merge both operand streams, tracking which operand changed
-        // Use stream_sync() to properly handle lazy actors in HOLD body context
+        // Use stream() to properly handle lazy actors in HOLD body context
         let value_stream = stream::select_all([
-            operand_a.clone().stream_sync().map(|v| (0usize, v)).boxed_local(),
-            operand_b.clone().stream_sync().map(|v| (1usize, v)).boxed_local(),
+            operand_a.clone().stream().map(|v| (0usize, v)).boxed_local(),
+            operand_b.clone().stream().map(|v| (1usize, v)).boxed_local(),
         ])
         .scan(
             (None::<Value>, None::<Value>),
@@ -3133,10 +3124,10 @@ pub struct ValueActor {
     /// Current version number - increments on each value change.
     current_version: Arc<AtomicU64>,
 
-    /// Channel for subscription requests.
-    /// Subscribers send SubscriptionRequest, receive back a Receiver<Value>.
+    /// Channel for fire-and-forget subscription setup.
+    /// The caller creates the channel and sends the sender - no reply needed.
     /// Bounded(32) - subscription bursts during initialization.
-    subscription_sender: NamedChannel<SubscriptionRequest>,
+    subscription_sender: NamedChannel<SubscriptionSetup>,
 
     /// Channel for direct value storage.
     /// Used by HOLD to store values without going through the input stream.
@@ -3205,7 +3196,7 @@ impl ValueActor {
         let (message_sender, message_receiver) = NamedChannel::new("value_actor.messages", 16);
         let current_version = Arc::new(AtomicU64::new(0));
 
-        // Bounded channel for subscription requests
+        // Bounded channel for fire-and-forget subscription setup
         let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.subscriptions", 32);
 
         // Bounded channel for direct value storage
@@ -3254,39 +3245,26 @@ impl ValueActor {
 
                 loop {
                     select! {
-                        // Handle new subscription requests
-                        req = subscription_receiver.next() => {
-                            if let Some(SubscriptionRequest { reply, starting_version }) = req {
+                        // Handle fire-and-forget subscription setup
+                        setup = subscription_receiver.next() => {
+                            if let Some(SubscriptionSetup { mut sender, starting_version }) = setup {
                                 // If stream ended without producing any value (SKIP case),
-                                // don't register subscriber - send empty receiver to signal completion
+                                // just close the sender to signal completion
                                 if stream_ended && !stream_ever_produced {
-                                    let (tx, rx) = mpsc::channel(1);
-                                    drop(tx); // Close immediately
-                                    if reply.send(rx).is_err() {
-                                        zoon::println!("[VALUE_ACTOR] Subscription reply receiver dropped (SKIP case) for '{construct_info}'");
-                                    }
+                                    drop(sender); // Close immediately - caller's receiver will see closed channel
                                 } else {
-                                    // Create channel for this subscriber (capacity 32 for buffering)
-                                    let (mut tx, rx) = mpsc::channel(32);
-
                                     // Send historical values from starting_version
                                     let historical_values = value_history.get_values_since(starting_version).0;
-                                    let history_count = historical_values.len();
-                                    let mut sent_count = 0;
                                     for value in historical_values {
-                                        // Best effort - if channel full, subscriber is too slow
-                                        if tx.try_send(value.clone()).is_ok() {
-                                            sent_count += 1;
+                                        // Best effort - if channel full or disconnected, skip
+                                        if sender.try_send(value.clone()).is_err() {
+                                            break;
                                         }
                                     }
-
                                     // Add to live subscribers list
-                                    subscribers.push(tx);
-
-                                    // Reply with the receiver
-                                    if reply.send(rx).is_err() {
-                                        zoon::println!("[VALUE_ACTOR] Subscription reply receiver dropped for '{construct_info}'");
-                                    }
+                                    // If sender is already disconnected (caller dropped), it will be cleaned up
+                                    // on next value push via retain_mut
+                                    subscribers.push(sender);
                                 }
                             }
                         }
@@ -3522,7 +3500,7 @@ impl ValueActor {
         let current_version = Arc::new(AtomicU64::new(0));
 
         // Dummy channels (won't be used since lazy_delegate handles subscriptions)
-        let (subscription_sender, _subscription_receiver) = NamedChannel::new("value_actor.lazy.subscriptions", 32);
+        let (subscription_sender, _subscription_receiver) = NamedChannel::<SubscriptionSetup>::new("value_actor.lazy.subscriptions", 32);
         let (direct_store_sender, _direct_store_receiver) = NamedChannel::new("value_actor.lazy.direct_store", 64);
         let (stored_value_query_sender, _stored_value_query_receiver) = NamedChannel::new("value_actor.lazy.queries", 8);
 
@@ -3615,24 +3593,16 @@ impl ValueActor {
 
                 loop {
                     select! {
-                        req = subscription_receiver.next() => {
-                            if let Some(SubscriptionRequest { reply, starting_version }) = req {
+                        // Handle fire-and-forget subscription setup
+                        setup = subscription_receiver.next() => {
+                            if let Some(SubscriptionSetup { mut sender, starting_version }) = setup {
                                 if stream_ended && !stream_ever_produced {
-                                    let (tx, rx) = mpsc::channel(1);
-                                    drop(tx);
-                                    if reply.send(rx).is_err() {
-                                        zoon::println!("[VALUE_ACTOR] Subscription reply receiver dropped (SKIP case) for '{construct_info}'");
-                                    }
+                                    drop(sender);
                                 } else {
-                                    let (mut tx, rx) = mpsc::channel(32);
                                     for value in value_history.get_values_since(starting_version).0 {
-                                        // Best effort historical send - if full, skip
-                                        tx.try_send(value.clone()).ok();
+                                        if sender.try_send(value.clone()).is_err() { break; }
                                     }
-                                    subscribers.push(tx);
-                                    if reply.send(rx).is_err() {
-                                        zoon::println!("[VALUE_ACTOR] Subscription reply receiver dropped for '{construct_info}'");
-                                    }
+                                    subscribers.push(sender);
                                 }
                             }
                         }
@@ -3806,7 +3776,7 @@ impl ValueActor {
                 }
             }
 
-            let mut subscription = source_actor.stream().await;
+            let mut subscription = source_actor.stream();
             while let Some(value) = subscription.next().await {
                 if forwarding_sender.send(value).await.is_err() {
                     break;
@@ -3884,24 +3854,16 @@ impl ValueActor {
                             }
                         }
 
-                        req = subscription_receiver.next() => {
-                            if let Some(SubscriptionRequest { reply, starting_version }) = req {
+                        // Handle fire-and-forget subscription setup
+                        setup = subscription_receiver.next() => {
+                            if let Some(SubscriptionSetup { mut sender, starting_version }) = setup {
                                 if stream_ended && !stream_ever_produced {
-                                    let (tx, rx) = mpsc::channel(1);
-                                    drop(tx);
-                                    if reply.send(rx).is_err() {
-                                        zoon::println!("[VALUE_ACTOR] Subscription reply receiver dropped (SKIP case) for '{construct_info}'");
-                                    }
+                                    drop(sender);
                                 } else {
-                                    let (mut tx, rx) = mpsc::channel(32);
                                     for value in value_history.get_values_since(starting_version).0 {
-                                        // Best effort historical send - if full, skip
-                                        tx.try_send(value.clone()).ok();
+                                        if sender.try_send(value.clone()).is_err() { break; }
                                     }
-                                    subscribers.push(tx);
-                                    if reply.send(rx).is_err() {
-                                        zoon::println!("[VALUE_ACTOR] Subscription reply receiver dropped for '{construct_info}'");
-                                    }
+                                    subscribers.push(sender);
                                 }
                             }
                         }
@@ -4015,64 +3977,50 @@ impl ValueActor {
             });
         }
         // Otherwise stream and wait for first value
-        let mut s = self.stream().await;
+        let mut s = self.stream();
         s.next().await.ok_or(ValueError::ActorDropped)
     }
 
-    /// Subscribe to continuous stream of all values from version 0 (async).
+    /// Subscribe to continuous stream of all values from version 0.
     ///
     /// Use this for WHILE bodies, LATEST inputs, and reactive bindings where you
     /// need continuous updates.
     ///
     /// Takes ownership of the Arc to keep the actor alive for the subscription lifetime.
-    /// Callers should use `.clone().stream().await` if they need to retain a reference.
-    pub async fn stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+    /// Callers should use `.clone().stream()` if they need to retain a reference.
+    ///
+    /// This is synchronous and cancellation-safe - the caller creates the subscription
+    /// channel and sends one end to the actor. If the caller is dropped, the actor
+    /// simply sees a disconnected sender and cleans up silently.
+    pub fn stream(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
         // Handle lazy actors
         if let Some(ref lazy_delegate) = self.lazy_delegate {
             return lazy_delegate.clone().stream().boxed_local();
         }
 
-        // Wait for actor to be ready (has processed at least one value).
-        // This ensures constant() values are in value_history before we subscribe.
-        // The ready_signal fires when the actor loop processes its first value.
-        if self.version() == 0 {
-            // Clone the shared future and await it - errors mean sender dropped (actor dead)
-            if self.ready_signal.clone().await.is_err() {
-                zoon::println!("[VALUE_ACTOR] Ready signal sender dropped - actor may be dead");
-            }
-        }
+        // Create the subscription channel (caller keeps receiver)
+        let (tx, rx) = mpsc::channel(32);
 
-        // Send subscription request to actor loop
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self.subscription_sender.send(SubscriptionRequest {
-            reply: reply_tx,
+        // Send setup to actor (best effort - if actor is dead, rx will be empty)
+        let _ = self.subscription_sender.try_send(SubscriptionSetup {
+            sender: tx,
             starting_version: 0,
-        }).await.is_err() {
-            zoon::eprintln!("Failed to stream: actor dropped");
-            // Return empty stream
-            return stream::empty().boxed_local();
-        }
+        });
 
-        // Wait for the receiver from actor loop
-        match reply_rx.await {
-            Ok(receiver) => {
-                PushSubscription::new(receiver, self).boxed_local()
-            }
-            Err(_) => {
-                zoon::eprintln!("Failed to stream: actor dropped before reply");
-                stream::empty().boxed_local()
-            }
-        }
+        // Return the receiver wrapped in a stream that keeps self alive
+        PushSubscription::new(rx, self).boxed_local()
     }
 
-    /// Subscribe starting from current version - only future values (async).
+    /// Subscribe starting from current version - only future values.
     ///
     /// Use this for event triggers (THEN, WHEN, List/remove) where historical
     /// events should NOT be replayed. Subscribers will only receive values
     /// emitted AFTER this subscription is created.
     ///
     /// Takes ownership of the Arc to keep the actor alive for the subscription lifetime.
-    pub async fn stream_from_now(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
+    ///
+    /// This is synchronous and cancellation-safe.
+    pub fn stream_from_now(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
         // Handle lazy actors
         if let Some(ref lazy_delegate) = self.lazy_delegate {
             return lazy_delegate.clone().stream().boxed_local();
@@ -4081,41 +4029,17 @@ impl ValueActor {
         // Capture current version BEFORE subscribing - this is the key difference from stream()
         let current_version = self.version();
 
-        // Send subscription request to actor loop with current version as starting point
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self.subscription_sender.send(SubscriptionRequest {
-            reply: reply_tx,
+        // Create the subscription channel (caller keeps receiver)
+        let (tx, rx) = mpsc::channel(32);
+
+        // Send setup to actor with current version as starting point
+        let _ = self.subscription_sender.try_send(SubscriptionSetup {
+            sender: tx,
             starting_version: current_version,
-        }).await.is_err() {
-            zoon::eprintln!("Failed to stream_from_now: actor dropped");
-            return stream::empty().boxed_local();
-        }
+        });
 
-        // Wait for the receiver from actor loop
-        match reply_rx.await {
-            Ok(receiver) => {
-                PushSubscription::new(receiver, self).boxed_local()
-            }
-            Err(_) => {
-                zoon::eprintln!("Failed to stream_from_now: actor dropped before reply");
-                stream::empty().boxed_local()
-            }
-        }
-    }
-
-    /// Sync wrapper for stream_from_now() - returns stream that emits only future values.
-    ///
-    /// Use this when you need stream_from_now() semantics but can't await.
-    pub fn stream_from_now_sync(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        stream::once(async move { self.stream_from_now().await }).flatten().boxed_local()
-    }
-
-    /// Sync wrapper for stream() - returns continuous stream from version 0.
-    ///
-    /// Use this when you need stream() semantics but can't await.
-    /// Equivalent to: `stream::once(async move { actor.stream().await }).flatten()`
-    pub fn stream_sync(self: Arc<Self>) -> LocalBoxStream<'static, Value> {
-        stream::once(async move { self.stream().await }).flatten().boxed_local()
+        // Return the receiver wrapped in a stream that keeps self alive
+        PushSubscription::new(rx, self).boxed_local()
     }
 
     /// Get optimal update for subscriber at given version (async).
@@ -4379,7 +4303,7 @@ impl Value {
             Value::Object(object, _) => {
                 let mut obj = serde_json::Map::new();
                 for variable in object.variables() {
-                    let value = variable.value_actor().clone().stream().await.next().await;
+                    let value = variable.value_actor().current_value().await.ok();
                     if let Some(value) = value {
                         let json_value = Box::pin(value.to_json()).await;
                         obj.insert(variable.name().to_string(), json_value);
@@ -4391,7 +4315,7 @@ impl Value {
                 let mut obj = serde_json::Map::new();
                 obj.insert("_tag".to_string(), serde_json::Value::String(tagged_object.tag().to_string()));
                 for variable in tagged_object.variables() {
-                    let value = variable.value_actor().clone().stream().await.next().await;
+                    let value = variable.value_actor().current_value().await.ok();
                     if let Some(value) = value {
                         let json_value = Box::pin(value.to_json()).await;
                         obj.insert(variable.name().to_string(), json_value);
@@ -4404,7 +4328,7 @@ impl Value {
                 if let Some(ListChange::Replace { items }) = first_change {
                     let mut json_items = Vec::new();
                     for item in items {
-                        let value = item.clone().stream().await.next().await;
+                        let value = item.current_value().await.ok();
                         if let Some(value) = value {
                             let json_value = Box::pin(value.to_json()).await;
                             json_items.push(json_value);
@@ -4633,8 +4557,8 @@ pub async fn materialize_value(
         Value::Object(object, metadata) => {
             let mut materialized_vars: Vec<Arc<Variable>> = Vec::new();
             for variable in object.variables() {
-                // Await the variable's current value through subscription (proper async)
-                let var_value = variable.value_actor().clone().stream().await.next().await;
+                // Await the variable's current value (use value() to avoid subscription churn)
+                let var_value = variable.value_actor().current_value().await.ok();
                 if let Some(var_value) = var_value {
                     // Recursively materialize nested values
                     let materialized = Box::pin(materialize_value(
@@ -4679,7 +4603,7 @@ pub async fn materialize_value(
         Value::TaggedObject(tagged_object, metadata) => {
             let mut materialized_vars: Vec<Arc<Variable>> = Vec::new();
             for variable in tagged_object.variables() {
-                let var_value = variable.value_actor().clone().stream().await.next().await;
+                let var_value = variable.value_actor().current_value().await.ok();
                 if let Some(var_value) = var_value {
                     let materialized = Box::pin(materialize_value(
                         var_value,
@@ -5820,8 +5744,8 @@ impl List {
                                 if let ListChange::Replace { ref items } = change {
                                     let mut json_items = Vec::new();
                                     for item in items {
-                                        // ValueActor::stream() returns a Future, await it to get the Stream
-                                        if let Some(value) = item.clone().stream().await.next().await {
+                                        // Use current_value() to get current value without subscription churn
+                                        if let Ok(value) = item.current_value().await {
                                             json_items.push(value.to_json().await);
                                         }
                                     }
@@ -5832,8 +5756,8 @@ impl List {
                                     if let Some(ListChange::Replace { items }) = list_stream.next().await {
                                         let mut json_items = Vec::new();
                                         for item in &items {
-                                            // ValueActor::stream() returns a Future, await it to get the Stream
-                                            if let Some(value) = item.clone().stream().await.next().await {
+                                            // Use current_value() to get current value without subscription churn
+                                            if let Ok(value) = item.current_value().await {
                                                 json_items.push(value.to_json().await);
                                             }
                                         }
@@ -6452,7 +6376,7 @@ impl ListBindingFunction {
         // But filter out re-emissions of the same list by ID to avoid cancelling
         // LINK connections unnecessarily.
         let change_stream = switch_map(
-            source_list_actor.clone().stream_sync()
+            source_list_actor.clone().stream()
             // Check if subscription scope is cancelled (e.g., WHILE arm switched)
             .take_while(move |_| {
                 let is_active = subscription_scope.as_ref().map_or(true, |s| !s.is_cancelled());
@@ -6542,7 +6466,7 @@ impl ListBindingFunction {
 
         // Use switch_map for proper list replacement handling
         let value_stream = switch_map(
-            source_list_actor.clone().stream_sync()
+            source_list_actor.clone().stream()
             .take_while(move |_| {
                 let is_active = subscription_scope.as_ref().map_or(true, |s| !s.is_cancelled());
                 future::ready(is_active)
@@ -6636,8 +6560,8 @@ impl ListBindingFunction {
                                                         );
                                                         predicates.insert(pid.clone(), pred.clone());
 
-                                                        // Query initial value
-                                                        if let Ok(value) = pred.clone().value().await {
+                                                        // Query initial value (use current_value to avoid subscription churn)
+                                                        if let Ok(value) = pred.current_value().await {
                                                             let is_true = matches!(&value, Value::Tag(tag, _) if tag.tag() == "True");
                                                             predicate_results.insert(pid, is_true);
                                                         }
@@ -6647,7 +6571,7 @@ impl ListBindingFunction {
                                                     let pred_streams: Vec<_> = predicates.iter()
                                                         .map(|(pid, pred)| {
                                                             let pid = pid.clone();
-                                                            pred.clone().stream_from_now_sync()
+                                                            pred.clone().stream_from_now()
                                                                 .map(move |v| {
                                                                     let is_true = matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
                                                                     (pid.clone(), is_true)
@@ -6680,8 +6604,8 @@ impl ListBindingFunction {
                                                 items.push(item);
                                                 predicates.insert(pid.clone(), pred.clone());
 
-                                                // Query new predicate value directly
-                                                let is_true = if let Ok(value) = pred.clone().value().await {
+                                                // Query new predicate value directly (use current_value to avoid subscription churn)
+                                                let is_true = if let Ok(value) = pred.current_value().await {
                                                     matches!(&value, Value::Tag(tag, _) if tag.tag() == "True")
                                                 } else {
                                                     false
@@ -6689,7 +6613,7 @@ impl ListBindingFunction {
                                                 predicate_results.insert(pid.clone(), is_true);
 
                                                 // Create stream for the new predicate only
-                                                let new_pred_stream = pred.stream_from_now_sync()
+                                                let new_pred_stream = pred.stream_from_now()
                                                     .map(move |v| {
                                                         let is_true = matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
                                                         (pid.clone(), is_true)
@@ -6827,8 +6751,8 @@ impl ListBindingFunction {
                                                 );
                                                 predicates.insert(pid.clone(), pred.clone());
 
-                                                // Query initial value
-                                                if let Ok(value) = pred.clone().value().await {
+                                                // Query initial value (use current_value to avoid subscription churn)
+                                                if let Ok(value) = pred.current_value().await {
                                                     let is_true = matches!(&value, Value::Tag(tag, _) if tag.tag() == "True");
                                                     predicate_results.insert(pid, is_true);
                                                 }
@@ -6838,7 +6762,7 @@ impl ListBindingFunction {
                                             let pred_streams: Vec<_> = predicates.iter()
                                                 .map(|(pid, pred)| {
                                                     let pid = pid.clone();
-                                                    pred.clone().stream_from_now_sync()
+                                                    pred.clone().stream_from_now()
                                                         .map(move |v| {
                                                             let is_true = matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
                                                             (pid.clone(), is_true)
@@ -6911,7 +6835,7 @@ impl ListBindingFunction {
 
         // Use switch_map for proper list replacement handling
         let value_stream = switch_map(
-            source_list_actor.clone().stream_sync()
+            source_list_actor.clone().stream()
             // Check if subscription scope is cancelled (e.g., WHILE arm switched)
             .take_while(move |_| {
                 let is_active = subscription_scope.as_ref().map_or(true, |s| !s.is_cancelled());
@@ -7003,7 +6927,7 @@ impl ListBindingFunction {
                                         let mut tx = remove_tx.clone();
                                         let when_clone = when_actor.clone();
                                         let task_handle = Task::start_droppable(async move {
-                                            let mut stream = when_clone.stream_from_now_sync();
+                                            let mut stream = when_clone.stream_from_now();
                                             // Wait for ANY emission - that triggers removal
                                             if stream.next().await.is_some() {
                                                 // Channel may be closed if filter was removed - that's fine
@@ -7043,7 +6967,7 @@ impl ListBindingFunction {
                                     let mut tx = remove_tx.clone();
                                     let when_clone = when_actor.clone();
                                     let task_handle = Task::start_droppable(async move {
-                                        let mut stream = when_clone.stream_from_now_sync();
+                                        let mut stream = when_clone.stream_from_now();
                                         if stream.next().await.is_some() {
                                             let _ = tx.send(persistence_id).await;
                                         }
@@ -7139,7 +7063,7 @@ impl ListBindingFunction {
         // But filter out re-emissions of the same list by ID to avoid cancelling
         // subscriptions unnecessarily.
         let value_stream = switch_map(
-            source_list_actor.clone().stream_sync()
+            source_list_actor.clone().stream()
             // Check if subscription scope is cancelled (e.g., WHILE arm switched)
             .take_while(move |_| {
                 let is_active = subscription_scope.as_ref().map_or(true, |s| !s.is_cancelled());
@@ -7245,7 +7169,7 @@ impl ListBindingFunction {
                 let construct_context_map = construct_context.clone();
 
                 let predicate_streams: Vec<_> = item_predicates.iter().enumerate().map(|(idx, (_, pred))| {
-                    pred.clone().stream_sync().map(move |value| (idx, value))
+                    pred.clone().stream().map(move |value| (idx, value))
                 }).collect();
 
                 stream::select_all(predicate_streams)
@@ -7318,7 +7242,7 @@ impl ListBindingFunction {
         let subscription_scope = actor_context.subscription_scope.clone();
 
         // Create a stream that:
-        // 1. Subscribes to source list changes (stream_sync() yields automatically)
+        // 1. Subscribes to source list changes (stream() yields automatically)
         // 2. For each item, evaluates key expression and subscribes to its changes
         // 3. When list or any key changes, emits sorted Replace
         // Use switch_map for proper list replacement handling:
@@ -7326,7 +7250,7 @@ impl ListBindingFunction {
         // But filter out re-emissions of the same list by ID to avoid cancelling
         // subscriptions unnecessarily.
         let value_stream = switch_map(
-            source_list_actor.clone().stream_sync()
+            source_list_actor.clone().stream()
             // Check if subscription scope is cancelled (e.g., WHILE arm switched)
             .take_while(move |_| {
                 let is_active = subscription_scope.as_ref().map_or(true, |s| !s.is_cancelled());
@@ -7432,7 +7356,7 @@ impl ListBindingFunction {
                 // Subscribe to all keys and emit sorted list when any changes
                 let key_streams: Vec<_> = item_keys.iter().enumerate().map(|(idx, (item, key_actor))| {
                     let item = item.clone();
-                    key_actor.clone().stream_sync().map(move |value| (idx, item.clone(), value))
+                    key_actor.clone().stream().map(move |value| (idx, item.clone(), value))
                 }).collect();
 
                 stream::select_all(key_streams)
@@ -7551,7 +7475,7 @@ impl ListBindingFunction {
                         "List/map mapped item",
                     ),
                     new_actor_context,
-                    TypedStream::infinite(result_actor.stream_sync()),
+                    TypedStream::infinite(result_actor.stream()),
                     original_pid,  // Preserve original PersistenceId!
                 )
             }
