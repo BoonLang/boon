@@ -20,7 +20,7 @@ store: [
     -- Toggle all state: when clicked, set all todos to this value
     -- If any are not completed -> True (mark all completed)
     -- If all are completed -> False (mark all not completed)
-    all_completed: active_todos |> List/empty()
+    all_completed: active_todos |> List/is_empty()
     toggle_all_target: elements.toggle_all_checkbox.event.click |> THEN {
         -- If all are completed, we want to uncomplete all (False)
         -- If some are not completed, we want to complete all (True)
@@ -38,12 +38,13 @@ store: [
         __ => SKIP
     }
     -- Create todo Objects with id, title, completed fields
-    todo_to_add: title_to_add |> WHEN { t => new_todo(title: t, toggle_all: toggle_all_target) }
+    -- Use PASS to pass toggle_all_target as streaming context, not as a snapshot argument
+    todo_to_add: title_to_add |> WHEN { t => new_todo(title: t, PASS: [toggle_all: toggle_all_target]) }
     -- Reactive list operations
     -- List/append adds new todos, List/remove handles both:
     -- 1. Individual X button clicks (direct event)
     -- 2. Clear completed button (event triggers check of item.completed)
-    todos: LIST { new_todo(title: TEXT { Buy groceries }, toggle_all: toggle_all_target), new_todo(title: TEXT { Clean room }, toggle_all: toggle_all_target) }
+    todos: LIST { new_todo(title: TEXT { Buy groceries }, PASS: [toggle_all: toggle_all_target]), new_todo(title: TEXT { Clean room }, PASS: [toggle_all: toggle_all_target]) }
         |> List/append(item: todo_to_add)
         |> List/remove(item, when: item.todo_elements.remove_todo_button.event.press)
         |> List/remove(item, when: elements.remove_completed_button.event.press |> THEN {
@@ -54,7 +55,8 @@ store: [
 ]
 
 -- Create a new todo with reactive completed state
-FUNCTION new_todo(title, toggle_all) {
+-- toggle_all stream is passed via PASSED context, not as a parameter
+FUNCTION new_todo(title) {
     [
         todo_elements: [
             remove_todo_button: LINK
@@ -102,8 +104,8 @@ FUNCTION new_todo(title, toggle_all) {
                 todo_elements.todo_checkbox.event.click |> THEN {
                     state |> Bool/not()
                 }
-                -- Toggle via toggle all checkbox (set to target value)
-                toggle_all
+                -- Toggle via toggle all checkbox (set to target value from PASSED)
+                PASSED.toggle_all
             }
         }
     ]
@@ -198,7 +200,7 @@ FUNCTION main_panel() {
                 style: []
                 items: LIST {
                     -- Show toggle all only when there are todos
-                    PASSED.store.todos |> List/empty() |> WHILE {
+                    PASSED.store.todos |> List/is_empty() |> WHILE {
                         True => NoElement
                         False => toggle_all_checkbox() |> LINK { PASSED.store.elements.toggle_all_checkbox }
                     }
@@ -206,7 +208,7 @@ FUNCTION main_panel() {
                 }
             )
             PASSED.store.todos
-                |> List/empty()
+                |> List/is_empty()
                 |> WHILE {
                     True => NoElement
                     False => Element/stripe(
@@ -450,7 +452,7 @@ FUNCTION panel_footer() {
         items: LIST {
             active_items_count_text()
             filters_element()
-            PASSED.store.completed_todos |> List/empty() |> WHILE {
+            PASSED.store.completed_todos |> List/is_empty() |> WHILE {
                 True => NoElement
                 False => remove_completed_button() |> LINK { PASSED.store.elements.remove_completed_button }
             }

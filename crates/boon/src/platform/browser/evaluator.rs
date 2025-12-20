@@ -1195,16 +1195,12 @@ fn schedule_expression(
                         }
                     }
 
-                    // Create context with arg_locals for argument expression evaluation
-                    // CRITICAL: Function arguments must NOT inherit snapshot mode.
-                    // When a function is called inside THEN/WHEN (which have is_snapshot_context: true),
-                    // stream arguments like `toggle_all_target` would only capture ONE value instead of
-                    // maintaining a live subscription. This breaks reactive patterns where dynamically
-                    // created objects need to receive future events from passed stream parameters.
+                    // Create context with arg_locals for argument expression evaluation.
+                    // Snapshot context propagates naturally - function arguments capture values
+                    // at trigger time when called inside THEN/WHEN bodies.
                     let ctx_with_arg_locals = EvaluationContext {
                         actor_context: ActorContext {
                             object_locals: arg_locals,
-                            is_snapshot_context: false,  // Arguments evaluate in streaming mode
                             ..ctx.actor_context.clone()
                         },
                         ..ctx.clone()
@@ -5136,8 +5132,8 @@ fn static_function_call_path_to_definition(
             api::function_list_latest(arguments, id, persistence_id, construct_context, actor_context)
                 .boxed_local()
         },
-        ["List", "empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_list_empty(arguments, id, persistence_id, construct_context, actor_context)
+        ["List", "is_empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_list_is_empty(arguments, id, persistence_id, construct_context, actor_context)
                 .boxed_local()
         },
         ["List", "not_empty"] => |arguments, id, persistence_id, construct_context, actor_context| {

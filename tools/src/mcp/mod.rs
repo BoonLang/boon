@@ -532,6 +532,24 @@ fn get_tools() -> Vec<Tool> {
                 "required": ["key"]
             }),
         },
+        Tool {
+            name: "boon_hover_text".to_string(),
+            description: "Hover over an element in the preview panel by its text content. Triggers hover state (e.g., shows hidden buttons like X to remove todo).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to find and hover over (e.g., 'Buy groceries')"
+                    },
+                    "exact": {
+                        "type": "boolean",
+                        "description": "If true, match exact text. If false (default), match if text contains the search string."
+                    }
+                },
+                "required": ["text"]
+            }),
+        },
     ]
 }
 
@@ -595,6 +613,17 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
         let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
 
         return dblclick_element_by_text(text, exact, ws_port).await;
+    }
+
+    // Handle hover-by-text (compound command)
+    if name == "boon_hover_text" {
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or("text parameter required")?;
+        let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        return hover_element_by_text(text, exact, ws_port).await;
     }
 
     // Handle click-checkbox
@@ -1151,6 +1180,44 @@ async fn dblclick_element_by_text(text: &str, exact: bool, ws_port: u16) -> Resu
                     )),
                     Response::Error { message } => Err(format!("Double-click failed: {}", message)),
                     _ => Ok(format!("Double-clicked '{}' at ({}, {})", text, click_x, click_y)),
+                }
+            } else {
+                Err(format!("No element found containing text '{}'", text))
+            }
+        }
+        Response::Error { message } => Err(format!("Failed to get elements: {}", message)),
+        _ => Err("Unexpected response from GetPreviewElements".to_string()),
+    }
+}
+
+/// Hover over an element by its text content
+async fn hover_element_by_text(text: &str, exact: bool, ws_port: u16) -> Result<String, String> {
+    // First get preview elements
+    let response = ws_server::send_command_to_server(ws_port, Command::GetPreviewElements)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::PreviewElements { data } => {
+            if let Some((x, y, width, height)) = find_element_bounds_by_text(&data, text, exact) {
+                let hover_x = x + width / 2;
+                let hover_y = y + height / 2;
+
+                // Hover at the center of the element
+                let response = ws_server::send_command_to_server(
+                    ws_port,
+                    Command::HoverAt { x: hover_x, y: hover_y },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+
+                match response {
+                    Response::Success { .. } => Ok(format!(
+                        "Hovered over '{}' at ({}, {})",
+                        text, hover_x, hover_y
+                    )),
+                    Response::Error { message } => Err(format!("Hover failed: {}", message)),
+                    _ => Ok(format!("Hovered over '{}' at ({}, {})", text, hover_x, hover_y)),
                 }
             } else {
                 Err(format!("No element found containing text '{}'", text))

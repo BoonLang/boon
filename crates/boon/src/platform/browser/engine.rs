@@ -1975,24 +1975,23 @@ impl VariableOrArgumentReference {
             }
             static_expression::Alias::WithPassed { extra_parts } => extra_parts,
         };
-        // The `subscribe()` method returns a `Subscription` that keeps the actor alive
-        // for the duration of the subscription, so we no longer need the manual unfold pattern.
-        let mut value_stream = stream::once(async move {
-            root_value_actor.await
-        })
-            .flat_map(move |actor| {
-                // Use value() or stream() based on context - type-safe subscription
-                if use_snapshot {
-                    // Value: convert Future to single-item Stream
-                    stream::once(actor.value())
-                        .filter_map(|v| async { v.ok() })
-                        .boxed_local()
-                } else {
-                    // Streaming: continuous updates - lazy wrapper for sync context
-                    stream::once(async move { actor.stream().await }).flatten().boxed_local()
-                }
+        // For snapshot context (THEN/WHEN bodies), we get a single value.
+        // For streaming context, we get continuous updates.
+        let mut value_stream: LocalBoxStream<'static, Value> = if use_snapshot {
+            // Snapshot: get current value once
+            stream::once(async move {
+                let actor = root_value_actor.await;
+                actor.value().await
             })
-            .boxed_local();
+            .filter_map(|v| future::ready(v.ok()))
+            .boxed_local()
+        } else {
+            // Streaming: continuous updates
+            stream::once(async move { root_value_actor.await })
+                .then(|actor| async move { actor.stream().await })
+                .flatten()
+                .boxed_local()
+        };
         // Collect parts to detect the last one
         let parts_vec: Vec<_> = alias_parts.into_iter().skip(skip_alias_parts).collect();
         let num_parts = parts_vec.len();
@@ -2020,14 +2019,14 @@ impl VariableOrArgumentReference {
                         let variable_actor = variable.value_actor();
                         // Use value() or stream() based on context - type-safe subscription
                         if use_snapshot {
-                            // Value: get one value using the type-safe Future API
+                            // Snapshot: get current value once
                             stream::once(async move {
                                 let value = variable_actor.value().await;
-                                // Prevent drop: captured by `async move`, lives until Future completes
-                                let _keepalive = (&object, &variable);
+                                // Keepalive - prevent drop until Future completes
+                                drop((object, variable));
                                 value
                             })
-                            .filter_map(|v| async { v.ok() })
+                            .filter_map(|v| future::ready(v.ok()))
                             .boxed_local()
                         } else {
                             // Streaming: continuous updates - use stream() and keep alive
@@ -2054,14 +2053,14 @@ impl VariableOrArgumentReference {
                         let variable_actor = variable.value_actor();
                         // Use value() or stream() based on context - type-safe subscription
                         if use_snapshot {
-                            // Value: get one value using the type-safe Future API
+                            // Snapshot: get current value once
                             stream::once(async move {
                                 let value = variable_actor.value().await;
-                                // Prevent drop: captured by `async move`, lives until Future completes
-                                let _keepalive = (&tagged_object, &variable);
+                                // Keepalive - prevent drop until Future completes
+                                drop((tagged_object, variable));
                                 value
                             })
-                            .filter_map(|v| async { v.ok() })
+                            .filter_map(|v| future::ready(v.ok()))
                             .boxed_local()
                         } else {
                             // Streaming: continuous updates - use stream() and keep alive
@@ -6886,7 +6885,6 @@ impl ListBindingFunction {
     }
 
     /// Creates a remove actor that removes items when their `when` event fires.
-    /// Uses stream::select_all pattern for automatic cancellation when list changes.
     fn create_remove_actor(
         construct_info: ConstructInfoComplete,
         construct_context: ConstructContext,
@@ -6931,115 +6929,125 @@ impl ListBindingFunction {
             let construct_context = construct_context.clone();
             let actor_context = actor_context.clone();
 
-            // Phase 1: Track item/when_actor pairs on list changes
-            // Phase 2: Use switch_map to properly handle Push/Remove - cancels old removal stream on new input
-            // (flat_map would block waiting for removal events, never polling for new list changes)
-            switch_map(
-                list.stream().scan(
-                    Vec::<(Arc<ValueActor>, Arc<ValueActor>)>::new(),
-                    move |item_events, change| {
-                        let config = config.clone();
-                        let construct_context = construct_context.clone();
-                        let actor_context = actor_context.clone();
+            // Create channel for removal events (index of item to remove)
+            let (remove_tx, remove_rx) = mpsc::channel::<usize>(64);
 
-                        match &change {
-                            ListChange::Replace { items } => {
-                                *item_events = items.iter().enumerate().map(|(idx, item)| {
+            // Event type for merged streams
+            enum RemoveEvent {
+                ListChange(ListChange),
+                RemoveItem(usize),
+            }
+
+            // Create list change stream
+            let list_changes = list.clone().stream().map(RemoveEvent::ListChange);
+
+            // Create removal event stream
+            let removal_events = remove_rx.map(RemoveEvent::RemoveItem);
+
+            // Merge list changes and removal events
+            stream::select(list_changes, removal_events).scan(
+                (
+                    Vec::<(usize, Arc<ValueActor>, Arc<ValueActor>, bool, Option<TaskHandle>)>::new(), // (original_idx, item, when_actor, removed, task_handle)
+                    remove_tx,
+                    config.clone(),
+                    construct_context.clone(),
+                    actor_context.clone(),
+                    0usize, // next_idx for assigning unique IDs
+                ),
+                move |state, event| {
+                    let (items, remove_tx, config, construct_context, actor_context, next_idx) = state;
+
+                    match event {
+                        RemoveEvent::ListChange(change) => {
+                            match change {
+                                ListChange::Replace { items: new_items } => {
+                                    // Simple approach: rebuild everything fresh on Replace.
+                                    // This is slower but reliable - no Arc::as_ptr (Rust-specific, not portable).
+                                    // When upstream sends Replace, it's providing the new authoritative list.
+                                    // Items removed upstream won't be in that list.
+                                    items.clear();
+                                    for item in new_items.iter() {
+                                        let idx = *next_idx;
+                                        *next_idx += 1;
+                                        let when_actor = Self::transform_item(
+                                            item.clone(),
+                                            idx,
+                                            config,
+                                            construct_context.clone(),
+                                            actor_context.clone(),
+                                        );
+                                        // Spawn task to listen for `when` event
+                                        let mut tx = remove_tx.clone();
+                                        let when_clone = when_actor.clone();
+                                        let task_handle = Task::start_droppable(async move {
+                                            let mut stream = when_clone.stream_from_now_sync();
+                                            // Wait for ANY emission - that triggers removal
+                                            if stream.next().await.is_some() {
+                                                // Channel may be closed if filter was removed - that's fine
+                                                if let Err(e) = tx.send(idx).await {
+                                                    zoon::println!("[LIST] Filter remove send failed: {e}");
+                                                }
+                                            }
+                                        });
+                                        items.push((idx, item.clone(), when_actor, false, Some(task_handle)));
+                                    }
+                                }
+                                ListChange::Push { item } => {
+                                    let idx = *next_idx;
+                                    *next_idx += 1;
                                     let when_actor = Self::transform_item(
                                         item.clone(),
                                         idx,
-                                        &config,
+                                        config,
                                         construct_context.clone(),
                                         actor_context.clone(),
                                     );
-                                    (item.clone(), when_actor)
-                                }).collect();
-                            }
-                            ListChange::Push { item } => {
-                                let idx = item_events.len();
-                                let when_actor = Self::transform_item(
-                                    item.clone(),
-                                    idx,
-                                    &config,
-                                    construct_context.clone(),
-                                    actor_context.clone(),
-                                );
-                                item_events.push((item.clone(), when_actor));
-                            }
-                            ListChange::Clear => {
-                                item_events.clear();
-                            }
-                            ListChange::Pop => {
-                                item_events.pop();
-                            }
-                            ListChange::RemoveAt { index } => {
-                                if *index < item_events.len() {
-                                    item_events.remove(*index);
+                                    // Spawn task to listen for `when` event
+                                    // Use stream_from_now_stream to avoid replaying historical events
+                                    let mut tx = remove_tx.clone();
+                                    let when_clone = when_actor.clone();
+                                    let task_handle = Task::start_droppable(async move {
+                                        let mut stream = when_clone.stream_from_now_sync();
+                                        if stream.next().await.is_some() {
+                                            // Channel may be closed if filter was removed - that's fine
+                                            if let Err(e) = tx.send(idx).await {
+                                                zoon::println!("[LIST] Filter remove send failed: {e}");
+                                            }
+                                        }
+                                    });
+                                    items.push((idx, item, when_actor, false, Some(task_handle)));
                                 }
+                                ListChange::Clear => {
+                                    items.clear();
+                                    *next_idx = 0;
+                                }
+                                ListChange::Pop => {
+                                    items.pop();
+                                }
+                                _ => {}
                             }
-                            _ => {}
-                        }
-
-                        future::ready(Some(item_events.clone()))
-                    }
-                ),
-                move |item_events| {
-                if item_events.is_empty() {
-                    // Empty list → emit empty Replace once
-                    return stream::once(future::ready(
-                        ListChange::Replace { items: vec![] }
-                    )).boxed_local();
-                }
-
-                // Extract items and create event streams
-                let items: Vec<Arc<ValueActor>> = item_events.iter()
-                    .map(|(item, _)| item.clone())
-                    .collect();
-                let item_count = items.len();
-
-                // Create merged event streams with indices
-                // Use stream_from_now_sync to avoid replaying historical events
-                let event_streams: Vec<_> = item_events.iter()
-                    .enumerate()
-                    .map(|(idx, (_, when_actor))| {
-                        // Take only first event (removal is one-shot)
-                        when_actor.clone().stream_from_now_sync()
-                            .take(1)
-                            .map(move |_| idx)
-                    })
-                    .collect();
-
-                // First emit the current list, then handle removals
-                let initial = stream::once(future::ready(
-                    ListChange::Replace { items: items.clone() }
-                ));
-
-                let removals = stream::select_all(event_streams)
-                    .scan(
-                        (items, vec![false; item_count]),  // (items, removed flags)
-                        move |(items, removed), idx| {
-                            if idx < removed.len() {
-                                removed[idx] = true;
-                            }
-
-                            // Build list of remaining items
-                            let remaining: Vec<Arc<ValueActor>> = items.iter()
-                                .zip(removed.iter())
-                                .filter_map(|(item, is_removed)| {
-                                    if !is_removed {
-                                        Some(item.clone())
-                                    } else {
-                                        None
-                                    }
-                                })
+                            // Emit current list state (all non-removed items)
+                            let current: Vec<Arc<ValueActor>> = items.iter()
+                                .filter(|(_, _, _, removed, _)| !removed)
+                                .map(|(_, item, _, _, _)| item.clone())
                                 .collect();
-
-                            future::ready(Some(ListChange::Replace { items: remaining }))
+                            future::ready(Some(Some(ListChange::Replace { items: current })))
                         }
-                    );
-
-                initial.chain(removals).boxed_local()
-            })
+                        RemoveEvent::RemoveItem(idx) => {
+                            // Mark the item as removed
+                            if let Some(item_entry) = items.iter_mut().find(|(i, _, _, _, _)| *i == idx) {
+                                item_entry.3 = true; // Mark as removed
+                            }
+                            // Emit updated list without removed items
+                            let remaining: Vec<Arc<ValueActor>> = items.iter()
+                                .filter(|(_, _, _, removed, _)| !removed)
+                                .map(|(_, item, _, _, _)| item.clone())
+                                .collect();
+                            future::ready(Some(Some(ListChange::Replace { items: remaining })))
+                        }
+                    }
+                }
+            ).filter_map(future::ready)
         });
 
         let list = List::new_with_change_stream(

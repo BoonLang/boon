@@ -1575,9 +1575,9 @@ pub fn function_bool_or(
 
 // --- List functions ---
 
-/// List/empty() -> Tag (True/False)
+/// List/is_empty() -> Tag (True/False)
 /// Checks if the piped list is empty
-pub fn function_list_empty(
+pub fn function_list_is_empty(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
@@ -1599,7 +1599,7 @@ pub fn function_list_empty(
             let is_empty = items.is_empty();
             let tag = if is_empty { "True" } else { "False" };
             future::ready(Some(Tag::new_value(
-                ConstructInfo::new(function_call_id.with_child_id(0), None, "List/empty result"),
+                ConstructInfo::new(function_call_id.with_child_id(0), None, "List/is_empty result"),
                 construct_context.clone(),
                 ValueIdempotencyKey::new(),
                 tag.to_string(),
@@ -1641,7 +1641,7 @@ pub fn function_list_count(
 }
 
 /// List/not_empty() -> Tag (True/False)
-/// Checks if the piped list is not empty (inverse of List/empty)
+/// Checks if the piped list is not empty (inverse of List/is_empty)
 pub fn function_list_not_empty(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     function_call_id: ConstructId,

@@ -19,10 +19,10 @@ store: [
     }
     -- Toggle all like in todo_mvc (for testing if LATEST is the issue)
     toggle_all_target: toggle_all_checkbox.event.click |> THEN { True }
-    -- LIST of items like in todo_mvc
+    -- LIST of items like in todo_mvc - use PASS for stream context
     items: LIST {
-        create_item(name: TEXT { Item A }, toggle_all: toggle_all_target)
-        create_item(name: TEXT { Item B }, toggle_all: toggle_all_target)
+        create_item(name: TEXT { Item A }, PASS: [toggle_all: toggle_all_target])
+        create_item(name: TEXT { Item B }, PASS: [toggle_all: toggle_all_target])
     }
     -- List/retain causes the bug when switching WHILE arms
     all_items: items
@@ -30,7 +30,8 @@ store: [
 ]
 
 -- Pattern from todo_mvc: HOLD with LATEST, one arm for checkbox, one for toggle_all
-FUNCTION create_item(name, toggle_all) {
+-- toggle_all stream passed via PASSED context
+FUNCTION create_item(name) {
     [
         name: name
         elements: [
@@ -41,7 +42,7 @@ FUNCTION create_item(name, toggle_all) {
                 elements.checkbox.event.click |> THEN {
                     state |> Bool/not()
                 }
-                toggle_all
+                PASSED.toggle_all
             }
         }
     ]
