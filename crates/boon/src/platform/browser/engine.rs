@@ -6455,16 +6455,24 @@ impl ListBindingFunction {
             let construct_context = construct_context_for_stream.clone();
             let actor_context = actor_context_for_stream.clone();
 
-            // Track both length AND mapping from original PersistenceIds to mapped PersistenceIds.
-            // This is needed because mapped items get new PersistenceIds, so Remove { id }
-            // must be translated to use the mapped item's PersistenceId.
-            type MapState = (usize, HashMap<parser::PersistenceId, parser::PersistenceId>);
-            list.stream().scan((0usize, HashMap::new()), move |state: &mut MapState, change| {
-                let (length, pid_map) = state;
+            // Track length, PersistenceId mapping, transform cache, AND item order.
+            // The transform cache (B1 optimization) caches transformed actors by source PersistenceId
+            // to avoid re-transforming unchanged items on Replace events.
+            // Item order (Vec) is needed to clean cache on Pop (we need to know which item was last).
+            type MapState = (
+                usize,
+                HashMap<parser::PersistenceId, parser::PersistenceId>,
+                HashMap<parser::PersistenceId, Arc<ValueActor>>, // B1: Transform cache
+                Vec<parser::PersistenceId>, // Item order for Pop handling
+            );
+            list.stream().scan((0usize, HashMap::new(), HashMap::new(), Vec::new()), move |state: &mut MapState, change| {
+                let (length, pid_map, transform_cache, item_order) = state;
                 let (transformed_change, new_length) = Self::transform_list_change_for_map_with_tracking(
                     change,
                     *length,
                     pid_map,
+                    transform_cache,
+                    item_order,
                     &config,
                     construct_context.clone(),
                     actor_context.clone(),
@@ -7751,6 +7759,8 @@ impl ListBindingFunction {
         change: ListChange,
         current_length: usize,
         pid_map: &mut std::collections::HashMap<parser::PersistenceId, parser::PersistenceId>,
+        transform_cache: &mut std::collections::HashMap<parser::PersistenceId, Arc<ValueActor>>,
+        item_order: &mut Vec<parser::PersistenceId>,
         config: &ListBindingConfig,
         construct_context: ConstructContext,
         actor_context: ActorContext,
@@ -7758,42 +7768,75 @@ impl ListBindingFunction {
         match change {
             ListChange::Replace { items } => {
                 let new_length = items.len();
-                // Clear old mapping and build new one
+                // Clear old PID mapping and item order (but keep transform cache for reuse)
                 pid_map.clear();
+                item_order.clear();
+
+                // B1: Track which items are still present for cache cleanup
+                let current_pids: std::collections::HashSet<_> = items.iter()
+                    .map(|item| item.persistence_id())
+                    .collect();
+
                 let transformed_items: Vec<Arc<ValueActor>> = items
                     .into_iter()
                     .enumerate()
                     .map(|(index, item)| {
                         let original_pid = item.persistence_id();
-                        let transformed = Self::transform_item(
-                            item,
-                            index,
-                            config,
-                            construct_context.clone(),
-                            actor_context.clone(),
-                        );
+                        item_order.push(original_pid.clone());
+
+                        // B1: Check cache first - reuse transformed actor if available
+                        let transformed = if let Some(cached) = transform_cache.get(&original_pid) {
+                            cached.clone()
+                        } else {
+                            let new_transformed = Self::transform_item(
+                                item,
+                                index,
+                                config,
+                                construct_context.clone(),
+                                actor_context.clone(),
+                            );
+                            transform_cache.insert(original_pid.clone(), new_transformed.clone());
+                            new_transformed
+                        };
+
                         let mapped_pid = transformed.persistence_id();
                         pid_map.insert(original_pid, mapped_pid);
                         transformed
                     })
                     .collect();
+
+                // B1: Clean up cache - remove items no longer in the list
+                transform_cache.retain(|pid, _| current_pids.contains(pid));
+
                 (ListChange::Replace { items: transformed_items }, new_length)
             }
             ListChange::InsertAt { index, item } => {
                 let original_pid = item.persistence_id();
-                let transformed_item = Self::transform_item(
-                    item,
-                    index,
-                    config,
-                    construct_context,
-                    actor_context,
-                );
+                // Track item order
+                if index <= item_order.len() {
+                    item_order.insert(index, original_pid.clone());
+                }
+                // B1: Check cache first, add to cache if miss
+                let transformed_item = if let Some(cached) = transform_cache.get(&original_pid) {
+                    cached.clone()
+                } else {
+                    let new_transformed = Self::transform_item(
+                        item,
+                        index,
+                        config,
+                        construct_context,
+                        actor_context,
+                    );
+                    transform_cache.insert(original_pid.clone(), new_transformed.clone());
+                    new_transformed
+                };
                 let mapped_pid = transformed_item.persistence_id();
                 pid_map.insert(original_pid, mapped_pid);
                 (ListChange::InsertAt { index, item: transformed_item }, current_length + 1)
             }
             ListChange::UpdateAt { index, item } => {
                 let original_pid = item.persistence_id();
+                // B1: For updates, always re-transform (the item content changed)
                 let transformed_item = Self::transform_item(
                     item,
                     index,
@@ -7801,24 +7844,37 @@ impl ListBindingFunction {
                     construct_context,
                     actor_context,
                 );
+                transform_cache.insert(original_pid.clone(), transformed_item.clone());
                 let mapped_pid = transformed_item.persistence_id();
                 pid_map.insert(original_pid, mapped_pid);
                 (ListChange::UpdateAt { index, item: transformed_item }, current_length)
             }
             ListChange::Push { item } => {
                 let original_pid = item.persistence_id();
-                let transformed_item = Self::transform_item(
-                    item,
-                    current_length,
-                    config,
-                    construct_context,
-                    actor_context,
-                );
+                // Track item order
+                item_order.push(original_pid.clone());
+                // B1: Check cache first, add to cache if miss
+                let transformed_item = if let Some(cached) = transform_cache.get(&original_pid) {
+                    cached.clone()
+                } else {
+                    let new_transformed = Self::transform_item(
+                        item,
+                        current_length,
+                        config,
+                        construct_context,
+                        actor_context,
+                    );
+                    transform_cache.insert(original_pid.clone(), new_transformed.clone());
+                    new_transformed
+                };
                 let mapped_pid = transformed_item.persistence_id();
                 pid_map.insert(original_pid, mapped_pid);
                 (ListChange::Push { item: transformed_item }, current_length + 1)
             }
             ListChange::Remove { id } => {
+                // B1: Remove from cache and item order
+                transform_cache.remove(&id);
+                item_order.retain(|pid| *pid != id);
                 // Translate the original PersistenceId to the mapped PersistenceId
                 if let Some(mapped_pid) = pid_map.remove(&id) {
                     (ListChange::Remove { id: mapped_pid }, current_length.saturating_sub(1))
@@ -7828,14 +7884,26 @@ impl ListBindingFunction {
                     (ListChange::Remove { id }, current_length.saturating_sub(1))
                 }
             }
-            ListChange::Move { old_index, new_index } => (ListChange::Move { old_index, new_index }, current_length),
+            ListChange::Move { old_index, new_index } => {
+                // Update item order for Move
+                if old_index < item_order.len() && new_index < item_order.len() {
+                    let pid = item_order.remove(old_index);
+                    item_order.insert(new_index, pid);
+                }
+                (ListChange::Move { old_index, new_index }, current_length)
+            }
             ListChange::Pop => {
-                // Pop removes the last item, but we don't know its PersistenceId here
-                // This is a limitation - Pop should be avoided with identity-based Remove
+                // B1: Now we can clean cache because we track item order
+                if let Some(popped_pid) = item_order.pop() {
+                    transform_cache.remove(&popped_pid);
+                    pid_map.remove(&popped_pid);
+                }
                 (ListChange::Pop, current_length.saturating_sub(1))
             }
             ListChange::Clear => {
                 pid_map.clear();
+                transform_cache.clear(); // B1: Clear cache
+                item_order.clear();
                 (ListChange::Clear, 0)
             }
         }
