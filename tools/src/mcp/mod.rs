@@ -550,6 +550,20 @@ fn get_tools() -> Vec<Tool> {
                 "required": ["text"]
             }),
         },
+        Tool {
+            name: "boon_localstorage".to_string(),
+            description: "Get localStorage entries from the Boon playground. Useful for debugging persistence. Returns key-value pairs, optionally filtered by a pattern.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Filter keys containing this pattern (e.g., '019b4290' to find specific persistence IDs)"
+                    }
+                },
+                "required": []
+            }),
+        },
     ]
 }
 
@@ -879,6 +893,11 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
 
         "boon_clear_states" => Command::ClearStates,
 
+        "boon_localstorage" => {
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).map(|s| s.to_string());
+            Command::GetLocalStorage { pattern }
+        }
+
         _ => return Err(format!("Unknown tool: {}", name)),
     };
 
@@ -968,6 +987,31 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
                 result.push_str(&format!("\n[truncated: showing ~100 of {} nodes]", node_count));
             }
             Ok(result)
+        }
+
+        Response::LocalStorage { entries } => {
+            // Format localStorage entries nicely
+            if let Some(obj) = entries.as_object() {
+                if obj.is_empty() {
+                    Ok("No localStorage entries found.".to_string())
+                } else {
+                    let mut result = format!("Found {} localStorage entries:\n", obj.len());
+                    for (key, value) in obj {
+                        let value_owned = value.to_string();
+                        let value_str = value.as_str().unwrap_or(&value_owned);
+                        // Truncate very long values
+                        let truncated_value = if value_str.len() > 100 {
+                            format!("{}...[truncated]", &value_str[..100])
+                        } else {
+                            value_str.to_string()
+                        };
+                        result.push_str(&format!("  {}: {}\n", key, truncated_value));
+                    }
+                    Ok(result)
+                }
+            } else {
+                Ok(format!("{}", entries))
+            }
         }
 
         Response::Error { message } => Err(message),

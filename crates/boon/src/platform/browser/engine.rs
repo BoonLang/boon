@@ -26,6 +26,55 @@ use zoon::{Task, TaskHandle};
 use zoon::{WebStorage, local_storage};
 use zoon::futures_util::SinkExt;
 
+// --- List Item Origin Tracking ---
+//
+// Each list item carries its own origin info (no global registry).
+// When List/remove removes an item, it uses the origin to update
+// its branch-local removed set in localStorage.
+
+/// Origin info for items created by persisted List/append.
+/// Each item carries this to enable removal tracking.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ListItemOrigin {
+    /// The localStorage key for the source list's recorded calls
+    /// e.g., "list_calls:list_append_Span(123:456)"
+    pub source_storage_key: String,
+    /// Stable identifier for this item's call (survives restores)
+    /// e.g., "call_0", "call_1"
+    pub call_id: String,
+}
+
+/// Add an item's call_id to a branch's removed set.
+/// Each List/remove site maintains its own removed set.
+/// This is idempotent (adding twice is safe).
+pub fn add_to_removed_set(removed_set_key: &str, call_id: &str) {
+    // Load existing removed set (or empty)
+    let mut removed: Vec<String> = match local_storage().get(removed_set_key) {
+        Some(Ok(set)) => set,
+        _ => Vec::new(),
+    };
+
+    // Add if not already present (idempotent)
+    if !removed.contains(&call_id.to_string()) {
+        removed.push(call_id.to_string());
+        if let Err(e) = local_storage().insert(removed_set_key, &removed) {
+            zoon::eprintln!("[DEBUG] Failed to save removed set: {:#}", e);
+        } else {
+            zoon::println!("[DEBUG] Added {} to removed set {}, now {} items",
+                call_id, removed_set_key, removed.len());
+        }
+    }
+}
+
+/// Load a branch's removed set from storage.
+/// Returns empty vec if not found or error.
+pub fn load_removed_set(removed_set_key: &str) -> Vec<String> {
+    match local_storage().get(removed_set_key) {
+        Some(Ok(set)) => set,
+        _ => Vec::new(),
+    }
+}
+
 // --- NamedChannel ---
 
 /// Error returned by `NamedChannel::send()`.
@@ -1373,8 +1422,8 @@ impl ConstructStorage {
             state_inserter_sender,
             state_getter_sender,
             actor_loop: ActorLoop::new(async move {
-                let mut states = match local_storage().get(&states_local_storage_key) {
-                    None => BTreeMap::<String, serde_json::Value>::new(),
+                let mut states: BTreeMap<String, serde_json::Value> = match local_storage().get::<BTreeMap<String, serde_json::Value>>(&states_local_storage_key) {
+                    None => BTreeMap::new(),
                     Some(Ok(states)) => states,
                     Some(Err(error)) => panic!("Failed to deserialize states: {error:#}"),
                 };
@@ -1382,14 +1431,16 @@ impl ConstructStorage {
                     select! {
                         (persistence_id, json_value) = state_inserter_receiver.select_next_some() => {
                             // @TODO remove `.to_string()` call when LocalStorage is replaced with IndexedDB (?)
-                            states.insert(persistence_id.to_string(), json_value);
+                            let key = persistence_id.to_string();
+                            states.insert(key, json_value);
                             if let Err(error) = local_storage().insert(&states_local_storage_key, &states) {
                                 zoon::eprintln!("Failed to save states: {error:#}");
                             }
                         },
                         (persistence_id, state_sender) = state_getter_receiver.select_next_some() => {
                             // @TODO Cheaper cloning? Replace get with remove?
-                            let state = states.get(&persistence_id.to_string()).cloned();
+                            let key = persistence_id.to_string();
+                            let state = states.get(&key).cloned();
                             if state_sender.send(state).is_err() {
                                 zoon::eprintln!("Failed to send state from construct storage");
                             }
@@ -1440,6 +1491,116 @@ impl ConstructStorage {
             }
         }
     }
+}
+
+// --- CapturedValue ---
+
+/// Value captured for persistence (hybrid model).
+/// Primitives are stored directly, persisting actors are stored as references.
+/// Used for recording function call inputs for restoration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CapturedValue {
+    // Primitives - stored directly
+    Nothing,
+    Number(f64),
+    Text(String),
+    Tag(String),
+    Bool(bool),
+
+    // Composites - recursive
+    List(Vec<CapturedValue>),
+    Object(BTreeMap<String, CapturedValue>),
+
+    // Actor reference - for persisting actors (HOLD, persisted LIST)
+    // Resolved against graph on restore
+    ActorRef {
+        persistence_id: u128,
+        scope: String,
+    },
+}
+
+impl CapturedValue {
+    /// Capture a Value for persistence.
+    /// Primitives are captured directly. For TodoMVC, this means capturing
+    /// "Buy milk" (the title text), not the complex todo object.
+    ///
+    /// Note: Object/TaggedObject/List contain Variables (actors) and would need
+    /// async snapshot - for now we capture them as Nothing with a warning.
+    pub fn capture(value: &Value) -> Self {
+        match value {
+            Value::Text(text_arc, _) => CapturedValue::Text(text_arc.text().to_string()),
+            Value::Number(number_arc, _) => CapturedValue::Number(number_arc.number()),
+            Value::Tag(tag_arc, _) => CapturedValue::Tag(tag_arc.tag().to_string()),
+            Value::Object(_, _) => {
+                // Objects contain Variables (actors) - need async to snapshot
+                // For now, capture as Nothing. TODO: Implement async capture
+                CapturedValue::Nothing
+            }
+            Value::TaggedObject(_, _) => {
+                // TaggedObjects contain Variables (actors) - need async to snapshot
+                CapturedValue::Nothing
+            }
+            Value::List(_, _) => {
+                // Lists contain items that may have actors - need async to snapshot
+                CapturedValue::Nothing
+            }
+            Value::Flushed(inner, _) => CapturedValue::capture(inner),
+        }
+    }
+
+    /// Convert captured value back to a Value for restoration.
+    /// This requires ConstructInfo and ConstructContext - must be called from evaluator context.
+    /// For now, returns None. The actual restoration will recreate values via evaluation.
+    pub fn restore_with_context(
+        &self,
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+    ) -> Option<Value> {
+        match self {
+            CapturedValue::Nothing => None,
+            CapturedValue::Text(s) => Some(Text::new_value(
+                construct_info,
+                construct_context,
+                ValueIdempotencyKey::new(),
+                s.clone(),
+            )),
+            CapturedValue::Number(n) => Some(Number::new_value(
+                construct_info,
+                construct_context,
+                ValueIdempotencyKey::new(),
+                *n,
+            )),
+            CapturedValue::Tag(t) => Some(Tag::new_value(
+                construct_info,
+                construct_context,
+                ValueIdempotencyKey::new(),
+                t.clone(),
+            )),
+            CapturedValue::Bool(b) => Some(Tag::new_value(
+                construct_info,
+                construct_context,
+                ValueIdempotencyKey::new(),
+                if *b { "True" } else { "False" },
+            )),
+            CapturedValue::Object(_) | CapturedValue::List(_) | CapturedValue::ActorRef { .. } => {
+                // Complex types need full evaluation context - not supported in simple restore
+                None
+            }
+        }
+    }
+}
+
+/// A recorded function call for scope-based persistence.
+/// When restoring, these calls are replayed with stored inputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordedCall {
+    /// Stable identifier for this call (e.g., "call_0", "call_1").
+    /// Used for removal tracking - survives restores.
+    pub id: String,
+    /// Function path (e.g., ["new_todo"])
+    pub path: Vec<String>,
+    /// Captured inputs at call time
+    pub inputs: CapturedValue,
 }
 
 // --- SubscriptionScope ---
@@ -1575,6 +1736,23 @@ pub struct ActorContext {
     /// created within that arm. This prevents inactive arms from processing updates
     /// and interfering with active arms (e.g., overwriting LINK Variables).
     pub subscription_scope: Option<Arc<SubscriptionScope>>,
+    /// Sender for recording function calls that produce stateful values.
+    /// When set, evaluate_function_call sends RecordedCall here for calls
+    /// whose result contains actors (stateful).
+    /// The receiver is held by the parent container (List/Map) for persistence.
+    pub call_recorder: Option<NamedChannel<RecordedCall>>,
+    /// True when restoring from persisted state.
+    /// When set, function calls check storage for results before executing.
+    /// This prevents re-execution of side effects and ensures stable impure values.
+    pub is_restoring: bool,
+    /// Storage key for list append recording.
+    /// When set, function calls generate ListItemOrigin for each recorded call.
+    /// Used to attach origin info to list items for removal persistence.
+    pub list_append_storage_key: Option<String>,
+    /// Counter for generating stable call_ids during recording.
+    /// Incremented for each recorded call to ensure unique, sequential IDs.
+    /// Used together with list_append_storage_key for ListItemOrigin.
+    pub recording_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl ActorContext {
@@ -1594,6 +1772,61 @@ impl ActorContext {
         };
         Self {
             scope: parser::Scope::Nested(new_prefix),
+            // Don't propagate call_recorder to child - each persisting scope has its own
+            call_recorder: None,
+            // Clear list append tracking - not applicable in child scope
+            list_append_storage_key: None,
+            recording_counter: None,
+            ..self.clone()
+        }
+    }
+
+    /// Creates a child context with a persisting scope that records function calls.
+    ///
+    /// Use this when evaluating code that needs persistence:
+    /// - List/append items
+    /// - Map/insert entries
+    /// - Any container item that needs to be restored on reload
+    ///
+    /// The `storage_key` is used for list append recording to attach origin info to items.
+    ///
+    /// Returns (child_context, receiver) where receiver collects RecordedCalls.
+    pub fn with_persisting_child_scope(&self, scope_id: &str, storage_key: String) -> (Self, mpsc::Receiver<RecordedCall>) {
+        let new_prefix = match &self.scope {
+            parser::Scope::Root => scope_id.to_string(),
+            parser::Scope::Nested(existing) => format!("{}:{}", existing, scope_id),
+        };
+        // Use static name for channel - the actual scope identity is in self.scope
+        let (call_recorder, receiver) = NamedChannel::new("call_recorder", 64);
+        (
+            Self {
+                scope: parser::Scope::Nested(new_prefix),
+                call_recorder: Some(call_recorder),
+                is_restoring: false,
+                list_append_storage_key: Some(storage_key),
+                recording_counter: Some(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+                ..self.clone()
+            },
+            receiver,
+        )
+    }
+
+    /// Creates a child context for restoration (replaying recorded calls).
+    ///
+    /// Use this when restoring items from persisted state.
+    /// Function calls will check storage before executing.
+    pub fn with_restoring_child_scope(&self, scope_id: &str) -> Self {
+        let new_prefix = match &self.scope {
+            parser::Scope::Root => scope_id.to_string(),
+            parser::Scope::Nested(existing) => format!("{}:{}", existing, scope_id),
+        };
+        Self {
+            scope: parser::Scope::Nested(new_prefix),
+            call_recorder: None,
+            is_restoring: true,
+            // Clear list append tracking - restoration doesn't record new calls
+            list_append_storage_key: None,
+            recording_counter: None,
             ..self.clone()
         }
     }
@@ -3199,6 +3432,11 @@ pub struct ValueActor {
 
     /// Extra ActorLoops that should be kept alive with this actor.
     extra_loops: Vec<ActorLoop>,
+
+    /// Origin info for items created by persisted List/append.
+    /// When this item is removed by List/remove, the origin is used
+    /// to update the branch's removed set in storage.
+    list_item_origin: Option<Arc<ListItemOrigin>>,
 }
 
 impl ValueActor {
@@ -3481,6 +3719,7 @@ impl ValueActor {
             actor_loop,
             lazy_delegate: None,
             extra_loops: Vec::new(),
+            list_item_origin: None,
         }
     }
 
@@ -3519,6 +3758,45 @@ impl ValueActor {
             persistence_id,
             inputs,
         ))
+    }
+
+    /// Create a new Arc<ValueActor> with list item origin info.
+    /// Used for items created by persisted List/append - the origin allows
+    /// List/remove to track removals in branch-local storage.
+    pub fn new_arc_with_origin<S: Stream<Item = Value> + 'static>(
+        construct_info: ConstructInfo,
+        actor_context: ActorContext,
+        value_stream: TypedStream<S, Infinite>,
+        persistence_id: parser::PersistenceId,
+        origin: ListItemOrigin,
+    ) -> Arc<Self> {
+        let mut actor = Self::new(
+            construct_info.complete(ConstructType::ValueActor),
+            actor_context,
+            value_stream,
+            persistence_id,
+        );
+        actor.list_item_origin = Some(Arc::new(origin));
+        Arc::new(actor)
+    }
+
+    /// Create a new Arc<ValueActor> with list item origin info from a boxed stream.
+    /// Used for restored items where the stream is dynamically typed.
+    pub fn new_arc_with_origin_boxed(
+        construct_info: ConstructInfo,
+        actor_context: ActorContext,
+        value_stream: Pin<Box<dyn Stream<Item = Value> + 'static>>,
+        persistence_id: parser::PersistenceId,
+        origin: ListItemOrigin,
+    ) -> Arc<Self> {
+        let mut actor = Self::new(
+            construct_info.complete(ConstructType::ValueActor),
+            actor_context,
+            TypedStream::infinite(value_stream),
+            persistence_id,
+        );
+        actor.list_item_origin = Some(Arc::new(origin));
+        Arc::new(actor)
     }
 
     /// Create a ValueActor that delegates to a LazyValueActor for demand-driven evaluation.
@@ -3572,6 +3850,7 @@ impl ValueActor {
             actor_loop,
             lazy_delegate: Some(lazy_actor),
             extra_loops: Vec::new(),
+            list_item_origin: None,
         })
     }
 
@@ -3728,11 +4007,17 @@ impl ValueActor {
             actor_loop,
             lazy_delegate: None,
             extra_loops: Vec::new(),
+            list_item_origin: None,
         }
     }
 
     pub fn persistence_id(&self) -> parser::PersistenceId {
         self.persistence_id
+    }
+
+    /// Get the list item origin info, if this actor represents a persisted list item.
+    pub fn list_item_origin(&self) -> Option<&ListItemOrigin> {
+        self.list_item_origin.as_deref()
     }
 
     /// Get the current version of this actor's value.
@@ -3977,6 +4262,7 @@ impl ValueActor {
             actor_loop,
             lazy_delegate: None,
             extra_loops: Vec::new(),
+            list_item_origin: None,
         })
     }
 
@@ -4273,6 +4559,31 @@ impl Value {
             idempotency_key: parser::PersistenceId::new(),
         };
         Value::Flushed(Box::new(self), metadata)
+    }
+
+    /// Check if this value might contain internal actors (stateful components).
+    ///
+    /// Returns true for complex types that might have internal state:
+    /// - Object: might contain HOLD fields
+    /// - TaggedObject: might contain HOLD fields
+    /// - List: has internal state (items)
+    ///
+    /// Returns false for simple values that are just data:
+    /// - Text, Number, Tag: no internal state
+    ///
+    /// Used by scope-based persistence to decide which function calls to record.
+    /// If a function returns a value that contains_actors(), its inputs should
+    /// be recorded so the value can be recreated on restoration.
+    pub fn contains_actors(&self) -> bool {
+        match self {
+            Self::Object(_, _) => true,
+            Self::TaggedObject(_, _) => true,
+            Self::List(_, _) => true,
+            Self::Text(_, _) => false,
+            Self::Tag(_, _) => false,
+            Self::Number(_, _) => false,
+            Self::Flushed(inner, _) => inner.contains_actors(),
+        }
     }
 
     pub fn idempotency_key(&self) -> ValueIdempotencyKey {
@@ -4582,6 +4893,18 @@ pub fn value_actor_from_json(
         constant(value),
         parser::PersistenceId::new(),
     ))
+}
+
+/// Saves a list of ValueActors to JSON for persistence.
+/// Used by List persistence functions.
+pub async fn save_list_items_to_json(items: &[Arc<ValueActor>]) -> Vec<serde_json::Value> {
+    let mut json_items = Vec::new();
+    for item in items {
+        if let Ok(value) = item.current_value().await {
+            json_items.push(value.to_json().await);
+        }
+    }
+    json_items
 }
 
 /// Materialize a Value by eagerly evaluating all lazy variable streams.
@@ -5663,6 +5986,202 @@ impl List {
         }
     }
 
+    /// Creates a wrapper List with persistence support.
+    /// Used by List/append and List/clear to persist their final state.
+    ///
+    /// Unlike new_arc_value_actor_with_persistence (for LIST {}), this:
+    /// - Receives changes from a source list via change_stream
+    /// - If saved state exists: uses saved items as initial state, skips first source Replace
+    /// - If no saved state: forwards all source changes normally
+    /// - On any change: saves the current list state
+    pub fn new_with_change_stream_and_persistence<EOD: 'static>(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        actor_context: ActorContext,
+        change_stream: impl Stream<Item = ListChange> + 'static,
+        extra_owned_data: EOD,
+        persistence_id: parser::PersistenceId,
+    ) -> Self {
+        let construct_storage = construct_context.construct_storage.clone();
+        let construct_context_for_stream = construct_context.clone();
+        let actor_context_for_stream = actor_context.clone();
+        let construct_id = construct_info.id.clone();
+
+        // State for the persistence stream
+        enum PersistState {
+            /// First iteration - need to check for saved state
+            Init {
+                storage: Arc<ConstructStorage>,
+                pid: parser::PersistenceId,
+                change_stream: std::pin::Pin<Box<dyn Stream<Item = ListChange>>>,
+                ctx: ConstructContext,
+                actor_ctx: ActorContext,
+                cid: ConstructId,
+            },
+            /// Restored from storage - need to skip first source Replace
+            Restored {
+                pid: parser::PersistenceId,
+                change_stream: std::pin::Pin<Box<dyn Stream<Item = ListChange>>>,
+                current_items: Vec<Arc<ValueActor>>,
+                ctx: ConstructContext,
+                actor_ctx: ActorContext,
+                cid: ConstructId,
+            },
+            /// Running normally - forward and save changes
+            Running {
+                pid: parser::PersistenceId,
+                change_stream: std::pin::Pin<Box<dyn Stream<Item = ListChange>>>,
+                current_items: Vec<Arc<ValueActor>>,
+                ctx: ConstructContext,
+                actor_ctx: ActorContext,
+                cid: ConstructId,
+            },
+        }
+
+        let persistent_change_stream = stream::unfold(
+            PersistState::Init {
+                storage: construct_storage.clone(),
+                pid: persistence_id,
+                change_stream: Box::pin(change_stream),
+                ctx: construct_context_for_stream,
+                actor_ctx: actor_context_for_stream,
+                cid: construct_id,
+            },
+            move |state| {
+                let storage_for_save = construct_storage.clone();
+                async move {
+                    match state {
+                        PersistState::Init { storage, pid, mut change_stream, ctx, actor_ctx, cid } => {
+                            // Check for saved state
+                            let loaded_items: Option<Vec<serde_json::Value>> = storage.clone().load_state(pid).await;
+
+                            // Only restore simple values from JSON - complex Objects with nested
+                            // fields (like TodoMVC items) don't survive JSON restoration because
+                            // they lose their Variable structure and reactive connections.
+                            // For complex items, use recorded-call restoration via List/append instead.
+                            let should_restore = loaded_items.as_ref().map_or(false, |items| {
+                                items.iter().all(|json| {
+                                    // Only restore if ALL items are simple (not nested Objects)
+                                    match json {
+                                        serde_json::Value::Object(obj) => {
+                                            // Allow Tagged values (have "$Tag" field and one other field)
+                                            // but NOT complex objects with multiple fields or nested objects
+                                            if obj.contains_key("$Tag") && obj.len() <= 2 {
+                                                true
+                                            } else if obj.len() > 1 {
+                                                // Complex object - skip restoration
+                                                zoon::println!("[DEBUG] Skipping JSON restoration: complex object with {} fields", obj.len());
+                                                false
+                                            } else {
+                                                true
+                                            }
+                                        }
+                                        _ => true, // Numbers, strings, etc. are fine
+                                    }
+                                })
+                            });
+
+                            if should_restore {
+                                if let Some(json_items) = loaded_items {
+                                    // Restore from saved state (simple values only)
+                                    let items: Vec<Arc<ValueActor>> = json_items
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, json)| {
+                                            value_actor_from_json(
+                                                json,
+                                                cid.with_child_id(format!("restored_item_{i}")),
+                                                ctx.clone(),
+                                                parser::PersistenceId::new(),
+                                                actor_ctx.clone(),
+                                            )
+                                        })
+                                        .collect();
+
+                                    let restored_change = ListChange::Replace { items: items.clone() };
+                                    return Some((
+                                        restored_change,
+                                        PersistState::Restored { pid, change_stream, current_items: items, ctx, actor_ctx, cid },
+                                    ));
+                                }
+                            } else if loaded_items.is_some() {
+                                zoon::println!("[DEBUG] Skipping JSON restoration for list with complex objects - use recorded-call restoration instead");
+                            }
+
+                            // No saved state OR skipped restoration - forward first change from source
+                            if let Some(change) = change_stream.next().await {
+                                let mut items = Vec::new();
+                                change.clone().apply_to_vec(&mut items);
+
+                                // Save immediately
+                                let json_items = save_list_items_to_json(&items).await;
+                                storage_for_save.save_state(pid, &json_items);
+
+                                Some((
+                                    change,
+                                    PersistState::Running { pid, change_stream, current_items: items, ctx, actor_ctx, cid },
+                                ))
+                            } else {
+                                None
+                            }
+                        }
+                        PersistState::Restored { pid, mut change_stream, current_items, ctx, actor_ctx, cid } => {
+                            // Need to skip the first Replace from source (their initial state)
+                            if let Some(change) = change_stream.next().await {
+                                if matches!(&change, ListChange::Replace { .. }) {
+                                    // Skip source's Replace, emit our restored items instead
+                                    Some((
+                                        ListChange::Replace { items: current_items.clone() },
+                                        PersistState::Running { pid, change_stream, current_items, ctx, actor_ctx, cid },
+                                    ))
+                                } else {
+                                    // Non-Replace change, process normally
+                                    let mut items = current_items;
+                                    change.clone().apply_to_vec(&mut items);
+
+                                    let json_items = save_list_items_to_json(&items).await;
+                                    storage_for_save.save_state(pid, &json_items);
+
+                                    Some((
+                                        change,
+                                        PersistState::Running { pid, change_stream, current_items: items, ctx, actor_ctx, cid },
+                                    ))
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        PersistState::Running { pid, mut change_stream, current_items, ctx, actor_ctx, cid } => {
+                            // Forward changes and save
+                            if let Some(change) = change_stream.next().await {
+                                let mut items = current_items;
+                                change.clone().apply_to_vec(&mut items);
+
+                                let json_items = save_list_items_to_json(&items).await;
+                                storage_for_save.save_state(pid, &json_items);
+
+                                Some((
+                                    change,
+                                    PersistState::Running { pid, change_stream, current_items: items, ctx, actor_ctx, cid },
+                                ))
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                }
+            },
+        );
+
+        // Create the list with the persistent change stream
+        Self::new_with_change_stream(
+            construct_info,
+            actor_context,
+            persistent_change_stream,
+            extra_owned_data,
+        )
+    }
+
     /// Creates a List with persistence support.
     /// - If saved data exists, it's loaded and used as initial items (code items are ignored)
     /// - On any change, the current list state is saved to storage
@@ -6353,6 +6872,7 @@ impl ListBindingFunction {
         actor_context: ActorContext,
         source_list_actor: Arc<ValueActor>,
         config: ListBindingConfig,
+        persistence_id: Option<parser::PersistenceId>,
     ) -> Arc<ValueActor> {
         let construct_info = construct_info.complete(ConstructType::FunctionCall);
         let config = Arc::new(config);
@@ -6383,6 +6903,7 @@ impl ListBindingFunction {
                     actor_context,
                     source_list_actor,
                     config,
+                    persistence_id,
                 )
             }
             ListBindingOperation::Every => {
@@ -7034,12 +7555,19 @@ impl ListBindingFunction {
         actor_context: ActorContext,
         source_list_actor: Arc<ValueActor>,
         config: Arc<ListBindingConfig>,
+        persistence_id: Option<parser::PersistenceId>,
     ) -> Arc<ValueActor> {
         use std::collections::HashSet;
+
+        // Storage key for this List/remove's removed set (per-branch removal tracking)
+        let removed_set_key: Option<String> = persistence_id.as_ref().map(|pid| {
+            format!("list_removed:{}", pid)
+        });
 
         // Clone for use after the chain
         let actor_context_for_list = actor_context.clone();
         let actor_context_for_result = actor_context.clone();
+        let construct_context_for_persistence = construct_context.clone();
 
         // Clone subscription scope for scope cancellation check
         let subscription_scope = actor_context.subscription_scope.clone();
@@ -7073,6 +7601,12 @@ impl ListBindingFunction {
             let config = config.clone();
             let construct_context = construct_context.clone();
             let actor_context = actor_context.clone();
+            let removed_set_key = removed_set_key.clone();
+
+            // Load persisted removed set for restoration (call_ids that were previously removed)
+            let persisted_removed: HashSet<String> = removed_set_key.as_ref()
+                .map(|key| load_removed_set(key).into_iter().collect())
+                .unwrap_or_default();
 
             // Create channel for removal events (PersistenceId of item to remove)
             let (remove_tx, remove_rx) = mpsc::channel::<parser::PersistenceId>(64);
@@ -7105,9 +7639,11 @@ impl ListBindingFunction {
                     construct_context.clone(),
                     actor_context.clone(),
                     0usize, // next_idx for assigning unique internal IDs
+                    removed_set_key.clone(), // storage key for this branch's removed set
+                    persisted_removed, // call_ids from storage for restoration filtering
                 ),
                 move |state, event| {
-                    let (items, removed_pids, remove_tx, config, construct_context, actor_context, next_idx) = state;
+                    let (items, removed_pids, remove_tx, config, construct_context, actor_context, next_idx, removed_set_key, persisted_removed) = state;
 
                     match event {
                         RemoveEvent::ListChange(change) => {
@@ -7115,6 +7651,8 @@ impl ListBindingFunction {
                                 ListChange::Replace { items: new_items } => {
                                     // Filter out items we've already removed (by PersistenceId)
                                     // and rebuild tracking for remaining items
+                                    zoon::println!("[DEBUG] List/remove Replace: {} items incoming, persisted_removed={:?}",
+                                        new_items.len(), persisted_removed);
                                     items.clear();
                                     let mut filtered_items = Vec::new();
 
@@ -7122,7 +7660,20 @@ impl ListBindingFunction {
                                         let persistence_id = item.persistence_id();
                                         if removed_pids.contains(&persistence_id) {
                                             // This item was removed by this List/remove, skip it
+                                            zoon::println!("[DEBUG] List/remove Replace: filtering by removed_pids");
                                             continue;
+                                        }
+
+                                        // Check persisted removals (for restoration after reload)
+                                        if let Some(origin) = item.list_item_origin() {
+                                            zoon::println!("[DEBUG] List/remove Replace: item has origin call_id={}", origin.call_id);
+                                            if persisted_removed.contains(&origin.call_id) {
+                                                // This item was previously removed, skip it
+                                                zoon::println!("[DEBUG] List/remove Replace: FILTERING out call_id={}", origin.call_id);
+                                                continue;
+                                            }
+                                        } else {
+                                            zoon::println!("[DEBUG] List/remove Replace: item has NO origin");
                                         }
 
                                         let idx = *next_idx;
@@ -7162,7 +7713,20 @@ impl ListBindingFunction {
                                     let persistence_id = item.persistence_id();
                                     // If this item was previously removed, don't add it back
                                     if removed_pids.contains(&persistence_id) {
+                                        zoon::println!("[DEBUG] List/remove Push: filtering by removed_pids");
                                         return future::ready(Some(None));
+                                    }
+
+                                    // Check persisted removals (for restoration after reload)
+                                    if let Some(origin) = item.list_item_origin() {
+                                        zoon::println!("[DEBUG] List/remove Push: item has origin call_id={}, persisted_removed={:?}",
+                                            origin.call_id, persisted_removed);
+                                        if persisted_removed.contains(&origin.call_id) {
+                                            zoon::println!("[DEBUG] List/remove Push: FILTERING out call_id={}", origin.call_id);
+                                            return future::ready(Some(None));
+                                        }
+                                    } else {
+                                        zoon::println!("[DEBUG] List/remove Push: item has NO origin");
                                     }
 
                                     let idx = *next_idx;
@@ -7217,6 +7781,19 @@ impl ListBindingFunction {
                         RemoveEvent::RemoveItem(persistence_id) => {
                             // Local removal triggered by `when` event
                             if let Some(pos) = items.iter().position(|(_, item, _, _)| item.persistence_id() == persistence_id) {
+                                // Get the item before removing to check its origin
+                                let (_, item, _, _) = &items[pos];
+
+                                // Debug logging
+                                zoon::println!("[DEBUG] RemoveItem: item has origin: {}, removed_set_key: {:?}",
+                                    item.list_item_origin().is_some(), removed_set_key);
+
+                                // Persist removal to this branch's removed set
+                                if let (Some(origin), Some(key)) = (item.list_item_origin(), removed_set_key.as_ref()) {
+                                    zoon::println!("[DEBUG] Adding to removed set: key={}, call_id={}", key, origin.call_id);
+                                    add_to_removed_set(key, &origin.call_id);
+                                }
+
                                 items.remove(pos);
                                 // Track this removal so item doesn't reappear on upstream Replace
                                 removed_pids.insert(persistence_id);
@@ -7230,16 +7807,32 @@ impl ListBindingFunction {
             ).filter_map(future::ready)
         });
 
-        let list = List::new_with_change_stream(
-            ConstructInfo::new(
-                construct_info.id.clone().with_child_id(0),
-                None,
-                "List/remove result",
-            ),
-            actor_context_for_list,
-            value_stream,
-            source_list_actor.clone(),
-        );
+        // Use persistence-aware list creation if persistence_id is provided
+        let list = if let Some(pid) = persistence_id {
+            List::new_with_change_stream_and_persistence(
+                ConstructInfo::new(
+                    construct_info.id.clone().with_child_id(0),
+                    None,
+                    "List/remove result",
+                ),
+                construct_context_for_persistence,
+                actor_context_for_list,
+                value_stream,
+                (source_list_actor.clone(),),
+                pid,
+            )
+        } else {
+            List::new_with_change_stream(
+                ConstructInfo::new(
+                    construct_info.id.clone().with_child_id(0),
+                    None,
+                    "List/remove result",
+                ),
+                actor_context_for_list,
+                value_stream,
+                source_list_actor.clone(),
+            )
+        };
 
         Arc::new(ValueActor::new(
             construct_info,

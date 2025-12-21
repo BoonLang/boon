@@ -108,6 +108,12 @@ pub enum Command {
 
     /// Press a special key (Enter, Escape, Tab, Backspace, Delete)
     PressKey { key: String },
+
+    /// Get localStorage entries, optionally filtered by pattern
+    GetLocalStorage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+    },
 }
 
 /// Response from Extension to CLI via Server
@@ -158,6 +164,9 @@ pub enum Response {
 
     /// Accessibility tree
     AccessibilityTree { tree: serde_json::Value },
+
+    /// LocalStorage entries
+    LocalStorage { entries: serde_json::Value },
 }
 
 /// Console message from browser

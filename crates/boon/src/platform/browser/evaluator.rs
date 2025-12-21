@@ -11,7 +11,7 @@ use zoon::futures_channel::oneshot;
 use zoon::futures_util::select;
 use zoon::futures_util::future;
 use zoon::futures_util::stream::{self, LocalBoxStream};
-use zoon::{Stream, StreamExt, SinkExt, mpsc};
+use zoon::{Stream, StreamExt, SinkExt, mpsc, Task, TaskHandle};
 
 /// Yields control to the executor, allowing other tasks to run.
 /// This is a simple implementation that returns Pending once and schedules a wake.
@@ -57,6 +57,22 @@ fn create_variable_persistence_stream(
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
     let scoped_id = persistence_id.in_scope(&scope);
+
+    // Inside HOLD body (sequential_processing), skip restoration logic.
+    // HOLD itself handles state persistence. Variables inside HOLD body are
+    // recreated each iteration with fresh values that should NOT be overwritten
+    // by stored values from previous iterations.
+    if actor_context.sequential_processing {
+        return source_actor.stream()
+            .then(move |value| {
+                let storage = storage.clone();
+                async move {
+                    save_value_if_applicable(&value, scoped_id, &storage).await;
+                    value
+                }
+            })
+            .left_stream();
+    }
 
     // Use unfold to manage state: first load stored value, then forward source
     // Returns Option<Value> so we can skip emissions (None) when needed
@@ -148,7 +164,7 @@ fn create_variable_persistence_stream(
                 }
             }
         }
-    ).filter_map(future::ready)
+    ).filter_map(future::ready).right_stream()
 }
 
 enum PersistenceState {
@@ -163,18 +179,16 @@ enum PersistenceState {
     },
 }
 
-async fn save_value_if_applicable(value: &Value, scoped_id: PersistenceId, storage: &Arc<ConstructStorage>) {
+async fn save_value_if_applicable(value: &Value, scoped_id: PersistenceId, storage: &ConstructStorage) {
     match value {
         // Don't persist Lists at variable level - they need List-actor-level persistence
         // Restoring a List from JSON creates a disconnected List
         Value::List(..) => {}
-        Value::Text(..) | Value::Number(..) | Value::Tag(..) => {
+        Value::Text(_, _) | Value::Number(..) | Value::Tag(..) => {
             let json = value.to_json().await;
             storage.save_state(scoped_id, &json);
         }
-        _ => {
-            // Don't persist Objects or other complex types
-        }
+        _ => {}
     }
 }
 
@@ -446,6 +460,15 @@ pub enum WorkItem {
     ConnectForwardingActors {
         connections: Vec<(SlotId, NamedChannel<Value>)>,
     },
+
+    /// Wrap an evaluated slot with variable persistence.
+    /// Used for function arguments that have persistence IDs.
+    WrapWithPersistence {
+        source_slot: SlotId,
+        persistence_id: PersistenceId,
+        ctx: EvaluationContext,
+        result_slot: SlotId,
+    },
 }
 
 impl WorkItem {
@@ -466,6 +489,7 @@ impl WorkItem {
             WorkItem::EvaluateWithPiped { .. } => "EvaluateWithPiped",
             WorkItem::CallFunction { .. } => "CallFunction",
             WorkItem::ConnectForwardingActors { .. } => "ConnectForwardingActors",
+            WorkItem::WrapWithPersistence { .. } => "WrapWithPersistence",
         }
     }
 }
@@ -1266,6 +1290,20 @@ fn schedule_expression(
                         state.store(result_slot, actor);
                     }
                 }
+                ["List", "append"] => {
+                    // Special handling for List/append - enable call recording for the item expression
+                    // This captures function calls that produce list items (e.g., new_todo())
+                    // so they can be replayed on restoration
+                    if let Some(actor) = build_list_append_with_recording(
+                        arguments,
+                        span,
+                        persistence,
+                        persistence_id,
+                        ctx,
+                    )? {
+                        state.store(result_slot, actor);
+                    }
+                }
                 _ => {
                     // Normal function call - pre-evaluate all arguments
                     // First pass: collect argument data and allocate slots (don't schedule yet)
@@ -1370,6 +1408,36 @@ fn schedule_expression(
                     if !forwarding_connections.is_empty() {
                         state.push(WorkItem::ConnectForwardingActors {
                             connections: forwarding_connections,
+                        });
+                    }
+
+                    // Collect LATEST args that need persistence wrapping.
+                    // Only LATEST expressions need value persistence here - other expressions
+                    // (Objects, Literals, etc.) handle their own persistence internally.
+                    let latest_args_with_persistence: Vec<_> = args_to_schedule.iter()
+                        .filter_map(|(expr, slot)| {
+                            // Only wrap LATEST expressions with value persistence
+                            if matches!(expr.node, static_expression::Expression::Latest { .. }) {
+                                expr.persistence.as_ref().map(|p| (*slot, p.id))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    // DEBUG: Log LATEST args with persistence
+                    if !latest_args_with_persistence.is_empty() {
+                        zoon::println!("[DEBUG] FunctionCall has {} LATEST args with persistence", latest_args_with_persistence.len());
+                    }
+
+                    // Push persistence wrappers for LATEST args
+                    for (arg_slot, persistence_id) in latest_args_with_persistence {
+                        zoon::println!("[DEBUG] Pushing WrapWithPersistence for LATEST slot {:?} with id {}", arg_slot, persistence_id);
+                        state.push(WorkItem::WrapWithPersistence {
+                            source_slot: arg_slot,
+                            persistence_id,
+                            ctx: ctx_with_arg_locals.clone(),
+                            result_slot: arg_slot, // wrap in place
                         });
                     }
 
@@ -2124,9 +2192,10 @@ fn process_work_item(
 
                 // Check for List binding functions first
                 match path_strs_ref.as_slice() {
-                    ["List", "map"] | ["List", "retain"] | ["List", "remove"] | ["List", "every"] | ["List", "any"] | ["List", "sort_by"] => {
+                    ["List", "map"] | ["List", "retain"] | ["List", "remove"] | ["List", "every"] | ["List", "any"] | ["List", "sort_by"] | ["List", "append"] => {
                         // Handle List binding functions specially - they have their own handling
                         // These use the piped value from the context
+                        // List/append also has special handling for call recording (persistence)
                         schedule_expression(state, expr, new_ctx, result_slot)?;
                     }
                     _ => {
@@ -2401,6 +2470,10 @@ fn process_work_item(
                             object_locals: ctx.actor_context.object_locals,
                             scope: ctx.actor_context.scope,
                             subscription_scope: ctx.actor_context.subscription_scope.clone(),
+                            call_recorder: ctx.actor_context.call_recorder,
+                            is_restoring: ctx.actor_context.is_restoring,
+                            list_append_storage_key: ctx.actor_context.list_append_storage_key,
+                            recording_counter: ctx.actor_context.recording_counter,
                         },
                         reference_connector: ctx.reference_connector,
                         link_connector: ctx.link_connector,
@@ -2475,6 +2548,36 @@ fn process_work_item(
                     // Store in state to keep alive
                     state.add_forwarding_loop(forwarding_loop);
                 }
+            }
+        }
+
+        WorkItem::WrapWithPersistence { source_slot, persistence_id, ctx, result_slot } => {
+            // Wrap an evaluated function argument with persistence.
+            // This enables persistence for LATEST and other constructs used as function arguments.
+            zoon::println!("[DEBUG] Processing WrapWithPersistence for slot {:?} with id {}", source_slot, persistence_id);
+            if let Some(source_actor) = state.get(source_slot) {
+                zoon::println!("[DEBUG] Found source actor, wrapping with persistence");
+                let persistence_stream = create_variable_persistence_stream(
+                    source_actor.clone(),
+                    ctx.construct_context.construct_storage.clone(),
+                    persistence_id,
+                    ctx.actor_context.scope.clone(),
+                    ctx.construct_context.clone(),
+                    ctx.actor_context.clone(),
+                );
+
+                let persisted_actor = Arc::new(ValueActor::new(
+                    ConstructInfo::new(
+                        format!("PersistenceId: {} (argument persistence)", persistence_id),
+                        None,
+                        format!("function argument persistence wrapper"),
+                    ).complete(ConstructType::ValueActor),
+                    ctx.actor_context.clone(),
+                    TypedStream::infinite(persistence_stream),
+                    persistence_id,
+                ));
+
+                state.store(result_slot, persisted_actor);
             }
         }
     }
@@ -2689,6 +2792,10 @@ fn build_then_actor(
                 object_locals: actor_context_clone.object_locals.clone(),
                 scope: actor_context_clone.scope.clone(),
                 subscription_scope: actor_context_clone.subscription_scope.clone(),
+                call_recorder: actor_context_clone.call_recorder.clone(),
+                is_restoring: actor_context_clone.is_restoring,
+                list_append_storage_key: actor_context_clone.list_append_storage_key.clone(),
+                recording_counter: actor_context_clone.recording_counter.clone(),
             };
 
             let new_ctx = EvaluationContext {
@@ -2924,6 +3031,10 @@ fn build_when_actor(
                         object_locals: actor_context_clone.object_locals.clone(),
                         scope: actor_context_clone.scope.clone(),
                         subscription_scope: actor_context_clone.subscription_scope.clone(),
+                        call_recorder: actor_context_clone.call_recorder.clone(),
+                        is_restoring: actor_context_clone.is_restoring,
+                        list_append_storage_key: actor_context_clone.list_append_storage_key.clone(),
+                        recording_counter: actor_context_clone.recording_counter.clone(),
                     };
 
                     let new_ctx = EvaluationContext {
@@ -3132,6 +3243,10 @@ fn build_while_actor(
                     // All subscriptions created within this arm will check this scope
                     // and terminate when it's cancelled (on arm switch)
                     subscription_scope: Some(arm_scope.clone()),
+                    call_recorder: actor_context_clone.call_recorder.clone(),
+                    is_restoring: actor_context_clone.is_restoring,
+                    list_append_storage_key: actor_context_clone.list_append_storage_key.clone(),
+                    recording_counter: actor_context_clone.recording_counter.clone(),
                 };
 
                 let new_ctx = EvaluationContext {
@@ -3508,6 +3623,10 @@ fn build_hold_actor(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
 ) -> Result<Option<Arc<ValueActor>>, String> {
+    // Apply scope to persistence_id so HOLDs inside user-defined functions
+    // get unique storage keys for each call site
+    let persistence_id = persistence_id.in_scope(&ctx.actor_context.scope);
+
     // Use a bounded channel to hold current state value and broadcast updates
     // Note: Sender::try_send takes &self, so we can just clone the sender
     let (state_sender, state_receiver) = zoon::futures_channel::mpsc::channel::<Value>(16);
@@ -3629,6 +3748,10 @@ fn build_hold_actor(
         object_locals: ctx.actor_context.object_locals.clone(),
         scope: ctx.actor_context.scope.clone(),
         subscription_scope: ctx.actor_context.subscription_scope.clone(),
+        call_recorder: ctx.actor_context.call_recorder.clone(),
+        is_restoring: ctx.actor_context.is_restoring,
+        list_append_storage_key: ctx.actor_context.list_append_storage_key.clone(),
+        recording_counter: ctx.actor_context.recording_counter.clone(),
     };
 
     // Create new context for body evaluation
@@ -4317,6 +4440,13 @@ fn build_list_binding_function(
         function_registry_snapshot: ctx.function_registry_snapshot.clone(),
     };
 
+    // Pass persistence_id for List/remove so it can persist its removed set
+    // Other operations don't need persistence - complex objects with LINKs don't survive JSON serialization
+    let pid_for_operation = match operation {
+        ListBindingOperation::Remove => Some(persistence_id),
+        _ => None,
+    };
+
     let result = ListBindingFunction::new_arc_value_actor(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
@@ -4327,8 +4457,329 @@ fn build_list_binding_function(
         ctx.actor_context,
         list_actor,
         config,
+        pid_for_operation,
     );
     Ok(Some(result))
+}
+
+/// Build List/append with call recording for persistence.
+/// This enables capturing function calls that produce list items (e.g., new_todo())
+/// so they can be replayed on restoration.
+fn build_list_append_with_recording(
+    arguments: Vec<static_expression::Spanned<static_expression::Argument>>,
+    span: Span,
+    persistence: Option<Persistence>,
+    persistence_id: PersistenceId,
+    ctx: EvaluationContext,
+) -> Result<Option<Arc<ValueActor>>, String> {
+    zoon::println!("[DEBUG] build_list_append_with_recording called");
+    zoon::println!("[DEBUG] persistence: {:?}, persistence_id: {}", persistence.is_some(), persistence_id);
+
+    // For List/append(item: expr):
+    // - First arg "item:" has the expression to evaluate
+    // - List comes from piped value
+    if arguments.is_empty() {
+        return Err("List/append requires an item argument".to_string());
+    }
+
+    // Get the list from piped value
+    let list_actor = if let Some(ref piped) = ctx.actor_context.piped {
+        piped.clone()
+    } else {
+        return Err("List/append requires a list (piped)".to_string());
+    };
+
+    // Get the item expression
+    let item_arg = &arguments[0];
+    let item_expr = item_arg.node.value.clone()
+        .ok_or_else(|| "List/append requires an item expression".to_string())?;
+
+    // Create persisting child scope for item evaluation
+    // This enables call recording for function calls within the item expression
+    // Use span (source position) for stable key across page reloads, not persistence_id (which includes timestamps)
+    let scope_id = format!("list_append_{}", span);
+    // Storage key must be defined first to pass to with_persisting_child_scope
+    let storage_key = format!("list_calls:{}", scope_id);
+    let (child_ctx, call_receiver) = ctx.actor_context.with_persisting_child_scope(&scope_id, storage_key.clone());
+    zoon::println!("[DEBUG] Created persisting scope: {}, call_recorder is Some: {}", scope_id, child_ctx.call_recorder.is_some());
+
+    // Create new evaluation context with the persisting scope
+    let item_eval_ctx = EvaluationContext {
+        actor_context: child_ctx.clone(),
+        ..ctx.clone()
+    };
+
+    // Evaluate the item expression in the persisting scope
+    // Recording happens automatically during evaluation (in call_function when piped values flow)
+    let item_actor = match evaluate_expression(item_expr, item_eval_ctx)? {
+        Some(actor) => actor,
+        None => {
+            // Item is SKIP - just forward the list unchanged
+            return Ok(Some(list_actor));
+        }
+    };
+
+    // Load any existing recorded calls for restoration
+    // These are replayed to recreate list items from previous sessions
+    let stored_calls: Vec<RecordedCall> = {
+        use zoon::{local_storage, WebStorage};
+        match local_storage().get::<Vec<RecordedCall>>(&storage_key) {
+            None => Vec::new(),
+            Some(Ok(calls)) => calls,
+            Some(Err(error)) => {
+                zoon::eprintln!("[DEBUG] Failed to load stored calls for restoration: {:#}", error);
+                Vec::new()
+            }
+        }
+    };
+
+    // Update recording_counter to start after existing stored calls
+    // This ensures new items get unique call_ids that don't conflict with restored items
+    if let Some(counter) = &child_ctx.recording_counter {
+        counter.store(stored_calls.len(), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    // Replay stored calls to restore list items
+    // Each call creates an item by evaluating the function with stored inputs
+    let mut restored_items: Vec<Arc<ValueActor>> = Vec::new();
+    if !stored_calls.is_empty() {
+        zoon::println!("[DEBUG] Restoring {} items from stored calls", stored_calls.len());
+        for (index, recorded_call) in stored_calls.iter().enumerate() {
+            zoon::println!("[DEBUG] Restoring item {}: {:?}", index, recorded_call);
+
+            // 1. Convert CapturedValue back to a Value actor
+            let Some(input_value) = recorded_call.inputs.restore_with_context(
+                ConstructInfo::new(
+                    format!("restored_input_value_{}", index),
+                    None,
+                    format!("Restored input value for item {}", index),
+                ),
+                ctx.construct_context.clone(),
+            ) else {
+                zoon::eprintln!("[DEBUG] Failed to restore input for item {}", index);
+                continue;
+            };
+            let input_actor = ValueActor::new_arc(
+                ConstructInfo::new(
+                    format!("restored_input_{}", index),
+                    None,
+                    format!("Restored input for item {}", index),
+                ),
+                ctx.actor_context.clone(),
+                constant(input_value),
+                PersistenceId::new(),
+            );
+
+            // 2. Look up the function in registry
+            let function_path = recorded_call.path.join("/");
+            let Some(func_def) = ctx.function_registry_snapshot.as_ref()
+                .and_then(|registry| registry.get(&function_path)) else {
+                zoon::eprintln!("[DEBUG] Function '{}' not found for restoration", function_path);
+                continue;
+            };
+
+            // 3. Bind the input to the function's first parameter (like call_function does with piped)
+            // For `title_to_add |> new_todo()`, the piped value becomes the first argument (title)
+            let mut parameters = ctx.actor_context.parameters.clone();
+            if let Some(first_param) = func_def.parameters.first() {
+                zoon::println!("[DEBUG] Binding restored input to parameter '{}' for function '{}'", first_param, function_path);
+                parameters.insert(first_param.clone(), input_actor.clone());
+            } else {
+                zoon::eprintln!("[DEBUG] Function '{}' has no parameters to bind input to", function_path);
+            }
+
+            // 4. Create restoring context with parameters bound (prevents re-recording)
+            // Use the same scope format as during initial creation (call_id)
+            // This ensures HOLDs inside the function can find their persisted state
+            let body_ctx = EvaluationContext {
+                actor_context: ActorContext {
+                    parameters,
+                    is_restoring: true,
+                    ..child_ctx.with_restoring_child_scope(&recorded_call.id)
+                },
+                ..ctx.clone()
+            };
+
+            // 5. Evaluate function body
+            match evaluate_expression(func_def.body.clone(), body_ctx) {
+                Ok(Some(item_actor)) => {
+                    zoon::println!("[DEBUG] Restored item {} successfully", index);
+                    // Wrap the item with origin for removal tracking
+                    let origin = ListItemOrigin {
+                        source_storage_key: storage_key.clone(),
+                        call_id: recorded_call.id.clone(),
+                    };
+                    let wrapped_item = ValueActor::new_arc_with_origin_boxed(
+                        ConstructInfo::new(
+                            format!("restored_item_wrapper_{}", index),
+                            None,
+                            format!("Restored item wrapper with origin for item {}", index),
+                        ),
+                        ctx.actor_context.clone(),
+                        Box::pin(item_actor.stream()),
+                        PersistenceId::new(),
+                        origin,
+                    );
+                    restored_items.push(wrapped_item);
+                }
+                Ok(None) => {
+                    zoon::println!("[DEBUG] Restored item {} was SKIP", index);
+                }
+                Err(e) => {
+                    zoon::eprintln!("[DEBUG] Failed to restore item {}: {}", index, e);
+                }
+            }
+        }
+    }
+    let storage_handle = spawn_recorded_calls_storage_actor(storage_key.clone(), call_receiver);
+    zoon::println!("[DEBUG] Spawned storage actor for key: {}", storage_key);
+
+    // Build a custom change stream that includes restored items
+    // This replicates function_list_append logic but injects restored items after the first Replace
+
+    let function_call_id = ConstructId::new(format!("List/append:{}", persistence_id));
+    let function_call_id_for_append = function_call_id.clone();
+    let actor_context_for_append = ctx.actor_context.clone();
+    let storage_key_for_append = storage_key.clone();
+    // Counter for generating call_ids - starts at stored_calls.len() so new items get unique IDs
+    let appending_counter = Arc::new(std::sync::atomic::AtomicUsize::new(stored_calls.len()));
+
+    // Tag changes with their source so we can ensure proper ordering
+    enum TaggedChange {
+        FromList(ListChange),
+        FromAppend(ListChange),
+        FromRestored(ListChange),
+    }
+
+    // Source list changes
+    let list_actor_for_stream = list_actor.clone();
+    let list_changes = list_actor_for_stream.stream().filter_map(|value| {
+        future::ready(match value {
+            Value::List(list, _) => Some(list),
+            _ => None,
+        })
+    }).flat_map(|list| list.stream()).map(TaggedChange::FromList);
+
+    // New item changes (from item_actor stream)
+    let item_actor_for_stream = item_actor.clone();
+    let append_changes = item_actor_for_stream.stream().map(move |value| {
+        // Generate call_id that matches the one used during recording
+        let call_id = format!("call_{}", appending_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+        let origin = ListItemOrigin {
+            source_storage_key: storage_key_for_append.clone(),
+            call_id,
+        };
+        let new_item_actor = ValueActor::new_arc_with_origin(
+            ConstructInfo::new(
+                function_call_id_for_append.with_child_id("appended_item"),
+                None,
+                "List/append appended item",
+            ),
+            actor_context_for_append.clone(),
+            constant(value),
+            PersistenceId::new(),
+            origin,
+        );
+        TaggedChange::FromAppend(ListChange::Push { item: new_item_actor })
+    });
+
+    // Restored item changes (one-time stream of Push changes for each restored item)
+    // Track if we have stored calls - determines whether to override initial items
+    let had_stored_calls = !restored_items.is_empty();
+
+    let restored_changes = stream::iter(
+        restored_items.into_iter().map(|item| {
+            zoon::println!("[DEBUG] Emitting restored item to change stream");
+            TaggedChange::FromRestored(ListChange::Push { item })
+        })
+    );
+
+    // Merge all change streams, then use scan to ensure proper ordering:
+    // 1. First list Replace must come first
+    // 2. Then restored items are pushed
+    // 3. Then new appended items
+    let change_stream = stream::select(
+        stream::select(list_changes, append_changes),
+        restored_changes,
+    )
+    .scan(
+        (false, Vec::<ListChange>::new(), false, had_stored_calls), // (has_received_first_list_change, buffered_appends, restored_emitted, had_stored_calls)
+        |state, tagged_change| {
+            let (has_received_first, buffered, restored_emitted, had_stored_calls) = state;
+
+            let changes_to_emit = match tagged_change {
+                TaggedChange::FromList(change) => {
+                    if !*has_received_first {
+                        *has_received_first = true;
+                        // Always include FromList items (default items from LIST literal)
+                        // plus restored items (dynamically added and recorded via List/append).
+                        // FromList items are fresh evaluations, not JSON-restored, so they're valid.
+                        // Buffered includes restored items and any early appends.
+                        let mut all = vec![change];
+                        all.append(buffered);
+                        all
+                    } else {
+                        // Subsequent list change - emit directly
+                        vec![change]
+                    }
+                }
+                TaggedChange::FromAppend(change) => {
+                    if *has_received_first {
+                        // Already received first list change - emit directly
+                        vec![change]
+                    } else {
+                        // Buffer until first list change arrives
+                        buffered.push(change);
+                        vec![]
+                    }
+                }
+                TaggedChange::FromRestored(change) => {
+                    if *has_received_first {
+                        // Already received first list change - emit restored item directly
+                        *restored_emitted = true;
+                        vec![change]
+                    } else {
+                        // Buffer until first list change arrives (treat like append)
+                        buffered.push(change);
+                        vec![]
+                    }
+                }
+            };
+
+            future::ready(Some(changes_to_emit))
+        }
+    )
+    .flat_map(|changes| stream::iter(changes));
+
+    // Create the result list with the combined change stream
+    let list = List::new_with_change_stream(
+        ConstructInfo::new(
+            function_call_id.with_child_id(ulid::Ulid::new().to_string()),
+            None,
+            "List/append with restoration result",
+        ),
+        ctx.actor_context.clone(),
+        change_stream,
+        (list_actor, item_actor, storage_handle),  // Keep these alive
+    );
+
+    let result_stream = constant(Value::List(
+        Arc::new(list),
+        ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+    ));
+
+    let result_actor = ValueActor::new_arc(
+        ConstructInfo::new(
+            format!("PersistenceId: {persistence_id}"),
+            persistence,
+            format!("{span}; List/append(..) with recording"),
+        ),
+        ctx.actor_context.clone(),
+        result_stream,
+        persistence_id,
+    );
+
+    Ok(Some(result_actor))
 }
 
 /// Call a function with stack-safe evaluation.
@@ -4399,11 +4850,33 @@ fn call_function(
             let persistence_for_construct = persistence.clone();
             let span_for_construct = span;
 
+            // Clone path for recording
+            let path_for_recording = path.clone();
+
             // Create a stream that:
             // 1. Subscribes to the piped input
             // 2. For each value from piped, evaluates the function body with that value
             // 3. If piped never produces values (SKIP), this stream also never produces values
             let result_stream = piped_for_closure.stream().flat_map(move |piped_value| {
+                // Generate unique invocation_id for this call (used for both recording and scope)
+                // This ensures each invocation of the function gets its own scope for internal HOLDs
+                let invocation_id = ctx_for_closure.actor_context.recording_counter
+                    .as_ref()
+                    .map(|counter| format!("call_{}", counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)))
+                    .unwrap_or_else(|| format!("call_{}", ulid::Ulid::new()));
+
+                // Record the call if we're in a persisting scope
+                if let Some(call_recorder) = &ctx_for_closure.actor_context.call_recorder {
+                    let captured_input = CapturedValue::capture(&piped_value);
+                    zoon::println!("[DEBUG] Recording call: {:?} with id: {} and input: {:?}", path_for_recording, invocation_id, captured_input);
+                    let recorded_call = RecordedCall {
+                        id: invocation_id.clone(),
+                        path: path_for_recording.clone(),
+                        inputs: captured_input,
+                    };
+                    call_recorder.send_or_drop(recorded_call);
+                }
+
                 // Create a constant actor for this specific piped value
                 let value_actor = ValueActor::new_arc(
                     ConstructInfo::new(
@@ -4420,6 +4893,18 @@ fn call_function(
                 let mut params = parameters_for_closure.clone();
                 params.insert(param_name_for_closure.clone(), value_actor);
 
+                // Create a nested scope using the invocation_id (call_id like "call_0").
+                // This ensures each invocation of the function gets a UNIQUE scope,
+                // so HOLDs inside don't overwrite each other across invocations.
+                // Note: We use just invocation_id (not persistence_id:invocation_id) to match
+                // the scope format used during restoration, which uses recorded_call.id.
+                let call_scope = match &ctx_for_closure.actor_context.scope {
+                    Scope::Root => Scope::Nested(invocation_id.clone()),
+                    Scope::Nested(existing) => {
+                        Scope::Nested(format!("{}:{}", existing, invocation_id))
+                    }
+                };
+
                 let new_actor_context = ActorContext {
                     output_valve_signal: ctx_for_closure.actor_context.output_valve_signal.clone(),
                     piped: None, // Clear piped - we've consumed it
@@ -4433,8 +4918,12 @@ fn call_function(
                     is_snapshot_context: false,
                     // Clear object_locals - function body is a new scope
                     object_locals: HashMap::new(),
-                    scope: ctx_for_closure.actor_context.scope.clone(),
+                    scope: call_scope,
                     subscription_scope: ctx_for_closure.actor_context.subscription_scope.clone(),
+                    call_recorder: ctx_for_closure.actor_context.call_recorder.clone(),
+                    is_restoring: ctx_for_closure.actor_context.is_restoring,
+                    list_append_storage_key: ctx_for_closure.actor_context.list_append_storage_key.clone(),
+                    recording_counter: ctx_for_closure.actor_context.recording_counter.clone(),
                 };
 
                 let new_ctx = EvaluationContext {
@@ -4487,6 +4976,16 @@ fn call_function(
         // Note: we collect from parameters which now contains the arg_map values
         let arg_actors: Vec<Arc<ValueActor>> = parameters.values().cloned().collect();
 
+        // Create a nested scope using the function call's persistence_id.
+        // This ensures that HOLDs inside the function body get unique persistence IDs
+        // for each call site (e.g., each call to new_todo() gets its own scope).
+        let call_scope = match &ctx.actor_context.scope {
+            Scope::Root => Scope::Nested(persistence_id.to_string()),
+            Scope::Nested(existing) => {
+                Scope::Nested(format!("{}:{}", existing, persistence_id))
+            }
+        };
+
         let new_actor_context = ActorContext {
             output_valve_signal: ctx.actor_context.output_valve_signal.clone(),
             piped: ctx.actor_context.piped.clone(),
@@ -4501,8 +5000,12 @@ fn call_function(
             is_snapshot_context: false,
             // Clear object_locals - function body is a new scope
             object_locals: HashMap::new(),
-            scope: ctx.actor_context.scope.clone(),
+            scope: call_scope,
             subscription_scope: ctx.actor_context.subscription_scope.clone(),
+            call_recorder: ctx.actor_context.call_recorder.clone(),
+            is_restoring: ctx.actor_context.is_restoring,
+            list_append_storage_key: ctx.actor_context.list_append_storage_key.clone(),
+            recording_counter: ctx.actor_context.recording_counter.clone(),
         };
 
         let new_ctx = EvaluationContext {
@@ -4576,6 +5079,10 @@ fn call_function(
                 object_locals: HashMap::new(),
                 scope: ctx.actor_context.scope.clone(),
                 subscription_scope: ctx.actor_context.subscription_scope.clone(),
+                call_recorder: ctx.actor_context.call_recorder.clone(),
+                is_restoring: ctx.actor_context.is_restoring,
+                list_append_storage_key: ctx.actor_context.list_append_storage_key.clone(),
+                recording_counter: ctx.actor_context.recording_counter.clone(),
             };
 
             Ok(Some(FunctionCall::new_arc_value_actor(
@@ -5540,5 +6047,44 @@ fn static_function_call_path_to_definition(
 
 /// Match result containing bindings if match succeeded
 type PatternBindings = HashMap<String, Arc<ValueActor>>;
+
+/// Spawn an actor that stores recorded calls to localStorage.
+/// Each recorded call represents an item added to a list (e.g., new_todo() call).
+/// Calls are stored in order so they can be replayed on restoration.
+fn spawn_recorded_calls_storage_actor(
+    storage_key: String,
+    mut call_receiver: mpsc::Receiver<RecordedCall>,
+) -> TaskHandle {
+    use zoon::futures_util::StreamExt;
+    use zoon::{local_storage, WebStorage};
+
+    Task::start_droppable(async move {
+        // Load existing recorded calls from storage (if any)
+        let mut recorded_calls: Vec<RecordedCall> = match local_storage().get::<Vec<RecordedCall>>(&storage_key) {
+            None => Vec::new(),
+            Some(Ok(calls)) => calls,
+            Some(Err(error)) => {
+                zoon::eprintln!("[DEBUG] Failed to deserialize recorded calls for {}: {:#}", storage_key, error);
+                Vec::new()
+            }
+        };
+        zoon::println!("[DEBUG] Storage actor loaded {} existing calls for {}", recorded_calls.len(), storage_key);
+
+        // Process incoming recorded calls
+        while let Some(call) = call_receiver.next().await {
+            zoon::println!("[DEBUG] Storage actor received call: {:?}", call);
+            recorded_calls.push(call);
+
+            // Save to localStorage after each call
+            if let Err(error) = local_storage().insert(&storage_key, &recorded_calls) {
+                zoon::eprintln!("[DEBUG] Failed to save recorded calls for {}: {:#}", storage_key, error);
+            } else {
+                zoon::println!("[DEBUG] Storage actor saved {} calls to {}", recorded_calls.len(), storage_key);
+            }
+        }
+
+        zoon::println!("[DEBUG] Storage actor for {} shutting down", storage_key);
+    })
+}
 
 

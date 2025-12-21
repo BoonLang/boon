@@ -278,6 +278,13 @@ enum ExecAction {
         #[arg(long)]
         examples_dir: Option<PathBuf>,
     },
+
+    /// Get localStorage entries (for debugging persistence)
+    LocalStorage {
+        /// Filter keys containing this pattern
+        #[arg(short, long)]
+        pattern: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -701,6 +708,35 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
             let all_passed = results.iter().all(|r| r.passed);
             if !all_passed {
                 std::process::exit(1);
+            }
+        }
+
+        ExecAction::LocalStorage { pattern } => {
+            let response = send_command_to_server(port, WsCommand::GetLocalStorage { pattern }).await?;
+            match response {
+                WsResponse::LocalStorage { entries } => {
+                    if let Some(obj) = entries.as_object() {
+                        if obj.is_empty() {
+                            println!("No localStorage entries found.");
+                        } else {
+                            println!("Found {} localStorage entries:", obj.len());
+                            for (key, value) in obj {
+                                let value_owned = value.to_string();
+                                let value_str = value.as_str().unwrap_or(&value_owned);
+                                // Truncate very long values
+                                let display_value = if value_str.len() > 100 {
+                                    format!("{}...[truncated]", &value_str[..100])
+                                } else {
+                                    value_str.to_string()
+                                };
+                                println!("  {}: {}", key, display_value);
+                            }
+                        }
+                    } else {
+                        println!("{}", entries);
+                    }
+                }
+                _ => print_response(response),
             }
         }
     }

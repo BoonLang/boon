@@ -1229,6 +1229,18 @@ async function handleCommand(id, command) {
         // Return null to indicate response already sent
         return null;
 
+      case 'getLocalStorage':
+        return await executeInTab(tab.id, (pattern) => {
+          const entries = {};
+          for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (!pattern || key.includes(pattern)) {
+              entries[key] = localStorage.getItem(key);
+            }
+          }
+          return { type: 'localStorage', entries };
+        }, command.pattern || null);
+
       default:
         return { type: 'error', message: `Unknown command: ${type}` };
     }

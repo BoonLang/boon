@@ -1836,10 +1836,11 @@ pub fn function_list_append(
 pub fn function_list_clear(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     function_call_id: ConstructId,
-    _function_call_persistence_id: PersistenceId,
-    _construct_context: ConstructContext,
+    function_call_persistence_id: PersistenceId,
+    construct_context: ConstructContext,
     actor_context: ActorContext,
 ) -> impl Stream<Item = Value> {
+
     // arguments[0] = the list (piped)
     // arguments[1] = the trigger stream (on: xxx)
     let list_actor = arguments[0].clone();
@@ -1853,7 +1854,7 @@ pub fn function_list_clear(
 
     // Similar pattern to List/append:
     // 1. Forward all changes from the original list
-    // 2. When trigger fires, emit Clear
+    // 2. When trigger fires, emit Clear AND clear recorded calls storage
     let change_stream = {
         enum TaggedChange {
             FromList(ListChange),
@@ -1872,20 +1873,49 @@ pub fn function_list_clear(
             TaggedChange::Clear
         });
 
+        // Track items so we can clear their source storage on Clear
+        // State: (has_received_first, has_pending_clear, tracked_items)
+        type TrackedItems = Vec<Arc<ValueActor>>;
+
         // Merge both streams, use scan for proper ordering
         stream::select(list_changes, clear_changes)
             .scan(
-                (false, false), // (has_received_first_list_change, has_pending_clear)
+                (false, false, Vec::<Arc<ValueActor>>::new()),
                 |state, tagged_change| {
-                    let (has_received_first, has_pending_clear) = state;
+                    let (has_received_first, has_pending_clear, tracked_items) = state;
 
                     let changes_to_emit = match tagged_change {
                         TaggedChange::FromList(change) => {
+                            // Update tracked items based on the change
+                            match &change {
+                                ListChange::Replace { items } => {
+                                    *tracked_items = items.clone();
+                                }
+                                ListChange::Push { item } => {
+                                    tracked_items.push(item.clone());
+                                }
+                                ListChange::Pop => {
+                                    tracked_items.pop();
+                                }
+                                ListChange::Clear => {
+                                    tracked_items.clear();
+                                }
+                                ListChange::Remove { id } => {
+                                    if let Some(pos) = tracked_items.iter().position(|i| i.persistence_id() == *id) {
+                                        tracked_items.remove(pos);
+                                    }
+                                }
+                                _ => {}
+                            }
+
                             if !*has_received_first {
                                 *has_received_first = true;
                                 // First list change - emit it plus pending clear if any
                                 if *has_pending_clear {
                                     *has_pending_clear = false;
+                                    // Clear storage for tracked items
+                                    clear_source_storage_for_items(tracked_items);
+                                    tracked_items.clear();
                                     vec![change, ListChange::Clear]
                                 } else {
                                     vec![change]
@@ -1896,6 +1926,9 @@ pub fn function_list_clear(
                         }
                         TaggedChange::Clear => {
                             if *has_received_first {
+                                // Clear storage for tracked items
+                                clear_source_storage_for_items(tracked_items);
+                                tracked_items.clear();
                                 vec![ListChange::Clear]
                             } else {
                                 // Buffer the clear until first list change arrives
@@ -1911,11 +1944,13 @@ pub fn function_list_clear(
             .flat_map(|changes| stream::iter(changes))
     };
 
-    let list = List::new_with_change_stream(
+    let list = List::new_with_change_stream_and_persistence(
         ConstructInfo::new(function_call_id.with_child_id(0), None, "List/clear result"),
+        construct_context,
         actor_context,
         change_stream,
         (list_actor, trigger_actor),
+        function_call_persistence_id,
     );
 
     constant(Value::List(
@@ -1923,6 +1958,27 @@ pub fn function_list_clear(
         ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
     ))
     .right_stream()
+}
+
+/// Clear recorded calls storage for all items that have source origins.
+/// Called when List/clear triggers to ensure items don't restore on next Run.
+fn clear_source_storage_for_items(items: &[Arc<ValueActor>]) {
+    use std::collections::HashSet;
+    use zoon::{local_storage, WebStorage};
+
+    // Collect unique source storage keys
+    let mut source_keys: HashSet<String> = HashSet::new();
+    for item in items {
+        if let Some(origin) = item.list_item_origin() {
+            source_keys.insert(origin.source_storage_key.clone());
+        }
+    }
+
+    // Clear each source storage key
+    for key in source_keys {
+        zoon::println!("[DEBUG] List/clear: Clearing source storage key: {}", key);
+        local_storage().remove(&key);
+    }
 }
 
 /// List/latest() -> Value

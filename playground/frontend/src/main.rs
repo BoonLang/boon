@@ -25,6 +25,35 @@ static PANEL_SPLIT_STORAGE_KEY: &str = "boon-playground-panel-split";
 static DEBUG_COLLAPSED_STORAGE_KEY: &str = "boon-playground-debug-collapsed";
 static CUSTOM_EXAMPLES_STORAGE_KEY: &str = "boon-playground-custom-examples";
 
+/// Clear all localStorage keys that match given prefixes.
+/// Used to clean up dynamically-keyed persistence data.
+fn clear_prefixed_storage_keys(prefixes: &[&str]) {
+    let storage = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .expect("localStorage should be available");
+
+    let len = storage.length().unwrap_or(0);
+    let mut keys_to_remove = Vec::new();
+
+    for i in 0..len {
+        if let Ok(Some(key)) = storage.key(i) {
+            for prefix in prefixes {
+                if key.starts_with(prefix) {
+                    keys_to_remove.push(key.clone());
+                    break;
+                }
+            }
+        }
+    }
+
+    // Debug logging (uncomment if needed)
+    // web_sys::console::log_1(&format!("[DEBUG] clear_prefixed_storage_keys: removing {} keys", keys_to_remove.len()).into());
+
+    for key in keys_to_remove {
+        let _ = storage.remove_item(&key);
+    }
+}
+
 // Number of main examples (rest are debug examples)
 const MAIN_EXAMPLES_COUNT: usize = 11;
 
@@ -1173,6 +1202,8 @@ impl Playground {
                 local_storage().remove(STATES_STORAGE_KEY);
                 local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                 local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
+                // Clear dynamically-keyed persistence data (list calls, removed sets)
+                clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
             })
     }
 
@@ -1523,6 +1554,7 @@ impl Playground {
                     local_storage().remove(STATES_STORAGE_KEY);
                     local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                     local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
+                    clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
 
                     // Update URL to share this example
                     set_example_in_url(example_data.filename.trim_end_matches(".bn"));
@@ -1623,6 +1655,7 @@ impl Playground {
                     local_storage().remove(STATES_STORAGE_KEY);
                     local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                     local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
+                    clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
 
                     // Update URL (use custom-example parameter)
                     set_custom_example_in_url(&name);
@@ -1840,6 +1873,7 @@ impl Playground {
                                             local_storage().remove(STATES_STORAGE_KEY);
                                             local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                                             local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
+                                            clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
 
                                             // Update URL (use custom-example parameter)
                                             set_custom_example_in_url(&name);

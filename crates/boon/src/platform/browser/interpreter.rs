@@ -156,19 +156,11 @@ pub fn run(
             eprintln!("Failed to store Span-PersistenceId pairs: {error:#}");
         }
 
-        if let Some(states) =
-            local_storage().get::<BTreeMap<String, serde_json::Value>>(&states_local_storage_key)
-        {
-            let mut states = states.expect("Failed to deseralize states");
-            let persistent_ids = new_span_id_pairs
-                .values()
-                .map(|id| id.to_string())
-                .collect::<HashSet<_>>();
-            states.retain(|id, _| persistent_ids.contains(id));
-            if let Err(error) = local_storage().insert(&states_local_storage_key, &states) {
-                eprintln!("Failed to store states after removing old ones: {error:#?}");
-            }
-        }
+        // NOTE: We intentionally do NOT filter states based on span-ID pairs here.
+        // Scoped IDs (created via persistence_id.in_scope()) are derived from base IDs
+        // and won't match the span-ID pairs, but they are valid entries that should persist.
+        // Filtering was removing these valid entries.
+        // @TODO: Implement smarter cleanup that tracks parent-child ID relationships.
     }
 
     evaluation_result
@@ -302,19 +294,11 @@ pub fn run_with_registry(
             eprintln!("Failed to store Span-PersistenceId pairs: {error:#}");
         }
 
-        if let Some(states) =
-            local_storage().get::<BTreeMap<String, serde_json::Value>>(&states_local_storage_key)
-        {
-            let mut states = states.expect("Failed to deseralize states");
-            let persistent_ids = new_span_id_pairs
-                .values()
-                .map(|id| id.to_string())
-                .collect::<HashSet<_>>();
-            states.retain(|id, _| persistent_ids.contains(id));
-            if let Err(error) = local_storage().insert(&states_local_storage_key, &states) {
-                eprintln!("Failed to store states after removing old ones: {error:#?}");
-            }
-        }
+        // NOTE: We intentionally do NOT filter states based on span-ID pairs here.
+        // Scoped IDs (created via persistence_id.in_scope()) are derived from base IDs
+        // and won't match the span-ID pairs, but they are valid entries that should persist.
+        // Filtering was removing these valid entries.
+        // @TODO: Implement smarter cleanup that tracks parent-child ID relationships.
     }
 
     evaluation_result
