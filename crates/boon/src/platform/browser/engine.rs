@@ -5375,6 +5375,8 @@ impl List {
                 // Diff subscriber notification senders (bounded channels)
                 let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
                 let mut list = None;
+                // Queue for subscribers that register before list is initialized
+                let mut pending_subscribers: Vec<NamedChannel<ListChange>> = Vec::new();
                 loop {
                     select! {
                         // Handle diff history queries
@@ -5430,6 +5432,15 @@ impl List {
                             } else {
                                 if let ListChange::Replace { items } = &change {
                                     list = Some(items.clone());
+                                    // Flush pending subscribers that registered before initialization
+                                    for pending_sender in pending_subscribers.drain(..) {
+                                        let first_change_to_send = ListChange::Replace { items: items.clone() };
+                                        match pending_sender.try_send(first_change_to_send) {
+                                            Ok(()) => change_senders.push(pending_sender),
+                                            Err(e) if !e.is_disconnected() => change_senders.push(pending_sender),
+                                            Err(_) => {} // Disconnected, don't add
+                                        }
+                                    }
                                 } else {
                                     panic!("Failed to initialize {construct_info}: The first change has to be 'ListChange::Replace'")
                                 }
@@ -5456,7 +5467,8 @@ impl List {
                                         Err(_) => {} // Disconnected, don't add
                                     }
                                 } else {
-                                    change_senders.push(change_sender);
+                                    // List not initialized yet - queue subscriber to receive initial state later
+                                    pending_subscribers.push(change_sender);
                                 }
                             } else {
                                 change_senders.push(change_sender);

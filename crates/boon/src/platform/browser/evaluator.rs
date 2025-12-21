@@ -30,10 +30,153 @@ async fn yield_once() {
 }
 
 use super::super::super::parser::{
-    Persistence, PersistenceId, SourceCode, Span, span_at, static_expression, lexer, parser, resolve_references, Token, Spanned,
+    Persistence, PersistenceId, Scope, SourceCode, Span, span_at, static_expression, lexer, parser, resolve_references, Token, Spanned,
 };
 use super::api;
 use super::engine::*;
+
+/// Creates a persistence-wrapped stream for a variable.
+///
+/// The stream:
+/// 1. First tries to load stored value from storage (only for primitives)
+/// 2. If found, emits the stored value first and SKIPS first source emission
+/// 3. Then subscribes to source actor and forwards all subsequent values
+/// 4. Each forwarded primitive value is saved to storage
+///
+/// IMPORTANT: Only primitive values (Text, Number, Tag) and Lists are persisted.
+/// Complex values (Object, TaggedObject) are NOT persisted because:
+/// - They contain nested Variables that need to be created by code evaluation
+/// - Each nested Variable handles its own persistence
+/// - Restoring complex structures from JSON would lose Variable references
+fn create_variable_persistence_stream(
+    source_actor: Arc<ValueActor>,
+    storage: Arc<ConstructStorage>,
+    persistence_id: PersistenceId,
+    scope: Scope,
+    construct_context: ConstructContext,
+    actor_context: ActorContext,
+) -> impl Stream<Item = Value> {
+    let scoped_id = persistence_id.in_scope(&scope);
+
+    // Use unfold to manage state: first load stored value, then forward source
+    // Returns Option<Value> so we can skip emissions (None) when needed
+    stream::unfold(
+        PersistenceState::LoadingStored,
+        move |state| {
+            let storage = storage.clone();
+            let source_actor = source_actor.clone();
+            let construct_context = construct_context.clone();
+            let actor_context = actor_context.clone();
+
+            async move {
+                match state {
+                    PersistenceState::LoadingStored => {
+                        // Try to load stored value
+                        let loaded: Option<zoon::serde_json::Value> = storage.clone().load_state(scoped_id).await;
+
+                        let restored_value = loaded.and_then(|json| {
+                            match &json {
+                                zoon::serde_json::Value::String(_) |
+                                zoon::serde_json::Value::Number(_) |
+                                zoon::serde_json::Value::Bool(_) |
+                                zoon::serde_json::Value::Null => {
+                                    Some(Value::from_json(
+                                        &json,
+                                        ConstructId::new("variable restored from storage"),
+                                        construct_context.clone(),
+                                        ValueIdempotencyKey::new(),
+                                        actor_context.clone(),
+                                    ))
+                                }
+                                zoon::serde_json::Value::Object(obj) => {
+                                    if obj.len() == 1 && obj.contains_key("_tag") {
+                                        Some(Value::from_json(
+                                            &json,
+                                            ConstructId::new("variable restored from storage"),
+                                            construct_context.clone(),
+                                            ValueIdempotencyKey::new(),
+                                            actor_context.clone(),
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                zoon::serde_json::Value::Array(_) => {
+                                    // Don't restore Lists from variable persistence.
+                                    // Restoring creates a NEW List disconnected from the reactive chain.
+                                    // List items need to be persisted at the List actor level instead.
+                                    None
+                                }
+                            }
+                        });
+
+                        let mut source_subscription = source_actor.stream();
+
+                        if let Some(value) = restored_value {
+                            // Emit restored value, then skip first source emission
+                            Some((Some(value), PersistenceState::SkipFirstSource {
+                                source_subscription,
+                                storage,
+                            }))
+                        } else {
+                            // No stored value, wait for first source emission and forward it
+                            let first_value = source_subscription.next().await?;
+                            save_value_if_applicable(&first_value, scoped_id, &storage).await;
+                            Some((Some(first_value), PersistenceState::ForwardingSource {
+                                source_subscription,
+                                storage,
+                            }))
+                        }
+                    }
+                    PersistenceState::SkipFirstSource { mut source_subscription, storage } => {
+                        // Skip first emission from source (it's the initial empty state)
+                        // Return None to skip this iteration, but continue with ForwardingSource
+                        let _ = source_subscription.next().await?;
+                        Some((None, PersistenceState::ForwardingSource {
+                            source_subscription,
+                            storage,
+                        }))
+                    }
+                    PersistenceState::ForwardingSource { mut source_subscription, storage } => {
+                        let value = source_subscription.next().await?;
+                        save_value_if_applicable(&value, scoped_id, &storage).await;
+                        Some((Some(value), PersistenceState::ForwardingSource {
+                            source_subscription,
+                            storage,
+                        }))
+                    }
+                }
+            }
+        }
+    ).filter_map(future::ready)
+}
+
+enum PersistenceState {
+    LoadingStored,
+    SkipFirstSource {
+        source_subscription: LocalBoxStream<'static, Value>,
+        storage: Arc<ConstructStorage>,
+    },
+    ForwardingSource {
+        source_subscription: LocalBoxStream<'static, Value>,
+        storage: Arc<ConstructStorage>,
+    },
+}
+
+async fn save_value_if_applicable(value: &Value, scoped_id: PersistenceId, storage: &Arc<ConstructStorage>) {
+    match value {
+        // Don't persist Lists at variable level - they need List-actor-level persistence
+        // Restoring a List from JSON creates a disconnected List
+        Value::List(..) => {}
+        Value::Text(..) | Value::Number(..) | Value::Tag(..) => {
+            let json = value.to_json().await;
+            storage.save_state(scoped_id, &json);
+        }
+        _ => {
+            // Don't persist Objects or other complex types
+        }
+    }
+}
 
 // =============================================================================
 // WORK QUEUE TYPES (Stack-safe evaluator)
@@ -1608,6 +1751,28 @@ fn process_work_item(
                 } else {
                     // If value slot is empty, skip this variable
                     let Some(value_actor) = state.get(vd.value_slot) else { continue; };
+
+                    // Wrap with persistence: load stored value first, save each emitted value
+                    let persistence_stream = create_variable_persistence_stream(
+                        value_actor.clone(),
+                        ctx.construct_context.construct_storage.clone(),
+                        var_persistence_id,
+                        ctx.actor_context.scope.clone(),
+                        ctx.construct_context.clone(),
+                        ctx.actor_context.clone(),
+                    );
+
+                    let persisted_actor = Arc::new(ValueActor::new(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {} (persisted)", var_persistence_id),
+                            vd.persistence.clone(),
+                            format!("{}: (variable persistence wrapper)", vd.name),
+                        ).complete(ConstructType::ValueActor),
+                        ctx.actor_context.clone(),
+                        TypedStream::infinite(persistence_stream),
+                        var_persistence_id,
+                    ));
+
                     Variable::new_arc(
                         ConstructInfo::new(
                             format!("PersistenceId: {}", var_persistence_id),
@@ -1616,7 +1781,7 @@ fn process_work_item(
                         ),
                         ctx.construct_context.clone(),
                         vd.name.clone(),
-                        value_actor,
+                        persisted_actor,
                         var_persistence_id,
                         ctx.actor_context.scope.clone(),
                     )
@@ -1753,6 +1918,28 @@ fn process_work_item(
                 } else {
                     // If value slot is empty, skip this variable
                     let Some(value_actor) = state.get(vd.value_slot) else { continue; };
+
+                    // Wrap with persistence: load stored value first, save each emitted value
+                    let persistence_stream = create_variable_persistence_stream(
+                        value_actor.clone(),
+                        ctx.construct_context.construct_storage.clone(),
+                        var_persistence_id,
+                        ctx.actor_context.scope.clone(),
+                        ctx.construct_context.clone(),
+                        ctx.actor_context.clone(),
+                    );
+
+                    let persisted_actor = Arc::new(ValueActor::new(
+                        ConstructInfo::new(
+                            format!("PersistenceId: {} (persisted)", var_persistence_id),
+                            vd.persistence.clone(),
+                            format!("{}: (variable persistence wrapper)", vd.name),
+                        ).complete(ConstructType::ValueActor),
+                        ctx.actor_context.clone(),
+                        TypedStream::infinite(persistence_stream),
+                        var_persistence_id,
+                    ));
+
                     Variable::new_arc(
                         ConstructInfo::new(
                             format!("PersistenceId: {}", var_persistence_id),
@@ -1761,7 +1948,7 @@ fn process_work_item(
                         ),
                         ctx.construct_context.clone(),
                         vd.name.clone(),
-                        value_actor,
+                        persisted_actor,
                         var_persistence_id,
                         ctx.actor_context.scope.clone(),
                     )
@@ -3327,13 +3514,60 @@ fn build_hold_actor(
     let state_sender_for_update = state_sender.clone();
     let state_sender_for_reset = state_sender.clone();
 
+    // Get storage for persistence
+    let storage = ctx.construct_context.construct_storage.clone();
+    let storage_for_state_load = storage.clone();
+    let storage_for_state_save = storage.clone();
+    let storage_for_initial_save = storage.clone();
+    let construct_context_for_state_load = ctx.construct_context.clone();
+    let actor_context_for_state_load = ctx.actor_context.clone();
+
+    // Shared state for restoration tracking
+    // restored_value_holder: stores the restored value to emit to output after output is created
+    let restored_value_holder: Arc<std::sync::OnceLock<Value>> = Arc::new(std::sync::OnceLock::new());
+    let restored_value_for_state = restored_value_holder.clone();
+
     // Create a ValueActor that provides the current state to the body
     // This is what the state_param references
     //
-    // State stream: first value from initial_actor, then updates from state_receiver
-    let state_stream = initial_actor.clone().stream()
-        .take(1)  // Get the first initial value
-        .chain(state_receiver);  // Then listen for updates and resets
+    // State stream: load stored value first (if exists), else initial_actor, then state_receiver
+    let initial_actor_for_state = initial_actor.clone();
+    let state_stream = stream::unfold(
+        (true, state_receiver),  // (is_first, receiver)
+        move |(is_first, mut receiver)| {
+            let storage = storage_for_state_load.clone();
+            let initial_actor = initial_actor_for_state.clone();
+            let construct_context = construct_context_for_state_load.clone();
+            let actor_context = actor_context_for_state_load.clone();
+            let restored_value_holder = restored_value_for_state.clone();
+            async move {
+                if is_first {
+                    // Try storage first - load persisted state
+                    let loaded: Option<zoon::serde_json::Value> = storage.load_state(persistence_id).await;
+                    if let Some(json) = loaded {
+                        // Deserialize stored value
+                        let value = Value::from_json(
+                            &json,
+                            ConstructId::new("HOLD state restored from storage"),
+                            construct_context,
+                            ValueIdempotencyKey::new(),
+                            actor_context,
+                        );
+                        // Store for output emission
+                        let _ = restored_value_holder.set(value.clone());
+                        return Some((value, (false, receiver)));
+                    }
+                    // No stored state - fall back to initial_actor's first value
+                    let initial = initial_actor.stream().next().await?;
+                    Some((initial, (false, receiver)))
+                } else {
+                    // Subsequent values from state channel (updates and resets)
+                    let value = receiver.next().await?;
+                    Some((value, (false, receiver)))
+                }
+            }
+        },
+    );
 
     // Create state actor - initial value will come through the stream asynchronously
     let state_actor = ValueActor::new_arc(
@@ -3429,6 +3663,7 @@ fn build_hold_actor(
     let state_update_stream = body_subscription.then(move |new_value| {
         let mut state_sender = state_sender_for_update.clone();
         let state_actor = state_actor_for_update.clone();
+        let storage = storage_for_state_save.clone();
         async move {
             // Send to state channel with backpressure so body can see it on next event
             if let Err(e) = state_sender.send(new_value.clone()).await {
@@ -3442,6 +3677,11 @@ fn build_hold_actor(
             // NOTE: Do NOT release permit here! The hold_state_update_callback already
             // releases it after THEN's body evaluation. Releasing twice would cause
             // permit count to grow, defeating backpressure and allowing parallel processing.
+
+            // Save state to persistent storage
+            let json = new_value.to_json().await;
+            storage.save_state(persistence_id, &json);
+
             new_value
         }
     });
@@ -3462,6 +3702,9 @@ fn build_hold_actor(
         let _driver_loop_holder = &driver_loop_holder_for_stream;
         Poll::Pending::<Option<Value>>
     });
+    // Clone contexts before they're moved into output
+    let construct_context_for_initial = ctx.construct_context.clone();
+    let actor_context_for_initial = ctx.actor_context.clone();
     let output = ValueActor::new_arc_with_inputs(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
@@ -3477,6 +3720,7 @@ fn build_hold_actor(
     // NOTE: We do NOT copy body_result's history here anymore.
     // The state_update_stream (below) will emit those values when polled, and it calls
     // store_value_directly() on output. Values flow through async streams.
+    // Restoration is handled by initial_stream which checks storage and emits stored value.
 
     // Reset/passthrough behavior: ALL emissions from input pass through as HOLD output.
     // First emission: state_actor gets it via take(1), so we don't send to state_receiver.
@@ -3493,14 +3737,38 @@ fn build_hold_actor(
         let is_first_input = is_first_input.clone();
         let output_weak = output_weak_for_initial.clone();
         let mut state_sender = state_sender_for_reset.clone();
+        let storage = storage_for_initial_save.clone();
+        let construct_context = construct_context_for_initial.clone();
+        let actor_context = actor_context_for_initial.clone();
         async move {
             // swap() atomically reads AND sets to false in one operation
             let is_first = is_first_input.swap(false, std::sync::atomic::Ordering::SeqCst);
             if is_first {
-                // First value: state_actor gets it via take(1) and store to output
+                // Check if we have stored state - if so, emit stored value instead of initial
+                // We check storage directly here to avoid race condition with state_stream
+                let stored: Option<zoon::serde_json::Value> = storage.clone().load_state(persistence_id).await;
+                if let Some(json) = stored {
+                    // Restore from storage - convert JSON to Value and emit to output
+                    let restored_value = Value::from_json(
+                        &json,
+                        ConstructId::new("HOLD restored value"),
+                        construct_context,
+                        ValueIdempotencyKey::new(),
+                        actor_context,
+                    );
+                    if let Some(output) = output_weak.upgrade() {
+                        output.store_value_directly(restored_value);
+                    }
+                    // Don't save - we just loaded this value
+                    return value;
+                }
+                // No stored state, this is truly the first value
+                // Store to output and save
                 if let Some(output) = output_weak.upgrade() {
                     output.store_value_directly(value.clone());
                 }
+                let json = value.to_json().await;
+                storage.save_state(persistence_id, &json);
             } else {
                 // Subsequent values (reset): send to state_receiver with backpressure
                 if let Err(e) = state_sender.send(value.clone()).await {
@@ -3511,6 +3779,9 @@ fn build_hold_actor(
                 if let Some(output) = output_weak.upgrade() {
                     output.store_value_directly(value.clone());
                 }
+                // Save reset state to storage
+                let json = value.to_json().await;
+                storage.save_state(persistence_id, &json);
             }
             // Always pass through as HOLD output
             value
