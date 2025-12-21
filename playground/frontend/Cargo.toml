@@ -6,3 +6,4 @@ publish.workspace = true
 
 [dependencies]
 boon = { path = "../../crates/boon" }
+ulid = { version = "1.2.0", features = ["serde"] }

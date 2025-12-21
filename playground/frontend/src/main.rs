@@ -6,6 +6,7 @@ use boon::zoon::{map_ref, Rgba};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use ulid::Ulid;
 
 use boon::platform::browser::{
     bridge::object_with_document_to_element_signal, engine::VirtualFilesystem, interpreter,
@@ -66,11 +67,36 @@ fn get_example_from_url() -> Option<String> {
     params.get("example")
 }
 
-/// Update URL query parameter without page reload
+/// Update URL query parameter without page reload (URL-encodes the name)
 fn set_example_in_url(example_name: &str) {
     if let Some(window) = web_sys::window() {
         if let Ok(history) = window.history() {
-            let new_url = format!("?example={}", example_name);
+            // URL-encode the example name to handle spaces and special characters
+            let encoded_name = js_sys::encode_uri_component(example_name);
+            let new_url = format!("?example={}", encoded_name);
+            let _ = history.push_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&new_url));
+        }
+    }
+}
+
+/// Get custom example name from URL query parameter (?custom-example=name)
+fn get_custom_example_from_url() -> Option<String> {
+    let window = web_sys::window()?;
+    let location = window.location();
+    let search = location.search().ok()?;
+    if search.is_empty() {
+        return None;
+    }
+    let params = web_sys::UrlSearchParams::new_with_str(&search).ok()?;
+    params.get("custom-example")
+}
+
+/// Update URL for custom example (uses ?custom-example= to avoid collision with built-in examples)
+fn set_custom_example_in_url(example_name: &str) {
+    if let Some(window) = web_sys::window() {
+        if let Ok(history) = window.history() {
+            let encoded_name = js_sys::encode_uri_component(example_name);
+            let new_url = format!("?custom-example={}", encoded_name);
             let _ = history.push_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&new_url));
         }
     }
@@ -150,8 +176,10 @@ struct Playground {
     is_dragging_panel_split: Mutable<bool>,
     /// Whether debug examples section is collapsed
     debug_collapsed: Mutable<bool>,
-    /// Custom user examples (name -> source_code)
-    custom_examples: Mutable<Rc<BTreeMap<String, String>>>,
+    /// Custom user examples (id, name, source_code) - Vec preserves insertion order, id is stable
+    custom_examples: Mutable<Rc<Vec<(String, String, String)>>>,
+    /// Currently selected custom example (for styling - not based on content matching)
+    selected_custom_example: Mutable<Option<String>>,
     /// Currently being renamed custom example (old_name)
     editing_custom_example: Mutable<Option<String>>,
     _store_files_task: Rc<TaskHandle>,
@@ -160,12 +188,36 @@ struct Playground {
     _store_debug_collapsed_task: Rc<TaskHandle>,
     _store_custom_examples_task: Rc<TaskHandle>,
     _sync_source_to_files_task: Rc<TaskHandle>,
+    _sync_source_to_custom_example_task: Rc<TaskHandle>,
 }
 
 impl Playground {
     fn new() -> impl Element {
-        // Load files from storage, or initialize with default example
-        let (files, current_file) = if let Some(Ok(stored_files)) =
+        // Load custom examples from storage first (needed for URL parameter check)
+        let custom_examples_value: Vec<(String, String, String)> = local_storage()
+            .get::<Vec<(String, String, String)>>(CUSTOM_EXAMPLES_STORAGE_KEY)
+            .and_then(Result::ok)
+            .unwrap_or_default();
+
+        // Check for ?custom-example= URL parameter first
+        let custom_example_from_url = get_custom_example_from_url()
+            .and_then(|name| {
+                custom_examples_value.iter()
+                    .find(|(_, n, _)| n == &name)
+                    .map(|(id, name, code)| (id.clone(), name.clone(), code.clone()))
+            });
+
+        // Determine initial selected custom example ID (if loading from URL)
+        let initial_selected_custom_example = custom_example_from_url.as_ref().map(|(id, _, _)| id.clone());
+
+        // Load files from storage, or initialize with default/URL example
+        let (files, current_file, current_content) = if let Some((_, name, code)) = custom_example_from_url {
+            // Load custom example from URL
+            let filename = format!("{}.bn", name);
+            let mut files = BTreeMap::new();
+            files.insert(filename.clone(), code.clone());
+            (files, filename, code)
+        } else if let Some(Ok(stored_files)) =
             local_storage().get::<BTreeMap<String, String>>(PROJECT_FILES_STORAGE_KEY)
         {
             let current = local_storage()
@@ -178,9 +230,10 @@ impl Playground {
                         .cloned()
                         .unwrap_or_else(|| DEFAULT_FILE_NAME.to_string())
                 });
-            (stored_files, current)
+            let content = stored_files.get(&current).cloned().unwrap_or_default();
+            (stored_files, current, content)
         } else {
-            // Check URL for example parameter first
+            // Check URL for built-in example parameter
             let example_data = get_example_from_url()
                 .and_then(|name| find_example_by_name(&name))
                 .unwrap_or(EXAMPLE_DATAS[0]);
@@ -190,18 +243,13 @@ impl Playground {
                 example_data.filename.to_string(),
                 example_data.source_code.to_string(),
             );
-            (files, example_data.filename.to_string())
+            (files, example_data.filename.to_string(), example_data.source_code.to_string())
         };
-
-        // Get current file content for editor
-        let current_content = files
-            .get(&current_file)
-            .cloned()
-            .unwrap_or_default();
 
         let files = Mutable::new(Rc::new(files));
         let current_file = Mutable::new(current_file);
         let source_code = Mutable::new(Rc::new(Cow::from(current_content)));
+        let custom_examples = Mutable::new(Rc::new(custom_examples_value));
 
         let panel_split_ratio_value =
             if let Some(Ok(ratio)) = local_storage().get(PANEL_SPLIT_STORAGE_KEY) {
@@ -258,12 +306,7 @@ impl Playground {
                 }),
         ));
 
-        // Load custom examples from storage
-        let custom_examples_value = local_storage()
-            .get::<BTreeMap<String, String>>(CUSTOM_EXAMPLES_STORAGE_KEY)
-            .and_then(Result::ok)
-            .unwrap_or_default();
-        let custom_examples = Mutable::new(Rc::new(custom_examples_value));
+        // custom_examples already loaded at the start for URL parameter check
 
         let _store_custom_examples_task = Rc::new(Task::start_droppable(
             custom_examples
@@ -290,6 +333,28 @@ impl Playground {
             ))
         };
 
+        // Track currently selected custom example for syncing code changes
+        // Initialize with URL parameter value if a custom example was requested
+        let selected_custom_example: Mutable<Option<String>> = Mutable::new(initial_selected_custom_example);
+
+        // Sync source_code changes to the currently selected custom example
+        let _sync_source_to_custom_example_task = {
+            let custom_examples = custom_examples.clone();
+            let selected_custom_example = selected_custom_example.clone();
+            Rc::new(Task::start_droppable(
+                source_code.signal_cloned().for_each_sync(move |content| {
+                    // If a custom example is selected, update its code
+                    if let Some(ref id) = *selected_custom_example.lock_ref() {
+                        let mut examples = (**custom_examples.lock_ref()).clone();
+                        if let Some((_, _, code)) = examples.iter_mut().find(|(eid, _, _)| eid == id) {
+                            *code = content.to_string();
+                            custom_examples.set(Rc::new(examples));
+                        }
+                    }
+                }),
+            ))
+        };
+
         Self {
             files,
             current_file,
@@ -301,6 +366,7 @@ impl Playground {
             is_dragging_panel_split: Mutable::new(false),
             debug_collapsed,
             custom_examples,
+            selected_custom_example,
             editing_custom_example: Mutable::new(None),
             _store_files_task,
             _store_current_file_task,
@@ -308,6 +374,7 @@ impl Playground {
             _store_debug_collapsed_task,
             _store_custom_examples_task,
             _sync_source_to_files_task,
+            _sync_source_to_custom_example_task,
         }
         .root()
     }
@@ -616,15 +683,16 @@ impl Playground {
                                     .item(this.add_custom_example_button())
                             )
                         } else {
-                            // Show custom examples with add button at the end
-                            let names: Vec<String> = custom_examples.keys().cloned().collect();
+                            // Show custom examples with add button at the end (Vec preserves order)
+                            // Pass (id, name) tuples for button creation
+                            let id_names: Vec<(String, String)> = custom_examples.iter().map(|(id, name, _)| (id.clone(), name.clone())).collect();
                             Some(
                                 Row::new()
                                     .s(Width::fill())
                                     .s(Align::new().center_y())
                                     .s(Gap::new().x(10).y(6))
                                     .multiline()
-                                    .items(names.into_iter().map(|name| this.custom_example_button(name)))
+                                    .items(id_names.into_iter().map(|(id, name)| this.custom_example_button(id, name)))
                                     .item(this.add_custom_example_button())
                             )
                         }
@@ -1434,7 +1502,23 @@ impl Playground {
                 let current_file = self.current_file.clone();
                 let source_code = self.source_code.clone();
                 let run_command = self.run_command.clone();
+                let custom_examples = self.custom_examples.clone();
+                let selected_custom_example = self.selected_custom_example.clone();
                 move || {
+                    // Save current code to previously selected custom example before switching
+                    let prev_selected_id = selected_custom_example.lock_ref().clone();
+                    if let Some(prev_id) = prev_selected_id {
+                        let current_code = source_code.lock_ref().to_string();
+                        let mut examples = (**custom_examples.lock_ref()).clone();
+                        if let Some((_, _, code)) = examples.iter_mut().find(|(id, _, _)| id == &prev_id) {
+                            *code = current_code;
+                        }
+                        custom_examples.set(Rc::new(examples));
+                    }
+
+                    // Clear custom example selection
+                    selected_custom_example.set(None);
+
                     // Clear saved state to prevent "ghost" data from previous examples
                     local_storage().remove(STATES_STORAGE_KEY);
                     local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
@@ -1494,17 +1578,30 @@ impl Playground {
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press({
                 let custom_examples = self.custom_examples.clone();
+                let selected_custom_example = self.selected_custom_example.clone();
                 let files = self.files.clone();
                 let current_file = self.current_file.clone();
                 let source_code = self.source_code.clone();
                 let run_command = self.run_command.clone();
                 move || {
-                    // Generate unique name for new custom example
+                    // Save current code to previously selected custom example before creating new one
+                    let prev_selected_id = selected_custom_example.lock_ref().clone();
+                    if let Some(prev_id) = prev_selected_id {
+                        let current_code = source_code.lock_ref().to_string();
+                        let mut examples = (**custom_examples.lock_ref()).clone();
+                        if let Some((_, _, code)) = examples.iter_mut().find(|(id, _, _)| id == &prev_id) {
+                            *code = current_code;
+                        }
+                        custom_examples.set(Rc::new(examples));
+                    }
+
+                    // Generate stable ID and unique name for new custom example
+                    let id = Ulid::new().to_string();
                     let examples = custom_examples.lock_ref();
                     let mut counter = 1;
                     let name = loop {
                         let candidate = format!("custom_{}", counter);
-                        if !examples.contains_key(&candidate) {
+                        if !examples.iter().any(|(_, n, _)| n == &candidate) {
                             break candidate;
                         }
                         counter += 1;
@@ -1514,18 +1611,21 @@ impl Playground {
                     // Default code for new custom example
                     let default_code = "-- My custom example\ndocument: TEXT { Hello! } |> Document/new()";
 
-                    // Add to custom examples
+                    // Add to custom examples (push to end to preserve order)
                     let mut new_examples = (**custom_examples.lock_ref()).clone();
-                    new_examples.insert(name.clone(), default_code.to_string());
+                    new_examples.push((id.clone(), name.clone(), default_code.to_string()));
                     custom_examples.set(Rc::new(new_examples));
+
+                    // Set as selected (by ID)
+                    selected_custom_example.set(Some(id));
 
                     // Clear saved state
                     local_storage().remove(STATES_STORAGE_KEY);
                     local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                     local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
 
-                    // Update URL
-                    set_example_in_url(&name);
+                    // Update URL (use custom-example parameter)
+                    set_custom_example_in_url(&name);
 
                     // Set as current file
                     let filename = format!("{}.bn", name);
@@ -1539,15 +1639,15 @@ impl Playground {
             })
     }
 
-    fn custom_example_button(&self, name: String) -> impl Element + use<> {
+    fn custom_example_button(&self, id: String, name: String) -> impl Element + use<> {
         let hovered = Mutable::new(false);
         let delete_hovered = Mutable::new(false);
         let hovered_signal = hovered.signal().broadcast();
-        let source_signal = self.source_code.signal_cloned().broadcast();
-        let name_for_bg = name.clone();
-        let name_for_font = name.clone();
-        let name_for_editing = name.clone();
-        let name_for_editing_check = name.clone();
+        let selected_signal = self.selected_custom_example.signal_cloned().broadcast();
+        let id_for_bg = id.clone();
+        let id_for_font = id.clone();
+        let id_for_editing = id.clone();
+        let id_for_editing_check = id.clone();
         let custom_examples_signal = self.custom_examples.signal_cloned().broadcast();
         let editing_signal = self.editing_custom_example.signal_cloned().broadcast();
         let edit_text = Mutable::new(name.clone());
@@ -1557,24 +1657,28 @@ impl Playground {
             .s(Gap::new().x(0))
             .item_signal(
                 editing_signal.signal_cloned().map({
+                    let id = id.clone();
                     let name = name.clone();
                     let hovered = hovered.clone();
                     let hovered_signal = hovered_signal.clone();
-                    let source_signal = source_signal.clone();
+                    let selected_signal = selected_signal.clone();
                     let custom_examples_signal = custom_examples_signal.clone();
                     let custom_examples = self.custom_examples.clone();
+                    let selected_custom_example = self.selected_custom_example.clone();
                     let editing_custom_example = self.editing_custom_example.clone();
                     let files = self.files.clone();
                     let current_file = self.current_file.clone();
                     let source_code = self.source_code.clone();
                     let run_command = self.run_command.clone();
-                    let name_for_bg = name_for_bg.clone();
-                    let name_for_font = name_for_font.clone();
+                    let id_for_bg = id_for_bg.clone();
+                    let id_for_font = id_for_font.clone();
                     let edit_text = edit_text.clone();
                     move |editing| {
-                        let is_editing = editing.as_ref() == Some(&name_for_editing_check);
+                        // editing_custom_example stores the ID
+                        let is_editing = editing.as_ref() == Some(&id_for_editing_check);
                         if is_editing {
                             // Editing mode: show text input
+                            let id_for_rename = id.clone();
                             let name_for_rename = name.clone();
                             let custom_examples_for_rename = custom_examples.clone();
                             let editing_custom_example_for_rename = editing_custom_example.clone();
@@ -1599,6 +1703,7 @@ impl Playground {
                                     move |new_text| edit_text.set(new_text)
                                 })
                                 .update_raw_el({
+                                    let id = id_for_rename.clone();
                                     let name = name_for_rename.clone();
                                     let custom_examples = custom_examples_for_rename.clone();
                                     let editing_custom_example = editing_custom_example_for_rename.clone();
@@ -1608,11 +1713,14 @@ impl Playground {
                                             if event.key() == "Enter" {
                                                 let new_name = edit_text.lock_ref().trim().to_string();
                                                 if !new_name.is_empty() && new_name != name {
-                                                    // Rename the custom example
+                                                    // Rename the custom example (in place to preserve order)
+                                                    // Find by ID, update name
                                                     let mut new_examples = (**custom_examples.lock_ref()).clone();
-                                                    if let Some(code) = new_examples.remove(&name) {
-                                                        new_examples.insert(new_name.clone(), code);
+                                                    if let Some((_, n, _)) = new_examples.iter_mut().find(|(eid, _, _)| eid == &id) {
+                                                        *n = new_name.clone();
                                                         custom_examples.set(Rc::new(new_examples));
+                                                        // Update URL to reflect new name
+                                                        set_custom_example_in_url(&new_name);
                                                     }
                                                 }
                                                 editing_custom_example.set(None);
@@ -1623,6 +1731,7 @@ impl Playground {
                                     }
                                 })
                                 .on_blur({
+                                    let id = id_for_rename;
                                     let name = name_for_rename;
                                     let custom_examples = custom_examples_for_rename;
                                     let editing_custom_example = editing_custom_example_for_rename;
@@ -1630,11 +1739,14 @@ impl Playground {
                                     move || {
                                         let new_name = edit_text.lock_ref().trim().to_string();
                                         if !new_name.is_empty() && new_name != name {
-                                            // Rename the custom example
+                                            // Rename the custom example (in place to preserve order)
+                                            // Find by ID, update name
                                             let mut new_examples = (**custom_examples.lock_ref()).clone();
-                                            if let Some(code) = new_examples.remove(&name) {
-                                                new_examples.insert(new_name.clone(), code);
+                                            if let Some((_, n, _)) = new_examples.iter_mut().find(|(eid, _, _)| eid == &id) {
+                                                *n = new_name.clone();
                                                 custom_examples.set(Rc::new(new_examples));
+                                                // Update URL to reflect new name
+                                                set_custom_example_in_url(&new_name);
                                             }
                                         }
                                         editing_custom_example.set(None);
@@ -1643,8 +1755,10 @@ impl Playground {
                                 .left_either()
                         } else {
                             // Normal mode: show button
-                            let name_for_bg = name_for_bg.clone();
-                            let name_for_font = name_for_font.clone();
+                            let id_for_bg = id_for_bg.clone();
+                            let id_for_font = id_for_font.clone();
+                            let id_for_click = id.clone();
+                            let id_for_dblclick = id.clone();
                             let name_for_click = name.clone();
                             let name_for_dblclick = name.clone();
                             Button::new()
@@ -1653,11 +1767,8 @@ impl Playground {
                                 .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
                                 .s(Background::new().color_signal(map_ref! {
                                     let hovered = hovered_signal.signal(),
-                                    let source_code = source_signal.signal_cloned(),
-                                    let custom_examples = custom_examples_signal.signal_cloned() => {
-                                        let is_active = custom_examples.get(&name_for_bg)
-                                            .map(|code| source_code.as_ref() == code.as_str())
-                                            .unwrap_or(false);
+                                    let selected = selected_signal.signal_cloned() => {
+                                        let is_active = selected.as_ref() == Some(&id_for_bg);
                                         match (is_active, *hovered) {
                                             (true, _) => color!("rgba(100, 140, 100, 0.55)"),
                                             (false, true) => color!("rgba(50, 70, 50, 0.45)"),
@@ -1672,12 +1783,9 @@ impl Playground {
                                 )
                                 .s(Font::new().color_signal(map_ref! {
                                     let hovered = hovered_signal.signal(),
-                                    let source_code = source_signal.signal_cloned(),
-                                    let custom_examples = custom_examples_signal.signal_cloned() =>
+                                    let selected = selected_signal.signal_cloned() =>
                                     {
-                                        let is_active = custom_examples.get(&name_for_font)
-                                            .map(|code| source_code.as_ref() == code.as_str())
-                                            .unwrap_or(false);
+                                        let is_active = selected.as_ref() == Some(&id_for_font);
                                         if is_active {
                                             color!("#e8ffe8")
                                         } else if *hovered {
@@ -1697,15 +1805,34 @@ impl Playground {
                                     move |is_hovered| hovered.set(is_hovered)
                                 })
                                 .on_press({
+                                    let id = id_for_click;
                                     let name = name_for_click;
                                     let custom_examples = custom_examples.clone();
+                                    let selected_custom_example = selected_custom_example.clone();
                                     let files = files.clone();
                                     let current_file = current_file.clone();
                                     let source_code = source_code.clone();
                                     let run_command = run_command.clone();
                                     move || {
+                                        // If already selected, do nothing (don't reset code)
+                                        if selected_custom_example.lock_ref().as_ref() == Some(&id) {
+                                            return;
+                                        }
+
+                                        // Save current code to previously selected custom example
+                                        let prev_selected_id = selected_custom_example.lock_ref().clone();
+                                        if let Some(prev_id) = prev_selected_id {
+                                            let current_code = source_code.lock_ref().to_string();
+                                            let mut examples = (**custom_examples.lock_ref()).clone();
+                                            if let Some((_, _, code)) = examples.iter_mut().find(|(eid, _, _)| eid == &prev_id) {
+                                                *code = current_code;
+                                            }
+                                            custom_examples.set(Rc::new(examples));
+                                        }
+
+                                        // Load new example's code
                                         let examples = custom_examples.lock_ref();
-                                        if let Some(code) = examples.get(&name) {
+                                        if let Some((_, _, code)) = examples.iter().find(|(eid, _, _)| eid == &id) {
                                             let code = code.clone();
                                             drop(examples);
 
@@ -1714,8 +1841,8 @@ impl Playground {
                                             local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                                             local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
 
-                                            // Update URL
-                                            set_example_in_url(&name);
+                                            // Update URL (use custom-example parameter)
+                                            set_custom_example_in_url(&name);
 
                                             // Set as current file
                                             let filename = format!("{}.bn", name);
@@ -1725,17 +1852,22 @@ impl Playground {
                                             current_file.set(filename);
                                             source_code.set(Rc::new(Cow::from(code)));
                                             run_command.set(Some(RunCommand { filename: None }));
+
+                                            // Update selection (by ID)
+                                            selected_custom_example.set(Some(id.clone()));
                                         }
                                     }
                                 })
                                 .update_raw_el({
                                     let editing_custom_example = editing_custom_example.clone();
                                     let edit_text = edit_text.clone();
+                                    let name_for_dblclick = name_for_dblclick.clone();
+                                    let id_for_dblclick = id_for_dblclick.clone();
                                     move |raw_el| {
                                         raw_el.event_handler(move |_: events::DoubleClick| {
-                                            // Start editing on double-click
+                                            // Start editing on double-click (store ID)
                                             edit_text.set(name_for_dblclick.clone());
-                                            editing_custom_example.set(Some(name_for_dblclick.clone()));
+                                            editing_custom_example.set(Some(id_for_dblclick.clone()));
                                         })
                                     }
                                 })
@@ -1776,12 +1908,19 @@ impl Playground {
                     .label("×")
                     .on_hovered_change(move |is_hovered| delete_hovered.set(is_hovered))
                     .on_press({
-                        let name = name.clone();
+                        let id = id.clone();
                         let custom_examples = self.custom_examples.clone();
+                        let selected_custom_example = self.selected_custom_example.clone();
                         move || {
-                            // Remove custom example
+                            // Clear selection if we're deleting the selected example
+                            if selected_custom_example.lock_ref().as_ref() == Some(&id) {
+                                selected_custom_example.set(None);
+                            }
+                            // Remove custom example by ID
                             let mut new_examples = (**custom_examples.lock_ref()).clone();
-                            new_examples.remove(&name);
+                            if let Some(idx) = new_examples.iter().position(|(eid, _, _)| eid == &id) {
+                                new_examples.remove(idx);
+                            }
                             custom_examples.set(Rc::new(new_examples));
                         }
                     })
