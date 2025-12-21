@@ -498,6 +498,65 @@ where
     .boxed_local()
 }
 
+// --- Coalesce ---
+
+/// Collects all immediately-available items from a stream into batches.
+///
+/// When the source emits an item, this combinator polls repeatedly until
+/// the source would block (Poll::Pending), collecting all ready items.
+/// It then yields a Vec containing the batch.
+///
+/// # Use Cases
+/// - Batching rapid predicate updates in List/retain, List/every, List/any
+/// - Coalescing multiple simultaneous events into a single processing pass
+///
+/// # Zero Latency
+/// If only one item is ready, yields immediately with a single-element Vec.
+/// No timer or delay is involved - batching is purely opportunistic.
+///
+/// # Hardware Mapping
+/// This is equivalent to "drain FIFO until empty" - a standard hardware pattern.
+pub fn coalesce<S>(source: S) -> impl Stream<Item = Vec<S::Item>>
+where
+    S: Stream + 'static,
+    S::Item: 'static,
+{
+    use zoon::futures_util::stream::FusedStream;
+    use std::task::Poll;
+
+    let fused_source = source.boxed_local().fuse();
+
+    stream::unfold(fused_source, |mut source| async move {
+        // 1. Wait for at least one item (this is the blocking point)
+        let first = source.next().await?;
+        let mut batch = vec![first];
+
+        // 2. Non-blocking: drain all IMMEDIATELY ready items
+        loop {
+            if source.is_terminated() {
+                break;
+            }
+
+            let maybe_item = std::future::poll_fn(|cx| {
+                match Pin::new(&mut source).poll_next(cx) {
+                    Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+                    Poll::Ready(None) => Poll::Ready(None), // Stream ended
+                    Poll::Pending => Poll::Ready(None),     // Would block - stop draining
+                }
+            })
+            .await;
+
+            match maybe_item {
+                Some(item) => batch.push(item),
+                None => break,
+            }
+        }
+
+        // 3. Emit the batch
+        Some((batch, source))
+    })
+}
+
 // --- BackpressuredStream ---
 
 /// Stream combinator with demand-based backpressure.
@@ -6505,12 +6564,15 @@ impl ListBindingFunction {
                     HashMap::<parser::PersistenceId, Arc<ValueActor>>::new(),
                     HashMap::<parser::PersistenceId, bool>::new(),
                     list_stream,
-                    None::<Pin<Box<dyn Stream<Item = (parser::PersistenceId, bool)>>>>,
+                    // A3: Coalesced predicate stream yields batches instead of single items
+                    None::<Pin<Box<dyn Stream<Item = Vec<(parser::PersistenceId, bool)>>>>>,
+                    // A2: Track last emitted PersistenceIds for output deduplication
+                    Vec::<parser::PersistenceId>::new(),
                     config,
                     construct_context,
                     actor_context,
                 ),
-                move |(mut items, mut predicates, mut predicate_results, mut list_stream, mut merged_predicates, config, construct_context, actor_context)| {
+                move |(mut items, mut predicates, mut predicate_results, mut list_stream, mut merged_predicates, mut last_emitted_pids, config, construct_context, actor_context)| {
                     async move {
                         loop {
                             // If we have predicate streams, race between list changes and predicate updates
@@ -6533,9 +6595,10 @@ impl ListBindingFunction {
                                                 // Rebuild merged predicate stream
                                                 if items.is_empty() {
                                                     merged_predicates = None;
+                                                    last_emitted_pids.clear(); // A2: Clear for empty list
                                                     return Some((
                                                         Some(ListChange::Replace { items: vec![] }),
-                                                        (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
+                                                        (items, predicates, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
                                                     ));
                                                 } else {
                                                     // Build predicates keyed by PersistenceId
@@ -6557,7 +6620,8 @@ impl ListBindingFunction {
                                                         }
                                                     }
 
-                                                    // Use stream_from_now_sync for future updates, keyed by PersistenceId
+                                                    // Use stream_from_now for future updates, keyed by PersistenceId
+                                                    // B2: Add boolean deduplication to each predicate stream
                                                     let pred_streams: Vec<_> = predicates.iter()
                                                         .map(|(pid, pred)| {
                                                             let pid = pid.clone();
@@ -6566,18 +6630,35 @@ impl ListBindingFunction {
                                                                     let is_true = matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
                                                                     (pid.clone(), is_true)
                                                                 })
+                                                                // B2: Deduplicate booleans - skip emission if same as previous
+                                                                .scan(None::<bool>, |last_bool, (pid, is_true)| {
+                                                                    if Some(is_true) == *last_bool {
+                                                                        future::ready(Some(None)) // Skip duplicate
+                                                                    } else {
+                                                                        *last_bool = Some(is_true);
+                                                                        future::ready(Some(Some((pid, is_true))))
+                                                                    }
+                                                                })
+                                                                .filter_map(future::ready)
                                                         })
                                                         .collect();
-                                                    merged_predicates = Some(Box::pin(stream::select_all(pred_streams)));
+                                                    // A3: Coalesce to batch all synchronously-available predicate updates
+                                                    merged_predicates = Some(Box::pin(coalesce(stream::select_all(pred_streams))));
 
                                                     // Emit initial filtered result immediately
                                                     let filtered: Vec<_> = items.iter()
                                                         .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
                                                         .cloned()
                                                         .collect();
+
+                                                    // A2: Update last_emitted_pids for future deduplication
+                                                    last_emitted_pids = filtered.iter()
+                                                        .map(|item| item.persistence_id())
+                                                        .collect();
+
                                                     return Some((
                                                         Some(ListChange::Replace { items: filtered }),
-                                                        (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
+                                                        (items, predicates, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
                                                     ));
                                                 }
                                             }
@@ -6602,28 +6683,50 @@ impl ListBindingFunction {
                                                 };
                                                 predicate_results.insert(pid.clone(), is_true);
 
-                                                // Create stream for the new predicate only
-                                                let new_pred_stream = pred.stream_from_now()
-                                                    .map(move |v| {
-                                                        let is_true = matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
-                                                        (pid.clone(), is_true)
-                                                    });
-
-                                                // Merge new stream with existing using stream::select (O(1) operation)
-                                                if let Some(existing) = merged_predicates.take() {
-                                                    merged_predicates = Some(Box::pin(stream::select(existing, new_pred_stream)));
-                                                } else {
-                                                    merged_predicates = Some(Box::pin(new_pred_stream));
-                                                }
+                                                // Rebuild coalesced merged predicate stream from all predicates
+                                                // This is O(N) per Push but Push is rare, filter switches are common
+                                                // and the coalesced stream optimizes those
+                                                let pred_streams: Vec<_> = predicates.iter()
+                                                    .map(|(pid, pred)| {
+                                                        let pid = pid.clone();
+                                                        pred.clone().stream_from_now()
+                                                            .map(move |v| {
+                                                                let is_true = matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
+                                                                (pid.clone(), is_true)
+                                                            })
+                                                            // B2: Deduplicate booleans - skip emission if same as previous
+                                                            .scan(None::<bool>, |last_bool, (pid, is_true)| {
+                                                                if Some(is_true) == *last_bool {
+                                                                    future::ready(Some(None)) // Skip duplicate
+                                                                } else {
+                                                                    *last_bool = Some(is_true);
+                                                                    future::ready(Some(Some((pid, is_true))))
+                                                                }
+                                                            })
+                                                            .filter_map(future::ready)
+                                                    })
+                                                    .collect();
+                                                // A3: Coalesce to batch all synchronously-available predicate updates
+                                                merged_predicates = Some(Box::pin(coalesce(stream::select_all(pred_streams))));
 
                                                 // Emit updated filtered result
                                                 let filtered: Vec<_> = items.iter()
                                                     .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
                                                     .cloned()
                                                     .collect();
+
+                                                // A2: Output deduplication - skip if same as last emitted
+                                                let current_pids: Vec<_> = filtered.iter()
+                                                    .map(|item| item.persistence_id())
+                                                    .collect();
+                                                if current_pids == last_emitted_pids {
+                                                    continue; // Skip redundant emission (pushed item was filtered out)
+                                                }
+                                                last_emitted_pids = current_pids;
+
                                                 return Some((
                                                     Some(ListChange::Replace { items: filtered }),
-                                                    (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
+                                                    (items, predicates, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
                                                 ));
                                             }
                                             ListChange::Remove { id } => {
@@ -6644,9 +6747,19 @@ impl ListBindingFunction {
                                                     .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
                                                     .cloned()
                                                     .collect();
+
+                                                // A2: Output deduplication - skip if same as last emitted
+                                                let current_pids: Vec<_> = filtered.iter()
+                                                    .map(|item| item.persistence_id())
+                                                    .collect();
+                                                if current_pids == last_emitted_pids {
+                                                    continue; // Skip redundant emission (removed item was filtered out)
+                                                }
+                                                last_emitted_pids = current_pids;
+
                                                 return Some((
                                                     Some(ListChange::Replace { items: filtered }),
-                                                    (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
+                                                    (items, predicates, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
                                                 ));
                                             }
                                             ListChange::Pop => {
@@ -6667,9 +6780,19 @@ impl ListBindingFunction {
                                                         .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
                                                         .cloned()
                                                         .collect();
+
+                                                    // A2: Output deduplication - skip if same as last emitted
+                                                    let current_pids: Vec<_> = filtered.iter()
+                                                        .map(|item| item.persistence_id())
+                                                        .collect();
+                                                    if current_pids == last_emitted_pids {
+                                                        continue; // Skip redundant emission (popped item was filtered out)
+                                                    }
+                                                    last_emitted_pids = current_pids;
+
                                                     return Some((
                                                         Some(ListChange::Replace { items: filtered }),
-                                                        (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
+                                                        (items, predicates, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
                                                     ));
                                                 }
                                                 continue;
@@ -6679,9 +6802,10 @@ impl ListBindingFunction {
                                                 predicates.clear();
                                                 predicate_results.clear();
                                                 merged_predicates = None;
+                                                last_emitted_pids.clear(); // A2: Clear for empty list
                                                 return Some((
                                                     Some(ListChange::Replace { items: vec![] }),
-                                                    (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
+                                                    (items, predicates, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
                                                 ));
                                             }
                                             _ => continue,
@@ -6691,20 +6815,37 @@ impl ListBindingFunction {
                                         // List stream ended
                                         return None;
                                     }
-                                    Either::Right((Some((pid, is_true)), _)) => {
-                                        // Predicate update - use PersistenceId lookup
-                                        // Stale updates for removed items will be ignored (contains_key returns false)
-                                        if predicate_results.contains_key(&pid) {
-                                            predicate_results.insert(pid, is_true);
+                                    Either::Right((Some(batch), _)) => {
+                                        // A3: Process entire batch of predicate updates at once
+                                        // This is the key optimization - N predicate updates → 1 Replace emission
+                                        let mut any_updated = false;
+                                        for (pid, is_true) in batch {
+                                            // Stale updates for removed items will be ignored (contains_key returns false)
+                                            if predicate_results.contains_key(&pid) {
+                                                predicate_results.insert(pid, is_true);
+                                                any_updated = true;
+                                            }
+                                        }
 
-                                            // Emit updated filtered result
+                                        if any_updated {
+                                            // Emit updated filtered result ONCE after all batch updates
                                             let filtered: Vec<_> = items.iter()
                                                 .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
                                                 .cloned()
                                                 .collect();
+
+                                            // A2: Output deduplication - skip if same as last emitted (order-aware)
+                                            let current_pids: Vec<_> = filtered.iter()
+                                                .map(|item| item.persistence_id())
+                                                .collect();
+                                            if current_pids == last_emitted_pids {
+                                                continue; // Skip redundant emission
+                                            }
+                                            last_emitted_pids = current_pids;
+
                                             return Some((
                                                 Some(ListChange::Replace { items: filtered }),
-                                                (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
+                                                (items, predicates, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
                                             ));
                                         }
                                         continue;
@@ -6724,9 +6865,10 @@ impl ListBindingFunction {
                                         predicate_results.clear();
 
                                         if items.is_empty() {
+                                            last_emitted_pids.clear(); // A2: Clear for empty list
                                             return Some((
                                                 Some(ListChange::Replace { items: vec![] }),
-                                                (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
+                                                (items, predicates, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
                                             ));
                                         } else {
                                             // Build predicates keyed by PersistenceId
@@ -6748,7 +6890,8 @@ impl ListBindingFunction {
                                                 }
                                             }
 
-                                            // Use stream_from_now_sync for future updates, keyed by PersistenceId
+                                            // Use stream_from_now for future updates, keyed by PersistenceId
+                                            // B2: Add boolean deduplication to each predicate stream
                                             let pred_streams: Vec<_> = predicates.iter()
                                                 .map(|(pid, pred)| {
                                                     let pid = pid.clone();
@@ -6757,18 +6900,35 @@ impl ListBindingFunction {
                                                             let is_true = matches!(&v, Value::Tag(tag, _) if tag.tag() == "True");
                                                             (pid.clone(), is_true)
                                                         })
+                                                        // B2: Deduplicate booleans - skip emission if same as previous
+                                                        .scan(None::<bool>, |last_bool, (pid, is_true)| {
+                                                            if Some(is_true) == *last_bool {
+                                                                future::ready(Some(None)) // Skip duplicate
+                                                            } else {
+                                                                *last_bool = Some(is_true);
+                                                                future::ready(Some(Some((pid, is_true))))
+                                                            }
+                                                        })
+                                                        .filter_map(future::ready)
                                                 })
                                                 .collect();
-                                            merged_predicates = Some(Box::pin(stream::select_all(pred_streams)));
+                                            // A3: Coalesce to batch all synchronously-available predicate updates
+                                            merged_predicates = Some(Box::pin(coalesce(stream::select_all(pred_streams))));
 
                                             // Emit initial filtered result immediately
                                             let filtered: Vec<_> = items.iter()
                                                 .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
                                                 .cloned()
                                                 .collect();
+
+                                            // A2: Update last_emitted_pids for future deduplication
+                                            last_emitted_pids = filtered.iter()
+                                                .map(|item| item.persistence_id())
+                                                .collect();
+
                                             return Some((
                                                 Some(ListChange::Replace { items: filtered }),
-                                                (items, predicates, predicate_results, list_stream, merged_predicates, config, construct_context, actor_context)
+                                                (items, predicates, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
                                             ));
                                         }
                                     }
@@ -7158,20 +7318,38 @@ impl ListBindingFunction {
                 let construct_info_id_map = construct_info_id.clone();
                 let construct_context_map = construct_context.clone();
 
+                // B2: Add boolean deduplication to each predicate stream
                 let predicate_streams: Vec<_> = item_predicates.iter().enumerate().map(|(idx, (_, pred))| {
-                    pred.clone().stream().map(move |value| (idx, value))
-                }).collect();
-
-                stream::select_all(predicate_streams)
-                    .scan(
-                        vec![None::<bool>; item_predicates.len()],
-                        move |states, (idx, value)| {
+                    pred.clone().stream()
+                        .map(move |value| {
                             let is_true = match &value {
                                 Value::Tag(tag, _) => tag.tag() == "True",
                                 _ => false,
                             };
-                            if idx < states.len() {
-                                states[idx] = Some(is_true);
+                            (idx, is_true)
+                        })
+                        // B2: Deduplicate booleans - skip emission if same as previous
+                        .scan(None::<bool>, |last_bool, (idx, is_true)| {
+                            if Some(is_true) == *last_bool {
+                                future::ready(Some(None)) // Skip duplicate
+                            } else {
+                                *last_bool = Some(is_true);
+                                future::ready(Some(Some((idx, is_true))))
+                            }
+                        })
+                        .filter_map(future::ready)
+                }).collect();
+
+                // A3: Coalesce to batch all synchronously-available predicate updates
+                coalesce(stream::select_all(predicate_streams))
+                    .scan(
+                        vec![None::<bool>; item_predicates.len()],
+                        move |states, batch| {
+                            // A3: Process entire batch of predicate updates at once
+                            for (idx, is_true) in batch {
+                                if idx < states.len() {
+                                    states[idx] = Some(is_true);
+                                }
                             }
 
                             let all_evaluated = states.iter().all(|r| r.is_some());
@@ -7358,19 +7536,23 @@ impl ListBindingFunction {
                 }
 
                 // Subscribe to all keys and emit sorted list when any changes
+                // A3: Use coalesce to batch simultaneous key updates
                 let key_streams: Vec<_> = item_keys.iter().enumerate().map(|(idx, (item, key_actor))| {
                     let item = item.clone();
                     key_actor.clone().stream().map(move |value| (idx, item.clone(), value))
                 }).collect();
 
-                stream::select_all(key_streams)
+                coalesce(stream::select_all(key_streams))
                     .scan(
                         item_keys.iter().map(|(item, _)| (item.clone(), None::<SortKey>)).collect::<Vec<_>>(),
-                        move |states, (idx, item, value)| {
-                            // Extract sortable key from value
-                            let sort_key = SortKey::from_value(&value);
-                            if idx < states.len() {
-                                states[idx] = (item, Some(sort_key));
+                        move |states, batch| {
+                            // A3: Process entire batch of key updates at once
+                            for (idx, item, value) in batch {
+                                // Extract sortable key from value
+                                let sort_key = SortKey::from_value(&value);
+                                if idx < states.len() {
+                                    states[idx] = (item, Some(sort_key));
+                                }
                             }
 
                             // If all items have key results, emit sorted list
