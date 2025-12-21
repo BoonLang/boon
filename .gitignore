@@ -2,7 +2,7 @@
 .idea
 **/.DS_Store
 
-# Chrome profile for browser automation testing
+# Chromium profile for browser automation testing (persists developer mode)
 tools/.chrome-profile/
 
 # DigitalJS development environment (cloned external repos)

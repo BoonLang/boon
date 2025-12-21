@@ -348,7 +348,7 @@ fn element_container(
             }))
     );
 
-    // Transform: move_right and move_down
+    // Transform: move_right, move_down, and rotate
     let transform_signal = signal::from_stream(
         sv6.stream()
             .flat_map(|value| value.expect_object().expect_variable("style").stream())
@@ -374,10 +374,25 @@ fn element_container(
                 } else {
                     0.0
                 };
-                if move_right != 0.0 || move_down != 0.0 {
-                    Some(format!("translate({}px, {}px)", move_right, move_down))
+                let rotate = if let Some(v) = obj.variable("rotate") {
+                    match v.value_actor().current_value().await {
+                        Ok(Value::Number(n, _)) => n.number(),
+                        _ => 0.0,
+                    }
                 } else {
+                    0.0
+                };
+                let mut transforms = Vec::new();
+                if move_right != 0.0 || move_down != 0.0 {
+                    transforms.push(format!("translate({}px, {}px)", move_right, move_down));
+                }
+                if rotate != 0.0 {
+                    transforms.push(format!("rotate({}deg)", rotate));
+                }
+                if transforms.is_empty() {
                     None
+                } else {
+                    Some(transforms.join(" "))
                 }
             })
             .boxed_local()
@@ -994,6 +1009,37 @@ fn element_stripe(
             .boxed_local()
     );
 
+    // Justify content signal for column alignment (controls main axis - vertical for Column direction)
+    let sv_justify = tagged_object.expect_variable("settings");
+    let justify_content_signal = signal::from_stream(
+        sv_justify
+            .stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("align")).flat_map(|var| var.stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("column")).flat_map(|var| var.stream())
+            })
+            .filter_map(|value| {
+                let result = match value {
+                    Value::Tag(tag, _) => {
+                        match tag.tag() {
+                            "Center" => Some("center"),
+                            "Start" => Some("flex-start"),
+                            "End" => Some("flex-end"),
+                            _ => None,
+                        }.map(|s| s.to_string())
+                    }
+                    _ => None,
+                };
+                future::ready(result)
+            })
+            .boxed_local()
+    );
+
     let items_vec_diff_stream = settings_variable
         .stream()
         .flat_map(|value| {
@@ -1037,6 +1083,7 @@ fn element_stripe(
                 .style_signal("text-align", font_align_signal)
                 .style_signal("border-top", border_top_signal)
                 .style_signal("align-items", align_items_signal)
+                .style_signal("justify-content", justify_content_signal)
         })
         // Keep tagged_object alive for the lifetime of this element
         .after_remove(move |_| {
@@ -1446,7 +1493,7 @@ fn element_button(
             .boxed_local()
     );
 
-    // Transform signal (move_left, move_down -> translate)
+    // Transform signal (move_left, move_down, rotate -> translate, rotate)
     let sv_transform = settings_variable.clone();
     let transform_signal = signal::from_stream(
         sv_transform
@@ -1478,14 +1525,26 @@ fn element_button(
                             n.number()
                         } else { 0.0 }
                     } else { 0.0 };
+                    let rotate = if let Some(v) = obj.variable("rotate") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number()
+                        } else { 0.0 }
+                    } else { 0.0 };
                     // Calculate final x (negative for move_left, positive for move_right)
                     let x = move_right - move_left;
                     // Calculate final y (positive for move_down, negative for move_up)
                     let y = move_down - move_up;
+                    let mut transforms = Vec::new();
                     if x != 0.0 || y != 0.0 {
-                        Some(format!("translate({}px, {}px)", x, y))
-                    } else {
+                        transforms.push(format!("translate({}px, {}px)", x, y));
+                    }
+                    if rotate != 0.0 {
+                        transforms.push(format!("rotate({}deg)", rotate));
+                    }
+                    if transforms.is_empty() {
                         None
+                    } else {
+                        Some(transforms.join(" "))
                     }
                 } else {
                     None

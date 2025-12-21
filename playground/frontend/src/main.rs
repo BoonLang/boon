@@ -21,6 +21,11 @@ static OLD_SOURCE_CODE_STORAGE_KEY: &str = "boon-playground-old-source-code";
 static OLD_SPAN_ID_PAIRS_STORAGE_KEY: &str = "boon-playground-span-id-pairs";
 static STATES_STORAGE_KEY: &str = "boon-playground-states";
 static PANEL_SPLIT_STORAGE_KEY: &str = "boon-playground-panel-split";
+static DEBUG_COLLAPSED_STORAGE_KEY: &str = "boon-playground-debug-collapsed";
+static CUSTOM_EXAMPLES_STORAGE_KEY: &str = "boon-playground-custom-examples";
+
+// Number of main examples (rest are debug examples)
+const MAIN_EXAMPLES_COUNT: usize = 11;
 
 const DEFAULT_PANEL_SPLIT_RATIO: f64 = 0.5;
 const MIN_PANEL_RATIO: f64 = 0.1;
@@ -46,6 +51,36 @@ fn primary_text_color() -> Rgba {
 
 fn muted_text_color() -> Rgba {
     color!("rgba(226, 232, 255, 0.7)")
+}
+
+/// Get example name from URL query parameter (?example=name)
+fn get_example_from_url() -> Option<String> {
+    let window = web_sys::window()?;
+    let location = window.location();
+    let search = location.search().ok()?;
+    if search.is_empty() {
+        return None;
+    }
+    // Parse query string (e.g., "?example=todo_mvc")
+    let params = web_sys::UrlSearchParams::new_with_str(&search).ok()?;
+    params.get("example")
+}
+
+/// Update URL query parameter without page reload
+fn set_example_in_url(example_name: &str) {
+    if let Some(window) = web_sys::window() {
+        if let Ok(history) = window.history() {
+            let new_url = format!("?example={}", example_name);
+            let _ = history.push_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&new_url));
+        }
+    }
+}
+
+/// Find example data by name (filename without .bn extension)
+fn find_example_by_name(name: &str) -> Option<ExampleData> {
+    EXAMPLE_DATAS.iter().find(|e| {
+        e.filename.trim_end_matches(".bn") == name || e.filename == name
+    }).copied()
 }
 
 #[derive(Clone, Copy)]
@@ -113,9 +148,17 @@ struct Playground {
     panel_split_ratio: Mutable<f64>,
     panel_container_width: Mutable<u32>,
     is_dragging_panel_split: Mutable<bool>,
+    /// Whether debug examples section is collapsed
+    debug_collapsed: Mutable<bool>,
+    /// Custom user examples (name -> source_code)
+    custom_examples: Mutable<Rc<BTreeMap<String, String>>>,
+    /// Currently being renamed custom example (old_name)
+    editing_custom_example: Mutable<Option<String>>,
     _store_files_task: Rc<TaskHandle>,
     _store_current_file_task: Rc<TaskHandle>,
     _store_panel_split_task: Rc<TaskHandle>,
+    _store_debug_collapsed_task: Rc<TaskHandle>,
+    _store_custom_examples_task: Rc<TaskHandle>,
     _sync_source_to_files_task: Rc<TaskHandle>,
 }
 
@@ -137,13 +180,17 @@ impl Playground {
                 });
             (stored_files, current)
         } else {
-            // Use default example
+            // Check URL for example parameter first
+            let example_data = get_example_from_url()
+                .and_then(|name| find_example_by_name(&name))
+                .unwrap_or(EXAMPLE_DATAS[0]);
+
             let mut files = BTreeMap::new();
             files.insert(
-                EXAMPLE_DATAS[0].filename.to_string(),
-                EXAMPLE_DATAS[0].source_code.to_string(),
+                example_data.filename.to_string(),
+                example_data.source_code.to_string(),
             );
-            (files, EXAMPLE_DATAS[0].filename.to_string())
+            (files, example_data.filename.to_string())
         };
 
         // Get current file content for editor
@@ -194,6 +241,40 @@ impl Playground {
                 }),
         ));
 
+        // Load debug collapsed state from storage (default: collapsed)
+        let debug_collapsed_value = local_storage()
+            .get::<bool>(DEBUG_COLLAPSED_STORAGE_KEY)
+            .and_then(Result::ok)
+            .unwrap_or(true);
+        let debug_collapsed = Mutable::new(debug_collapsed_value);
+
+        let _store_debug_collapsed_task = Rc::new(Task::start_droppable(
+            debug_collapsed
+                .signal()
+                .for_each_sync(|collapsed| {
+                    if let Err(error) = local_storage().insert(DEBUG_COLLAPSED_STORAGE_KEY, &collapsed) {
+                        eprintln!("Failed to store debug collapsed state: {error:#?}");
+                    }
+                }),
+        ));
+
+        // Load custom examples from storage
+        let custom_examples_value = local_storage()
+            .get::<BTreeMap<String, String>>(CUSTOM_EXAMPLES_STORAGE_KEY)
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        let custom_examples = Mutable::new(Rc::new(custom_examples_value));
+
+        let _store_custom_examples_task = Rc::new(Task::start_droppable(
+            custom_examples
+                .signal_cloned()
+                .for_each_sync(|examples| {
+                    if let Err(error) = local_storage().insert(CUSTOM_EXAMPLES_STORAGE_KEY, examples.as_ref()) {
+                        eprintln!("Failed to store custom examples: {error:#?}");
+                    }
+                }),
+        ));
+
         // Sync source_code changes back to files map
         let _sync_source_to_files_task = {
             let files = files.clone();
@@ -218,9 +299,14 @@ impl Playground {
             panel_split_ratio,
             panel_container_width: Mutable::new(0),
             is_dragging_panel_split: Mutable::new(false),
+            debug_collapsed,
+            custom_examples,
+            editing_custom_example: Mutable::new(None),
             _store_files_task,
             _store_current_file_task,
             _store_panel_split_task,
+            _store_debug_collapsed_task,
+            _store_custom_examples_task,
             _sync_source_to_files_task,
         }
         .root()
@@ -499,12 +585,111 @@ impl Playground {
     }
 
     fn example_tabs(&self) -> impl Element + use<> {
-        Row::new()
+        let main_examples = &EXAMPLE_DATAS[..MAIN_EXAMPLES_COUNT];
+        let debug_examples = &EXAMPLE_DATAS[MAIN_EXAMPLES_COUNT..];
+
+        Column::new()
             .s(Width::fill())
-            .s(Align::new().center_y())
-            .s(Gap::new().x(10).y(6))
-            .multiline()
-            .items(EXAMPLE_DATAS.map(|example_data| self.example_button(example_data)))
+            .s(Gap::new().y(8))
+            .item(
+                // Main examples row
+                Row::new()
+                    .s(Width::fill())
+                    .s(Align::new().center_y())
+                    .s(Gap::new().x(10).y(6))
+                    .multiline()
+                    .items(main_examples.iter().map(|&example_data| self.example_button(example_data)))
+            )
+            .item_signal(
+                // Custom examples row (only shown if there are custom examples or always show add button)
+                self.custom_examples.signal_cloned().map({
+                    let this = self.clone();
+                    move |custom_examples| {
+                        if custom_examples.is_empty() {
+                            // Just show the add button when no custom examples
+                            Some(
+                                Row::new()
+                                    .s(Width::fill())
+                                    .s(Align::new().center_y())
+                                    .s(Gap::new().x(10).y(6))
+                                    .multiline()
+                                    .item(this.add_custom_example_button())
+                            )
+                        } else {
+                            // Show custom examples with add button at the end
+                            let names: Vec<String> = custom_examples.keys().cloned().collect();
+                            Some(
+                                Row::new()
+                                    .s(Width::fill())
+                                    .s(Align::new().center_y())
+                                    .s(Gap::new().x(10).y(6))
+                                    .multiline()
+                                    .items(names.into_iter().map(|name| this.custom_example_button(name)))
+                                    .item(this.add_custom_example_button())
+                            )
+                        }
+                    }
+                })
+            )
+            .item(
+                // Debug section with toggle header
+                Column::new()
+                    .s(Width::fill())
+                    .s(Gap::new().y(6))
+                    .item(self.debug_section_header())
+                    .item_signal(
+                        self.debug_collapsed.signal().map({
+                            let this = self.clone();
+                            let debug_examples = debug_examples.to_vec();
+                            move |collapsed| {
+                                if collapsed {
+                                    None
+                                } else {
+                                    Some(
+                                        Row::new()
+                                            .s(Width::fill())
+                                            .s(Align::new().center_y())
+                                            .s(Gap::new().x(10).y(6))
+                                            .multiline()
+                                            .items(debug_examples.iter().map(|&example_data| this.example_button(example_data)))
+                                    )
+                                }
+                            }
+                        })
+                    )
+            )
+    }
+
+    fn debug_section_header(&self) -> impl Element + use<> {
+        let hovered = Mutable::new(false);
+        Button::new()
+            .s(Padding::new().x(10).y(5))
+            .s(RoundedCorners::all(12))
+            .s(Font::new().size(12).weight(FontWeight::Medium))
+            .s(Background::new().color_signal(
+                hovered.signal().map(|h| {
+                    if h {
+                        color!("rgba(60, 70, 100, 0.4)")
+                    } else {
+                        color!("rgba(40, 50, 80, 0.3)")
+                    }
+                })
+            ))
+            .s(Font::new().color(muted_text_color()))
+            .label_signal(self.debug_collapsed.signal().map(|collapsed| {
+                if collapsed {
+                    "▶  Debug examples"
+                } else {
+                    "▼  Debug examples"
+                }
+            }))
+            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+            .on_press({
+                let debug_collapsed = self.debug_collapsed.clone();
+                move || {
+                    debug_collapsed.set(!debug_collapsed.get());
+                }
+            })
     }
 
     fn controls_row(&self) -> impl Element + use<> {
@@ -978,135 +1163,7 @@ impl Playground {
             .s(Align::new().top())
             .s(Width::fill())
             .s(Height::fill())
-            .s(Gap::new().y(8))
-            .item(self.file_tabs_row())
             .item(self.standard_code_editor_surface())
-    }
-
-    fn file_tabs_row(&self) -> impl Element + use<> {
-        Row::new()
-            .s(Width::fill())
-            .s(Align::new().center_y())
-            .s(Gap::new().x(6))
-            .s(Padding::new().x(4).y(4))
-            .s(Background::new().color(color!("rgba(8, 12, 22, 0.5)")))
-            .s(RoundedCorners::all(16))
-            .multiline()
-            .items_signal_vec(
-                self.files
-                    .signal_cloned()
-                    .map({
-                        let this = self.clone();
-                        move |files| {
-                            files
-                                .keys()
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .into_iter()
-                                .map({
-                                    let this = this.clone();
-                                    move |filename| this.file_tab(filename)
-                                })
-                                .collect::<Vec<_>>()
-                        }
-                    })
-                    .to_signal_vec(),
-            )
-            .item(self.add_file_button())
-    }
-
-    fn file_tab(&self, filename: String) -> impl Element + use<> {
-        let hovered = Mutable::new(false);
-        let filename_for_check = filename.clone();
-        let filename_for_click = filename.clone();
-        let is_active_signal = self
-            .current_file
-            .signal_cloned()
-            .map(move |current| current == filename_for_check)
-            .broadcast();
-
-        Button::new()
-            .s(Padding::new().x(12).y(6))
-            .s(RoundedCorners::all(12))
-            .s(Font::new().size(13).weight(FontWeight::Medium).no_wrap())
-            .s(Background::new().color_signal(map_ref! {
-                let hovered = hovered.signal(),
-                let is_active = is_active_signal.signal() =>
-                match (*is_active, *hovered) {
-                    (true, _) => color!("rgba(60, 94, 148, 0.65)"),
-                    (false, true) => color!("rgba(36, 48, 72, 0.5)"),
-                    (false, false) => color!("rgba(20, 28, 44, 0.4)"),
-                }
-            }))
-            .s(Font::new().color_signal(map_ref! {
-                let hovered = hovered.signal(),
-                let is_active = is_active_signal.signal() =>
-                if *is_active {
-                    color!("#f6f8ff")
-                } else if *hovered {
-                    color!("rgba(214, 223, 255, 0.9)")
-                } else {
-                    muted_text_color()
-                }
-            }))
-            .label(El::new().child(filename.clone()))
-            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
-            .on_press({
-                let files = self.files.clone();
-                let current_file = self.current_file.clone();
-                let source_code = self.source_code.clone();
-                move || {
-                    // Switch to this file
-                    let files_ref = files.lock_ref();
-                    if let Some(content) = files_ref.get(&filename_for_click) {
-                        source_code.set(Rc::new(Cow::from(content.clone())));
-                        current_file.set(filename_for_click.clone());
-                    }
-                }
-            })
-    }
-
-    fn add_file_button(&self) -> impl Element + use<> {
-        let hovered = Mutable::new(false);
-        Button::new()
-            .s(Padding::new().x(10).y(6))
-            .s(RoundedCorners::all(12))
-            .s(Font::new().size(13).weight(FontWeight::Medium))
-            .s(Background::new().color_signal(
-                hovered
-                    .signal()
-                    .map_bool(|| color!("rgba(60, 140, 90, 0.5)"), || color!("rgba(40, 90, 60, 0.35)")),
-            ))
-            .s(Font::new().color_signal(
-                hovered
-                    .signal()
-                    .map_bool(|| color!("rgba(180, 255, 200, 0.95)"), || color!("rgba(160, 230, 180, 0.8)")),
-            ))
-            .label(El::new().child("+"))
-            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
-            .on_press({
-                let files = self.files.clone();
-                let current_file = self.current_file.clone();
-                let source_code = self.source_code.clone();
-                move || {
-                    // Find a unique filename
-                    let files_ref = files.lock_ref();
-                    let mut new_name = "new.bn".to_string();
-                    let mut counter = 1;
-                    while files_ref.contains_key(&new_name) {
-                        new_name = format!("new_{counter}.bn");
-                        counter += 1;
-                    }
-                    drop(files_ref);
-
-                    // Create new file
-                    let mut new_files = (**files.lock_ref()).clone();
-                    new_files.insert(new_name.clone(), String::new());
-                    files.set(Rc::new(new_files));
-                    current_file.set(new_name);
-                    source_code.set(Rc::new(Cow::from(String::new())));
-                }
-            })
     }
 
     fn snippet_screenshot_surface(&self) -> impl Element + use<> {
@@ -1311,6 +1368,8 @@ impl Playground {
         drop(source_code);
         if let Some((object, construct_context, _registry, _module_loader, reference_connector, link_connector, pass_through_connector)) = evaluation_result {
             El::new()
+                .s(Width::fill())
+                .s(Height::fill())
                 .child_signal(object_with_document_to_element_signal(
                     object.clone(),
                     construct_context,
@@ -1367,7 +1426,7 @@ impl Playground {
             .label(
                 El::new()
                     .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
-                    .child(example_data.filename),
+                    .child(example_data.filename.trim_end_matches(".bn")),
             )
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press({
@@ -1376,6 +1435,14 @@ impl Playground {
                 let source_code = self.source_code.clone();
                 let run_command = self.run_command.clone();
                 move || {
+                    // Clear saved state to prevent "ghost" data from previous examples
+                    local_storage().remove(STATES_STORAGE_KEY);
+                    local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
+                    local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
+
+                    // Update URL to share this example
+                    set_example_in_url(example_data.filename.trim_end_matches(".bn"));
+
                     // Replace project files with just this example
                     let mut new_files = BTreeMap::new();
                     new_files.insert(
@@ -1390,6 +1457,335 @@ impl Playground {
                     }));
                 }
             })
+    }
+
+    fn add_custom_example_button(&self) -> impl Element + use<> {
+        let hovered = Mutable::new(false);
+        Button::new()
+            .s(Padding::new().x(12).y(7))
+            .s(RoundedCorners::all(24))
+            .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
+            .s(Background::new().color_signal(
+                hovered.signal().map(|h| {
+                    if h {
+                        color!("rgba(60, 140, 100, 0.45)")
+                    } else {
+                        color!("rgba(40, 100, 70, 0.35)")
+                    }
+                })
+            ))
+            .s(Borders::all(
+                Border::new().color(color!("rgba(80, 180, 120, 0.5)")).width(1),
+            ))
+            .s(Font::new().color_signal(
+                hovered.signal().map(|h| {
+                    if h {
+                        color!("rgba(180, 255, 200, 0.95)")
+                    } else {
+                        color!("rgba(150, 220, 170, 0.85)")
+                    }
+                })
+            ))
+            .label(
+                El::new()
+                    .s(Font::new().size(14).weight(FontWeight::SemiBold).no_wrap())
+                    .child("+"),
+            )
+            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+            .on_press({
+                let custom_examples = self.custom_examples.clone();
+                let files = self.files.clone();
+                let current_file = self.current_file.clone();
+                let source_code = self.source_code.clone();
+                let run_command = self.run_command.clone();
+                move || {
+                    // Generate unique name for new custom example
+                    let examples = custom_examples.lock_ref();
+                    let mut counter = 1;
+                    let name = loop {
+                        let candidate = format!("custom_{}", counter);
+                        if !examples.contains_key(&candidate) {
+                            break candidate;
+                        }
+                        counter += 1;
+                    };
+                    drop(examples);
+
+                    // Default code for new custom example
+                    let default_code = "-- My custom example\ndocument: TEXT { Hello! } |> Document/new()";
+
+                    // Add to custom examples
+                    let mut new_examples = (**custom_examples.lock_ref()).clone();
+                    new_examples.insert(name.clone(), default_code.to_string());
+                    custom_examples.set(Rc::new(new_examples));
+
+                    // Clear saved state
+                    local_storage().remove(STATES_STORAGE_KEY);
+                    local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
+                    local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
+
+                    // Update URL
+                    set_example_in_url(&name);
+
+                    // Set as current file
+                    let filename = format!("{}.bn", name);
+                    let mut new_files = BTreeMap::new();
+                    new_files.insert(filename.clone(), default_code.to_string());
+                    files.set(Rc::new(new_files));
+                    current_file.set(filename);
+                    source_code.set_neq(Rc::new(Cow::from(default_code)));
+                    run_command.set(Some(RunCommand { filename: None }));
+                }
+            })
+    }
+
+    fn custom_example_button(&self, name: String) -> impl Element + use<> {
+        let hovered = Mutable::new(false);
+        let delete_hovered = Mutable::new(false);
+        let hovered_signal = hovered.signal().broadcast();
+        let source_signal = self.source_code.signal_cloned().broadcast();
+        let name_for_bg = name.clone();
+        let name_for_font = name.clone();
+        let name_for_editing = name.clone();
+        let name_for_editing_check = name.clone();
+        let custom_examples_signal = self.custom_examples.signal_cloned().broadcast();
+        let editing_signal = self.editing_custom_example.signal_cloned().broadcast();
+        let edit_text = Mutable::new(name.clone());
+
+        Row::new()
+            .s(Align::new().center_y())
+            .s(Gap::new().x(0))
+            .item_signal(
+                editing_signal.signal_cloned().map({
+                    let name = name.clone();
+                    let hovered = hovered.clone();
+                    let hovered_signal = hovered_signal.clone();
+                    let source_signal = source_signal.clone();
+                    let custom_examples_signal = custom_examples_signal.clone();
+                    let custom_examples = self.custom_examples.clone();
+                    let editing_custom_example = self.editing_custom_example.clone();
+                    let files = self.files.clone();
+                    let current_file = self.current_file.clone();
+                    let source_code = self.source_code.clone();
+                    let run_command = self.run_command.clone();
+                    let name_for_bg = name_for_bg.clone();
+                    let name_for_font = name_for_font.clone();
+                    let edit_text = edit_text.clone();
+                    move |editing| {
+                        let is_editing = editing.as_ref() == Some(&name_for_editing_check);
+                        if is_editing {
+                            // Editing mode: show text input
+                            let name_for_rename = name.clone();
+                            let custom_examples_for_rename = custom_examples.clone();
+                            let editing_custom_example_for_rename = editing_custom_example.clone();
+                            let edit_text_for_input = edit_text.clone();
+
+                            TextInput::new()
+                                .s(Padding::new().left(14).right(6).y(4))
+                                .s(RoundedCorners::new().left(24))
+                                .s(Font::new().size(14).weight(FontWeight::Medium).color(color!("#e8ffe8")))
+                                .s(Background::new().color(color!("rgba(100, 140, 100, 0.55)")))
+                                .s(Borders::new()
+                                    .left(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
+                                    .top(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
+                                    .bottom(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
+                                )
+                                .s(Width::exact(100))
+                                .focus(true)
+                                .label_hidden("Rename example")
+                                .text_signal(edit_text_for_input.signal_cloned())
+                                .on_change({
+                                    let edit_text = edit_text.clone();
+                                    move |new_text| edit_text.set(new_text)
+                                })
+                                .update_raw_el({
+                                    let name = name_for_rename.clone();
+                                    let custom_examples = custom_examples_for_rename.clone();
+                                    let editing_custom_example = editing_custom_example_for_rename.clone();
+                                    let edit_text = edit_text.clone();
+                                    move |raw_el| {
+                                        raw_el.event_handler(move |event: events::KeyDown| {
+                                            if event.key() == "Enter" {
+                                                let new_name = edit_text.lock_ref().trim().to_string();
+                                                if !new_name.is_empty() && new_name != name {
+                                                    // Rename the custom example
+                                                    let mut new_examples = (**custom_examples.lock_ref()).clone();
+                                                    if let Some(code) = new_examples.remove(&name) {
+                                                        new_examples.insert(new_name.clone(), code);
+                                                        custom_examples.set(Rc::new(new_examples));
+                                                    }
+                                                }
+                                                editing_custom_example.set(None);
+                                            } else if event.key() == "Escape" {
+                                                editing_custom_example.set(None);
+                                            }
+                                        })
+                                    }
+                                })
+                                .on_blur({
+                                    let name = name_for_rename;
+                                    let custom_examples = custom_examples_for_rename;
+                                    let editing_custom_example = editing_custom_example_for_rename;
+                                    let edit_text = edit_text.clone();
+                                    move || {
+                                        let new_name = edit_text.lock_ref().trim().to_string();
+                                        if !new_name.is_empty() && new_name != name {
+                                            // Rename the custom example
+                                            let mut new_examples = (**custom_examples.lock_ref()).clone();
+                                            if let Some(code) = new_examples.remove(&name) {
+                                                new_examples.insert(new_name.clone(), code);
+                                                custom_examples.set(Rc::new(new_examples));
+                                            }
+                                        }
+                                        editing_custom_example.set(None);
+                                    }
+                                })
+                                .left_either()
+                        } else {
+                            // Normal mode: show button
+                            let name_for_bg = name_for_bg.clone();
+                            let name_for_font = name_for_font.clone();
+                            let name_for_click = name.clone();
+                            let name_for_dblclick = name.clone();
+                            Button::new()
+                                .s(Padding::new().left(14).right(6).y(7))
+                                .s(RoundedCorners::new().left(24))
+                                .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
+                                .s(Background::new().color_signal(map_ref! {
+                                    let hovered = hovered_signal.signal(),
+                                    let source_code = source_signal.signal_cloned(),
+                                    let custom_examples = custom_examples_signal.signal_cloned() => {
+                                        let is_active = custom_examples.get(&name_for_bg)
+                                            .map(|code| source_code.as_ref() == code.as_str())
+                                            .unwrap_or(false);
+                                        match (is_active, *hovered) {
+                                            (true, _) => color!("rgba(100, 140, 100, 0.55)"),
+                                            (false, true) => color!("rgba(50, 70, 50, 0.45)"),
+                                            (false, false) => color!("rgba(35, 50, 35, 0.35)"),
+                                        }
+                                    }
+                                }))
+                                .s(Borders::new()
+                                    .left(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
+                                    .top(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
+                                    .bottom(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
+                                )
+                                .s(Font::new().color_signal(map_ref! {
+                                    let hovered = hovered_signal.signal(),
+                                    let source_code = source_signal.signal_cloned(),
+                                    let custom_examples = custom_examples_signal.signal_cloned() =>
+                                    {
+                                        let is_active = custom_examples.get(&name_for_font)
+                                            .map(|code| source_code.as_ref() == code.as_str())
+                                            .unwrap_or(false);
+                                        if is_active {
+                                            color!("#e8ffe8")
+                                        } else if *hovered {
+                                            color!("rgba(200, 240, 200, 0.86)")
+                                        } else {
+                                            color!("rgba(150, 200, 150, 0.7)")
+                                        }
+                                    }
+                                }))
+                                .label(
+                                    El::new()
+                                        .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
+                                        .child(name.clone()),
+                                )
+                                .on_hovered_change({
+                                    let hovered = hovered.clone();
+                                    move |is_hovered| hovered.set(is_hovered)
+                                })
+                                .on_press({
+                                    let name = name_for_click;
+                                    let custom_examples = custom_examples.clone();
+                                    let files = files.clone();
+                                    let current_file = current_file.clone();
+                                    let source_code = source_code.clone();
+                                    let run_command = run_command.clone();
+                                    move || {
+                                        let examples = custom_examples.lock_ref();
+                                        if let Some(code) = examples.get(&name) {
+                                            let code = code.clone();
+                                            drop(examples);
+
+                                            // Clear saved state
+                                            local_storage().remove(STATES_STORAGE_KEY);
+                                            local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
+                                            local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
+
+                                            // Update URL
+                                            set_example_in_url(&name);
+
+                                            // Set as current file
+                                            let filename = format!("{}.bn", name);
+                                            let mut new_files = BTreeMap::new();
+                                            new_files.insert(filename.clone(), code.clone());
+                                            files.set(Rc::new(new_files));
+                                            current_file.set(filename);
+                                            source_code.set(Rc::new(Cow::from(code)));
+                                            run_command.set(Some(RunCommand { filename: None }));
+                                        }
+                                    }
+                                })
+                                .update_raw_el({
+                                    let editing_custom_example = editing_custom_example.clone();
+                                    let edit_text = edit_text.clone();
+                                    move |raw_el| {
+                                        raw_el.event_handler(move |_: events::DoubleClick| {
+                                            // Start editing on double-click
+                                            edit_text.set(name_for_dblclick.clone());
+                                            editing_custom_example.set(Some(name_for_dblclick.clone()));
+                                        })
+                                    }
+                                })
+                                .right_either()
+                        }
+                    }
+                })
+            )
+            .item(
+                // Delete button (×)
+                Button::new()
+                    .s(Padding::new().left(4).right(10).y(7))
+                    .s(RoundedCorners::new().right(24))
+                    .s(Font::new().size(12).weight(FontWeight::Bold))
+                    .s(Background::new().color_signal(
+                        delete_hovered.signal().map(|h| {
+                            if h {
+                                color!("rgba(180, 80, 80, 0.55)")
+                            } else {
+                                color!("rgba(35, 50, 35, 0.35)")
+                            }
+                        })
+                    ))
+                    .s(Borders::new()
+                        .right(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
+                        .top(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
+                        .bottom(Border::new().color(color!("rgba(100, 160, 100, 0.4)")).width(1))
+                    )
+                    .s(Font::new().color_signal(
+                        delete_hovered.signal().map(|h| {
+                            if h {
+                                color!("rgba(255, 200, 200, 0.95)")
+                            } else {
+                                color!("rgba(150, 200, 150, 0.6)")
+                            }
+                        })
+                    ))
+                    .label("×")
+                    .on_hovered_change(move |is_hovered| delete_hovered.set(is_hovered))
+                    .on_press({
+                        let name = name.clone();
+                        let custom_examples = self.custom_examples.clone();
+                        move || {
+                            // Remove custom example
+                            let mut new_examples = (**custom_examples.lock_ref()).clone();
+                            new_examples.remove(&name);
+                            custom_examples.set(Rc::new(new_examples));
+                        }
+                    })
+            )
     }
 
 }

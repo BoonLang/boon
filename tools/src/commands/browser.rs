@@ -78,12 +78,15 @@ fn find_chromium_binary() -> Result<PathBuf> {
 }
 
 /// Create a user data directory for browser profile
-/// Uses a consistent directory so developer mode settings persist across launches
-fn create_temp_profile() -> Result<PathBuf> {
-    let temp_dir = std::env::temp_dir().join("boon-chromium");
-    std::fs::create_dir_all(&temp_dir)?;
-    log::info!("Using profile at: {}", temp_dir.display());
-    Ok(temp_dir)
+/// Uses tools/.chrome-profile/ for persistence (gitignored)
+fn create_persistent_profile() -> Result<PathBuf> {
+    // Binary is at target/release/boon-tools, repo root is 3 levels up
+    let exe = std::env::current_exe()?;
+    let repo_root = exe.parent().unwrap().parent().unwrap().parent().unwrap();
+    let profile_dir = repo_root.join("tools").join(".chrome-profile");
+    std::fs::create_dir_all(&profile_dir)?;
+    log::info!("Using profile at: {}", profile_dir.display());
+    Ok(profile_dir)
 }
 
 /// Options for launching the browser
@@ -110,7 +113,7 @@ impl Default for LaunchOptions {
 /// Launch Chromium with the Boon extension pre-loaded
 pub fn launch_browser(opts: LaunchOptions) -> Result<Child> {
     let extension_path = find_extension_path()?;
-    let user_data_dir = create_temp_profile()?;
+    let user_data_dir = create_persistent_profile()?;
     let browser = opts
         .browser_path
         .map(Ok)
