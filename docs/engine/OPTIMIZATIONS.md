@@ -112,22 +112,54 @@ On Replace:
 
 **Note:** Cached actors still forward updates from their source - no staleness issue.
 
-### Phase 3: Fine-Grained Updates (Future)
+### Phase 3: Fine-Grained Updates
 
 #### C1: Smart List/retain Diffing
 
-**Status:** Not yet implemented
+**Location:** `engine.rs` (in List/retain batch handler)
 
 Instead of emitting Replace for every predicate change, emit InsertAt/Remove based on which items' visibility changed:
 
 - Predicate True → False: emit `Remove { id }`
-- Predicate False → True: emit `InsertAt { index, item }`
+- Predicate False → True: emit `InsertAt { index, item }` (computes correct filtered index)
+
+**Implementation:**
+```rust
+// Track visibility changes in batch
+let mut visibility_changes: Vec<(PersistenceId, bool, bool)> = Vec::new();
+
+for (pid, is_true) in batch {
+    if let Some(&old_visible) = predicate_results.get(&pid) {
+        if old_visible != is_true {
+            visibility_changes.push((pid, old_visible, is_true));
+        }
+    }
+}
+
+// Smart diffing for single item changes
+if visibility_changes.len() == 1 {
+    let (pid, was_visible, is_visible) = &visibility_changes[0];
+
+    if *was_visible && !*is_visible {
+        // Item became hidden - emit Remove
+        emit(ListChange::Remove { id: pid.clone() });
+    } else if !*was_visible && *is_visible {
+        // Item became visible - compute index and emit InsertAt
+        let insert_idx = compute_filtered_index(...);
+        emit(ListChange::InsertAt { index: insert_idx, item });
+    }
+}
+```
+
+**When smart diffing is used:**
+- Single predicate visibility change → InsertAt or Remove
+- Multiple changes → Falls back to Replace (still benefits from coalescing)
 
 **Effect:** Single predicate change → O(1) work
 
 ## Combined Effect
 
-With all Phase 1 and Phase 2 optimizations:
+With all Phase 1, Phase 2, and Phase 3 optimizations:
 
 **Before:**
 ```
@@ -138,7 +170,7 @@ Filter switch with 10 todos, 3 completed (All → Active):
 - O(N^2) work
 ```
 
-**After:**
+**After (filter switch - multiple items change):**
 ```
 Filter switch with 10 todos, 3 completed (All → Active):
 - B2: 7 predicates don't emit (True → True)
@@ -149,6 +181,15 @@ Filter switch with 10 todos, 3 completed (All → Active):
 - O(N) work
 ```
 
+**After (single item change - smart diffing):**
+```
+Toggle single todo completed in Active view:
+- 1 predicate changes (Active item → Completed)
+- C1: Emits Remove instead of Replace
+- List/map: O(1) - just removes the item
+- O(1) work!
+```
+
 ## Files Modified
 
 | File | Changes |
@@ -156,7 +197,8 @@ Filter switch with 10 todos, 3 completed (All → Active):
 | `engine.rs` | Added `coalesce()` combinator, B2 dedup in List/retain, List/every, List/any |
 | `engine.rs` | Added A2 output dedup in List/retain |
 | `engine.rs` | Added A3 coalesce to List/retain, List/sort_by, List/every, List/any |
-| `engine.rs` | Added B1 transform cache to List/map |
+| `engine.rs` | Added B1 transform cache to List/map (with item_order for Pop cleanup) |
+| `engine.rs` | Added C1 smart diffing in List/retain (InsertAt/Remove for single changes) |
 
 ## Hardware Mapping
 
@@ -176,3 +218,4 @@ These optimizations align with hardware design principles:
 - **Virtual List / Windowing:** For very large lists, only render visible items
 - **Lazy Transform Evaluation:** Don't transform until item is actually rendered
 - **MobX-style Computed Values:** Track dependencies for automatic cache invalidation
+- **Batch InsertAt/Remove:** Extend C1 to emit multiple InsertAt/Remove for 2+ changes (currently falls back to Replace)

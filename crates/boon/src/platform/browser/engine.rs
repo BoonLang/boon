@@ -6825,38 +6825,79 @@ impl ListBindingFunction {
                                     }
                                     Either::Right((Some(batch), _)) => {
                                         // A3: Process entire batch of predicate updates at once
-                                        // This is the key optimization - N predicate updates → 1 Replace emission
-                                        let mut any_updated = false;
+                                        // C1: Track visibility changes for smart diffing
+                                        let mut visibility_changes: Vec<(parser::PersistenceId, bool, bool)> = Vec::new(); // (pid, old_visible, new_visible)
+
                                         for (pid, is_true) in batch {
                                             // Stale updates for removed items will be ignored (contains_key returns false)
-                                            if predicate_results.contains_key(&pid) {
+                                            if let Some(&old_visible) = predicate_results.get(&pid) {
+                                                if old_visible != is_true {
+                                                    visibility_changes.push((pid.clone(), old_visible, is_true));
+                                                }
                                                 predicate_results.insert(pid, is_true);
-                                                any_updated = true;
                                             }
                                         }
 
-                                        if any_updated {
-                                            // Emit updated filtered result ONCE after all batch updates
-                                            let filtered: Vec<_> = items.iter()
-                                                .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
-                                                .cloned()
-                                                .collect();
-
-                                            // A2: Output deduplication - skip if same as last emitted (order-aware)
-                                            let current_pids: Vec<_> = filtered.iter()
-                                                .map(|item| item.persistence_id())
-                                                .collect();
-                                            if current_pids == last_emitted_pids {
-                                                continue; // Skip redundant emission
-                                            }
-                                            last_emitted_pids = current_pids;
-
-                                            return Some((
-                                                Some(ListChange::Replace { items: filtered }),
-                                                (items, predicates, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
-                                            ));
+                                        if visibility_changes.is_empty() {
+                                            continue; // No visibility changes
                                         }
-                                        continue;
+
+                                        // C1: Smart diffing - emit InsertAt/Remove for small changes, Replace for large changes
+                                        // Threshold: if more than 25% of items changed, use Replace (simpler for downstream)
+                                        let use_smart_diffing = visibility_changes.len() <= items.len() / 4 + 1;
+
+                                        if use_smart_diffing && visibility_changes.len() == 1 {
+                                            // Single item changed - emit InsertAt or Remove
+                                            let (pid, was_visible, is_visible) = &visibility_changes[0];
+
+                                            if *was_visible && !*is_visible {
+                                                // Item became hidden - emit Remove
+                                                last_emitted_pids.retain(|p| p != pid);
+                                                return Some((
+                                                    Some(ListChange::Remove { id: pid.clone() }),
+                                                    (items, predicates, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
+                                                ));
+                                            } else if !*was_visible && *is_visible {
+                                                // Item became visible - emit InsertAt
+                                                // Find the item and compute its filtered index
+                                                if let Some((source_idx, item)) = items.iter().enumerate()
+                                                    .find(|(_, item)| item.persistence_id() == *pid)
+                                                {
+                                                    // Compute filtered index: count visible items before this one
+                                                    let filtered_idx = items.iter().take(source_idx)
+                                                        .filter(|i| predicate_results.get(&i.persistence_id()) == Some(&true))
+                                                        .count();
+
+                                                    // Update last_emitted_pids
+                                                    last_emitted_pids.insert(filtered_idx, pid.clone());
+
+                                                    return Some((
+                                                        Some(ListChange::InsertAt { index: filtered_idx, item: item.clone() }),
+                                                        (items, predicates, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
+                                                    ));
+                                                }
+                                            }
+                                        }
+
+                                        // Fallback: emit Replace for multiple changes or complex cases
+                                        let filtered: Vec<_> = items.iter()
+                                            .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
+                                            .cloned()
+                                            .collect();
+
+                                        // A2: Output deduplication - skip if same as last emitted (order-aware)
+                                        let current_pids: Vec<_> = filtered.iter()
+                                            .map(|item| item.persistence_id())
+                                            .collect();
+                                        if current_pids == last_emitted_pids {
+                                            continue; // Skip redundant emission
+                                        }
+                                        last_emitted_pids = current_pids;
+
+                                        return Some((
+                                            Some(ListChange::Replace { items: filtered }),
+                                            (items, predicates, predicate_results, list_stream, merged_predicates, last_emitted_pids, config, construct_context, actor_context)
+                                        ));
                                     }
                                     Either::Right((None, _)) => {
                                         // Predicate stream ended (shouldn't happen normally)
