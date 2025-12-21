@@ -1019,7 +1019,7 @@ Similar to WHEN, but semantically used for reactive conditional branching.
 ✅ **Correct - Conditional rendering:**
 ```boon
 PASSED.store.todos
-    |> List/not_empty()
+    |> List/is_not_empty()
     |> WHILE {
         True => Element/stripe(
             element: []

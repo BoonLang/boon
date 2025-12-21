@@ -17,7 +17,7 @@ RUN.bn demonstrates strong emergent physical design with a well-structured archi
 4. **Filter Routes DRY** - Single source of truth with `filter_routes` record
 5. **BUILD.bn Updated** - Flat structure using BuildFS for browser compatibility
 6. **Spring Range API** - `spring_range: [extend: X, compress: Y]` for elastic pointer response
-7. **Conditional Rendering** - Standardized True = show, False = hide pattern with `List/not_empty()`
+7. **Conditional Rendering** - Standardized True = show, False = hide pattern with `List/is_not_empty()`
 8. **Sizing & Spacing Tokens** - `Theme/sizing()` and `Theme/spacing()` for interactive elements and gaps
 
 **Remaining Opportunities**:
@@ -238,10 +238,10 @@ PASSED.store.todos
 
 **Problem**: Inverted logic reduces readability - True leads to hiding, False leads to showing.
 
-**Implemented Solution** (use List/not_empty):
+**Implemented Solution** (use List/is_not_empty):
 ```boon
 PASSED.store.todos
-    |> List/not_empty()
+    |> List/is_not_empty()
     |> WHILE {
         True => Element/stripe(...)  // If not empty, show list
         False => NoElement           // If empty, show nothing
@@ -927,7 +927,7 @@ Element/paragraph(
 
 ### ✅ Phase 3: Completed
 6. ✅ **Spring range naming** - Renamed `pointer_response` → `spring_range`, `lift/press` → `extend/compress`
-7. ✅ **Conditional rendering** - Standardized on `List/not_empty()` with True = show, False = hide pattern
+7. ✅ **Conditional rendering** - Standardized on `List/is_not_empty()` with True = show, False = hide pattern
 
 **Status**: Completed
 
@@ -955,7 +955,7 @@ RUN.bn demonstrates **excellent architectural patterns** with emergent physical 
 - ✅ Router/Filter DRY with `filter_routes` single source of truth
 - ✅ BUILD.bn updated to flat structure with BuildFS
 - ✅ Spring range API with `extend/compress` parameters
-- ✅ Conditional rendering standardized with `List/not_empty()` pattern
+- ✅ Conditional rendering standardized with `List/is_not_empty()` pattern
 - ✅ Sizing & spacing tokens for interactive elements and gaps
 
 **Remaining Opportunities**:

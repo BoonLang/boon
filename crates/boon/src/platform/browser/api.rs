@@ -1400,6 +1400,7 @@ pub fn function_text_trim(
 }
 
 /// Text/is_empty(text) -> Tag (True/False)
+/// Deduplicated: only emits when the result actually changes
 pub fn function_text_is_empty(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     function_call_id: ConstructId,
@@ -1410,22 +1411,31 @@ pub fn function_text_is_empty(
     let [argument_text] = arguments.as_slice() else {
         panic!("Text/is_empty expects 1 argument")
     };
-    argument_text.clone().stream().map(move |value| {
+    argument_text.clone().stream().scan(None::<bool>, move |last_result, value| {
         let text = match &value {
             Value::Text(t, _) => t.text(),
             _ => panic!("Text/is_empty expects a Text value"),
         };
-        let tag = if text.is_empty() { "True" } else { "False" };
-        Tag::new_value(
-            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/is_empty result"),
-            construct_context.clone(),
-            ValueIdempotencyKey::new(),
-            tag.to_string(),
-        )
-    })
+        let current_result = text.is_empty();
+
+        // Only emit when result actually changes
+        if *last_result != Some(current_result) {
+            *last_result = Some(current_result);
+            let tag = if current_result { "True" } else { "False" };
+            future::ready(Some(Some(Tag::new_value(
+                ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/is_empty result"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                tag.to_string(),
+            ))))
+        } else {
+            future::ready(Some(None))
+        }
+    }).filter_map(future::ready)
 }
 
 /// Text/is_not_empty(text) -> Tag (True/False)
+/// Deduplicated: only emits when the result actually changes
 pub fn function_text_is_not_empty(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     function_call_id: ConstructId,
@@ -1436,19 +1446,27 @@ pub fn function_text_is_not_empty(
     let [argument_text] = arguments.as_slice() else {
         panic!("Text/is_not_empty expects 1 argument")
     };
-    argument_text.clone().stream().map(move |value| {
+    argument_text.clone().stream().scan(None::<bool>, move |last_result, value| {
         let text = match &value {
             Value::Text(t, _) => t.text(),
             _ => panic!("Text/is_not_empty expects a Text value"),
         };
-        let tag = if !text.is_empty() { "True" } else { "False" };
-        Tag::new_value(
-            ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/is_not_empty result"),
-            construct_context.clone(),
-            ValueIdempotencyKey::new(),
-            tag.to_string(),
-        )
-    })
+        let current_result = !text.is_empty();
+
+        // Only emit when result actually changes
+        if *last_result != Some(current_result) {
+            *last_result = Some(current_result);
+            let tag = if current_result { "True" } else { "False" };
+            future::ready(Some(Some(Tag::new_value(
+                ConstructInfo::new(function_call_id.with_child_id(0), None, "Text/is_not_empty result"),
+                construct_context.clone(),
+                ValueIdempotencyKey::new(),
+                tag.to_string(),
+            ))))
+        } else {
+            future::ready(Some(None))
+        }
+    }).filter_map(future::ready)
 }
 
 // --- Bool functions ---
@@ -1579,6 +1597,7 @@ pub fn function_bool_or(
 
 /// List/is_empty() -> Tag (True/False)
 /// Checks if the piped list is empty
+/// Deduplicated: only emits when the result actually changes
 pub fn function_list_is_empty(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     function_call_id: ConstructId,
@@ -1596,22 +1615,30 @@ pub fn function_list_is_empty(
     }).flat_map(move |list| {
         let construct_context = construct_context.clone();
         let function_call_id = function_call_id.clone();
-        list.stream().scan(Vec::<Arc<ValueActor>>::new(), move |items, change| {
+        list.stream().scan((Vec::<Arc<ValueActor>>::new(), None::<bool>), move |(items, last_result), change| {
             change.apply_to_vec(items);
-            let is_empty = items.is_empty();
-            let tag = if is_empty { "True" } else { "False" };
-            future::ready(Some(Tag::new_value(
-                ConstructInfo::new(function_call_id.with_child_id(0), None, "List/is_empty result"),
-                construct_context.clone(),
-                ValueIdempotencyKey::new(),
-                tag.to_string(),
-            )))
-        })
+            let current_result = items.is_empty();
+
+            // Only emit when result actually changes
+            if *last_result != Some(current_result) {
+                *last_result = Some(current_result);
+                let tag = if current_result { "True" } else { "False" };
+                future::ready(Some(Some(Tag::new_value(
+                    ConstructInfo::new(function_call_id.with_child_id(0), None, "List/is_empty result"),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    tag.to_string(),
+                ))))
+            } else {
+                future::ready(Some(None))
+            }
+        }).filter_map(future::ready)
     })
 }
 
 /// List/count -> Number
 /// Returns the count of items in the list
+/// Deduplicated: only emits when the count actually changes
 pub fn function_list_count(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     function_call_id: ConstructId,
@@ -1629,22 +1656,30 @@ pub fn function_list_count(
     }).flat_map(move |list| {
         let construct_context = construct_context.clone();
         let function_call_id = function_call_id.clone();
-        list.stream().scan(Vec::<Arc<ValueActor>>::new(), move |items, change| {
+        list.stream().scan((Vec::<Arc<ValueActor>>::new(), None::<usize>), move |(items, last_count), change| {
             change.apply_to_vec(items);
-            let count = items.len() as f64;
-            future::ready(Some(Number::new_value(
-                ConstructInfo::new(function_call_id.with_child_id(0), None, "List/count result"),
-                construct_context.clone(),
-                ValueIdempotencyKey::new(),
-                count,
-            )))
-        })
+            let current_count = items.len();
+
+            // Only emit when count actually changes
+            if *last_count != Some(current_count) {
+                *last_count = Some(current_count);
+                future::ready(Some(Some(Number::new_value(
+                    ConstructInfo::new(function_call_id.with_child_id(0), None, "List/count result"),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    current_count as f64,
+                ))))
+            } else {
+                future::ready(Some(None))
+            }
+        }).filter_map(future::ready)
     })
 }
 
-/// List/not_empty() -> Tag (True/False)
+/// List/is_not_empty() -> Tag (True/False)
 /// Checks if the piped list is not empty (inverse of List/is_empty)
-pub fn function_list_not_empty(
+/// Deduplicated: only emits when the result actually changes
+pub fn function_list_is_not_empty(
     arguments: Arc<Vec<Arc<ValueActor>>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
@@ -1661,17 +1696,24 @@ pub fn function_list_not_empty(
     }).flat_map(move |list| {
         let construct_context = construct_context.clone();
         let function_call_id = function_call_id.clone();
-        list.stream().scan(Vec::<Arc<ValueActor>>::new(), move |items, change| {
+        list.stream().scan((Vec::<Arc<ValueActor>>::new(), None::<bool>), move |(items, last_result), change| {
             change.apply_to_vec(items);
-            let is_not_empty = !items.is_empty();
-            let tag = if is_not_empty { "True" } else { "False" };
-            future::ready(Some(Tag::new_value(
-                ConstructInfo::new(function_call_id.with_child_id(0), None, "List/not_empty result"),
-                construct_context.clone(),
-                ValueIdempotencyKey::new(),
-                tag.to_string(),
-            )))
-        })
+            let current_result = !items.is_empty();
+
+            // Only emit when result actually changes
+            if *last_result != Some(current_result) {
+                *last_result = Some(current_result);
+                let tag = if current_result { "True" } else { "False" };
+                future::ready(Some(Some(Tag::new_value(
+                    ConstructInfo::new(function_call_id.with_child_id(0), None, "List/is_not_empty result"),
+                    construct_context.clone(),
+                    ValueIdempotencyKey::new(),
+                    tag.to_string(),
+                ))))
+            } else {
+                future::ready(Some(None))
+            }
+        }).filter_map(future::ready)
     })
 }
 

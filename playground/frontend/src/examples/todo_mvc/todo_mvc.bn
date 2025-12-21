@@ -19,7 +19,9 @@ store: [
     title_to_add: elements.new_todo_title_text_input.event.key_down.key |> WHEN {
         Enter => BLOCK {
             trimmed: elements.new_todo_title_text_input.text |> Text/trim()
-            trimmed |> Text/is_not_empty() |> WHEN { True => trimmed, False => SKIP }
+            trimmed
+                |> Text/is_not_empty()
+                |> WHEN { True => trimmed, False => SKIP }
         }
         __ => SKIP
     }
@@ -33,11 +35,10 @@ store: [
         |> List/remove(item, on: elements.remove_completed_button.event.press |> THEN {
             item.completed |> WHEN { True => [], False => SKIP }
         })
-    active_todos: todos |> List/retain(item, if: item.completed |> Bool/not())
-    all_completed: active_todos |> List/is_empty()
-    completed_todos: todos |> List/retain(item, if: item.completed)
-    -- Simplified for debugging
-    selected_todo_id: None
+    todos_count: todos |> List/count()
+    completed_todos_count: todos |> List/retain(item, if: item.completed) |> List/count()
+    active_todos_count: todos_count - completed_todos_count
+    all_completed: todos_count == completed_todos_count
 ]
 
 -- Create a new todo with reactive completed state
@@ -343,7 +344,7 @@ FUNCTION toggle_all_checkbox() {
                     padding: [row: 27, column: 6]
                     font: [
                         size: 22
-                        color: Oklch[lightness: all_completed |> WHILE {
+                        color: Oklch[lightness: all_completed |> WHEN {
                             True => 0.40
                             False => 0.75
                         }]
@@ -435,9 +436,9 @@ FUNCTION panel_footer() {
         items: LIST {
             active_items_count_text()
             filters_element()
-            PASSED.store.completed_todos |> List/is_empty() |> WHILE {
-                True => NoElement
-                False => remove_completed_button() |> LINK { PASSED.store.elements.remove_completed_button }
+            PASSED.store.completed_todos_count > 0 |> WHILE {
+                True => remove_completed_button() |> LINK { PASSED.store.elements.remove_completed_button }
+                False => NoElement
             }
         }
     )
@@ -445,8 +446,7 @@ FUNCTION panel_footer() {
 
 -- Count only active (non-completed) items
 FUNCTION active_items_count_text() {
-    PASSED.store.active_todos
-        |> List/count()
+    PASSED.store.active_todos_count
         |> WHEN { count => BLOCK {
             maybe_s: count == 1 |> Bool/not() |> WHEN { True => TEXT { s }, False => Text/empty() }
             TEXT { {count} item{maybe_s} left }

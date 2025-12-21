@@ -5138,8 +5138,8 @@ fn static_function_call_path_to_definition(
             api::function_list_is_empty(arguments, id, persistence_id, construct_context, actor_context)
                 .boxed_local()
         },
-        ["List", "not_empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
-            api::function_list_not_empty(arguments, id, persistence_id, construct_context, actor_context)
+        ["List", "is_not_empty"] => |arguments, id, persistence_id, construct_context, actor_context| {
+            api::function_list_is_not_empty(arguments, id, persistence_id, construct_context, actor_context)
                 .boxed_local()
         },
         ["Router", "route"] => |arguments, id, persistence_id, construct_context, actor_context| {

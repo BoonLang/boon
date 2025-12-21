@@ -7205,10 +7205,24 @@ impl ListBindingFunction {
             })
         });
 
+        // Deduplicate: only emit when the boolean result actually changes
+        let deduplicated_stream = value_stream.scan(None::<bool>, |last_result, value| {
+            let current_result = match &value {
+                Value::Tag(tag, _) => tag.tag() == "True",
+                _ => false,
+            };
+            if *last_result != Some(current_result) {
+                *last_result = Some(current_result);
+                future::ready(Some(Some(value)))
+            } else {
+                future::ready(Some(None))
+            }
+        }).filter_map(future::ready);
+
         Arc::new(ValueActor::new(
             construct_info,
             actor_context_for_result,
-            TypedStream::infinite(value_stream),
+            TypedStream::infinite(deduplicated_stream),
             parser::PersistenceId::new(),
         ))
     }

@@ -335,7 +335,7 @@ FUNCTION main_panel() {
             new_todo_title_text_input()
                 |> LINK { PASSED.store.elements.new_todo_title_text_input }
             PASSED.store.todos
-                |> List/not_empty()
+                |> List/is_not_empty()
                 |> WHILE {
                     True => Element/stripe(
                         element: []

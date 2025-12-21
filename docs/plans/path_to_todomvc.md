@@ -87,7 +87,7 @@ All expression types evaluate correctly:
 
 **List functions:**
 - ✅ `List/append`, `List/retain`, `List/map`, `List/latest`
-- ✅ `List/every`, `List/any`, `List/count`, `List/empty`, `List/not_empty`, `List/sort_by`
+- ✅ `List/every`, `List/any`, `List/count`, `List/is_empty`, `List/is_not_empty`, `List/sort_by`
 
 **Bool functions:**
 - ✅ `Bool/not`, `Bool/toggle`, `Bool/or`
