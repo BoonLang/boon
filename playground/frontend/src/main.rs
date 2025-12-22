@@ -797,6 +797,11 @@ impl Playground {
             .multiline()
             .item(El::new().s(Align::new().left()).child(self.snippet_screenshot_mode_button()))
             .item(El::new().s(Align::new().center_x()).child(self.run_button()))
+            .item(
+                El::new()
+                    .s(Font::new().size(12).color(color!("rgba(255, 255, 255, 0.5)")))
+                    .child("F12 → dev tools for logs & errors")
+            )
             .item(El::new().s(Align::new().right()).child(self.clear_saved_states_button()))
     }
 
