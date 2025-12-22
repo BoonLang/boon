@@ -7673,7 +7673,13 @@ impl ListBindingFunction {
                                                 continue;
                                             }
                                         } else {
-                                            zoon::println!("[DEBUG] List/remove Replace: item has NO origin");
+                                            // Check for persistence_id-based removal (LIST literal items)
+                                            let id_str = format!("pid:{}", persistence_id);
+                                            zoon::println!("[DEBUG] List/remove Replace: item has NO origin, checking pid={}", id_str);
+                                            if persisted_removed.contains(&id_str) {
+                                                zoon::println!("[DEBUG] List/remove Replace: FILTERING out pid={}", id_str);
+                                                continue;
+                                            }
                                         }
 
                                         let idx = *next_idx;
@@ -7726,7 +7732,13 @@ impl ListBindingFunction {
                                             return future::ready(Some(None));
                                         }
                                     } else {
-                                        zoon::println!("[DEBUG] List/remove Push: item has NO origin");
+                                        // Check for persistence_id-based removal (LIST literal items)
+                                        let id_str = format!("pid:{}", persistence_id);
+                                        zoon::println!("[DEBUG] List/remove Push: item has NO origin, checking pid={}", id_str);
+                                        if persisted_removed.contains(&id_str) {
+                                            zoon::println!("[DEBUG] List/remove Push: FILTERING out pid={}", id_str);
+                                            return future::ready(Some(None));
+                                        }
                                     }
 
                                     let idx = *next_idx;
@@ -7789,9 +7801,16 @@ impl ListBindingFunction {
                                     item.list_item_origin().is_some(), removed_set_key);
 
                                 // Persist removal to this branch's removed set
-                                if let (Some(origin), Some(key)) = (item.list_item_origin(), removed_set_key.as_ref()) {
-                                    zoon::println!("[DEBUG] Adding to removed set: key={}, call_id={}", key, origin.call_id);
-                                    add_to_removed_set(key, &origin.call_id);
+                                if let Some(key) = removed_set_key.as_ref() {
+                                    if let Some(origin) = item.list_item_origin() {
+                                        zoon::println!("[DEBUG] Adding to removed set: key={}, call_id={}", key, origin.call_id);
+                                        add_to_removed_set(key, &origin.call_id);
+                                    } else {
+                                        // Fallback: use persistence_id for items without origin (LIST literal items)
+                                        let id_str = format!("pid:{}", persistence_id);
+                                        zoon::println!("[DEBUG] Adding to removed set (no origin): key={}, id={}", key, id_str);
+                                        add_to_removed_set(key, &id_str);
+                                    }
                                 }
 
                                 items.remove(pos);
