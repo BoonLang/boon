@@ -1,0 +1,375 @@
+# First Major Milestone: Playground Running on New Engine
+
+**Goal:** Migrate the current playground to use the arena-based engine (Parts 1-12), with all integrated examples working correctly.
+
+This section provides a concrete path from "Parts 1-12 documented" to "playground fully migrated."
+
+---
+
+## M.1 Current State
+
+### Existing Engine (`crates/boon/src/platform/browser/`)
+- `interpreter.rs` - Entry point, runs Boon code
+- `evaluator.rs` - Evaluates AST into `Arc<ValueActor>` values
+- `engine.rs` - ValueActor, LazyValueActor, List, channels, subscriptions
+- `bridge.rs` - Converts Boon objects to Zoon UI elements
+- `api.rs` - Built-in functions (Math, Element, Document, List, etc.)
+
+### New Engine (to be created)
+- `engine_v2/mod.rs` - Arena, SlotId, ReactiveNode
+- `engine_v2/event_loop.rs` - EventLoop, timer queue
+- `engine_v2/message.rs` - Message, Payload, routing
+- `engine_v2/nodes.rs` - Node kinds (Router, Register, Transformer, etc.)
+- `evaluator_v2.rs` - Evaluator using SlotId
+- `api_v2.rs` - API functions for new engine
+
+### Playground Examples (50+ files)
+
+**Core examples (must work for milestone):**
+| Example | Phase | Key Features |
+|---------|-------|--------------|
+| `minimal/minimal.bn` | 3 | Trivial constant |
+| `hello_world/hello_world.bn` | 3 | Static text |
+| `counter/counter.bn` | 4 | LATEST + THEN + LINK |
+| `counter_hold/counter_hold.bn` | 4 | HOLD + LINK |
+| `interval/interval.bn` | 6 | Timer queue |
+| `interval_hold/interval_hold.bn` | 6 | Timer + Register |
+| `fibonacci/fibonacci.bn` | 6 | Stream/pulses, Log/info |
+| `layers/layers.bn` | 5 | Static list |
+| `shopping_list/shopping_list.bn` | 7 | PASS/PASSED, List ops |
+| `pages/pages.bn` | 7 | Router/go_to, Router/route |
+| `todo_mvc/todo_mvc.bn` | 7 | **Full validation** |
+
+**Test cases (bug reproductions):**
+- `list_map_external_dep/` - External deps in List/map
+- `text_interpolation_update/` - TextTemplate reactivity
+- `switch_hold_test/` - LINK rebinding on WHILE
+- `filter_checkbox_bug/` - Complex List+WHILE
+- `chained_list_remove_bug/` - Chained List/remove
+
+---
+
+## M.2 Migration Strategy: Parallel Development
+
+**Key principle:** Keep existing engine working while building new one.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     crates/boon/src/platform/browser/           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   interpreter.rs ───────┬───────> evaluator.rs (existing)       │
+│                         │         ↓                             │
+│                         │         engine.rs (Arc<ValueActor>)   │
+│                         │         ↓                             │
+│                         │         bridge.rs ──> Zoon            │
+│                         │                                       │
+│                         └───────> evaluator_v2.rs (NEW)         │
+│                                   ↓                             │
+│                                   engine_v2/ (Arena, SlotId)    │
+│                                   ↓                             │
+│                                   bridge_v2.rs ──> Zoon         │
+│                                                                 │
+│   Feature flag: USE_NEW_ENGINE                                  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Step 1: Create engine_v2 skeleton (Phase 1-2)
+- Create `engine_v2/` module structure
+- Implement core types: `Arena`, `SlotId`, `ReactiveNode`, `Message`
+- Implement `EventLoop` skeleton with message routing
+- **No integration yet** - just unit tests
+
+### Step 2: Add evaluator_v2 (Phase 3-4)
+- Create `evaluator_v2.rs` that produces `SlotId` values
+- Implement basic nodes: Constant, Variable, Router
+- Implement combinators: LATEST, HOLD, THEN/WHEN, WHILE
+- Test with `minimal.bn`, `counter.bn`
+
+### Step 3: Add bridge_v2 (Phase 7)
+- Create `bridge_v2.rs` that reads from Arena
+- Adapt Zoon element creation to use SlotId
+- Test with `hello_world.bn`, `counter.bn`
+
+### Step 4: Feature flag integration
+```rust
+// interpreter.rs
+pub fn run(code: &str, use_new_engine: bool) {
+    if use_new_engine {
+        evaluator_v2::evaluate(ast, arena, event_loop);
+        bridge_v2::render(arena, element);
+    } else {
+        evaluator::evaluate(ast);
+        bridge::render(element);
+    }
+}
+```
+
+### Step 5: Progressive migration
+- Enable new engine for simple examples first
+- Add fallback to old engine on failure
+- Track which examples pass on new engine
+- Fix issues until all examples work
+
+---
+
+## M.3 Implementation Phases (Detailed)
+
+### Phase 1: Core Types & Arena (1 week)
+
+**Files to create:**
+```
+crates/boon/src/platform/browser/engine_v2/
+├── mod.rs          # Public exports
+├── arena.rs        # Arena, SlotId
+├── node.rs         # ReactiveNode, NodeKind
+└── message.rs      # Message, Payload
+```
+
+**Tasks:**
+1. Implement `Arena` with generational indices
+2. Implement `SlotId` (u32 index + u32 generation)
+3. Implement `ReactiveNode` enum (placeholder variants)
+4. Implement `Message` with `Payload` enum
+5. Unit tests for arena allocation/deallocation
+
+**Exit criteria:**
+- Can allocate 1000 nodes, deallocate half, allocate 500 more
+- No use-after-free with generation checks
+- All unit tests pass
+
+### Phase 2: Message & Routing (1 week)
+
+**Files to modify/create:**
+```
+engine_v2/
+├── event_loop.rs   # EventLoop, message queue
+├── routing.rs      # RoutingTable, static/dynamic routes
+└── subscriber.rs   # Subscription tracking
+```
+
+**Tasks:**
+1. Implement `EventLoop` with message queue
+2. Implement `RoutingTable` for node→node routing
+3. Implement subscription management
+4. Test: constant → subscriber flow works
+
+**Exit criteria:**
+- Can send message from node A to node B
+- Can subscribe/unsubscribe dynamically
+- Queue drains correctly in single tick
+
+### Phase 3: Basic Nodes (1 week)
+
+**Nodes to implement:**
+- `Constant` - Emits fixed value, never changes
+- `Variable` - Wire that forwards messages
+- `Router` - Demultiplexes object fields
+
+**Tests to pass:**
+- `minimal.bn` - Just a constant value
+- `hello_world.bn` - Constant text
+
+**Exit criteria:**
+- `minimal.bn` renders "42" (or whatever)
+- `hello_world.bn` renders "Hello, World!"
+
+### Phase 4: Combinators (2 weeks)
+
+**Nodes to implement:**
+- `Combiner` - LATEST: merges N inputs, emits when any changes
+- `Register` - HOLD: stores state, emits new state on trigger
+- `Transformer` - THEN/WHEN: transforms input on trigger
+- `SwitchedWire` - WHILE: routes based on pattern match
+
+**Tests to pass:**
+- `counter.bn` - LATEST + THEN + LINK
+- `counter_hold.bn` - HOLD + LINK
+- `while_function_call.bn` - FUNCTION inside WHILE arm
+
+**Exit criteria:**
+- Counter increments on button click
+- Hold pattern works correctly
+- WHILE switches outputs correctly
+
+### Phase 5: Lists (2 weeks)
+
+**Nodes to implement:**
+- `Bus` - Dynamic collection of wires
+- List operations: append, remove, map, retain, count
+
+**Tests to pass:**
+- `layers.bn` - Static list
+- `list_retain_remove.bn` - Basic list append
+- `list_map_block.bn` - BLOCK inside List/map
+
+**Exit criteria:**
+- Can add/remove items from list
+- List/map produces correct output
+- Diff tracking works for UI updates
+
+### Phase 6: Timer & Events (1 week)
+
+**Features to implement:**
+- Timer queue (priority heap)
+- `Timer/interval` API function
+- `LINK` node (DOM event source)
+
+**Tests to pass:**
+- `interval.bn` - Timer fires repeatedly
+- `interval_hold.bn` - Timer + Register combo
+- `fibonacci.bn` - Stream/pulses
+
+**Exit criteria:**
+- `interval.bn` counts up automatically
+- Timer cancellation works
+- LINK events propagate correctly
+
+### Phase 7: Bridge & Full UI (2 weeks)
+
+**Files to create/modify:**
+```
+bridge_v2.rs        # NEW: Arena-based rendering
+api_v2/             # NEW: API functions
+├── mod.rs
+├── element.rs      # Element/*, Document/*
+├── list.rs         # List/*
+├── math.rs         # Math/*
+├── text.rs         # Text/*
+└── router.rs       # Router/*
+```
+
+**Tests to pass:**
+- `shopping_list.bn` - List ops + PASS/PASSED
+- `pages.bn` - Router/go_to, Router/route
+- `todo_mvc.bn` - **FULL VALIDATION**
+
+**Exit criteria:**
+- All UI examples render correctly
+- Interactions work (click, type, etc.)
+- `todo_mvc.bn` is fully functional
+
+---
+
+## M.4 Testing Strategy
+
+### Unit Tests (per phase)
+- Arena: allocation, deallocation, generation checks
+- Messages: routing, delivery, subscription
+- Nodes: each node type in isolation
+
+### Integration Tests (per example)
+- Parse example → evaluate → check output
+- Compare output with existing engine
+- Automated regression testing
+
+### Visual Tests (browser)
+- Screenshot comparison (before/after migration)
+- Manual smoke testing for interactions
+- Performance comparison (FPS, memory)
+
+### Diff Testing
+```rust
+// Test harness
+fn test_example(name: &str) {
+    let ast = parse(load_example(name));
+
+    let old_output = evaluator::evaluate(&ast).to_string();
+    let new_output = evaluator_v2::evaluate(&ast).to_string();
+
+    assert_eq!(old_output, new_output, "Example {} differs", name);
+}
+```
+
+---
+
+## M.5 Risk Mitigation
+
+| Risk | Mitigation |
+|------|------------|
+| New engine has different semantics | Test against all examples early, compare outputs |
+| Migration takes too long | Feature flag allows incremental rollout |
+| Performance regression | Benchmark before/after, optimize hot paths |
+| Breaking changes to API | Keep old API working during transition |
+| Edge cases in complex examples | Use bug-reproduction tests (filter_checkbox_bug, etc.) |
+
+---
+
+## M.6 Success Criteria
+
+**Milestone complete when:**
+
+1. **All core examples work:**
+   - [ ] `minimal.bn`
+   - [ ] `hello_world.bn`
+   - [ ] `counter.bn`
+   - [ ] `counter_hold.bn`
+   - [ ] `interval.bn`
+   - [ ] `interval_hold.bn`
+   - [ ] `fibonacci.bn`
+   - [ ] `layers.bn`
+   - [ ] `shopping_list.bn`
+   - [ ] `pages.bn`
+   - [ ] `todo_mvc.bn` ← **Primary validation target**
+
+2. **All test examples work:**
+   - [ ] `list_map_block.bn`
+   - [ ] `list_retain_remove.bn`
+   - [ ] `while_function_call.bn`
+   - [ ] `list_retain_reactive.bn`
+   - [ ] `list_object_state.bn`
+   - [ ] `button_hover_test.bn`
+
+3. **Known bugs fixed (or documented as "won't fix"):**
+   - [ ] `text_interpolation_update.bn` - K4 issue
+   - [ ] `list_map_external_dep.bn` - K16 issue
+   - [ ] `switch_hold_test.bn` - K15 issue
+   - [ ] `filter_checkbox_bug.bn` - K15/K16 issues
+   - [ ] `chained_list_remove_bug.bn` - K17 issue
+
+4. **Old engine removed:**
+   - [ ] Feature flag defaults to new engine
+   - [ ] Old engine code deleted
+   - [ ] No `Arc<ValueActor>` in codebase
+
+5. **Performance acceptable:**
+   - [ ] `todo_mvc.bn` renders at 60 FPS
+   - [ ] Memory usage ≤ old engine
+   - [ ] No perceptible latency on interactions
+
+---
+
+## M.7 Estimated Timeline
+
+| Phase | Duration | Cumulative |
+|-------|----------|------------|
+| Phase 1: Core Types & Arena | 1 week | 1 week |
+| Phase 2: Message & Routing | 1 week | 2 weeks |
+| Phase 3: Basic Nodes | 1 week | 3 weeks |
+| Phase 4: Combinators | 2 weeks | 5 weeks |
+| Phase 5: Lists | 2 weeks | 7 weeks |
+| Phase 6: Timer & Events | 1 week | 8 weeks |
+| Phase 7: Bridge & Full UI | 2 weeks | 10 weeks |
+| Bug fixes & polish | 2 weeks | **12 weeks** |
+
+**Total: ~3 months** for complete migration
+
+---
+
+## M.8 Critical Files Summary
+
+| File | Status | Purpose |
+|------|--------|---------|
+| `engine_v2/mod.rs` | NEW | Arena, SlotId, ReactiveNode |
+| `engine_v2/arena.rs` | NEW | Arena allocator |
+| `engine_v2/event_loop.rs` | NEW | EventLoop, timer queue |
+| `engine_v2/message.rs` | NEW | Message, Payload, routing |
+| `engine_v2/nodes.rs` | NEW | Node kinds |
+| `evaluator_v2.rs` | NEW | Evaluator using SlotId |
+| `bridge_v2.rs` | NEW | Arena-based rendering |
+| `api_v2/` | NEW | API functions for new engine |
+| `interpreter.rs` | MODIFY | Add feature flag for engine selection |
+
+---
+

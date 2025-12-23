@@ -1,0 +1,130 @@
+## Part 1: Node Identification System
+
+### 1.1 SourceId (Parse-Time)
+
+Every AST node gets a stable structural hash ID during parsing (see K26 for full details):
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SourceId {
+    pub stable_id: u64,    // Structural hash (survives whitespace/comment changes)
+    pub parse_order: u32,  // For debugging and collision tiebreaking
+}
+```
+
+**Assignment:** Computed via structural hash of node kind, parent path, and content. Stored in `Spanned<T>` alongside span.
+
+**Files to modify:**
+- `crates/boon/src/parser.rs` - Add SourceId to Spanned struct
+- `crates/boon/src/parser/persistence_resolver.rs` - Integrate with PersistenceId
+
+### 1.2 ScopeId (Runtime)
+
+Captures dynamic instantiation context:
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ScopeId(u64);  // Hash of scope path
+
+impl ScopeId {
+    pub const ROOT: Self = Self(0);
+
+    pub fn child(&self, discriminator: u64) -> Self {
+        Self(self.0.wrapping_mul(31).wrapping_add(discriminator))
+    }
+}
+```
+
+**Propagation rules:**
+| Context | Scope Change |
+|---------|--------------|
+| Top-level | `ScopeId::ROOT` |
+| Function call | `parent.child(call_site_source_id)` |
+| LIST item | `parent.child(item_key)` via AllocSite |
+| HOLD body | Same scope (NO new child scope per iteration) |
+| WHILE arm | `parent.child(arm_index)` |
+| BLOCK | Same scope (local bindings, no scope change) |
+
+### 1.2.1 AllocSite for List Item Identity
+
+**Problem:** When `List/append(item: new_todo())` creates items, each needs a stable identity that:
+- Survives page reload (persistence)
+- Handles "removed then re-added" correctly
+- Avoids fragile call-stack tracking
+
+**Solution:** Each append site is a "factory" with monotonic instance IDs:
+
+```rust
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct AllocSite {
+    pub site_source_id: SourceId,  // The List/append call site
+    pub next_instance: u64,        // Monotonic counter, persisted
+}
+
+pub type ItemKey = u64;  // The instance_id from AllocSite
+
+impl AllocSite {
+    pub fn allocate(&mut self) -> ItemKey {
+        let id = self.next_instance;
+        self.next_instance += 1;
+        id
+    }
+}
+```
+
+**How it works:**
+1. Each `List/append` call site has its own AllocSite
+2. When append triggers, allocate a new InstanceId
+3. Item's ScopeId = `parent.child(instance_id)`
+4. Persist AllocSite counter for reload stability
+
+**Benefits:**
+- Stable persistence keys for dynamically created items
+- No fragile origin tracking needed
+- Works correctly with removal + re-addition
+- Each append location is its own numbered "factory"
+
+### 1.3 NodeAddress (Combined with Domain)
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeAddress {
+    pub domain: Domain,   // Execution location
+    pub source_id: SourceId,
+    pub scope_id: ScopeId,
+    pub port: Port,       // Which input/output of the node
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum Domain {
+    #[default]
+    Main,           // UI thread (browser main, or single-threaded mode)
+    Worker(u8),     // WebWorker index
+    Server,         // Backend (future: over WebSocket)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Port {
+    Output,           // Default output
+    Input(u8),        // Numbered input (for LATEST, etc.)
+    Field(u32),       // Field ID (for Router/Object)
+}
+```
+
+**Why domain is needed:**
+- Same NodeId can exist in different execution contexts
+- Explicit routing for WebWorkers and backend distribution
+- Clean message routing: "this message goes to Worker[2]"
+- Same pattern works for local threading and remote WebSocket
+
+**Why port is needed:**
+- LATEST has multiple inputs - need to address "input 2 of this LATEST"
+- Objects have multiple fields - each is a distinct output
+- Hardware-inspired: each port maps conceptually to a wire (mental model, not synthesizable - see K3)
+- Precise debugging (which input triggered this node?)
+
+**Files to modify:**
+- `crates/boon/src/platform/browser/engine.rs` - Add NodeAddress, replace Scope enum
+
+---
+

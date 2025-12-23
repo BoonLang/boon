@@ -1,0 +1,708 @@
+## Part 10: Live Code Updates & State Migration
+
+This section designs the system for updating Boon code at runtime while preserving user state. Unlike traditional hot module replacement, Boon's reactive dataflow engine requires careful handling of node identity, state preservation, and incremental graph patching.
+
+### 10.1 Node Identity Stability
+
+#### 10.1.1 SourceId with Structural Hash
+
+The current PersistenceId system (K26) breaks on code changes because sequential IDs shift when lines are added. The new engine uses structural hashing:
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SourceId {
+    /// Structural hash - survives whitespace, comments, reordering
+    pub stable_id: u64,
+    /// Parse order for debugging and collision tiebreaking
+    pub parse_order: u32,
+}
+
+impl SourceId {
+    pub fn compute(node: &AstNode, parent_path: &[SourceId]) -> Self {
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+
+        let mut hasher = DefaultHasher::new();
+
+        // 1. Hash the parent path (structural position)
+        for parent in parent_path {
+            parent.stable_id.hash(&mut hasher);
+        }
+
+        // 2. Hash the node kind (what type of construct)
+        std::mem::discriminant(&node.kind).hash(&mut hasher);
+
+        // 3. Hash relevant content (NOT spans or whitespace)
+        match &node.kind {
+            AstNode::Variable { name, .. } => name.hash(&mut hasher),
+            AstNode::FunctionCall { path, .. } => path.hash(&mut hasher),
+            AstNode::FunctionDef { name, params, .. } => {
+                name.hash(&mut hasher);
+                params.len().hash(&mut hasher);
+            }
+            AstNode::FieldAccess { field, .. } => field.hash(&mut hasher),
+            AstNode::Literal(lit) => lit.hash(&mut hasher),
+            AstNode::Hold { state_param, .. } => state_param.hash(&mut hasher),
+            AstNode::Latest { inputs } => inputs.len().hash(&mut hasher),
+            AstNode::Block { variables, .. } => variables.len().hash(&mut hasher),
+            _ => {}
+        }
+
+        Self {
+            stable_id: hasher.finish(),
+            parse_order: 0, // Set by parser during traversal
+        }
+    }
+}
+```
+
+**Properties:**
+- Survives whitespace and comment changes
+- Survives reordering of sibling expressions (different parent paths)
+- Changes only when structural content changes
+- Collision handling via parse_order tiebreaker
+
+#### 10.1.2 SourceId Assignment During Parse
+
+```rust
+pub struct SourceIdAssigner {
+    parent_path: Vec<SourceId>,
+    next_parse_order: u32,
+}
+
+impl SourceIdAssigner {
+    pub fn assign(&mut self, node: &mut AstNode) {
+        let mut source_id = SourceId::compute(node, &self.parent_path);
+        source_id.parse_order = self.next_parse_order;
+        self.next_parse_order += 1;
+
+        node.source_id = Some(source_id);
+
+        self.parent_path.push(source_id);
+        for child in node.children_mut() {
+            self.assign(child);
+        }
+        self.parent_path.pop();
+    }
+}
+```
+
+---
+
+### 10.2 Code Update Detection
+
+#### 10.2.1 Topology Diff
+
+```rust
+#[derive(Debug)]
+pub struct TopologyDiff {
+    /// Nodes that exist in new code but not in old
+    pub added: Vec<SourceId>,
+    /// Nodes that exist in old code but not in new
+    pub removed: Vec<SourceId>,
+    /// Nodes that exist in both but may have changed connections
+    pub modified: Vec<ModifiedNode>,
+    /// Nodes unchanged in structure and connections
+    pub unchanged: Vec<SourceId>,
+}
+
+#[derive(Debug)]
+pub struct ModifiedNode {
+    pub source_id: SourceId,
+    pub changes: NodeChanges,
+}
+
+#[derive(Debug)]
+pub struct NodeChanges {
+    pub inputs_changed: bool,
+    pub content_changed: bool,
+    pub subscribers_changed: bool,
+}
+
+impl TopologyDiff {
+    pub fn compute(old_ast: &Ast, new_ast: &Ast) -> Self {
+        let old_nodes: HashMap<SourceId, &AstNode> = old_ast.collect_nodes_by_source_id();
+        let new_nodes: HashMap<SourceId, &AstNode> = new_ast.collect_nodes_by_source_id();
+
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        let mut modified = Vec::new();
+        let mut unchanged = Vec::new();
+
+        for source_id in new_nodes.keys() {
+            if !old_nodes.contains_key(source_id) {
+                added.push(*source_id);
+            }
+        }
+
+        for source_id in old_nodes.keys() {
+            if !new_nodes.contains_key(source_id) {
+                removed.push(*source_id);
+            }
+        }
+
+        for (source_id, new_node) in &new_nodes {
+            if let Some(old_node) = old_nodes.get(source_id) {
+                let changes = Self::compare_nodes(old_node, new_node);
+                if changes.is_some() {
+                    modified.push(ModifiedNode {
+                        source_id: *source_id,
+                        changes: changes.unwrap(),
+                    });
+                } else {
+                    unchanged.push(*source_id);
+                }
+            }
+        }
+
+        TopologyDiff { added, removed, modified, unchanged }
+    }
+}
+```
+
+---
+
+### 10.3 State Preservation During Hot Reload
+
+#### 10.3.1 Pre-Reload Snapshot
+
+```rust
+/// State captured before hot reload
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HotReloadSnapshot {
+    pub tick: u64,
+    pub node_states: HashMap<NodeAddress, NodeStateSnapshot>,
+    pub pending_messages: Vec<Message>,
+    pub timer_states: Vec<TimerSnapshot>,
+    pub alloc_sites: HashMap<SourceId, AllocSiteSnapshot>,
+    pub code_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStateSnapshot {
+    pub address: NodeAddress,
+    pub current_value: Option<Payload>,
+    pub version: u64,
+    pub kind_state: NodeKindState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NodeKindState {
+    Producer,
+    Wire,
+    Router { fields: HashMap<FieldId, Option<Payload>> },
+    Bus {
+        items: Vec<(ItemKey, NodeStateSnapshot)>,
+        next_instance: u64,
+    },
+    Register { stored_value: Payload },
+    Combiner { last_input_port: Option<u8> },
+    Transformer,
+    SwitchedWire { current_arm: Option<usize> },
+    PatternMux,
+    Timer { next_fire_ms: f64 },
+    TextTemplate { cached: Option<String> },
+    Effect { last_execution_tick: u64 },
+    Skip { remaining: u32 },
+}
+```
+
+#### 10.3.2 Snapshot Capture
+
+```rust
+impl EventLoop {
+    pub fn snapshot_for_reload(&self) -> HotReloadSnapshot {
+        let mut node_states = HashMap::new();
+        let mut alloc_sites = HashMap::new();
+
+        for slot_id in self.arena.iter_active() {
+            let node = self.arena.get(slot_id);
+            let address = node.address;
+            let state = self.snapshot_node(node);
+            node_states.insert(address, state);
+
+            if let NodeKind::Bus { alloc_site, .. } = &node.kind {
+                alloc_sites.insert(
+                    alloc_site.site_source_id,
+                    AllocSiteSnapshot {
+                        source_id: alloc_site.site_source_id,
+                        next_instance: alloc_site.next_instance,
+                    },
+                );
+            }
+        }
+
+        let timer_states: Vec<_> = self.timer_queue.iter()
+            .map(|event| TimerSnapshot {
+                node_address: self.arena.get(event.node_id).address,
+                deadline_tick: event.deadline_tick,
+                deadline_ms: event.deadline_ms,
+            })
+            .collect();
+
+        HotReloadSnapshot {
+            tick: self.current_tick,
+            node_states,
+            pending_messages: self.drain_pending_messages(),
+            timer_states,
+            alloc_sites,
+            code_version: self.code_version,
+        }
+    }
+}
+```
+
+---
+
+### 10.4 Incremental Graph Patching
+
+#### 10.4.1 Reload Orchestrator
+
+```rust
+pub struct HotReloadOrchestrator {
+    diff: TopologyDiff,
+    snapshot: HotReloadSnapshot,
+    migrations: Vec<MigrationRule>,
+}
+
+impl HotReloadOrchestrator {
+    /// Execute the hot reload
+    pub fn execute(&self, event_loop: &mut EventLoop, new_ast: &Ast) -> ReloadResult {
+        // Phase 1: Validate migrations before making changes
+        let migration_plan = self.plan_migrations()?;
+
+        // Phase 2: Finalize removed nodes
+        self.finalize_removed_nodes(event_loop)?;
+
+        // Phase 3: Create new topology from AST
+        let new_slots = event_loop.build_topology(new_ast)?;
+
+        // Phase 4: Restore state to matching nodes
+        let restore_result = self.restore_state(event_loop, &new_slots)?;
+
+        // Phase 5: Apply migrations for incompatible changes
+        self.apply_migrations(event_loop, &migration_plan)?;
+
+        // Phase 6: Initialize new nodes with defaults
+        self.initialize_new_nodes(event_loop, &new_slots)?;
+
+        // Phase 7: Rewire modified connections
+        self.rewire_connections(event_loop, &new_slots)?;
+
+        // Phase 8: Restore pending messages and timers
+        self.restore_in_flight(event_loop)?;
+
+        Ok(ReloadResult {
+            nodes_preserved: restore_result.preserved_count,
+            nodes_migrated: migration_plan.len(),
+            nodes_reset: self.diff.added.len(),
+            warnings: restore_result.warnings,
+        })
+    }
+}
+```
+
+#### 10.4.2 Node Finalization
+
+```rust
+impl HotReloadOrchestrator {
+    fn finalize_removed_nodes(&self, event_loop: &mut EventLoop) -> Result<(), ReloadError> {
+        for source_id in &self.diff.removed {
+            let matching_slots: Vec<_> = event_loop.arena.iter_active()
+                .filter(|slot| event_loop.arena.get(*slot).address.source_id == *source_id)
+                .collect();
+
+            for slot in matching_slots {
+                event_loop.mark_finalizing(slot);
+                if let Some(value) = &event_loop.arena.get(slot).current_value {
+                    event_loop.emit_finalization_event(slot, value.clone());
+                }
+                event_loop.schedule_deallocation(slot);
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+#### 10.4.3 State Restoration
+
+```rust
+impl HotReloadOrchestrator {
+    fn restore_state(
+        &self,
+        event_loop: &mut EventLoop,
+        new_slots: &HashMap<SourceId, Vec<SlotId>>,
+    ) -> Result<RestoreResult, ReloadError> {
+        let mut preserved_count = 0;
+        let mut warnings = Vec::new();
+
+        // Restore unchanged nodes
+        for source_id in &self.diff.unchanged {
+            if let Some(slots) = new_slots.get(source_id) {
+                for slot in slots {
+                    let address = event_loop.arena.get(*slot).address;
+                    if let Some(old_state) = self.snapshot.node_states.get(&address) {
+                        match self.restore_node_state(event_loop, *slot, old_state) {
+                            Ok(()) => preserved_count += 1,
+                            Err(e) => warnings.push(format!(
+                                "Failed to restore {:?}: {}", address, e
+                            )),
+                        }
+                    }
+                }
+            }
+        }
+
+        // Restore modified nodes (if state is compatible)
+        for modified in &self.diff.modified {
+            if !modified.changes.content_changed {
+                if let Some(slots) = new_slots.get(&modified.source_id) {
+                    for slot in slots {
+                        let address = event_loop.arena.get(*slot).address;
+                        if let Some(old_state) = self.snapshot.node_states.get(&address) {
+                            match self.restore_node_state(event_loop, *slot, old_state) {
+                                Ok(()) => preserved_count += 1,
+                                Err(e) => warnings.push(format!(
+                                    "Failed to restore {:?}: {}", address, e
+                                )),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(RestoreResult { preserved_count, warnings })
+    }
+}
+```
+
+---
+
+### 10.5 mzoon Integration
+
+#### 10.5.1 WASM Reload Flow
+
+```rust
+/// Browser-side state preservation during WASM reload
+pub struct WasmReloadBridge {
+    storage_key: String,
+}
+
+impl WasmReloadBridge {
+    /// Called before WASM is unloaded
+    pub fn prepare_for_reload(&self, event_loop: &EventLoop) {
+        let snapshot = event_loop.snapshot_for_reload();
+        let json = serde_json::to_string(&snapshot)
+            .expect("Snapshot serialization failed");
+
+        // Store in sessionStorage (survives reload but not tab close)
+        web_sys::window()
+            .and_then(|w| w.session_storage().ok())
+            .flatten()
+            .map(|storage| storage.set_item(&self.storage_key, &json));
+    }
+
+    /// Called after new WASM loads
+    pub fn restore_after_reload(&self) -> Option<HotReloadSnapshot> {
+        let json = web_sys::window()
+            .and_then(|w| w.session_storage().ok())
+            .flatten()
+            .and_then(|storage| storage.get_item(&self.storage_key).ok())
+            .flatten()?;
+
+        // Clear after reading (one-time use)
+        web_sys::window()
+            .and_then(|w| w.session_storage().ok())
+            .flatten()
+            .map(|storage| storage.remove_item(&self.storage_key));
+
+        serde_json::from_str(&json).ok()
+    }
+}
+```
+
+#### 10.5.2 mzoon Event Handler
+
+```rust
+/// Entry point called by mzoon after WASM reload
+#[wasm_bindgen]
+pub fn initialize_with_preserved_state(source_code: &str) {
+    let bridge = WasmReloadBridge::new("boon_reload_snapshot");
+    let preserved_snapshot = bridge.restore_after_reload();
+    let new_ast = parse_boon(source_code);
+    let mut event_loop = EventLoop::new();
+
+    if let Some(snapshot) = preserved_snapshot {
+        if let Some(old_source) = get_old_source_code() {
+            let old_ast = parse_boon(&old_source);
+            let migrations = load_user_migrations();
+
+            let orchestrator = HotReloadOrchestrator::new(
+                &old_ast, &new_ast, snapshot, migrations,
+            );
+
+            match orchestrator.execute(&mut event_loop, &new_ast) {
+                Ok(result) => {
+                    console_log!("Hot reload: {} preserved, {} migrated, {} new",
+                        result.nodes_preserved, result.nodes_migrated, result.nodes_reset);
+                }
+                Err(e) => {
+                    console_error!("Hot reload failed: {}", e);
+                    event_loop = EventLoop::new();
+                    event_loop.build_topology(&new_ast);
+                }
+            }
+        }
+    } else {
+        event_loop.build_topology(&new_ast);
+    }
+
+    register_before_unload(move || {
+        bridge.prepare_for_reload(&event_loop);
+    });
+
+    event_loop.run();
+}
+```
+
+---
+
+### 10.6 Delta Migration
+
+#### 10.6.1 Migration Rules
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationRule {
+    pub target: SourceId,
+    pub from_version: Option<u64>,
+    pub to_version: Option<u64>,
+    pub migration: MigrationKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MigrationKind {
+    Transform(MigrationTransform),
+    Reset(Payload),
+    BoonFunction { path: Vec<String> },
+    Drop,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MigrationTransform {
+    RenameField { from: String, to: String },
+    AddField { name: String, default: Payload },
+    RemoveField { name: String },
+    ConvertType { from_type: String, to_type: String },
+    Expression { expr: String },
+}
+```
+
+#### 10.6.2 User-Defined Migrations in Boon
+
+```boon
+// migrations.bn - User-defined migration functions
+
+MIGRATION user_state_v1_to_v2(old_state) {
+    [
+        name: old_state.full_name  // Renamed field
+        email: old_state.email     // Unchanged
+        preferences: [             // New field with default
+            theme: Dark
+            notifications: True
+        ]
+    ]
+}
+
+MIGRATION todo_item_add_priority(old_item) {
+    [
+        text: old_item.text
+        completed: old_item.completed
+        priority: Normal  // New field with default
+    ]
+}
+```
+
+---
+
+### 10.7 Multi-Domain Coordination
+
+#### 10.7.1 Reload Synchronization Protocol
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ReloadMessage {
+    PrepareReload { version: u64 },
+    WorkerSnapshot { worker_id: WorkerId, snapshot: WorkerSnapshot },
+    ApplyReload { version: u64 },
+    ReloadComplete { worker_id: WorkerId },
+    AbortReload { reason: String },
+}
+
+pub struct MultiDomainReloadCoordinator {
+    workers: Vec<WorkerHandle>,
+    pending_snapshots: HashMap<WorkerId, WorkerSnapshot>,
+    reload_state: ReloadState,
+}
+
+#[derive(Debug)]
+enum ReloadState {
+    Idle,
+    CollectingSnapshots { expected: usize, collected: usize },
+    Applying,
+    WaitingConfirmation { expected: usize, confirmed: usize },
+}
+```
+
+#### 10.7.2 Coordinated Reload Flow
+
+1. **Phase 1:** Notify all workers to prepare (pause processing, snapshot state)
+2. **Phase 2:** Collect worker snapshots (with timeout)
+3. **Phase 3:** Apply reload on main thread
+4. **Phase 4:** Signal workers to apply new code
+5. **Phase 5:** Wait for confirmation from all workers
+
+---
+
+### 10.8 Error Handling
+
+#### 10.8.1 Error Types
+
+```rust
+#[derive(Debug)]
+pub enum ReloadError {
+    SourceIdCollision { ids: Vec<SourceId> },
+    IncompatibleKind { source_id: SourceId, old: String, new: String },
+    IncompatibleChange { source_id: SourceId, message: String },
+    MigrationFailed { source_id: SourceId, error: String },
+    NodeNotFound,
+    Timeout,
+    WorkerError { worker_id: WorkerId, error: String },
+    SerializationError(String),
+    StorageQuotaExceeded,
+}
+
+impl ReloadError {
+    pub fn is_recoverable(&self) -> bool {
+        matches!(
+            self,
+            ReloadError::IncompatibleChange { .. }
+                | ReloadError::MigrationFailed { .. }
+                | ReloadError::NodeNotFound
+        )
+    }
+}
+```
+
+#### 10.8.2 Graceful Degradation Strategy
+
+| Error Type | Recovery Strategy |
+|------------|-------------------|
+| Recoverable errors | Partial reload - preserve what we can |
+| Non-recoverable | Full reset with warning |
+| Timeout | Continue with partial state |
+
+---
+
+### 10.9 Integration with Part 5 Snapshot System
+
+The hot reload snapshot extends the Part 5 GraphSnapshot:
+
+```rust
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HotReloadSnapshot {
+    pub graph: GraphSnapshot,  // From Part 5
+    pub reload_metadata: ReloadMetadata,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReloadMetadata {
+    pub source_hash: u64,
+    pub timestamp_ms: f64,
+    pub session_id: String,
+}
+```
+
+**Storage Strategy:**
+- **sessionStorage:** Short-term for active reload (survives page reload)
+- **localStorage/IndexedDB:** Long-term persistence (from Part 5)
+
+---
+
+### 10.10 Future: Triple Store Integration
+
+When the triple store architecture is implemented, hot reload becomes simpler:
+
+```rust
+impl TripleStoreReload {
+    /// With content-addressed types, no migration needed
+    pub fn preserve_state(&self, old_code_version: u64, new_code_version: u64) {
+        // Types are content-hashed, so:
+        // - #hash_User_v1 triples remain valid
+        // - #hash_User_v2 triples are added
+        // - Query system handles both automatically
+        // No explicit migration required!
+    }
+}
+```
+
+---
+
+### 10.11 Implementation Phases
+
+#### Phase 10A: Basic Hot Reload (Essential)
+
+1. Implement SourceId with structural hash in parser
+2. Implement TopologyDiff computation
+3. Implement HotReloadSnapshot capture/restore
+4. Integrate with mzoon WASM reload
+5. **Milestone:** Counter state survives code edit
+
+#### Phase 10B: Migration System
+
+1. Implement MigrationRule definitions
+2. Implement migration planning and validation
+3. Add MIGRATION syntax to Boon language
+4. **Milestone:** User can define custom migrations
+
+#### Phase 10C: Multi-Domain Coordination
+
+1. Implement ReloadMessage protocol
+2. Implement MultiDomainReloadCoordinator
+3. Add worker snapshot collection
+4. **Milestone:** Multi-worker apps reload cleanly
+
+---
+
+### 10.12 Critical Files
+
+| File | Purpose |
+|------|---------|
+| `crates/boon/src/parser.rs` | Add SourceId structural hash computation |
+| `engine_v2/hot_reload.rs` | **NEW:** HotReloadOrchestrator, TopologyDiff |
+| `engine_v2/snapshot.rs` | Extend GraphSnapshot for hot reload |
+| `engine_v2/migrations.rs` | **NEW:** MigrationRule, MigrationKind |
+| `crates/boon/src/platform/browser/interpreter.rs` | mzoon integration |
+| `playground/frontend/src/main.rs` | Browser storage for reload state |
+
+---
+
+### 10.13 Summary
+
+Part 10 provides complete live code update support:
+
+| Capability | Approach |
+|------------|----------|
+| **Node Identity** | Structural hash survives code changes |
+| **State Detection** | TopologyDiff finds added/removed/modified |
+| **State Preservation** | Full snapshot → selective restore |
+| **Incremental Patching** | Only recreate what changed |
+| **mzoon Integration** | sessionStorage bridge |
+| **Delta Migration** | User-defined transforms |
+| **Multi-Domain** | Synchronized reload across workers |
+| **Graceful Degradation** | Fallback to fresh state when needed |
+
+---
+

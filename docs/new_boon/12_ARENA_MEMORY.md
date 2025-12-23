@@ -1,0 +1,212 @@
+## Part 2: Arena-Based Memory Model
+
+### 2.1 SlotId (Generational Index)
+
+Replace `Arc<ValueActor>` with arena slot references:
+
+```rust
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SlotId {
+    index: u32,
+    generation: u32,
+}
+```
+
+**Benefits:**
+- No reference counting overhead
+- Use-after-free detection via generation check
+- Cache-friendly contiguous memory
+- Serializable (just index + generation)
+
+### 2.2 Arena Structure
+
+```rust
+pub struct Arena {
+    nodes: Vec<ReactiveNode>,
+    free_list: Vec<u32>,
+    generation: u32,
+}
+```
+
+**For multi-threading:** Each Web Worker gets its own arena. Cross-worker references use `(WorkerId, SlotId)`.
+
+### 2.3 Arena Allocation & Resizing
+
+**Initial Size:**
+```rust
+impl Arena {
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::with_capacity(1024),  // Initial capacity: 1024 nodes
+            free_list: Vec::new(),
+            generation: 0,
+        }
+    }
+}
+```
+
+**Allocation Strategy:**
+1. **First:** Check free_list for recycled slots
+2. **Then:** Allocate from end of nodes vector
+3. **If full:** Grow arena (double capacity)
+
+```rust
+impl Arena {
+    pub fn alloc(&mut self) -> SlotId {
+        if let Some(index) = self.free_list.pop() {
+            // Reuse freed slot, bump generation
+            self.nodes[index as usize].generation += 1;
+            SlotId { index, generation: self.nodes[index as usize].generation }
+        } else {
+            // Allocate new slot
+            let index = self.nodes.len() as u32;
+            self.nodes.push(ReactiveNode::default());
+            SlotId { index, generation: 0 }
+        }
+    }
+
+    pub fn free(&mut self, slot: SlotId) {
+        if self.is_valid(slot) {
+            self.free_list.push(slot.index);
+            // Generation stays - next alloc will bump it
+        }
+    }
+}
+```
+
+**Resizing Policy:**
+| Scenario | Behavior |
+|----------|----------|
+| Arena full, need more | `Vec::push` auto-doubles capacity |
+| Many freed slots | Reuse via free_list (no shrink) |
+| Memory pressure (future) | Could compact + remap SlotIds |
+
+**Why not fixed size?**
+- Static programs: Known node count, arena could be fixed
+- Dynamic Lists: User adds todos → need new slots
+- Trade-off: Start small (1024), grow as needed
+
+**SharedArrayBuffer constraint (multi-threading):**
+
+**IMPORTANT:** Node state is NOT shared between workers. Only message queues use SharedArrayBuffer (see K22 for details).
+
+```rust
+// SharedArrayBuffer is for MESSAGE QUEUES ONLY, not node storage
+// Nodes live in thread-local arenas - see Part 2.5 tiered approach
+```
+
+**Sizing heuristics:**
+| App Complexity | Recommended Initial Capacity |
+|----------------|------------------------------|
+| Simple (counter) | 64 nodes |
+| Medium (shopping_list) | 256 nodes |
+| Complex (todo_mvc) | 1024 nodes |
+| Large app | 4096+ nodes |
+
+Could analyze AST at compile time to estimate node count for better initial sizing.
+
+### 2.5 WASM Memory Strategy
+
+**Key insight:** WASM memory uses lazy page commit - declaring large `maximum` doesn't consume RAM.
+
+```
+WASM Memory Layout:
+┌─────────────────────────────────────────────────────────────┐
+│  initial = 16MB (actually allocated)                        │
+├─────────────────────────────────────────────────────────────┤
+│  ... grows on demand via memory.grow() ...                  │
+│  (OS commits pages only when written)                       │
+├─────────────────────────────────────────────────────────────┤
+│  maximum = 4GB (just a limit, no RAM cost)                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Recommended WASM config:**
+```toml
+# In Cargo.toml or .cargo/config.toml
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "link-arg=--initial-memory=16777216",   # 16MB initial (256 pages)
+    "-C", "link-arg=--max-memory=4294967296",     # 4GB maximum (phone is fine!)
+]
+```
+
+**Why this works for both scenarios:**
+
+| Scenario | Behavior |
+|----------|----------|
+| Simple website on phone | Uses ~1-2MB, rest is uncommitted virtual space |
+| NovyWave with lots of data | Grows on demand up to 4GB, no OOM until truly full |
+
+**Arena growth triggers `memory.grow()`:**
+```rust
+impl Arena {
+    pub fn alloc(&mut self) -> SlotId {
+        // When Vec needs to grow beyond current WASM memory...
+        // Vec::push() internally calls memory.grow()
+        // Browser/OS commits new pages lazily
+        self.nodes.push(ReactiveNode::default());  // May trigger memory.grow()
+        // ...
+    }
+}
+```
+
+**SharedArrayBuffer (multi-threading) - tiered approach (see K22 for full details):**
+```rust
+// TIER 1: Shared region for cross-worker COMMUNICATION ONLY (no node state!)
+pub struct SharedRegion {
+    pub message_queues: [[AtomicU64; 1024]; MAX_WORKERS],  // SPSC queues
+    pub dirty_bitmap: [AtomicU64; 1024],  // Cross-worker dirty notifications
+    // NO shared node state - too complex for atomics
+}
+
+// TIER 2: Thread-local growable arena for ALL nodes
+pub struct LocalArena {
+    nodes: Vec<ReactiveNode>,   // Grows on demand, NOT shared
+    free_list: Vec<u32>,
+}
+
+// Cross-worker node references via MESSAGES, not direct access
+// See K28 for lock-free constraint (browser kills page on block)
+```
+
+**Summary:**
+- Set large `maximum` (4GB) - it's free, just virtual address space
+- Start small `initial` (16MB) - actual RAM usage
+- Arena `Vec` grows naturally, OS commits pages on-demand
+- Simple sites use minimal RAM, heavy apps scale up automatically
+- SharedArrayBuffer: use tiered approach (small shared + large local)
+
+### 2.6 ReactiveNode (Hardware-Friendly)
+
+Fixed-size node structure (fits cache line):
+
+```rust
+#[repr(C, align(64))]
+pub struct ReactiveNode {
+    // Hot data (8 bytes)
+    generation: u32,
+    version: u32,
+
+    // Flags (4 bytes)
+    dirty: bool,
+    kind_tag: u8,
+    input_count: u8,
+    subscriber_count: u8,
+
+    // Inline small arrays (48 bytes)
+    inputs: [SlotId; 4],      // 32 bytes
+    subscribers: [SlotId; 2], // 16 bytes
+
+    // Extension for large nodes
+    extension: Option<Box<NodeExtension>>,
+}
+```
+
+**FPGA mapping:** Each node = one register + combinational logic block.
+
+**Files to modify:**
+- `crates/boon/src/platform/browser/engine.rs` - New Arena, SlotId, ReactiveNode types
+
+---
+

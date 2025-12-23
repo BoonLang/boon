@@ -1,0 +1,591 @@
+## Part 8: Bridge & API Architecture Redesign (New Engine)
+
+This section details the redesign of the Bridge (Boon→Zoon rendering) and API (standard library functions) for the **new arena-based engine** (no backward compatibility with Arc<ValueActor>).
+
+### Current Problems (to eliminate)
+
+- 170+ `expect_*()` calls that panic without context
+- Event handler boilerplate duplicated 6+ times
+- No path for users to add custom Rust functions
+- `chain(stream::pending())` workaround everywhere
+- Arc/stream complexity makes debugging hard
+
+### Design Principles
+
+1. **Trait-based extension** - Users implement `BoonFunction` trait
+2. **Fast-fail with context** - Panics include function path, argument index, expected vs actual type
+3. **Debuggability first** - Clear data flow, traceable errors
+4. **Arena-native** - Uses SlotId, Message, Payload directly (no Arc<ValueActor>)
+
+---
+
+### 8.1 Trait-Based Function API (Arena-Native)
+
+Functions operate on arena nodes via `SlotId`, returning outputs through the message system.
+
+#### Core Trait
+
+```rust
+/// Context passed to all function implementations
+pub struct FunctionContext<'a> {
+    pub arena: &'a mut Arena,
+    pub event_loop: &'a mut EventLoop,
+    pub source_id: SourceId,
+    pub scope_id: ScopeId,
+    pub path: &'static str,  // "Element/button" - for error messages
+}
+
+/// Core trait for Boon standard library functions
+pub trait BoonFunction: Send + Sync + 'static {
+    fn path(&self) -> &'static [&'static str];  // ["Element", "button"]
+    fn min_args(&self) -> usize { 0 }
+    fn max_args(&self) -> Option<usize> { None }
+
+    /// Process function call, returning output slot
+    fn call(
+        &self,
+        args: Arguments,
+        ctx: FunctionContext,
+    ) -> SlotId;
+}
+```
+
+#### Arguments Wrapper (SlotId-based)
+
+```rust
+/// Wrapper for type-safe argument extraction
+pub struct Arguments<'a> {
+    slots: &'a [SlotId],
+    arena: &'a Arena,
+    function_path: &'static str,
+}
+
+impl<'a> Arguments<'a> {
+    /// Panics with: "Element/button(..) missing required argument 'label' at position 2"
+    pub fn require(&self, index: usize, name: &str) -> SlotId {
+        self.slots.get(index).copied().unwrap_or_else(|| {
+            panic!(
+                "{}(..) missing required argument '{}' at position {} (got {} arguments)",
+                self.function_path, name, index, self.slots.len()
+            )
+        })
+    }
+
+    /// Panics with: "Element/button(..) expects 3 arguments, got 5"
+    pub fn expect_exact<const N: usize>(&self) -> [SlotId; N] {
+        if self.slots.len() != N {
+            panic!(
+                "{}(..) expects {} arguments, got {}",
+                self.function_path, N, self.slots.len()
+            );
+        }
+        std::array::from_fn(|i| self.slots[i])
+    }
+
+    /// Get current value from slot with context
+    pub fn value(&self, slot: SlotId) -> &Payload {
+        self.arena.get_value(slot)
+    }
+}
+```
+
+#### Payload Extraction with Context
+
+```rust
+impl Payload {
+    /// Panics with: "Element/button: settings.style.font.size expected Number, got Text"
+    pub fn expect_number(&self, ctx: &str) -> f64 {
+        match self {
+            Payload::Number(n) => *n,
+            other => panic!("{}: expected Number, got {}", ctx, other.type_name()),
+        }
+    }
+
+    pub fn expect_text(&self, ctx: &str) -> &Arc<str> {
+        match self {
+            Payload::Text(t) => t,
+            other => panic!("{}: expected Text, got {}", ctx, other.type_name()),
+        }
+    }
+
+    pub fn expect_object_handle(&self, ctx: &str) -> SlotId {
+        match self {
+            Payload::ObjectHandle(slot) => *slot,
+            other => panic!("{}: expected Object, got {}", ctx, other.type_name()),
+        }
+    }
+
+    pub fn expect_list_handle(&self, ctx: &str) -> SlotId {
+        match self {
+            Payload::ListHandle(slot) => *slot,
+            other => panic!("{}: expected List, got {}", ctx, other.type_name()),
+        }
+    }
+}
+```
+
+#### Function Registry
+
+```rust
+pub struct FunctionRegistry {
+    functions: HashMap<&'static str, Box<dyn BoonFunction>>,
+}
+
+impl FunctionRegistry {
+    pub fn with_stdlib() -> Self {
+        let mut r = Self::new();
+        r.register(text::TextTrim);
+        r.register(math::MathSum);
+        r.register(element::ElementButton);
+        // ... all 40+ functions
+        r
+    }
+
+    pub fn get(&self, path: &str) -> Option<&dyn BoonFunction> {
+        self.functions.get(path).map(|b| b.as_ref())
+    }
+}
+```
+
+#### Example: Text/trim (pure Transformer)
+
+```rust
+pub struct TextTrim;
+
+impl BoonFunction for TextTrim {
+    fn path(&self) -> &'static [&'static str] { &["Text", "trim"] }
+    fn min_args(&self) -> usize { 1 }
+    fn max_args(&self) -> Option<usize> { Some(1) }
+
+    fn call(&self, args: Arguments, ctx: FunctionContext) -> SlotId {
+        let input_slot = args.expect_exact::<1>()[0];
+
+        // Create a Transformer node that trims text
+        let output_slot = ctx.arena.alloc_transformer(
+            ctx.source_id,
+            ctx.scope_id,
+            vec![input_slot],
+            |inputs| {
+                let text = inputs[0].expect_text("Text/trim(..) argument 0");
+                Payload::Text(text.trim().into())
+            },
+        );
+
+        // Wire input to output
+        ctx.arena.connect(input_slot, output_slot);
+
+        output_slot
+    }
+}
+```
+
+#### Example: Math/sum (stateful Register)
+
+```rust
+pub struct MathSum;
+
+impl BoonFunction for MathSum {
+    fn path(&self) -> &'static [&'static str] { &["Math", "sum"] }
+    fn min_args(&self) -> usize { 1 }
+    fn max_args(&self) -> Option<usize> { Some(1) }
+
+    fn call(&self, args: Arguments, ctx: FunctionContext) -> SlotId {
+        let increment_slot = args.expect_exact::<1>()[0];
+
+        // Create a Register node that accumulates
+        let sum_slot = ctx.arena.alloc_register(
+            ctx.source_id,
+            ctx.scope_id,
+            Payload::Number(0.0),  // Initial value
+        );
+
+        // Create Transformer that adds increment to current sum
+        let adder_slot = ctx.arena.alloc_transformer(
+            ctx.source_id.child(1),
+            ctx.scope_id,
+            vec![increment_slot, sum_slot],
+            |inputs| {
+                let increment = inputs[0].expect_number("Math/sum(..) increment");
+                let current = inputs[1].expect_number("Math/sum(..) state");
+                Payload::Number(current + increment)
+            },
+        );
+
+        // Wire: increment + current_sum -> adder -> sum_register
+        ctx.arena.connect(adder_slot, sum_slot);
+
+        sum_slot
+    }
+}
+```
+
+---
+
+### 8.2 Element Nodes & Property Binding
+
+Elements are Router nodes (object with fields) that connect to Zoon UI via a Bridge component.
+
+#### Element Node Structure
+
+```rust
+/// Element nodes are Routers with standard fields
+pub struct ElementNode {
+    pub kind: ElementKind,           // Button, Stripe, Container, etc.
+    pub settings_slot: SlotId,       // Router with style, label, etc.
+    pub element_slot: Option<SlotId>, // element arg (for LINK binding)
+    pub event_slots: Vec<(EventKind, SlotId)>,  // IOPad nodes for events
+}
+
+pub enum ElementKind {
+    Button, Stripe, Container, Stack, TextInput, Checkbox, Label, Paragraph, Link
+}
+```
+
+#### Style Property Binding
+
+Properties are extracted from the settings Router and converted to CSS:
+
+```rust
+/// Declarative style property definition
+pub struct StyleProperty {
+    css_name: &'static str,
+    field_path: &'static [&'static str],  // ["style", "font", "size"]
+    converter: fn(&Payload, &str) -> String,  // (value, error_context) -> css_value
+}
+
+impl ElementNode {
+    /// Standard properties for most elements
+    fn standard_style_properties() -> &'static [StyleProperty] {
+        &[
+            StyleProperty { css_name: "font-size", field_path: &["style", "font", "size"], converter: number_to_px },
+            StyleProperty { css_name: "color", field_path: &["style", "font", "color"], converter: oklch_to_css },
+            StyleProperty { css_name: "font-weight", field_path: &["style", "font", "weight"], converter: weight_tag_to_css },
+            StyleProperty { css_name: "padding", field_path: &["style", "padding"], converter: directional_to_css },
+            StyleProperty { css_name: "background-color", field_path: &["style", "background", "color"], converter: oklch_to_css },
+            StyleProperty { css_name: "border-radius", field_path: &["style", "rounded_corners"], converter: number_to_px },
+            StyleProperty { css_name: "width", field_path: &["style", "width"], converter: dimension_to_css },
+            StyleProperty { css_name: "height", field_path: &["style", "height"], converter: dimension_to_css },
+        ]
+    }
+}
+```
+
+#### Property Navigation via Arena
+
+```rust
+impl Arena {
+    /// Navigate a field path through nested Routers
+    pub fn navigate_field_path(
+        &self,
+        root: SlotId,
+        path: &[&str],
+        error_ctx: &str,
+    ) -> Option<SlotId> {
+        let mut current = root;
+        for segment in path {
+            let router = self.get_router(current);
+            current = router.get_field(segment).unwrap_or_else(|| {
+                panic!("{}: field '{}' not found in path {:?}", error_ctx, segment, path)
+            });
+        }
+        Some(current)
+    }
+}
+```
+
+---
+
+### 8.3 Event Handling via IOPad Nodes
+
+Events use IOPad nodes that receive DOM events and forward to LINK targets.
+
+#### IOPad Node for Events
+
+```rust
+/// IOPad node handles DOM events
+pub struct IOPadNode {
+    pub direction: IODirection,
+    pub event_kind: EventKind,
+    pub link_target: Option<SlotId>,  // Where to send events (LINK destination)
+    pub pending_buffer: VecDeque<Payload>,  // Events before LINK is bound
+    pub buffer_capacity: usize,
+}
+
+pub enum IODirection { Input, Output }
+
+pub enum EventKind {
+    Press, Click, DoubleClick, Hovered, Change, KeyDown, Blur
+}
+```
+
+#### Event Flow
+
+```
+DOM Event (click)
+    ↓
+Bridge.on_click()
+    ↓
+EventLoop.inject_dom_event(element_id, EventKind::Press, Payload::Empty)
+    ↓
+Arena.get_iopad(element_slot) → IOPadNode
+    ↓
+if link_target.is_some():
+    EventLoop.send_message(link_target, payload)
+else:
+    pending_buffer.push(payload)  // Buffer until LINK binds
+```
+
+#### LINK Binding
+
+When `element |> LINK { target }` evaluates:
+
+```rust
+impl Arena {
+    /// Bind LINK from element's IOPad to target
+    pub fn bind_link(
+        &mut self,
+        element_slot: SlotId,
+        event_kind: EventKind,
+        target_slot: SlotId,
+    ) {
+        let iopad = self.get_iopad_mut(element_slot, event_kind);
+        iopad.link_target = Some(target_slot);
+
+        // Flush buffered events
+        for payload in iopad.pending_buffer.drain(..) {
+            self.event_loop.enqueue_message(Message {
+                source: NodeAddress::new(element_slot, Port::Output),
+                target: NodeAddress::new(target_slot, Port::Input(0)),
+                payload,
+            });
+        }
+    }
+}
+```
+
+#### Element Function with Events
+
+```rust
+pub struct ElementButton;
+
+impl BoonFunction for ElementButton {
+    fn path(&self) -> &'static [&'static str] { &["Element", "button"] }
+    fn min_args(&self) -> usize { 3 }
+
+    fn call(&self, args: Arguments, ctx: FunctionContext) -> SlotId {
+        let [element_slot, style_slot, label_slot] = args.expect_exact::<3>();
+
+        // Create settings Router
+        let settings = ctx.arena.alloc_router(ctx.source_id, ctx.scope_id, vec![
+            ("style", style_slot),
+            ("label", label_slot),
+        ]);
+
+        // Create IOPad nodes for events
+        let press_iopad = ctx.arena.alloc_iopad(
+            ctx.source_id.child(1),
+            ctx.scope_id,
+            EventKind::Press,
+            0,  // No buffering
+        );
+        let hovered_iopad = ctx.arena.alloc_iopad(
+            ctx.source_id.child(2),
+            ctx.scope_id,
+            EventKind::Hovered,
+            0,
+        );
+
+        // Create event Router
+        let event_router = ctx.arena.alloc_router(ctx.source_id.child(3), ctx.scope_id, vec![
+            ("press", press_iopad),
+        ]);
+
+        // Create element Router (the output)
+        let element_node = ctx.arena.alloc_element_node(
+            ctx.source_id,
+            ctx.scope_id,
+            ElementKind::Button,
+            settings,
+            Some(element_slot),
+            vec![(EventKind::Press, press_iopad), (EventKind::Hovered, hovered_iopad)],
+        );
+
+        // Extract event from element argument if present
+        if let Some(event_slot) = ctx.arena.try_get_field(element_slot, "event") {
+            // Wire element.event.press to our press_iopad (derived event)
+            if let Some(press_slot) = ctx.arena.try_get_field(event_slot, "press") {
+                ctx.arena.connect(press_iopad, press_slot);
+            }
+        }
+
+        element_node
+    }
+}
+
+---
+
+### 8.4 Bridge: Arena to Zoon Rendering
+
+The Bridge connects the arena-based runtime to Zoon UI elements.
+
+#### Bridge Architecture
+
+```rust
+/// Bridge manages DOM rendering from arena state
+pub struct Bridge {
+    arena: Arc<Arena>,
+    event_loop: Arc<EventLoop>,
+    /// Map element SlotIds to Zoon element handles
+    rendered_elements: HashMap<SlotId, ZoonElementHandle>,
+    /// Style property converters
+    converters: StyleConverters,
+}
+
+impl Bridge {
+    /// Called each tick to sync arena state to DOM
+    pub fn render(&mut self) {
+        // Get document root from arena
+        let doc_slot = self.arena.get_document_root();
+        let root_element = self.arena.navigate_field(doc_slot, "root_element");
+
+        // Render recursively
+        self.render_element(root_element);
+    }
+
+    fn render_element(&mut self, slot: SlotId) {
+        let node = self.arena.get_element_node(slot);
+
+        match node.kind {
+            ElementKind::Button => self.render_button(slot, node),
+            ElementKind::Stripe => self.render_stripe(slot, node),
+            // ...
+        }
+    }
+
+    fn render_button(&mut self, slot: SlotId, node: &ElementNode) {
+        // Extract style properties
+        let font_size = self.extract_style(node.settings_slot, &["style", "font", "size"]);
+        let label = self.extract_text(node.settings_slot, &["label"]);
+
+        // Create or update Zoon button
+        let btn = Button::new()
+            .label(label)
+            .style("font-size", font_size);
+
+        // Wire DOM events to IOPads
+        let press_iopad = node.event_slots.get(&EventKind::Press);
+        btn.on_press(move || {
+            self.event_loop.inject_dom_event(press_iopad, Payload::Empty);
+        });
+
+        self.rendered_elements.insert(slot, btn.into());
+    }
+}
+```
+
+#### Style Converters
+
+```rust
+pub struct StyleConverters;
+
+impl StyleConverters {
+    pub fn number_to_px(payload: &Payload, ctx: &str) -> String {
+        format!("{}px", payload.expect_number(ctx))
+    }
+
+    pub fn oklch_to_css(payload: &Payload, ctx: &str) -> String {
+        let obj = payload.expect_object_handle(ctx);
+        // Extract l, c, h, alpha from object
+        format!("oklch({} {} {} / {})", l, c, h, alpha)
+    }
+
+    pub fn directional_to_css(payload: &Payload, ctx: &str) -> String {
+        match payload {
+            Payload::Number(n) => format!("{}px", n),
+            Payload::ObjectHandle(slot) => {
+                // Extract top/right/bottom/left with row/column fallbacks
+                format!("{}px {}px {}px {}px", top, right, bottom, left)
+            }
+            _ => panic!("{}: expected Number or Object for padding", ctx),
+        }
+    }
+}
+```
+
+---
+
+### 8.5 Module Structure (New Engine)
+
+```
+crates/boon/src/platform/browser/engine_v2/
+├── mod.rs                      # Arena, SlotId, EventLoop, ReactiveNode
+├── nodes.rs                    # Node kinds (Router, Register, Transformer, Bus, IOPad)
+├── message.rs                  # Message, Payload, NodeAddress
+├── routing.rs                  # RoutingTable
+├── functions/
+│   ├── mod.rs                  # BoonFunction trait, FunctionContext, Arguments
+│   ├── registry.rs             # FunctionRegistry
+│   ├── text.rs                 # TextTrim, TextEmpty, TextSpace, etc.
+│   ├── math.rs                 # MathSum
+│   ├── bool.rs                 # BoolNot, BoolToggle
+│   ├── list.rs                 # ListAppend, ListCount, ListClear, etc.
+│   ├── element.rs              # ElementButton, ElementStripe, etc.
+│   ├── document.rs             # DocumentNew
+│   ├── timer.rs                # TimerInterval
+│   ├── log.rs                  # LogInfo, LogError
+│   └── stream.rs               # StreamPulses, StreamDebounce, etc.
+├── bridge.rs                   # Bridge (arena → Zoon)
+└── converters.rs               # Style converters (number_to_px, oklch_to_css, etc.)
+```
+
+---
+
+### 8.6 Implementation Phases
+
+**Note:** Bridge/API is built as part of the new engine, not migrated from old.
+
+#### Part of Phase 7: Bridge & UI
+1. Implement `BoonFunction` trait and `FunctionRegistry`
+2. Implement core functions: `Text/*`, `Math/*`, `Bool/*`
+3. Implement element functions: `Element/*`, `Document/*`
+4. Implement `Bridge` for arena→Zoon rendering
+5. Implement style converters
+6. Implement IOPad event handling
+7. **Milestone:** `counter.bn` with button works
+
+#### Part of Phase 7 (continued):
+8. Implement list functions: `List/*`
+9. Implement timer: `Timer/interval`
+10. Implement side-effects: `Log/*`
+11. **Milestone:** `todo_mvc.bn` works
+
+---
+
+### 8.7 Critical Files (New Engine)
+
+| File | Purpose |
+|------|---------|
+| `engine_v2/functions/mod.rs` | BoonFunction trait, FunctionContext, Arguments |
+| `engine_v2/functions/registry.rs` | FunctionRegistry with stdlib |
+| `engine_v2/functions/element.rs` | Element functions (Button, Stripe, etc.) |
+| `engine_v2/bridge.rs` | Arena→Zoon rendering |
+| `engine_v2/converters.rs` | Style property converters |
+| `engine_v2/nodes.rs` | IOPadNode for events |
+
+---
+
+### 8.8 Benefits Summary
+
+| Aspect | Old Engine | New Engine |
+|--------|------------|------------|
+| Function definition | Closure in match arm | Implement `BoonFunction` trait |
+| Argument access | `Arc<ValueActor>` streams | `SlotId` direct arena access |
+| Error messages | "expected Object" | "Element/button: settings.style.font expected Object, got Number" |
+| Event handling | ActorLoop + select! | IOPadNode in arena |
+| Style extraction | 5-7 flat_map chains | `Arena.navigate_field_path()` |
+| Stream lifecycle | Manual `chain(pending())` | Not needed (arena manages lifecycle) |
+| User extensibility | None | Implement `BoonFunction` trait, register |
+| Debugging | Scattered async streams | Single arena state, deterministic ticks |
+
+---
+

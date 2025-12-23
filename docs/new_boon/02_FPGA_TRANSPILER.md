@@ -1,0 +1,1112 @@
+# Part 13: FPGA Circuit Design - Boon-to-SystemVerilog Transpiler
+
+**Goal:** Generate synthesizable SystemVerilog from Boon source code for real FPGA deployment.
+
+**First Milestone:** Transpile `super_counter.bn` → working `super_counter.sv` verified by Yosys synthesis.
+
+---
+
+## 13.1 Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Boon Source (.bn)                               │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    PHASE 1: Parsing (existing)                          │
+│   crates/boon/src/parser/ → lexer.rs, parser.rs, scope_resolver.rs     │
+│   Output: Expression AST with resolved references                       │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    PHASE 2: Type Inference (new)                        │
+│   crates/boon-hdl/src/type_system/                                      │
+│   - Infer BITS[N] widths from literals and operations                   │
+│   - Propagate widths through pipes and function calls                   │
+│   - Detect unsynthesizable patterns (dynamic LIST, unbounded recursion) │
+│   Output: Typed AST with explicit hardware types                        │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    PHASE 3: Elaboration (new)                           │
+│   crates/boon-hdl/src/elaboration/                                      │
+│   - Evaluate compile-time constants (Config.clock_hz / Config.baud)     │
+│   - Inline functions with known arguments                               │
+│   - Unroll LIST[N, T] operations to parallel hardware                   │
+│   - Generate module hierarchy from FUNCTION definitions                 │
+│   Output: Flattened HIR (Hardware IR) with no generics                  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    PHASE 4: Code Generation (new)                       │
+│   crates/boon-hdl/src/codegen/                                          │
+│   - Lower HIR to SystemVerilog strings                                  │
+│   - Generate module, always_ff, always_comb, assign blocks              │
+│   - Handle naming, formatting, comments                                 │
+│   Output: SystemVerilog file (.sv)                                      │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         SystemVerilog (.sv)                             │
+│   → Yosys synthesis → bitstream → FPGA                                  │
+│   → Optional: yosys2digitaljs → DigitalJS simulation                    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 13.2 New Crate: `crates/boon-hdl/`
+
+**Rationale:** Separate crate because:
+- HDL compilation is batch, not reactive runtime
+- No async dependencies (no zoon, mpsc, Task)
+- Can import `boon::parser` for AST types
+- Independent versioning and optimization
+
+**Structure:**
+
+```
+crates/boon-hdl/
+├── Cargo.toml
+├── src/
+│   ├── lib.rs                    # Public API
+│   ├── error.rs                  # HdlError, diagnostics
+│   │
+│   ├── type_system/
+│   │   ├── mod.rs
+│   │   ├── types.rs              # HirType, Width, SignedWidth
+│   │   ├── inference.rs          # Type inference engine
+│   │   └── checker.rs            # Synthesizability checks
+│   │
+│   ├── elaboration/
+│   │   ├── mod.rs
+│   │   ├── const_eval.rs         # Compile-time constant evaluation
+│   │   ├── unroll.rs             # LIST[N] → parallel hardware
+│   │   └── module_builder.rs     # Build module hierarchy
+│   │
+│   ├── hir/                      # Hardware Intermediate Representation
+│   │   ├── mod.rs
+│   │   ├── types.rs              # HirModule, HirSignal, HirRegister, etc.
+│   │   └── from_ast.rs           # AST → HIR lowering
+│   │
+│   └── codegen/
+│       ├── mod.rs
+│       ├── sv_writer.rs          # HIR → SystemVerilog
+│       └── naming.rs             # Identifier mangling rules
+│
+└── tests/
+    ├── super_counter.rs          # First milestone test
+    └── examples/                 # Per-example tests
+```
+
+---
+
+## 13.3 Hardware Intermediate Representation (HIR)
+
+### 13.3.1 Core Types
+
+```rust
+// crates/boon-hdl/src/hir/types.rs
+
+/// Hardware module (→ SystemVerilog module)
+pub struct HirModule {
+    pub name: String,
+    pub source_span: Span,              // For error reporting
+    pub generics: Vec<HirGeneric>,      // Before elaboration
+    pub ports: Vec<HirPort>,
+    pub signals: Vec<HirSignal>,
+    pub registers: Vec<HirRegister>,
+    pub instances: Vec<HirInstance>,
+    pub combinational: Vec<HirCombBlock>,
+    pub sequential: Vec<HirSeqBlock>,
+}
+
+/// Port direction
+pub enum PortDir {
+    Input,
+    Output,
+    InOut,  // For bidirectional (rare in Boon)
+}
+
+/// A module port
+pub struct HirPort {
+    pub name: String,
+    pub dir: PortDir,
+    pub ty: HirType,
+    pub is_clock: bool,     // Special handling for clock ports
+    pub is_reset: bool,     // Special handling for reset ports
+}
+
+/// Hardware types with compile-time known sizes
+pub enum HirType {
+    Bit,                                        // logic (1-bit)
+    Bits { width: u32, signed: bool },          // logic [width-1:0]
+    Array { size: u32, elem: Box<HirType> },    // Fixed-size array
+    Record { name: String, fields: Vec<(String, HirType)> },
+    Tag { name: String, variants: Vec<String> }, // Enum with auto-encoding
+}
+
+impl HirType {
+    /// Get total bit width (for flattening)
+    pub fn bit_width(&self) -> u32 {
+        match self {
+            HirType::Bit => 1,
+            HirType::Bits { width, .. } => *width,
+            HirType::Array { size, elem } => size * elem.bit_width(),
+            HirType::Record { fields, .. } => fields.iter().map(|(_, t)| t.bit_width()).sum(),
+            HirType::Tag { variants, .. } => (variants.len() as f64).log2().ceil() as u32,
+        }
+    }
+}
+```
+
+### 13.3.2 Signals and Registers
+
+```rust
+/// Internal signal (wire)
+pub struct HirSignal {
+    pub name: String,
+    pub ty: HirType,
+    pub source: SignalSource,
+    pub span: Span,
+}
+
+pub enum SignalSource {
+    Port(String),           // From module port
+    Register(String),       // From register output
+    Combinational,          // From always_comb
+    Instance(String, String), // (instance_name, port_name)
+    Constant(HirLiteral),   // Tied to constant
+}
+
+/// A register (from HOLD or LATEST with state)
+pub struct HirRegister {
+    pub name: String,
+    pub ty: HirType,
+    pub clock: ClockSpec,
+    pub reset: Option<ResetSpec>,
+    pub initial: HirExpr,
+    pub next: HirExpr,          // Next-state logic
+    pub enable: Option<HirExpr>, // Optional clock enable
+    pub span: Span,
+}
+
+pub struct ClockSpec {
+    pub signal: String,
+    pub edge: ClockEdge,
+}
+
+pub enum ClockEdge {
+    Posedge,
+    Negedge,
+}
+
+pub struct ResetSpec {
+    pub signal: String,
+    pub active_low: bool,
+    pub synchronous: bool,
+    pub value: HirExpr,     // Reset value
+}
+```
+
+### 13.3.3 Expressions
+
+```rust
+/// Hardware expression (synthesizable subset)
+pub enum HirExpr {
+    // Terminals
+    Signal(String),
+    Literal(HirLiteral),
+
+    // Operators
+    BinaryOp { op: BinOp, lhs: Box<Self>, rhs: Box<Self>, result_width: u32 },
+    UnaryOp { op: UnaryOp, operand: Box<Self>, result_width: u32 },
+
+    // Multiplexing
+    Mux {
+        sel: Box<Self>,
+        cases: Vec<(HirPattern, Box<Self>)>,
+        default: Option<Box<Self>>,
+        result_ty: HirType,
+    },
+    Ternary { cond: Box<Self>, then_expr: Box<Self>, else_expr: Box<Self> },
+
+    // Bit manipulation
+    Concat(Vec<Self>),
+    Slice { signal: Box<Self>, high: u32, low: u32 },
+    Index { signal: Box<Self>, index: Box<Self> },  // Dynamic index
+    StaticIndex { signal: Box<Self>, index: u32 },  // Static index
+
+    // Compound
+    FieldAccess { record: Box<Self>, field: String },
+    ArrayInit { elements: Vec<Self>, elem_ty: HirType },
+    RecordInit { ty_name: String, fields: Vec<(String, Self)> },
+}
+
+pub enum BinOp {
+    // Arithmetic
+    Add, Sub, Mul, Div, Mod,
+    // Comparison
+    Eq, Ne, Lt, Le, Gt, Ge,
+    // Bitwise
+    And, Or, Xor, Nand, Nor, Xnor,
+    // Shift
+    Shl, Shr, Ashr,  // Arithmetic shift right
+}
+
+pub enum UnaryOp {
+    Not,        // Bitwise NOT
+    Neg,        // Arithmetic negation
+    RedAnd,     // Reduction AND (&x)
+    RedOr,      // Reduction OR (|x)
+    RedXor,     // Reduction XOR (^x)
+}
+
+pub enum HirLiteral {
+    Bits { width: u32, value: u64, signed: bool },
+    Bool(bool),
+    // For larger constants
+    BigBits { width: u32, value: Vec<u8>, signed: bool },
+}
+```
+
+### 13.3.4 Module Instances
+
+```rust
+/// Instantiation of another module
+pub struct HirInstance {
+    pub name: String,               // Instance name (u_debouncer, etc.)
+    pub module: String,             // Module being instantiated
+    pub connections: Vec<PortConnection>,
+    pub span: Span,
+}
+
+pub struct PortConnection {
+    pub port: String,       // Port name on instantiated module
+    pub signal: HirExpr,    // Connected signal/expression
+}
+
+/// Combinational logic block
+pub struct HirCombBlock {
+    pub outputs: Vec<String>,   // Signals assigned in this block
+    pub logic: HirExpr,         // The combinational logic
+    pub span: Span,
+}
+
+/// Sequential logic block (for complex patterns)
+pub struct HirSeqBlock {
+    pub clock: ClockSpec,
+    pub reset: Option<ResetSpec>,
+    pub body: Vec<SeqStatement>,
+    pub span: Span,
+}
+
+pub enum SeqStatement {
+    Assign { target: String, value: HirExpr },
+    If { cond: HirExpr, then_body: Vec<SeqStatement>, else_body: Vec<SeqStatement> },
+    Case { sel: HirExpr, arms: Vec<(HirPattern, Vec<SeqStatement>)>, default: Vec<SeqStatement> },
+}
+```
+
+---
+
+## 13.4 AST → HIR Lowering
+
+### 13.4.1 Lowering Rules
+
+```rust
+// crates/boon-hdl/src/hir/from_ast.rs
+
+impl HirLowering {
+    /// Lower a Boon FUNCTION to HirModule
+    pub fn lower_function(&mut self, func: &Function) -> Result<HirModule, HdlError> {
+        let mut module = HirModule::new(func.name.clone());
+
+        // Extract PASSED context for implicit ports (clk, rst)
+        if let Some(passed) = self.find_passed_context(func) {
+            for (name, _) in passed.fields() {
+                if name == "clk" {
+                    module.ports.push(HirPort::clock("clk"));
+                } else if name == "rst" || name == "reset" {
+                    module.ports.push(HirPort::reset(name));
+                }
+            }
+        }
+
+        // Add explicit parameters as input ports
+        for param in &func.parameters {
+            let ty = self.infer_type(&param.ty)?;
+            module.ports.push(HirPort::input(param.name.clone(), ty));
+        }
+
+        // Process body
+        self.lower_block(&func.body, &mut module)?;
+
+        // Determine output ports from BLOCK output
+        self.extract_outputs(&func.body, &mut module)?;
+
+        Ok(module)
+    }
+
+    /// Lower HOLD/LATEST with state to HirRegister
+    pub fn lower_hold(&mut self, hold: &Hold, module: &mut HirModule) -> Result<(), HdlError> {
+        let clock = self.extract_clock_from_body(&hold.body)?;
+        let reset = self.extract_reset_from_body(&hold.body)?;
+        let next_logic = self.lower_next_state_logic(&hold.body)?;
+
+        let register = HirRegister {
+            name: hold.state_name.clone(),
+            ty: self.infer_type(&hold.initial)?,
+            clock,
+            reset,
+            initial: self.lower_expr(&hold.initial)?,
+            next: next_logic,
+            enable: None,
+            span: hold.span.clone(),
+        };
+
+        module.registers.push(register);
+        Ok(())
+    }
+
+    /// Lower WHILE to ternary or mux
+    pub fn lower_while(&mut self, while_expr: &While) -> Result<HirExpr, HdlError> {
+        // Simple True/False pattern → ternary
+        if self.is_simple_bool_match(&while_expr.arms) {
+            let cond = self.lower_expr(&while_expr.input)?;
+            let then_expr = self.lower_expr(&while_expr.arms[0].body)?;  // True arm
+            let else_expr = self.lower_expr(&while_expr.arms[1].body)?;  // False arm
+            return Ok(HirExpr::Ternary {
+                cond: Box::new(cond),
+                then_expr: Box::new(then_expr),
+                else_expr: Box::new(else_expr),
+            });
+        }
+
+        // Complex pattern → full mux
+        self.lower_pattern_match(&while_expr.input, &while_expr.arms)
+    }
+
+    /// Lower WHEN to case/mux
+    pub fn lower_when(&mut self, when: &When) -> Result<HirExpr, HdlError> {
+        let sel = self.lower_expr(&when.input)?;
+        let mut cases = Vec::new();
+        let mut default = None;
+
+        for arm in &when.arms {
+            if arm.pattern.is_wildcard() {
+                default = Some(Box::new(self.lower_expr(&arm.body)?));
+            } else {
+                let pattern = self.lower_pattern(&arm.pattern)?;
+                let body = self.lower_expr(&arm.body)?;
+                cases.push((pattern, Box::new(body)));
+            }
+        }
+
+        Ok(HirExpr::Mux {
+            sel: Box::new(sel),
+            cases,
+            default,
+            result_ty: self.infer_result_type(&when)?,
+        })
+    }
+}
+```
+
+### 13.4.2 Pattern Recognition
+
+```rust
+impl HirLowering {
+    /// Detect `PASSED.clk |> THEN { ... }` pattern
+    fn is_clocked_block(&self, expr: &Expression) -> bool {
+        matches!(expr,
+            Expression::Pipe { from, to } if
+                self.is_passed_clk(from) &&
+                matches!(**to, Expression::Then { .. })
+        )
+    }
+
+    /// Extract clock specification from PASSED.clk
+    fn extract_clock(&self, expr: &Expression) -> Result<ClockSpec, HdlError> {
+        if let Expression::FieldAccess { object, field } = expr {
+            if self.is_passed_context(object) {
+                return Ok(ClockSpec {
+                    signal: field.clone(),
+                    edge: ClockEdge::Posedge, // Default for THEN
+                });
+            }
+        }
+        Err(HdlError::MissingClock(expr.span().clone()))
+    }
+
+    /// Detect reset pattern: `rst |> WHILE { True => reset_val, False => normal }`
+    fn extract_reset_pattern(&self, expr: &Expression) -> Option<(ResetSpec, HirExpr)> {
+        if let Expression::Pipe { from, to } = expr {
+            if let Expression::While { arms, .. } = &**to {
+                if arms.len() == 2 && self.is_bool_pattern(&arms[0].pattern, true) {
+                    let reset_value = self.lower_expr(&arms[0].body).ok()?;
+                    let normal_logic = self.lower_expr(&arms[1].body).ok()?;
+
+                    return Some((
+                        ResetSpec {
+                            signal: self.extract_signal_name(from)?,
+                            active_low: false,
+                            synchronous: true,
+                            value: reset_value,
+                        },
+                        normal_logic,
+                    ));
+                }
+            }
+        }
+        None
+    }
+}
+```
+
+---
+
+## 13.5 Boon → SystemVerilog Mapping
+
+### 13.5.1 Construct Mappings
+
+| Boon Construct | SystemVerilog Output | Notes |
+|----------------|---------------------|-------|
+| `FUNCTION name(params) { BLOCK { ... } }` | `module name (...); ... endmodule` | Params become ports |
+| `PASSED: [clk: clk_input]` | `input logic clk` | Implicit clock port |
+| `PASSED.clk \|> THEN { body }` | `always_ff @(posedge clk)` | Clock edge trigger |
+| `initial \|> LATEST state { ... }` | Register with `always_ff` | Stateful node |
+| `initial \|> HOLD state { ... }` | Same as LATEST | Alternative syntax |
+| `x \|> WHILE { True => a, False => b }` | `x ? a : b` | Ternary operator |
+| `x \|> WHEN { A => ..., B => ... }` | `case (x) A: ...; B: ...; endcase` | Case statement |
+| `BLOCK { vars, output }` | Local signals + assignments | Scoped variables |
+| `func(args)` | `func u_func (.port(arg), ...)` | Module instantiation |
+| `[field: value, ...]` | Struct or flattened signals | Record literal |
+| `Tag` (Idle, Send, etc.) | `typedef enum` | State encoding |
+
+### 13.5.2 Type Mappings
+
+| Boon Type | SystemVerilog | Notes |
+|-----------|---------------|-------|
+| `Bool` | `logic` | 1-bit |
+| `True` / `False` | `1'b1` / `1'b0` | Boolean literals |
+| `BITS[N] { 10uV }` | `N'dV` | Decimal literal |
+| `BITS[N] { 16uV }` | `N'hV` | Hex literal |
+| `BITS[N] { 2uV }` | `N'bV` | Binary literal |
+| `BITS[N] { 10sV }` | `N'sd V` | Signed decimal |
+| `LIST[N, T]` | `T name [0:N-1]` | Fixed-size array |
+| `[a: T1, b: T2]` | `struct packed { T1 a; T2 b; }` | Record |
+| `StateTag` | `typedef enum logic [W:0] { ... }` | Auto-width enum |
+
+### 13.5.3 Operation Mappings
+
+| Boon Operation | SystemVerilog | Notes |
+|----------------|---------------|-------|
+| `a \|> Bits/add(b)` | `a + b` | Addition |
+| `a \|> Bits/subtract(b)` | `a - b` | Subtraction |
+| `a \|> Bits/multiply(b)` | `a * b` | Multiplication |
+| `a \|> Bits/divide(b)` | `a / b` | Division (expensive!) |
+| `a \|> Bits/modulo(b)` | `a % b` | Modulo |
+| `a \|> Bits/equal(b)` | `a == b` | Equality |
+| `a \|> Bits/not_equal(b)` | `a != b` | Inequality |
+| `a \|> Bits/less_than(b)` | `a < b` | Less than |
+| `a \|> Bits/less_equal(b)` | `a <= b` | Less or equal |
+| `a \|> Bits/greater_than(b)` | `a > b` | Greater than |
+| `a \|> Bits/greater_equal(b)` | `a >= b` | Greater or equal |
+| `a \|> Bits/shift_left(by: n)` | `a << n` | Left shift |
+| `a \|> Bits/shift_right(by: n)` | `a >> n` | Logical right shift |
+| `a \|> Bits/shift_right_arith(by: n)` | `a >>> n` | Arithmetic right shift |
+| `a \|> Bits/and(b)` | `a & b` | Bitwise AND |
+| `a \|> Bits/or(b)` | `a \| b` | Bitwise OR |
+| `a \|> Bits/xor(b)` | `a ^ b` | Bitwise XOR |
+| `a \|> Bits/not()` | `~a` | Bitwise NOT |
+| `a \|> Bits/get(index: i)` | `a[i]` | Bit select |
+| `a \|> Bits/set(index: i, value: v)` | `{a[W-1:i+1], v, a[i-1:0]}` | Bit replace |
+| `a \|> Bits/slice(high: h, low: l)` | `a[h:l]` | Bit slice |
+| `a \|> Bits/concat(b)` | `{a, b}` | Concatenation |
+| `a \|> Bits/zero_extend(to: n)` | `{{(n-W){1'b0}}, a}` | Zero extend |
+| `a \|> Bits/sign_extend(to: n)` | `{{(n-W){a[W-1]}}, a}` | Sign extend |
+| `Bool/not(a)` | `!a` | Logical NOT |
+| `Bool/and(a, b)` | `a && b` | Logical AND |
+| `Bool/or(a, b)` | `a \|\| b` | Logical OR |
+| `list \|> List/get(index: i)` | `list[i]` | Array index |
+| `record.field` | `record.field` | Field access |
+
+---
+
+## 13.6 Type System Constraints
+
+### 13.6.1 Fixed-Size Requirement
+
+Every signal must have compile-time known width:
+
+```boon
+-- ✅ OK: Width from literal
+counter: BITS[8] { 10u0 }
+
+-- ✅ OK: Width from constant expression
+count_width: 8
+counter: BITS[count_width] { 10u0 }
+
+-- ✅ OK: Width from Config record
+Config: [width: 32]
+data: BITS[Config.width] { 10u0 }
+
+-- ✅ OK: Width from arithmetic on constants
+data: BITS[8 + 4] { 10u0 }  -- BITS[12]
+
+-- ❌ ERROR: Dynamic width
+fn get_width() { ... }
+data: BITS[get_width()] { 10u0 }  -- "Width must be compile-time constant"
+```
+
+### 13.6.2 Fixed-Size Lists
+
+```boon
+-- ✅ OK: Size known at compile time
+bcd: [BITS[4] { 10u0 }, BITS[4] { 10u0 }, BITS[4] { 10u0 }]  -- LIST[3, BITS[4]]
+msg: LIST[10] { BITS[8] { 10u0 } }
+
+-- ✅ OK: List/map with fixed-size list (elaboration-time unrolling)
+inverted: bits |> List/map(bit: bit |> Bool/not())
+
+-- ✅ OK: List/fold for reduction
+parity: bits |> List/fold(init: False, acc, bit: acc |> Bool/xor(bit))
+
+-- ❌ ERROR: Dynamic list
+items: LIST { ... }  -- "Dynamic LIST not allowed in hardware"
+
+-- ❌ ERROR: Size-changing operations
+items |> List/append(x)  -- "Cannot change size of hardware list"
+items |> List/filter(...)  -- "Cannot change size of hardware list"
+```
+
+### 13.6.3 Width Inference Rules
+
+```rust
+// crates/boon-hdl/src/type_system/inference.rs
+
+impl TypeInference {
+    fn infer_binary_op(&self, op: BinOp, lhs: &HirType, rhs: &HirType) -> Result<HirType, TypeError> {
+        match op {
+            // Comparison operators always return 1-bit
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                self.check_widths_match(lhs, rhs)?;
+                Ok(HirType::Bit)
+            }
+
+            // Arithmetic: result width = max(lhs, rhs) for add/sub
+            BinOp::Add | BinOp::Sub => {
+                let lhs_w = lhs.bit_width();
+                let rhs_w = rhs.bit_width();
+                Ok(HirType::Bits { width: max(lhs_w, rhs_w), signed: lhs.is_signed() })
+            }
+
+            // Multiplication: result width = lhs + rhs
+            BinOp::Mul => {
+                let lhs_w = lhs.bit_width();
+                let rhs_w = rhs.bit_width();
+                Ok(HirType::Bits { width: lhs_w + rhs_w, signed: lhs.is_signed() })
+            }
+
+            // Bitwise: widths must match, result same width
+            BinOp::And | BinOp::Or | BinOp::Xor => {
+                self.check_widths_match(lhs, rhs)?;
+                Ok(lhs.clone())
+            }
+
+            // Shift: result width = lhs width
+            BinOp::Shl | BinOp::Shr | BinOp::Ashr => {
+                Ok(lhs.clone())
+            }
+        }
+    }
+}
+```
+
+---
+
+## 13.7 Elaboration
+
+### 13.7.1 Compile-Time Constant Evaluation
+
+```rust
+// crates/boon-hdl/src/elaboration/const_eval.rs
+
+pub struct ConstEvaluator {
+    env: HashMap<String, ConstValue>,
+}
+
+pub enum ConstValue {
+    Number(i64),
+    Bool(bool),
+    List(Vec<ConstValue>),
+    Record(HashMap<String, ConstValue>),
+}
+
+impl ConstEvaluator {
+    /// Evaluate expression to compile-time constant
+    pub fn eval(&self, expr: &Expression) -> Result<ConstValue, ElabError> {
+        match expr {
+            Expression::Literal(Literal::Number(n)) => Ok(ConstValue::Number(*n as i64)),
+
+            Expression::Alias(name) => {
+                self.env.get(name).cloned()
+                    .ok_or(ElabError::NotConstant(name.clone()))
+            }
+
+            Expression::FieldAccess { object, field } => {
+                let obj = self.eval(object)?;
+                if let ConstValue::Record(fields) = obj {
+                    fields.get(field).cloned()
+                        .ok_or(ElabError::NoSuchField(field.clone()))
+                } else {
+                    Err(ElabError::NotARecord)
+                }
+            }
+
+            Expression::ArithmeticOperator(op) => self.eval_arith(op),
+
+            _ => Err(ElabError::NotConstant(format!("{:?}", expr))),
+        }
+    }
+
+    /// Evaluate arithmetic operations
+    fn eval_arith(&self, op: &ArithOp) -> Result<ConstValue, ElabError> {
+        match op {
+            ArithOp::Add(a, b) => {
+                let a = self.eval(a)?.as_number()?;
+                let b = self.eval(b)?.as_number()?;
+                Ok(ConstValue::Number(a + b))
+            }
+            ArithOp::Subtract(a, b) => {
+                let a = self.eval(a)?.as_number()?;
+                let b = self.eval(b)?.as_number()?;
+                Ok(ConstValue::Number(a - b))
+            }
+            ArithOp::Multiply(a, b) => {
+                let a = self.eval(a)?.as_number()?;
+                let b = self.eval(b)?.as_number()?;
+                Ok(ConstValue::Number(a * b))
+            }
+            ArithOp::Divide(a, b) => {
+                let a = self.eval(a)?.as_number()?;
+                let b = self.eval(b)?.as_number()?;
+                if b == 0 {
+                    return Err(ElabError::DivideByZero);
+                }
+                Ok(ConstValue::Number(a / b))
+            }
+        }
+    }
+}
+```
+
+### 13.7.2 LIST Unrolling
+
+```rust
+// crates/boon-hdl/src/elaboration/unroll.rs
+
+impl Elaborator {
+    /// Unroll List/map to parallel instances
+    pub fn unroll_list_map(
+        &mut self,
+        list: &HirExpr,
+        elem_name: &str,
+        body: &Expression,
+    ) -> Result<Vec<HirExpr>, ElabError> {
+        let size = self.get_list_size(list)?;
+        let mut results = Vec::with_capacity(size);
+
+        for i in 0..size {
+            // Create indexed access
+            let elem = HirExpr::StaticIndex {
+                signal: Box::new(list.clone()),
+                index: i as u32
+            };
+
+            // Substitute element variable and lower body
+            let body_lowered = self.lower_with_substitution(body, elem_name, &elem)?;
+            results.push(body_lowered);
+        }
+
+        Ok(results)
+    }
+
+    /// Unroll List/fold to chain of operations
+    pub fn unroll_list_fold(
+        &mut self,
+        list: &HirExpr,
+        init: &HirExpr,
+        acc_name: &str,
+        elem_name: &str,
+        body: &Expression,
+    ) -> Result<HirExpr, ElabError> {
+        let size = self.get_list_size(list)?;
+        let mut acc = init.clone();
+
+        for i in 0..size {
+            let elem = HirExpr::StaticIndex {
+                signal: Box::new(list.clone()),
+                index: i as u32
+            };
+
+            // acc = body(acc, elem)
+            acc = self.lower_with_substitutions(
+                body,
+                &[(acc_name, &acc), (elem_name, &elem)]
+            )?;
+        }
+
+        Ok(acc)
+    }
+}
+```
+
+---
+
+## 13.8 Code Generation
+
+### 13.8.1 SystemVerilog Writer
+
+```rust
+// crates/boon-hdl/src/codegen/sv_writer.rs
+
+pub struct SvWriter {
+    indent: usize,
+    output: String,
+}
+
+impl SvWriter {
+    pub fn write_module(&mut self, module: &HirModule) -> String {
+        self.writeln(&format!("module {} (", module.name));
+        self.indent += 1;
+
+        // Write ports
+        for (i, port) in module.ports.iter().enumerate() {
+            let comma = if i < module.ports.len() - 1 { "," } else { "" };
+            self.write_port(port, comma);
+        }
+
+        self.indent -= 1;
+        self.writeln(");");
+        self.writeln("");
+
+        self.indent += 1;
+
+        // Write enums
+        for reg in &module.registers {
+            if let HirType::Tag { name, variants } = &reg.ty {
+                self.write_enum(name, variants);
+            }
+        }
+
+        // Write local signals
+        for signal in &module.signals {
+            self.write_signal_decl(signal);
+        }
+        self.writeln("");
+
+        // Write register declarations
+        for reg in &module.registers {
+            self.write_register_decl(reg);
+        }
+
+        // Write combinational logic
+        for comb in &module.combinational {
+            self.write_comb_block(comb);
+        }
+
+        // Write sequential logic (registers)
+        for reg in &module.registers {
+            self.write_register_logic(reg);
+        }
+
+        // Write instances
+        for inst in &module.instances {
+            self.write_instance(inst);
+        }
+
+        self.indent -= 1;
+        self.writeln("endmodule");
+
+        std::mem::take(&mut self.output)
+    }
+
+    fn write_register_logic(&mut self, reg: &HirRegister) {
+        let edge = match reg.clock.edge {
+            ClockEdge::Posedge => "posedge",
+            ClockEdge::Negedge => "negedge",
+        };
+
+        self.writeln(&format!("always_ff @({} {}) begin", edge, reg.clock.signal));
+        self.indent += 1;
+
+        if let Some(reset) = &reg.reset {
+            let cond = if reset.active_low {
+                format!("!{}", reset.signal)
+            } else {
+                reset.signal.clone()
+            };
+
+            self.writeln(&format!("if ({}) begin", cond));
+            self.indent += 1;
+            self.writeln(&format!("{} <= {};", reg.name, self.expr_to_sv(&reset.value)));
+            self.indent -= 1;
+            self.writeln("end else begin");
+            self.indent += 1;
+            self.writeln(&format!("{} <= {};", reg.name, self.expr_to_sv(&reg.next)));
+            self.indent -= 1;
+            self.writeln("end");
+        } else {
+            self.writeln(&format!("{} <= {};", reg.name, self.expr_to_sv(&reg.next)));
+        }
+
+        self.indent -= 1;
+        self.writeln("end");
+        self.writeln("");
+    }
+
+    fn expr_to_sv(&self, expr: &HirExpr) -> String {
+        match expr {
+            HirExpr::Signal(name) => name.clone(),
+
+            HirExpr::Literal(lit) => self.literal_to_sv(lit),
+
+            HirExpr::BinaryOp { op, lhs, rhs, .. } => {
+                let op_str = match op {
+                    BinOp::Add => "+",
+                    BinOp::Sub => "-",
+                    BinOp::Mul => "*",
+                    BinOp::Eq => "==",
+                    BinOp::Ne => "!=",
+                    BinOp::Lt => "<",
+                    BinOp::Le => "<=",
+                    BinOp::Gt => ">",
+                    BinOp::Ge => ">=",
+                    BinOp::And => "&",
+                    BinOp::Or => "|",
+                    BinOp::Xor => "^",
+                    BinOp::Shl => "<<",
+                    BinOp::Shr => ">>",
+                    BinOp::Ashr => ">>>",
+                    _ => unimplemented!(),
+                };
+                format!("({} {} {})", self.expr_to_sv(lhs), op_str, self.expr_to_sv(rhs))
+            }
+
+            HirExpr::Ternary { cond, then_expr, else_expr } => {
+                format!("({} ? {} : {})",
+                    self.expr_to_sv(cond),
+                    self.expr_to_sv(then_expr),
+                    self.expr_to_sv(else_expr))
+            }
+
+            HirExpr::Slice { signal, high, low } => {
+                format!("{}[{}:{}]", self.expr_to_sv(signal), high, low)
+            }
+
+            HirExpr::StaticIndex { signal, index } => {
+                format!("{}[{}]", self.expr_to_sv(signal), index)
+            }
+
+            HirExpr::Concat(parts) => {
+                let parts_sv: Vec<_> = parts.iter().map(|p| self.expr_to_sv(p)).collect();
+                format!("{{{}}}", parts_sv.join(", "))
+            }
+
+            HirExpr::FieldAccess { record, field } => {
+                format!("{}.{}", self.expr_to_sv(record), field)
+            }
+
+            _ => unimplemented!("expr_to_sv: {:?}", expr),
+        }
+    }
+}
+```
+
+---
+
+## 13.9 super_counter.bn Requirements
+
+The first milestone requires supporting:
+
+### Constructs
+- [x] `FUNCTION` definitions → `module`
+- [x] `BLOCK` scoping → local signals
+- [x] `PASSED.clk |> THEN { ... }` → `always_ff @(posedge clk)`
+- [x] `initial |> LATEST state { ... }` → register with initial value
+- [x] `WHILE { True => a, False => b }` → ternary `?:`
+- [x] `WHEN { Tag => ... }` → `case` statement
+- [x] Nested WHILE/WHEN → nested conditionals
+- [x] Record literals `[field: value, ...]` → struct or flattened signals
+- [x] Tags `Idle, Send, Wait` → enum encoding
+- [x] Function calls → module instantiation
+- [x] Nested FUNCTION (helper functions) → inlined or separate modules
+
+### Types
+- [x] `Bool` (True, False) → `logic` (1-bit)
+- [x] `BITS[N]` with widths: 1, 4, 8, 10, 17, 20, 32
+- [x] `LIST[N]` fixed-size arrays
+- [x] Records with named fields
+- [x] Tags for FSM states
+
+### Operations
+- [x] `Bool/not`, `Bool/and`
+- [x] `Bits/add`, `Bits/subtract`, `Bits/multiply`
+- [x] `Bits/equal`, `Bits/not_equal`, `Bits/less_than`, `Bits/greater_equal`, `Bits/less_equal`
+- [x] `Bits/shift_right`, `Bits/set`, `Bits/get`, `Bits/slice`
+- [x] `Bits/zero_extend`, `Bits/to_number` (for indexing)
+- [x] `List/get` with constant or variable index
+
+---
+
+## 13.10 Implementation Phases
+
+### Phase 13A: Minimal HIR + CodeGen (FSM Example)
+
+**Goal:** Transpile `fsm.bn` (simplest stateful example)
+
+1. Create `crates/boon-hdl/` crate structure
+2. Define minimal HIR types (HirModule, HirRegister, HirExpr)
+3. Implement AST → HIR for:
+   - `FUNCTION` → `HirModule`
+   - `LATEST state { PASSED.clk |> THEN { ... } }` → `HirRegister`
+   - `WHEN` → `HirExpr::Mux`
+   - Tags → enum encoding
+4. Implement `sv_writer.rs` for basic output
+5. Test: `boon-hdl fsm.bn -o fsm.sv` synthesizes with Yosys
+
+### Phase 13B: BITS Type System
+
+**Goal:** Handle BITS[N] with width inference
+
+1. Implement width inference in `type_system/inference.rs`
+2. Add signed vs unsigned tracking (`10u` vs `10s`)
+3. Implement all `Bits/` API mappings
+4. Width mismatch errors with helpful messages
+5. Test: `counter.bn`, `lfsr.bn`
+
+### Phase 13C: Fixed-Size Lists
+
+**Goal:** Unroll `LIST[N, T]` to parallel hardware
+
+1. Implement `elaboration/const_eval.rs` for compile-time constants
+2. Add `LIST[N]` type tracking and enforcement
+3. Implement `List/get`, `List/map` elaboration (unrolling)
+4. Generate array declarations in SystemVerilog
+5. Test: `serialadder.bn`
+
+### Phase 13D: super_counter Milestone
+
+**Goal:** Full transpilation of super_counter.bn
+
+1. Handle multi-module instantiation (function calls)
+2. Implement nested BLOCK scoping
+3. Add record type flattening
+4. Handle complex FSM patterns with nested WHILE/WHEN
+5. Generate complete `super_counter.sv`
+6. Verify with Yosys: `yosys -p "read_verilog super_counter.sv; synth_ice40"`
+
+### Phase 13E: CLI + Tooling
+
+**Goal:** Production-ready command-line interface
+
+1. Create `boon-hdl` binary crate
+2. CLI options: `--output`, `--target ice40|ecp5|generic`, `--verbose`
+3. Source-mapped error messages with ariadne
+4. Optional Yosys synthesis integration
+5. Documentation and examples
+
+---
+
+## 13.11 Error Messages
+
+Clear errors are essential for hardware designers:
+
+```
+error[E0001]: Dynamic list not allowed in hardware
+  --> super_counter.bn:42:5
+   |
+42 |     items: LIST { a, b, c }
+   |            ^^^^^^^^^^^^^^^^
+   |
+   = help: Use fixed-size list: LIST[3] { a, b, c }
+   = note: Hardware requires compile-time known sizes
+
+error[E0002]: Width mismatch in addition
+  --> counter.bn:15:20
+   |
+15 |     result: a |> Bits/add(b)
+   |                  ^^^^^^^^^^
+   |
+   = note: Left operand has width 8, right operand has width 4
+   = help: Use Bits/zero_extend(b, to: 8) to match widths
+
+error[E0003]: Unsynthesizable construct: recursive function
+  --> example.bn:10:1
+   |
+10 | FUNCTION factorial(n) { ... factorial(n - 1) ... }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: Hardware cannot implement unbounded recursion
+   = help: Use fixed unrolling with LIST[N] and fold instead
+
+error[E0004]: Missing clock for register
+  --> fsm.bn:5:5
+   |
+ 5 |     state: Idle |> LATEST state { ... }
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: Registers require clock source
+   = help: Use PASSED.clk |> THEN { ... } pattern inside the body
+```
+
+---
+
+## 13.12 Critical Files
+
+| File | Purpose |
+|------|---------|
+| `crates/boon/src/parser.rs` | Existing AST definitions (reuse) |
+| `crates/boon/src/parser/static_expression.rs` | Input format for transpiler |
+| `crates/boon-hdl/src/lib.rs` | **NEW:** Public API |
+| `crates/boon-hdl/src/hir/types.rs` | **NEW:** Hardware IR types |
+| `crates/boon-hdl/src/hir/from_ast.rs` | **NEW:** AST → HIR lowering |
+| `crates/boon-hdl/src/type_system/inference.rs` | **NEW:** Width inference |
+| `crates/boon-hdl/src/elaboration/const_eval.rs` | **NEW:** Compile-time evaluation |
+| `crates/boon-hdl/src/elaboration/unroll.rs` | **NEW:** LIST unrolling |
+| `crates/boon-hdl/src/codegen/sv_writer.rs` | **NEW:** HIR → SystemVerilog |
+| `~/repos/digitaljs_uart/super_counter/super_counter.bn` | First milestone input |
+| `playground/frontend/src/examples/hw_examples/README.md` | Transpiler model reference |
+
+---
+
+## 13.13 Relationship to Arena-Based Engine (Parts 1-12)
+
+**Separate compilation paths:**
+- **Browser/Server runtime:** Uses arena-based engine (Parts 1-12)
+- **FPGA synthesis:** Uses boon-hdl transpiler (Part 13)
+
+**Shared components:**
+- Parser (`crates/boon/src/parser/`) - both paths start here
+- AST types (`Expression`, `Pattern`, etc.) - shared definitions
+
+**Key difference:**
+- Arena engine: Dynamic, reactive, async actors
+- HDL transpiler: Static, batch compilation, fixed topology
+
+**Future unification possibility:**
+If fixed-size `LIST[N, T]` is enforced across all targets:
+- Arena engine could pre-allocate fixed slots
+- Same code runs in browser AND synthesizes to FPGA
+- Predictable memory usage everywhere
+
+---
+

@@ -1,0 +1,1061 @@
+## Known Issues & Required Corrections
+
+### K1. ScopeId HOLD Rule (BUG FIX)
+
+**Problem:** The rule "HOLD iteration -> parent.child(iteration_count)" creates a new scope per tick, breaking stable addressing and persistence.
+
+**Correction:** HOLD should NOT create new scopes per iteration. The state variable lives in the parent scope, and body evaluation happens in the SAME scope (not a child scope per tick).
+
+```rust
+// WRONG - breaks stable addressing
+| HOLD iteration | parent.child(iteration_count) |
+
+// CORRECT - body evaluates in existing scope
+| HOLD | Same scope as parent (body re-evaluates, doesn't create new scope) |
+```
+
+### K2. Arc<str> in Payload (Clarification)
+
+**Problem:** "No Arcs in hot path" contradicts `Payload::Text(Arc<str>)`.
+
+**Clarification:** The goal is "no Arc<ValueActor>" (the reactive nodes). `Arc<str>` for immutable strings is acceptable because:
+- Strings are immutable, reference-counted sharing is safe
+- No reactive lifetime management issues
+- Alternative (inline SmallString + overflow Box) adds complexity
+
+**Restated goal:** "No Arc<ValueActor> in hot path. Payload strings use Arc<str> for efficient sharing."
+
+### K3. FPGA Target (Honest Assessment)
+
+**Problem:** Design uses Vec, HashMap, VecDeque, Box, Option<Box<NodeExtension>>. This is NOT synthesizable.
+
+**Correction:** Rename "FPGA synthesis target" to "Hardware-inspired design":
+- Current design is **not synthesizable** without major changes
+- It's **hardware-inspired** for mental model and future direction
+- True synthesis would need: fixed sizes, static routing, no heap
+- ScopeId hashing + dynamic scopes break register identity
+
+**Future FPGA path (if needed):**
+1. Restrict to static programs (no dynamic List growth)
+2. Fixed-size arena allocated at compile time
+3. Pre-computed routing tables
+4. No Option<Box<...>> extensions
+
+### K4. Reactive TEXT Interpolation (Missing Node)
+
+**Problem:** `TEXT { Value: {store.value} }` doesn't update when `store.value` changes.
+
+**Solution:** Add `TextTemplate` node:
+
+```rust
+pub struct TextTemplate {
+    template: String,           // "Value: {0}"
+    dependencies: Vec<SlotId>,  // [store.value slot]
+    cached_output: Option<String>,
+}
+
+impl TextTemplate {
+    fn on_dependency_change(&mut self, _slot: SlotId, _value: Payload) {
+        // Re-render template with new values
+        self.cached_output = None;  // Invalidate cache
+        self.emit_rendered_text();
+    }
+}
+```
+
+**Mapping:** `TEXT { Value: {expr} }` compiles to TextTemplate with dependency on `expr`.
+
+### K5. Single-Thread Fallback Mode
+
+**Problem:** Multi-threaded WASM requires COOP/COEP + SharedArrayBuffer. Many hosting setups don't support this.
+
+**Solution:** Add explicit single-thread mode:
+
+```rust
+pub enum RuntimeMode {
+    SingleThreaded,                      // Default, works everywhere
+    MultiThreaded { worker_count: u8 },  // Requires COOP/COEP headers
+}
+
+impl EventLoop {
+    pub fn new(mode: RuntimeMode) -> Self {
+        match mode {
+            RuntimeMode::SingleThreaded => Self::new_single_threaded(),
+            RuntimeMode::MultiThreaded { .. } => Self::new_multi_threaded(),
+        }
+    }
+}
+```
+
+Phase 9 (Multi-Threading) is OPTIONAL. Single-threaded mode is the default.
+
+### K6. Timer Tick-to-Milliseconds Mapping
+
+**Problem:** Timer code mixes logical ticks and milliseconds: `current_tick + delay_ms`.
+
+**Clarification:** Need explicit wall-clock integration:
+
+```rust
+pub struct EventLoop {
+    current_tick: u64,
+    tick_start_ms: f64,      // Performance.now() when tick started
+    ms_per_tick: f64,        // Default: 16.67 (60 fps)
+}
+
+impl EventLoop {
+    fn schedule_timer(&mut self, node: SlotId, delay_ms: u32) {
+        let target_ms = self.tick_start_ms + (delay_ms as f64);
+        let target_tick = (target_ms / self.ms_per_tick) as u64;
+        self.timer_queue.push(TimerEvent {
+            deadline_tick: target_tick,
+            deadline_ms: target_ms,  // For precise wall-clock check
+            node_id: node,
+        });
+    }
+}
+```
+
+**WASM integration:** `requestAnimationFrame` advances tick + checks wall-clock timers.
+
+### K7. Element State Streams
+
+**Problem:** Examples use `element.hovered`, `element.focused`, reactive style bindings. Docs only mention LINK event pads.
+
+**Solution:** Element state as continuous input signals:
+
+```rust
+pub struct ElementState {
+    pub hovered: SlotId,   // Bool producer, updates on mouseenter/mouseleave
+    pub focused: SlotId,   // Bool producer, updates on focus/blur
+    pub bounds: SlotId,    // Rect producer, updates on resize observer
+}
+
+// LINK includes both events AND state
+pub struct LinkNode {
+    pub events: HashMap<String, SlotId>,   // press, click, key_down
+    pub state: ElementState,                // hovered, focused, bounds
+}
+```
+
+### K8. Server Domain UI Boundary
+
+**Problem:** `Domain::Server` exists but no behavior defined for Document/new, Element/*, Router/go_to.
+
+**Solution:** Domain-specific constraints:
+
+```rust
+impl NodeKind {
+    fn allowed_in_domain(&self, domain: Domain) -> bool {
+        match (self, domain) {
+            // UI nodes only on Main
+            (NodeKind::Document | NodeKind::Element | NodeKind::IOPad, Domain::Server) => false,
+            // Router/go_to has server-specific behavior
+            (NodeKind::RouterGoTo, Domain::Server) => false,  // Or: HTTP redirect?
+            _ => true,
+        }
+    }
+}
+```
+
+**Compile-time check:** Reject UI nodes in server subgraphs.
+
+### K9. Snapshot In-Flight Events
+
+**Problem:** Snapshot only covers nodes, timers, routing. Missing: pending messages, in-flight network.
+
+**Correction:** Expand GraphSnapshot:
+
+```rust
+#[derive(Serialize, Deserialize)]
+pub struct GraphSnapshot {
+    pub tick: u64,
+    pub nodes: Vec<NodeSnapshot>,
+    pub timers: Vec<(u64, NodeAddress)>,
+    pub routing: SerializedRoutingTable,
+    // ADDED:
+    pub pending_messages: Vec<Message>,      // In event queue
+    pub pending_dom_events: Vec<DomEvent>,   // Buffered UI events
+    pub transport_state: Vec<TransportEdgeSnapshot>,  // For reconnection
+}
+```
+
+### K10. Missing API Functions
+
+Functions used in examples but not mapped to nodes:
+
+| Function | Node Mapping |
+|----------|--------------|
+| `List/is_empty` | Reducer: emits Bool when list count changes |
+| `List/is_not_empty` | Reducer: emits Bool |
+| `List/any(if:)` | Reducer: emits Bool when any predicate true |
+| `List/every(if:)` | Reducer: emits Bool when all predicates true |
+| `List/latest` | Combiner: emits last item's value |
+| `List/sort_by(key:)` | Transformer: reorders items, emits ListDelta::Move |
+| `List/get(index:)` | Selector: emits value at index |
+| `List/zip(with:)` | Combiner: pairs two lists |
+| `List/chain(...)` | Combiner: sequential processing |
+| `List/to_u_bits` | Converter: List<Bool> to integer |
+| `Bits/*` | Hardware operations (for hw_examples/) |
+| `Memory/*` | RAM/ROM operations (for hw_examples/) |
+| `tick`, `impulse` | Timer: single-tick pulse |
+| `delta`, `sum` | Accumulator: change detection, running sum |
+| `increment`, `decrement` | Math: +1/-1 operations |
+
+### K11. Known Bugs to Fix
+
+The new engine MUST fix these bug repros:
+
+| Bug | File | Required Fix |
+|-----|------|--------------|
+| WHILE in List/map doesn't update | `list_map_external_dep.bn` | Dynamic subscription tracking for external deps |
+| TEXT interpolation not reactive | `text_interpolation_update.bn` | TextTemplate node (K4) |
+| List/retain + WHILE breaks checkboxes | `filter_checkbox_bug.bn` | Stable list item scopes, correct subscription switching |
+| Chained list remove | `chained_list_remove_bug.bn` | Proper cascade deletion |
+| List object state | `list_object_state.bn` | Object reactivity in list items |
+
+### K12. Missing Examples in Compatibility Doc
+
+**CRITICAL FIX:** EXAMPLE_COMPATIBILITY.md line 508 uses `item_index` for scoping:
+```rust
+let item_scope = parent_scope.child(item_index as u64);  // WRONG!
+```
+This will cause "checkbox sharing / wrong event target" bugs when lists change.
+Must use `item_key` (from AllocSite) instead:
+```rust
+let item_scope = parent_scope.child(item_key);  // CORRECT
+```
+
+**Actual 23 playground examples (from main.rs:156):**
+1. minimal, hello_world, interval, interval_hold, counter, counter_hold
+2. fibonacci, layers, shopping_list, pages, todo_mvc
+3. list_retain_count, list_map_block, list_object_state, list_retain_reactive, list_retain_remove
+4. while_function_call, list_map_external_dep, text_interpolation_update
+5. button_hover_test, switch_hold_test, filter_checkbox_bug, chained_list_remove_bug
+
+**Missing from EXAMPLE_COMPATIBILITY.md (in playground, NOT analyzed):**
+- list_retain_count.bn
+- list_object_state.bn
+- list_retain_reactive.bn
+- while_function_call.bn
+- list_map_external_dep.bn
+- text_interpolation_update.bn
+- button_hover_test.bn
+- switch_hold_test.bn
+- filter_checkbox_bug.bn
+- chained_list_remove_bug.bn
+
+**Analyzed but NOT in playground (outdated):**
+- latest.bn
+- then.bn
+- when.bn
+- while.bn
+
+**EXAMPLE_COMPATIBILITY.md claims 17 examples, actual is 23.** Need to:
+1. Remove/note the 4 examples that don't exist in playground
+2. Add analysis for 10 missing examples
+3. Total should be 23 analyzed examples
+
+### K13. Payload Definition Contradiction
+
+**Problem:** OVERVIEW.md defines Payload twice:
+- Line 364: With `ListDelta(ListDelta)`, `ObjectDelta(ObjectDelta)`
+- Line 640: Without deltas, only `Number`, `Text`, `Tag`, `Flushed`
+
+**Correction:** Unify to single definition with deltas:
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Payload {
+    // Scalars
+    Number(f64),
+    Text(Arc<str>),
+    Tag(u32),
+    Bool(bool),
+
+    // Containers (handles, not storage)
+    ListHandle(SlotId),      // Reference to Bus node
+    ObjectHandle(SlotId),    // Reference to Router node
+
+    // Error wrapper
+    Flushed(Box<Payload>),
+
+    // Deltas (for efficient sync)
+    ListDelta(ListDelta),
+    ObjectDelta(ObjectDelta),
+}
+```
+
+### K14. Alias Field-Path Semantics
+
+**Problem:** Examples heavily use `a.b.c.event.press` (alias paths), but docs don't specify how this resolves.
+
+**Solution:** Define alias-path resolution:
+
+```rust
+// Expression::FieldAccess compilation
+// `store.filter_buttons.all.event.press` becomes:
+//
+// 1. Resolve `store` -> SlotId of store Router
+// 2. Access field `filter_buttons` -> SlotId of nested Router
+// 3. Access field `all` -> SlotId of LinkNode
+// 4. Access field `event` -> SlotId of events Router within LinkNode
+// 5. Access field `press` -> SlotId of press event stream
+
+pub fn resolve_field_path(base: SlotId, path: &[FieldId], arena: &Arena) -> SlotId {
+    let mut current = base;
+    for field in path {
+        current = arena.get(current).get_field(*field)
+            .expect("Field path resolution failed");
+    }
+    current
+}
+```
+
+**Key rule:** Each field access returns a SlotId, not a cloned value. Paths are chains of Router projections.
+
+### K15. LINK Setter Binding/Unbinding Protocol
+
+**Problem:** `|> LINK { store.some_link }` binding semantics not specified. Critical for switch_hold_test.bn, filter_checkbox_bug.bn.
+
+**Solution:** Define LINK lifecycle:
+
+```rust
+pub struct LinkBinding {
+    pub element_id: ElementId,     // DOM element being bound
+    pub link_slot: SlotId,         // LINK node receiving events
+    pub event_listeners: Vec<EventListenerHandle>,
+}
+
+impl LinkNode {
+    // Called when element is created/attached
+    fn bind(&mut self, element_id: ElementId, event_loop: &mut EventLoop) {
+        // 1. Register DOM event listeners
+        // 2. Connect listeners to this LinkNode's event streams
+        // 3. Store handles for cleanup
+        self.bindings.push(LinkBinding { ... });
+    }
+
+    // Called when scope is finalizing (WHILE switch, List/remove)
+    fn unbind(&mut self, element_id: ElementId, event_loop: &mut EventLoop) {
+        // 1. Remove DOM event listeners
+        // 2. Don't emit any more events
+        // 3. Clean up handles
+        self.bindings.retain(|b| b.element_id != element_id);
+    }
+}
+```
+
+**Scope safety:** When WHILE switches arms:
+1. Old arm's LINK bindings are unbound via scope finalization
+2. New arm creates fresh LINK bindings
+3. No event leakage between arms
+
+### K16. List/map External Dependency Tracking
+
+**Problem:** `list_map_external_dep.bn` - List/map item subgraphs don't re-run when external dependencies change.
+
+**Solution:** Track external dependencies per item:
+
+```rust
+pub struct ListMapNode {
+    pub source_list: SlotId,
+    pub item_subgraphs: HashMap<ItemKey, ItemSubgraph>,
+}
+
+pub struct ItemSubgraph {
+    pub root_slot: SlotId,
+    pub external_deps: Vec<SlotId>,  // Deps outside the item scope
+}
+
+impl ListMapNode {
+    fn on_external_dep_change(&mut self, dep: SlotId, event_loop: &mut EventLoop) {
+        // Re-evaluate all items that depend on this external
+        for (key, subgraph) in &self.item_subgraphs {
+            if subgraph.external_deps.contains(&dep) {
+                event_loop.mark_dirty(subgraph.root_slot);
+            }
+        }
+    }
+}
+```
+
+**Compile-time:** During List/map body compilation, track which SlotIds are external (not created within item scope).
+
+### K17. Chained List/remove Semantics
+
+**Problem:** `chained_list_remove_bug.bn` - chaining `List/remove` breaks when upstream triggers Replace.
+
+**Solution:** Removed-set composition per remove-site:
+
+```rust
+pub struct ListRemoveNode {
+    pub source: SlotId,              // Upstream list
+    pub site_id: SourceId,           // This remove site
+    pub removed_keys: HashSet<ItemKey>,  // Keys removed BY THIS SITE
+}
+
+impl ListRemoveNode {
+    fn on_upstream_delta(&mut self, delta: ListDelta) -> Option<ListDelta> {
+        match delta {
+            ListDelta::Insert { key, .. } => {
+                if self.removed_keys.contains(&key) {
+                    None  // Filter out: this key was removed downstream
+                } else {
+                    Some(delta)  // Pass through
+                }
+            }
+            ListDelta::Remove { key } => {
+                // Propagate removal, update our set
+                self.removed_keys.remove(&key);
+                Some(delta)
+            }
+            ListDelta::Replace { items } => {
+                // On Replace, keep our removed_keys and filter
+                let filtered: Vec<_> = items.into_iter()
+                    .filter(|item| !self.removed_keys.contains(&item.key))
+                    .collect();
+                Some(ListDelta::Replace { items: filtered })
+            }
+        }
+    }
+}
+```
+
+**Key insight:** Each remove-site maintains its OWN removed-keys set, applied to upstream deltas.
+
+### K18. Effect Node Model
+
+**Problem:** `fibonacci.bn` uses `Log/info()`, others use `Router/go_to()`. No general "effect node" model defined.
+
+**NOTE:** K29 extends this with validation/retry support for restore scenarios.
+
+**Solution:** Define side-effect handling:
+
+```rust
+pub enum NodeEffect {
+    None,
+    ConsoleLog { level: LogLevel, message: String },
+    RouterNavigate { url: String },
+    LocalStorageSet { key: String, value: String },
+    // ... other effects
+}
+
+pub struct EffectNode {
+    pub effect_kind: EffectKind,
+    pub trigger_input: SlotId,
+    pub last_execution_tick: u64,  // Prevent double-run on restore
+}
+
+impl EffectNode {
+    fn process(&mut self, msg: Message, current_tick: u64) -> Option<NodeEffect> {
+        // Idempotency: don't re-run effects for same tick
+        if current_tick <= self.last_execution_tick {
+            return None;
+        }
+        self.last_execution_tick = current_tick;
+
+        // Generate effect (executed by EventLoop after tick)
+        Some(self.create_effect(&msg))
+    }
+}
+```
+
+**Restore safety:** On snapshot restore, set `last_execution_tick` to restored tick to prevent re-running effects.
+
+### K19. BLOCK Compilation Model
+
+**Problem:** `BLOCK { vars; output }` used but no compilation/runtime model specified.
+
+**Solution:** Define BLOCK as lexical scope with local bindings:
+
+```rust
+// BLOCK compiles to:
+// 1. Create local SlotIds for each binding
+// 2. Evaluate bindings in order (may depend on previous)
+// 3. Return output expression's SlotId
+
+// BLOCK { x: 1, y: x + 1, x * y }
+// Compiles to:
+//   slot_x = Producer(1)
+//   slot_y = Transformer(slot_x, |x| x + 1)
+//   slot_output = Transformer([slot_x, slot_y], |x, y| x * y)
+//   return slot_output
+
+pub fn compile_block(block: &Block, ctx: &mut CompileContext) -> SlotId {
+    // Same scope_id as parent (BLOCK doesn't create new scope)
+    let scope = ctx.current_scope;
+
+    // Create slots for each binding
+    for binding in &block.bindings {
+        let slot = ctx.compile_expr(&binding.value);
+        ctx.local_bindings.insert(binding.name.clone(), slot);
+    }
+
+    // Compile and return output
+    ctx.compile_expr(&block.output)
+}
+```
+
+**FLUSH boundary:** When FLUSH hits variable assignment within BLOCK, it unwraps at that binding (per Part 6.4).
+
+### K20. Tick Processing - Process Until Quiescence
+
+**Problem:** OVERVIEW.md builds ready set once and doesn't define iterative propagation.
+
+**Correction:** Full propagation algorithm:
+
+```rust
+impl EventLoop {
+    pub fn run_tick(&mut self) {
+        self.current_tick += 1;
+        self.tick_seq = 0;
+
+        // 1. Collect external inputs
+        self.process_timers();
+        self.process_dom_events();
+
+        // 2. Propagate until quiescence (no more dirty nodes)
+        while !self.dirty_nodes.is_empty() {
+            // Sort for determinism
+            self.dirty_nodes.sort_by_key(|s| {
+                let node = self.arena.get(*s);
+                (node.source_id, node.scope_id)
+            });
+
+            // Process all dirty nodes for this "wave"
+            let to_process: Vec<_> = self.dirty_nodes.drain(..).collect();
+
+            for slot in to_process {
+                self.tick_seq += 1;
+                let new_dirty = self.process_node(slot);
+                self.dirty_nodes.extend(new_dirty);  // May add subscribers
+            }
+        }
+
+        // 3. Finalize scopes at tick end
+        self.finalize_pending_scopes();
+
+        // 4. Execute effects (after all nodes settled)
+        self.execute_pending_effects();
+    }
+}
+```
+
+**Glitch-freedom:** Within a tick, nodes see latest values because we iterate until quiescence.
+
+### K21. Snapshot Storage Strategy
+
+**Problem:** Full graph snapshot + localStorage will hit 5-10MB limit quickly.
+
+**Solution:** Tiered storage strategy:
+
+```rust
+pub enum StorageBackend {
+    LocalStorage,      // Small snapshots only (<1MB)
+    IndexedDB,         // Large snapshots (up to 100MB+)
+    Custom(Box<dyn SnapshotStore>),
+}
+
+pub struct SnapshotConfig {
+    pub backend: StorageBackend,
+    pub chunking: bool,           // Split large snapshots
+    pub compression: bool,        // LZ4/zstd for size reduction
+    pub incremental: bool,        // Delta from last snapshot
+    pub max_size_bytes: usize,    // Warn/fail if exceeded
+}
+
+impl EventLoop {
+    pub fn snapshot_with_config(&self, config: &SnapshotConfig) -> Result<SnapshotId, SnapshotError> {
+        let snapshot = self.snapshot();
+        let serialized = if config.compression {
+            compress(serialize(&snapshot))
+        } else {
+            serialize(&snapshot)
+        };
+
+        if serialized.len() > config.max_size_bytes {
+            return Err(SnapshotError::TooLarge);
+        }
+
+        match config.backend {
+            StorageBackend::LocalStorage => store_localstorage(&serialized),
+            StorageBackend::IndexedDB => store_indexeddb(&serialized),
+            StorageBackend::Custom(store) => store.save(&serialized),
+        }
+    }
+}
+```
+
+### K22. SharedArrayBuffer Clarity
+
+**Problem:** Docs say "separate arena per worker" but also show shared `nodes_region`. Conflicting.
+
+**Correction:** Clarify tiered approach:
+
+```rust
+// TIER 1: Shared between workers (fixed size, cross-worker communication)
+pub struct SharedRegion {
+    // Message queues ONLY - not node state
+    pub message_queues: [[AtomicU64; 1024]; MAX_WORKERS],  // SPSC queues
+    pub dirty_bitmap: [AtomicU64; 1024],  // Cross-worker dirty notifications
+    // NO shared node state - too complex for atomics
+}
+
+// TIER 2: Thread-local arenas (growable, most nodes live here)
+pub struct LocalArena {
+    pub nodes: Vec<ReactiveNode>,  // NOT shared
+    pub free_list: Vec<u32>,
+}
+
+// Cross-worker node references via messages, not direct access
+pub struct CrossWorkerRef {
+    pub worker_id: WorkerId,
+    pub slot_id: SlotId,
+    // To access: send message to worker, receive response
+}
+```
+
+**Clear stance:** Node STATE is NOT shared. Only message QUEUES use SharedArrayBuffer. This avoids complex atomic protocols.
+
+### K23. Per-User/Session Isolation (Server)
+
+**Problem:** Server domain has no session isolation - 500 users would collide.
+
+**Solution:** Add SessionId to scope:
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SessionId(u64);  // From auth token or connection ID
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ServerNodeAddress {
+    pub session_id: SessionId,   // Session isolation
+    pub source_id: SourceId,
+    pub scope_id: ScopeId,
+    pub port: Port,
+}
+
+// For server domain, full address includes session
+pub enum FullNodeAddress {
+    Browser(NodeAddress),                    // Single user
+    Server(ServerNodeAddress),               // Multi-user with session isolation
+}
+```
+
+**Runtime per session:** Each session gets isolated scope tree rooted at `ScopeId::ROOT.child(session_id)`.
+
+### K24. NodeSnapshot Type Definition
+
+**Problem:** `GraphSnapshot` references `NodeSnapshot` but it's never defined.
+
+**Solution:** Define NodeSnapshot:
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeSnapshot {
+    pub address: NodeAddress,
+    pub kind: NodeKindSnapshot,
+    pub current_value: Option<Payload>,
+    pub version: u64,
+    pub dirty: bool,
+
+    // Connections
+    pub inputs: Vec<NodeAddress>,
+    pub subscribers: Vec<NodeAddress>,
+
+    // Kind-specific state
+    pub state: NodeStateSnapshot,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum NodeStateSnapshot {
+    Producer,
+    Wire,
+    Router { fields: HashMap<FieldId, SlotId> },
+    Bus { items: Vec<(ItemKey, SlotId)>, alloc_site: AllocSite },
+    Register { stored_value: Payload },
+    Combiner { last_input: Option<u8> },
+    Transformer,
+    SwitchedWire { current_arm: Option<usize> },
+    LinkNode { bindings: Vec<LinkBindingSnapshot> },
+    Timer { next_fire_ms: f64 },
+    TextTemplate { template: String, cached: Option<String> },
+    Effect { last_execution_tick: u64 },
+}
+```
+
+### K25. Async Integration Boundary
+
+**Problem:** "No Rust async" internally, but server IO is async. Need defined boundary.
+
+**Solution:** Explicit IO adapter layer:
+
+```rust
+// EventLoop is sync internally
+impl EventLoop {
+    // Called by external async runtime
+    pub fn handle_network_event(&mut self, event: NetworkEvent) {
+        match event {
+            NetworkEvent::MessageReceived(msg) => {
+                self.enqueue_external_message(msg);
+            }
+            NetworkEvent::ConnectionClosed(session) => {
+                self.schedule_session_cleanup(session);
+            }
+        }
+    }
+
+    // Returns effects to be executed by async runtime
+    pub fn drain_network_effects(&mut self) -> Vec<NetworkEffect> {
+        std::mem::take(&mut self.pending_network_effects)
+    }
+}
+
+// Async wrapper (runs in tokio/async-std)
+pub async fn run_server_event_loop(mut event_loop: EventLoop, mut network: NetworkAdapter) {
+    loop {
+        tokio::select! {
+            event = network.recv() => {
+                event_loop.handle_network_event(event);
+                event_loop.run_tick();
+
+                for effect in event_loop.drain_network_effects() {
+                    network.send(effect).await;
+                }
+            }
+            _ = tokio::time::sleep(TICK_INTERVAL) => {
+                event_loop.run_tick();
+            }
+        }
+    }
+}
+```
+
+**Ordering policy:** Network events are queued, processed in arrival order within each tick. Timers are checked at tick start.
+
+### K26. SourceId Stability for Persistence
+
+**Problem:** Sequential SourceId breaks on code changes (add line = all IDs shift). Current PersistenceId implementation is broken.
+
+**Solution:** Structural hash (universal, doesn't depend on broken PersistenceId):
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SourceId {
+    pub stable_id: u64,          // Structural hash
+    pub parse_order: u32,        // For debugging only
+}
+
+pub fn compute_stable_source_id(node: &AstNode, parent_path: &[u32]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+
+    // Include structural position, not just parse order
+    parent_path.hash(&mut hasher);
+    node.kind().hash(&mut hasher);
+
+    // Include relevant content (but not spans/whitespace)
+    match node {
+        AstNode::Variable(name) => name.hash(&mut hasher),
+        AstNode::FunctionCall(name, _) => name.hash(&mut hasher),
+        AstNode::FieldAccess(_, field) => field.hash(&mut hasher),
+        AstNode::Literal(lit) => lit.hash(&mut hasher),
+        // ... other node types
+    }
+
+    hasher.finish()
+}
+```
+
+**Key properties:**
+- Survives whitespace/comment changes
+- Survives reordering of unrelated code
+- Only changes when node structure or content changes
+- Collision handling: if two nodes hash same, use parse_order as tiebreaker
+
+**Migration:** On code change, map old SourceIds to new via structural similarity matching.
+
+### K27. Stream/pulses Semantics (Sequential Like FPGA Clock)
+
+**Problem:** `Stream/pulses(n)` needs to emit N values. Two options:
+- Option A: Emit all N in single tick (batched)
+- Option B: Schedule N separate ticks (sequential, like FPGA clock)
+
+**Decision:** Sequential (Option B) - matches FPGA clock semantics.
+
+```rust
+pub struct PulsesNode {
+    remaining: u32,
+    total: u32,
+}
+
+impl PulsesNode {
+    fn on_input(&mut self, count: u32, event_loop: &mut EventLoop) {
+        self.total = count;
+        self.remaining = count;
+        if self.remaining > 0 {
+            // Schedule first pulse for next tick
+            event_loop.schedule_next_tick(self.slot_id);
+        }
+    }
+
+    fn on_tick(&mut self, event_loop: &mut EventLoop) -> Option<Message> {
+        if self.remaining > 0 {
+            let pulse_index = self.total - self.remaining;
+            self.remaining -= 1;
+
+            if self.remaining > 0 {
+                // Schedule next pulse
+                event_loop.schedule_next_tick(self.slot_id);
+            }
+
+            Some(Message::new(pulse_index))
+        } else {
+            None
+        }
+    }
+}
+```
+
+**Pros of Sequential:**
+- Matches FPGA clock behavior (one value per clock cycle)
+- HOLD body sees updated state between each pulse (critical for fibonacci)
+- Predictable, debuggable execution
+- Maps directly to hardware synthesis
+
+**Cons of Sequential:**
+- Slower for large N (N ticks instead of 1)
+- More complex scheduling
+
+**Pros of Batched (rejected):**
+- Faster execution
+- Simpler implementation
+
+**Cons of Batched (rejected):**
+- HOLD body can't see intermediate state updates
+- Breaks fibonacci semantics (all THENs see same state)
+- Doesn't match FPGA mental model
+
+### K28. Multi-Threading Constraints (LOCK-FREE REQUIRED)
+
+**CRITICAL CONSTRAINT:** Browser will IMMEDIATELY KILL the page if main thread blocks.
+
+**Frontend (Web Workers + SharedArrayBuffer):**
+- Main thread: UI rendering, DOM events - CANNOT BLOCK
+- Worker threads: Compute-heavy work
+- Communication: Lock-free SPSC queues via SharedArrayBuffer atomics
+- NO Mutex, NO RwLock, NO blocking channel operations
+
+```rust
+// FORBIDDEN on frontend - will cause browser to kill page:
+mutex.lock();           // BLOCKS
+rwlock.read();          // BLOCKS
+channel.recv().await;   // BLOCKS (if no message)
+thread::sleep();        // BLOCKS
+
+// ALLOWED - lock-free operations only:
+atomic.load(Ordering::Acquire);
+atomic.store(value, Ordering::Release);
+atomic.compare_exchange(...);
+channel.try_recv();     // Non-blocking
+channel.try_send();     // Non-blocking
+```
+
+**Lock-free message queue pattern:**
+```rust
+pub struct SPSCQueue<T> {
+    buffer: SharedArrayBuffer,
+    head: AtomicU32,  // Written by producer
+    tail: AtomicU32,  // Written by consumer
+}
+
+impl<T> SPSCQueue<T> {
+    // Non-blocking push - returns false if full
+    fn try_push(&self, item: T) -> bool {
+        let head = self.head.load(Ordering::Relaxed);
+        let next_head = (head + 1) % self.capacity;
+        if next_head == self.tail.load(Ordering::Acquire) {
+            return false;  // Queue full
+        }
+        // Write item, then update head
+        unsafe { self.write_slot(head, item); }
+        self.head.store(next_head, Ordering::Release);
+        true
+    }
+
+    // Non-blocking pop - returns None if empty
+    fn try_pop(&self) -> Option<T> {
+        let tail = self.tail.load(Ordering::Relaxed);
+        if tail == self.head.load(Ordering::Acquire) {
+            return None;  // Queue empty
+        }
+        let item = unsafe { self.read_slot(tail) };
+        self.tail.store((tail + 1) % self.capacity, Ordering::Release);
+        Some(item)
+    }
+}
+```
+
+**Backend (Server Cluster):**
+- Multiple servers in cluster, each multi-threaded
+- Can use blocking operations (Mutex, async channels)
+- But prefer lock-free for performance
+- Inter-server communication via network (WebSocket, gRPC)
+
+**Design implication:** EventLoop must be 100% non-blocking:
+- `run_tick()` processes available work and returns immediately
+- Never waits for messages - uses `try_recv()`
+- Browser schedules next tick via `requestAnimationFrame` / `setTimeout`
+
+### K29. Effect Node Restore Safety (External State Changes)
+
+**Problem:** What if external state changed during session (user logged out, network state changed)?
+
+**Solution:** Effect validation + retry/skip strategy:
+
+```rust
+pub struct EffectNode {
+    pub effect_kind: EffectKind,
+    pub trigger_input: SlotId,
+    pub last_execution_tick: u64,
+    pub requires_validation: bool,  // Some effects need validation
+}
+
+impl EffectNode {
+    fn process_on_restore(&mut self, current_tick: u64) -> EffectResult {
+        // Skip if already executed this tick
+        if current_tick <= self.last_execution_tick {
+            return EffectResult::Skip;
+        }
+
+        // Validate external preconditions if needed
+        if self.requires_validation {
+            match self.validate_preconditions() {
+                Ok(()) => {}
+                Err(ValidationError::UserLoggedOut) => {
+                    // External state changed - skip effect, emit warning
+                    return EffectResult::SkipWithWarning("User logged out during session");
+                }
+                Err(ValidationError::NetworkUnavailable) => {
+                    // Queue for retry when network returns
+                    return EffectResult::QueueForRetry;
+                }
+            }
+        }
+
+        self.last_execution_tick = current_tick;
+        EffectResult::Execute(self.create_effect())
+    }
+}
+
+pub enum EffectResult {
+    Execute(NodeEffect),
+    Skip,
+    SkipWithWarning(&'static str),
+    QueueForRetry,
+}
+```
+
+**Effect categories:**
+| Effect Type | On Restore | Validation |
+|-------------|------------|------------|
+| ConsoleLog | Skip (already logged) | None |
+| RouterNavigate | Re-execute (URL may differ) | Check if route exists |
+| LocalStorageSet | Skip (already set) | None |
+| NetworkRequest | Skip or retry | Check network available |
+| DOMManipulation | Re-execute (DOM rebuilt) | Check element exists |
+
+**Idempotency keys:** For network effects, include idempotency key in request so server can dedupe.
+
+### K30. Timer in Backgrounded Tabs
+
+**Problem:** Browser throttles timers when tab is backgrounded:
+- `requestAnimationFrame`: Stops completely
+- `setTimeout`: Throttled to 1 call/second minimum
+- Async tasks: May be throttled or paused
+
+**MoonZoon reference:** Check `Task::microtick` in Zoon - likely uses `queueMicrotask()` which runs in same event loop iteration.
+
+**Timer strategy options:**
+
+**Option A: Wall-clock deadlines (miss ticks when backgrounded):**
+```rust
+pub struct TimerEvent {
+    deadline_ms: f64,        // Absolute wall-clock time
+    node_id: SlotId,
+}
+
+impl EventLoop {
+    fn process_timers(&mut self) {
+        let now = performance_now();
+        while let Some(event) = self.timer_queue.peek() {
+            if event.deadline_ms <= now {
+                let event = self.timer_queue.pop().unwrap();
+                self.mark_dirty(event.node_id);
+                // Re-schedule for interval
+                if let Some(interval_ms) = self.get_interval(event.node_id) {
+                    self.schedule_timer(event.node_id, interval_ms);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+}
+```
+- **Behavior:** When tab returns, timers fire once with current time
+- **Pros:** Matches real-world time expectations
+- **Cons:** Missed ticks are lost (no catch-up)
+
+**Option B: Logical ticks with batch catch-up:**
+```rust
+fn process_timers_with_catchup(&mut self) {
+    let now = performance_now();
+    while let Some(event) = self.timer_queue.peek() {
+        if event.deadline_ms <= now {
+            let event = self.timer_queue.pop().unwrap();
+            self.mark_dirty(event.node_id);
+
+            // Re-schedule ALL missed intervals
+            if let Some(interval_ms) = self.get_interval(event.node_id) {
+                let mut next_deadline = event.deadline_ms + interval_ms;
+                while next_deadline <= now {
+                    // Emit for each missed tick
+                    self.mark_dirty(event.node_id);
+                    next_deadline += interval_ms;
+                }
+                self.schedule_timer_at(event.node_id, next_deadline);
+            }
+        } else {
+            break;
+        }
+    }
+}
+```
+- **Behavior:** When tab returns, fires multiple times to catch up
+- **Pros:** Logical time advances correctly (counter reaches expected value)
+- **Cons:** May cause burst of activity, can overwhelm system
+
+**Recommendation: Wall-clock with optional catch-up limit:**
+```rust
+pub struct TimerConfig {
+    pub max_catchup_ticks: u32,  // 0 = no catchup, 10 = max 10 missed ticks
+}
+```
+- Default: `max_catchup_ticks = 0` (wall-clock, no catch-up)
+- For counters/progress: `max_catchup_ticks = 100` (limited catch-up)
+- For animations: `max_catchup_ticks = 0` (just resume from current state)
+
+**Browser integration:**
+```rust
+// Use rAF for visual updates (stops when backgrounded - good for animations)
+request_animation_frame(|| event_loop.run_tick());
+
+// Use setTimeout for timers (throttled but not stopped)
+set_timeout(|| event_loop.process_timers(), timer_interval_ms);
+
+// queueMicrotask for immediate same-tick work
+queue_microtask(|| event_loop.process_microtasks());
+```
+
+---
+

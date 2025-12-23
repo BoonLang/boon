@@ -1,0 +1,81 @@
+## Migration Strategy: Clean Rewrite
+
+Build the new engine as a separate module (`engine_v2.rs`) alongside the existing engine. Switch when the new engine passes all example tests.
+
+**Approach:**
+1. Create `crates/boon/src/platform/browser/engine_v2/` module directory
+2. Implement new engine without touching existing code
+3. Add feature flag to switch between engines
+4. Test with `interval.bn`, `counter.bn`, then `todo_mvc.bn`
+5. Once passing, deprecate old engine
+
+**Benefits:**
+- No risk of breaking existing functionality during development
+- Can A/B test performance between engines
+- Clean slate, no legacy compromises
+- Easy rollback if issues found
+
+---
+
+## Implementation Phases
+
+### Phase 1: Core Types & Arena
+1. Create `engine_v2/` module structure
+2. Implement `SourceId`, `ScopeId`, `NodeAddress`
+3. Implement `Arena`, `SlotId`, `ReactiveNode`
+4. Add basic `EventLoop` skeleton
+5. Unit tests for arena allocation/deallocation
+
+### Phase 2: Message & Routing
+1. Implement `Message`, `Payload` types
+2. Create `RoutingTable` with static/dynamic routes
+3. Implement message delivery in EventLoop
+4. Test with simple constant → subscriber flow
+
+### Phase 3: Basic Nodes
+1. Implement `Constant` node (producer)
+2. Implement `Variable` node (wire)
+3. Implement `Object` as `Router` (demultiplexer)
+4. Implement field access path resolution
+5. Test: simple object with fields works
+
+### Phase 4: Combinators
+1. Implement LATEST as `Combiner`
+2. Implement HOLD as `Register`
+3. Implement THEN/WHEN as `Transformer`
+4. Implement WHILE as `SwitchedWire`
+5. **Milestone:** `counter.bn` example works
+
+### Phase 5: Lists
+1. Implement `List` as `Bus` (dynamic wire creation)
+2. Implement List/append, List/remove, List/map
+3. Diff tracking for efficient UI updates
+4. **Milestone:** Simple list example works
+
+### Phase 6: Timer & Events
+1. Implement timer queue (priority heap)
+2. Integrate with browser's `requestAnimationFrame`/`setTimeout`
+3. Implement `Timer/interval` API function
+4. Implement LINK node (DOM event source)
+5. **Milestone:** `interval.bn` example works
+
+### Phase 7: Bridge & UI
+1. Adapt `bridge.rs` to arena-based values
+2. Create new `evaluator_v2.rs` using SlotId
+3. Wire up to Zoon elements
+4. **Milestone:** `todo_mvc.bn` example works
+
+### Phase 8: Snapshot System
+1. Implement `GraphSnapshot` serialization
+2. Add snapshot/restore to `EventLoop`
+3. Integrate with localStorage persistence
+4. Test: reload page, state preserved
+
+### Phase 9: Multi-Threading (optional)
+1. Worker pool creation
+2. Cross-worker message routing
+3. Node partitioning (UI vs compute)
+4. Testing with CPU-heavy workloads
+
+---
+

@@ -1,0 +1,197 @@
+## Part 11: Unified Cross-Platform Engine
+
+This section designs a trait-based abstraction layer enabling a single `boon` crate to run on browser (WASM), server (native tokio), and CLI platforms.
+
+### 11.1 Feasibility Assessment
+
+**Current Platform Distribution:**
+| Category | LOC | Percentage |
+|----------|-----|------------|
+| Platform-agnostic (parser, core engine) | ~17,500 | 78% |
+| Browser-specific (bridge, some API) | ~5,700 | 22% |
+
+**Abstraction Cost:**
+- New trait code: ~1,050 LOC
+- Refactoring existing: ~300 LOC
+- **ROI: 33:1** (vs duplicating 17,500 LOC for server + CLI)
+
+### 11.2 Core Platform Trait
+
+```rust
+/// Core platform abstraction - minimal surface area
+pub trait Platform: Send + Sync + 'static {
+    type TaskHandle: Send + 'static;
+
+    /// Spawn a task that runs until completion or handle dropped
+    fn spawn_droppable(
+        future: Pin<Box<dyn Future<Output = ()> + 'static>>
+    ) -> Self::TaskHandle;
+
+    /// Sleep for milliseconds
+    fn sleep(ms: u32) -> Pin<Box<dyn Future<Output = ()> + 'static>>;
+
+    /// Get storage implementation
+    fn storage() -> &'static dyn PersistentStorage;
+
+    /// Get logger implementation
+    fn logger() -> &'static dyn Logger;
+}
+```
+
+### 11.3 Platform Trait Definitions
+
+```rust
+/// Persistent storage abstraction
+pub trait PersistentStorage: Send + Sync {
+    fn get<T: DeserializeOwned>(&self, key: &str) -> Pin<Box<dyn Future<Output = Option<T>>>>;
+    fn set<T: Serialize>(&self, key: &str, value: T) -> Pin<Box<dyn Future<Output = Result<(), StorageError>>>>;
+    fn remove(&self, key: &str) -> Pin<Box<dyn Future<Output = ()>>>;
+}
+
+/// Logger abstraction
+pub trait Logger: Send + Sync {
+    fn info(&self, message: &str);
+    fn warn(&self, message: &str);
+    fn error(&self, message: &str);
+    fn debug(&self, message: &str);
+}
+
+/// Renderer abstraction (optional - headless for server/CLI)
+pub trait Renderer: Send + Sync {
+    type Element: Send + 'static;
+    fn value_to_element(&self, value: Value) -> Self::Element;
+    fn is_headless(&self) -> bool;
+}
+
+/// Navigation abstraction (browser-only meaningful impl)
+pub trait NavigationSystem: Send + Sync {
+    fn current_route(&self) -> String;
+    fn navigate(&self, route: &str);
+    fn route_changes(&self) -> LocalBoxStream<'static, String>;
+}
+```
+
+### 11.4 Feature Flags
+
+```toml
+[features]
+default = ["platform-browser"]
+
+# Platform features - mutually exclusive
+platform-browser = ["zoon", "web-sys", "wasm-bindgen"]
+platform-server = ["tokio/full"]
+platform-cli = []  # Minimal deps, uses async-std
+
+# Debug features
+debug-channels = []
+```
+
+### 11.5 Platform Implementations
+
+| Platform | TaskHandle | Sleep | Storage | Logger |
+|----------|------------|-------|---------|--------|
+| **Browser** | zoon::TaskHandle | zoon::Timer::sleep | localStorage | zoon::println |
+| **Server** | tokio::JoinHandle | tokio::time::sleep | In-memory/Redis | println! |
+| **CLI** | async_std::JoinHandle | async_std::sleep | File-based | println! |
+
+### 11.6 API Function Portability
+
+**Universal (All Platforms) - ~1,590 LOC:**
+- Math/*, Text/*, Bool/*, List/*, Stream/*
+- Ulid/*, Log/*, File/*, Directory/*, Build/*
+
+**Browser-Only - ~1,500 LOC:**
+- Document/*, Element/*, Router/*, Scene/*, Theme/*
+
+**Platform-Variant:**
+- Timer/interval: uses Platform::sleep()
+- Log/*: uses Platform::logger()
+
+### 11.7 Module Reorganization
+
+```
+crates/boon/src/
+  parser/              # 100% platform-agnostic (unchanged)
+
+  engine/              # Core engine (platform-agnostic)
+    actor.rs           # ValueActor, LazyValueActor
+    channels.rs        # NamedChannel
+    types.rs           # Value, Object, List
+    storage.rs         # Uses PersistentStorage trait
+    virtual_fs.rs      # Already abstracted
+
+  evaluator/           # Platform-agnostic evaluation
+    context.rs         # EvaluationContext
+    functions.rs       # Function dispatch
+    constructs.rs      # HOLD, WHEN, WHILE, LATEST
+
+  api/
+    universal/         # Platform-agnostic functions
+      text.rs, bool.rs, list.rs, stream.rs, math.rs
+    browser/           # Browser-only (feature-gated)
+      element.rs, document.rs, router.rs
+
+  platform/
+    mod.rs             # Platform trait, current_platform()
+    traits.rs          # PersistentStorage, Logger, Renderer
+    browser/           # zoon-based implementation
+    server/            # tokio-based implementation
+    cli/               # async-std-based implementation
+```
+
+### 11.8 Implementation Phases
+
+#### Phase 11A: Extract Traits
+
+1. Create `platform/traits.rs` with all trait definitions
+2. Create `platform/browser/` implementing traits with current code
+3. Add platform selection in `platform/mod.rs`
+4. Replace `zoon::println!` with `boon_println!` macro
+
+#### Phase 11B: Extract Engine Core
+
+1. Move platform-agnostic code from browser/engine.rs to engine/
+2. Update ConstructStorage to use PersistentStorage trait
+3. Update ActorLoop to use Platform::spawn_droppable
+
+#### Phase 11C: Split API Functions
+
+1. Create api/universal/ with portable functions
+2. Keep browser-specific in api/browser/
+3. Add feature flags to function dispatch
+
+#### Phase 11D: Add Server/CLI Platforms
+
+1. Implement ServerPlatform with tokio
+2. Implement CliPlatform with async-std
+3. Test universal functions on new platforms
+
+### 11.9 Benefits vs Costs
+
+**Benefits:**
+- Single source of truth (85% code shared)
+- Consistent behavior across platforms
+- Fast native testing (no WASM overhead)
+- Future-proof (iOS, Android = just new trait impls)
+- Enables SSR and CLI tooling
+
+**Costs:**
+- ~1,050 LOC of abstraction code
+- 2-3 days initial refactoring
+- Must test on all platforms
+
+### 11.10 Summary
+
+| Metric | Value |
+|--------|-------|
+| New abstraction code | ~1,050 LOC |
+| Code duplication avoided | ~35,000 LOC |
+| ROI | 33:1 |
+| Shared code ratio | 85% |
+| Platforms supported | Browser, Server, CLI |
+| Complexity | Low (5 simple traits) |
+
+**Verdict:** Unified engine is clearly better than 3 separate implementations
+
+---
+

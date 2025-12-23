@@ -1,0 +1,90 @@
+## Compatibility Matrix: 23 Real Playground Examples
+
+### Feature Key
+
+| Code | Feature | Node Type |
+|------|---------|-----------|
+| PRD | Constants/literals | Producer |
+| RTR | Objects | Router |
+| BUS | Lists | Bus |
+| CMB | LATEST | Combiner |
+| REG | HOLD | Register |
+| TRN | THEN | Transformer |
+| PMX | WHEN | PatternMux |
+| SWR | WHILE | SwitchedWire |
+| IOPad | LINK | IOPad |
+| TXT | TEXT interpolation | TextTemplate |
+| TMR | Timer/interval | Timer |
+| EFF | Effects (Log/info, Router/go_to) | EffectNode |
+| BLK | BLOCK | (local bindings) |
+| CTX | PASS/PASSED | Context threading |
+| L/A | List/append | Bus delta |
+| L/M | List/map | Bus transform |
+| L/R | List/retain | Bus filter |
+| L/X | List/remove | Bus remove |
+| L/C | List/clear, List/count, List/is_empty | Bus reducers |
+| FP | Field-path (a.b.c.d) | Router chain |
+| ELS | Element state (hovered, focused) | ElementState |
+| S/P | Stream/pulses | Pulse generator |
+| S/S | Stream/skip | Filter node |
+| FN | FUNCTION definitions | (compile-time) |
+
+### Compatibility Matrix
+
+| Example | Phase | Core Nodes | List Ops | Other | Status | Notes |
+|---------|-------|------------|----------|-------|--------|-------|
+| **minimal** | 3 | PRD, RTR | - | - | ✅ | Trivial constant |
+| **hello_world** | 3 | PRD, RTR | - | TXT | ✅ | Static text |
+| **interval** | 6 | PRD, TRN, TMR | - | - | ✅ | Timer queue test |
+| **interval_hold** | 6 | PRD, REG, TRN, TMR | - | S/S | ✅ | Timer + Register |
+| **counter** | 4 | PRD, CMB, TRN, IOPad | BUS | TXT, FP | ✅ | LATEST + LINK |
+| **counter_hold** | 4 | PRD, REG, TRN, IOPad | BUS | TXT, FP | ✅ | HOLD + LINK |
+| **fibonacci** | 4+ | PRD, REG, TRN, SWR, PMX | - | TXT, BLK, FN, EFF, S/P, S/S | ⚠️ | Stream/pulses, Log/info |
+| **layers** | 5 | PRD, RTR | BUS | TXT, FN | ✅ | Static list |
+| **shopping_list** | 7 | PRD, RTR, REG, CMB, TRN, PMX, IOPad | BUS, L/A, L/M, L/C | TXT, BLK, CTX, FP, FN | ⚠️ | PASS/PASSED, BLOCK, List ops |
+| **pages** | 7 | PRD, RTR, CMB, TRN, PMX, SWR, IOPad | BUS | TXT, BLK, CTX, FP, FN, EFF | ⚠️ | Router/go_to, Router/route |
+| **todo_mvc** | 7 | ALL | ALL | ALL | ⚠️ | Full validation target |
+| **list_retain_count** | 5 | PRD, RTR, CMB, PMX, IOPad | BUS, L/A, L/R, L/C, L/M | TXT, BLK, CTX, FP, FN | ⚠️ | List/retain + count |
+| **list_map_block** | 5 | PRD, RTR, PMX, SWR | BUS, L/M | TXT, BLK | ⚠️ | BLOCK inside List/map (K19) |
+| **list_object_state** | 5 | PRD, RTR, REG, TRN, IOPad | BUS, L/M | TXT, FP, FN | ⚠️ | HOLD in list item objects |
+| **list_retain_reactive** | 5 | PRD, RTR, REG, TRN, PMX, IOPad | BUS, L/R, L/M, L/C | TXT, FP | ⚠️ | Reactive retain predicate |
+| **list_retain_remove** | 5 | PRD, RTR, CMB, TRN, PMX, IOPad | BUS, L/A, L/M | TXT, BLK, FP | ✅ | Basic list append |
+| **while_function_call** | 4 | PRD, RTR, REG, TRN, SWR, IOPad | BUS | TXT, FP, FN | ✅ | FUNCTION inside WHILE arm |
+| **list_map_external_dep** | 5 | PRD, RTR, REG, TRN, SWR, IOPad | BUS, L/M | TXT, FP | ⚠️ BUG | External deps in List/map (K16) |
+| **text_interpolation_update** | 4 | PRD, RTR, REG, TRN, SWR, IOPad | BUS | TXT, FP | ⚠️ BUG | TextTemplate (K4) |
+| **button_hover_test** | 7 | PRD, RTR, SWR, IOPad | BUS | TXT, ELS, FN | ✅ | Element hovered state (K7) |
+| **switch_hold_test** | 7 | PRD, RTR, REG, TRN, SWR, IOPad | BUS | TXT, FP, FN | ⚠️ | LINK rebinding on WHILE (K15) |
+| **filter_checkbox_bug** | 7 | PRD, RTR, REG, CMB, TRN, PMX, SWR, IOPad | BUS, L/R, L/M | TXT, BLK, CTX, FP, FN | ⚠️ BUG | Complex List+WHILE (K15, K16) |
+| **chained_list_remove_bug** | 5 | PRD, RTR, REG, CMB, TRN, PMX, SWR, IOPad | BUS, L/A, L/X, L/R, L/M, L/C | TXT, BLK, ELS, FP, FN | ⚠️ BUG | Chained List/remove (K17) |
+
+### Phase Requirements by Example
+
+| Phase | Required For Examples |
+|-------|----------------------|
+| **Phase 3: Basic Nodes** | minimal, hello_world |
+| **Phase 4: Combinators** | counter, counter_hold, while_function_call, text_interpolation_update |
+| **Phase 5: Lists** | layers, list_retain_count, list_map_block, list_object_state, list_retain_reactive, list_retain_remove, list_map_external_dep, chained_list_remove_bug |
+| **Phase 6: Timer** | interval, interval_hold, fibonacci |
+| **Phase 7: Bridge/UI** | shopping_list, pages, todo_mvc, button_hover_test, switch_hold_test, filter_checkbox_bug |
+
+### Critical Path: Bug Fixes Required
+
+| Bug | Example | Required Fix (Known Issue) |
+|-----|---------|---------------------------|
+| TEXT not reactive | text_interpolation_update | K4: TextTemplate node |
+| List/map external deps | list_map_external_dep, filter_checkbox_bug | K16: External dependency tracking |
+| LINK rebinding | switch_hold_test, filter_checkbox_bug | K15: LINK setter protocol |
+| Chained List/remove | chained_list_remove_bug | K17: Removed-set composition |
+
+### Milestone Examples
+
+| Milestone | Example | Validates |
+|-----------|---------|-----------|
+| **M1** | counter.bn | Basic LATEST + THEN + LINK |
+| **M2** | interval.bn | Timer queue |
+| **M3** | counter_hold.bn | HOLD register |
+| **M4** | shopping_list.bn | List operations + PASS/PASSED |
+| **M5** | todo_mvc.bn | Full validation (all features) |
+
+---
+
