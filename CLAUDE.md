@@ -6,6 +6,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Boon is a reactive, dataflow-oriented programming language designed for building UIs, hardware descriptions, and durable state applications. It uses actors and streams for data flow, with constructs like `LATEST`, `WHEN`, `WHILE`, `THEN` for flow control, and `LINK` for event binding. Boon source files use the `.bn` extension.
 
+## New Engine Design (docs/new_boon/)
+
+The current engine (ValueActor, ActorLoop, LazyValueActor) is being replaced with a new arena-based design. The new design is documented in `docs/new_boon/`:
+
+- **1.x**: Overview and getting started
+- **2.x**: Core architecture (nodes, arena, messages, event loop)
+- **3.x**: Runtime features (modules, hot reload, cross-platform, testing)
+- **4.x**: Migration phases
+- **5.x**: Hardware targets (FPGA, RISC-V)
+- **6.x**: Reference material (issues, examples, notes)
+
+The sections below marked **(Old Engine)** document the current engine and will be updated when the new engine is implemented.
+
 ## Important Rules for Claude
 
 - **NEVER revert files using `git checkout` or `git restore` without explicit user confirmation.** Even if a file appears broken, ask the user first before reverting. The user may want to investigate the issue or fix it differently.
@@ -209,7 +222,7 @@ Most Boon language features are documented in `docs/language/`:
 - `storage/` - Durable state and persistence research
 - `gpu/` - GPU/HVM research and analysis
 
-## Debugging the Engine
+## Debugging the Engine (Old Engine)
 
 ### Common Issues: Actor Drop Problems
 
@@ -297,7 +310,7 @@ When debugging with browser automation (`boon-tools exec`):
 3. Extension disconnected → refresh browser tab manually
 4. Complete failure (last resort) → kill browser, restart
 
-## Stream Lifecycle Safety
+## Stream Lifecycle Safety (Old Engine)
 
 ValueActors require **infinite streams** (streams that never terminate). If a stream terminates, the actor's internal loop exits, dropping all sender channels and causing "receiver is gone" errors for active subscribers.
 
@@ -323,7 +336,9 @@ pub fn constant<T>(item: T) -> TypedStream<impl Stream<Item = T>, Infinite> {
 }
 ```
 
-### TypedStream System
+### TypedStream System (Old Engine Only)
+
+**Note:** TypedStream is specific to the old actor-based engine and is not used in the new arena-based engine. See `docs/new_boon/` for the new design.
 
 The codebase provides compile-time markers for stream lifecycle:
 
@@ -348,7 +363,7 @@ While not fully enforced on `ValueActor::new()` yet, these types serve as docume
 - **zoon/moon** - MoonZoon framework (frontend/backend)
 - **ulid** - Unique IDs for persistence
 
-## Engine Architecture Rules
+## Engine Architecture Rules (Old Engine)
 
 See also: `docs/engine/ACTOR_MODEL.md` for comprehensive documentation.
 
@@ -493,7 +508,7 @@ If identity information is missing, it's a BUG that should be fixed at the sourc
 - Do NOT run `cargo build` separately - it duplicates work and may conflict
 - Use the Boon Browser MCP `boon_playground_status` tool if available
 
-### Lazy vs Eager Evaluation (LazyValueActor)
+### Lazy vs Eager Evaluation (LazyValueActor) (Old Engine)
 
 **The Problem**: ValueActor eagerly polls its source stream in an internal loop, decoupling producers from consumers. This breaks sequential state updates in HOLD:
 
