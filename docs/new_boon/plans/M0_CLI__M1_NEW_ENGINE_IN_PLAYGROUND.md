@@ -91,6 +91,9 @@ fn materialize(payload: &Payload, arena: &Arena) -> serde_json::Value {
             json!(fields.into_iter().map(|(k, v)| (k, materialize(v, arena))).collect::<Map<_>>())
         }
         Payload::Flushed(inner) => json!({"error": materialize(inner, arena)}),
+        // Note: Flushed should normally unwrap at bindings (see §2.6), so reaching
+        // the root as Flushed is a fallback case. Exception: List/map item errors
+        // appear as per-item error values after unwrapping at item binding.
         _ => json!(null), // Deltas not materialized
     }
 }
