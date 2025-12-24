@@ -232,6 +232,15 @@ pub struct ReactiveNode {
     subscribers: [SlotId; 2],
     extension: Option<Box<NodeExtension>>,
 }
+
+/// Heap-allocated extension for value storage and overflow arrays.
+pub struct NodeExtension {
+    pub current_value: Option<Payload>,   // Last scalar value (§2.3.6)
+    pub pending_deltas: Vec<Payload>,     // Accumulated deltas this tick
+    pub kind_data: NodeKindData,          // Type-specific data
+    pub extra_inputs: Vec<SlotId>,        // Overflow (>4 inputs)
+    pub extra_subscribers: Vec<SlotId>,   // Overflow (>2 subscribers)
+}
 ```
 
 ### Message & Payload (§2.3)
@@ -988,11 +997,14 @@ enum Commands {
 |---------|-------|
 | §2.1 | Node identification (SourceId, ScopeId, NodeAddress) |
 | §2.2 | Arena memory model |
-| §2.3 | Message passing, node kinds |
+| §2.3 | Message passing, node kinds, routing table management |
 | §2.4 | EventLoop, timers, microtasks |
 | §2.5 | Graph snapshot |
-| §2.6 | FLUSH error handling |
+| §2.6 | FLUSH error handling (including FLUSH + HOLD semantics) |
+| §2.8 | Bridge API |
+| §2.11 | Context passing (PASS/PASSED) |
 | §4.9 | Implementation phases |
+| §6.1 | Known issues and fixes |
 
 ---
 

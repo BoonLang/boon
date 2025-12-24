@@ -7,7 +7,42 @@
 - `[~]` In progress
 - `[x]` Complete
 
-**Time estimate:** ~130 atomic tasks, each 5-30 minutes.
+### Realistic Time Estimates
+
+| Phase | Duration | Notes |
+|-------|----------|-------|
+| Phase 1-3 | 2 weeks | Core types, arena, basic nodes |
+| Phase 3.5 | 1 week | CLI test harness (enables fast iteration) |
+| Phase 4 | 2 weeks | Combinators (LATEST, HOLD, THEN, WHEN, WHILE) |
+| Phase 4.5 | 1 week | FUNCTION + BLOCK compilation |
+| Phase 5 | 2 weeks | Lists with Issue 16/17 fixes |
+| Phase 6 | 2 weeks | Timer, events, effects |
+| Phase 7a | 1 week | Basic bridge |
+| Phase 7b | 1 week | Element API |
+| Phase 7c | 2 weeks | Interactive features, LINK, events |
+| Phase 7d | 1 week | PASS/PASSED, TextTemplate |
+| Phase 8 | 1 week | Snapshot system |
+| Phase 9 | 1 week | CLI completion |
+| **Total** | **16-18 weeks** | Full-time, with debugging/iteration |
+
+**Task granularity:** ~150 atomic tasks, each 15-60 minutes
+
+**Risk factors:**
+- Integration issues between phases (+1-2 weeks)
+- Unforeseen edge cases in LINK/WHILE interaction (+1 week)
+- Performance optimization if needed (+1 week)
+
+### Critical Issues Phase Assignment
+
+| Issue # | Description | Phase | Checklist Section |
+|---------|-------------|-------|-------------------|
+| **Issue 4** | TextTemplate reactive updates | Phase 7d | §9.12 |
+| **Issue 7** | Element states (hovered, focused) | Phase 7c | §9.8 |
+| **Issue 15** | LINK bind/unbind protocol | Phase 7c | §9.7 |
+| **Issue 16** | List/map external dependencies | Phase 5 | §7.3.3 |
+| **Issue 17** | Chained List/remove | Phase 5 | §7.3.2 |
+
+All critical issues are now assigned to specific phases with explicit verification tests.
 
 ---
 
@@ -57,9 +92,13 @@
 - [ ] **0.3.1** Confirm familiarity with key design docs:
   - `docs/new_boon/2.1_NODE_IDENTIFICATION.md` - SourceId, ScopeId, NodeAddress
   - `docs/new_boon/2.2_ARENA_MEMORY.md` - Arena, SlotId
-  - `docs/new_boon/2.3_MESSAGE_PASSING.md` - Message, Payload, Node kinds
+  - `docs/new_boon/2.3_MESSAGE_PASSING.md` - Message, Payload, Node kinds, routing table management
   - `docs/new_boon/2.4_EVENT_LOOP.md` - EventLoop, tick processing
+  - `docs/new_boon/2.6_ERROR_HANDLING.md` - FLUSH semantics, FLUSH + HOLD interaction
+  - `docs/new_boon/2.8_BRIDGE_API.md` - Bridge and DOM reconciliation
+  - `docs/new_boon/2.11_CONTEXT_PASSING.md` - PASS/PASSED context threading
   - `docs/new_boon/6.1_ISSUES.md` - Known issues to fix
+  - `docs/new_boon/plans/M0_CLI__M1_NEW_ENGINE_IN_PLAYGROUND.md` - Canonical implementation plan
 
 ---
 
@@ -270,14 +309,27 @@
     use super::node::NodeKind;
 
     /// A single reactive node in the arena.
-    /// 64-byte cache-line aligned for performance.
+    /// 64-byte cache-line aligned for performance (see §2.2.5).
     #[repr(C, align(64))]
     pub struct ReactiveNode {
         pub generation: u32,
         pub version: u32,
         pub dirty: bool,
-        pub kind: NodeKind,
-        // Connections stored in NodeKind variants
+        pub kind_tag: u8,
+        pub input_count: u8,
+        pub subscriber_count: u8,
+        pub inputs: [SlotId; 4],
+        pub subscribers: [SlotId; 2],
+        pub extension: Option<Box<NodeExtension>>,
+    }
+
+    /// Heap-allocated extension for value storage and overflow arrays.
+    pub struct NodeExtension {
+        pub current_value: Option<Payload>,
+        pub pending_deltas: Vec<Payload>,
+        pub kind_data: NodeKindData,
+        pub extra_inputs: Vec<SlotId>,
+        pub extra_subscribers: Vec<SlotId>,
     }
 
     impl Default for ReactiveNode {
@@ -286,7 +338,12 @@
                 generation: 0,
                 version: 0,
                 dirty: false,
-                kind: NodeKind::Producer { value: None },
+                kind_tag: 0,
+                input_count: 0,
+                subscriber_count: 0,
+                inputs: [SlotId::INVALID; 4],
+                subscribers: [SlotId::INVALID; 2],
+                extension: None,
             }
         }
     }
@@ -686,7 +743,7 @@
 
 - [ ] **1.5.3** Commit Phase 1
   ```bash
-  git add -A && git commit -m "Phase 1: Core types and arena for engine_v2"
+  jj new -m "Phase 1: Core types and arena for engine_v2"
   ```
 
 **If stuck:**
@@ -713,11 +770,12 @@
     /// Delta for efficient list updates.
     #[derive(Clone, Debug)]
     pub enum ListDelta {
-        Insert { key: ItemKey, index: u32, initial: Payload },
-        Update { key: ItemKey, value: Payload },
-        Remove { key: ItemKey },
-        Move { key: ItemKey, from_index: u32, to_index: u32 },
-        Replace { items: Vec<(ItemKey, Payload)> },
+        Insert { key: ItemKey, index: u32, value: Payload },    // Add item at index
+        Update { key: ItemKey, value: Payload },                 // Replace item value
+        FieldUpdate { key: ItemKey, field: FieldId, value: Payload }, // Nested field within item
+        Remove { key: ItemKey },                                 // Remove item by key
+        Move { key: ItemKey, from_index: u32, to_index: u32 },   // Reorder item
+        Replace { items: Vec<(ItemKey, Payload)> },              // Full list replacement
     }
     ```
   - Verify: `cargo check -p boon`
@@ -943,7 +1001,7 @@
 
 - [ ] **2.5.3** Commit Phase 2
   ```bash
-  git add -A && git commit -m "Phase 2: Message passing and routing table"
+  jj new -m "Phase 2: Message passing and routing table"
   ```
 
 ---
@@ -1154,7 +1212,7 @@
 
 - [ ] **3.6.2** Commit Phase 3
   ```bash
-  git add -A && git commit -m "Phase 3: Basic nodes (Producer, Wire, Router) and evaluator"
+  jj new -m "Phase 3: Basic nodes (Producer, Wire, Router) and evaluator"
   ```
 
 ---
@@ -1374,7 +1432,7 @@
 
 - [ ] **4.5.3** Commit Phase 3.5
   ```bash
-  git add -A && git commit -m "Phase 3.5: CLI test harness foundation"
+  jj new -m "Phase 3.5: CLI test harness foundation"
   ```
 
 ---
@@ -1450,41 +1508,204 @@
     ```
   - Verify: `cargo check -p boon`
 
-### 5.6 Implement Node Processing
+### 5.6 Implement Combiner (LATEST) Processing
 
-- [ ] **5.6.1** Expand process_node for combinators
-  - Update EventLoop::process_node to handle new node kinds
-  - (Implementation details depend on message storage approach)
+- [ ] **5.6.1** Implement Combiner message handling
+  - File: `src/engine_v2/event_loop.rs`
+  - Content:
+    ```rust
+    fn process_combiner(&mut self, slot: SlotId, port: Port, msg: Payload) {
+        let node = self.arena.get_mut(slot);
+        if let NodeKind::Combiner { inputs, last_values } = &mut node.kind {
+            // Update the specific input's cached value
+            let input_idx = port.as_input_index();
+            last_values[input_idx] = Some(msg);
 
-### 5.7 Add Combinator Compilation
+            // Check if all inputs have values
+            if last_values.iter().all(|v| v.is_some()) {
+                // Emit combined output (object or list of values)
+                let combined = self.combine_values(last_values);
+                self.emit_to_subscribers(slot, combined);
+            }
+        }
+    }
+    ```
 
-- [ ] **5.7.1** Add compile_hold to CompileContext
-  - Content: Create HOLD node with initial value and body
+- [ ] **5.6.2** Implement combine_values helper
+  - Options: a) List of values, b) Object with named fields, c) Last arriving value
+  - Decision: Use last-value semantics (LATEST emits the most recent value)
 
-- [ ] **5.7.2** Add compile_latest to CompileContext
-  - Content: Create Combiner with multiple inputs
+- [ ] **5.6.3** Implement dirty tracking for Combiner
+  - Combiner is dirty when any input arrives
+  - Emit output when all inputs have at least one value
 
-- [ ] **5.7.3** Add compile_then to CompileContext
-  - Content: Create Transformer with input
+### 5.7 Implement Register (HOLD) Processing
 
-### 5.8 Phase 4 Verification
+- [ ] **5.7.1** Implement Register initial value handling
+  - Store initial value on first tick
+  - Emit initial value to subscribers immediately
 
-- [ ] **5.8.1** Test counter pattern
+- [ ] **5.7.2** Implement Register body subscription
+  - Register subscribes to its body subgraph output
+  - Body receives piped input values
+
+- [ ] **5.7.3** Implement Register state update
+  - Content:
+    ```rust
+    fn process_register(&mut self, slot: SlotId, msg: Payload) {
+        let node = self.arena.get_mut(slot);
+        if let NodeKind::Register { stored_value, .. } = &mut node.kind {
+            match msg {
+                Payload::Flushed(err) => {
+                    // FLUSH + HOLD: Don't store error, propagate it
+                    self.emit_to_subscribers(slot, Payload::Flushed(err));
+                }
+                value => {
+                    // Store new state and emit
+                    *stored_value = Some(value.clone());
+                    self.emit_to_subscribers(slot, value);
+                }
+            }
+        }
+    }
+    ```
+
+- [ ] **5.7.4** Implement `state` binding resolution in HOLD body
+  - Body expressions can reference `state` to get current value
+  - Create wire that reads from Register's stored_value
+
+### 5.8 Implement Transformer (THEN) Processing
+
+- [ ] **5.8.1** Implement THEN trigger on input arrival
+  - When input arrives, evaluate body expression
+  - Emit body result to subscribers
+
+- [ ] **5.8.2** Implement THEN with nested expressions
+  - Body may contain LATEST, WHEN, etc.
+  - Create subgraph for body, connect output
+
+- [ ] **5.8.3** Implement SKIP handling in THEN
+  - If body evaluates to SKIP, don't emit (filter pattern)
+
+### 5.9 Implement PatternMux (WHEN) Processing
+
+- [ ] **5.9.1** Implement WHEN pattern matching
+  - On input arrival, match against arm patterns
+  - First matching arm's body is evaluated
+
+- [ ] **5.9.2** Implement literal pattern matching
+  - Numbers: exact match
+  - Tags: exact match
+  - `__` (wildcard): always matches
+
+- [ ] **5.9.3** Implement binding patterns in WHEN
+  - `Tag name =>` binds `name` to inner value
+  - `n =>` binds entire value to `n`
+
+- [ ] **5.9.4** Implement WHEN fallthrough to SKIP
+  - If no pattern matches, treat as SKIP (don't emit)
+
+### 5.10 Implement SwitchedWire (WHILE) Processing
+
+- [ ] **5.10.1** Implement WHILE arm switching
+  - On input arrival, determine which arm matches
+  - If arm changes, finalize old arm scope, create new
+
+- [ ] **5.10.2** Implement arm scope creation
+  - Each arm has its own scope with bindings
+  - Content:
+    ```rust
+    fn switch_while_arm(&mut self, slot: SlotId, new_arm: usize) {
+        let node = self.arena.get_mut(slot);
+        if let NodeKind::SwitchedWire { current_arm, arm_outputs, .. } = &mut node.kind {
+            if *current_arm != Some(new_arm) {
+                // Finalize old arm scope
+                if let Some(old) = *current_arm {
+                    self.pending_finalizations.push(arm_outputs[old]);
+                }
+                // Create new arm scope
+                *current_arm = Some(new_arm);
+                // Wire up new arm's routes
+            }
+        }
+    }
+    ```
+
+- [ ] **5.10.3** Implement continuous value forwarding
+  - WHILE continuously forwards values from active arm
+  - Re-evaluate arm body when upstream values change
+
+### 5.11 Add Combinator Compilation
+
+- [ ] **5.11.1** Add compile_latest to CompileContext
+  - Parse LATEST { expr1, expr2, ... } arms
+  - Allocate Combiner node with input count = arm count
+  - Wire each expression's output to Combiner input port
+
+- [ ] **5.11.2** Add compile_hold to CompileContext
+  - Parse `initial |> HOLD state { body }`
+  - Allocate Register node
+  - Create body subgraph with `state` binding to Register's value
+  - Wire body output to Register's body_input
+
+- [ ] **5.11.3** Add compile_then to CompileContext
+  - Parse `input |> THEN { body }`
+  - Allocate Transformer node
+  - Create body subgraph, wire to Transformer
+
+- [ ] **5.11.4** Add compile_when to CompileContext
+  - Parse `input |> WHEN { pattern1 => body1, ... }`
+  - Allocate PatternMux node
+  - Create arm bodies as subgraphs
+  - Store patterns for runtime matching
+
+- [ ] **5.11.5** Add compile_while to CompileContext
+  - Parse `input |> WHILE { pattern1 => body1, ... }`
+  - Allocate SwitchedWire node
+  - Defer arm body creation (lazy on match)
+
+### 5.12 Phase 4 Verification
+
+- [ ] **5.12.1** Unit test: LATEST with two constants
   ```rust
-  // Manual test: counter increments on trigger
-  let initial = ctx.compile_constant(Payload::Number(0.0));
-  let hold = ctx.compile_hold(initial, body_slot);
+  let a = ctx.compile_constant(1.0);
+  let b = ctx.compile_constant(2.0);
+  let latest = ctx.compile_latest(vec![a, b]);
+  // Expect: emits 1.0 then 2.0 (last wins)
   ```
 
-- [ ] **5.8.2** Run all tests
+- [ ] **5.12.2** Unit test: HOLD counter pattern
+  ```rust
+  // count: 0 |> HOLD state { trigger |> THEN { state + 1 } }
+  // Trigger 3 times, expect final value = 3
+  ```
+
+- [ ] **5.12.3** Unit test: WHEN pattern matching
+  ```rust
+  // input |> WHEN { 1 => TEXT{one}, 2 => TEXT{two}, __ => TEXT{other} }
+  // Send 1, expect "one"
+  ```
+
+- [ ] **5.12.4** Unit test: WHILE arm switching
+  ```rust
+  // toggle |> WHILE { True => TEXT{on}, False => TEXT{off} }
+  // Toggle true/false, verify output changes
+  ```
+
+- [ ] **5.12.5** Unit test: FLUSH in HOLD body
+  ```rust
+  // Verify FLUSH propagates to output but doesn't corrupt state (§2.6.5)
+  ```
+
+- [ ] **5.12.6** Run all tests
   ```bash
   cargo test -p boon engine_v2
   cargo test -p boon evaluator_v2
   ```
 
-- [ ] **5.8.3** Commit Phase 4
+- [ ] **5.12.7** Commit Phase 4
   ```bash
-  git add -A && git commit -m "Phase 4: Combinators (LATEST, HOLD, THEN, WHEN, WHILE)"
+  jj new -m "Phase 4: Combinators (LATEST, HOLD, THEN, WHEN, WHILE)"
   ```
 
 ---
@@ -1604,52 +1825,155 @@
 ## PART 9: Phase 7 - Bridge & Playground
 
 **Prerequisites:** Part 8 complete
-**Goal:** Connect new engine to Zoon UI.
+**Goal:** Connect new engine to Zoon UI. Split into 4 sub-phases for manageability.
 
-### 9.1 Bridge Module
+**Estimated Duration:** 4-5 weeks total (previously underestimated as 1 week)
+
+---
+
+### Phase 7a: Basic Bridge (Week 1)
+
+**Goal:** Minimal bridge connecting arena values to Zoon.
+
+#### 9.1 Bridge Module
 
 - [ ] **9.1.1** Create `platform/browser/bridge_v2.rs`
-- [ ] **9.1.2** Implement arena → Zoon element conversion
-- [ ] **9.1.3** Handle scalar roots (Text, Number, Bool, Unit) - see 2.8
+- [ ] **9.1.2** Implement Payload → Zoon primitive conversion
+  - Number → RawText (or formatted display)
+  - Text → RawText
+  - Bool → RawText ("true"/"false")
+  - Unit → empty
+- [ ] **9.1.3** Implement ObjectHandle → Zoon element conversion
+  - Router node → child elements
+- [ ] **9.1.4** Handle scalar roots (Text, Number, Bool, Unit) - see §2.8
 
-### 9.2 PASS/PASSED Context
+#### 9.2 Feature Flag
 
-- [ ] **9.2.1** Add pass_stack to CompileContext
-- [ ] **9.2.2** Implement PASS: argument handling
-- [ ] **9.2.3** Implement PASSED resolution
+- [ ] **9.2.1** Add `engine-v2` feature flag to Cargo.toml
+- [ ] **9.2.2** Wire interpreter to conditionally use new engine
+- [ ] **9.2.3** Ensure old engine still works (feature off)
 
-### 9.3 TextTemplate Node (Issue 4)
+#### 9.3 Basic Document/new
 
-- [ ] **9.3.1** Add TextTemplate to NodeKind
-- [ ] **9.3.2** Implement reactive TEXT interpolation
+- [ ] **9.3.1** Implement Document/new for scalar roots
+- [ ] **9.3.2** Test: `document: TEXT { Hello } |> Document/new()`
+- [ ] **9.3.3** Test: `document: 42 |> Document/new()`
 
-### 9.4 Element States (Issue 7)
+**Phase 7a Verification:**
+- [ ] **9.3.4** Simple TEXT example renders in playground
+- [ ] **9.3.5** Commit Phase 7a
 
-- [ ] **9.4.1** Add ElementState struct
-- [ ] **9.4.2** Implement hovered/focused streams
+---
 
-### 9.5 LINK Protocol (Issue 15)
+### Phase 7b: Element API (Week 2)
 
-- [ ] **9.5.1** Implement LINK bind/unbind
-- [ ] **9.5.2** Implement scope finalization for LINK cleanup
+**Goal:** Implement Element/* functions for building UIs.
 
-### 9.6 Document/new and Element/*
+#### 9.4 Core Element Functions
 
-- [ ] **9.6.1** Implement Document/new
-- [ ] **9.6.2** Implement Element/button, Element/label, etc.
+- [ ] **9.4.1** Implement Element/container (basic wrapper)
+- [ ] **9.4.2** Implement Element/label (text display)
+- [ ] **9.4.3** Implement Element/button (clickable, no events yet)
+- [ ] **9.4.4** Implement Element/stripe (flex layout, direction/gap)
+- [ ] **9.4.5** Implement Element/stack (z-order layout)
 
-### 9.7 Feature Flag
+#### 9.5 Styling Support
 
-- [ ] **9.7.1** Add engine-v2 feature flag
-- [ ] **9.7.2** Wire up interpreter to use new engine conditionally
+- [ ] **9.5.1** Parse style object from Boon object
+- [ ] **9.5.2** Map Boon styles to Zoon properties
+  - width, height, padding, font, background, etc.
+- [ ] **9.5.3** Handle Oklch color values
+- [ ] **9.5.4** Handle Duration values (for animations)
 
-### 9.8 Phase 7 Verification
+#### 9.6 More Elements
 
-- [ ] **9.8.1** Test shopping_list.bn in playground
-- [ ] **9.8.2** Test switch_hold_test.bn (Issue 15)
-- [ ] **9.8.3** Test button_hover_test.bn (Issue 7)
-- [ ] **9.8.4** Test todo_mvc.bn (full validation)
-- [ ] **9.8.5** Commit Phase 7
+- [ ] **9.6.1** Implement Element/text_input (no events yet)
+- [ ] **9.6.2** Implement Element/checkbox (no events yet)
+- [ ] **9.6.3** Implement Element/paragraph
+- [ ] **9.6.4** Implement Element/link
+
+**Phase 7b Verification:**
+- [ ] **9.6.5** Static counter UI renders (no reactivity)
+- [ ] **9.6.6** Commit Phase 7b
+
+---
+
+### Phase 7c: Interactive Features (Weeks 3-4)
+
+**Goal:** Add event handling, LINK protocol, and element states.
+
+#### 9.7 LINK Protocol (Issue 15)
+
+- [ ] **9.7.1** Implement IOPad node for LINK
+- [ ] **9.7.2** Implement LINK bind (attach event listeners)
+- [ ] **9.7.3** Implement LINK unbind (detach listeners on scope finalization)
+- [ ] **9.7.4** Implement scope finalization at tick end
+- [ ] **9.7.5** Test: switch_hold_test.bn (LINK in WHILE arms)
+
+#### 9.8 Element States (Issue 7)
+
+- [ ] **9.8.1** Add ElementState struct (hovered, focused slots)
+- [ ] **9.8.2** Wire hovered state to mouse events
+- [ ] **9.8.3** Wire focused state to focus/blur events
+- [ ] **9.8.4** Test: button_hover_test.bn
+
+#### 9.9 Element Events
+
+- [ ] **9.9.1** Implement element.event.press (button click)
+- [ ] **9.9.2** Implement element.event.change (input change)
+- [ ] **9.9.3** Implement element.event.key_down (key press)
+- [ ] **9.9.4** Implement element.event.blur, element.event.double_click
+
+#### 9.10 Router Effects
+
+- [ ] **9.10.1** Implement Router/go_to effect
+- [ ] **9.10.2** Implement Router/route query
+- [ ] **9.10.3** Test: pages.bn
+
+**Phase 7c Verification:**
+- [ ] **9.10.4** counter.bn works with button click
+- [ ] **9.10.5** Commit Phase 7c
+
+---
+
+### Phase 7d: Context & Templates (Week 5)
+
+**Goal:** PASS/PASSED context and reactive text templates.
+
+#### 9.11 PASS/PASSED Context (§2.11)
+
+- [ ] **9.11.1** Add pass_stack to CompileContext
+- [ ] **9.11.2** Implement PASS: argument compilation
+- [ ] **9.11.3** Implement PASSED keyword resolution
+- [ ] **9.11.4** Implement pass_stack push/pop at function boundaries
+- [ ] **9.11.5** Test: nested function calls with PASS
+
+#### 9.12 TextTemplate Node (Issue 4)
+
+- [ ] **9.12.1** Add TextTemplate to NodeKind
+- [ ] **9.12.2** Parse TEXT { ... {var} ... } into template + dependencies
+- [ ] **9.12.3** Implement reactive re-rendering on dependency change
+- [ ] **9.12.4** Handle nested interpolations
+- [ ] **9.12.5** Test: TEXT { Count: {count} } updates when count changes
+
+#### 9.13 Full Validation
+
+- [ ] **9.13.1** Test shopping_list.bn (PASS/PASSED + List ops)
+- [ ] **9.13.2** Test todo_mvc.bn (FULL VALIDATION TARGET)
+- [ ] **9.13.3** Run all 23 example files, note failures
+- [ ] **9.13.4** Commit Phase 7d
+
+---
+
+### Phase 7 Summary
+
+| Sub-phase | Duration | Key Deliverables |
+|-----------|----------|------------------|
+| 7a | 1 week | Basic bridge, scalar rendering, feature flag |
+| 7b | 1 week | Element/*, styling, layout |
+| 7c | 2 weeks | LINK, events, element states, router |
+| 7d | 1 week | PASS/PASSED, TextTemplate, full validation |
+| **Total** | **5 weeks** | **todo_mvc.bn works** |
 
 ---
 
@@ -1762,7 +2086,7 @@ Run all 23 validation examples:
 - [ ] **12.4.2** Update 6.5_SYNC.md with completion status
 - [ ] **12.4.3** Final commit
   ```bash
-  git add -A && git commit -m "M0 + M1 complete: New arena-based engine + CLI"
+  jj new -m "M0 + M1 complete: New arena-based engine + CLI"
   ```
 
 ---
@@ -1806,11 +2130,14 @@ cd playground && makers mzoon start &
 |-------|------|
 | Node identification | `docs/new_boon/2.1_NODE_IDENTIFICATION.md` |
 | Arena memory | `docs/new_boon/2.2_ARENA_MEMORY.md` |
-| Message passing | `docs/new_boon/2.3_MESSAGE_PASSING.md` |
+| Message passing, routing | `docs/new_boon/2.3_MESSAGE_PASSING.md` |
 | Event loop | `docs/new_boon/2.4_EVENT_LOOP.md` |
+| Error handling (FLUSH) | `docs/new_boon/2.6_ERROR_HANDLING.md` |
 | Bridge API | `docs/new_boon/2.8_BRIDGE_API.md` |
+| Context passing (PASS/PASSED) | `docs/new_boon/2.11_CONTEXT_PASSING.md` |
 | Issues | `docs/new_boon/6.1_ISSUES.md` |
 | Examples | `docs/new_boon/6.2_EXAMPLES.md` |
+| Canonical plan | `docs/new_boon/plans/M0_CLI__M1_NEW_ENGINE_IN_PLAYGROUND.md` |
 
 ---
 
