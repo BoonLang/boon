@@ -76,20 +76,33 @@ fn materialize(payload: &Payload, arena: &Arena) -> serde_json::Value {
         Payload::Number(n) => json!(n),
         Payload::Text(s) => json!(s),
         Payload::Bool(b) => json!(b),
+        Payload::Unit => json!(null),  // Unit → null
         Payload::Tag(t) => json!(arena.tag_name(*t)),
         Payload::ListHandle(slot) => {
             let bus = arena.get(*slot);
-            json!(bus.items().map(|item| materialize(item, arena)).collect::<Vec<_>>())
+            // Lists: ordered by insertion index (deterministic)
+            json!(bus.items_by_index().map(|item| materialize(item, arena)).collect::<Vec<_>>())
         }
         Payload::ObjectHandle(slot) => {
             let router = arena.get(*slot);
-            json!(router.fields().map(|(k, v)| (k, materialize(v, arena))).collect::<Map<_>>())
+            // Objects: fields sorted alphabetically (deterministic)
+            let mut fields: Vec<_> = router.fields().collect();
+            fields.sort_by_key(|(k, _)| k.clone());
+            json!(fields.into_iter().map(|(k, v)| (k, materialize(v, arena))).collect::<Map<_>>())
         }
         Payload::Flushed(inner) => json!({"error": materialize(inner, arena)}),
         _ => json!(null), // Deltas not materialized
     }
 }
 ```
+
+**Deterministic ordering rules (for golden tests):**
+
+| Container | Order | Rationale |
+|-----------|-------|-----------|
+| **List** | Insertion index | Preserves user-visible order |
+| **Object** | Alphabetical by field name | Reproducible across runs |
+| **Numbers** | Full precision (no rounding) | Exact match in tests |
 
 ### boon test (M0 minimal)
 
@@ -231,7 +244,7 @@ impl EventLoop {
 ```
 crates/boon/src/
 ├── lib.rs                           # Feature-gated exports
-├── parser/                          # Unchanged
+├── parser/                          # Minor changes: add SourceId to Spanned
 │
 ├── engine_v2/                       # NEW: Platform-agnostic core
 │   ├── mod.rs                       # Re-exports
@@ -370,6 +383,13 @@ These features are **required for M1 todo_mvc validation**. The plan must explic
 | 1.5 | Implement ReactiveNode struct | `src/engine_v2/node.rs` |
 | 1.6 | Add EventLoop skeleton | `src/engine_v2/event_loop.rs` |
 | 1.7 | Unit tests for arena operations | `src/engine_v2/arena.rs` |
+| 1.8 | **Add SourceId to parser Spanned struct** | `src/parser.rs` |
+
+**Parser modifications (step 1.8):**
+- Add `source_id: SourceId` field to `Spanned<T>` struct
+- Compute SourceId via structural hash during parsing
+- SourceId uses node kind + parent path + content hash
+- This enables stable identity for hot-reload (§3.2)
 
 **Validation:** `cargo test -p boon` passes
 
@@ -634,11 +654,14 @@ Test: `fibonacci.bn` (uses Stream/pulses, Log/info)
 PASS/PASSED provides implicit context passing through function calls without explicit parameters.
 
 ```boon
--- Caller side: PASS sets context for the function call
-add_button |> Element/button() |> PASS: [store: items_store]
+-- Caller side: PASS: sets context as a named argument
+Document/new(root: root_element(PASS: [store: items_store]))
 
--- Inside button's on_press handler, PASSED accesses the context
-on_press: LINK |> THEN { PASSED.store |> List/append(item: new_item) }
+-- Inside root_element, PASSED accesses the context
+item_list: PASSED.store.items |> List/map(item, new: item_view(item, PASS: PASSED))
+
+-- Inside item_view, PASSED is still available
+remove_button |> LINK |> THEN { PASSED.store |> List/remove(item: item) }
 ```
 
 **Runtime representation:**
@@ -658,7 +681,7 @@ struct EvalContext {
 
 | Rule | Behavior |
 |------|----------|
-| **PASS: value** | Pushes value onto pass_stack before function call |
+| **func(PASS: value)** | Pushes value onto pass_stack for this function call |
 | **PASSED** | Resolves to top of pass_stack (current context) |
 | **PASSED.field** | Field access on passed value |
 | **Missing PASSED** | Compile error if PASSED used without active PASS |
@@ -666,25 +689,100 @@ struct EvalContext {
 | **List/map scope** | PASS context propagates into List/map item bodies |
 | **WHILE switching** | PASS context preserved across arm switches |
 
+**Pipe-Field-Access Syntax:**
+
+The pattern `stream |> .field` extracts fields from each value in a reactive stream:
+
+```boon
+-- Shorthand syntax
+counter |> .current
+
+-- Equivalent to:
+counter |> WHILE { value => value.current }
+```
+
+**Semantics:**
+- `|> .field` navigates through the field path for each incoming value
+- Uses "switch" semantics: when value changes, re-navigate through new value
+- Essential for reactive paths like `element.event.click` where element may change
+
+**Implementation:**
+```rust
+fn compile_field_access(path: Vec<String>, piped: SlotId) -> SlotId {
+    // Build SwitchedWire that navigates field path
+    // Equivalent to: WHILE { value => value.field1.field2... }
+    arena.alloc_switched_wire(piped, |value| {
+        path.iter().fold(value, |acc, field| acc.get_field(field))
+    })
+}
+```
+
+**Call-Arg Local Bindings:**
+
+Named arguments in function calls create local bindings available within the same call's argument scope:
+
+```boon
+-- The `element` argument creates a local binding
+Element/text_input(
+    element: [
+        event: [change: LINK, key_down: LINK]
+    ]
+    -- `element` is available here because it's a sibling argument
+    text: LATEST { Text/empty(), element.event.change.text }
+)
+```
+
+**Semantics:**
+- Named arguments are evaluated in order (left to right)
+- Earlier arguments are available as bindings for later arguments
+- The binding is local to the function call scope
+- Pattern: `arg_name: value` creates binding `arg_name` for subsequent args
+
+**Implementation:**
+```rust
+fn compile_function_call(call: &FunctionCall, ctx: &mut CompileContext) -> SlotId {
+    // Create temporary scope for call-arg bindings
+    let call_scope = ctx.push_scope();
+
+    for (name, expr) in &call.named_args {
+        let slot = ctx.compile_expr(expr);
+        // Binding available for subsequent args in same call
+        ctx.local_bindings.insert(name.clone(), slot);
+    }
+
+    // ... compile function with resolved args
+    ctx.pop_scope();
+}
+```
+
 **Example: shopping_list.bn pattern**
 ```boon
--- items is a List, each with access to the store via PASSED
-items: LIST {} |> HOLD state {
-    add_button.event.press |> THEN {
-        state |> List/append(item: new_item)
-    }
+-- Store holds references to reactive state
+store: [
+    items: LIST {},
+    elements: [add_button: LINK_TARGET, clear_button: LINK_TARGET]
+]
+
+-- Items are added via LINK event on add_button
+items: store.elements.add_button.event.press |> THEN {
+    store.items |> List/append(item: new_item)
 }
 
--- Item renderer receives store via PASS
+-- Item renderer receives store via PASS: named argument
 item_view: FUNCTION(item) {
-    -- PASSED.store available here because caller used PASS
-    remove_button |> Element/button() |> LINK |> THEN {
-        PASSED.store |> List/remove(item: item)
-    }
+    -- PASSED.store available here because caller used PASS: argument
+    Element/row(children: [
+        Element/label(text: item.name)
+        Element/button(label: TEXT { X }) |> LINK |> THEN {
+            PASSED.store.items |> List/remove(item: item)
+        }
+    ])
 }
 
--- Caller passes context
-items |> List/map(item, new: item |> item_view() |> PASS: [store: items])
+-- Caller passes context via PASS: named argument
+document: Document/new(root: Element/column(children: [
+    PASSED.store.items |> List/map(item, new: item_view(item, PASS: [store: store]))
+])(PASS: [store: store]))
 ```
 
 **TextTemplate (Issue 4):**
