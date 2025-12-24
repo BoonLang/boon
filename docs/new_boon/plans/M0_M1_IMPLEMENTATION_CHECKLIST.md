@@ -352,6 +352,40 @@ All critical issues are now assigned to specific phases with explicit verificati
             }
         }
     }
+
+    impl ReactiveNode {
+        /// Get the node kind from extension (lazy allocation means this may be None).
+        pub fn kind(&self) -> Option<&NodeKind> {
+            self.extension.as_ref().map(|ext| &ext.kind_data)
+        }
+
+        /// Get mutable reference to node kind (for in-place updates).
+        pub fn kind_mut(&mut self) -> Option<&mut NodeKind> {
+            self.extension.as_mut().map(|ext| &mut ext.kind_data)
+        }
+
+        /// Get mutable access to extension, allocating if needed (lazy allocation §2.2.5.1).
+        pub fn extension_mut(&mut self) -> &mut NodeExtension {
+            self.extension.get_or_insert_with(|| Box::new(NodeExtension::default()))
+        }
+
+        /// Set the node kind (allocates extension if needed).
+        pub fn set_kind(&mut self, kind: NodeKind) {
+            self.extension_mut().kind_data = kind;
+        }
+    }
+
+    impl Default for NodeExtension {
+        fn default() -> Self {
+            Self {
+                current_value: None,
+                pending_deltas: Vec::new(),
+                kind_data: NodeKind::Wire { source: None },  // Default to empty wire
+                extra_inputs: Vec::new(),
+                extra_subscribers: Vec::new(),
+            }
+        }
+    }
     ```
   - Verify: `cargo check -p boon` (will fail until node.rs exists)
 
@@ -406,6 +440,18 @@ All critical issues are now assigned to specific phases with explicit verificati
         free_list: Vec<u32>,
         /// Side table: SlotId → NodeAddress (for deterministic sorting)
         addresses: HashMap<SlotId, NodeAddress>,
+        /// Intern table: FieldId → field name string (see §2.3.1.1)
+        field_names: HashMap<u32, Arc<str>>,
+        /// Reverse lookup: field name → FieldId
+        field_ids: HashMap<Arc<str>, u32>,
+        /// Next FieldId to allocate
+        next_field_id: u32,
+        /// Intern table: TagId → tag name string
+        tag_names: HashMap<u32, Arc<str>>,
+        /// Reverse lookup: tag name → TagId
+        tag_ids: HashMap<Arc<str>, u32>,
+        /// Next TagId to allocate
+        next_tag_id: u32,
     }
 
     impl Arena {
@@ -418,7 +464,49 @@ All critical issues are now assigned to specific phases with explicit verificati
                 nodes: Vec::with_capacity(capacity),
                 free_list: Vec::new(),
                 addresses: HashMap::new(),
+                field_names: HashMap::new(),
+                field_ids: HashMap::new(),
+                next_field_id: 0,
+                tag_names: HashMap::new(),
+                tag_ids: HashMap::new(),
+                next_tag_id: 0,
             }
+        }
+
+        /// Intern a field name, returning its FieldId.
+        pub fn intern_field(&mut self, name: &str) -> u32 {
+            if let Some(&id) = self.field_ids.get(name) {
+                return id;
+            }
+            let id = self.next_field_id;
+            self.next_field_id += 1;
+            let name: Arc<str> = name.into();
+            self.field_names.insert(id, name.clone());
+            self.field_ids.insert(name, id);
+            id
+        }
+
+        /// Get field name from FieldId.
+        pub fn get_field_name(&self, id: u32) -> Option<&Arc<str>> {
+            self.field_names.get(&id)
+        }
+
+        /// Intern a tag name, returning its TagId.
+        pub fn intern_tag(&mut self, name: &str) -> u32 {
+            if let Some(&id) = self.tag_ids.get(name) {
+                return id;
+            }
+            let id = self.next_tag_id;
+            self.next_tag_id += 1;
+            let name: Arc<str> = name.into();
+            self.tag_names.insert(id, name.clone());
+            self.tag_ids.insert(name, id);
+            id
+        }
+
+        /// Get tag name from TagId.
+        pub fn get_tag_name(&self, id: u32) -> Option<&Arc<str>> {
+            self.tag_names.get(&id)
         }
     }
 
@@ -1058,13 +1146,20 @@ All critical issues are now assigned to specific phases with explicit verificati
                 return;
             };
 
-            let output = match &node.kind {
+            // Access kind through extension (see §2.2.5.1 lazy allocation)
+            let Some(kind) = node.kind() else {
+                return;  // Node has no extension yet (shouldn't happen for dirty nodes)
+            };
+
+            let output = match kind {
                 NodeKind::Producer { value } => value.clone(),
                 NodeKind::Wire { source } => {
                     source.and_then(|s| {
-                        self.arena.get(s).and_then(|n| match &n.kind {
-                            NodeKind::Producer { value } => value.clone(),
-                            _ => None,
+                        self.arena.get(s).and_then(|n| {
+                            n.kind().and_then(|k| match k {
+                                NodeKind::Producer { value } => value.clone(),
+                                _ => None,
+                            })
                         })
                     })
                 }
@@ -1089,28 +1184,85 @@ All critical issues are now assigned to specific phases with explicit verificati
     //!
     //! Compiles AST expressions into reactive nodes in the arena.
 
+    use std::collections::HashMap;
     use crate::engine_v2::{
         arena::SlotId,
         event_loop::EventLoop,
         message::Payload,
         node::NodeKind,
+        address::ScopeId,
     };
 
     /// Context for compilation.
+    /// Tracks compile-time state for expression compilation.
     pub struct CompileContext<'a> {
         pub event_loop: &'a mut EventLoop,
+        /// Current scope for node instantiation
+        pub scope_id: ScopeId,
+        /// Local bindings: variable name → SlotId (lexical scope)
+        pub local_bindings: HashMap<String, SlotId>,
+        /// PASS/PASSED context stack (§2.11 - compile-time only)
+        pub pass_stack: Vec<SlotId>,
+        /// Function parameters: name → SlotId (for FUNCTION compilation)
+        pub parameters: HashMap<String, SlotId>,
     }
 
     impl<'a> CompileContext<'a> {
         pub fn new(event_loop: &'a mut EventLoop) -> Self {
-            Self { event_loop }
+            Self {
+                event_loop,
+                scope_id: ScopeId::ROOT,
+                local_bindings: HashMap::new(),
+                pass_stack: Vec::new(),
+                parameters: HashMap::new(),
+            }
+        }
+
+        /// Push PASS context for function call (§2.11).
+        pub fn push_pass(&mut self, slot: SlotId) {
+            self.pass_stack.push(slot);
+        }
+
+        /// Pop PASS context after function body compiled.
+        pub fn pop_pass(&mut self) {
+            self.pass_stack.pop();
+        }
+
+        /// Get current PASSED context (top of stack).
+        pub fn current_passed(&self) -> Option<SlotId> {
+            self.pass_stack.last().copied()
+        }
+
+        /// Add a call-arg local binding (§2.11 - compile-time only).
+        pub fn add_local_binding(&mut self, name: String, slot: SlotId) {
+            self.local_bindings.insert(name, slot);
+        }
+
+        /// Remove a local binding after function body compiled.
+        pub fn remove_local_binding(&mut self, name: &str) {
+            self.local_bindings.remove(name);
+        }
+
+        /// Resolve a variable name to its SlotId.
+        pub fn resolve_variable(&self, name: &str) -> Option<SlotId> {
+            // Check local bindings first (call-arg bindings)
+            if let Some(&slot) = self.local_bindings.get(name) {
+                return Some(slot);
+            }
+            // Then check function parameters
+            if let Some(&slot) = self.parameters.get(name) {
+                return Some(slot);
+            }
+            // Variable not found in current scope
+            None
         }
 
         /// Compile a constant value.
         pub fn compile_constant(&mut self, value: Payload) -> SlotId {
             let slot = self.event_loop.arena.alloc();
             if let Some(node) = self.event_loop.arena.get_mut(slot) {
-                node.kind = NodeKind::Producer { value: Some(value) };
+                // Use set_kind() for lazy extension allocation (§2.2.5.1)
+                node.set_kind(NodeKind::Producer { value: Some(value) });
             }
             slot
         }
@@ -1119,7 +1271,7 @@ All critical issues are now assigned to specific phases with explicit verificati
         pub fn compile_wire(&mut self, source: SlotId) -> SlotId {
             let slot = self.event_loop.arena.alloc();
             if let Some(node) = self.event_loop.arena.get_mut(slot) {
-                node.kind = NodeKind::Wire { source: Some(source) };
+                node.set_kind(NodeKind::Wire { source: Some(source) });
             }
             // Subscribe to source
             self.event_loop.routing.add_route(source, slot, crate::engine_v2::address::Port::Output);
@@ -1149,7 +1301,7 @@ All critical issues are now assigned to specific phases with explicit verificati
             let field_map: HashMap<FieldId, SlotId> = fields.into_iter().collect();
 
             if let Some(node) = self.event_loop.arena.get_mut(slot) {
-                node.kind = NodeKind::Router { fields: field_map };
+                node.set_kind(NodeKind::Router { fields: field_map });
             }
 
             slot
@@ -1158,7 +1310,7 @@ All critical issues are now assigned to specific phases with explicit verificati
         /// Get a field from a Router node.
         pub fn get_field(&self, router: SlotId, field: FieldId) -> Option<SlotId> {
             let node = self.event_loop.arena.get(router)?;
-            match &node.kind {
+            match node.kind()? {
                 NodeKind::Router { fields } => fields.get(&field).copied(),
                 _ => None,
             }
@@ -1185,8 +1337,8 @@ All critical issues are now assigned to specific phases with explicit verificati
             let slot = ctx.compile_constant(Payload::Number(42.0));
 
             let node = ctx.event_loop.arena.get(slot).unwrap();
-            match &node.kind {
-                NodeKind::Producer { value: Some(Payload::Number(n)) } => {
+            match node.kind() {
+                Some(NodeKind::Producer { value: Some(Payload::Number(n)) }) => {
                     assert_eq!(*n, 42.0);
                 }
                 _ => panic!("Expected Producer with Number"),
@@ -1954,19 +2106,172 @@ All critical issues are now assigned to specific phases with explicit verificati
 
 #### 9.11 PASS/PASSED Context (§2.11)
 
-- [ ] **9.11.1** Add pass_stack to CompileContext
+- [ ] **9.11.1** Verify pass_stack in CompileContext
+  - Already added in §3.3.1: `pass_stack: Vec<SlotId>` with `push_pass()`, `pop_pass()`, `current_passed()`
+
 - [ ] **9.11.2** Implement PASS: argument compilation
+  - Content:
+    ```rust
+    /// Compile function call with PASS argument (§2.11).
+    pub fn compile_function_call(&mut self, call: &FunctionCall) -> SlotId {
+        // Process named arguments as local bindings
+        for arg in &call.arguments {
+            if arg.name != "PASS" {
+                let arg_slot = self.compile_expression(&arg.value);
+                self.add_local_binding(arg.name.clone(), arg_slot);
+            }
+        }
+
+        // Handle PASS argument
+        if let Some(pass_arg) = call.get_pass_argument() {
+            let pass_slot = self.compile_expression(&pass_arg.value);
+            self.push_pass(pass_slot);
+        }
+
+        // Compile function body (inlined - no FunctionCall node)
+        let result = self.inline_function_body(&call.function);
+
+        // Pop PASS context if we pushed one
+        if call.has_pass_argument() {
+            self.pop_pass();
+        }
+
+        // Clean up local bindings
+        for arg in &call.arguments {
+            if arg.name != "PASS" {
+                self.remove_local_binding(&arg.name);
+            }
+        }
+
+        result
+    }
+    ```
+
 - [ ] **9.11.3** Implement PASSED keyword resolution
+  - Content:
+    ```rust
+    /// Compile PASSED or PASSED.field.path expression.
+    pub fn compile_passed(&mut self, field_path: &[String]) -> Result<SlotId, CompileError> {
+        let pass_slot = self.current_passed()
+            .ok_or(CompileError::PassedNotAvailable)?;
+
+        if field_path.is_empty() {
+            // Just `PASSED` - return the entire context
+            return Ok(pass_slot);
+        }
+
+        // `PASSED.store.items` - emit field access chain
+        let mut current = pass_slot;
+        for field_name in field_path {
+            let field_id = self.event_loop.arena.intern_field(field_name);
+            current = self.compile_field_access(current, field_id);
+        }
+
+        Ok(current)
+    }
+    ```
+
 - [ ] **9.11.4** Implement pass_stack push/pop at function boundaries
+  - Already implemented in push_pass/pop_pass methods
+
 - [ ] **9.11.5** Test: nested function calls with PASS
 
 #### 9.12 TextTemplate Node (Issue 4)
 
 - [ ] **9.12.1** Add TextTemplate to NodeKind
-- [ ] **9.12.2** Parse TEXT { ... {var} ... } into template + dependencies
+  - Content:
+    ```rust
+    /// Text template with reactive interpolations (TEXT { ... {var} ... })
+    TextTemplate {
+        /// Template string with placeholders: "Count: {0}, Total: {1}"
+        template: String,
+        /// Dependencies: SlotIds referenced in interpolations (collected at compile-time)
+        dependencies: Vec<SlotId>,
+        /// Cached rendered string (updated when any dependency changes)
+        cached: Option<Arc<str>>,
+    },
+    ```
+
+- [ ] **9.12.2** Implement compile-time dependency collection (§2.3)
+  - Content:
+    ```rust
+    /// Compile TEXT { literal {expr1} more {expr2} } into TextTemplate node.
+    pub fn compile_text_template(&mut self, segments: &[TextSegment]) -> SlotId {
+        let mut template_parts = Vec::new();
+        let mut dependencies = Vec::new();
+
+        for segment in segments {
+            match segment {
+                TextSegment::Literal(text) => {
+                    template_parts.push(text.clone());
+                }
+                TextSegment::Interpolation(expr) => {
+                    // Compile the expression and track its SlotId as a dependency
+                    let dep_slot = self.compile_expression(expr);
+                    dependencies.push(dep_slot);
+                    // Add placeholder for this dependency
+                    template_parts.push(format!("{{{}}}", dependencies.len() - 1));
+                }
+            }
+        }
+
+        let template = template_parts.join("");
+        let slot = self.event_loop.arena.alloc();
+
+        if let Some(node) = self.event_loop.arena.get_mut(slot) {
+            node.set_kind(NodeKind::TextTemplate {
+                template,
+                dependencies: dependencies.clone(),
+                cached: None,
+            });
+        }
+
+        // Subscribe to all dependencies - template re-renders when any changes
+        for dep in &dependencies {
+            self.event_loop.routing.add_route(*dep, slot, Port::Output);
+        }
+
+        slot
+    }
+    ```
+
 - [ ] **9.12.3** Implement reactive re-rendering on dependency change
+  - Content:
+    ```rust
+    fn process_text_template(&mut self, slot: SlotId) {
+        let node = self.arena.get_mut(slot);
+        if let Some(NodeKind::TextTemplate { template, dependencies, cached }) = node.kind_mut() {
+            // Collect current values from all dependencies
+            let mut values: Vec<String> = Vec::new();
+            for dep in dependencies.iter() {
+                let value = self.get_current_value(*dep)
+                    .map(|p| p.to_display_string())
+                    .unwrap_or_default();
+                values.push(value);
+            }
+
+            // Render template with substitutions
+            let mut result = template.clone();
+            for (i, value) in values.iter().enumerate() {
+                result = result.replace(&format!("{{{}}}", i), value);
+            }
+
+            // Update cache and emit
+            let text: Arc<str> = result.into();
+            *cached = Some(text.clone());
+            self.emit_to_subscribers(slot, Payload::Text(text));
+        }
+    }
+    ```
+
 - [ ] **9.12.4** Handle nested interpolations
+  - Nested expressions like `{item.name}` compile to field access chain
+  - Each intermediate SlotId is NOT a dependency - only the final result is
+
 - [ ] **9.12.5** Test: TEXT { Count: {count} } updates when count changes
+  - Verify initial render
+  - Verify re-render when `count` changes
+  - Verify only one dependency tracked (the count slot)
 
 #### 9.13 Full Validation
 
