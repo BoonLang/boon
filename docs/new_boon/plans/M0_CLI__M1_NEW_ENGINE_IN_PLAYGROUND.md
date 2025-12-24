@@ -51,11 +51,28 @@ y: x * 2
 
 For Document/new, output is the **text content** of the root element:
 ```boon
-document: "Hello" |> Document/new()
+document: TEXT { Hello } |> Document/new()
 -- Output: "Hello"
 ```
 
-For non-text UI trees, output is a JSON representation of the element structure.
+For non-text UI trees, output is a JSON representation of the element structure:
+
+```json
+// Document/new output schema for CLI
+{
+  "element": "container",          // Element kind (container, stripe, button, etc.)
+  "tag": "div",                    // HTML tag (optional)
+  "style": { ... },                // Style object
+  "children": [                    // Child elements (if container)
+    { "element": "label", "text": "Hello" },
+    { "element": "button", "label": "Click me", "events": ["press"] }
+  ],
+  "text": "...",                   // For text/label elements
+  "attrs": { ... }                 // Additional attributes
+}
+```
+
+This schema enables deterministic golden tests for CLI output.
 
 ### When does `boon run` exit?
 
@@ -536,7 +553,7 @@ pub struct ListRemoveNode {
 
 **Validation:**
 ```boon
-items: LIST {} |> List/append(item: "hello") |> List/remove(if: item.done)
+items: LIST {} |> List/append(item: TEXT { hello }) |> List/remove(if: item.done)
 ```
 
 Test: `chained_list_remove_bug.bn`, `list_map_external_dep.bn`
