@@ -551,6 +551,28 @@ pub enum NodeEffect {
 }
 ```
 
+**Duration type (built-in tagged object):**
+```rust
+// Duration is parsed at compile time and normalized to milliseconds
+// Syntax: Duration[seconds: N] | Duration[milliseconds: N] | Duration[ms: N]
+fn evaluate_duration(tagged_obj: &TaggedObject) -> Result<f64, EvalError> {
+    match tagged_obj.tag.as_str() {
+        "Duration" => {
+            if let Some(secs) = tagged_obj.fields.get("seconds") {
+                Ok(secs.as_number()? * 1000.0)
+            } else if let Some(ms) = tagged_obj.fields.get("milliseconds") {
+                Ok(ms.as_number()?)
+            } else if let Some(ms) = tagged_obj.fields.get("ms") {
+                Ok(ms.as_number()?)
+            } else {
+                Err(EvalError::InvalidDuration)
+            }
+        }
+        _ => Err(EvalError::ExpectedDuration)
+    }
+}
+```
+
 **Timer/interval API (matches existing examples):**
 ```boon
 -- Canonical form: Duration piped to Timer/interval
@@ -607,12 +629,62 @@ Test: `fibonacci.bn` (uses Stream/pulses, Log/info)
 | 7.10 | **Implement scope finalization at tick end** | `src/engine_v2/event_loop.rs` |
 | 7.11 | Implement Router/go_to, Router/route effects | `src/evaluator_v2/api.rs` |
 
-**PASS/PASSED Context Threading:**
+**PASS/PASSED Context Threading (Precise Rules):**
+
+PASS/PASSED provides implicit context passing through function calls without explicit parameters.
+
+```boon
+-- Caller side: PASS sets context for the function call
+add_button |> Element/button() |> PASS: [store: items_store]
+
+-- Inside button's on_press handler, PASSED accesses the context
+on_press: LINK |> THEN { PASSED.store |> List/append(item: new_item) }
+```
+
+**Runtime representation:**
 ```rust
-// During function call compilation:
-// 1. Caller sets PASS: value → stored in context
-// 2. Inside function, PASSED resolves to context value
-// 3. Context cleared after function returns
+pub struct PassContext {
+    value: Option<SlotId>,  // The passed value (reactive)
+    scope: ScopeId,         // Scope where PASS was set
+}
+
+// During evaluation:
+struct EvalContext {
+    pass_stack: Vec<PassContext>,  // Stack for nested calls
+}
+```
+
+**Precise semantics:**
+
+| Rule | Behavior |
+|------|----------|
+| **PASS: value** | Pushes value onto pass_stack before function call |
+| **PASSED** | Resolves to top of pass_stack (current context) |
+| **PASSED.field** | Field access on passed value |
+| **Missing PASSED** | Compile error if PASSED used without active PASS |
+| **Nested calls** | Each PASS pushes new context, pops on return |
+| **List/map scope** | PASS context propagates into List/map item bodies |
+| **WHILE switching** | PASS context preserved across arm switches |
+
+**Example: shopping_list.bn pattern**
+```boon
+-- items is a List, each with access to the store via PASSED
+items: LIST {} |> HOLD state {
+    add_button.event.press |> THEN {
+        state |> List/append(item: new_item)
+    }
+}
+
+-- Item renderer receives store via PASS
+item_view: FUNCTION(item) {
+    -- PASSED.store available here because caller used PASS
+    remove_button |> Element/button() |> LINK |> THEN {
+        PASSED.store |> List/remove(item: item)
+    }
+}
+
+-- Caller passes context
+items |> List/map(item, new: item |> item_view() |> PASS: [store: items])
 ```
 
 **TextTemplate (Issue 4):**
