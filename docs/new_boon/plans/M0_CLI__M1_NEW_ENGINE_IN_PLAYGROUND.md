@@ -49,10 +49,30 @@ y: x * 2
 -- Output: 6 (y is last binding)
 ```
 
-For Document/new, output is the **text content** of the root element:
+For Document/new, output depends on the root type:
+
+| Root Type | CLI Output | Example |
+|-----------|------------|---------|
+| TEXT {} element | Text content as JSON string | `"Hello"` |
+| Other element | JSON element structure | `{"element": "button", ...}` |
+| Scalar (Number, Bool) | JSON primitive | `42`, `true` |
+| Text primitive | JSON string | `"hello"` |
+| Object | JSON object | `{"name": "Alice"}` |
+| List | JSON array | `[1, 2, 3]` |
+| TaggedObject | Tagged JSON | `{"Duration": {"milliseconds": 1000}}` |
+
 ```boon
+-- Example 1: TEXT {} element → text content
 document: TEXT { Hello } |> Document/new()
 -- Output: "Hello"
+
+-- Example 2: Scalar root → JSON primitive
+document: 42 |> Document/new()
+-- Output: 42
+
+-- Example 3: Object root → JSON object
+document: [name: TEXT { Alice }, age: 30] |> Document/new()
+-- Output: {"name": "Alice", "age": 30}
 ```
 
 For non-text UI trees, output is a JSON representation of the element structure:
@@ -106,6 +126,17 @@ fn materialize(payload: &Payload, arena: &Arena) -> serde_json::Value {
             let mut fields: Vec<_> = router.fields().collect();
             fields.sort_by_key(|(k, _)| k.clone());
             json!(fields.into_iter().map(|(k, v)| (k, materialize(v, arena))).collect::<Map<_>>())
+        }
+        Payload::TaggedObject { tag, fields } => {
+            // Tagged objects (Duration, Oklch, Hidden, etc.): {TagName: {fields}}
+            let tag_name = arena.tag_name(*tag);
+            let router = arena.get(*fields);
+            let mut field_map: Vec<_> = router.fields().collect();
+            field_map.sort_by_key(|(k, _)| k.clone());
+            let fields_json = field_map.into_iter()
+                .map(|(k, v)| (k, materialize(v, arena)))
+                .collect::<Map<_>>();
+            json!({ tag_name: fields_json })
         }
         Payload::Flushed(inner) => json!({"error": materialize(inner, arena)}),
         // Note: Flushed should normally unwrap at bindings (see §2.6), so reaching
