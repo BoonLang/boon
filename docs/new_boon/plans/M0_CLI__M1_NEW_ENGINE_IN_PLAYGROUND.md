@@ -736,30 +736,31 @@ item_list: PASSED.store.items |> List/map(item, new: item_view(item, PASS: PASSE
 remove_button |> LINK |> THEN { PASSED.store |> List/remove(item: item) }
 ```
 
-**Runtime representation:**
+**Compile-time representation (no runtime stack):**
+
+PASS/PASSED is entirely compile-time. Functions are inlined, and PASSED references compile to field access nodes:
+
 ```rust
-pub struct PassContext {
-    value: Option<SlotId>,  // The passed value (reactive)
-    scope: ScopeId,         // Scope where PASS was set
+// COMPILE-TIME ONLY - Compiler tracks context during function inlining
+struct CompileContext {
+    pass_stack: Vec<SlotId>,  // Stack of PASSED context slots
 }
 
-// During evaluation:
-struct EvalContext {
-    pass_stack: Vec<PassContext>,  // Stack for nested calls
-}
+// At runtime, there is NO pass_stack - PASSED.field compiles to FieldAccess nodes
 ```
 
 **Precise semantics:**
 
 | Rule | Behavior |
 |------|----------|
-| **func(PASS: value)** | Pushes value onto pass_stack for this function call |
-| **PASSED** | Resolves to top of pass_stack (current context) |
-| **PASSED.field** | Field access on passed value |
+| **func(PASS: value)** | Compiler pushes SlotId onto compile-time pass_stack, inlines function body |
+| **PASSED** | Compiler resolves to top of pass_stack (the SlotId of passed value) |
+| **PASSED.field** | Compiles to `FieldAccess { source: passed_slot, field }` - Router projection |
 | **Missing PASSED** | Compile error if PASSED used without active PASS |
-| **Nested calls** | Each PASS pushes new context, pops on return |
-| **List/map scope** | PASS context propagates into List/map item bodies |
-| **WHILE switching** | PASS context preserved across arm switches |
+| **Nested calls** | Compiler stack tracks nested contexts during inlining |
+| **At runtime** | No stack manipulation - just field access nodes (SlotIds baked in) |
+
+See §2.11 Context Passing for detailed implementation.
 
 **Pipe-Field-Access Syntax:**
 

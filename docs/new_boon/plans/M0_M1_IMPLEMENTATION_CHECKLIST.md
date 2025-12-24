@@ -323,11 +323,16 @@ All critical issues are now assigned to specific phases with explicit verificati
         pub extension: Option<Box<NodeExtension>>,
     }
 
+    /// Type alias: NodeKindData is the same as NodeKind enum (see node.rs).
+    /// The name "NodeKindData" emphasizes this is the data stored in extension,
+    /// while "NodeKind" is used for matching/dispatch.
+    pub type NodeKindData = NodeKind;
+
     /// Heap-allocated extension for value storage and overflow arrays.
     pub struct NodeExtension {
         pub current_value: Option<Payload>,
         pub pending_deltas: Vec<Payload>,
-        pub kind_data: NodeKindData,
+        pub kind_data: NodeKindData,  // See NodeKind enum in node.rs
         pub extra_inputs: Vec<SlotId>,
         pub extra_subscribers: Vec<SlotId>,
     }
@@ -783,7 +788,14 @@ All critical issues are now assigned to specific phases with explicit verificati
 - [ ] **2.1.2** Add ObjectDelta to message.rs
   - Content:
     ```rust
-    /// Field identifier (interned string ID).
+    /// Field identifier - interned string index for O(1) lookup.
+    ///
+    /// **Engine representation:** `u32` index into global intern table
+    /// **Protocol JSON:** String field name (human-readable, see §6.8)
+    /// **Persistence:** Intern table serialized alongside snapshot
+    ///
+    /// Use `intern_table.get_name(field_id)` to recover the string.
+    /// Use `intern_table.intern("field_name")` to get the FieldId.
     pub type FieldId = u32;
 
     /// Delta for efficient object updates.
