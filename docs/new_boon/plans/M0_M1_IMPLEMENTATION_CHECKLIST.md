@@ -205,6 +205,16 @@ All critical issues are now assigned to specific phases with explicit verificati
         Field(u32),       // Field ID (for Router/Object)
     }
 
+    impl Port {
+        /// Extract the input index from an Input port, panics for other variants.
+        pub fn input_index(&self) -> usize {
+            match self {
+                Port::Input(i) => *i as usize,
+                _ => panic!("input_index() called on non-Input port: {:?}", self),
+            }
+        }
+    }
+
     impl Default for Port {
         fn default() -> Self {
             Self::Output
@@ -1084,11 +1094,13 @@ All critical issues are now assigned to specific phases with explicit verificati
         let source = el.arena.alloc();
         let target = el.arena.alloc();
 
-        el.routing.add_route(source, target, Port::Output);
+        // Route from source's output to target's input port 0
+        el.routing.add_route(source, target, Port::Input(0));
         el.deliver_message(source, Payload::Number(42.0));
 
         assert_eq!(el.dirty_nodes.len(), 1);
         assert_eq!(el.dirty_nodes[0].slot, target);
+        assert_eq!(el.dirty_nodes[0].port, Port::Input(0));
     }
     ```
   - Verify: `cargo test -p boon engine_v2::event_loop`
@@ -1131,17 +1143,26 @@ All critical issues are now assigned to specific phases with explicit verificati
 
         /// Object demultiplexer - routes to field slots
         Router { fields: HashMap<FieldId, SlotId> },
+
+        /// Test probe - stores last received value for assertions (test-only)
+        #[cfg(test)]
+        Probe { last: Option<Payload> },
     }
     ```
   - Verify: `cargo check -p boon`
 
 ### 3.2 Node Processing
 
+**Note:** Add Probe handling to process_node for test observability:
+
 - [ ] **3.2.1** Implement process_node in EventLoop
   - Content:
     ```rust
     impl EventLoop {
         fn process_node(&mut self, entry: DirtyEntry) {
+            // Take the message from inbox (if any) - see §4.6.3
+            let msg = self.inbox.remove(&(entry.slot, entry.port));
+
             let Some(node) = self.arena.get(entry.slot) else {
                 return;
             };
@@ -1164,6 +1185,18 @@ All critical issues are now assigned to specific phases with explicit verificati
                     })
                 }
                 NodeKind::Router { .. } => None, // Router doesn't emit directly
+                #[cfg(test)]
+                NodeKind::Probe { .. } => {
+                    // Probe stores incoming message in its `last` field
+                    if let Some(payload) = msg.clone() {
+                        if let Some(node) = self.arena.get_mut(entry.slot) {
+                            if let Some(NodeKind::Probe { last }) = node.kind_mut() {
+                                *last = Some(payload);
+                            }
+                        }
+                    }
+                    None // Probe doesn't emit
+                }
             };
 
             if let Some(payload) = output {
@@ -1173,6 +1206,33 @@ All critical issues are now assigned to specific phases with explicit verificati
     }
     ```
   - Verify: `cargo check -p boon`
+
+- [ ] **3.2.2** Add test helper for creating Probe nodes
+  - Content (in test module):
+    ```rust
+    #[cfg(test)]
+    impl CompileContext<'_> {
+        /// Create a probe node that stores received values (for testing).
+        pub fn compile_probe(&mut self) -> SlotId {
+            let slot = self.event_loop.arena.alloc();
+            if let Some(node) = self.event_loop.arena.get_mut(slot) {
+                node.set_kind(NodeKind::Probe { last: None });
+            }
+            slot
+        }
+
+        /// Get the last value received by a probe.
+        pub fn get_probe_value(&self, slot: SlotId) -> Option<Payload> {
+            self.event_loop.arena.get(slot)
+                .and_then(|n| n.kind())
+                .and_then(|k| match k {
+                    NodeKind::Probe { last } => last.clone(),
+                    _ => None,
+                })
+        }
+    }
+    ```
+  - Verify: `cargo test -p boon engine_v2`
 
 ### 3.3 Create Basic Evaluator
 
@@ -1273,8 +1333,8 @@ All critical issues are now assigned to specific phases with explicit verificati
             if let Some(node) = self.event_loop.arena.get_mut(slot) {
                 node.set_kind(NodeKind::Wire { source: Some(source) });
             }
-            // Subscribe to source
-            self.event_loop.routing.add_route(source, slot, crate::engine_v2::address::Port::Output);
+            // Subscribe to source (wire receives on its input port 0)
+            self.event_loop.routing.add_route(source, slot, crate::engine_v2::address::Port::Input(0));
             slot
         }
     }
@@ -1461,21 +1521,24 @@ All critical issues are now assigned to specific phases with explicit verificati
   - Verify: `cargo check -p boon`
 
 - [ ] **4.1.4** Add cli module to platform
-  - File: `crates/boon/src/platform/mod.rs` (create if needed)
-  - Content:
+  - File: `crates/boon/src/platform.rs`
+  - Edit: Add the following (do NOT create `platform/mod.rs` - it would conflict with `platform.rs`):
     ```rust
+    pub mod browser;
     #[cfg(feature = "cli")]
     pub mod cli;
     ```
   - File: `crates/boon/src/lib.rs`
-  - Edit: Add `pub mod platform;` if not exists
+  - Verify: `pub mod platform;` already exists; no edit needed
   - Verify: `cargo check -p boon`
 
 ### 4.2 Value Materialization
 
 - [ ] **4.2.1** Add materialize function to message.rs
+  - Note: Gate with `#[cfg(feature = "cli")]` so core engine_v2 doesn't require serde_json
   - Content:
     ```rust
+    #[cfg(feature = "cli")]
     impl Payload {
         /// Convert payload to JSON for CLI output.
         pub fn to_json(&self) -> serde_json::Value {
@@ -1496,7 +1559,8 @@ All critical issues are now assigned to specific phases with explicit verificati
         }
     }
     ```
-  - Verify: `cargo check -p boon`
+  - Verify: `cargo check -p boon` (without cli feature)
+  - Verify: `cargo check -p boon --features cli` (with cli feature)
 
 ### 4.3 Create boon-cli Crate
 
@@ -1565,19 +1629,27 @@ All critical issues are now assigned to specific phases with explicit verificati
 
 - [ ] **4.3.3** Add boon-cli to workspace
   - File: `Cargo.toml` (workspace root)
-  - Edit: Add `"crates/boon-cli"` to members
+  - Note: No workspace edit needed; root Cargo.toml already has `members = ["crates/*"]` which auto-includes new crates
   - Verify: `cargo check -p boon-cli`
 
 ### 4.4 Add cli Feature to boon
 
 - [ ] **4.4.1** Add cli feature to boon's Cargo.toml
   - File: `crates/boon/Cargo.toml`
-  - Edit: Add under `[features]`:
+  - Edit: Add optional dependency:
+    ```toml
+    [dependencies]
+    # ... existing deps ...
+    serde_json = { version = "1", optional = true }
+    ```
+  - Edit: Update features (preserving existing defaults):
     ```toml
     [features]
-    default = []
-    cli = ["serde_json"]
+    default = ["debug-channels"]
+    debug-channels = []
+    cli = ["dep:serde_json"]
     ```
+  - Note: Do NOT replace `default = ["debug-channels"]` with `default = []`
   - Verify: `cargo check -p boon --features cli`
 
 ### 4.5 Phase 3.5 Verification
@@ -1598,6 +1670,122 @@ All critical issues are now assigned to specific phases with explicit verificati
   ```bash
   jj new -m "Phase 3.5: CLI test harness foundation"
   ```
+
+### 4.6 Message Inbox & Current Value API
+
+**Note:** Phase 4/5 assumes message handling but the earlier EventLoop only has dirty_nodes and no message storage. This subsection adds the required API before combinators.
+
+- [ ] **4.6.1** Add inbox to EventLoop
+  - File: `crates/boon/src/engine_v2/event_loop.rs`
+  - Content: Add to EventLoop struct:
+    ```rust
+    use std::collections::HashMap;
+
+    pub struct EventLoop {
+        // ... existing fields ...
+        /// Inbox: stores pending messages by (target_slot, target_port)
+        pub inbox: HashMap<(SlotId, Port), Payload>,
+    }
+
+    impl EventLoop {
+        pub fn new() -> Self {
+            Self {
+                // ... existing fields ...
+                inbox: HashMap::new(),
+            }
+        }
+    }
+    ```
+  - Verify: `cargo check -p boon`
+
+- [ ] **4.6.2** Update deliver_message to store in inbox
+  - Content: Modify deliver_message to store payload before marking dirty:
+    ```rust
+    impl EventLoop {
+        /// Deliver a message to all subscribers of a source node.
+        pub fn deliver_message(&mut self, source: SlotId, payload: Payload) {
+            let subscribers: Vec<_> = self.routing
+                .get_subscribers(source)
+                .to_vec();
+
+            for (target, port) in subscribers {
+                // Store the payload for the target to consume
+                self.inbox.insert((target, port), payload.clone());
+                self.mark_dirty(target, port);
+            }
+        }
+    }
+    ```
+  - Verify: `cargo check -p boon`
+
+- [ ] **4.6.3** Update process_node to consume from inbox
+  - Content: process_node should take/remove payload from inbox:
+    ```rust
+    fn process_node(&mut self, entry: DirtyEntry) {
+        // Take the message from inbox (if any)
+        let msg = self.inbox.remove(&(entry.slot, entry.port));
+
+        let Some(node) = self.arena.get(entry.slot) else {
+            return;
+        };
+
+        // ... rest of processing uses `msg` as Option<Payload> ...
+    }
+    ```
+  - Note: For nodes expecting messages (Combiner, Register, etc.), `msg` should be `Some`
+  - Verify: `cargo check -p boon`
+
+- [ ] **4.6.4** Add get_current_value helper
+  - Content: Add method to get stored current value from a node:
+    ```rust
+    impl EventLoop {
+        /// Get the current value stored in a node's extension.
+        pub fn get_current_value(&self, slot: SlotId) -> Option<&Payload> {
+            self.arena.get(slot)
+                .and_then(|node| node.extension.as_ref())
+                .and_then(|ext| ext.current_value.as_ref())
+        }
+
+        /// Set the current value for a node.
+        pub fn set_current_value(&mut self, slot: SlotId, value: Payload) {
+            if let Some(node) = self.arena.get_mut(slot) {
+                node.extension_mut().current_value = Some(value);
+            }
+        }
+    }
+    ```
+  - Note: `current_value` is stored in `NodeExtension.current_value` (see arena.rs)
+  - Verify: `cargo check -p boon`
+
+- [ ] **4.6.5** Add to_display_string helper for Payload
+  - Content: Add method to Payload for string formatting (used by TextTemplate):
+    ```rust
+    impl Payload {
+        /// Convert payload to display string for text interpolation.
+        pub fn to_display_string(&self) -> String {
+            match self {
+                Payload::Number(n) => n.to_string(),
+                Payload::Text(s) => s.to_string(),
+                Payload::Bool(b) => b.to_string(),
+                Payload::Unit => String::new(),
+                Payload::Tag(t) => format!("Tag({})", t),
+                Payload::TaggedObject { tag, .. } => format!("TaggedObject({})", tag),
+                Payload::ListHandle(_) => "[list]".to_string(),
+                Payload::ObjectHandle(_) => "{object}".to_string(),
+                Payload::Flushed(inner) => format!("Error: {}", inner.to_display_string()),
+                Payload::ListDelta(_) => "[delta]".to_string(),
+                Payload::ObjectDelta(_) => "{delta}".to_string(),
+            }
+        }
+    }
+    ```
+  - Verify: `cargo check -p boon`
+
+- [ ] **4.6.6** Run tests
+  ```bash
+  cargo test -p boon engine_v2
+  ```
+  - Expected: All tests pass
 
 ---
 
@@ -1675,14 +1863,14 @@ All critical issues are now assigned to specific phases with explicit verificati
 ### 5.6 Implement Combiner (LATEST) Processing
 
 - [ ] **5.6.1** Implement Combiner message handling
-  - File: `src/engine_v2/event_loop.rs`
+  - File: `crates/boon/src/engine_v2/event_loop.rs`
   - Content:
     ```rust
     fn process_combiner(&mut self, slot: SlotId, port: Port, msg: Payload) {
         let node = self.arena.get_mut(slot);
         if let NodeKind::Combiner { inputs, last_values } = &mut node.kind {
             // Update the specific input's cached value
-            let input_idx = port.as_input_index();
+            let input_idx = port.input_index();
             last_values[input_idx] = Some(msg);
 
             // Check if all inputs have values
@@ -1830,35 +2018,126 @@ All critical issues are now assigned to specific phases with explicit verificati
 
 ### 5.12 Phase 4 Verification
 
+**Note:** Use Probe nodes to make assertions (not just "dirty_nodes got shorter").
+
 - [ ] **5.12.1** Unit test: LATEST with two constants
   ```rust
-  let a = ctx.compile_constant(1.0);
-  let b = ctx.compile_constant(2.0);
-  let latest = ctx.compile_latest(vec![a, b]);
-  // Expect: emits 1.0 then 2.0 (last wins)
+  #[test]
+  fn test_latest_two_constants() {
+      let mut el = EventLoop::new();
+      let mut ctx = CompileContext::new(&mut el);
+
+      let a = ctx.compile_constant(Payload::Number(1.0));
+      let b = ctx.compile_constant(Payload::Number(2.0));
+      let latest = ctx.compile_latest(vec![a, b]);
+
+      // Connect probe to observe output
+      let probe = ctx.compile_probe();
+      ctx.event_loop.routing.add_route(latest, probe, Port::Input(0));
+
+      // Run until quiescent
+      ctx.event_loop.run_tick();
+
+      // Expect: last value wins (2.0)
+      let value = ctx.get_probe_value(probe);
+      assert!(matches!(value, Some(Payload::Number(n)) if n == 2.0));
+  }
   ```
 
 - [ ] **5.12.2** Unit test: HOLD counter pattern
   ```rust
-  // count: 0 |> HOLD state { trigger |> THEN { state + 1 } }
-  // Trigger 3 times, expect final value = 3
+  #[test]
+  fn test_hold_counter() {
+      // count: 0 |> HOLD state { trigger |> THEN { state + 1 } }
+      let mut el = EventLoop::new();
+      let mut ctx = CompileContext::new(&mut el);
+
+      // Setup hold with initial value 0
+      let hold = ctx.compile_hold_counter(0.0);
+      let probe = ctx.compile_probe();
+      ctx.event_loop.routing.add_route(hold, probe, Port::Input(0));
+
+      // Trigger 3 times
+      for _ in 0..3 {
+          ctx.event_loop.deliver_message(hold, Payload::Unit); // trigger
+          ctx.event_loop.run_tick();
+      }
+
+      // Expect final value = 3
+      let value = ctx.get_probe_value(probe);
+      assert!(matches!(value, Some(Payload::Number(n)) if n == 3.0));
+  }
   ```
 
 - [ ] **5.12.3** Unit test: WHEN pattern matching
   ```rust
-  // input |> WHEN { 1 => TEXT{one}, 2 => TEXT{two}, __ => TEXT{other} }
-  // Send 1, expect "one"
+  #[test]
+  fn test_when_pattern_match() {
+      // input |> WHEN { 1 => "one", 2 => "two", __ => "other" }
+      let mut el = EventLoop::new();
+      let mut ctx = CompileContext::new(&mut el);
+
+      let when_node = ctx.compile_when_example();
+      let probe = ctx.compile_probe();
+      ctx.event_loop.routing.add_route(when_node, probe, Port::Input(0));
+
+      // Send 1
+      ctx.event_loop.deliver_message(when_node, Payload::Number(1.0));
+      ctx.event_loop.run_tick();
+
+      // Expect "one"
+      let value = ctx.get_probe_value(probe);
+      assert!(matches!(value, Some(Payload::Text(s)) if s.as_ref() == "one"));
+  }
   ```
 
 - [ ] **5.12.4** Unit test: WHILE arm switching
   ```rust
-  // toggle |> WHILE { True => TEXT{on}, False => TEXT{off} }
-  // Toggle true/false, verify output changes
+  #[test]
+  fn test_while_arm_switch() {
+      // toggle |> WHILE { True => "on", False => "off" }
+      let mut el = EventLoop::new();
+      let mut ctx = CompileContext::new(&mut el);
+
+      let while_node = ctx.compile_while_toggle();
+      let probe = ctx.compile_probe();
+      ctx.event_loop.routing.add_route(while_node, probe, Port::Input(0));
+
+      // Send True
+      ctx.event_loop.deliver_message(while_node, Payload::Bool(true));
+      ctx.event_loop.run_tick();
+      assert!(matches!(ctx.get_probe_value(probe), Some(Payload::Text(s)) if s.as_ref() == "on"));
+
+      // Send False
+      ctx.event_loop.deliver_message(while_node, Payload::Bool(false));
+      ctx.event_loop.run_tick();
+      assert!(matches!(ctx.get_probe_value(probe), Some(Payload::Text(s)) if s.as_ref() == "off"));
+  }
   ```
 
 - [ ] **5.12.5** Unit test: FLUSH in HOLD body
   ```rust
-  // Verify FLUSH propagates to output but doesn't corrupt state (§2.6.5)
+  #[test]
+  fn test_flush_in_hold() {
+      // Verify FLUSH propagates to output but doesn't corrupt state (§2.6.5)
+      let mut el = EventLoop::new();
+      let mut ctx = CompileContext::new(&mut el);
+
+      let hold = ctx.compile_hold_with_potential_flush();
+      let probe = ctx.compile_probe();
+      ctx.event_loop.routing.add_route(hold, probe, Port::Input(0));
+
+      // Trigger FLUSH
+      ctx.event_loop.deliver_message(hold, Payload::Flushed(Box::new(Payload::Text("error".into()))));
+      ctx.event_loop.run_tick();
+
+      // FLUSH should propagate to output
+      assert!(matches!(ctx.get_probe_value(probe), Some(Payload::Flushed(_))));
+
+      // State should remain valid (not corrupted by FLUSH)
+      let state_value = ctx.get_hold_state(hold);
+      assert!(!matches!(state_value, Some(Payload::Flushed(_))));
+  }
   ```
 
 - [ ] **5.12.6** Run all tests
@@ -2106,64 +2385,128 @@ All critical issues are now assigned to specific phases with explicit verificati
 
 #### 9.11 PASS/PASSED Context (§2.11)
 
+**Note:** Uses types from `crates/boon/src/parser/static_expression.rs`:
+- `Expression::FunctionCall { path, arguments }` for function calls
+- `Argument { name, is_referenced, value }` for call arguments
+- `Alias::WithPassed { extra_parts }` for PASSED.field.path
+
+- [ ] **9.11.0** Add CompileError enum to evaluator_v2
+  - File: `crates/boon/src/evaluator_v2/mod.rs`
+  - Content:
+    ```rust
+    /// Compilation errors for the new evaluator.
+    #[derive(Debug, Clone)]
+    pub enum CompileError {
+        /// PASSED used outside of a PASS: context
+        PassedNotAvailable,
+        /// Unknown variable reference
+        UnknownVariable(String),
+        /// Unknown function
+        UnknownFunction(Vec<String>),
+        /// Type mismatch during compilation
+        TypeMismatch { expected: String, got: String },
+    }
+
+    impl std::fmt::Display for CompileError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                CompileError::PassedNotAvailable => {
+                    write!(f, "PASSED used outside of PASS: context")
+                }
+                CompileError::UnknownVariable(name) => {
+                    write!(f, "Unknown variable: {}", name)
+                }
+                CompileError::UnknownFunction(path) => {
+                    write!(f, "Unknown function: {}", path.join("/"))
+                }
+                CompileError::TypeMismatch { expected, got } => {
+                    write!(f, "Type mismatch: expected {}, got {}", expected, got)
+                }
+            }
+        }
+    }
+
+    impl std::error::Error for CompileError {}
+    ```
+  - Verify: `cargo check -p boon`
+
 - [ ] **9.11.1** Verify pass_stack in CompileContext
   - Already added in §3.3.1: `pass_stack: Vec<SlotId>` with `push_pass()`, `pop_pass()`, `current_passed()`
 
 - [ ] **9.11.2** Implement PASS: argument compilation
+  - Uses: `Expression::FunctionCall { path, arguments }` and `Argument` from static_expression
   - Content:
     ```rust
+    use crate::parser::static_expression::{Expression, Argument, Spanned};
+
     /// Compile function call with PASS argument (§2.11).
-    pub fn compile_function_call(&mut self, call: &FunctionCall) -> SlotId {
+    /// Uses Expression::FunctionCall from static_expression.rs.
+    pub fn compile_function_call(
+        &mut self,
+        path: &[StrSlice],
+        arguments: &[Spanned<Argument>],
+    ) -> Result<SlotId, CompileError> {
         // Process named arguments as local bindings
-        for arg in &call.arguments {
-            if arg.name != "PASS" {
-                let arg_slot = self.compile_expression(&arg.value);
-                self.add_local_binding(arg.name.clone(), arg_slot);
+        for arg in arguments {
+            let arg_name = arg.node.name.as_str();
+            if arg_name != "PASS" {
+                if let Some(ref value) = arg.node.value {
+                    let arg_slot = self.compile_expression(&value.node)?;
+                    self.add_local_binding(arg_name.to_string(), arg_slot);
+                }
             }
         }
 
         // Handle PASS argument
-        if let Some(pass_arg) = call.get_pass_argument() {
-            let pass_slot = self.compile_expression(&pass_arg.value);
-            self.push_pass(pass_slot);
+        let has_pass = arguments.iter().any(|a| a.node.name.as_str() == "PASS");
+        if let Some(pass_arg) = arguments.iter().find(|a| a.node.name.as_str() == "PASS") {
+            if let Some(ref value) = pass_arg.node.value {
+                let pass_slot = self.compile_expression(&value.node)?;
+                self.push_pass(pass_slot);
+            }
         }
 
-        // Compile function body (inlined - no FunctionCall node)
-        let result = self.inline_function_body(&call.function);
+        // Resolve and inline function body
+        let result = self.inline_function_body(path)?;
 
         // Pop PASS context if we pushed one
-        if call.has_pass_argument() {
+        if has_pass {
             self.pop_pass();
         }
 
         // Clean up local bindings
-        for arg in &call.arguments {
-            if arg.name != "PASS" {
-                self.remove_local_binding(&arg.name);
+        for arg in arguments {
+            let arg_name = arg.node.name.as_str();
+            if arg_name != "PASS" {
+                self.remove_local_binding(arg_name);
             }
         }
 
-        result
+        Ok(result)
     }
     ```
 
 - [ ] **9.11.3** Implement PASSED keyword resolution
+  - Uses: `Alias::WithPassed { extra_parts }` from static_expression for PASSED.field.path
   - Content:
     ```rust
+    use crate::parser::static_expression::StrSlice;
+
     /// Compile PASSED or PASSED.field.path expression.
-    pub fn compile_passed(&mut self, field_path: &[String]) -> Result<SlotId, CompileError> {
+    /// extra_parts: the field path after PASSED (e.g., ["store", "items"] for PASSED.store.items)
+    pub fn compile_passed(&mut self, extra_parts: &[StrSlice]) -> Result<SlotId, CompileError> {
         let pass_slot = self.current_passed()
             .ok_or(CompileError::PassedNotAvailable)?;
 
-        if field_path.is_empty() {
+        if extra_parts.is_empty() {
             // Just `PASSED` - return the entire context
             return Ok(pass_slot);
         }
 
         // `PASSED.store.items` - emit field access chain
         let mut current = pass_slot;
-        for field_name in field_path {
-            let field_id = self.event_loop.arena.intern_field(field_name);
+        for part in extra_parts {
+            let field_id = self.event_loop.arena.intern_field(part.as_str());
             current = self.compile_field_access(current, field_id);
         }
 
@@ -2193,21 +2536,33 @@ All critical issues are now assigned to specific phases with explicit verificati
     ```
 
 - [ ] **9.12.2** Implement compile-time dependency collection (§2.3)
+  - Uses: `TextPart` from `crates/boon/src/parser/static_expression.rs`:
+    ```rust
+    pub enum TextPart {
+        Text(StrSlice),
+        Interpolation { var: StrSlice, referenced_span: Option<SimpleSpan> },
+    }
+    ```
   - Content:
     ```rust
-    /// Compile TEXT { literal {expr1} more {expr2} } into TextTemplate node.
-    pub fn compile_text_template(&mut self, segments: &[TextSegment]) -> SlotId {
+    use crate::parser::static_expression::TextPart;
+
+    /// Compile TEXT { literal {var} more {var2} } into TextTemplate node.
+    /// Uses TextPart from static_expression.rs.
+    pub fn compile_text_template(&mut self, parts: &[TextPart]) -> Result<SlotId, CompileError> {
         let mut template_parts = Vec::new();
         let mut dependencies = Vec::new();
 
-        for segment in segments {
-            match segment {
-                TextSegment::Literal(text) => {
-                    template_parts.push(text.clone());
+        for part in parts {
+            match part {
+                TextPart::Text(text) => {
+                    template_parts.push(text.as_str().to_string());
                 }
-                TextSegment::Interpolation(expr) => {
-                    // Compile the expression and track its SlotId as a dependency
-                    let dep_slot = self.compile_expression(expr);
+                TextPart::Interpolation { var, referenced_span } => {
+                    // Resolve the variable to a SlotId
+                    let var_name = var.as_str();
+                    let dep_slot = self.resolve_variable(var_name)
+                        .ok_or_else(|| CompileError::UnknownVariable(var_name.to_string()))?;
                     dependencies.push(dep_slot);
                     // Add placeholder for this dependency
                     template_parts.push(format!("{{{}}}", dependencies.len() - 1));
@@ -2226,12 +2581,13 @@ All critical issues are now assigned to specific phases with explicit verificati
             });
         }
 
-        // Subscribe to all dependencies - template re-renders when any changes
-        for dep in &dependencies {
-            self.event_loop.routing.add_route(*dep, slot, Port::Output);
+        // Subscribe to all dependencies - each gets a distinct input port
+        // so we can identify which dependency changed
+        for (i, dep) in dependencies.iter().enumerate() {
+            self.event_loop.routing.add_route(*dep, slot, Port::Input(i as u8));
         }
 
-        slot
+        Ok(slot)
     }
     ```
 
