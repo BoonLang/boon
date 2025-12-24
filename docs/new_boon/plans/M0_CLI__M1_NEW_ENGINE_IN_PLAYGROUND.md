@@ -114,7 +114,14 @@ fn materialize(payload: &Payload, arena: &Arena) -> serde_json::Value {
         Payload::Text(s) => json!(s),
         Payload::Bool(b) => json!(b),
         Payload::Unit => json!(null),  // Unit → null
-        Payload::Tag(t) => json!(arena.tag_name(*t)),
+        Payload::Tag(t) => {
+            let name = arena.tag_name(*t);
+            if name == "NoElement" {
+                json!(null)  // NoElement → null (consistent with Bridge, see §2.8)
+            } else {
+                json!(name)
+            }
+        }
         Payload::ListHandle(slot) => {
             let bus = arena.get(*slot);
             // Lists: ordered by insertion index (deterministic)
@@ -244,10 +251,12 @@ pub enum Payload {
     Unit,                  // Signal with no data (DOM events)
     ListHandle(SlotId),
     ObjectHandle(SlotId),
+    TaggedObject { tag: u32, fields: SlotId },  // Duration, Oklch, Hidden, etc.
     Flushed(Box<Payload>),
     ListDelta(ListDelta),
     ObjectDelta(ObjectDelta),
 }
+// Note: Canonical Payload definition is in §2.3. This is illustrative.
 ```
 
 ### EventLoop (§2.4)
@@ -255,11 +264,14 @@ pub enum Payload {
 pub struct EventLoop {
     arena: Arena,
     timer_queue: BinaryHeap<TimerEvent>,
-    dirty_nodes: Vec<SlotId>,
+    dirty_nodes: Vec<DirtyEntry>,  // (SlotId, Port) for multi-input nodes
     dom_events: VecDeque<DomEvent>,
     current_tick: u64,
     pending_effects: Vec<NodeEffect>,
+    in_tick: AtomicBool,           // Reentrancy guard (see §2.4)
+    pending_ticks: AtomicU32,      // Deferred tick count
 }
+// Note: Canonical EventLoop definition is in §2.4. This is illustrative.
 
 impl EventLoop {
     pub fn run_tick(&mut self) {
