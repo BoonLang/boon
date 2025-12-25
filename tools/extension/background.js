@@ -359,9 +359,31 @@ async function jsDispatchKeyEvent(tabId, key) {
   const keyInfo = keyMap[key] || { key, code: key, keyCode: 0, which: 0 };
 
   // Dispatch keydown event on the focused element
+  // Also try to find and dispatch on any input element in the preview pane
   const script = `
     (function() {
-      const target = document.activeElement || document.body;
+      // First try document.activeElement
+      let target = document.activeElement;
+
+      // If activeElement is body or not an input, try to find the input in preview
+      if (!target || target === document.body || target.tagName !== 'INPUT') {
+        const previewPane = document.querySelector('.preview-pane') || document.querySelector('[class*="preview"]');
+        if (previewPane) {
+          const input = previewPane.querySelector('input');
+          if (input) {
+            target = input;
+            input.focus();
+          }
+        }
+      }
+
+      // Fallback to any input on the page
+      if (!target || target === document.body) {
+        target = document.querySelector('input') || document.body;
+      }
+
+      console.log('[boon-tools] Dispatching keydown on:', target.tagName, target.className);
+
       const event = new KeyboardEvent('keydown', {
         key: '${keyInfo.key}',
         code: '${keyInfo.code}',
@@ -369,10 +391,12 @@ async function jsDispatchKeyEvent(tabId, key) {
         which: ${keyInfo.which},
         bubbles: true,
         cancelable: true,
-        composed: true
+        composed: true,
+        view: window
       });
+
       target.dispatchEvent(event);
-      return { target: target.tagName, key: '${keyInfo.key}' };
+      return { target: target.tagName, className: target.className, key: '${keyInfo.key}' };
     })()
   `;
 

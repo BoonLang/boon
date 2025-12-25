@@ -1,0 +1,10 @@
+[package]
+name = "boon-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+boon = { path = "../boon", features = ["cli"] }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros"] }

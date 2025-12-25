@@ -1,0 +1,6 @@
+-- Stream operations tests
+-- Note: Stream/pulses requires async runtime support, testing only what works in CLI
+
+-- test: stream_empty_list
+LIST {} |> List/count()
+-- expect: 0.0

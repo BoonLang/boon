@@ -1,0 +1,27 @@
+-- test: literal_number
+42
+-- expect: 42.0
+
+-- test: arithmetic_add
+1 + 2
+-- expect: 3.0
+
+-- test: arithmetic_subtract
+10 - 3
+-- expect: 7.0
+
+-- test: arithmetic_multiply
+6 * 7
+-- expect: 42.0
+
+-- test: arithmetic_divide
+100 / 4
+-- expect: 25.0
+
+-- test: variable_binding
+x: 42
+-- expect: 42.0
+
+-- test: nested_arithmetic
+(1 + 2) * 3
+-- expect: 9.0

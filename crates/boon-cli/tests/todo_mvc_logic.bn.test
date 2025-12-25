@@ -1,0 +1,146 @@
+-- test: text_trim_basic
+TEXT { hello } |> Text/trim()
+-- expect: "hello"
+
+-- test: text_trim_with_spaces
+TEXT {   hello world   } |> Text/trim()
+-- expect: "hello world"
+
+-- test: text_is_not_empty_true
+TEXT { hello } |> Text/is_not_empty()
+-- expect: true
+
+-- test: text_is_not_empty_false
+TEXT {} |> Text/is_not_empty()
+-- expect: false
+
+-- test: text_is_not_empty_trimmed
+TEXT {   } |> Text/trim() |> Text/is_not_empty()
+-- expect: false
+
+-- test: bool_not_true
+True |> Bool/not()
+-- expect: false
+
+-- test: bool_not_false
+False |> Bool/not()
+-- expect: true
+
+-- test: bool_or_true_true
+True |> Bool/or(that: True)
+-- expect: true
+
+-- test: bool_or_true_false
+True |> Bool/or(that: False)
+-- expect: true
+
+-- test: bool_or_false_false
+False |> Bool/or(that: False)
+-- expect: false
+
+-- test: list_retain_all
+items: LIST { 1, 2, 3, 4, 5 }
+items |> List/retain(item, if: True)
+-- expect: [1.0, 2.0, 3.0, 4.0, 5.0]
+
+-- test: list_retain_none
+items: LIST { 1, 2, 3 }
+items |> List/retain(item, if: False)
+-- expect: []
+
+-- test: list_retain_even
+items: LIST { 1, 2, 3, 4 }
+items |> List/retain(item, if: item == 2)
+-- expect: [2.0]
+
+-- test: list_is_empty_true
+LIST {} |> List/is_empty()
+-- expect: true
+
+-- test: list_is_empty_false
+LIST { 1 } |> List/is_empty()
+-- expect: false
+
+-- test: when_tag_matching
+All |> WHEN {
+    All => TEXT { all }
+    Active => TEXT { active }
+    Completed => TEXT { completed }
+}
+-- expect: "all"
+
+-- test: when_wildcard
+Unknown |> WHEN {
+    All => TEXT { all }
+    __ => TEXT { other }
+}
+-- expect: "other"
+
+-- test: arithmetic_subtraction
+total: 5
+completed: 2
+total - completed
+-- expect: 3.0
+
+-- test: comparison_equal_true
+5 == 5
+-- expect: true
+
+-- test: comparison_equal_false
+5 == 3
+-- expect: false
+
+-- test: comparison_not_equal_true
+5 =/= 3
+-- expect: true
+
+-- test: comparison_not_equal_false
+5 =/= 5
+-- expect: false
+
+-- test: comparison_greater_than
+5 > 3
+-- expect: true
+
+-- test: comparison_less_than
+3 < 5
+-- expect: true
+
+-- test: block_with_variables
+BLOCK {
+    x: 10
+    y: 20
+    x + y
+}
+-- expect: 30.0
+
+-- test: function_with_object_return
+FUNCTION new_todo(title) {
+    [
+        title: title
+        completed: False
+    ]
+}
+
+new_todo(title: TEXT { Buy groceries })
+-- expect: {"title": "Buy groceries", "completed": false}
+
+-- test: list_map_with_object_field
+items: LIST { 1, 2 }
+items |> List/map(item, new: [value: item, doubled: item * 2])
+-- expect: [{"value": 1.0, "doubled": 2.0}, {"value": 2.0, "doubled": 4.0}]
+
+-- test: chained_list_operations
+LIST { 1, 2, 3, 4, 5 }
+    |> List/retain(item, if: item > 2)
+    |> List/map(item, new: item * 10)
+    |> List/count()
+-- expect: 3.0
+
+-- test: conditional_in_list_map
+items: LIST { True, False, True }
+items |> List/map(item, new: item |> WHEN {
+    True => TEXT { yes }
+    False => TEXT { no }
+})
+-- expect: ["yes", "no", "yes"]

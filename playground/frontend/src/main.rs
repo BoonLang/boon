@@ -12,6 +12,9 @@ use boon::platform::browser::{
     bridge::object_with_document_to_element_signal, engine::VirtualFilesystem, interpreter,
 };
 
+#[cfg(feature = "engine-v2")]
+use boon::platform::browser::interpreter_v2;
+
 mod code_editor;
 use code_editor::CodeEditor;
 
@@ -1457,40 +1460,53 @@ impl Playground {
             println!("BUILD.bn completed");
         }
 
-        // Run the main file (uses ModuleLoader for imports, no shared registry)
-        // We keep reference_connector and link_connector alive to preserve all actors.
-        // Dropping them (via after_remove) will trigger cleanup of all actors.
-        let evaluation_result = interpreter::run_with_registry(
-            filename,
-            &source_code,
-            STATES_STORAGE_KEY,
-            OLD_SOURCE_CODE_STORAGE_KEY,
-            OLD_SPAN_ID_PAIRS_STORAGE_KEY,
-            virtual_fs,
-            None,
-        );
-        drop(source_code);
-        if let Some((object, construct_context, _registry, _module_loader, reference_connector, link_connector, pass_through_connector)) = evaluation_result {
-            El::new()
-                .s(Width::fill())
-                .s(Height::fill())
-                .child_signal(object_with_document_to_element_signal(
-                    object.clone(),
-                    construct_context,
-                ))
-                .after_remove(move |_| {
-                    // Drop object first, then drop connectors to trigger actor cleanup
-                    drop(object);
-                    drop(reference_connector);
-                    drop(link_connector);
-                    drop(pass_through_connector);
-                })
-                .unify()
-        } else {
-            El::new()
-                .s(Font::new().color(color!("LightCoral")))
-                .child("Failed to run the example. See errors in dev console.")
-                .unify()
+        // Use engine-v2 if feature is enabled
+        #[cfg(feature = "engine-v2")]
+        {
+            drop(virtual_fs);
+            let source_code = source_code.to_string();
+            let result = interpreter_v2::run_and_render(source_code);
+            result.unify()
+        }
+
+        // Use old engine if engine-v2 feature is not enabled
+        #[cfg(not(feature = "engine-v2"))]
+        {
+            // Run the main file (uses ModuleLoader for imports, no shared registry)
+            // We keep reference_connector and link_connector alive to preserve all actors.
+            // Dropping them (via after_remove) will trigger cleanup of all actors.
+            let evaluation_result = interpreter::run_with_registry(
+                filename,
+                &source_code,
+                STATES_STORAGE_KEY,
+                OLD_SOURCE_CODE_STORAGE_KEY,
+                OLD_SPAN_ID_PAIRS_STORAGE_KEY,
+                virtual_fs,
+                None,
+            );
+            drop(source_code);
+            if let Some((object, construct_context, _registry, _module_loader, reference_connector, link_connector, pass_through_connector)) = evaluation_result {
+                El::new()
+                    .s(Width::fill())
+                    .s(Height::fill())
+                    .child_signal(object_with_document_to_element_signal(
+                        object.clone(),
+                        construct_context,
+                    ))
+                    .after_remove(move |_| {
+                        // Drop object first, then drop connectors to trigger actor cleanup
+                        drop(object);
+                        drop(reference_connector);
+                        drop(link_connector);
+                        drop(pass_through_connector);
+                    })
+                    .unify()
+            } else {
+                El::new()
+                    .s(Font::new().color(color!("LightCoral")))
+                    .child("Failed to run the example. See errors in dev console.")
+                    .unify()
+            }
         }
     }
 

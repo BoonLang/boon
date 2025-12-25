@@ -1,0 +1,94 @@
+-- test: function_simple
+FUNCTION add(a, b) {
+    a + b
+}
+add(a: 1, b: 2)
+-- expect: 3.0
+
+-- test: function_single_param
+FUNCTION double(x) {
+    x * 2
+}
+double(x: 21)
+-- expect: 42.0
+
+-- test: function_returns_object
+FUNCTION create_point(x, y) {
+    [x: x, y: y]
+}
+create_point(x: 10, y: 20)
+-- expect: {"x": 10.0, "y": 20.0}
+
+-- test: function_nested_call
+FUNCTION square(n) {
+    n * n
+}
+FUNCTION sum_of_squares(a, b) {
+    square(n: a) + square(n: b)
+}
+sum_of_squares(a: 3, b: 4)
+-- expect: 25.0
+
+-- test: function_with_when
+FUNCTION describe(status) {
+    status |> WHEN {
+        Active => TEXT { active }
+        Completed => TEXT { done }
+        __ => TEXT { unknown }
+    }
+}
+describe(status: Completed)
+-- expect: "done"
+
+-- test: object_field_access
+obj: [a: 1, b: 2, c: 3]
+obj.b
+-- expect: 2.0
+
+-- test: object_nested_field
+obj: [outer: [inner: 42]]
+obj.outer.inner
+-- expect: 42.0
+
+-- test: object_deeply_nested
+obj: [level1: [level2: [level3: [value: 100]]]]
+obj.level1.level2.level3.value
+-- expect: 100.0
+
+-- test: object_with_text_fields
+person: [name: TEXT { Alice }, role: TEXT { Admin }]
+person.name
+-- expect: "Alice"
+
+-- test: object_with_bool_field
+item: [completed: True]
+item.completed
+-- expect: true
+
+-- test: object_with_list_field
+container: [items: LIST { 1, 2, 3 }]
+container.items |> List/count()
+-- expect: 3.0
+
+-- test: tagged_object_simple
+Active
+-- expect: "Active"
+
+-- test: tagged_object_in_when
+value: Active
+value |> WHEN {
+    Active => 1
+    Inactive => 0
+}
+-- expect: 1.0
+
+-- test: function_with_block
+FUNCTION complex_calc(x) {
+    BLOCK {
+        doubled: x * 2
+        squared: x * x
+        doubled + squared
+    }
+}
+complex_calc(x: 5)
+-- expect: 35.0

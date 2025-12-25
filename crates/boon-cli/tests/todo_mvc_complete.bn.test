@@ -1,0 +1,158 @@
+-- test: new_todo_function
+FUNCTION new_todo(title) {
+    [title: title, completed: False]
+}
+new_todo(title: TEXT { Buy milk })
+-- expect: {"title": "Buy milk", "completed": false}
+
+-- test: filter_all_shows_all
+filter: All
+todos: LIST {
+    [completed: True, title: TEXT { Done }]
+    [completed: False, title: TEXT { Todo }]
+}
+todos |> List/retain(todo, if: filter |> WHEN {
+    All => True
+    Active => todo.completed == False
+    Completed => todo.completed == True
+})
+-- expect: [{"completed": true, "title": "Done"}, {"completed": false, "title": "Todo"}]
+
+-- test: filter_active_shows_only_active
+filter: Active
+todos: LIST {
+    [completed: True, title: TEXT { Done }]
+    [completed: False, title: TEXT { Todo }]
+    [completed: False, title: TEXT { Also todo }]
+}
+todos |> List/retain(todo, if: filter |> WHEN {
+    All => True
+    Active => todo.completed == False
+    Completed => todo.completed == True
+})
+-- expect: [{"completed": false, "title": "Todo"}, {"completed": false, "title": "Also todo"}]
+
+-- test: filter_completed_shows_only_completed
+filter: Completed
+todos: LIST {
+    [completed: True, title: TEXT { Done }]
+    [completed: False, title: TEXT { Todo }]
+    [completed: True, title: TEXT { Also done }]
+}
+todos |> List/retain(todo, if: filter |> WHEN {
+    All => True
+    Active => todo.completed == False
+    Completed => todo.completed == True
+})
+-- expect: [{"completed": true, "title": "Done"}, {"completed": true, "title": "Also done"}]
+
+-- test: active_count_all_active
+todos: LIST {
+    [completed: False]
+    [completed: False]
+    [completed: False]
+}
+todos |> List/retain(t, if: t.completed == False) |> List/count()
+-- expect: 3.0
+
+-- test: active_count_mixed
+todos: LIST {
+    [completed: True]
+    [completed: False]
+    [completed: False]
+    [completed: True]
+}
+todos |> List/retain(t, if: t.completed == False) |> List/count()
+-- expect: 2.0
+
+-- test: active_count_all_completed
+todos: LIST {
+    [completed: True]
+    [completed: True]
+}
+todos |> List/retain(t, if: t.completed == False) |> List/count()
+-- expect: 0.0
+
+-- test: active_count_empty
+LIST {} |> List/retain(t, if: t.completed == False) |> List/count()
+-- expect: 0.0
+
+-- test: clear_completed_removes_done
+todos: LIST {
+    [completed: True, title: TEXT { Done1 }]
+    [completed: False, title: TEXT { Active }]
+    [completed: True, title: TEXT { Done2 }]
+}
+todos |> List/retain(t, if: t.completed == False)
+-- expect: [{"completed": false, "title": "Active"}]
+
+-- test: clear_completed_keeps_all_when_none_completed
+todos: LIST {
+    [completed: False, title: TEXT { Task1 }]
+    [completed: False, title: TEXT { Task2 }]
+}
+todos |> List/retain(t, if: t.completed == False)
+-- expect: [{"completed": false, "title": "Task1"}, {"completed": false, "title": "Task2"}]
+
+-- test: clear_completed_empty_when_all_completed
+todos: LIST {
+    [completed: True, title: TEXT { Done1 }]
+    [completed: True, title: TEXT { Done2 }]
+}
+todos |> List/retain(t, if: t.completed == False)
+-- expect: []
+
+-- test: has_completed_true
+todos: LIST {
+    [completed: True]
+    [completed: False]
+}
+todos |> List/retain(t, if: t.completed == True) |> List/is_empty() |> Bool/not()
+-- expect: true
+
+-- test: has_completed_false
+todos: LIST {
+    [completed: False]
+    [completed: False]
+}
+todos |> List/retain(t, if: t.completed == True) |> List/is_empty() |> Bool/not()
+-- expect: false
+
+-- test: items_left_text_singular
+count: 1
+count |> WHEN {
+    1 => TEXT { item left }
+    __ => TEXT { items left }
+}
+-- expect: "item left"
+
+-- test: items_left_text_plural
+count: 5
+count |> WHEN {
+    1 => TEXT { item left }
+    __ => TEXT { items left }
+}
+-- expect: "items left"
+
+-- test: items_left_text_zero
+count: 0
+count |> WHEN {
+    1 => TEXT { item left }
+    __ => TEXT { items left }
+}
+-- expect: "items left"
+
+-- test: validate_empty_title
+title: TEXT {} |> Text/trim()
+title |> Text/is_not_empty()
+-- expect: false
+
+-- test: validate_whitespace_title
+title: TEXT {   } |> Text/trim()
+title |> Text/is_not_empty()
+-- expect: false
+
+-- test: validate_valid_title
+title: TEXT { Buy groceries } |> Text/trim()
+title |> Text/is_not_empty()
+-- expect: true

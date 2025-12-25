@@ -1,0 +1,42 @@
+-- test: list_count_basic
+LIST { 1, 2, 3 } |> List/count()
+-- expect: 3.0
+
+-- test: list_count_empty
+LIST {} |> List/count()
+-- expect: 0.0
+
+-- test: list_map_identity
+items: LIST { 1, 2, 3 }
+items |> List/map(item, new: item)
+-- expect: [1.0, 2.0, 3.0]
+
+-- test: list_map_transform
+items: LIST { 1, 2, 3 }
+items |> List/map(item, new: item * 2)
+-- expect: [2.0, 4.0, 6.0]
+
+-- test: list_map_with_object
+items: LIST { 1, 2 }
+items |> List/map(item, new: [value: item])
+-- expect: [{"value": 1.0}, {"value": 2.0}]
+
+-- test: list_map_function_call
+FUNCTION double(x) {
+    x * 2
+}
+
+items: LIST { 1, 2, 3 }
+items |> List/map(item, new: double(x: item))
+-- expect: [2.0, 4.0, 6.0]
+
+-- test: list_append_single
+base: LIST {}
+base |> List/append(item: 42)
+-- expect: [42.0]
+
+-- test: list_append_with_count
+base: LIST {}
+appended: base |> List/append(item: 42)
+appended |> List/count()
+-- expect: 1.0

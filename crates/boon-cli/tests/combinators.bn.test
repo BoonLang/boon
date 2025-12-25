@@ -1,0 +1,150 @@
+-- test: hold_simple_increment
+-- HOLD accumulates state: initial 0, body returns state + 1 = 1
+0 |> HOLD state { state + 1 }
+-- expect: 1.0
+
+-- test: hold_with_list_append
+-- HOLD with list accumulation pattern (from shopping_list.bn)
+[items: LIST {}] |> HOLD state {
+    [items: state.items |> List/append(item: 42)]
+}
+-- expect: {"items": [42.0]}
+
+-- test: latest_returns_last
+-- LATEST with multiple values returns the last one (not a merged object)
+LATEST {
+    10
+    20
+}
+-- expect: 20.0
+
+-- test: latest_single_value
+LATEST {
+    42
+}
+-- expect: 42.0
+
+-- test: latest_with_expression
+LATEST {
+    1 + 2
+    3 * 4
+}
+-- expect: 12.0
+
+-- test: then_simple
+-- THEN transforms input, returns body value
+10 |> THEN { 20 }
+-- expect: 20.0
+
+-- test: then_ignores_input
+-- THEN body doesn't use input value
+TEXT { hello } |> THEN { 42 }
+-- expect: 42.0
+
+-- test: then_with_computation
+5 |> THEN { 10 * 2 }
+-- expect: 20.0
+
+-- test: when_first_arm
+Active |> WHEN {
+    Active => TEXT { active }
+    Completed => TEXT { completed }
+}
+-- expect: "active"
+
+-- test: when_second_arm
+Completed |> WHEN {
+    Active => TEXT { active }
+    Completed => TEXT { completed }
+}
+-- expect: "completed"
+
+-- test: when_with_all_tag
+All |> WHEN {
+    All => TEXT { all items }
+    Active => TEXT { active only }
+    Completed => TEXT { completed only }
+}
+-- expect: "all items"
+
+-- test: when_wildcard_match
+Unknown |> WHEN {
+    Known => 100
+    __ => 0
+}
+-- expect: 0.0
+
+-- test: when_with_numeric_result
+Active |> WHEN {
+    Active => 1
+    Completed => 2
+}
+-- expect: 1.0
+
+-- test: while_condition_true
+-- WHILE emits continuously while pattern matches
+Enabled |> WHILE {
+    Enabled => 42
+}
+-- expect: 42.0
+
+-- test: while_condition_false
+-- WHILE with non-matching pattern returns null/nothing
+Disabled |> WHILE {
+    Enabled => 42
+}
+-- expect: null
+
+-- test: while_first_pattern
+Running |> WHILE {
+    Running => TEXT { running }
+    Stopped => TEXT { stopped }
+}
+-- expect: "running"
+
+-- test: while_second_pattern
+Stopped |> WHILE {
+    Running => TEXT { running }
+    Stopped => TEXT { stopped }
+}
+-- expect: "stopped"
+
+-- test: block_simple
+BLOCK {
+    x: 5
+    x
+}
+-- expect: 5.0
+
+-- test: block_two_vars
+BLOCK {
+    a: 10
+    b: 20
+    a + b
+}
+-- expect: 30.0
+
+-- test: block_with_computation
+BLOCK {
+    base: 100
+    multiplier: 2
+    base * multiplier
+}
+-- expect: 200.0
+
+-- test: block_nested_object
+BLOCK {
+    inner: [value: 42]
+    inner.value
+}
+-- expect: 42.0
+
+-- test: pipe_chain_simple
+10 |> THEN { 20 } |> THEN { 30 }
+-- expect: 30.0
+
+-- test: pipe_to_when
+Active |> WHEN {
+    Active => 1
+} |> THEN { 100 }
+-- expect: 100.0

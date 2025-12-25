@@ -1,0 +1,73 @@
+-- test: text_empty
+TEXT {}
+-- expect: ""
+
+-- test: text_simple
+TEXT { Hello World }
+-- expect: "Hello World"
+
+-- test: text_with_punctuation
+TEXT { Hello, World! }
+-- expect: "Hello, World!"
+
+-- test: text_interpolation_number
+count: 42
+TEXT { Count is {count} }
+-- expect: "Count is 42"
+
+-- test: text_interpolation_variable
+name: TEXT { Alice }
+TEXT { Hello, {name}! }
+-- expect: "Hello, Alice!"
+
+-- test: text_interpolation_multiple
+first: TEXT { Hello }
+second: TEXT { World }
+TEXT { {first}, {second}! }
+-- expect: "Hello, World!"
+
+-- test: text_trim_leading
+TEXT {    hello} |> Text/trim()
+-- expect: "hello"
+
+-- test: text_trim_trailing
+TEXT {hello    } |> Text/trim()
+-- expect: "hello"
+
+-- test: text_trim_both
+TEXT {   hello   } |> Text/trim()
+-- expect: "hello"
+
+-- test: text_trim_empty
+TEXT {} |> Text/trim()
+-- expect: ""
+
+-- test: text_trim_only_spaces
+TEXT {      } |> Text/trim()
+-- expect: ""
+
+-- test: text_is_not_empty_with_content
+TEXT { x } |> Text/is_not_empty()
+-- expect: true
+
+-- test: text_is_not_empty_trimmed_spaces
+TEXT {   } |> Text/trim() |> Text/is_not_empty()
+-- expect: false
+
+-- test: text_space
+Text/space()
+-- expect: " "
+
+-- test: text_empty_function
+Text/empty()
+-- expect: ""
+
+-- test: text_in_object
+obj: [message: TEXT { hello }]
+obj.message
+-- expect: "hello"
+
+-- test: text_in_list
+items: LIST { TEXT { a }, TEXT { b }, TEXT { c } }
+items |> List/count()
+-- expect: 3.0

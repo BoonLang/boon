@@ -28,6 +28,7 @@ The sections below marked **(Old Engine)** document the current engine and will 
   - For fallible conversions: use `try_into()` or `TryFrom` and handle errors
   - For type annotations: `as` is fine (e.g., `0usize` or `0 as usize`)
   - For pointer casting in FFI: `as` is appropriate but rare in Boon
+- **When fixing subtle bugs, document the architectural principle in `docs/new_boon/`.** The fix itself solves the immediate problem, but documenting *why* the code must be structured that way prevents the bug from being reintroduced. For example, the "Wire Transparency Principle" (§2.3.6.1) explains why Wire nodes must always follow their source chain instead of returning cached values - a subtle invariant that, if violated, breaks HOLD state updates.
 
 ## Project Structure
 

@@ -1,0 +1,88 @@
+-- test: list_append_multiple_chained
+LIST {} |> List/append(item: 1) |> List/append(item: 2) |> List/append(item: 3)
+-- expect: [1.0, 2.0, 3.0]
+
+-- test: list_append_to_existing
+LIST { 10, 20 } |> List/append(item: 30)
+-- expect: [10.0, 20.0, 30.0]
+
+-- test: list_retain_by_field_completed
+items: LIST {
+    [completed: True, title: TEXT { Done }]
+    [completed: False, title: TEXT { Todo }]
+    [completed: True, title: TEXT { Also done }]
+}
+items |> List/retain(item, if: item.completed == True)
+-- expect: [{"completed": true, "title": "Done"}, {"completed": true, "title": "Also done"}]
+
+-- test: list_retain_by_field_not_completed
+items: LIST {
+    [completed: True, title: TEXT { Done }]
+    [completed: False, title: TEXT { Todo }]
+}
+items |> List/retain(item, if: item.completed == False)
+-- expect: [{"completed": false, "title": "Todo"}]
+
+-- test: list_retain_greater_than
+LIST { 1, 5, 10, 15, 20 } |> List/retain(n, if: n > 10)
+-- expect: [15.0, 20.0]
+
+-- test: list_retain_less_than
+LIST { 1, 5, 10, 15, 20 } |> List/retain(n, if: n < 10)
+-- expect: [1.0, 5.0]
+
+-- test: list_map_to_field
+items: LIST {
+    [value: 1]
+    [value: 2]
+    [value: 3]
+}
+items |> List/map(item, new: item.value)
+-- expect: [1.0, 2.0, 3.0]
+
+-- test: list_map_add_field
+items: LIST { 1, 2, 3 }
+items |> List/map(n, new: [original: n, squared: n * n])
+-- expect: [{"original": 1.0, "squared": 1.0}, {"original": 2.0, "squared": 4.0}, {"original": 3.0, "squared": 9.0}]
+
+-- test: list_count_after_retain
+LIST { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }
+    |> List/retain(n, if: n > 5)
+    |> List/count()
+-- expect: 5.0
+
+-- test: list_count_after_append
+LIST { 1, 2 } |> List/append(item: 3) |> List/count()
+-- expect: 3.0
+
+-- test: list_retain_then_map
+LIST { 1, 2, 3, 4, 5 }
+    |> List/retain(n, if: n > 2)
+    |> List/map(n, new: n * 100)
+-- expect: [300.0, 400.0, 500.0]
+
+-- test: list_map_then_retain
+LIST { 1, 2, 3 }
+    |> List/map(n, new: n * 10)
+    |> List/retain(n, if: n > 15)
+-- expect: [20.0, 30.0]
+
+-- test: list_empty_retain
+LIST {} |> List/retain(item, if: True)
+-- expect: []
+
+-- test: list_empty_map
+LIST {} |> List/map(item, new: item * 2)
+-- expect: []
+
+-- test: list_is_empty_after_append
+LIST {} |> List/append(item: 1) |> List/is_empty()
+-- expect: false
+
+-- test: list_nested_objects
+LIST {
+    [user: [name: TEXT { Alice }]]
+    [user: [name: TEXT { Bob }]]
+}
+    |> List/map(item, new: item.user.name)
+-- expect: ["Alice", "Bob"]

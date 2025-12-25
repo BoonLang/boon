@@ -18,6 +18,7 @@ ariadne = "0.5"
 pin-project = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json_any_key = "2.0.0"
+serde_json = { version = "1", optional = true }
 
 ulid = { version = "1.2.0", features = ["serde"] }
 # `rustflags = ["--cfg", 'getrandom_backend="wasm_js"']` has to be in workspace .cargo/config.toml
@@ -37,3 +38,10 @@ default = ["debug-channels"]
 # Enabled by default. To disable for production:
 # `cargo build --no-default-features`
 debug-channels = []
+
+# CLI platform support with serde_json for output formatting
+cli = ["dep:serde_json"]
+
+# Use the new arena-based engine (engine_v2) instead of the old actor-based engine.
+# This is the new reactive engine being developed in M0/M1.
+engine-v2 = []
