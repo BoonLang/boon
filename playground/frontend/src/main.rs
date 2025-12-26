@@ -509,13 +509,13 @@ impl Playground {
                     // Set window.boonPlayground
                     js_sys::Reflect::set(&window, &"boonPlayground".into(), &api).ok();
 
-                    // Auto-run on startup: trigger execution after a short delay to let the UI settle
-                    let run_command_for_autorun = run_command.clone();
-                    Task::start(async move {
-                        // Small delay to ensure the editor and UI are fully initialized
-                        Timer::sleep(100).await;
-                        run_command_for_autorun.set(Some(RunCommand { filename: None }));
-                    });
+                    // Auto-run on startup: DISABLED to prevent infinite loops from crashing the page
+                    // let run_command_for_autorun = run_command.clone();
+                    // Task::start(async move {
+                    //     // Small delay to ensure the editor and UI are fully initialized
+                    //     Timer::sleep(100).await;
+                    //     run_command_for_autorun.set(Some(RunCommand { filename: None }));
+                    // });
 
                     // Also keep the legacy boon-run event listener for backwards compatibility
                     let run_command_clone = run_command.clone();

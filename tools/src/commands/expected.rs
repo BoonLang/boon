@@ -109,17 +109,31 @@ impl Action {
                         Ok(ParsedAction::Click { selector })
                     }
                     "type" => {
-                        let selector = arr
-                            .get(1)
-                            .and_then(|v| v.as_str())
-                            .context("type requires selector")?
-                            .to_string();
-                        let text = arr
-                            .get(2)
-                            .and_then(|v| v.as_str())
-                            .context("type requires text")?
-                            .to_string();
-                        Ok(ParsedAction::Type { selector, text })
+                        // Two forms:
+                        // ["type", "text"] - type into currently focused element (use after focus_input)
+                        // ["type", "selector", "text"] - focus element by selector, then type
+                        if arr.len() == 2 {
+                            // ["type", "text"] - type into focused element
+                            let text = arr
+                                .get(1)
+                                .and_then(|v| v.as_str())
+                                .context("type requires text")?
+                                .to_string();
+                            Ok(ParsedAction::TypeText { text })
+                        } else {
+                            // ["type", "selector", "text"] - focus by selector first
+                            let selector = arr
+                                .get(1)
+                                .and_then(|v| v.as_str())
+                                .context("type requires selector")?
+                                .to_string();
+                            let text = arr
+                                .get(2)
+                                .and_then(|v| v.as_str())
+                                .context("type requires text")?
+                                .to_string();
+                            Ok(ParsedAction::Type { selector, text })
+                        }
                     }
                     "wait" => {
                         let ms = arr
@@ -129,6 +143,21 @@ impl Action {
                         Ok(ParsedAction::Wait { ms })
                     }
                     "clear_states" => Ok(ParsedAction::ClearStates),
+                    "key" => {
+                        let key = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .context("key requires key name (Enter, Tab, Escape, Backspace, Delete)")?
+                            .to_string();
+                        Ok(ParsedAction::Key { key })
+                    }
+                    "focus_input" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("focus_input requires index (0-indexed)")?;
+                        Ok(ParsedAction::FocusInput { index: index as u32 })
+                    }
                     _ => anyhow::bail!("Unknown action type: {}", cmd),
                 }
             }
@@ -140,8 +169,11 @@ impl Action {
 pub enum ParsedAction {
     Click { selector: String },
     Type { selector: String, text: String },
+    TypeText { text: String },  // Type into currently focused element
     Wait { ms: u64 },
     ClearStates,
+    Key { key: String },
+    FocusInput { index: u32 },
 }
 
 #[derive(Debug, Clone, Deserialize)]

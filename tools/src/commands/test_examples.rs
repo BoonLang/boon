@@ -83,6 +83,43 @@ pub fn discover_examples(examples_dir: &Path) -> Result<Vec<DiscoveredExample>> 
 
 /// Run all discovered examples
 pub async fn run_tests(opts: TestOptions) -> Result<Vec<TestResult>> {
+    // Pre-flight check: verify WebSocket server and browser extension are running
+    match check_server_connection(opts.port).await {
+        Ok(status) => {
+            if !status.connected {
+                eprintln!("ERROR: Browser extension not connected!");
+                eprintln!();
+                eprintln!("To run playground tests, you need:");
+                eprintln!("  1. WebSocket server running:");
+                eprintln!("     cd tools && cargo run --release -- server start");
+                eprintln!();
+                eprintln!("  2. Browser with extension loaded:");
+                eprintln!("     - Open Chromium");
+                eprintln!("     - Load extension from tools/extension/");
+                eprintln!("     - Navigate to http://localhost:8081");
+                eprintln!();
+                eprintln!("Or use MCP tools if available (boon_status, boon_launch_browser)");
+                anyhow::bail!("Browser extension not connected");
+            }
+            if !status.api_ready {
+                eprintln!("ERROR: Boon playground API not ready!");
+                eprintln!("Make sure the playground is loaded at http://localhost:8081");
+                anyhow::bail!("Playground API not ready");
+            }
+        }
+        Err(e) => {
+            eprintln!("ERROR: Cannot connect to WebSocket server on port {}!", opts.port);
+            eprintln!();
+            eprintln!("Error: {}", e);
+            eprintln!();
+            eprintln!("To run playground tests, start the WebSocket server first:");
+            eprintln!("  cd tools && cargo run --release -- server start");
+            eprintln!();
+            eprintln!("Or use MCP tools if available (boon_start_playground, boon_launch_browser)");
+            anyhow::bail!("WebSocket server not running");
+        }
+    }
+
     // Find examples directory
     let examples_dir = if let Some(ref dir) = opts.examples_dir {
         dir.clone()
@@ -477,6 +514,27 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
             let _ = send_command_to_server(port, WsCommand::ClearStates).await?;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        ParsedAction::Key { key } => {
+            let response = send_command_to_server(port, WsCommand::Key { key: key.clone() }).await?;
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Key press failed: {}", message);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ParsedAction::FocusInput { index } => {
+            let response = send_command_to_server(port, WsCommand::FocusInput { index: *index }).await?;
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Focus input failed: {}", message);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ParsedAction::TypeText { text } => {
+            let response = send_command_to_server(port, WsCommand::TypeText { text: text.clone() }).await?;
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Type text failed: {}", message);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     Ok(())
 }
@@ -631,6 +689,28 @@ async fn get_console(port: u16) -> Result<Vec<String>> {
         }
         WsResponse::Error { message } => anyhow::bail!("{}", message),
         _ => anyhow::bail!("Unexpected response"),
+    }
+}
+
+/// Server connection status
+struct ServerStatus {
+    connected: bool,
+    api_ready: bool,
+}
+
+/// Check if WebSocket server is running and browser extension is connected
+async fn check_server_connection(port: u16) -> Result<ServerStatus> {
+    let response = send_command_to_server(port, WsCommand::GetStatus).await?;
+    match response {
+        WsResponse::Status { connected, api_ready, .. } => {
+            Ok(ServerStatus { connected, api_ready })
+        }
+        WsResponse::Error { message } => {
+            anyhow::bail!("Status check failed: {}", message)
+        }
+        _ => {
+            anyhow::bail!("Unexpected response from status check")
+        }
     }
 }
 

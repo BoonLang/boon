@@ -285,6 +285,13 @@ enum ExecAction {
         #[arg(short, long)]
         pattern: Option<String>,
     },
+
+    /// Verify example file integrity (check for unauthorized modifications)
+    VerifyIntegrity {
+        /// Path to examples directory (default: auto-detect)
+        #[arg(long)]
+        examples_dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -737,6 +744,15 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
                     }
                 }
                 _ => print_response(response),
+            }
+        }
+
+        ExecAction::VerifyIntegrity { examples_dir } => {
+            use commands::verify_integrity::run_integrity_check;
+
+            let passed = run_integrity_check(examples_dir)?;
+            if !passed {
+                std::process::exit(1);
             }
         }
     }

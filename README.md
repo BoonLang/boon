@@ -225,6 +225,51 @@ Examples on [play.boon.run](https://play.boon.run/) are guaranteed to run. I'll 
 
 Questions ▷ martin@kavik.cz
 
+## Testing Playground Examples
+
+Boon includes a comprehensive test suite for verifying all 11 playground examples work correctly.
+
+### Running Tests
+
+```bash
+# Run integrity check only (fast, no browser needed)
+makers verify-integrity
+
+# Run all example tests (requires WebSocket server and browser extension running)
+makers verify-playground
+
+# Interactive debugging on failure
+makers verify-playground-interactive
+
+# Run a specific example test
+./target/release/boon-tools exec test-examples --filter shopping_list
+```
+
+### Test Categories
+
+- **Static**: Examples that display fixed output (minimal, hello_world, layers)
+- **Timer**: Time-based reactive examples (interval, interval_hold)
+- **Interactive**: Examples requiring user interaction (counter, shopping_list, todo_mvc)
+- **Computation**: Examples that compute and display results (fibonacci)
+
+### Adding New Tests
+
+Create a `.expected` file alongside any `.bn` example:
+
+```toml
+[test]
+category = "interactive"
+description = "Test description"
+
+[output]
+text = "Expected initial output"
+
+[[sequence]]
+description = "Step description"
+actions = [["click", "button"], ["key", "Enter"]]
+expect = "Expected output after actions"
+```
+
 ## Credits
 
 - ASCII Art: [patorjk.com + Mono 12](https://patorjk.com/software/taag/#p=display&f=Mono+12&t=boon&x=rainbow3&v=4&h=4&w=80&we=false)

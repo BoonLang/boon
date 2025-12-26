@@ -1,0 +1,137 @@
+-- test: function_simple
+-- Simple function definition and call with named args
+FUNCTION add(a, b) { a + b }
+result: add(a: 2, b: 3)
+result
+-- expect: 5.0
+
+-- test: function_single_arg
+-- Function with single argument
+FUNCTION double(x) { x * 2 }
+result: double(x: 7)
+result
+-- expect: 14.0
+
+-- test: while_literal_match_zero
+-- WHILE with literal pattern matching for 0
+FUNCTION classify(n) {
+    n |> WHILE {
+        0 => TEXT { zero }
+        1 => TEXT { one }
+        __ => TEXT { other }
+    }
+}
+result: classify(n: 0)
+result
+-- expect: "zero"
+
+-- test: while_literal_match_one
+-- WHILE matching 1
+FUNCTION classify(n) {
+    n |> WHILE {
+        0 => TEXT { zero }
+        1 => TEXT { one }
+        __ => TEXT { other }
+    }
+}
+result: classify(n: 1)
+result
+-- expect: "one"
+
+-- test: while_literal_match_other
+-- WHILE matching catchall
+FUNCTION classify(n) {
+    n |> WHILE {
+        0 => TEXT { zero }
+        1 => TEXT { one }
+        __ => TEXT { other }
+    }
+}
+result: classify(n: 99)
+result
+-- expect: "other"
+
+-- test: while_variable_binding
+-- WHILE with variable binding in pattern
+FUNCTION increment(x) {
+    x |> WHILE {
+        n => n + 1
+    }
+}
+result: increment(x: 5)
+result
+-- expect: 6.0
+
+-- test: hold_simple
+-- Simple HOLD accumulator
+counter: 0 |> HOLD state {
+    1 |> THEN { state + 1 }
+}
+counter
+-- expect: 1.0
+
+-- test: hold_object_state
+-- HOLD with object state
+result: [a: 1, b: 2] |> HOLD state {
+    1 |> THEN { [a: state.a + 1, b: state.b + 2] }
+}
+result.a
+-- expect: 2.0
+
+-- test: text_interpolation_simple
+-- Simple TEXT interpolation
+x: 5
+message: TEXT { Value is {x} }
+message
+-- expect: "Value is 5"
+
+-- test: text_interpolation_multiple
+-- Multiple interpolations in TEXT
+a: 10
+b: 20
+message: TEXT { {a} plus {b} }
+message
+-- expect: "10 plus 20"
+
+-- test: field_access_simple
+-- Field access on object
+obj: [x: 42, y: 99]
+result: obj.x
+result
+-- expect: 42.0
+
+-- test: nested_field_access
+-- Nested field access
+data: [inner: [value: 123]]
+result: data.inner.value
+result
+-- expect: 123.0
+
+-- test: arithmetic_in_function
+-- Arithmetic operations in function body
+FUNCTION compute(x) { x * x + 2 * x + 1 }
+result: compute(x: 3)
+result
+-- expect: 16.0
+
+-- test: function_calling_function
+-- Function calling another function
+FUNCTION add(a, b) { a + b }
+FUNCTION add3(x, y, z) { add(a: add(a: x, b: y), b: z) }
+result: add3(x: 1, y: 2, z: 3)
+result
+-- expect: 6.0
+
+-- test: stream_pulses_basic
+-- Stream/pulses emits sequential values
+result: 3 |> Stream/pulses()
+result
+-- expect: 2.0
+
+-- test: fibonacci_pattern
+-- Fibonacci-like HOLD with object state (simplified)
+result: [prev: 0, curr: 1] |> HOLD state {
+    1 |> THEN { [prev: state.curr, curr: state.prev + state.curr] }
+}
+result.curr
+-- expect: 1.0

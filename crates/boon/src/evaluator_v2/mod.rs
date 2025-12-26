@@ -340,6 +340,43 @@ impl<'a, 'code> CompileContext<'a, 'code> {
         slot
     }
 
+    /// Compile a Stream/pulses node that emits 0, 1, 2, ..., N-1 over N ticks.
+    pub fn compile_pulses(&mut self, count: u32) -> SlotId {
+        let slot = self.event_loop.arena.alloc();
+
+        if let Some(node) = self.event_loop.arena.get_mut(slot) {
+            node.set_kind(NodeKind::Pulses {
+                total: count,
+                current: 0,
+                started: false,
+            });
+        }
+
+        // Note: We don't mark_dirty here because the caller (CLI/browser runtime)
+        // will mark all nodes dirty during initial evaluation. Marking twice
+        // would cause double processing since dirty_nodes doesn't deduplicate.
+
+        slot
+    }
+
+    /// Compile a Stream/skip node that skips the first N values from a source.
+    pub fn compile_skip(&mut self, source: SlotId, count: u32) -> SlotId {
+        let slot = self.event_loop.arena.alloc();
+
+        if let Some(node) = self.event_loop.arena.get_mut(slot) {
+            node.set_kind(NodeKind::Skip {
+                source,
+                count,
+                skipped: 0,
+            });
+        }
+
+        // Subscribe to the source
+        self.event_loop.routing.add_route(source, slot, Port::Input(0));
+
+        slot
+    }
+
     // Phase 5: List compilation
 
     /// Compile a Bus (List) node.
@@ -1652,6 +1689,33 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                 // Math/sum() accumulates piped values
                 self.compile_accumulator(input_slot)
             }
+            ["Stream", "pulses"] => {
+                // Stream/pulses() - emit 0, 1, 2, ..., N-1 where N is the piped count
+                // First get the count value from the input
+                let count = self.event_loop.get_current_value(input_slot)
+                    .and_then(|v| match v {
+                        Payload::Number(n) => Some(*n as u32),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                self.compile_pulses(count)
+            }
+            ["Stream", "skip"] => {
+                // Stream/skip(count: N) - skip first N values from source, then pass through
+                let count = arguments.iter()
+                    .find(|arg| arg.node.name == "count")
+                    .and_then(|arg| arg.node.value.as_ref())
+                    .and_then(|value_expr| {
+                        let count_slot = self.compile_expression(value_expr);
+                        self.event_loop.get_current_value(count_slot)
+                            .and_then(|v| match v {
+                                Payload::Number(n) => Some(*n as u32),
+                                _ => None,
+                            })
+                    })
+                    .unwrap_or(0);
+                self.compile_skip(input_slot, count)
+            }
             ["Document", "new"] => {
                 // Document/new() - wrap input in a Document TaggedObject
                 // This allows the bridge to detect it's a Document and use ReactiveEventLoop
@@ -1783,18 +1847,8 @@ impl<'a, 'code> CompileContext<'a, 'code> {
 
     /// Extract duration in milliseconds from a Duration slot.
     fn extract_duration_ms(&self, slot: SlotId) -> f64 {
-        #[cfg(target_arch = "wasm32")]
-        zoon::println!("extract_duration_ms: slot={:?} arena_len={} is_valid={}",
-            slot, self.event_loop.arena_len(), self.event_loop.arena.is_valid(slot));
-
         // Try to get the value directly
-        let get_result = self.event_loop.arena.get(slot);
-        #[cfg(target_arch = "wasm32")]
-        zoon::println!("  arena.get result: is_some={}", get_result.is_some());
-
-        if let Some(node) = get_result {
-            #[cfg(target_arch = "wasm32")]
-            zoon::println!("  node FOUND, has_kind={}", node.kind().is_some());
+        if let Some(node) = self.event_loop.arena.get(slot) {
 
             if let Some(kind) = node.kind() {
                 match kind {
@@ -1851,7 +1905,23 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                         }
                     }
                 }
-                // Try "ms" field
+                // Try "milliseconds" field (full name)
+                let ms_id = self.event_loop.arena.get_field_id("milliseconds");
+                if let Some(ms_id) = ms_id {
+                    if let Some(&field_slot) = fields.get(&ms_id) {
+                        if let Some(payload) = self.event_loop.get_current_value(field_slot) {
+                            if let Payload::Number(ms) = payload {
+                                return *ms;
+                            }
+                        }
+                        if let Some(field_node) = self.event_loop.arena.get(field_slot) {
+                            if let Some(NodeKind::Producer { value: Some(Payload::Number(ms)) }) = field_node.kind() {
+                                return *ms;
+                            }
+                        }
+                    }
+                }
+                // Try "ms" field (short name)
                 let ms_id = self.event_loop.arena.get_field_id("ms");
                 if let Some(ms_id) = ms_id {
                     if let Some(&field_slot) = fields.get(&ms_id) {
@@ -2277,11 +2347,36 @@ impl<'a, 'code> CompileContext<'a, 'code> {
             self.local_bindings.remove("element");
         }
 
-        // Extract event from element.event
+        // Extract event.key_down and event.change IOPads from element
+        // When user writes: element: [event: [key_down: LINK, change: LINK]]
+        // LINK compiles directly to an IOPad, so element.event.key_down IS the IOPad
         let event_field_id = self.event_loop.arena.intern_field("event");
-        let event_slot = self.get_field(element_slot, event_field_id)
-            .map(|s| self.compile_wire(s))
-            .unwrap_or_else(|| self.compile_constant(Payload::Unit));
+        let key_down_field_id = self.event_loop.arena.intern_field("key_down");
+        let change_field_id = self.event_loop.arena.intern_field("change");
+
+        // Get the IOPads directly from element.event.key_down and element.event.change
+        let ev_slot = self.get_field(element_slot, event_field_id);
+        let key_down_iopad = ev_slot.and_then(|ev| self.get_field(ev, key_down_field_id));
+        let change_iopad = ev_slot.and_then(|ev| self.get_field(ev, change_field_id));
+
+        // Create a new event Router with IOPads directly exposed
+        // IMPORTANT: Don't wrap in Wire - we need the actual IOPad slots for event injection
+        let mut event_fields = vec![];
+        if let Some(iopad) = key_down_iopad {
+            event_fields.push((key_down_field_id, iopad));
+        }
+        if let Some(iopad) = change_iopad {
+            event_fields.push((change_field_id, iopad));
+        }
+
+        let event_slot = if !event_fields.is_empty() {
+            self.compile_object(event_fields)
+        } else {
+            // Fallback: just expose element.event as-is
+            ev_slot
+                .map(|s| self.compile_wire(s))
+                .unwrap_or_else(|| self.compile_constant(Payload::Unit))
+        };
 
         let style_field_id = self.event_loop.arena.intern_field("style");
         let text_field_id = self.event_loop.arena.intern_field("text");

@@ -1,0 +1,67 @@
+# Shopping List example - full CRUD test
+#
+# Test Flow:
+# 1. Initial state check (empty list, "0 items")
+# 2. Add "Milk" → verify appears in list
+# 3. Add "Bread" → verify both items, count = 2
+# 4. Add "Eggs" → verify count = 3
+# 5. Clear all → verify count = 0, list empty
+
+[test]
+category = "interactive"
+description = "Shopping list: add items and clear all"
+
+[output]
+# Initial state: header visible, 0 items
+text = "0 items"
+
+[timing]
+timeout = 10000
+poll_interval = 200
+
+[[sequence]]
+description = "Step 1: Add first item (Milk)"
+actions = [
+    ["focus_input", 0],
+    ["type", "Milk"],
+    ["key", "Enter"]
+]
+expect = "- Milk"
+
+[[sequence]]
+description = "Step 2: Verify count is 1"
+expect = "1 item"
+
+[[sequence]]
+description = "Step 3: Add second item (Bread)"
+actions = [
+    ["type", "Bread"],
+    ["key", "Enter"]
+]
+expect = "- Bread"
+
+[[sequence]]
+description = "Step 4: Verify count is 2"
+expect = "2 items"
+
+[[sequence]]
+description = "Step 5: Add third item (Eggs)"
+actions = [
+    ["type", "Eggs"],
+    ["key", "Enter"]
+]
+expect = "- Eggs"
+
+[[sequence]]
+description = "Step 6: Verify count is 3"
+expect = "3 items"
+
+[[sequence]]
+description = "Step 7: Clear all items"
+actions = [["click", "button"]]
+expect = "0 items"
+
+[[sequence]]
+description = "Step 8: Verify list is empty (no dash items)"
+# After clear, there should be no "- " prefixed items
+expect = "Shopping List"

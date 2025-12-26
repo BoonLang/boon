@@ -1,0 +1,36 @@
+-- test: timer_interval_single_tick
+-- Timer fires once after advancing virtual time 1000ms
+counter: 0 |> HOLD state {
+    Duration[milliseconds: 1000] |> Timer/interval() |> THEN { state + 1 }
+}
+Test/advance(milliseconds: 1000)
+counter
+-- expect: 1.0
+
+-- test: timer_interval_multiple_ticks
+-- Timer fires 3 times after advancing 3 seconds
+counter: 0 |> HOLD state {
+    Duration[milliseconds: 1000] |> Timer/interval() |> THEN { state + 1 }
+}
+Test/advance(milliseconds: 3000)
+counter
+-- expect: 3.0
+
+-- test: timer_interval_no_fire_before_deadline
+-- Advancing less than interval shouldn't fire timer
+counter: 0 |> HOLD state {
+    Duration[milliseconds: 1000] |> Timer/interval() |> THEN { state + 1 }
+}
+Test/advance(milliseconds: 500)
+counter
+-- expect: 0.0
+
+-- test: timer_interval_precise_boundary
+-- Advancing exactly on interval boundary fires timer
+counter: 0 |> HOLD state {
+    Duration[milliseconds: 100] |> Timer/interval() |> THEN { state + 1 }
+}
+Test/advance(milliseconds: 100)
+Test/advance(milliseconds: 100)
+counter
+-- expect: 2.0

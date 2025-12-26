@@ -1,0 +1,80 @@
+# TodoMVC example - full CRUD test
+#
+# NOTE: This example starts with 2 pre-populated todos:
+#   - "Buy groceries"
+#   - "Clean room"
+#
+# Test Flow:
+# 1. Initial state check (2 todos visible)
+# 2. Add "Walk the dog" → verify appears, count = 3
+# 3. Toggle first todo complete → count = 2 active
+# 4. Filter "Active" → only uncompleted visible
+# 5. Filter "Completed" → only completed visible
+# 6. Filter "All" → all visible
+# 7. Clear completed → only 2 remain
+
+[test]
+category = "interactive"
+description = "TodoMVC: add, complete, filter, and clear todos"
+
+[output]
+# Initial state has 2 pre-populated todos
+text = "2 items left"
+
+[timing]
+timeout = 10000
+poll_interval = 200
+
+# --- ADD TODO ---
+
+[[sequence]]
+description = "Step 1: Add new todo (Walk the dog)"
+actions = [
+    ["focus_input", 0],
+    ["type", "Walk the dog"],
+    ["key", "Enter"]
+]
+expect = "Walk the dog"
+
+[[sequence]]
+description = "Step 2: Verify item count shows 3"
+expect = "3 items left"
+
+# --- COMPLETE TODO ---
+
+[[sequence]]
+description = "Step 3: Toggle first todo complete (click checkbox)"
+actions = [["click", "checkbox:1"]]
+# After completing first todo, 2 active items left
+expect = "2 items left"
+
+# --- FILTER TODOS ---
+
+[[sequence]]
+description = "Step 4: Click Active filter"
+actions = [["click", "text:Active"]]
+# Only uncompleted todos should be visible (Clean room, Walk the dog)
+expect = "Clean room"
+
+[[sequence]]
+description = "Step 5: Click Completed filter"
+actions = [["click", "text:Completed"]]
+# Only completed "Buy groceries" should be visible
+expect = "Buy groceries"
+
+[[sequence]]
+description = "Step 6: Click All filter to show all todos"
+actions = [["click", "text:All"]]
+expect = "Buy groceries"
+
+# --- CLEAR COMPLETED ---
+
+[[sequence]]
+description = "Step 7: Clear completed todos"
+actions = [["click", "text:Clear completed"]]
+# Only "Clean room" and "Walk the dog" should remain
+expect = "Clean room"
+
+[[sequence]]
+description = "Step 8: Verify count shows 2 items"
+expect = "2 items left"

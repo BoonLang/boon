@@ -1,11 +1,11 @@
-# Fibonacci example - computes 5th Fibonacci number
+# Fibonacci example - computes 10th Fibonacci number
 
 [test]
 category = "computation"
-description = "Computes and displays the 5th Fibonacci number"
+description = "Computes and displays the 10th Fibonacci number"
 
 [output]
-text = "5. Fibonacci number is 8"
+text = "10. Fibonacci number is 55"
 
 [timing]
 timeout = 5000

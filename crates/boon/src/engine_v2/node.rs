@@ -101,6 +101,27 @@ pub enum NodeKind {
         active: bool,
     },
 
+    /// Pulses node (Stream/pulses) - emits sequential values 0, 1, 2, ..., N-1
+    /// Sequential emission allows HOLD body to see updated state between each pulse
+    Pulses {
+        /// Total number of pulses to emit
+        total: u32,
+        /// Current pulse index (0-based)
+        current: u32,
+        /// Whether pulses have started emitting
+        started: bool,
+    },
+
+    /// Skip node (Stream/skip) - skips first N values from source, then passes through
+    Skip {
+        /// Source slot to read from
+        source: SlotId,
+        /// Number of values to skip
+        count: u32,
+        /// Number of values already skipped
+        skipped: u32,
+    },
+
     /// Accumulator node (Math/sum) - sums incoming values
     Accumulator {
         /// Current sum

@@ -1,0 +1,37 @@
+# Boon project tasks
+# Run with: makers <task-name>
+
+[config]
+# Don't run tasks in workspace members
+skip_core_tasks = true
+
+[tasks.build-tools]
+description = "Build boon-tools"
+workspace = false
+script = '''
+cd tools && cargo build --release --target-dir ../target
+'''
+
+[tasks.verify-integrity]
+description = "Verify example files haven't been modified (fast, no browser)"
+workspace = false
+dependencies = ["build-tools"]
+script = '''
+./target/release/boon-tools exec verify-integrity
+'''
+
+[tasks.verify-playground]
+description = "Run all playground example tests (requires browser extension)"
+workspace = false
+dependencies = ["build-tools"]
+script = '''
+./target/release/boon-tools exec test-examples
+'''
+
+[tasks.verify-playground-interactive]
+description = "Run tests with interactive debugging on failure"
+workspace = false
+dependencies = ["build-tools"]
+script = '''
+./target/release/boon-tools exec test-examples --interactive
+'''

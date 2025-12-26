@@ -61,6 +61,8 @@ pub struct EventLoop {
     /// Timers pending external scheduling (real setTimeout).
     /// Each entry is (node_id, interval_ms).
     pub pending_real_timers: Vec<(SlotId, f64)>,
+    /// Pulses nodes that need to emit their next value on the next tick.
+    pub pending_pulses: Vec<SlotId>,
 }
 
 impl EventLoop {
@@ -78,6 +80,7 @@ impl EventLoop {
             route_slot: None,
             visibility_conditions: HashMap::new(),
             pending_real_timers: Vec::new(),
+            pending_pulses: Vec::new(),
         }
     }
 
@@ -167,11 +170,20 @@ impl EventLoop {
         // Phase 1: Process timers
         self.process_timers();
 
-        // Phase 2: Process until quiescence
+        // Phase 2: Process dirty nodes until quiescence
         while !self.dirty_nodes.is_empty() {
             let to_process: Vec<_> = self.dirty_nodes.drain(..).collect();
             for entry in to_process {
                 self.process_node(entry);
+            }
+        }
+
+        // Move pending pulses to dirty_nodes for NEXT tick (not this one)
+        // This ensures sequential processing: emit pulse -> process HOLD -> emit next pulse
+        if !self.pending_pulses.is_empty() {
+            let pulses: Vec<_> = std::mem::take(&mut self.pending_pulses);
+            for slot in pulses {
+                self.mark_dirty(slot, Port::Output);
             }
         }
 
@@ -303,13 +315,18 @@ impl EventLoop {
                                 Some(payload)
                             }
                             _ => {
+                                // Deep-clone ObjectHandle payloads to break self-reference.
+                                // Without cloning, the body's nodes (Extractors, Arithmetic)
+                                // become part of the state, creating cycles when reading state.
+                                let cloned_payload = self.deep_clone_payload(&payload);
+
                                 // Store new state and emit
                                 if let Some(node) = self.arena.get_mut(entry.slot) {
                                     if let Some(NodeKind::Register { stored_value, .. }) = node.kind_mut() {
-                                        *stored_value = Some(payload.clone());
+                                        *stored_value = Some(cloned_payload.clone());
                                     }
                                 }
-                                Some(payload)
+                                Some(cloned_payload)
                             }
                         }
                     }
@@ -321,10 +338,17 @@ impl EventLoop {
             NodeKind::Transformer { body_slot, .. } => {
                 // THEN: On input arrival, trigger body re-evaluation and get output
                 if msg.is_some() {
-                    // Trigger body to re-evaluate so it reads fresh values from sources
-                    // This is crucial for HOLD bodies where the state variable may have changed
+                    // Re-evaluate all nodes in the body subgraph.
+                    // This is crucial because body nodes (Extractors, Arithmetic) may have
+                    // cached stale values. We need to process them to read fresh state.
                     if let Some(slot) = *body_slot {
-                        self.process_node(DirtyEntry { slot, port: Port::Output });
+                        // Collect all nodes in the body subgraph
+                        let body_nodes = self.collect_body_nodes(slot);
+
+                        // Process each node to update its current_value
+                        for node_slot in body_nodes {
+                            self.process_node(DirtyEntry { slot: node_slot, port: Port::Output });
+                        }
                     }
 
                     // Now read the freshly computed value
@@ -595,6 +619,63 @@ impl EventLoop {
                     None
                 }
             }
+            NodeKind::Pulses { total, current, started } => {
+                // Pulses emits 0, 1, 2, ..., total-1 sequentially
+                let (emit_value, schedule_more) = if !started {
+                    // First pulse - start from 0
+                    if let Some(node) = self.arena.get_mut(entry.slot) {
+                        if let Some(NodeKind::Pulses { started, .. }) = node.kind_mut() {
+                            *started = true;
+                        }
+                    }
+                    if *total > 0 {
+                        (Some(Payload::Number(0.0)), *total > 1)
+                    } else {
+                        (None, false)
+                    }
+                } else if *current + 1 < *total {
+                    // Emit next pulse
+                    let next = *current + 1;
+                    if let Some(node) = self.arena.get_mut(entry.slot) {
+                        if let Some(NodeKind::Pulses { current, .. }) = node.kind_mut() {
+                            *current = next;
+                        }
+                    }
+                    (Some(Payload::Number(next as f64)), next + 1 < *total)
+                } else {
+                    (None, false)
+                };
+
+                // Schedule next pulse if there are more
+                if schedule_more {
+                    self.pending_pulses.push(entry.slot);
+                }
+
+                emit_value
+            }
+            NodeKind::Skip { source, count, skipped } => {
+                // Skip node - skips first N values, then passes through
+                // Get the incoming value from source
+                let source_value = self.get_current_value(*source).cloned();
+
+                if let Some(value) = source_value {
+                    if *skipped < *count {
+                        // Still skipping - increment counter, don't emit
+                        let new_skipped = *skipped + 1;
+                        if let Some(node) = self.arena.get_mut(entry.slot) {
+                            if let Some(NodeKind::Skip { skipped, .. }) = node.kind_mut() {
+                                *skipped = new_skipped;
+                            }
+                        }
+                        None
+                    } else {
+                        // Done skipping - pass through
+                        Some(value)
+                    }
+                } else {
+                    None
+                }
+            }
             NodeKind::Accumulator { sum } => {
                 // Accumulator sums incoming numbers
                 if let Some(Payload::Number(n)) = msg {
@@ -782,10 +863,22 @@ impl EventLoop {
                     });
 
                     // Subscribe to the field slot for future reactive updates
+                    // But only subscribe to Producer or IOPad nodes (actual data sources).
+                    // Subscribing to Extractor, Arithmetic, or other computed nodes
+                    // can create cycles (E1 -> A -> E2 -> E1) that cause infinite loops.
+                    // IOPad nodes handle external events (button presses, input changes) and
+                    // must be subscribed to for event propagation to work.
                     if let Some(fs) = field_slot {
-                        if *subscribed_field != Some(fs) {
+                        // Subscribe to Producer nodes (constants/values), IOPad nodes (events),
+                        // and Combiner nodes (LATEST - reactive stream mergers)
+                        let is_subscribable = self.arena.get(fs)
+                            .and_then(|n| n.kind())
+                            .map(|k| matches!(k, NodeKind::Producer { .. } | NodeKind::IOPad { .. } | NodeKind::Combiner { .. }))
+                            .unwrap_or(false);
+
+                        if is_subscribable && *subscribed_field != Some(fs) && fs != entry.slot {
                             #[cfg(target_arch = "wasm32")]
-                            zoon::println!("  Extractor: subscribing to field slot {:?}", fs);
+                            zoon::println!("  Extractor: subscribing to Producer/IOPad/Combiner field slot {:?}", fs);
 
                             // Add route from field slot to this Extractor
                             self.routing.add_route(fs, entry.slot, Port::Input(1));
@@ -1046,6 +1139,71 @@ impl EventLoop {
         if let Some(node) = self.arena.get_mut(slot) {
             node.extension_mut().current_value = Some(value);
         }
+    }
+
+    /// Collect all nodes in a body subgraph, ordered leaves-first for re-evaluation.
+    /// This traverses the node's inputs recursively, skipping wires that point to
+    /// external nodes (like state_wire pointing to HOLD).
+    fn collect_body_nodes(&self, root_slot: SlotId) -> Vec<SlotId> {
+        let mut result = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        self.collect_body_nodes_impl(root_slot, &mut result, &mut visited);
+        result
+    }
+
+    fn collect_body_nodes_impl(
+        &self,
+        slot: SlotId,
+        result: &mut Vec<SlotId>,
+        visited: &mut std::collections::HashSet<SlotId>,
+    ) {
+        if visited.contains(&slot) {
+            return;
+        }
+        visited.insert(slot);
+
+        // Get the node's kind and collect its inputs
+        if let Some(node) = self.arena.get(slot) {
+            if let Some(kind) = node.kind() {
+                match kind {
+                    NodeKind::Router { fields } => {
+                        // Process each field first
+                        for (_, field_slot) in fields {
+                            self.collect_body_nodes_impl(*field_slot, result, visited);
+                        }
+                    }
+                    NodeKind::Arithmetic { left, right, .. } => {
+                        if let Some(l) = left {
+                            self.collect_body_nodes_impl(*l, result, visited);
+                        }
+                        if let Some(r) = right {
+                            self.collect_body_nodes_impl(*r, result, visited);
+                        }
+                    }
+                    NodeKind::Extractor { source, .. } => {
+                        // Don't traverse into source - that's outside the body
+                        // (e.g., state_wire pointing to HOLD)
+                        let _ = source;
+                    }
+                    NodeKind::Wire { source } => {
+                        // Don't traverse into wire source - that's outside the body
+                        let _ = source;
+                    }
+                    NodeKind::Combiner { inputs, .. } => {
+                        for inp in inputs {
+                            self.collect_body_nodes_impl(*inp, result, visited);
+                        }
+                    }
+                    NodeKind::Producer { .. } => {
+                        // Producer is a leaf, no inputs
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Add this node after its inputs (leaves first)
+        result.push(slot);
     }
 
     /// Deep-clone a payload, creating new slots for ObjectHandle/Router fields.

@@ -4,6 +4,7 @@ use std::fs;
 use boon::engine_v2::event_loop::EventLoop;
 use boon::evaluator_v2::CompileContext;
 use boon::parser::{lexer, parser, reset_expression_depth, Parser, Input, Spanned, span_at};
+use boon::platform::cli::clock::TestClock;
 
 #[derive(ClapParser)]
 #[command(name = "boon")]
@@ -213,12 +214,128 @@ fn run_single_test(file: &PathBuf, name: &str, code: &str, expected: Option<&str
     }
 }
 
+/// Command to advance virtual time in tests.
+#[derive(Debug, Clone)]
+enum TestCommand {
+    /// Advance virtual time by milliseconds
+    AdvanceMs(u64),
+}
+
+/// Pre-process test code to extract Test/advance directives.
+/// Returns the cleaned code (without Test/advance lines) and a list of commands.
+fn extract_test_commands(code: &str) -> (String, Vec<TestCommand>) {
+    let mut cleaned_lines = Vec::new();
+    let mut commands = Vec::new();
+
+    for line in code.lines() {
+        let trimmed = line.trim();
+
+        // Check for Test/advance(milliseconds: N)
+        if let Some(ms) = parse_test_advance(trimmed) {
+            commands.push(TestCommand::AdvanceMs(ms));
+        } else {
+            cleaned_lines.push(line);
+        }
+    }
+
+    (cleaned_lines.join("\n"), commands)
+}
+
+/// Parse a Test/advance(milliseconds: N) call and extract the milliseconds value.
+fn parse_test_advance(line: &str) -> Option<u64> {
+    // Match patterns like:
+    // - Test/advance(milliseconds: 1000)
+    // - Test/advance(milliseconds: 1000)  # comment
+
+    let line = line.split('#').next()?.trim(); // Remove comments
+
+    if !line.starts_with("Test/advance(") || !line.ends_with(')') {
+        return None;
+    }
+
+    // Extract the part between parentheses
+    let inner = line.strip_prefix("Test/advance(")?.strip_suffix(')')?;
+
+    // Look for "milliseconds:" pattern
+    let parts: Vec<&str> = inner.split(':').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    if parts[0].trim() != "milliseconds" {
+        return None;
+    }
+
+    // Parse the number
+    parts[1].trim().parse().ok()
+}
+
+/// Run the event loop until quiescent, with TestClock for timers.
+/// Used during initial evaluation to register newly created timers.
+fn run_with_clock(
+    event_loop: &mut EventLoop,
+    clock: &mut TestClock,
+    max_ticks: u64,
+) {
+    for _ in 0..max_ticks {
+        event_loop.run_tick();
+
+        // Register any pending real timers with TestClock AFTER run_tick
+        // (timers are scheduled during run_tick when Timer nodes are processed)
+        let pending = event_loop.take_pending_timers();
+        for (node_id, interval_ms) in pending {
+            clock.register_timer(node_id, interval_ms);
+        }
+
+        if event_loop.dirty_nodes.is_empty() && !clock.has_pending_timers() {
+            break;
+        }
+    }
+}
+
+/// Run ticks until quiescent after a timer fire.
+/// Does NOT register new timers - TestClock already rescheduled.
+fn run_until_quiescent(event_loop: &mut EventLoop, max_ticks: u64) {
+    for _ in 0..max_ticks {
+        event_loop.run_tick();
+        // Discard any pending timers - TestClock already rescheduled them
+        let _ = event_loop.take_pending_timers();
+        if event_loop.dirty_nodes.is_empty() {
+            break;
+        }
+    }
+}
+
+/// Advance virtual time and fire any timers that become ready.
+fn advance_time(
+    event_loop: &mut EventLoop,
+    clock: &mut TestClock,
+    ms: u64,
+    max_ticks: u64,
+) {
+    // Advance clock and get timers that should fire
+    let fired = clock.advance_by(ms);
+
+    // Fire each timer ONE AT A TIME with quiescence between
+    // This is necessary because the inbox overwrites messages to the same (slot, port),
+    // so firing multiple timers at once would lose all but the last message.
+    for node_id in fired {
+        event_loop.fire_timer(node_id);
+        // Don't call run_with_clock - it would re-register the timer
+        // that TestClock already rescheduled in advance_by
+        run_until_quiescent(event_loop, max_ticks);
+    }
+}
+
 /// Evaluate code and return the result as JSON value.
 fn eval_code_to_json(code: &str, max_ticks: u64) -> Result<serde_json::Value, String> {
+    // Extract Test/advance commands from the code
+    let (cleaned_code, commands) = extract_test_commands(code);
+
     reset_expression_depth();
 
     // Lex the code
-    let (tokens, lex_errors) = lexer().parse(code).into_output_errors();
+    let (tokens, lex_errors) = lexer().parse(&cleaned_code).into_output_errors();
 
     if !lex_errors.is_empty() {
         return Err(format!("Lexer errors: {:?}", lex_errors));
@@ -228,7 +345,7 @@ fn eval_code_to_json(code: &str, max_ticks: u64) -> Result<serde_json::Value, St
     tokens.retain(|t| !matches!(t.node, boon::parser::Token::Comment(_)));
 
     let input = tokens.map(
-        span_at(code.len()),
+        span_at(cleaned_code.len()),
         |Spanned { node, span, persistence: _ }| (node, span),
     );
 
@@ -244,6 +361,9 @@ fn eval_code_to_json(code: &str, max_ticks: u64) -> Result<serde_json::Value, St
     let mut ctx = CompileContext::new(&mut event_loop);
     let result_slot = ctx.compile_program(&expressions);
 
+    // Create TestClock for virtual time
+    let mut clock = TestClock::new();
+
     // Mark all nodes dirty
     let all_slots: Vec<_> = (0..event_loop.arena_len() as u32)
         .filter_map(|idx| {
@@ -256,11 +376,15 @@ fn eval_code_to_json(code: &str, max_ticks: u64) -> Result<serde_json::Value, St
         event_loop.mark_dirty(slot, boon::engine_v2::address::Port::Output);
     }
 
-    // Run ticks
-    for _ in 0..max_ticks {
-        event_loop.run_tick();
-        if event_loop.dirty_nodes.is_empty() && event_loop.timer_queue.is_empty() {
-            break;
+    // Run initial evaluation
+    run_with_clock(&mut event_loop, &mut clock, max_ticks);
+
+    // Execute Test/advance commands
+    for cmd in commands {
+        match cmd {
+            TestCommand::AdvanceMs(ms) => {
+                advance_time(&mut event_loop, &mut clock, ms, max_ticks);
+            }
         }
     }
 

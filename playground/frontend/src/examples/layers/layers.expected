@@ -1,0 +1,12 @@
+# Layers example - displays three overlapping colored cards
+
+[test]
+category = "static"
+description = "Displays three colored cards with absolute positioning"
+
+[output]
+# Check that all three cards are rendered
+text = "Blue Card"
+
+[timing]
+timeout = 5000

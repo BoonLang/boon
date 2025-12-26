@@ -1,0 +1,15 @@
+# Pages example - multi-page router navigation
+
+[test]
+category = "interactive"
+description = "Navigate between pages using router"
+
+[output]
+# Initial page should be Home
+text = "Home"
+
+[timing]
+timeout = 5000
+
+# Note: Page navigation tests may need adjustment based on actual UI structure
+# These are placeholder sequences - actual selectors may differ

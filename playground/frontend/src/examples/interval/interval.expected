@@ -10,5 +10,12 @@ match = "regex"
 pattern = "^\\d+$"
 
 [timing]
-timeout = 3000
+timeout = 5000
 initial_delay = 500
+
+[[sequence]]
+description = "Wait 1.5 seconds and verify counter advances"
+actions = [["wait", 1500]]
+expect_match = "regex"
+# After 1.5 seconds, counter should be at least 1 (not 0)
+expect = "^[1-9]\\d*$"

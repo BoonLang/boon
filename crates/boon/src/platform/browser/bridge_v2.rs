@@ -126,11 +126,24 @@ impl ReactiveEventLoop {
         }
 
         for (node_id, interval_ms) in pending {
+            #[cfg(target_arch = "wasm32")]
+            zoon::println!("  timer {:?} interval_ms={}", node_id, interval_ms);
+
             let reactive_el = self.clone();
             let my_generation = self.generation;
             Task::start(async move {
                 // Real wait using browser's setTimeout via Zoon's Timer
-                Timer::sleep(interval_ms.round().max(0.0).min(u32::MAX as f64) as u32).await;
+                let sleep_ms = interval_ms.round().max(0.0).min(u32::MAX as f64) as u32;
+                #[cfg(target_arch = "wasm32")]
+                let start = web_sys::window().and_then(|w| Some(w.performance()?.now())).unwrap_or(0.0);
+                #[cfg(target_arch = "wasm32")]
+                zoon::println!("Timer::sleep({}) starting at {:.0}ms", sleep_ms, start);
+                Timer::sleep(sleep_ms).await;
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let end = web_sys::window().and_then(|w| Some(w.performance()?.now())).unwrap_or(0.0);
+                    zoon::println!("Timer::sleep({}) completed at {:.0}ms (elapsed: {:.0}ms)", sleep_ms, end, end - start);
+                }
 
                 // Check if this timer is still current (not from an old ReactiveEventLoop)
                 let current_gen = CURRENT_GENERATION.load(Ordering::SeqCst);
@@ -167,6 +180,8 @@ impl ReactiveEventLoop {
 
     /// Inject an event and run tick.
     pub fn inject_event(&self, target_slot: SlotId, payload: Payload) {
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!("inject_event: target={:?} payload={:?}", target_slot, payload);
         {
             let mut el = self.inner.borrow_mut();
             // Put payload in inbox so IOPad can forward it to subscribers
@@ -431,9 +446,20 @@ impl ReactiveEventLoop {
             _ => String::new(),
         };
 
-        let event_slot = self.get_nested_slot(fields_slot, &["event"]);
-        let reactive_el = self.clone();
-        let event_slot_val = event_slot.unwrap_or(SlotId::INVALID);
+        // Get separate event slots for key_down and change
+        let key_down_slot = self.get_nested_slot(fields_slot, &["event", "key_down"]);
+        let change_slot = self.get_nested_slot(fields_slot, &["event", "change"]);
+
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!("render_text_input: key_down_slot={:?} change_slot={:?}", key_down_slot, change_slot);
+
+        let reactive_el_keydown = self.clone();
+        let reactive_el_change = self.clone();
+        let key_down_slot_val = key_down_slot.unwrap_or(SlotId::INVALID);
+        let change_slot_val = change_slot.unwrap_or(SlotId::INVALID);
+
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!("render_text_input: key_down valid={} change valid={}", key_down_slot_val.is_valid(), change_slot_val.is_valid());
 
         // Need unique ID for text input
         let input_id = format!("ti-{}", fields_slot.index);
@@ -445,22 +471,198 @@ impl ReactiveEventLoop {
             .placeholder(Placeholder::new(placeholder_str))
             .text(&text_str)
             .on_change(move |new_text| {
-                if event_slot_val.is_valid() {
-                    reactive_el.inject_event(event_slot_val, Payload::Text(new_text.into()));
+                #[cfg(target_arch = "wasm32")]
+                zoon::println!("on_change TRIGGERED! text='{}' slot_valid={}", new_text, change_slot_val.is_valid());
+                if change_slot_val.is_valid() {
+                    // Create change event payload: TaggedObject { text: new_text }
+                    let payload = reactive_el_change.create_change_event_payload(&new_text);
+                    reactive_el_change.inject_event(change_slot_val, payload);
+                }
+            })
+            .on_key_down_event(move |event| {
+                #[cfg(target_arch = "wasm32")]
+                zoon::println!("on_key_down_event TRIGGERED! slot_valid={}", key_down_slot_val.is_valid());
+                if key_down_slot_val.is_valid() {
+                    // Convert key to string for tag lookup
+                    let key_name = match event.key() {
+                        zoon::Key::Enter => "Enter",
+                        zoon::Key::Escape => "Escape",
+                        zoon::Key::Other(k) => k.as_str(),
+                    };
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::println!("TextInput key_down: {} injecting to {:?}", key_name, key_down_slot_val);
+                    // Create key_down event payload: TaggedObject { key: Tag(key_name) }
+                    let payload = reactive_el_keydown.create_key_event_payload(key_name);
+                    reactive_el_keydown.inject_event(key_down_slot_val, payload);
                 }
             })
             .unify()
     }
 
-    /// Render an ElementLabel.
+    /// Create a key event payload: an object with a `key` field containing the key tag.
+    fn create_key_event_payload(&self, key_name: &str) -> Payload {
+        // Get or create the tag ID for this key name
+        let tag_id = {
+            let mut el = self.inner.borrow_mut();
+            el.arena.intern_tag(key_name)
+        };
+
+        // Create a simple object structure with a "key" field
+        // For simplicity, we create a TaggedObject where the fields Router has a "key" field
+        let (fields_slot, key_field_slot) = {
+            let mut el = self.inner.borrow_mut();
+
+            // Allocate slots for the structure
+            let key_field_slot = el.arena.alloc();
+            let fields_slot = el.arena.alloc();
+
+            // Set up the key field as a Producer with the Tag value
+            if let Some(node) = el.arena.get_mut(key_field_slot) {
+                node.set_kind(NodeKind::Producer { value: Some(Payload::Tag(tag_id)) });
+                node.extension_mut().current_value = Some(Payload::Tag(tag_id));
+            }
+
+            // Set up the fields Router with the "key" field
+            let key_field_id = el.arena.intern_field("key");
+            let mut fields = std::collections::HashMap::new();
+            fields.insert(key_field_id, key_field_slot);
+            if let Some(node) = el.arena.get_mut(fields_slot) {
+                node.set_kind(NodeKind::Router { fields });
+            }
+
+            (fields_slot, key_field_slot)
+        };
+
+        // Return an ObjectHandle pointing to the fields Router
+        Payload::ObjectHandle(fields_slot)
+    }
+
+    /// Create a change event payload: an object with a `text` field.
+    fn create_change_event_payload(&self, text: &str) -> Payload {
+        let (fields_slot, _text_field_slot) = {
+            let mut el = self.inner.borrow_mut();
+
+            // Allocate slots for the structure
+            let text_field_slot = el.arena.alloc();
+            let fields_slot = el.arena.alloc();
+
+            // Set up the text field as a Producer
+            let text_arc: std::sync::Arc<str> = text.into();
+            if let Some(node) = el.arena.get_mut(text_field_slot) {
+                node.set_kind(NodeKind::Producer { value: Some(Payload::Text(text_arc.clone())) });
+                node.extension_mut().current_value = Some(Payload::Text(text_arc));
+            }
+
+            // Set up the fields Router with the "text" field
+            let text_field_id = el.arena.intern_field("text");
+            let mut fields = std::collections::HashMap::new();
+            fields.insert(text_field_id, text_field_slot);
+            if let Some(node) = el.arena.get_mut(fields_slot) {
+                node.set_kind(NodeKind::Router { fields });
+            }
+
+            (fields_slot, text_field_slot)
+        };
+
+        Payload::ObjectHandle(fields_slot)
+    }
+
+    /// Render an ElementLabel with full styling support.
     fn render_label(&self, fields_slot: SlotId) -> RawElOrText {
         // Label content is stored as "label" field, not "content"
         let label = self.get_nested_value(fields_slot, &["settings", "label"]);
 
-        match label {
-            Some(Payload::Text(s)) => zoon::Text::new(s.as_ref()).unify(),
-            Some(Payload::Number(n)) => zoon::Text::new(n.to_string()).unify(),
-            _ => zoon::Text::new("").unify(),
+        let label_text = match label {
+            Some(Payload::Text(s)) => s.to_string(),
+            Some(Payload::Number(n)) => n.to_string(),
+            _ => String::new(),
+        };
+
+        // Get style properties
+        let style_slot = self.get_nested_slot(fields_slot, &["settings", "style"]);
+
+        // Extract style values
+        let padding = style_slot.and_then(|s| self.get_nested_number(s, &["padding"]));
+        let width = style_slot.and_then(|s| self.get_nested_number(s, &["width"]));
+        let rounded_corners = style_slot.and_then(|s| self.get_nested_number(s, &["rounded_corners"]));
+        let bg_color = style_slot.and_then(|s| self.get_nested_value(s, &["background", "color"]));
+        let font_color = style_slot.and_then(|s| self.get_nested_value(s, &["font", "color"]));
+
+        // Build the styled element
+        let mut el = El::new();
+
+        // Apply padding
+        if let Some(p) = padding {
+            el = el.s(Padding::all(p as u32));
+        }
+
+        // Apply width
+        if let Some(w) = width {
+            el = el.s(Width::exact(w as u32));
+        }
+
+        // Apply rounded corners
+        if let Some(r) = rounded_corners {
+            el = el.s(RoundedCorners::all(r as u32));
+        }
+
+        // Apply background color via CSS
+        if let Some(color_payload) = bg_color {
+            if let Some(css_color) = self.payload_to_css_color(&color_payload) {
+                // Use Zoon's style system with raw CSS color
+                el = el.update_raw_el(|raw_el| {
+                    raw_el.style("background-color", &css_color)
+                });
+            }
+        }
+
+        // Apply font color via CSS
+        if let Some(color_payload) = font_color {
+            if let Some(css_color) = self.payload_to_css_color(&color_payload) {
+                el = el.update_raw_el(|raw_el| {
+                    raw_el.style("color", &css_color)
+                });
+            }
+        }
+
+        el.child(label_text).unify()
+    }
+
+    /// Convert a Payload (Oklch tagged object or named color tag) to a CSS color string.
+    fn payload_to_css_color(&self, payload: &Payload) -> Option<String> {
+        match payload {
+            Payload::TaggedObject { tag, fields } => {
+                let el = self.inner.borrow();
+                let tag_name = el.arena.get_tag_name(*tag)?;
+                if tag_name.as_ref() == "Oklch" {
+                    // Extract Oklch components
+                    let lightness = self.get_nested_number(*fields, &["lightness"]).unwrap_or(0.0);
+                    let chroma = self.get_nested_number(*fields, &["chroma"]).unwrap_or(0.0);
+                    let hue = self.get_nested_number(*fields, &["hue"]).unwrap_or(0.0);
+                    drop(el);
+                    // Generate oklch() CSS color string
+                    // oklch(lightness chroma hue) where lightness is 0-100%
+                    Some(format!("oklch({}% {} {})", lightness * 100.0, chroma, hue))
+                } else {
+                    drop(el);
+                    None
+                }
+            }
+            Payload::Tag(tag_id) => {
+                let el = self.inner.borrow();
+                let tag_name = el.arena.get_tag_name(*tag_id)?;
+                let color = match tag_name.as_ref() {
+                    "White" => Some("white".to_string()),
+                    "Black" => Some("black".to_string()),
+                    "Red" => Some("red".to_string()),
+                    "Green" => Some("green".to_string()),
+                    "Blue" => Some("blue".to_string()),
+                    _ => None,
+                };
+                drop(el);
+                color
+            }
+            _ => None,
         }
     }
 
