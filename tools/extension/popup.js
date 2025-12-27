@@ -28,6 +28,7 @@ async function updateStatus() {
     try {
       const results = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
+        world: 'MAIN',  // Run in page's main world to access window.boonPlayground
         func: () => {
           return {
             apiReady: typeof window.boonPlayground !== 'undefined' &&
