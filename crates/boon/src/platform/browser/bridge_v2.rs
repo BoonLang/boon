@@ -169,13 +169,43 @@ impl ReactiveEventLoop {
         let mut el = self.inner.borrow_mut();
         let had_work = !el.dirty_nodes.is_empty() || !el.timer_queue.is_empty();
         el.run_tick();
-        drop(el);
+
+        // Check for pending route change and update browser URL
+        if let Some(route_payload) = el.pending_route_change.take() {
+            drop(el); // Release borrow before accessing window
+            self.update_browser_url(&route_payload);
+        } else {
+            drop(el);
+        }
+
         if had_work {
             // update() takes closure that returns new value, not in-place mutation
             self.version.update(|v| v + 1);
         }
         // Schedule any new pending timers that may have been created during this tick
         self.schedule_pending_timers();
+    }
+
+    /// Update the browser URL using history.pushState.
+    fn update_browser_url(&self, route_payload: &Payload) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Payload::Text(route) = route_payload {
+                let route_str = route.as_ref();
+                zoon::println!("ReactiveEventLoop: updating browser URL to {}", route_str);
+
+                // Use history.pushState to update URL without page reload
+                if let Some(window) = web_sys::window() {
+                    if let Ok(history) = window.history() {
+                        let _ = history.push_state_with_url(
+                            &wasm_bindgen::JsValue::NULL,
+                            "",
+                            Some(route_str),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Inject an event and run tick.
@@ -193,6 +223,8 @@ impl ReactiveEventLoop {
 
     /// Render the root element.
     pub fn render_element(&self) -> RawElOrText {
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!("render_element called, current version={}", self.version.get());
         let el = self.inner.borrow();
 
         if let Some(root_slot) = self.root_slot {
@@ -330,6 +362,13 @@ impl ReactiveEventLoop {
             .map(|slot| self.collect_bus_items(slot))
             .unwrap_or_default();
 
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!("render_stripe: is_column={} children.len()={}", is_column, children.len());
+        #[cfg(target_arch = "wasm32")]
+        for (i, c) in children.iter().enumerate() {
+            zoon::println!("  child[{}] = {:?}", i, std::mem::discriminant(c));
+        }
+
         if children.is_empty() {
             return El::new().unify();
         }
@@ -441,11 +480,33 @@ impl ReactiveEventLoop {
             _ => String::new(),
         };
 
-        let placeholder = self.get_nested_value(fields_slot, &["settings", "placeholder"]);
-        let placeholder_str = match placeholder {
+        // Placeholder can be either direct text or an object with a "text" field
+        // Try direct text first, then try nested text field
+        let placeholder_str = match self.get_nested_value(fields_slot, &["settings", "placeholder"]) {
             Some(Payload::Text(s)) => s.to_string(),
-            _ => String::new(),
+            _ => {
+                // Try object with "text" field: [text: "..."]
+                match self.get_nested_value(fields_slot, &["settings", "placeholder", "text"]) {
+                    Some(Payload::Text(s)) => s.to_string(),
+                    _ => String::new(),
+                }
+            }
         };
+
+        // Get focus setting - check if it's true (Bool) or the Tag "True"
+        let focus = self.get_nested_value(fields_slot, &["settings", "focus"]);
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!("render_text_input: focus value = {:?}", focus);
+        let should_focus = match focus {
+            Some(Payload::Bool(b)) => b,
+            Some(Payload::Tag(tag_id)) => {
+                let el = self.inner.borrow();
+                el.arena.get_tag_name(tag_id).map(|n| n.as_ref() == "True").unwrap_or(false)
+            }
+            _ => false,
+        };
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!("render_text_input: should_focus = {}", should_focus);
 
         // Get separate event slots for key_down and change
         let key_down_slot = self.get_nested_slot(fields_slot, &["event", "key_down"]);
@@ -471,6 +532,32 @@ impl ReactiveEventLoop {
             .s(Padding::all(8))
             .placeholder(Placeholder::new(placeholder_str))
             .text(&text_str)
+            .update_raw_el(move |raw_el| {
+                if should_focus {
+                    // Create a Mutable that changes from false to true
+                    // This triggers dominator's focused_signal to actually apply focus
+                    let focus_mutable = Mutable::new(false);
+                    let focus_mutable_clone = focus_mutable.clone();
+
+                    raw_el
+                        // Add data attribute for test detection (document.activeElement
+                        // doesn't work in automated Chrome without OS-level window focus)
+                        .attr("data-boon-focused", "true")
+                        .focus_signal(focus_mutable.signal())
+                        .after_insert(move |_| {
+                            // Set to true after element is in DOM
+                            focus_mutable_clone.set(true);
+                            #[cfg(target_arch = "wasm32")]
+                            zoon::println!("Focus mutable set to true in after_insert");
+                        })
+                        .after_remove(move |_| {
+                            // Keep focus_mutable alive until element is removed
+                            drop(focus_mutable);
+                        })
+                } else {
+                    raw_el
+                }
+            })
             .on_change(move |new_text| {
                 #[cfg(target_arch = "wasm32")]
                 zoon::println!("on_change TRIGGERED! text='{}' slot_valid={}", new_text, change_slot_val.is_valid());

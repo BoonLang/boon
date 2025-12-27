@@ -9,7 +9,7 @@ use crate::engine_v2::{
     arena::SlotId,
     event_loop::EventLoop,
     message::{Payload, FieldId},
-    node::{NodeKind, RuntimePattern, ComparisonOp},
+    node::{EffectType, NodeKind, RuntimePattern, ComparisonOp},
     address::{ScopeId, SourceId, Port},
 };
 use crate::parser::{Expression, Spanned, Object, TextPart, Argument, Arm, Pattern, Literal};
@@ -2428,6 +2428,7 @@ impl<'a, 'code> CompileContext<'a, 'code> {
         let style_slot = self.get_argument_slot(arguments, "style");
         let text_slot = self.get_argument_slot(arguments, "text");
         let placeholder_slot = self.get_argument_slot(arguments, "placeholder");
+        let focus_slot = self.get_argument_slot(arguments, "focus");
 
         // Restore old binding
         if let Some(old) = old_element_binding {
@@ -2470,11 +2471,13 @@ impl<'a, 'code> CompileContext<'a, 'code> {
         let style_field_id = self.event_loop.arena.intern_field("style");
         let text_field_id = self.event_loop.arena.intern_field("text");
         let placeholder_field_id = self.event_loop.arena.intern_field("placeholder");
+        let focus_field_id = self.event_loop.arena.intern_field("focus");
 
         let settings_slot = self.compile_object(vec![
             (style_field_id, style_slot),
             (text_field_id, text_slot),
             (placeholder_field_id, placeholder_slot),
+            (focus_field_id, focus_slot),
         ]);
 
         let tag_id = self.event_loop.arena.intern_tag("ElementTextInput");
@@ -3754,22 +3757,26 @@ impl<'a, 'code> CompileContext<'a, 'code> {
 
     /// Compile Router/go_to - when input arrives, update the global route.
     pub fn compile_router_go_to(&mut self, input_slot: SlotId) -> SlotId {
-        // Get or create the route slot
-        let route_slot = self.get_or_create_route_slot();
+        // Get or create the route slot (so it exists for Effect to update)
+        let _route_slot = self.get_or_create_route_slot();
 
-        // Create a Wire that forwards input to route slot
-        // When input arrives, update the route Producer
-        let wire_slot = self.event_loop.arena.alloc();
-        if let Some(node) = self.event_loop.arena.get_mut(wire_slot) {
-            node.set_kind(NodeKind::Wire { source: Some(input_slot) });
+        // Create an Effect node for RouterGoTo
+        // The effect will be processed by the bridge to:
+        // 1. Update the route_slot Producer's value
+        // 2. Call browser history.pushState
+        let effect_slot = self.event_loop.arena.alloc();
+        if let Some(node) = self.event_loop.arena.get_mut(effect_slot) {
+            node.set_kind(NodeKind::Effect {
+                effect_type: EffectType::RouterGoTo,
+                input: Some(input_slot),
+            });
         }
 
-        // Route input through wire to route slot
-        self.event_loop.routing.add_route(input_slot, wire_slot, Port::Input(0));
-        self.event_loop.routing.add_route(wire_slot, route_slot, Port::Input(0));
+        // Route input to the effect
+        self.event_loop.routing.add_route(input_slot, effect_slot, Port::Input(0));
 
-        // Return the wire as the result (pass through)
-        wire_slot
+        // Return the effect as the result (for the pipe chain)
+        effect_slot
     }
 }
 

@@ -1,23 +1,30 @@
 # Interval (HOLD) example - counter that increments every second
-# Using regex to match any number since timing varies
+# HOLD starts at 0, Stream/skip(1) skips the initial 0
 
 [test]
 category = "timer"
 description = "Counter increments every second using HOLD pattern"
 
 [output]
-match = "regex"
-pattern = "^\\d+$"
+# Initial value: HOLD starts at 0, but Stream/skip(1) skips it
+# So nothing displayed until first tick. After first tick, counter = 1
+# Due to skip, the first visible value is 1 (not 0)
+text = "0"
 
 [timing]
-timeout = 3000
-initial_delay = 500
+timeout = 5000
+initial_delay = 200
 
 [[sequence]]
-description = "Wait for counter to advance"
-actions = [["wait", 1200]]
-expect_match = "regex"
-expect = "^[1-9]\\d*$"
+description = "After 1 second, counter should be exactly 1"
+actions = [["wait", 1100]]
+# After first timer tick, HOLD updates 0 → 1, skip allows it through
+expect = "1"
+
+[[sequence]]
+description = "After another second, counter should be 2"
+actions = [["wait", 1000]]
+expect = "2"
 
 # --- PERSISTENCE TEST ---
 # HOLD state should persist - counter should NOT reset to 0

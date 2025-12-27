@@ -1,10 +1,12 @@
 {
-  "supervisor_prompt": "Make 11 basic browser Boon examples work properly. Update new engine and related code as needed. Create new Boon CLI runtime tests as needed to test patterns in browser examples isolated (ideally during making examples work to make sure Boon CLI and Browser engine has similar functionality and help you with browser examples deubgging). When all examples tested and verified, say +completed+. If you are not sure how to implement something or when you think something is completely missing in the new engine, look at docs/new_engine docs for guides/architecture. Changing examples code or testing code will result in task fail, DO NOT CHANGE them until necesary - when you find a bug in them, fix it and say +bug in test+. Current state of examples (test verifier output): ",
+  "supervisor_prompt": "Make 11 basic browser Boon examples work properly. Update new engine and related code as needed. Create new Boon CLI runtime tests as needed to test patterns in browser examples isolated (ideally during making examples work to make sure Boon CLI and Browser engine has similar functionality and help you with browser examples debugging). When all examples tested and verified, say +completed+. If you are not sure how to implement something or when you think something is completely missing in the new engine, look at docs/new_boon docs for guides/architecture. Changing examples code or testing code will result in task fail, DO NOT CHANGE them until necessary - when you find a bug in them, fix it and say +bug in test+. Current state of examples (test verifier output):",
   "completion_condition": "+completed+",
   "completion_command": "makers verify-playground",
   "protected_patterns": [
-    "tools/",
-    "playground/frontend/src/examples/"
+    "tools/**/*.rs",
+    "crates/boon-cli/tests/*.bn.test",
+    "playground/frontend/src/examples/**/*.expected",
+    "playground/frontend/src/examples/**/*.bn"
   ],
   "escape_keyword": "+bug in test+"
 }

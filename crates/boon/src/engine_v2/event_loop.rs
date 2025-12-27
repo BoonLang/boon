@@ -4,7 +4,7 @@ use super::arena::{Arena, SlotId};
 use super::address::Port;
 use super::routing::RoutingTable;
 use super::message::Payload;
-use super::node::{NodeKind, RuntimePattern};
+use super::node::{EffectType, NodeKind, RuntimePattern};
 
 /// Entry in the dirty node queue.
 #[derive(Clone, Copy, Debug)]
@@ -63,6 +63,8 @@ pub struct EventLoop {
     pub pending_real_timers: Vec<(SlotId, f64)>,
     /// Pulses nodes that need to emit their next value on the next tick.
     pub pending_pulses: Vec<SlotId>,
+    /// Pending route change for bridge to handle (browser URL update).
+    pub pending_route_change: Option<Payload>,
 }
 
 impl EventLoop {
@@ -81,6 +83,7 @@ impl EventLoop {
             visibility_conditions: HashMap::new(),
             pending_real_timers: Vec::new(),
             pending_pulses: Vec::new(),
+            pending_route_change: None,
         }
     }
 
@@ -550,6 +553,12 @@ impl EventLoop {
                             #[cfg(target_arch = "wasm32")]
                             zoon::println!("ListAppender: cloned template, output {:?}", cloned_output);
 
+                            // Mark source_slot dirty so it emits its value to all subscribers.
+                            // This is critical for cloned HOLD nodes that have initial_input
+                            // pointing to source_slot - they need to receive the initial value
+                            // via Port::Input(1) to initialize their stored_value.
+                            self.mark_dirty(source_slot, Port::Output);
+
                             cloned_output
                         }
                         _ => {
@@ -944,10 +953,40 @@ impl EventLoop {
                 zoon::println!("  Comparison result: {:?}", result);
                 result
             }
-            NodeKind::Effect { .. } => {
-                // Effects don't emit, they execute at tick end
-                // Add to pending effects queue (TBD)
-                None
+            NodeKind::Effect { effect_type, input } => {
+                match effect_type {
+                    EffectType::RouterGoTo => {
+                        // Update the global route slot with the new route
+                        if let Some(payload) = msg.clone() {
+                            #[cfg(target_arch = "wasm32")]
+                            zoon::println!("Effect RouterGoTo: updating route to {:?}", payload);
+
+                            // Update the route_slot Producer's value
+                            if let Some(route_slot) = self.route_slot {
+                                if let Some(route_node) = self.arena.get_mut(route_slot) {
+                                    if let Some(NodeKind::Producer { value }) = route_node.kind_mut() {
+                                        *value = Some(payload.clone());
+                                    }
+                                    route_node.extension_mut().current_value = Some(payload.clone());
+                                }
+                                // Mark route_slot dirty to notify subscribers (Router/route())
+                                self.mark_dirty(route_slot, Port::Output);
+                            }
+
+                            // Store the pending route change for bridge to handle browser URL update
+                            self.pending_route_change = Some(payload.clone());
+
+                            // Emit Unit as result (go_to returns [])
+                            Some(Payload::Unit)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => {
+                        // Other effects: add to pending effects queue (TBD)
+                        None
+                    }
+                }
             }
             NodeKind::IOPad { .. } => {
                 // IOPad forwards events from DOM

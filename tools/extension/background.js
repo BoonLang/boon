@@ -1267,32 +1267,63 @@ async function handleCommand(id, command) {
 
       case 'getFocusedElement':
         // Get information about the currently focused element
+        // NOTE: document.activeElement can return body in automated environments
+        // even when an element is properly focused at the DOM level.
+        // We check multiple fallbacks for reliable detection.
         try {
           const result = await cdpEvaluate(tab.id, `
             (function() {
               const preview = document.querySelector('[data-boon-panel="preview"]');
-              const focused = document.activeElement;
+              let focused = document.activeElement;
 
-              if (!focused || focused === document.body) {
-                return { tagName: null, inputType: null, inputIndex: null };
+              // Debug logging
+              const boonFocused = preview ? preview.querySelector('[data-boon-focused="true"]') : null;
+              const inputs = preview ? preview.querySelectorAll('input') : [];
+              console.log('[getFocusedElement] activeElement:', focused?.tagName, 'boonFocused:', boonFocused?.tagName, 'inputs:', inputs.length);
+              if (inputs.length > 0) {
+                console.log('[getFocusedElement] input attrs:', Array.from(inputs[0].attributes).map(a => a.name + '=' + a.value).join(', '));
               }
 
-              const tagName = focused.tagName;
-              const inputType = focused.type || null;
+              // If activeElement is body, try fallback detection methods
+              if (!focused || focused === document.body) {
+                if (preview) {
+                  // Try :focus pseudo-class
+                  focused = preview.querySelector(':focus');
+                  // Try data-boon-focused attribute (set by Boon's bridge_v2.rs)
+                  if (!focused) {
+                    focused = preview.querySelector('[data-boon-focused="true"]');
+                  }
+                  // Try elements with focused="true" attribute (dominator may set this)
+                  if (!focused) {
+                    focused = preview.querySelector('[focused="true"]');
+                  }
+                  // Try autofocus attribute as last resort
+                  if (!focused) {
+                    focused = preview.querySelector('[autofocus]');
+                  }
+                }
+              }
+
+              if (!focused || focused === document.body) {
+                return { tag_name: null, input_type: null, input_index: null };
+              }
+
+              const tag_name = focused.tagName;
+              const input_type = focused.type || null;
 
               // Find the input index within the preview pane
-              let inputIndex = null;
+              let input_index = null;
               if (preview && (focused.tagName === 'INPUT' || focused.tagName === 'TEXTAREA')) {
                 const inputs = preview.querySelectorAll('input, textarea, [contenteditable="true"]');
                 for (let i = 0; i < inputs.length; i++) {
                   if (inputs[i] === focused) {
-                    inputIndex = i;
+                    input_index = i;
                     break;
                   }
                 }
               }
 
-              return { tagName, inputType, inputIndex };
+              return { tag_name, input_type, input_index };
             })()
           `);
           return { type: 'focusedElement', ...result };

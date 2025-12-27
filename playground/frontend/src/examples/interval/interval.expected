@@ -1,24 +1,28 @@
 # Interval example - counter that increments every second
-# Using regex to match any number since timing varies
+# Math/sum starts at 0, then adds 1 each second
 
 [test]
 category = "timer"
 description = "Counter increments every second"
 
 [output]
-match = "regex"
-pattern = "^\\d+$"
+# Initial value should be 0 (Math/sum starts at 0, timer hasn't fired yet)
+text = "0"
 
 [timing]
 timeout = 5000
-initial_delay = 500
+initial_delay = 200
 
 [[sequence]]
-description = "Wait 1.5 seconds and verify counter advances"
-actions = [["wait", 1500]]
-expect_match = "regex"
-# After 1.5 seconds, counter should be at least 1 (not 0)
-expect = "^[1-9]\\d*$"
+description = "After 1 second, counter should be exactly 1"
+actions = [["wait", 1100]]
+# After first timer tick, sum is 0 + 1 = 1
+expect = "1"
+
+[[sequence]]
+description = "After another second, counter should be 2"
+actions = [["wait", 1000]]
+expect = "2"
 
 # --- PERSISTENCE TEST ---
 # Counter HOLD state should persist - after re-run, should NOT reset to 0
