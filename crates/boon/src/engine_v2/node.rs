@@ -57,6 +57,9 @@ pub enum NodeKind {
     Bus {
         items: Vec<(ItemKey, SlotId)>,
         alloc_site: AllocSite,
+        /// Number of static items (from source code) - these are NOT persisted.
+        /// Only items added after compilation (index >= static_item_count) are persisted.
+        static_item_count: usize,
     },
 
     /// List appender - reactively appends items to a Bus when input emits
@@ -133,12 +136,16 @@ pub enum NodeKind {
         count: u32,
         /// Number of values already skipped
         skipped: u32,
+        /// Last value that was skipped (to detect duplicate deliveries of same value)
+        last_skipped_value: Option<Payload>,
     },
 
     /// Accumulator node (Math/sum) - sums incoming values
     Accumulator {
         /// Current sum
         sum: f64,
+        /// Whether the accumulator has received any input (don't emit until first input)
+        has_input: bool,
     },
 
     /// Arithmetic operation node - combines two inputs with an operator

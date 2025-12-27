@@ -132,6 +132,10 @@ pub enum Command {
 
     /// Verify input is actually typeable (not disabled/readonly/hidden)
     VerifyInputTypeable { index: u32 },
+
+    /// ATOMIC: Run code and capture initial preview BEFORE any async events fire
+    /// This is critical for testing initial state before timer-based updates
+    RunAndCaptureInitial,
 }
 
 /// Response from Extension to CLI via Server
@@ -225,6 +229,17 @@ pub enum Response {
         hidden: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+
+    /// Run and capture initial preview result
+    RunAndCaptureInitial {
+        /// Whether the command succeeded
+        success: bool,
+        /// Initial preview text captured immediately after run (before any timers fire)
+        #[serde(rename = "initialPreview")]
+        initial_preview: String,
+        /// Timestamp when capture was made
+        timestamp: u64,
     },
 }
 

@@ -362,7 +362,7 @@ impl<'a, 'code> CompileContext<'a, 'code> {
         let slot = self.event_loop.arena.alloc();
 
         if let Some(node) = self.event_loop.arena.get_mut(slot) {
-            node.set_kind(NodeKind::Accumulator { sum: 0.0 });
+            node.set_kind(NodeKind::Accumulator { sum: 0.0, has_input: false });
         }
 
         // Wire input to accumulator
@@ -399,6 +399,7 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                 source,
                 count,
                 skipped: 0,
+                last_skipped_value: None,
             });
         }
 
@@ -420,6 +421,7 @@ impl<'a, 'code> CompileContext<'a, 'code> {
             node.set_kind(NodeKind::Bus {
                 items: Vec::new(),
                 alloc_site: AllocSite::new(source_id),
+                static_item_count: 0,  // Updated by compile_list_items after adding static items
             });
         }
 
@@ -979,11 +981,13 @@ impl<'a, 'code> CompileContext<'a, 'code> {
 
         // Add items to the bus
         if let Some(node) = self.event_loop.arena.get_mut(slot) {
-            if let Some(NodeKind::Bus { items, alloc_site }) = node.kind_mut() {
+            if let Some(NodeKind::Bus { items, alloc_site, static_item_count }) = node.kind_mut() {
                 for item_slot in item_slots.iter() {
                     let key = alloc_site.allocate();
                     items.push((key, *item_slot));
                 }
+                // Mark all items added during compilation as static (not persisted)
+                *static_item_count = items.len();
             }
         }
 
@@ -3461,13 +3465,14 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                 })
             }
             // Bus
-            Some(NodeKind::Bus { items, alloc_site }) => {
+            Some(NodeKind::Bus { items, alloc_site, static_item_count }) => {
                 let new_items = items.iter()
                     .map(|(key, slot)| (*key, remap(slot)))
                     .collect();
                 Some(NodeKind::Bus {
                     items: new_items,
                     alloc_site: alloc_site.clone(),
+                    static_item_count: *static_item_count,
                 })
             }
             // Effect
@@ -3968,8 +3973,9 @@ mod tests {
         // Check node has Accumulator kind
         let node = ctx.event_loop.arena.get(acc).unwrap();
         match node.kind() {
-            Some(NodeKind::Accumulator { sum }) => {
+            Some(NodeKind::Accumulator { sum, has_input }) => {
                 assert_eq!(*sum, 0.0); // Initially zero
+                assert!(!*has_input); // No input received yet
             }
             _ => panic!("Expected Accumulator node"),
         }

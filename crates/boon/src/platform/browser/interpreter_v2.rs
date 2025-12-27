@@ -10,7 +10,7 @@ use crate::evaluator_v2::CompileContext;
 use crate::parser::{
     Input, Spanned, Token, lexer, parser, reset_expression_depth, span_at,
 };
-use crate::platform::browser::bridge_v2::{BridgeContext, ReactiveEventLoop};
+use crate::platform::browser::bridge_v2::{BridgeContext, ReactiveEventLoop, invalidate_all_timers};
 use chumsky::prelude::Parser as ChumskyParser;
 use zoon::*;
 
@@ -26,6 +26,11 @@ pub struct InterpreterResult {
 ///
 /// Returns the event loop and root slot for bridge rendering.
 pub fn run_v2(source_code: &str) -> Option<InterpreterResult> {
+    run_v2_with_storage(source_code, None)
+}
+
+/// Run Boon code with optional storage key for persistence.
+pub fn run_v2_with_storage(source_code: &str, storage_key: Option<&str>) -> Option<InterpreterResult> {
     reset_expression_depth();
 
     // Lex the code
@@ -64,6 +69,12 @@ pub fn run_v2(source_code: &str) -> Option<InterpreterResult> {
     // Compile the program
     let root_slot = ctx.compile_program(&expressions);
 
+    // Load persistence BEFORE initial ticks (so persisted values aren't overwritten)
+    #[cfg(target_arch = "wasm32")]
+    if let Some(key) = storage_key {
+        load_persistence_into_event_loop(&mut event_loop, key);
+    }
+
     // Mark all nodes as dirty to trigger initial evaluation
     let all_slots: Vec<_> = (0..event_loop.arena_len() as u32)
         .filter_map(|idx| {
@@ -91,6 +102,250 @@ pub fn run_v2(source_code: &str) -> Option<InterpreterResult> {
     })
 }
 
+/// Load persistence state into the event loop before initial ticks.
+#[cfg(target_arch = "wasm32")]
+fn load_persistence_into_event_loop(event_loop: &mut EventLoop, storage_key: &str) {
+    use std::collections::BTreeMap;
+    use crate::engine_v2::node::NodeKind;
+    use crate::engine_v2::message::Payload;
+
+    let states: BTreeMap<String, serde_json::Value> = match local_storage().get(storage_key) {
+        None => return,
+        Some(Ok(states)) => states,
+        Some(Err(error)) => {
+            zoon::eprintln!("Failed to load state: {error:#}");
+            return;
+        }
+    };
+
+    if states.is_empty() {
+        return;
+    }
+
+    zoon::println!("Loading {} states from localStorage (pre-tick)", states.len());
+
+    for (key, json) in states {
+        if let Some(index_str) = key.strip_prefix("slot:") {
+            if let Ok(index) = index_str.parse::<u32>() {
+                let slot = SlotId { index, generation: 0 };
+
+                if !event_loop.arena.is_valid(slot) {
+                    continue;
+                }
+
+                if let Some(node) = event_loop.arena.get_mut(slot) {
+                    match node.kind_mut() {
+                        Some(NodeKind::Register { stored_value, .. }) => {
+                            if let Some(payload) = json_to_payload(&json) {
+                                zoon::println!("  Pre-tick restore Register slot {} with {:?}", index, payload);
+                                *stored_value = Some(payload.clone());
+                                node.extension_mut().current_value = Some(payload);
+                            }
+                        }
+                        Some(NodeKind::Accumulator { sum, has_input }) => {
+                            if let Some(obj) = json.as_object() {
+                                if obj.get("type").and_then(|v| v.as_str()) == Some("Accumulator") {
+                                    if let Some(s) = obj.get("sum").and_then(|v| v.as_f64()) {
+                                        zoon::println!("  Pre-tick restore Accumulator slot {} with sum {}", index, s);
+                                        *sum = s;
+                                        *has_input = true; // Restored value counts as having received input
+                                        node.extension_mut().current_value = Some(Payload::Number(s));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // Check if this is a Bus that needs restoring
+                            // (handled separately below since we need mutable arena access)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Second pass: Restore Bus (LIST) items
+    // Done separately because we need to allocate new slots for items
+    let states: BTreeMap<String, serde_json::Value> = match local_storage().get(storage_key) {
+        None => return,
+        Some(Ok(states)) => states,
+        Some(Err(_)) => return,
+    };
+
+    for (key, json) in states {
+        if let Some(index_str) = key.strip_prefix("slot:") {
+            if let Ok(index) = index_str.parse::<u32>() {
+                let slot = SlotId { index, generation: 0 };
+
+                // Check if this is a Bus snapshot
+                if let Some(obj) = json.as_object() {
+                    if obj.get("type").and_then(|v| v.as_str()) == Some("Bus") {
+                        if !event_loop.arena.is_valid(slot) {
+                            continue;
+                        }
+
+                        // Get the saved data
+                        let next_instance = obj.get("next_instance")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let saved_items = obj.get("items")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+
+                        if saved_items.is_empty() {
+                            continue;
+                        }
+
+                        zoon::println!("  Pre-tick restore Bus slot {} with {} items, next_instance={}",
+                            index, saved_items.len(), next_instance);
+
+                        // Create new slots for each saved item and collect them
+                        let mut new_items: Vec<(u64, SlotId)> = Vec::new();
+
+                        for item_json in saved_items {
+                            let item_obj = match item_json.as_object() {
+                                Some(obj) => obj,
+                                None => continue,
+                            };
+
+                            let item_key = match item_obj.get("key").and_then(|v| v.as_u64()) {
+                                Some(k) => k,
+                                None => continue,
+                            };
+
+                            let value_json = match item_obj.get("value") {
+                                Some(v) => v,
+                                None => continue,
+                            };
+
+                            // Try to restore the item - either as simple payload or object structure
+                            let item_slot = if let Some(payload) = json_to_payload(value_json) {
+                                // Simple scalar value - create a Producer
+                                let item_slot = event_loop.arena.alloc();
+                                if let Some(item_node) = event_loop.arena.get_mut(item_slot) {
+                                    item_node.set_kind(NodeKind::Producer {
+                                        value: Some(payload.clone()),
+                                    });
+                                    item_node.extension_mut().current_value = Some(payload);
+                                }
+                                zoon::println!("    Restored scalar item key={} at slot {:?}", item_key, item_slot);
+                                Some(item_slot)
+                            } else {
+                                // Try to restore as Object structure (Router with fields)
+                                let result = restore_object_structure(event_loop, value_json);
+                                if result.is_some() {
+                                    zoon::println!("    Restored object item key={} at slot {:?}", item_key, result);
+                                }
+                                result
+                            };
+
+                            if let Some(slot) = item_slot {
+                                new_items.push((item_key, slot));
+                            }
+                        }
+
+                        // Now update the Bus with restored items
+                        if let Some(bus_node) = event_loop.arena.get_mut(slot) {
+                            if let Some(NodeKind::Bus { items, alloc_site, .. }) = bus_node.kind_mut() {
+                                // Restore the AllocSite counter
+                                alloc_site.next_instance = next_instance;
+
+                                // Add the restored items
+                                for (item_key, item_slot) in new_items {
+                                    items.push((item_key, item_slot));
+                                }
+
+                                zoon::println!("    Bus now has {} items, next_instance={}",
+                                    items.len(), alloc_site.next_instance);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Convert JSON to Payload for persistence loading.
+#[cfg(target_arch = "wasm32")]
+fn json_to_payload(json: &serde_json::Value) -> Option<crate::engine_v2::message::Payload> {
+    use crate::engine_v2::message::Payload;
+
+    let obj = json.as_object()?;
+    let type_str = obj.get("type")?.as_str()?;
+
+    Some(match type_str {
+        "Number" => Payload::Number(obj.get("value")?.as_f64()?),
+        "Text" => Payload::Text(obj.get("value")?.as_str()?.into()),
+        "Bool" => Payload::Bool(obj.get("value")?.as_bool()?),
+        "Unit" => Payload::Unit,
+        "Tag" => Payload::Tag(obj.get("value")?.as_u64()? as u32),
+        _ => return None,
+    })
+}
+
+/// Restore an Object structure from JSON, creating Router and Producer nodes.
+/// Returns the root SlotId of the restored structure.
+#[cfg(target_arch = "wasm32")]
+fn restore_object_structure(
+    event_loop: &mut EventLoop,
+    json: &serde_json::Value,
+) -> Option<SlotId> {
+    use crate::engine_v2::message::Payload;
+    use crate::engine_v2::node::NodeKind;
+    use std::collections::HashMap;
+
+    let obj = json.as_object()?;
+    let type_str = obj.get("type")?.as_str()?;
+
+    match type_str {
+        "Object" => {
+            // Restore a Router with fields
+            let fields_json = obj.get("fields")?.as_object()?;
+            let mut fields: HashMap<crate::engine_v2::message::FieldId, SlotId> = HashMap::new();
+
+            for (name, value) in fields_json {
+                // Recursively restore each field
+                if let Some(field_slot) = restore_object_structure(event_loop, value) {
+                    let field_id = event_loop.arena.intern_field(name);
+                    fields.insert(field_id, field_slot);
+                }
+            }
+
+            if fields.is_empty() {
+                return None;
+            }
+
+            // Create Router node
+            let router_slot = event_loop.arena.alloc();
+            if let Some(node) = event_loop.arena.get_mut(router_slot) {
+                node.set_kind(NodeKind::Router { fields });
+                // Set current_value to ObjectHandle pointing to self
+                node.extension_mut().current_value = Some(Payload::ObjectHandle(router_slot));
+            }
+
+            zoon::println!("    Restored Object at slot {:?} with {} fields",
+                router_slot, fields_json.len());
+
+            Some(router_slot)
+        }
+        // For scalar types, create a Producer
+        "Number" | "Text" | "Bool" | "Unit" | "Tag" => {
+            let payload = json_to_payload(json)?;
+            let slot = event_loop.arena.alloc();
+            if let Some(node) = event_loop.arena.get_mut(slot) {
+                node.set_kind(NodeKind::Producer {
+                    value: Some(payload.clone()),
+                });
+                node.extension_mut().current_value = Some(payload);
+            }
+            Some(slot)
+        }
+        _ => None,
+    }
+}
+
 /// Get the display string for the root value.
 pub fn get_display_string(result: &InterpreterResult) -> String {
     let ctx = BridgeContext::new(&result.event_loop);
@@ -104,12 +359,24 @@ pub fn get_display_string(result: &InterpreterResult) -> String {
     String::new()
 }
 
+/// Default localStorage key for engine-v2 state persistence.
+pub const STATES_STORAGE_KEY: &str = "boon-playground-v2-states";
+
 /// Run Boon code and return a Zoon element for the playground.
 ///
 /// This is the entry point for the playground UI with engine-v2.
 /// Takes ownership of the source code to avoid lifetime issues.
 pub fn run_and_render(source_code: String) -> impl Element + use<> {
-    let result = run_v2(&source_code);
+    run_and_render_with_storage(source_code, Some(STATES_STORAGE_KEY.to_string()))
+}
+
+/// Run Boon code with optional state persistence.
+pub fn run_and_render_with_storage(source_code: String, storage_key: Option<String>) -> impl Element + use<> {
+    // Invalidate all running timers from previous code BEFORE running new code.
+    // This is critical for scalar results that don't create a ReactiveEventLoop.
+    invalidate_all_timers();
+
+    let result = run_v2_with_storage(&source_code, storage_key.as_deref());
 
     match result {
         Some(r) => {
@@ -140,7 +407,7 @@ pub fn run_and_render(source_code: String) -> impl Element + use<> {
             }
 
             // Interactive UI rendering with reactive event loop
-            let reactive_el = ReactiveEventLoop::new(r.event_loop, r.root_slot);
+            let reactive_el = ReactiveEventLoop::new_with_storage(r.event_loop, r.root_slot, storage_key);
 
             // Create a signal that re-renders when version changes
             let reactive_el_clone = reactive_el.clone();

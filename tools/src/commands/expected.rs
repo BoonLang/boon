@@ -149,6 +149,7 @@ impl Action {
                         Ok(ParsedAction::Wait { ms })
                     }
                     "clear_states" => Ok(ParsedAction::ClearStates),
+                    "run" => Ok(ParsedAction::Run),
                     "key" => {
                         let key = arr
                             .get(1)
@@ -250,6 +251,7 @@ pub enum ParsedAction {
     TypeText { text: String },  // Type into currently focused element
     Wait { ms: u64 },
     ClearStates,
+    Run,  // Trigger code execution
     Key { key: String },
     FocusInput { index: u32 },
     ClickText { text: String },    // Click by text content

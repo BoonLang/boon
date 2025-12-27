@@ -486,7 +486,9 @@ async function cdpFocusElement(tabId, selector) {
 async function cdpQuerySelectorAll(tabId, selector) {
   await attachDebugger(tabId);
 
-  const { root } = await chrome.debugger.sendCommand({ tabId }, 'DOM.getDocument');
+  // Force a fresh DOM tree by requesting depth: -1 (full tree)
+  // This prevents stale cached DOM issues when the page has changed
+  const { root } = await chrome.debugger.sendCommand({ tabId }, 'DOM.getDocument', { depth: -1 });
   const { nodeIds } = await chrome.debugger.sendCommand({ tabId }, 'DOM.querySelectorAll', {
     nodeId: root.nodeId, selector
   });
@@ -745,6 +747,41 @@ async function handleCommand(id, command) {
           return { type: 'error', message: e.message };
         }
 
+      case 'runAndCaptureInitial':
+        // ATOMIC: Run code and capture initial preview BEFORE any async events (timers) fire
+        // This is critical for testing initial state before timer-based updates
+        try {
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              // Run the code synchronously
+              if (typeof window.boonPlayground === 'undefined' || !window.boonPlayground.run) {
+                return { error: 'boonPlayground API not available' };
+              }
+
+              // Trigger run - this compiles and renders synchronously
+              window.boonPlayground.run();
+
+              // Immediately capture the preview BEFORE any setTimeout/timers fire
+              // JavaScript event loop guarantees sync code completes before async callbacks
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              const initialText = preview ? preview.textContent || '' : '';
+
+              return {
+                success: true,
+                initialPreview: initialText,
+                timestamp: Date.now()
+              };
+            })()
+          `);
+
+          if (result.error) {
+            return { type: 'error', message: result.error };
+          }
+          return { type: 'runAndCaptureInitial', ...result };
+        } catch (e) {
+          return { type: 'error', message: e.message };
+        }
+
       case 'getPreviewElements':
         // Use CDP to get ALL visible elements with bounding boxes (like raybox approach)
         try {
@@ -808,57 +845,49 @@ async function handleCommand(id, command) {
         }
 
       case 'clearStates':
-        // Use CDP Runtime.evaluate to find and click the Clear saved states button
+        // Clear all persistence-related localStorage keys directly via CDP
+        // IMPORTANT: Invalidate timers FIRST to prevent race condition where running timers
+        // re-save state immediately after we clear it.
         try {
           const result = await cdpEvaluate(tab.id, `
             (function() {
-              // Find all elements that might be buttons
-              const elements = document.querySelectorAll('[role="button"], button');
-              for (const el of elements) {
-                const text = (el.textContent || '').toLowerCase();
-                if (text.includes('clear') && text.includes('saved') && text.includes('states')) {
-                  // Found the button - dispatch pointer events (Zoon uses pointer events)
-                  const rect = el.getBoundingClientRect();
-                  const x = rect.left + rect.width / 2;
-                  const y = rect.top + rect.height / 2;
-
-                  el.dispatchEvent(new PointerEvent('pointerdown', {
-                    bubbles: true,
-                    cancelable: true,
-                    view: window,
-                    clientX: x,
-                    clientY: y,
-                    button: 0,
-                    pointerType: 'mouse'
-                  }));
-                  el.dispatchEvent(new PointerEvent('pointerup', {
-                    bubbles: true,
-                    cancelable: true,
-                    view: window,
-                    clientX: x,
-                    clientY: y,
-                    button: 0,
-                    pointerType: 'mouse'
-                  }));
-                  return { clicked: true, text: text.trim() };
-                }
+              // Step 1: Invalidate all running timers (engine-v2)
+              // This prevents old timers from saving state while we're clearing it
+              if (window.boonPlayground && window.boonPlayground.invalidateTimers) {
+                window.boonPlayground.invalidateTimers();
               }
-              return { clicked: false, found: elements.length };
+
+              // Step 2: Clear all known persistence keys
+              const keysToRemove = [
+                'boon-playground-states',           // Old engine state
+                'boon-playground-v2-states',        // Engine v2 state
+                'boon-playground-old-source-code',
+                'boon-playground-span-id-pairs'
+              ];
+              keysToRemove.forEach(key => localStorage.removeItem(key));
+
+              // Clear prefixed keys (list_calls:*, list_removed:*)
+              const allKeys = Object.keys(localStorage);
+              allKeys.forEach(key => {
+                if (key.startsWith('list_calls:') || key.startsWith('list_removed:')) {
+                  localStorage.removeItem(key);
+                }
+              });
+
+              return { cleared: keysToRemove.length, prefixedCleared: allKeys.filter(k => k.startsWith('list_')).length };
             })()
           `);
-          if (result && result.clicked) {
-            return { type: 'success', data: { method: 'cdp-evaluate', text: result.text } };
-          }
-          return { type: 'error', message: `Clear saved states button not found (searched ${result?.found || 0} elements)` };
+          return { type: 'success', data: { method: 'cdp-evaluate', text: 'clear saved states' } };
         } catch (e) {
           return { type: 'error', message: e.message };
         }
 
       case 'selectExample':
         // Select an example by name (e.g., "todo_mvc.bn", "counter.bn")
-        // Uses CDP Runtime.evaluate to find and click the tab reliably
+        // Uses CDP trusted clicks (Input.dispatchMouseEvent) for proper Zoon event handling
         try {
           const exampleName = command.name;
+          // First, find the example tab and get its coordinates
           const result = await cdpEvaluate(tab.id, `
             (function() {
               // Find all example tabs in the header
@@ -866,25 +895,14 @@ async function handleCommand(id, command) {
               for (const tab of tabs) {
                 const text = (tab.textContent || '').trim();
                 if (text === '${exampleName}' || text === '${exampleName.replace('.bn', '')}') {
-                  // Found the tab - dispatch pointer events (Zoon uses pointer events)
+                  // Found the tab - return its center coordinates (page coords)
                   const rect = tab.getBoundingClientRect();
-                  const x = rect.left + rect.width / 2;
-                  const y = rect.top + rect.height / 2;
-
-                  ['pointerdown', 'pointerup'].forEach(type => {
-                    tab.dispatchEvent(new PointerEvent(type, {
-                      bubbles: true, cancelable: true, view: window,
-                      clientX: x, clientY: y,
-                      pointerId: 1, pointerType: 'mouse', isPrimary: true
-                    }));
-                  });
-
-                  tab.dispatchEvent(new MouseEvent('click', {
-                    bubbles: true, cancelable: true, view: window,
-                    clientX: x, clientY: y
-                  }));
-
-                  return { found: true, text: text };
+                  return {
+                    found: true,
+                    text: text,
+                    x: rect.left + rect.width / 2 + window.scrollX,
+                    y: rect.top + rect.height / 2 + window.scrollY
+                  };
                 }
               }
               return { found: false, available: Array.from(tabs).map(t => (t.textContent || '').trim()).filter(t => t.endsWith('.bn')) };
@@ -892,6 +910,8 @@ async function handleCommand(id, command) {
           `);
 
           if (result && result.found) {
+            // Use CDP trusted click (same as cdpClickAt) for proper event handling
+            await cdpClickAt(tab.id, result.x, result.y);
             return { type: 'success', data: { selected: result.text } };
           } else {
             const available = result?.available?.join(', ') || 'unknown';

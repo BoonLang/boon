@@ -1,35 +1,46 @@
-# Interval (HOLD) example - counter that increments every second
+# Interval (HOLD) example - counter that increments every second using HOLD pattern
 # HOLD starts at 0, Stream/skip(1) skips the initial 0
+# Timer fires AFTER delay, not immediately. First visible value is 1 after 1 second.
+#
+# Bug tests:
+# 1. Initial display should be EMPTY (not 0) - skip(1) should hide initial 0
+# 2. First value should appear AFTER 1 second and be 1
+# 3. Clear states + re-run should reset to fresh start
+# 4. No ghost timers on example switch (tested manually/separately)
 
 [test]
 category = "timer"
-description = "Counter increments every second using HOLD pattern"
+description = "Counter increments every second using HOLD pattern, NO immediate value"
 
 [output]
-# Initial value: HOLD starts at 0, but Stream/skip(1) skips it
-# So nothing displayed until first tick. After first tick, counter = 1
-# Due to skip, the first visible value is 1 (not 0)
-text = "0"
+# Initial display MUST be empty - Stream/skip(1) should hide the initial 0
+# If this shows "0" instead of empty, it's a bug in Skip or HOLD emission timing
+match = "exact"
+text = ""
 
 [timing]
-timeout = 5000
+timeout = 6000
 initial_delay = 200
 
+# BUG TEST: First value appears AFTER 1 second, and is 1
 [[sequence]]
-description = "After 1 second, counter should be exactly 1"
+description = "After 1 second, first value appears and is 1"
 actions = [["wait", 1100]]
-# After first timer tick, HOLD updates 0 → 1, skip allows it through
+expect_match = "exact"
 expect = "1"
 
 [[sequence]]
-description = "After another second, counter should be 2"
+description = "After another second, counter is 2"
 actions = [["wait", 1000]]
+expect_match = "exact"
 expect = "2"
 
 # --- PERSISTENCE TEST ---
-# HOLD state should persist - counter should NOT reset to 0
+# BUG TEST: After clear states + re-run, should start fresh
+# HOLD state should be cleared by clear_states
 
 [[persistence]]
-description = "After re-run, counter HOLD state should persist (not reset to 0)"
-expect_match = "regex"
-expect = "^[1-9]\\d*$"
+description = "After clear + re-run, HOLD counter resets to fresh 1 (not persisted 2+)"
+actions = [["clear_states"], ["run"], ["wait", 1100]]
+expect_match = "exact"
+expect = "1"

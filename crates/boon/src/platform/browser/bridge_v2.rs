@@ -13,8 +13,16 @@ use zoon::*;
 /// Used to cancel timers from old event loops when a new one is created.
 static CURRENT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Increment the generation counter to invalidate all running timers.
+/// Call this when switching examples or running new code, even for scalar results.
+pub fn invalidate_all_timers() {
+    let new_gen = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    #[cfg(target_arch = "wasm32")]
+    zoon::println!("invalidate_all_timers: gen now {}", new_gen);
+}
+
 use crate::engine_v2::{
-    arena::SlotId,
+    arena::{Arena, SlotId},
     event_loop::EventLoop,
     message::Payload,
     node::NodeKind,
@@ -92,10 +100,16 @@ pub struct ReactiveEventLoop {
     pub version: Mutable<u64>,
     /// Generation ID - used to cancel timers when a new ReactiveEventLoop is created.
     generation: u64,
+    /// localStorage key for state persistence.
+    storage_key: Option<String>,
 }
 
 impl ReactiveEventLoop {
     pub fn new(event_loop: EventLoop, root_slot: Option<SlotId>) -> Self {
+        Self::new_with_storage(event_loop, root_slot, None)
+    }
+
+    pub fn new_with_storage(event_loop: EventLoop, root_slot: Option<SlotId>, storage_key: Option<String>) -> Self {
         // Increment generation - this invalidates all timers from previous ReactiveEventLoops
         let generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -107,7 +121,38 @@ impl ReactiveEventLoop {
             root_slot,
             version: Mutable::new(0),
             generation,
+            storage_key,
         };
+
+        // Load persisted state before scheduling timers
+        #[cfg(target_arch = "wasm32")]
+        if let Some(key) = &this.storage_key {
+            this.load_state_from_storage(key);
+            // Run a tick to propagate loaded values
+            {
+                let mut el = this.inner.borrow_mut();
+                // Mark all Register and Accumulator nodes as dirty so their values propagate
+                for i in 0..el.arena.len() {
+                    let slot = SlotId { index: i as u32, generation: 0 };
+                    if el.arena.is_valid(slot) {
+                        if let Some(node) = el.arena.get(slot) {
+                            if matches!(node.kind(), Some(NodeKind::Register { .. }) | Some(NodeKind::Accumulator { .. })) {
+                                el.dirty_nodes.push(crate::engine_v2::event_loop::DirtyEntry {
+                                    slot,
+                                    port: Port::Output
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Run the tick to propagate
+            {
+                let mut el = this.inner.borrow_mut();
+                el.run_tick();
+            }
+        }
+
         // Schedule any pending real timers
         this.schedule_pending_timers();
         this
@@ -181,6 +226,12 @@ impl ReactiveEventLoop {
         if had_work {
             // update() takes closure that returns new value, not in-place mutation
             self.version.update(|v| v + 1);
+
+            // Save state to localStorage after changes
+            #[cfg(target_arch = "wasm32")]
+            if let Some(key) = &self.storage_key {
+                self.save_state_to_storage(key);
+            }
         }
         // Schedule any new pending timers that may have been created during this tick
         self.schedule_pending_timers();
@@ -446,8 +497,10 @@ impl ReactiveEventLoop {
     /// Render an ElementButton.
     fn render_button(&self, fields_slot: SlotId) -> RawElOrText {
         let label = self.get_nested_value(fields_slot, &["settings", "label"]);
-        // The press event is at path ["event", "press"] since element: [event: [press: LINK]]
+        // The press event is at path ["event", "press"] since element.event is promoted to top level
         let press_slot = self.get_nested_slot(fields_slot, &["event", "press"]);
+        // The hovered state is at path ["element", "hovered"] (not promoted like event)
+        let hovered_slot = self.get_nested_slot(fields_slot, &["element", "hovered"]);
 
         let label_text = match label {
             Some(Payload::Text(s)) => s.to_string(),
@@ -455,20 +508,113 @@ impl ReactiveEventLoop {
             _ => "Button".to_string(),
         };
 
-        let reactive_el = self.clone();
-        let press_slot = press_slot.unwrap_or(SlotId::INVALID);
+        // Get style properties
+        let style_slot = self.get_nested_slot(fields_slot, &["settings", "style"]);
 
-        Button::new()
+        // Extract style values (non-reactive)
+        let padding = style_slot.and_then(|s| self.get_nested_number(s, &["padding"]));
+        let padding_row = style_slot.and_then(|s| self.get_nested_number(s, &["padding", "row"]));
+        let padding_col = style_slot.and_then(|s| self.get_nested_number(s, &["padding", "column"]));
+        let rounded_corners = style_slot.and_then(|s| self.get_nested_number(s, &["rounded_corners"]));
+
+        let reactive_el = self.clone();
+        let reactive_el_hover = self.clone();
+        let press_slot = press_slot.unwrap_or(SlotId::INVALID);
+        let hovered_slot = hovered_slot.unwrap_or(SlotId::INVALID);
+
+        // Read current style values (may be None if WHILE hasn't received input yet)
+        let bg_color = style_slot.and_then(|s| self.get_nested_value(s, &["background", "color"]));
+        let outline = style_slot.and_then(|s| self.get_nested_value(s, &["outline"]));
+
+        // Build button with label and events
+        let mut btn = Button::new()
             .label(label_text)
             .on_press(move || {
                 if press_slot.is_valid() {
-                    zoon::println!("Button pressed! Injecting event to slot {:?}", press_slot);
                     reactive_el.inject_event(press_slot, Payload::Unit);
-                } else {
-                    zoon::println!("Button pressed but no valid press slot!");
                 }
             })
-            .unify()
+            .on_hovered_change(move |is_hovered| {
+                if hovered_slot.is_valid() {
+                    reactive_el_hover.inject_event(hovered_slot, Payload::Bool(is_hovered));
+                }
+            });
+
+        // Apply padding
+        if let Some(p) = padding {
+            btn = btn.s(Padding::all(p as u32));
+        } else if padding_row.is_some() || padding_col.is_some() {
+            let row = padding_row.unwrap_or(0.0) as u32;
+            let col = padding_col.unwrap_or(0.0) as u32;
+            btn = btn.s(Padding::new().x(row).y(col));
+        }
+
+        // Apply rounded corners
+        if let Some(r) = rounded_corners {
+            btn = btn.s(RoundedCorners::all(r as u32));
+        }
+
+        // Apply background color via raw CSS
+        if let Some(color_payload) = bg_color {
+            if let Some(css_color) = self.payload_to_css_color(&color_payload) {
+                btn = btn.update_raw_el(|raw_el| {
+                    raw_el.style("background-color", &css_color)
+                });
+            }
+        }
+
+        // Apply outline via raw CSS
+        if let Some(outline_payload) = outline {
+            if let Some(css_outline) = self.payload_to_css_outline(&outline_payload) {
+                btn = btn.update_raw_el(|raw_el| {
+                    raw_el.style("outline", &css_outline)
+                });
+            }
+        }
+
+        btn.unify()
+    }
+
+    /// Convert a Payload to a CSS outline string.
+    fn payload_to_css_outline(&self, payload: &Payload) -> Option<String> {
+        match payload {
+            // Handle NoOutline tag
+            Payload::Tag(tag_id) => {
+                let el = self.inner.borrow();
+                let tag_name = el.arena.get_tag_name(*tag_id)?.to_string();
+                drop(el);
+                if tag_name == "NoOutline" {
+                    Some("none".to_string())
+                } else {
+                    None
+                }
+            }
+            // Handle outline object with side and color
+            Payload::ObjectHandle(fields_slot) => {
+                let color = self.get_nested_value(*fields_slot, &["color"]);
+                let side = self.get_nested_value(*fields_slot, &["side"]);
+
+                let color_css = color.and_then(|c| self.payload_to_css_color(&c))?;
+
+                // Default to 2px solid outline
+                let outline_style = match side {
+                    Some(Payload::Tag(tag_id)) => {
+                        let el = self.inner.borrow();
+                        let tag_name = el.arena.get_tag_name(tag_id).map(|s| s.to_string());
+                        drop(el);
+                        match tag_name.as_deref() {
+                            Some("Inner") => "2px solid",
+                            Some("Outer") => "2px solid",
+                            _ => "2px solid",
+                        }
+                    }
+                    _ => "2px solid",
+                };
+
+                Some(format!("{} {}", outline_style, color_css))
+            }
+            _ => None,
+        }
     }
 
     /// Render an ElementCheckbox.
@@ -1021,6 +1167,272 @@ impl ReactiveEventLoop {
         match self.get_nested_value(start_slot, path)? {
             Payload::Text(s) => Some(s.to_string()),
             _ => None,
+        }
+    }
+
+    /// Save Register (HOLD) and Accumulator (Math/sum) state to localStorage.
+    /// Uses slot index as key for simplicity - stable for same source code.
+    #[cfg(target_arch = "wasm32")]
+    pub fn save_state_to_storage(&self, storage_key: &str) {
+        use std::collections::BTreeMap;
+
+        let el = self.inner.borrow();
+        let mut states: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+
+        // Iterate through all slots looking for persistable nodes
+        for i in 0..el.arena.len() {
+            let slot = SlotId { index: i as u32, generation: 0 };
+            if !el.arena.is_valid(slot) {
+                continue;
+            }
+
+            if let Some(node) = el.arena.get(slot) {
+                match node.kind() {
+                    // HOLD state (Register)
+                    Some(NodeKind::Register { stored_value, .. }) => {
+                        if let Some(value) = stored_value {
+                            if let Some(json) = Self::payload_to_json(value) {
+                                let key = format!("slot:{}", i);
+                                states.insert(key, json);
+                            }
+                        }
+                    }
+                    // Math/sum state (Accumulator)
+                    Some(NodeKind::Accumulator { sum, has_input }) => {
+                        // Only persist if accumulator has received input
+                        if *has_input {
+                            let json = serde_json::json!({ "type": "Accumulator", "sum": sum });
+                            let key = format!("slot:{}", i);
+                            states.insert(key, json);
+                        }
+                    }
+                    // Bus (LIST) - Only persist DYNAMIC items (added after compilation)
+                    // Static items (from source code) are recreated by the compiler.
+                    Some(NodeKind::Bus { items, alloc_site, static_item_count }) => {
+                        // Only save if there are dynamic items
+                        if items.len() > *static_item_count {
+                            let mut serialized_items = Vec::new();
+                            // Skip static items (index < static_item_count)
+                            for (item_key, item_slot) in items.iter().skip(*static_item_count) {
+                                if let Some(serialized) = Self::serialize_object_structure_depth(&el, *item_slot, 0) {
+                                    serialized_items.push(serde_json::json!({
+                                        "key": item_key,
+                                        "value": serialized
+                                    }));
+                                }
+                            }
+                            if !serialized_items.is_empty() {
+                                let json = serde_json::json!({
+                                    "type": "Bus",
+                                    "items": serialized_items,
+                                    "next_instance": alloc_site.next_instance,
+                                });
+                                let key = format!("slot:{}", i);
+                                states.insert(key, json);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Save to localStorage if we have any state
+        if !states.is_empty() {
+            if let Err(error) = local_storage().insert(storage_key, &states) {
+                zoon::eprintln!("Failed to save state: {error:#}");
+            }
+        }
+    }
+
+    /// Load Register (HOLD) and Accumulator (Math/sum) state from localStorage.
+    #[cfg(target_arch = "wasm32")]
+    pub fn load_state_from_storage(&self, storage_key: &str) {
+        use std::collections::BTreeMap;
+
+        let states: BTreeMap<String, serde_json::Value> = match local_storage().get(storage_key) {
+            None => return,  // No saved state
+            Some(Ok(states)) => states,
+            Some(Err(error)) => {
+                zoon::eprintln!("Failed to load state: {error:#}");
+                return;
+            }
+        };
+
+        if states.is_empty() {
+            return;
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!("Loading {} states from localStorage", states.len());
+
+        // Collect Register and Accumulator updates
+        enum StateUpdate {
+            Register(Payload),
+            Accumulator(f64),
+        }
+
+        let updates: Vec<(SlotId, StateUpdate)> = {
+            let el = self.inner.borrow();
+            states.iter().filter_map(|(key, json)| {
+                let index_str = key.strip_prefix("slot:")?;
+                let index = index_str.parse::<u32>().ok()?;
+                let slot = SlotId { index, generation: 0 };
+
+                if !el.arena.is_valid(slot) {
+                    return None;
+                }
+
+                let node = el.arena.get(slot)?;
+                match node.kind() {
+                    Some(NodeKind::Register { .. }) => {
+                        let payload = Self::json_to_payload(json)?;
+                        Some((slot, StateUpdate::Register(payload)))
+                    }
+                    Some(NodeKind::Accumulator { .. }) => {
+                        // Parse Accumulator JSON
+                        let obj = json.as_object()?;
+                        if obj.get("type")?.as_str()? == "Accumulator" {
+                            let sum = obj.get("sum")?.as_f64()?;
+                            Some((slot, StateUpdate::Accumulator(sum)))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None
+                }
+            }).collect()
+        };
+
+        // Apply updates
+        let mut el = self.inner.borrow_mut();
+        for (slot, update) in updates {
+            if let Some(node) = el.arena.get_mut(slot) {
+                match update {
+                    StateUpdate::Register(payload) => {
+                        #[cfg(target_arch = "wasm32")]
+                        zoon::println!("  Restored Register slot {} with value {:?}", slot.index, payload);
+                        if let Some(NodeKind::Register { stored_value, .. }) = node.kind_mut() {
+                            *stored_value = Some(payload.clone());
+                            node.extension_mut().current_value = Some(payload);
+                        }
+                    }
+                    StateUpdate::Accumulator(sum) => {
+                        #[cfg(target_arch = "wasm32")]
+                        zoon::println!("  Restored Accumulator slot {} with sum {}", slot.index, sum);
+                        if let Some(NodeKind::Accumulator { sum: current_sum, has_input }) = node.kind_mut() {
+                            *current_sum = sum;
+                            *has_input = true; // Restored value counts as having received input
+                            node.extension_mut().current_value = Some(Payload::Number(sum));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Convert a Payload to JSON for storage.
+    fn payload_to_json(payload: &Payload) -> Option<serde_json::Value> {
+        use serde_json::json;
+
+        Some(match payload {
+            Payload::Number(n) => json!({ "type": "Number", "value": n }),
+            Payload::Text(s) => json!({ "type": "Text", "value": s.as_ref() }),
+            Payload::Bool(b) => json!({ "type": "Bool", "value": b }),
+            Payload::Unit => json!({ "type": "Unit" }),
+            Payload::Tag(t) => json!({ "type": "Tag", "value": t }),
+            // For now, skip complex types
+            Payload::ObjectHandle(_) => return None,
+            Payload::ListHandle(_) => return None,
+            Payload::TaggedObject { tag, .. } => json!({ "type": "Tag", "value": tag }),
+            Payload::Flushed(_) => return None,
+            Payload::ListDelta(_) | Payload::ObjectDelta(_) => return None,
+        })
+    }
+
+    /// Convert JSON back to a Payload.
+    fn json_to_payload(json: &serde_json::Value) -> Option<Payload> {
+        let obj = json.as_object()?;
+        let type_str = obj.get("type")?.as_str()?;
+
+        Some(match type_str {
+            "Number" => Payload::Number(obj.get("value")?.as_f64()?),
+            "Text" => Payload::Text(obj.get("value")?.as_str()?.into()),
+            "Bool" => Payload::Bool(obj.get("value")?.as_bool()?),
+            "Unit" => Payload::Unit,
+            "Tag" => Payload::Tag(obj.get("value")?.as_u64()? as u32),
+            _ => return None,
+        })
+    }
+
+    /// Serialize an Object (Router) structure recursively for persistence.
+    /// This handles complex items like todo_mvc todos with nested HOLD states.
+    #[cfg(target_arch = "wasm32")]
+    fn serialize_object_structure(event_loop: &EventLoop, slot: SlotId) -> Option<serde_json::Value> {
+        Self::serialize_object_structure_depth(event_loop, slot, 0)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn serialize_object_structure_depth(event_loop: &EventLoop, slot: SlotId, depth: usize) -> Option<serde_json::Value> {
+        use serde_json::json;
+        use crate::engine_v2::node::NodeKind;
+
+        // Prevent infinite recursion
+        if depth > 10 {
+            return None;
+        }
+
+        let node = event_loop.arena.get(slot)?;
+        let kind = node.kind()?;
+
+        match kind {
+            NodeKind::Router { fields } => {
+                // Serialize as Object with all fields
+                let mut obj = serde_json::Map::new();
+                for (field_id, field_slot) in fields {
+                    if let Some(name) = event_loop.arena.get_field_name(*field_id) {
+                        if let Some(value) = Self::serialize_object_structure_depth(event_loop, *field_slot, depth + 1) {
+                            obj.insert(name.to_string(), value);
+                        }
+                    }
+                }
+                if obj.is_empty() {
+                    return None;
+                }
+                Some(json!({
+                    "type": "Object",
+                    "fields": serde_json::Value::Object(obj)
+                }))
+            }
+            NodeKind::Register { stored_value, .. } => {
+                // Save the HOLD state value
+                stored_value.as_ref().and_then(|v| Self::payload_to_json(v))
+            }
+            NodeKind::Producer { value } => {
+                // Save the Producer's value
+                value.as_ref().and_then(|v| Self::payload_to_json(v))
+            }
+            NodeKind::Wire { source } => {
+                // Follow the Wire to its source
+                source.and_then(|s| Self::serialize_object_structure_depth(event_loop, s, depth + 1))
+            }
+            NodeKind::Transformer { body_slot, .. } => {
+                // Follow the Transformer's body output (for dynamically created list items)
+                body_slot.and_then(|s| Self::serialize_object_structure_depth(event_loop, s, depth + 1))
+            }
+            NodeKind::Combiner { inputs, .. } => {
+                // For LATEST, try to serialize from any input that has a value
+                for input in inputs {
+                    if let Some(result) = Self::serialize_object_structure_depth(event_loop, *input, depth + 1) {
+                        return Some(result);
+                    }
+                }
+                None
+            }
+            _ => {
+                // Try to get current_value as fallback
+                event_loop.get_current_value(slot).and_then(|v| Self::payload_to_json(&v))
+            }
         }
     }
 }

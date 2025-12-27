@@ -15,6 +15,9 @@ use boon::platform::browser::{
 #[cfg(feature = "engine-v2")]
 use boon::platform::browser::interpreter_v2;
 
+#[cfg(feature = "engine-v2")]
+use boon::platform::browser::bridge_v2::invalidate_all_timers;
+
 mod code_editor;
 use code_editor::CodeEditor;
 
@@ -486,6 +489,17 @@ impl Playground {
                     }) as Box<dyn Fn()>);
                     js_sys::Reflect::set(&api, &"run".into(), run_fn.as_ref()).ok();
                     run_fn.forget();
+
+                    // invalidateTimers() - stop all running timers (engine-v2 only)
+                    // Call this BEFORE clearing localStorage to prevent race conditions
+                    #[cfg(feature = "engine-v2")]
+                    {
+                        let invalidate_fn = Closure::wrap(Box::new(move || {
+                            invalidate_all_timers();
+                        }) as Box<dyn Fn()>);
+                        js_sys::Reflect::set(&api, &"invalidateTimers".into(), invalidate_fn.as_ref()).ok();
+                        invalidate_fn.forget();
+                    }
 
                     // getPreview() - get preview panel text content
                     let get_preview = Closure::wrap(Box::new(|| -> String {
@@ -1212,6 +1226,9 @@ impl Playground {
                 local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
                 // Clear dynamically-keyed persistence data (list calls, removed sets)
                 clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
+                // Clear engine-v2 persistence state
+                #[cfg(feature = "engine-v2")]
+                local_storage().remove(interpreter_v2::STATES_STORAGE_KEY);
             })
     }
 
@@ -1557,6 +1574,9 @@ impl Playground {
                 let custom_examples = self.custom_examples.clone();
                 let selected_custom_example = self.selected_custom_example.clone();
                 move || {
+                    // Check if we're re-selecting the same example
+                    let is_same_example = *current_file.lock_ref() == example_data.filename;
+
                     // Save current code to previously selected custom example before switching
                     let prev_selected_id = selected_custom_example.lock_ref().clone();
                     if let Some(prev_id) = prev_selected_id {
@@ -1571,11 +1591,18 @@ impl Playground {
                     // Clear custom example selection
                     selected_custom_example.set(None);
 
-                    // Clear saved state to prevent "ghost" data from previous examples
-                    local_storage().remove(STATES_STORAGE_KEY);
-                    local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
-                    local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
-                    clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
+                    // Only clear saved state when switching to a DIFFERENT example.
+                    // When re-selecting the same example, preserve state for persistence testing.
+                    if !is_same_example {
+                        // Clear saved state to prevent "ghost" data from previous examples
+                        local_storage().remove(STATES_STORAGE_KEY);
+                        local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
+                        local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
+                        clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
+                        // Clear engine-v2 persistence state
+                        #[cfg(feature = "engine-v2")]
+                        local_storage().remove(interpreter_v2::STATES_STORAGE_KEY);
+                    }
 
                     // Update URL to share this example
                     set_example_in_url(example_data.filename.trim_end_matches(".bn"));
@@ -1677,6 +1704,9 @@ impl Playground {
                     local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                     local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
                     clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
+                    // Clear engine-v2 persistence state
+                    #[cfg(feature = "engine-v2")]
+                    local_storage().remove(interpreter_v2::STATES_STORAGE_KEY);
 
                     // Update URL (use custom-example parameter)
                     set_custom_example_in_url(&name);
@@ -1895,6 +1925,9 @@ impl Playground {
                                             local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                                             local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
                                             clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
+                                            // Clear engine-v2 persistence state
+                                            #[cfg(feature = "engine-v2")]
+                                            local_storage().remove(interpreter_v2::STATES_STORAGE_KEY);
 
                                             // Update URL (use custom-example parameter)
                                             set_custom_example_in_url(&name);

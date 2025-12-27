@@ -400,6 +400,15 @@ fn get_tools() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "boon_run_and_capture".to_string(),
+            description: "ATOMIC: Run Boon code and immediately capture the preview text BEFORE any timers fire. Critical for testing initial state of timer-based examples. Returns the initial preview text captured synchronously after run.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        Tool {
             name: "boon_playground_status".to_string(),
             description: "Check if the Boon playground dev server (mzoon) is running and healthy. Returns server status and any compilation errors.".to_string(),
             input_schema: json!({
@@ -899,6 +908,8 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
 
         "boon_clear_states" => Command::ClearStates,
 
+        "boon_run_and_capture" => Command::RunAndCaptureInitial,
+
         "boon_localstorage" => {
             let pattern = args.get("pattern").and_then(|v| v.as_str()).map(|s| s.to_string());
             Command::GetLocalStorage { pattern }
@@ -933,6 +944,15 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
         }
 
         Response::PreviewText { text } => Ok(text),
+
+        Response::RunAndCaptureInitial { success, initial_preview, timestamp } => {
+            if success {
+                Ok(format!("Initial preview (captured at {}): {}", timestamp,
+                    if initial_preview.is_empty() { "(empty)" } else { &initial_preview }))
+            } else {
+                Err("RunAndCaptureInitial command failed".to_string())
+            }
+        }
 
         Response::Screenshot { base64: _ } => {
             // This shouldn't happen - WS server transforms to ScreenshotFile

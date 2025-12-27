@@ -88,8 +88,14 @@ impl EventLoop {
     }
 
     /// Mark a node as dirty (needs reprocessing).
+    /// Deduplicates: if the same (slot, port) is already in dirty_nodes, don't add again.
+    /// This prevents double-processing when a node receives the same message via multiple paths.
     pub fn mark_dirty(&mut self, slot: SlotId, port: Port) {
-        self.dirty_nodes.push(DirtyEntry { slot, port });
+        // Check for existing entry with same slot and port
+        let already_dirty = self.dirty_nodes.iter().any(|e| e.slot == slot && e.port == port);
+        if !already_dirty {
+            self.dirty_nodes.push(DirtyEntry { slot, port });
+        }
     }
 
     /// Get the number of nodes in the arena.
@@ -577,7 +583,7 @@ impl EventLoop {
 
                     // Add to the Bus
                     if let Some(bus_node) = self.arena.get_mut(bus_slot) {
-                        if let Some(NodeKind::Bus { items, alloc_site }) = bus_node.kind_mut() {
+                        if let Some(NodeKind::Bus { items, alloc_site, .. }) = bus_node.kind_mut() {
                             let key = alloc_site.allocate();
                             items.push((key, item_slot));
                             #[cfg(target_arch = "wasm32")]
@@ -736,7 +742,7 @@ impl EventLoop {
 
                     // Add to output Bus
                     if let Some(bus_node) = self.arena.get_mut(output_bus) {
-                        if let Some(NodeKind::Bus { items, alloc_site }) = bus_node.kind_mut() {
+                        if let Some(NodeKind::Bus { items, alloc_site, .. }) = bus_node.kind_mut() {
                             for (_, _, cloned_output) in &new_mappings {
                                 let key = alloc_site.allocate();
                                 items.push((key, *cloned_output));
@@ -798,41 +804,78 @@ impl EventLoop {
 
                 emit_value
             }
-            NodeKind::Skip { source, count, skipped } => {
+            NodeKind::Skip { source, count, skipped, last_skipped_value } => {
                 // Skip node - skips first N values, then passes through
-                // Get the incoming value from source
-                let source_value = self.get_current_value(*source).cloned();
-
-                if let Some(value) = source_value {
-                    if *skipped < *count {
-                        // Still skipping - increment counter, don't emit
-                        let new_skipped = *skipped + 1;
-                        if let Some(node) = self.arena.get_mut(entry.slot) {
-                            if let Some(NodeKind::Skip { skipped, .. }) = node.kind_mut() {
-                                *skipped = new_skipped;
-                            }
-                        }
-                        None
-                    } else {
-                        // Done skipping - pass through
-                        Some(value)
-                    }
-                } else {
+                // IMPORTANT: Only process when we have an actual incoming message.
+                // The msg=None case is initial processing and should NOT count toward skip.
+                if msg.is_none() {
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::println!("Skip {:?}: msg=None, ignoring initial processing", entry.slot);
                     None
+                } else {
+                    let source_value = self.get_current_value(*source).cloned();
+
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::println!("Skip {:?}: msg={:?} source_value={:?} skipped={} count={} last_skipped={:?}",
+                        entry.slot, msg, source_value, *skipped, *count, last_skipped_value);
+
+                    if let Some(value) = source_value {
+                        // Check if this is the same value we already skipped
+                        // This handles duplicate deliveries of the same value across tick iterations
+                        if last_skipped_value.as_ref() == Some(&value) {
+                            #[cfg(target_arch = "wasm32")]
+                            zoon::println!("Skip {:?}: DUPLICATE of already-skipped value {:?}, ignoring",
+                                entry.slot, value);
+                            None
+                        } else if *skipped < *count {
+                            // New value to skip - increment counter, store it, don't emit
+                            let new_skipped = *skipped + 1;
+                            #[cfg(target_arch = "wasm32")]
+                            zoon::println!("Skip {:?}: SKIPPING value {:?} (skipped {} -> {})",
+                                entry.slot, value, *skipped, new_skipped);
+                            if let Some(node) = self.arena.get_mut(entry.slot) {
+                                if let Some(NodeKind::Skip { skipped, last_skipped_value, .. }) = node.kind_mut() {
+                                    *skipped = new_skipped;
+                                    *last_skipped_value = Some(value);
+                                }
+                            }
+                            None
+                        } else {
+                            // Done skipping - pass through and clear last_skipped
+                            #[cfg(target_arch = "wasm32")]
+                            zoon::println!("Skip {:?}: PASSING value {:?}", entry.slot, value);
+                            if let Some(node) = self.arena.get_mut(entry.slot) {
+                                if let Some(NodeKind::Skip { last_skipped_value, .. }) = node.kind_mut() {
+                                    *last_skipped_value = None;
+                                }
+                            }
+                            Some(value)
+                        }
+                    } else {
+                        #[cfg(target_arch = "wasm32")]
+                        zoon::println!("Skip {:?}: no source value, returning None", entry.slot);
+                        None
+                    }
                 }
             }
-            NodeKind::Accumulator { sum } => {
+            NodeKind::Accumulator { sum, has_input } => {
                 // Accumulator sums incoming numbers
+                // Only emit after receiving at least one input (prevents showing 0 before timer fires)
                 if let Some(Payload::Number(n)) = msg {
                     let new_sum = sum + n;
                     if let Some(node) = self.arena.get_mut(entry.slot) {
-                        if let Some(NodeKind::Accumulator { sum }) = node.kind_mut() {
+                        if let Some(NodeKind::Accumulator { sum, has_input }) = node.kind_mut() {
                             *sum = new_sum;
+                            *has_input = true;
                         }
                     }
                     Some(Payload::Number(new_sum))
-                } else {
+                } else if *has_input {
+                    // Only emit current sum if we've received at least one input
                     Some(Payload::Number(*sum))
+                } else {
+                    // No input received yet - don't emit anything
+                    None
                 }
             }
             NodeKind::Arithmetic { op, left, right, .. } => {
@@ -1938,13 +1981,14 @@ impl EventLoop {
                 })
             }
             // Bus
-            Some(NodeKind::Bus { items, alloc_site }) => {
+            Some(NodeKind::Bus { items, alloc_site, static_item_count }) => {
                 let new_items = items.iter()
                     .map(|(key, slot)| (*key, remap(slot)))
                     .collect();
                 Some(NodeKind::Bus {
                     items: new_items,
                     alloc_site: alloc_site.clone(),
+                    static_item_count: *static_item_count,
                 })
             }
             // Effect
@@ -2075,8 +2119,15 @@ impl EventLoop {
                 true
             }
         } else {
-            // No visibility condition, always visible
-            true
+            // No visibility condition for this item in the FilteredView.
+            // This happens when the item was added dynamically (via List/append)
+            // AFTER the FilteredView was created.
+            // Default to NOT visible - the item doesn't match the filter since
+            // we can't evaluate the filter expression for it.
+            // This ensures dynamically added items are correctly excluded from
+            // filtered counts (e.g., completed_todos_count won't wrongly count
+            // newly added incomplete todos as completed).
+            false
         }
     }
 }

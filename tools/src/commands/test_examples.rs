@@ -396,23 +396,12 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
         let refresh_delay = std::cmp::max(spec.timing.initial_delay, 2000);
         tokio::time::sleep(Duration::from_millis(refresh_delay)).await;
 
-        // Re-select the example after refresh (URL may have changed to default)
-        let response = send_command_to_server(opts.port, WsCommand::SelectExample {
-            name: format!("{}.bn", example.name),
-        }).await?;
-        if let WsResponse::Error { message } = response {
-            return Ok(TestResult {
-                name: example.name.clone(),
-                passed: false,
-                skipped: None,
-                duration: start.elapsed(),
-                error: Some(format!("Persistence re-select failed: {}", message)),
-                actual_output: None,
-                expected_output: None,
-                steps,
-            });
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // NOTE: We intentionally do NOT call SelectExample here!
+        // The code is already saved in PROJECT_FILES_STORAGE_KEY from the initial inject.
+        // After refresh, it loads automatically. Calling SelectExample would clear the
+        // persistence state (boon-playground-v2-states) because the playground clears
+        // localStorage when switching examples. Since we're testing persistence,
+        // we just need to TriggerRun to execute the already-loaded code.
 
         // Trigger run after refresh - the playground doesn't auto-run on page load
         // This is where persistence should restore state from localStorage
@@ -669,6 +658,13 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
         ParsedAction::ClearStates => {
             let _ = send_command_to_server(port, WsCommand::ClearStates).await?;
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ParsedAction::Run => {
+            let response = send_command_to_server(port, WsCommand::TriggerRun).await?;
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Run failed: {}", message);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
         ParsedAction::Key { key } => {
             let response = send_command_to_server(port, WsCommand::Key { key: key.clone() }).await?;

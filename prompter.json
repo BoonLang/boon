@@ -1,5 +1,5 @@
 {
-  "supervisor_prompt": "Make 11 basic browser Boon examples work properly. Update new engine and related code as needed. Create new Boon CLI runtime tests as needed to test patterns in browser examples isolated (ideally during making examples work to make sure Boon CLI and Browser engine has similar functionality and help you with browser examples debugging). When all examples tested and verified, say +completed+. If you are not sure how to implement something or when you think something is completely missing in the new engine, look at docs/new_boon docs for guides/architecture and read also plan and checklist in docs/new_boon/plans. Changing examples code or testing code allowed only if you are SURE there is a bug - don't change them to make it easier for you or when a part of engine needed for them is still not implemented. Also look at ~/repos/MoonZoon and old bridge code when you need to debug bridge_v2.",
+  "supervisor_prompt": "Make 11 basic browser Boon examples (intergrated in Playground, e.g. `minimal`, `shopping_list`, `todo_mvc`, etc.) work properly (debug examples not needed to complete our goal) and all tests run by `makers verify-playground` have to pass. Update new engine and related code as needed. Create new Boon CLI runtime tests as needed to test patterns in browser examples isolated (ideally during making examples work to make sure Boon CLI and Browser engine has similar functionality and help you with browser examples debugging). When all examples tested and verified, say +completed+. If you are not sure how to implement something or when you think something is completely missing in the new engine, look at docs/new_boon docs for guides/architecture and read also plan and checklist in docs/new_boon/plans. Changing examples code or testing code allowed only if you are SURE there is a bug - don't change them to make it easier for you or when a part of engine needed for them is still not implemented. Also look at ~/repos/MoonZoon and old bridge code when you need to debug bridge_v2. You can run automatic tests by running command `makers verify-playground`.",
   "completion_condition": "+completed+",
   "completion_command": "makers verify-playground",
   "protected_patterns": [
@@ -7,5 +7,6 @@
     "crates/boon-cli/tests/*.bn.test",
     "playground/frontend/src/examples/**/*.expected",
     "playground/frontend/src/examples/**/*.bn"
-  ]
+  ],
+  "command_timeout_secs": 600
 }
