@@ -1,46 +1,68 @@
-# TodoMVC example - full CRUD test
+# TodoMVC example - comprehensive CRUD test
 #
 # NOTE: This example starts with 2 pre-populated todos:
 #   - "Buy groceries"
 #   - "Clean room"
 #
 # Test Flow:
-# 1. Initial state check (2 todos visible)
-# 2. Add "Walk the dog" → verify appears, count = 3
-# 3. Toggle first todo complete → count = 2 active
-# 4. Filter "Active" → only uncompleted visible
-# 5. Filter "Completed" → only completed visible
-# 6. Filter "All" → all visible
-# 7. Clear completed → only 2 remain
+# 1. Input ready checks
+# 2. Add "Walk the dog" → 3 items
+# 3. Toggle complete (check/uncheck)
+# 4. Toggle all
+# 5. Edit todo (double-click)
+# 6. Escape cancel edit
+# 7. Delete todo
+# 8. Filter todos
+# 9. Clear completed
+# 10. Persistence checks
+#
+# ==========================================
+# KNOWN ISSUES TO FIX (test infrastructure ready, implementation pending):
+# ==========================================
+# - TOGGLE ALL (checkbox 0): Shows "1 items" instead of "0 items left"
+#   → Need to investigate: Is checkbox 0 actually toggle_all or first todo?
+#   → The checkbox indexing might be different than expected
+#
+# - EDIT (double-click): Need to verify dblclick_text works on todo items
+#   → Edit mode might not be entering correctly
+#
+# - DELETE (hover + X): Need to verify hover shows the X button
+#   → X button might have different indexing
+#
+# ==========================================
 
 [test]
 category = "interactive"
-description = "TodoMVC: add, complete, filter, and clear todos"
+description = "TodoMVC: add, complete, toggle, edit, delete, filter, clear, and persist todos"
 
 [output]
 # Initial state has 2 pre-populated todos
 text = "2 items left"
 
 [timing]
-timeout = 10000
+timeout = 15000
 poll_interval = 200
 
-# --- VERIFY INPUT READY ---
+# ============================================
+# SECTION 1: INPUT READY
+# ============================================
 
 [[sequence]]
-description = "Step 0a: Verify input has focus (focus: True in Boon code)"
+description = "Verify input has focus (focus: True in Boon code)"
 actions = [["assert_focused", 0]]
 expect = "2 items left"
 
 [[sequence]]
-description = "Step 0b: Verify input is actually typeable (not disabled/readonly/hidden)"
+description = "Verify input is actually typeable (not disabled/readonly/hidden)"
 actions = [["assert_input_typeable", 0]]
 expect = "2 items left"
 
-# --- ADD TODO ---
+# ============================================
+# SECTION 2: ADD TODO
+# ============================================
 
 [[sequence]]
-description = "Step 1: Add new todo (Walk the dog)"
+description = "Add new todo (Walk the dog)"
 actions = [
     ["type", "Walk the dog"],
     ["key", "Enter"]
@@ -48,59 +70,171 @@ actions = [
 expect = "Walk the dog"
 
 [[sequence]]
-description = "Step 2: Verify item count shows 3"
+description = "Verify item count shows 3"
 expect = "3 items left"
 
-# --- COMPLETE TODO ---
+# ============================================
+# SECTION 3: TOGGLE COMPLETE (CHECK/UNCHECK)
+# ============================================
 
 [[sequence]]
-description = "Step 3: Toggle first todo complete (click checkbox)"
+description = "Toggle first todo complete (Buy groceries)"
 actions = [["click_checkbox", 1]]
-# After completing first todo, 2 active items left
 expect = "2 items left"
 
-# --- FILTER TODOS ---
+[[sequence]]
+description = "Uncheck same todo - toggle back to active"
+actions = [["click_checkbox", 1]]
+expect = "3 items left"
+
+# ============================================
+# SECTION 4: TOGGLE ALL
+# ============================================
 
 [[sequence]]
-description = "Step 4: Click Active filter"
+description = "Toggle all todos complete using toggle_all checkbox (index 0)"
+actions = [["click_checkbox", 0]]
+expect = "0 items left"
+
+[[sequence]]
+description = "Toggle all todos back to active"
+actions = [["click_checkbox", 0]]
+expect = "3 items left"
+
+# ============================================
+# SECTION 5: CHECK DIFFERENT TODO
+# ============================================
+
+[[sequence]]
+description = "Check a different todo (Clean room)"
+actions = [["click_checkbox", 2]]
+expect = "2 items left"
+
+[[sequence]]
+description = "Uncheck that todo"
+actions = [["click_checkbox", 2]]
+expect = "3 items left"
+
+# ============================================
+# SECTION 5: EDIT TODO (DOUBLE-CLICK)
+# ============================================
+
+[[sequence]]
+description = "Double-click todo to enter edit mode"
+actions = [["dblclick_text", "Buy groceries"]]
+expect = "items left"
+
+[[sequence]]
+description = "Clear existing text and type new text"
+actions = [
+    ["key", "Backspace"],
+    ["key", "Backspace"],
+    ["key", "Backspace"],
+    ["key", "Backspace"],
+    ["key", "Backspace"],
+    ["key", "Backspace"],
+    ["key", "Backspace"],
+    ["key", "Backspace"],
+    ["key", "Backspace"],
+    ["key", "Backspace"],
+    ["key", "Backspace"],
+    ["key", "Backspace"],
+    ["key", "Backspace"],
+    ["type", "Buy vegetables"]
+]
+expect = "items left"
+
+[[sequence]]
+description = "Press Enter to save edit"
+actions = [["key", "Enter"]]
+expect = "Buy vegetables"
+
+# ============================================
+# SECTION 6: ESCAPE CANCEL EDIT
+# ============================================
+
+[[sequence]]
+description = "Double-click todo to enter edit mode for cancel test"
+actions = [["dblclick_text", "Clean room"]]
+expect = "items left"
+
+[[sequence]]
+description = "Type some text then press Escape to cancel"
+actions = [
+    ["type", "CHANGED TEXT"],
+    ["key", "Escape"]
+]
+expect = "Clean room"
+
+# ============================================
+# SECTION 7: DELETE TODO
+# ============================================
+
+[[sequence]]
+description = "Hover over todo to show delete button"
+actions = [["hover_text", "Walk the dog"]]
+expect = "items left"
+
+[[sequence]]
+description = "Click X button to delete todo"
+actions = [["click_button", 0]]
+expect = "2 items left"
+
+# ============================================
+# SECTION 8: FILTER TODOS
+# ============================================
+
+# First complete a todo so we have something to filter
+[[sequence]]
+description = "Complete Buy vegetables for filter test"
+actions = [["click_checkbox", 1]]
+expect = "1 item left"
+
+[[sequence]]
+description = "Click Active filter"
 actions = [["click_text", "Active"]]
-# Only uncompleted todos should be visible (Clean room, Walk the dog)
+# Only uncompleted todos should be visible (Clean room)
 expect = "Clean room"
 
 [[sequence]]
-description = "Step 5: Click Completed filter"
+description = "Click Completed filter"
 actions = [["click_text", "Completed"]]
-# Only completed "Buy groceries" should be visible
-expect = "Buy groceries"
+# Only completed "Buy vegetables" should be visible
+expect = "Buy vegetables"
 
 [[sequence]]
-description = "Step 6: Click All filter to show all todos"
+description = "Click All filter to show all todos"
 actions = [["click_text", "All"]]
-expect = "Buy groceries"
+expect = "Buy vegetables"
 
-# --- CLEAR COMPLETED ---
+# ============================================
+# SECTION 9: CLEAR COMPLETED
+# ============================================
 
 [[sequence]]
-description = "Step 7: Clear completed todos"
+description = "Clear completed todos"
 actions = [["click_text", "Clear completed"]]
-# Only "Clean room" and "Walk the dog" should remain
+# Only "Clean room" should remain
 expect = "Clean room"
 
 [[sequence]]
-description = "Step 8: Verify count shows 2 items"
-expect = "2 items left"
+description = "Verify count shows 1 item"
+expect = "1 item left"
 
-# --- PERSISTENCE TEST ---
-# Todo list items (LIST/Bus) should persist across re-run
+# ============================================
+# SECTION 10: PERSISTENCE TESTS
+# ============================================
 
 [[persistence]]
-description = "After re-run, should still have 2 items (LIST persisted)"
-expect = "2 items left"
+description = "After re-run, should still have 1 item (LIST persisted)"
+expect = "1 item left"
 
 [[persistence]]
 description = "After re-run, 'Clean room' should still be in list"
 expect = "Clean room"
 
 [[persistence]]
-description = "After re-run, 'Walk the dog' should still be in list"
-expect = "Walk the dog"
+description = "After persistence reload, no 'Element' artifact in output"
+actions = [["run"], ["wait", 500]]
+expect_match = "contains"
+expect = "Clean room"

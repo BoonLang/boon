@@ -31,10 +31,25 @@ pub fn run_v2(source_code: &str) -> Option<InterpreterResult> {
 
 /// Run Boon code with optional storage key for persistence.
 pub fn run_v2_with_storage(source_code: &str, storage_key: Option<&str>) -> Option<InterpreterResult> {
+    // ===== PERFORMANCE TIMING INFRASTRUCTURE =====
+    // Uncomment the timing lines below to diagnose performance issues.
+    // Each phase is measured separately to identify bottlenecks.
+
+    #[cfg(target_arch = "wasm32")]
+    let total_start = web_sys::window().and_then(|w| w.performance()).map(|p| p.now());
+
     reset_expression_depth();
 
-    // Lex the code
+    // ----- PHASE 1: LEX -----
+    #[cfg(target_arch = "wasm32")]
+    let lex_start = web_sys::window().and_then(|w| w.performance()).map(|p| p.now());
+
     let (tokens, lex_errors) = lexer().parse(source_code).into_output_errors();
+
+    #[cfg(target_arch = "wasm32")]
+    if let (Some(start), Some(perf)) = (lex_start, web_sys::window().and_then(|w| w.performance())) {
+        zoon::println!("[PERF] Lex: {:.2}ms ({} chars)", perf.now() - start, source_code.len());
+    }
 
     if !lex_errors.is_empty() {
         zoon::println!("Lex errors: {:?}", lex_errors);
@@ -52,8 +67,16 @@ pub fn run_v2_with_storage(source_code: &str, storage_key: Option<&str>) -> Opti
         |Spanned { node, span, persistence: _ }| (node, span),
     );
 
-    // Parse
+    // ----- PHASE 2: PARSE -----
+    #[cfg(target_arch = "wasm32")]
+    let parse_start = web_sys::window().and_then(|w| w.performance()).map(|p| p.now());
+
     let (expressions, parse_errors) = parser().parse(input).into_output_errors();
+
+    #[cfg(target_arch = "wasm32")]
+    if let (Some(start), Some(perf)) = (parse_start, web_sys::window().and_then(|w| w.performance())) {
+        zoon::println!("[PERF] Parse: {:.2}ms", perf.now() - start);
+    }
 
     if !parse_errors.is_empty() {
         zoon::println!("Parse errors: {:?}", parse_errors);
@@ -62,18 +85,28 @@ pub fn run_v2_with_storage(source_code: &str, storage_key: Option<&str>) -> Opti
 
     let expressions = expressions?;
 
-    // Create event loop and compile context
+    // ----- PHASE 3: COMPILE -----
+    #[cfg(target_arch = "wasm32")]
+    let compile_start = web_sys::window().and_then(|w| w.performance()).map(|p| p.now());
+
     let mut event_loop = EventLoop::new();
     let mut ctx = CompileContext::new(&mut event_loop);
-
-    // Compile the program
     let root_slot = ctx.compile_program(&expressions);
+
+    #[cfg(target_arch = "wasm32")]
+    if let (Some(start), Some(perf)) = (compile_start, web_sys::window().and_then(|w| w.performance())) {
+        zoon::println!("[PERF] Compile: {:.2}ms ({} nodes)", perf.now() - start, event_loop.arena_len());
+    }
 
     // Load persistence BEFORE initial ticks (so persisted values aren't overwritten)
     #[cfg(target_arch = "wasm32")]
     if let Some(key) = storage_key {
         load_persistence_into_event_loop(&mut event_loop, key);
     }
+
+    // ----- PHASE 4: INITIAL TICKS -----
+    #[cfg(target_arch = "wasm32")]
+    let tick_start = web_sys::window().and_then(|w| w.performance()).map(|p| p.now());
 
     // Mark all nodes as dirty to trigger initial evaluation
     let all_slots: Vec<_> = (0..event_loop.arena_len() as u32)
@@ -83,17 +116,36 @@ pub fn run_v2_with_storage(source_code: &str, storage_key: Option<&str>) -> Opti
         })
         .collect();
 
+    #[cfg(target_arch = "wasm32")]
+    let num_slots = all_slots.len();
+
     for slot in all_slots {
         event_loop.mark_dirty(slot, crate::engine_v2::address::Port::Output);
     }
 
     // Run until quiescent (max 1000 ticks for safety)
-    // Note: We ignore timer_queue - real timers are handled asynchronously via pending_real_timers
+    #[cfg(target_arch = "wasm32")]
+    let mut tick_count = 0u32;
+
     for _ in 0..1000 {
         event_loop.run_tick();
+        #[cfg(target_arch = "wasm32")]
+        { tick_count += 1; }
         if event_loop.dirty_nodes.is_empty() {
             break;
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    if let (Some(start), Some(perf)) = (tick_start, web_sys::window().and_then(|w| w.performance())) {
+        zoon::println!("[PERF] Initial ticks: {:.2}ms ({} ticks, {} slots marked dirty)",
+            perf.now() - start, tick_count, num_slots);
+    }
+
+    // ----- TOTAL TIME -----
+    #[cfg(target_arch = "wasm32")]
+    if let (Some(start), Some(perf)) = (total_start, web_sys::window().and_then(|w| w.performance())) {
+        zoon::println!("[PERF] TOTAL run_v2: {:.2}ms", perf.now() - start);
     }
 
     Some(InterpreterResult {
