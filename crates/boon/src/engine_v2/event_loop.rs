@@ -312,6 +312,9 @@ impl EventLoop {
                         }
                     } else {
                         // Body input (Port::Input(0))
+                        #[cfg(target_arch = "wasm32")]
+                        zoon::println!("HOLD_BODY_UPDATE: slot={:?} payload={:?}", entry.slot, payload);
+
                         match &payload {
                             Payload::Flushed(_) => {
                                 // FLUSH + HOLD: Don't store error, propagate it

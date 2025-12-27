@@ -242,6 +242,22 @@ impl ReactiveEventLoop {
         El::new().unify()
     }
 
+    /// Render an element from a specific slot.
+    pub fn render_slot_element(&self, slot: SlotId) -> RawElOrText {
+        let el = self.inner.borrow();
+        if let Some(node) = el.arena.get(slot) {
+            if let Some(ext) = &node.extension {
+                if let Some(payload) = &ext.current_value {
+                    let payload = payload.clone();
+                    drop(el);
+                    return self.render_payload(payload);
+                }
+            }
+        }
+        drop(el);
+        El::new().unify()
+    }
+
     /// Render a payload to a Zoon element.
     fn render_payload(&self, payload: Payload) -> RawElOrText {
         match payload {
@@ -313,27 +329,41 @@ impl ReactiveEventLoop {
     fn render_container(&self, fields_slot: SlotId) -> RawElOrText {
         let child_payload = self.get_nested_value(fields_slot, &["settings", "child"]);
         let padding = self.get_nested_number(fields_slot, &["settings", "style", "padding"]);
+        let background_url = self.get_nested_text(fields_slot, &["settings", "style", "background", "url"]);
+        let size = self.get_nested_number(fields_slot, &["settings", "style", "size"]);
+        let width = self.get_nested_number(fields_slot, &["settings", "style", "width"]).or(size);
+        let height = self.get_nested_number(fields_slot, &["settings", "style", "height"]).or(size);
+
+        // Build up styles
+        let width_style = width.map(|w| Width::exact(w as u32)).unwrap_or_else(Width::fill);
+        let height_style = height.map(|h| Height::exact(h as u32)).unwrap_or_else(Height::fill);
 
         if let Some(child) = child_payload {
+            // With child
             let mut container = El::new()
-                .s(Width::fill())
-                .s(Height::fill())
+                .s(width_style)
+                .s(height_style)
                 .child(self.render_payload(child));
 
+            if let Some(url) = background_url {
+                container = container.s(Background::new().url(url));
+            }
             if let Some(p) = padding {
                 container = container.s(Padding::all(p as u32));
             }
-
             container.unify()
         } else {
+            // Without child
             let mut container = El::new()
-                .s(Width::fill())
-                .s(Height::fill());
+                .s(width_style)
+                .s(height_style);
 
+            if let Some(url) = background_url {
+                container = container.s(Background::new().url(url));
+            }
             if let Some(p) = padding {
                 container = container.s(Padding::all(p as u32));
             }
-
             container.unify()
         }
     }
@@ -366,7 +396,17 @@ impl ReactiveEventLoop {
         zoon::println!("render_stripe: is_column={} children.len()={}", is_column, children.len());
         #[cfg(target_arch = "wasm32")]
         for (i, c) in children.iter().enumerate() {
-            zoon::println!("  child[{}] = {:?}", i, std::mem::discriminant(c));
+            let child_info = match c {
+                Payload::TaggedObject { tag, .. } => {
+                    let el = self.inner.borrow();
+                    let name = el.arena.get_tag_name(*tag).map(|s| s.to_string()).unwrap_or_else(|| "?".to_string());
+                    drop(el);
+                    format!("TaggedObject({})", name)
+                }
+                Payload::Text(t) => format!("Text({})", t),
+                _ => format!("{:?}", std::mem::discriminant(c)),
+            };
+            zoon::println!("  child[{}] = {}", i, child_info);
         }
 
         if children.is_empty() {
@@ -433,31 +473,63 @@ impl ReactiveEventLoop {
 
     /// Render an ElementCheckbox.
     fn render_checkbox(&self, fields_slot: SlotId) -> RawElOrText {
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!(">>> render_checkbox called, fields_slot={:?}", fields_slot);
+
         let checked = self.get_nested_value(fields_slot, &["settings", "checked"]);
         let checked_bool = matches!(checked, Some(Payload::Bool(true)));
         // Click event is at ["event", "click"], like button's press is at ["event", "press"]
         let click_slot = self.get_nested_slot(fields_slot, &["event", "click"]);
         let label = self.get_nested_value(fields_slot, &["settings", "label"]);
 
+        // Check for custom icon element
+        let icon_slot = self.get_nested_slot(fields_slot, &["settings", "icon"]);
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!("  icon_slot={:?} checked={:?}", icon_slot, checked);
+
         let reactive_el = self.clone();
         let click_slot = click_slot.unwrap_or(SlotId::INVALID);
 
         // Need unique ID for each checkbox - use the fields_slot index
         let checkbox_id = format!("cb-{}", fields_slot.index);
-        let checkbox_el = Checkbox::new()
-            .id(checkbox_id)
-            .label_hidden("checkbox")
-            .icon(|checked| {
-                // Unicode checkbox icons: ☐ (unchecked) and ☑ (checked)
-                let icon_char = if checked.get() { "☑" } else { "☐" };
-                zoon::Text::new(icon_char)
-            })
-            .checked(checked_bool)
-            .on_click(move || {
-                if click_slot.is_valid() {
-                    reactive_el.inject_event(click_slot, Payload::Bool(!checked_bool));
-                }
-            });
+
+        // If custom icon is provided, render it; otherwise use default Unicode icons
+        let checkbox_el = if let Some(icon_slot) = icon_slot {
+            // Custom icon provided - render it as the checkbox icon
+            let icon_reactive = self.clone();
+            Checkbox::new()
+                .id(checkbox_id)
+                .label_hidden("checkbox")
+                .icon(move |_checked| {
+                    // Render the custom icon element
+                    icon_reactive.render_slot_element(icon_slot)
+                })
+                .checked(checked_bool)
+                .on_click({
+                    let reactive_el = reactive_el.clone();
+                    move || {
+                        if click_slot.is_valid() {
+                            reactive_el.inject_event(click_slot, Payload::Bool(!checked_bool));
+                        }
+                    }
+                })
+        } else {
+            // Default Unicode checkbox icons
+            Checkbox::new()
+                .id(checkbox_id)
+                .label_hidden("checkbox")
+                .icon(|checked| {
+                    // Unicode checkbox icons: ☐ (unchecked) and ☑ (checked)
+                    let icon_char = if checked.get() { "☑" } else { "☐" };
+                    zoon::Text::new(icon_char)
+                })
+                .checked(checked_bool)
+                .on_click(move || {
+                    if click_slot.is_valid() {
+                        reactive_el.inject_event(click_slot, Payload::Bool(!checked_bool));
+                    }
+                })
+        };
 
         // Add label if present
         match label {
@@ -941,6 +1013,13 @@ impl ReactiveEventLoop {
     fn get_nested_number(&self, start_slot: SlotId, path: &[&str]) -> Option<f64> {
         match self.get_nested_value(start_slot, path)? {
             Payload::Number(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    fn get_nested_text(&self, start_slot: SlotId, path: &[&str]) -> Option<String> {
+        match self.get_nested_value(start_slot, path)? {
+            Payload::Text(s) => Some(s.to_string()),
             _ => None,
         }
     }

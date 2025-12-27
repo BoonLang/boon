@@ -463,6 +463,14 @@ impl<'a, 'code> CompileContext<'a, 'code> {
     pub fn compile_field_access(&mut self, source: SlotId, field_id: FieldId) -> SlotId {
         // Check if source is a Router and directly access the field slot
         if let Some(field_slot) = self.get_field(source, field_id) {
+            // Debug: log completed field access
+            #[cfg(target_arch = "wasm32")]
+            {
+                let field_name = self.event_loop.arena.get_field_name(field_id);
+                if field_name.map(|n| n.as_ref()) == Some("completed") {
+                    zoon::println!("COMPLETED_ACCESS: source={:?} -> field_slot={:?}", source, field_slot);
+                }
+            }
             // Direct access: wire to the field's actual slot
             return self.compile_wire(field_slot);
         }
@@ -942,6 +950,11 @@ impl<'a, 'code> CompileContext<'a, 'code> {
             // Add to local_bindings so later fields can reference this one
             self.local_bindings.insert(var.node.name.to_string(), value_slot);
 
+            #[cfg(target_arch = "wasm32")]
+            if var.node.name == "completed" {
+                zoon::println!("OBJECT_FIELD: router={:?} field='completed' -> slot={:?}", router_slot, value_slot);
+            }
+
             // Also add field to the pre-allocated Router
             if let Some(node) = self.event_loop.arena.get_mut(router_slot) {
                 if let Some(NodeKind::Router { fields: router_fields }) = node.kind_mut() {
@@ -1017,6 +1030,9 @@ impl<'a, 'code> CompileContext<'a, 'code> {
 
                 // Create the HOLD register first (without body connection)
                 let hold_slot = self.compile_hold(initial.clone(), None, initial_input_slot);
+
+                #[cfg(target_arch = "wasm32")]
+                zoon::println!("HOLD_CREATED: hold_slot={:?} initial={:?}", hold_slot, initial);
 
                 // Create a wire that represents the current state
                 // This wire reads from the register's stored_value but does NOT subscribe to updates.
@@ -1504,8 +1520,12 @@ impl<'a, 'code> CompileContext<'a, 'code> {
         let path_str: Vec<&str> = path.iter().copied().collect();
 
         #[cfg(target_arch = "wasm32")]
-        if path_str.len() >= 2 && (path_str[0] == "List" || path_str[0] == "Router" || path_str[0] == "Stream") {
+        if path_str.len() >= 2 && (path_str[0] == "List" || path_str[0] == "Router" || path_str[0] == "Stream" || path_str[0] == "Element") {
             zoon::println!("compile_function_call (non-piped): path={:?}", path_str);
+        }
+        #[cfg(target_arch = "wasm32")]
+        if path_str.as_slice() == ["Element", "checkbox"] {
+            zoon::println!(">>> Element/checkbox compile_function_call CALLED!");
         }
 
         match path_str.as_slice() {
@@ -1585,7 +1605,11 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                 // Check if this is a user-defined function call (single-part path)
                 if path_str.len() == 1 {
                     let func_name = path_str[0];
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::println!("compile_function_call: looking up '{}' in {} functions", func_name, self.functions.len());
                     if let Some(func_def) = self.functions.get(func_name).cloned() {
+                        #[cfg(target_arch = "wasm32")]
+                        zoon::println!("compile_function_call: FOUND user function '{}'", func_name);
                         // Check for PASS: argument
                         let pass_value = arguments.iter()
                             .find(|arg| arg.node.name == "PASS")
@@ -1594,6 +1618,12 @@ impl<'a, 'code> CompileContext<'a, 'code> {
 
                         // No pipe input for non-piped function calls
                         return self.compile_user_function_call(&func_def, arguments, pass_value, None);
+                    } else {
+                        #[cfg(target_arch = "wasm32")]
+                        zoon::println!("compile_function_call: '{}' NOT FOUND, available: {:?}", func_name, self.functions.keys().collect::<Vec<_>>());
+                        // Make the missing function visible at runtime
+                        #[cfg(target_arch = "wasm32")]
+                        zoon::eprintln!("ERROR: Function '{}' not found!", func_name);
                     }
                 }
                 // Unknown function - return unit
@@ -2506,6 +2536,9 @@ impl<'a, 'code> CompileContext<'a, 'code> {
 
     /// Compile Element/checkbox function call.
     fn compile_element_checkbox(&mut self, arguments: &[Spanned<Argument<'code>>]) -> SlotId {
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!("compile_element_checkbox CALLED");
+
         // First compile `element` and add to local_bindings so other args can reference it
         let element_slot = self.get_argument_slot(arguments, "element");
 
@@ -2516,6 +2549,7 @@ impl<'a, 'code> CompileContext<'a, 'code> {
         let style_slot = self.get_argument_slot(arguments, "style");
         let checked_slot = self.get_argument_slot(arguments, "checked");
         let label_slot = self.get_argument_slot(arguments, "label");
+        let icon_slot = self.get_argument_slot(arguments, "icon");
 
         // Restore old binding
         if let Some(old) = old_element_binding {
@@ -2547,11 +2581,13 @@ impl<'a, 'code> CompileContext<'a, 'code> {
         let style_field_id = self.event_loop.arena.intern_field("style");
         let checked_field_id = self.event_loop.arena.intern_field("checked");
         let label_field_id = self.event_loop.arena.intern_field("label");
+        let icon_field_id = self.event_loop.arena.intern_field("icon");
 
         let settings_slot = self.compile_object(vec![
             (style_field_id, style_slot),
             (checked_field_id, checked_slot),
             (label_field_id, label_slot),
+            (icon_field_id, icon_slot),
         ]);
 
         let tag_id = self.event_loop.arena.intern_tag("ElementCheckbox");
