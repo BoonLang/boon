@@ -298,9 +298,9 @@ When debugging with browser automation (`boon-tools exec`):
    - Results are consistent and reproducible
    - Never mix CDP and non-CDP approaches in the same workflow
 
-4. **One browser instance**: Keep a single Chromium instance running. Don't kill it.
+5. **One browser instance**: Keep a single Chromium instance running. Don't kill it.
 
-5. **Auto-reload**:
+6. **Auto-reload**:
    - mzoon auto-reloads WASM when Rust changes
    - WebSocket server `--watch` auto-reloads extension when JS changes
    - No manual restarts needed for most changes
@@ -310,6 +310,32 @@ When debugging with browser automation (`boon-tools exec`):
 2. Page state issues → `exec refresh` → retry
 3. Extension disconnected → refresh browser tab manually
 4. Complete failure (last resort) → kill browser, restart
+
+### Test Philosophy: Mimic Real Users
+
+**Tests MUST mimic real user behavior, not bypass UI issues.**
+
+The test framework exists to catch broken UX, not to hide it. CDP's low-level input simulation can "force" interactions that real users cannot perform (e.g., typing into unfocused inputs, clicking invisible elements). This creates **false positives** - tests that pass while users can't actually use the feature.
+
+**Rules for tests:**
+1. **Verify preconditions first** - Before interacting with an input, assert it has focus. Before reading text, assert it's visible.
+2. **Never rely on CDP bypass capabilities** - If a test needs to force-focus an element, that's a sign the UI is broken, not a workaround to use.
+3. **Test what users see** - Check placeholder text is visible, buttons are clickable, inputs are focusable.
+4. **Fail early on UX issues** - A test should fail at "assert_focused" if the input doesn't auto-focus, not silently work around it.
+
+**Bad pattern (masks bugs):**
+```toml
+# CDP types into input regardless of focus state - HIDES the focus bug
+actions = [["type", "input", "text"]]
+```
+
+**Good pattern (catches bugs):**
+```toml
+# First verify focus, then type - CATCHES the focus bug
+actions = [["assert_focused", 0]]
+# ... only then interact
+actions = [["type", "text"]]
+```
 
 ## Stream Lifecycle Safety (Old Engine)
 

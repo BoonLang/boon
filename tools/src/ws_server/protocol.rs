@@ -114,6 +114,24 @@ pub enum Command {
         #[serde(skip_serializing_if = "Option::is_none")]
         pattern: Option<String>,
     },
+
+    /// Get information about the currently focused element
+    GetFocusedElement,
+
+    /// Get properties of an input element by index (placeholder, value, type)
+    GetInputProperties { index: u32 },
+
+    /// Get the current page URL
+    GetCurrentUrl,
+
+    /// Double-click on element by text content
+    DoubleClickByText { text: String, exact: bool },
+
+    /// Hover over element by text content
+    HoverByText { text: String, exact: bool },
+
+    /// Verify input is actually typeable (not disabled/readonly/hidden)
+    VerifyInputTypeable { index: u32 },
 }
 
 /// Response from Extension to CLI via Server
@@ -167,6 +185,47 @@ pub enum Response {
 
     /// LocalStorage entries
     LocalStorage { entries: serde_json::Value },
+
+    /// Focused element information
+    FocusedElement {
+        /// Tag name (e.g., "INPUT", "BUTTON", null if no element focused)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tag_name: Option<String>,
+        /// Input type if it's an input (e.g., "text", "checkbox")
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_type: Option<String>,
+        /// Index among inputs in preview pane (if applicable)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_index: Option<u32>,
+    },
+
+    /// Input element properties
+    InputProperties {
+        /// Whether the input was found
+        found: bool,
+        /// Placeholder text
+        #[serde(skip_serializing_if = "Option::is_none")]
+        placeholder: Option<String>,
+        /// Current value
+        #[serde(skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+        /// Input type (text, checkbox, etc.)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_type: Option<String>,
+    },
+
+    /// Current page URL
+    CurrentUrl { url: String },
+
+    /// Input typeable verification result
+    InputTypeableStatus {
+        typeable: bool,
+        disabled: bool,
+        readonly: bool,
+        hidden: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 /// Console message from browser

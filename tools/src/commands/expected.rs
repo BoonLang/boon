@@ -24,6 +24,7 @@ pub struct ExpectedSpec {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
 pub struct TestMeta {
     /// Category: static, interactive, timer
     #[serde(default)]
@@ -180,6 +181,56 @@ impl Action {
                             .context("click_checkbox requires index (0-indexed)")?;
                         Ok(ParsedAction::ClickCheckbox { index: index as u32 })
                     }
+                    "dblclick_text" => {
+                        let text = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .context("dblclick_text requires text to double-click")?
+                            .to_string();
+                        Ok(ParsedAction::DblClickText { text })
+                    }
+                    "hover_text" => {
+                        let text = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .context("hover_text requires text to hover over")?
+                            .to_string();
+                        Ok(ParsedAction::HoverText { text })
+                    }
+                    "assert_focused" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .map(|i| i as u32);
+                        Ok(ParsedAction::AssertFocused { input_index: index })
+                    }
+                    "assert_input_placeholder" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_input_placeholder requires index (0-indexed)")?;
+                        let expected = arr
+                            .get(2)
+                            .and_then(|v| v.as_str())
+                            .context("assert_input_placeholder requires expected placeholder text")?
+                            .to_string();
+                        Ok(ParsedAction::AssertInputPlaceholder { index: index as u32, expected })
+                    }
+                    "assert_url" => {
+                        let pattern = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .context("assert_url requires URL pattern")?
+                            .to_string();
+                        Ok(ParsedAction::AssertUrl { pattern })
+                    }
+                    "assert_input_typeable" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_input_typeable requires index (0-indexed)")?;
+                        Ok(ParsedAction::AssertInputTypeable { index: index as u32 })
+                    }
                     _ => anyhow::bail!("Unknown action type: {}", cmd),
                 }
             }
@@ -199,6 +250,12 @@ pub enum ParsedAction {
     ClickText { text: String },    // Click by text content
     ClickButton { index: u32 },    // Click button by index
     ClickCheckbox { index: u32 },  // Click checkbox by index
+    DblClickText { text: String }, // Double-click by text content
+    HoverText { text: String },    // Hover over element by text content
+    AssertFocused { input_index: Option<u32> },  // Assert input has focus
+    AssertInputPlaceholder { index: u32, expected: String },  // Assert input placeholder
+    AssertUrl { pattern: String },  // Assert current URL contains pattern
+    AssertInputTypeable { index: u32 },  // Assert input is actually typeable (not disabled/readonly/hidden)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -253,6 +310,7 @@ impl ExpectedSpec {
     }
 
     /// Check if the given text matches the expected output
+    #[allow(dead_code)]
     pub fn matches(&self, text: &str) -> Result<bool> {
         self.output.matches(text)
     }

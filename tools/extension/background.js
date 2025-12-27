@@ -1265,6 +1265,245 @@ async function handleCommand(id, command) {
           return { type: 'localStorage', entries };
         }, command.pattern || null);
 
+      case 'getFocusedElement':
+        // Get information about the currently focused element
+        try {
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              const focused = document.activeElement;
+
+              if (!focused || focused === document.body) {
+                return { tagName: null, inputType: null, inputIndex: null };
+              }
+
+              const tagName = focused.tagName;
+              const inputType = focused.type || null;
+
+              // Find the input index within the preview pane
+              let inputIndex = null;
+              if (preview && (focused.tagName === 'INPUT' || focused.tagName === 'TEXTAREA')) {
+                const inputs = preview.querySelectorAll('input, textarea, [contenteditable="true"]');
+                for (let i = 0; i < inputs.length; i++) {
+                  if (inputs[i] === focused) {
+                    inputIndex = i;
+                    break;
+                  }
+                }
+              }
+
+              return { tagName, inputType, inputIndex };
+            })()
+          `);
+          return { type: 'focusedElement', ...result };
+        } catch (e) {
+          return { type: 'error', message: `Get focused element failed: ${e.message}` };
+        }
+
+      case 'getInputProperties':
+        // Get properties of an input element by index
+        try {
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { found: false, error: 'Preview panel not found' };
+
+              const inputs = preview.querySelectorAll('input, textarea, [contenteditable="true"]');
+              const index = ${command.index};
+
+              if (index >= inputs.length) {
+                return { found: false, error: 'Input index ' + index + ' out of range (found ' + inputs.length + ' inputs)' };
+              }
+
+              const input = inputs[index];
+              return {
+                found: true,
+                placeholder: input.placeholder || input.getAttribute('placeholder') || null,
+                value: input.value || input.textContent || null,
+                inputType: input.type || input.tagName.toLowerCase()
+              };
+            })()
+          `);
+          return { type: 'inputProperties', ...result };
+        } catch (e) {
+          return { type: 'error', message: `Get input properties failed: ${e.message}` };
+        }
+
+      case 'getCurrentUrl':
+        // Get the current page URL
+        return { type: 'currentUrl', url: tab.url };
+
+      case 'doubleClickByText':
+        // Double-click an element by its text content
+        try {
+          const searchText = command.text;
+          const exact = command.exact || false;
+
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const searchText = ${JSON.stringify(searchText)};
+              const exact = ${exact};
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { found: false, error: 'Preview panel not found' };
+
+              const allElements = preview.querySelectorAll('*');
+              let bestMatch = null;
+              let bestMatchSize = Infinity;
+
+              allElements.forEach((el) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return;
+
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return;
+
+                let directText = '';
+                for (const node of el.childNodes) {
+                  if (node.nodeType === Node.TEXT_NODE) {
+                    directText += node.textContent;
+                  }
+                }
+                directText = directText.trim();
+
+                let matches = exact ? directText === searchText : directText.includes(searchText);
+
+                if (matches) {
+                  const size = rect.width * rect.height;
+                  if (size < bestMatchSize) {
+                    bestMatchSize = size;
+                    bestMatch = {
+                      text: directText,
+                      centerX: Math.round(rect.x + rect.width / 2),
+                      centerY: Math.round(rect.y + rect.height / 2)
+                    };
+                  }
+                }
+              });
+
+              if (bestMatch) {
+                return { found: true, element: bestMatch };
+              }
+              return { found: false, error: 'No element found with text: ' + searchText };
+            })()
+          `);
+
+          if (!result.found) {
+            return { type: 'error', message: result.error || 'Element not found' };
+          }
+
+          const element = result.element;
+          await cdpDoubleClickAt(tab.id, element.centerX, element.centerY);
+          return { type: 'success', data: { text: element.text, x: element.centerX, y: element.centerY } };
+        } catch (e) {
+          return { type: 'error', message: `Double-click by text failed: ${e.message}` };
+        }
+
+      case 'hoverByText':
+        // Hover over an element by its text content
+        try {
+          const searchText = command.text;
+          const exact = command.exact || false;
+
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const searchText = ${JSON.stringify(searchText)};
+              const exact = ${exact};
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { found: false, error: 'Preview panel not found' };
+
+              const allElements = preview.querySelectorAll('*');
+              let bestMatch = null;
+              let bestMatchSize = Infinity;
+
+              allElements.forEach((el) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return;
+
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return;
+
+                let directText = '';
+                for (const node of el.childNodes) {
+                  if (node.nodeType === Node.TEXT_NODE) {
+                    directText += node.textContent;
+                  }
+                }
+                directText = directText.trim();
+
+                let matches = exact ? directText === searchText : directText.includes(searchText);
+
+                if (matches) {
+                  const size = rect.width * rect.height;
+                  if (size < bestMatchSize) {
+                    bestMatchSize = size;
+                    bestMatch = {
+                      text: directText,
+                      centerX: Math.round(rect.x + rect.width / 2),
+                      centerY: Math.round(rect.y + rect.height / 2)
+                    };
+                  }
+                }
+              });
+
+              if (bestMatch) {
+                return { found: true, element: bestMatch };
+              }
+              return { found: false, error: 'No element found with text: ' + searchText };
+            })()
+          `);
+
+          if (!result.found) {
+            return { type: 'error', message: result.error || 'Element not found' };
+          }
+
+          const element = result.element;
+          await cdpHoverAt(tab.id, element.centerX, element.centerY);
+          return { type: 'success', data: { text: element.text, x: element.centerX, y: element.centerY } };
+        } catch (e) {
+          return { type: 'error', message: `Hover by text failed: ${e.message}` };
+        }
+
+      case 'verifyInputTypeable':
+        // Verify input is actually typeable (not disabled/readonly/hidden)
+        try {
+          const inputIndex = command.index;
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { typeable: false, reason: 'Preview panel not found', disabled: false, readonly: false, hidden: true };
+
+              const inputs = preview.querySelectorAll('input, textarea');
+              if (${inputIndex} >= inputs.length) {
+                return { typeable: false, reason: 'Input ' + ${inputIndex} + ' not found (only ' + inputs.length + ' inputs)', disabled: false, readonly: false, hidden: true };
+              }
+
+              const input = inputs[${inputIndex}];
+              const style = window.getComputedStyle(input);
+              const rect = input.getBoundingClientRect();
+
+              const disabled = input.disabled || input.getAttribute('aria-disabled') === 'true';
+              const readonly = input.readOnly || input.getAttribute('aria-readonly') === 'true';
+              const hidden = style.display === 'none' || style.visibility === 'hidden' || rect.width === 0 || rect.height === 0;
+
+              let reason = null;
+              if (disabled) reason = 'Input is disabled';
+              else if (readonly) reason = 'Input is readonly';
+              else if (hidden) reason = 'Input is hidden (display:none or zero-size)';
+
+              return {
+                typeable: !disabled && !readonly && !hidden,
+                disabled,
+                readonly,
+                hidden,
+                reason
+              };
+            })()
+          `);
+          return { type: 'inputTypeableStatus', ...result };
+        } catch (e) {
+          return { type: 'error', message: `Verify input typeable failed: ${e.message}` };
+        }
+
       default:
         return { type: 'error', message: `Unknown command: ${type}` };
     }

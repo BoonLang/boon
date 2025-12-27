@@ -513,24 +513,58 @@ impl EventLoop {
                 Some(Payload::ListHandle(entry.slot))
             }
 
-            NodeKind::ListAppender { bus_slot, .. } => {
-                // When input emits a value, create a new Producer with that value and add to Bus
+            NodeKind::ListAppender { bus_slot, template_input, template_output, .. } => {
+                // When input emits a value, clone the template subgraph (if present) or create a simple Producer
                 if let Some(payload) = msg {
+                    let bus_slot = *bus_slot;
+                    let template_input = *template_input;
+                    let template_output = *template_output;
+
                     #[cfg(target_arch = "wasm32")]
                     zoon::println!("ListAppender: received {:?}, appending to bus {:?}", payload, bus_slot);
 
                     // Deep-clone objects so they don't share field references
                     let cloned_payload = self.deep_clone_payload(&payload);
 
-                    // Create a new Producer to hold this value
-                    let item_slot = self.arena.alloc();
-                    if let Some(node) = self.arena.get_mut(item_slot) {
-                        node.set_kind(NodeKind::Producer { value: Some(cloned_payload.clone()) });
-                        node.extension_mut().current_value = Some(cloned_payload);
-                    }
+                    // Determine the item slot to add to the Bus
+                    let item_slot = match (template_input, template_output) {
+                        (Some(tmpl_in), Some(tmpl_out)) => {
+                            // Has a template - clone the transform subgraph for this item
+                            #[cfg(target_arch = "wasm32")]
+                            zoon::println!("ListAppender: cloning template {:?} -> {:?}", tmpl_in, tmpl_out);
+
+                            // Create a Producer for the trigger value
+                            let source_slot = self.arena.alloc();
+                            if let Some(node) = self.arena.get_mut(source_slot) {
+                                node.set_kind(NodeKind::Producer { value: Some(cloned_payload.clone()) });
+                                node.extension_mut().current_value = Some(cloned_payload);
+                            }
+
+                            // Clone the template subgraph, rewiring template_input to source_slot
+                            let cloned_output = self.clone_transform_subgraph_runtime(
+                                tmpl_in,
+                                tmpl_out,
+                                source_slot,
+                            );
+
+                            #[cfg(target_arch = "wasm32")]
+                            zoon::println!("ListAppender: cloned template, output {:?}", cloned_output);
+
+                            cloned_output
+                        }
+                        _ => {
+                            // No template - just create a simple Producer (old behavior)
+                            let item_slot = self.arena.alloc();
+                            if let Some(node) = self.arena.get_mut(item_slot) {
+                                node.set_kind(NodeKind::Producer { value: Some(cloned_payload.clone()) });
+                                node.extension_mut().current_value = Some(cloned_payload);
+                            }
+                            item_slot
+                        }
+                    };
 
                     // Add to the Bus
-                    if let Some(bus_node) = self.arena.get_mut(*bus_slot) {
+                    if let Some(bus_node) = self.arena.get_mut(bus_slot) {
                         if let Some(NodeKind::Bus { items, alloc_site }) = bus_node.kind_mut() {
                             let key = alloc_site.allocate();
                             items.push((key, item_slot));
@@ -540,7 +574,7 @@ impl EventLoop {
                     }
 
                     // Re-emit the Bus to trigger re-render
-                    self.mark_dirty(*bus_slot, Port::Input(0));
+                    self.mark_dirty(bus_slot, Port::Input(0));
                 }
                 None // ListAppender doesn't emit directly
             }

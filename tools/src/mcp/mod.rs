@@ -492,7 +492,7 @@ fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "boon_focus_input".to_string(),
-            description: "Focus an input element in the preview panel by index (0-indexed). Use before typing text.".to_string(),
+            description: "Focus an input element in the preview panel by index (0-indexed). WARNING: This BYPASSES normal user behavior - real users must click to focus. For tests, prefer verifying the input already has focus (if it should auto-focus) rather than forcing focus.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -506,7 +506,7 @@ fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "boon_type_text".to_string(),
-            description: "Type text into the currently focused element. Use boon_focus_input first to focus an input.".to_string(),
+            description: "Type text into the currently focused element. WARNING: CDP can type even into unfocused elements, masking focus bugs. For tests, verify focus first with assertions before typing.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -773,15 +773,21 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
                         let w = elem.get("width").and_then(|v| v.as_i64()).unwrap_or(0);
                         let h = elem.get("height").and_then(|v| v.as_i64()).unwrap_or(0);
 
-                        // Only show elements with some text
-                        if !direct_text.is_empty() || !full_text.is_empty() {
+                        // Always include inputs (even if empty), otherwise only show elements with text
+                        let is_input = tag == "input" || tag == "textarea";
+                        if is_input || !direct_text.is_empty() || !full_text.is_empty() {
+                            let display_text = if is_input && direct_text.is_empty() && full_text.is_empty() {
+                                "[empty input]"
+                            } else {
+                                direct_text
+                            };
                             output.push_str(&format!(
                                 "[{}] <{}{}> at ({},{}) {}x{}\n  directText: {:?}\n  fullText: {:?}\n\n",
                                 i,
                                 tag,
                                 role.map(|r| format!(" role={}", r)).unwrap_or_default(),
                                 x, y, w, h,
-                                direct_text,
+                                display_text,
                                 full_text
                             ));
                         }
@@ -1011,6 +1017,51 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
                 }
             } else {
                 Ok(format!("{}", entries))
+            }
+        }
+
+        Response::FocusedElement { tag_name, input_type, input_index } => {
+            let mut result = String::new();
+            if let Some(tag) = tag_name {
+                result.push_str(&format!("Focused element: {}", tag));
+                if let Some(t) = input_type {
+                    result.push_str(&format!(" (type={})", t));
+                }
+                if let Some(idx) = input_index {
+                    result.push_str(&format!(" (input index={})", idx));
+                }
+            } else {
+                result.push_str("No element is focused");
+            }
+            Ok(result)
+        }
+
+        Response::InputProperties { found, placeholder, value, input_type } => {
+            if !found {
+                Ok("Input not found".to_string())
+            } else {
+                let mut result = String::new();
+                if let Some(t) = input_type {
+                    result.push_str(&format!("Type: {}\n", t));
+                }
+                if let Some(p) = placeholder {
+                    result.push_str(&format!("Placeholder: {}\n", p));
+                }
+                if let Some(v) = value {
+                    result.push_str(&format!("Value: {}", v));
+                }
+                Ok(result)
+            }
+        }
+
+        Response::CurrentUrl { url } => Ok(format!("URL: {}", url)),
+
+        Response::InputTypeableStatus { typeable, disabled, readonly, hidden, reason } => {
+            if typeable {
+                Ok("Input is typeable".to_string())
+            } else {
+                Ok(format!("Input NOT typeable: {} (disabled={}, readonly={}, hidden={})",
+                    reason.unwrap_or_default(), disabled, readonly, hidden))
             }
         }
 

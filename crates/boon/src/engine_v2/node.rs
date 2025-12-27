@@ -60,11 +60,16 @@ pub enum NodeKind {
     },
 
     /// List appender - reactively appends items to a Bus when input emits
+    /// Now supports template instantiation for function calls like `List/append(item: new_todo())`
     ListAppender {
         /// Target Bus slot
         bus_slot: SlotId,
-        /// Input source for new items
+        /// Input source that triggers append (the raw value before transformation)
         input: Option<SlotId>,
+        /// Template input wire - receives the raw input value for transformation (None = no template)
+        template_input: Option<SlotId>,
+        /// Template output slot - the root of the transform subgraph (None = no template)
+        template_output: Option<SlotId>,
     },
 
     /// List clearer - clears all items from a Bus when trigger emits

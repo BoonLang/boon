@@ -1763,12 +1763,11 @@ impl<'a, 'code> CompileContext<'a, 'code> {
             }
             ["List", "append"] => {
                 // List/append(item: expr)
-                let item_slot = arguments.iter()
+                // Pass raw expression for template instantiation (like List/map does)
+                let item_expr = arguments.iter()
                     .find(|arg| arg.node.name == "item")
-                    .and_then(|arg| arg.node.value.as_ref())
-                    .map(|value| self.compile_expression(value))
-                    .unwrap_or_else(|| self.compile_constant(Payload::Unit));
-                self.compile_list_append(input_slot, item_slot)
+                    .and_then(|arg| arg.node.value.as_ref());
+                self.compile_list_append(input_slot, item_expr)
             }
             ["List", "clear"] => {
                 // List/clear(on: trigger_event)
@@ -2767,32 +2766,99 @@ impl<'a, 'code> CompileContext<'a, 'code> {
     }
 
     /// Compile List/append - adds an item to the list reactively.
-    fn compile_list_append(&mut self, input_slot: SlotId, item_slot: SlotId) -> SlotId {
+    /// Now uses template instantiation for proper LINK slot isolation per item.
+    fn compile_list_append(
+        &mut self,
+        input_slot: SlotId,
+        item_expr: Option<&Spanned<Expression<'code>>>,
+    ) -> SlotId {
         // Find the target Bus
         let bus_slot = self.find_bus_slot(input_slot);
 
         if let Some(bus_slot) = bus_slot {
-            // Create a ListAppender node that will add items when item_slot emits
+            // Handle the item expression with template instantiation
+            let item_expr = match item_expr {
+                Some(expr) => expr,
+                None => {
+                    // No item expression - append Unit
+                    let unit_slot = self.compile_constant(Payload::Unit);
+                    let appender_slot = self.event_loop.arena.alloc();
+                    if let Some(node) = self.event_loop.arena.get_mut(appender_slot) {
+                        node.set_kind(NodeKind::ListAppender {
+                            bus_slot,
+                            input: Some(unit_slot),
+                            template_input: None,
+                            template_output: None,
+                        });
+                    }
+                    self.event_loop.routing.add_route(unit_slot, appender_slot, Port::Input(0));
+                    return bus_slot;
+                }
+            };
+
+            // Create template input wire (placeholder for item value, like List/map does)
+            let template_input = self.event_loop.arena.alloc();
+            if let Some(node) = self.event_loop.arena.get_mut(template_input) {
+                node.set_kind(NodeKind::Wire { source: None });
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            zoon::println!("List/append TEMPLATE: template_input={:?}", template_input);
+
+            // Check if item_expr is a Pipe expression
+            // For `title_to_add |> new_todo()`:
+            //   - trigger = title_to_add (the event stream that triggers append)
+            //   - template = new_todo() applied to template_input
+            let (trigger_slot, template_output) = match &item_expr.node {
+                Expression::Pipe { from, to } => {
+                    // Compile the trigger (left side of pipe)
+                    let trigger = self.compile_expression(from);
+
+                    // Compile the transform (right side of pipe) with template_input as input
+                    let output = self.compile_pipe_to(template_input, to);
+
+                    (trigger, output)
+                }
+                _ => {
+                    // Not a pipe - compile the whole expression as the trigger
+                    // The template will just forward the value (identity transform)
+                    let trigger = self.compile_expression(item_expr);
+                    (trigger, template_input)
+                }
+            };
+
+            #[cfg(target_arch = "wasm32")]
+            zoon::println!("List/append: trigger={:?} template_input={:?} template_output={:?}",
+                trigger_slot, template_input, template_output);
+
+            // Create a ListAppender node with template fields
             let appender_slot = self.event_loop.arena.alloc();
             if let Some(node) = self.event_loop.arena.get_mut(appender_slot) {
                 node.set_kind(NodeKind::ListAppender {
                     bus_slot,
-                    input: Some(item_slot),
+                    input: Some(trigger_slot),
+                    template_input: Some(template_input),
+                    template_output: Some(template_output),
                 });
             }
 
-            // Route from item_slot to the appender
-            self.event_loop.routing.add_route(item_slot, appender_slot, Port::Input(0));
+            // Route from trigger to the appender
+            self.event_loop.routing.add_route(trigger_slot, appender_slot, Port::Input(0));
 
             #[cfg(target_arch = "wasm32")]
-            zoon::println!("compile_list_append: created ListAppender {:?} for bus {:?}, item source {:?}",
-                appender_slot, bus_slot, item_slot);
+            zoon::println!("compile_list_append: created ListAppender {:?} for bus {:?}, trigger {:?}",
+                appender_slot, bus_slot, trigger_slot);
 
             // Return the bus slot (the list itself)
             bus_slot
         } else {
             // Create new bus with the item (for static case)
             let source_id = SourceId::default();
+            let item_slot = if let Some(expr) = item_expr {
+                self.compile_expression(expr)
+            } else {
+                self.compile_constant(Payload::Unit)
+            };
             self.compile_list_items(source_id, vec![item_slot])
         }
     }
@@ -3378,6 +3444,15 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                     element_slot: remap_opt(element_slot),
                     event_type: event_type.clone(),
                     connected: *connected,
+                })
+            }
+            // ListAppender - must remap template slots for proper cloning
+            Some(NodeKind::ListAppender { bus_slot, input, template_input, template_output }) => {
+                Some(NodeKind::ListAppender {
+                    bus_slot: remap(bus_slot),
+                    input: remap_opt(input),
+                    template_input: remap_opt(template_input),
+                    template_output: remap_opt(template_output),
                 })
             }
             _ => kind.cloned()

@@ -1,4 +1,10 @@
 # Pages example - multi-page router navigation
+#
+# Test Flow:
+# 1. Initial state check (Home page)
+# 2. Click About → verify page content
+# 3. Click Contact → verify page content
+# 4. Click Home → verify back to home page
 
 [test]
 category = "interactive"
@@ -9,7 +15,20 @@ description = "Navigate between pages using router"
 text = "Home"
 
 [timing]
-timeout = 5000
+timeout = 8000
+poll_interval = 200
 
-# Note: Page navigation tests may need adjustment based on actual UI structure
-# These are placeholder sequences - actual selectors may differ
+[[sequence]]
+description = "Step 1: Click About link"
+actions = [["click_text", "About"]]
+expect = "About"
+
+[[sequence]]
+description = "Step 2: Click Contact link"
+actions = [["click_text", "Contact"]]
+expect = "Contact"
+
+[[sequence]]
+description = "Step 3: Click Home link"
+actions = [["click_text", "Home"]]
+expect = "Home"

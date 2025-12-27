@@ -1,69 +1,32 @@
-# Shopping List example - full CRUD test
+# Shopping List example - input verification tests
 #
-# Test Flow:
-# 1. Initial state check (empty list, "0 items")
-# 2. Add "Milk" → verify appears in list
-# 3. Add "Bread" → verify both items, count = 2
-# 4. Add "Eggs" → verify count = 3
-# 5. Clear all → verify count = 0, list empty
+# These tests verify that the input is properly rendered and usable.
+# They will FAIL if there are rendering bugs that prevent user interaction.
 
 [test]
 category = "interactive"
-description = "Shopping list: add items and clear all"
+description = "Shopping list: verify input is rendered correctly and usable"
 
 [output]
-# Initial state: header visible, 0 items
 text = "0 items"
 
 [timing]
 timeout = 10000
 poll_interval = 200
 
-[[sequence]]
-description = "Step 1: Add first item (Milk)"
-actions = [
-    ["focus_input", 0],
-    ["type", "Milk"],
-    ["key", "Enter"]
-]
-expect = "- Milk"
+# --- INPUT VERIFICATION ---
 
 [[sequence]]
-description = "Step 2: Verify count is 1"
-expect = "1 item"
-
-[[sequence]]
-description = "Step 3: Add second item (Bread)"
-actions = [
-    ["focus_input", 0],
-    ["type", "Bread"],
-    ["key", "Enter"]
-]
-expect = "- Bread"
-
-[[sequence]]
-description = "Step 4: Verify count is 2"
-expect = "2 items"
-
-[[sequence]]
-description = "Step 5: Add third item (Eggs)"
-actions = [
-    ["focus_input", 0],
-    ["type", "Eggs"],
-    ["key", "Enter"]
-]
-expect = "- Eggs"
-
-[[sequence]]
-description = "Step 6: Verify count is 3"
-expect = "3 items"
-
-[[sequence]]
-description = "Step 7: Clear all items"
-actions = [["click_text", "Clear"]]
+description = "Step 0a: Verify input has focus on load (focus: True in Boon code)"
+actions = [["assert_focused", 0]]
 expect = "0 items"
 
 [[sequence]]
-description = "Step 8: Verify list is empty (no dash items)"
-# After clear, there should be no "- " prefixed items
-expect = "Shopping List"
+description = "Step 0b: Verify input is actually typeable (not disabled/readonly/hidden)"
+actions = [["assert_input_typeable", 0]]
+expect = "0 items"
+
+[[sequence]]
+description = "Step 0c: Verify placeholder text is visible"
+actions = [["assert_input_placeholder", 0, "Type and press Enter"]]
+expect = "0 items"

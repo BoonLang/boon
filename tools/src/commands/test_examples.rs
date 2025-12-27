@@ -309,7 +309,25 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
         // Execute actions
         for action in &seq.actions {
             let parsed = action.parse()?;
-            execute_action(opts.port, &parsed).await?;
+            if let Err(e) = execute_action(opts.port, &parsed).await {
+                // Action failed (including assertions) - record as test failure
+                steps.push(StepResult {
+                    description: seq.description.clone().unwrap_or_else(|| format!("{:?}", parsed)),
+                    passed: false,
+                    actual: Some(e.to_string()),
+                    expected: None,
+                });
+                return Ok(TestResult {
+                    name: example.name.clone(),
+                    passed: false,
+                    skipped: None,
+                    duration: start.elapsed(),
+                    error: Some(e.to_string()),
+                    actual_output: None,
+                    expected_output: None,
+                    steps,
+                });
+            }
         }
 
         // Check expected output if specified
@@ -555,6 +573,112 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 anyhow::bail!("Click checkbox failed: {}", message);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ParsedAction::DblClickText { text } => {
+            let response = send_command_to_server(port, WsCommand::DoubleClickByText {
+                text: text.clone(),
+                exact: false
+            }).await?;
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Double-click text failed: {}", message);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ParsedAction::HoverText { text } => {
+            let response = send_command_to_server(port, WsCommand::HoverByText {
+                text: text.clone(),
+                exact: false
+            }).await?;
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Hover text failed: {}", message);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ParsedAction::AssertFocused { input_index } => {
+            let response = send_command_to_server(port, WsCommand::GetFocusedElement).await?;
+            match response {
+                WsResponse::FocusedElement { tag_name, input_index: actual_index, .. } => {
+                    // Check if any element is focused
+                    if tag_name.is_none() {
+                        anyhow::bail!("Assert focused failed: no element is focused");
+                    }
+                    // If a specific index is expected, verify it matches
+                    if let Some(expected_idx) = input_index {
+                        if actual_index != Some(*expected_idx) {
+                            anyhow::bail!(
+                                "Assert focused failed: expected input index {}, got {:?}",
+                                expected_idx, actual_index
+                            );
+                        }
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert focused failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for GetFocusedElement"),
+            }
+        }
+        ParsedAction::AssertInputPlaceholder { index, expected } => {
+            let response = send_command_to_server(port, WsCommand::GetInputProperties { index: *index }).await?;
+            match response {
+                WsResponse::InputProperties { found, placeholder, .. } => {
+                    if !found {
+                        anyhow::bail!("Assert input placeholder failed: input {} not found", index);
+                    }
+                    let actual = placeholder.unwrap_or_default();
+                    if !actual.contains(expected) {
+                        anyhow::bail!(
+                            "Assert input placeholder failed: expected '{}' in placeholder, got '{}'",
+                            expected, actual
+                        );
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert input placeholder failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for GetInputProperties"),
+            }
+        }
+        ParsedAction::AssertUrl { pattern } => {
+            let response = send_command_to_server(port, WsCommand::GetCurrentUrl).await?;
+            match response {
+                WsResponse::CurrentUrl { url } => {
+                    if !url.contains(pattern) {
+                        anyhow::bail!(
+                            "Assert URL failed: expected '{}' in URL, got '{}'",
+                            pattern, url
+                        );
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert URL failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for GetCurrentUrl"),
+            }
+        }
+        ParsedAction::AssertInputTypeable { index } => {
+            let response = send_command_to_server(port, WsCommand::VerifyInputTypeable { index: *index }).await?;
+            match response {
+                WsResponse::InputTypeableStatus { typeable, disabled, readonly, hidden, reason } => {
+                    if !typeable {
+                        let reason_str = reason.unwrap_or_else(|| {
+                            let mut reasons = vec![];
+                            if disabled { reasons.push("disabled"); }
+                            if readonly { reasons.push("readonly"); }
+                            if hidden { reasons.push("hidden"); }
+                            reasons.join(", ")
+                        });
+                        anyhow::bail!(
+                            "Input {} is NOT typeable: {}",
+                            index, reason_str
+                        );
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert input typeable failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for VerifyInputTypeable"),
+            }
         }
     }
     Ok(())

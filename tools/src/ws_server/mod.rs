@@ -60,7 +60,8 @@ pub struct ServerState {
     /// Request ID counter
     next_id: RwLock<u64>,
 
-    /// Broadcast channel for server shutdown
+    /// Broadcast channel for server shutdown (kept alive to maintain channel)
+    #[allow(dead_code)]
     shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -156,6 +157,7 @@ impl ServerState {
     }
 
     /// Check if extension is connected
+    #[allow(dead_code)]
     pub async fn is_extension_connected(&self) -> bool {
         self.extension_tx.read().await.is_some()
     }
@@ -296,7 +298,7 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
         .await
         .context("WebSocket handshake failed")?;
 
-    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+    let (ws_tx, mut ws_rx) = ws_stream.split();
 
     // Wait for first message to determine client type
     let first_msg = match ws_rx.next().await {

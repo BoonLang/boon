@@ -90,6 +90,7 @@ fn create_persistent_profile() -> Result<PathBuf> {
 }
 
 /// Options for launching the browser
+#[allow(dead_code)]
 pub struct LaunchOptions {
     pub playground_port: u16,
     pub ws_port: u16,
