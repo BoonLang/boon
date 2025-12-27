@@ -7,6 +7,10 @@ description = "Counter button increments display using HOLD pattern"
 [output]
 text = "0"
 
+[timing]
+timeout = 5000
+poll_interval = 200
+
 [[sequence]]
 description = "Click increment button"
 actions = [["click", "[role='button']"]]
@@ -15,4 +19,11 @@ expect = "1"
 [[sequence]]
 description = "Click again"
 actions = [["click", "[role='button']"]]
+expect = "2"
+
+# --- PERSISTENCE TEST ---
+# HOLD state should survive re-run (simulating page reload)
+
+[[persistence]]
+description = "After re-run, counter should still be 2 (HOLD persisted)"
 expect = "2"

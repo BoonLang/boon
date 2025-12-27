@@ -372,6 +372,144 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
         }
     }
 
+    // --- PERSISTENCE TEST ---
+    // If there are persistence sequences, do a FULL PAGE REFRESH and verify state was restored
+    if all_passed && !spec.persistence.is_empty() {
+        // Full page refresh - this clears JavaScript memory and forces restoration from localStorage
+        // NOTE: This properly tests persistence - TriggerRun would just keep memory state
+        let response = send_command_to_server(opts.port, WsCommand::Refresh).await?;
+        if let WsResponse::Error { message } = response {
+            return Ok(TestResult {
+                name: example.name.clone(),
+                passed: false,
+                skipped: None,
+                duration: start.elapsed(),
+                error: Some(format!("Persistence refresh failed: {}", message)),
+                actual_output: None,
+                expected_output: None,
+                steps,
+            });
+        }
+
+        // Wait for page refresh to complete - full page reload takes longer than re-run
+        // Use a minimum of 2 seconds to ensure page is fully loaded
+        let refresh_delay = std::cmp::max(spec.timing.initial_delay, 2000);
+        tokio::time::sleep(Duration::from_millis(refresh_delay)).await;
+
+        // Re-select the example after refresh (URL may have changed to default)
+        let response = send_command_to_server(opts.port, WsCommand::SelectExample {
+            name: format!("{}.bn", example.name),
+        }).await?;
+        if let WsResponse::Error { message } = response {
+            return Ok(TestResult {
+                name: example.name.clone(),
+                passed: false,
+                skipped: None,
+                duration: start.elapsed(),
+                error: Some(format!("Persistence re-select failed: {}", message)),
+                actual_output: None,
+                expected_output: None,
+                steps,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Trigger run after refresh - the playground doesn't auto-run on page load
+        // This is where persistence should restore state from localStorage
+        let response = send_command_to_server(opts.port, WsCommand::TriggerRun).await?;
+        if let WsResponse::Error { message } = response {
+            return Ok(TestResult {
+                name: example.name.clone(),
+                passed: false,
+                skipped: None,
+                duration: start.elapsed(),
+                error: Some(format!("Persistence run failed: {}", message)),
+                actual_output: None,
+                expected_output: None,
+                steps,
+            });
+        }
+
+        // Wait for code execution to stabilize
+        tokio::time::sleep(Duration::from_millis(spec.timing.initial_delay)).await;
+
+        // Run persistence verification sequences
+        for seq in &spec.persistence {
+            // Execute actions
+            for action in &seq.actions {
+                let parsed = action.parse()?;
+                if let Err(e) = execute_action(opts.port, &parsed).await {
+                    steps.push(StepResult {
+                        description: format!("[PERSISTENCE] {}", seq.description.clone().unwrap_or_else(|| format!("{:?}", parsed))),
+                        passed: false,
+                        actual: Some(e.to_string()),
+                        expected: None,
+                    });
+                    return Ok(TestResult {
+                        name: example.name.clone(),
+                        passed: false,
+                        skipped: None,
+                        duration: start.elapsed(),
+                        error: Some(format!("Persistence test failed: {}", e)),
+                        actual_output: None,
+                        expected_output: None,
+                        steps,
+                    });
+                }
+            }
+
+            // Check expected output if specified
+            if let Some(ref expected) = seq.expect {
+                // For persistence checks, do an IMMEDIATE check of the current state.
+                // We don't poll/wait because we want to verify the INITIAL state after
+                // refresh, not wait for timer-based values to change over time.
+                let response = send_command_to_server(opts.port, WsCommand::GetPreviewText).await?;
+                let preview = match response {
+                    WsResponse::PreviewText { text } => text,
+                    WsResponse::Error { message } => {
+                        return Ok(TestResult {
+                            name: example.name.clone(),
+                            passed: false,
+                            skipped: None,
+                            duration: start.elapsed(),
+                            error: Some(format!("Persistence check failed: {}", message)),
+                            actual_output: None,
+                            expected_output: Some(expected.clone()),
+                            steps,
+                        });
+                    }
+                    _ => {
+                        return Ok(TestResult {
+                            name: example.name.clone(),
+                            passed: false,
+                            skipped: None,
+                            duration: start.elapsed(),
+                            error: Some("Unexpected response for GetPreviewText".to_string()),
+                            actual_output: None,
+                            expected_output: Some(expected.clone()),
+                            steps,
+                        });
+                    }
+                };
+
+                let passed = matches_inline(&preview, expected, &seq.expect_match)?;
+                let actual = preview;
+
+                steps.push(StepResult {
+                    description: format!("[PERSISTENCE] {}", seq.description.clone().unwrap_or_default()),
+                    passed,
+                    actual: Some(actual),
+                    expected: Some(expected.clone()),
+                });
+
+                if !passed {
+                    all_passed = false;
+                    break;
+                }
+            }
+        }
+    }
+
     Ok(TestResult {
         name: example.name.clone(),
         passed: all_passed,

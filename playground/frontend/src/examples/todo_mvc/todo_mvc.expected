@@ -89,3 +89,18 @@ expect = "Clean room"
 [[sequence]]
 description = "Step 8: Verify count shows 2 items"
 expect = "2 items left"
+
+# --- PERSISTENCE TEST ---
+# Todo list items (LIST/Bus) should persist across re-run
+
+[[persistence]]
+description = "After re-run, should still have 2 items (LIST persisted)"
+expect = "2 items left"
+
+[[persistence]]
+description = "After re-run, 'Clean room' should still be in list"
+expect = "Clean room"
+
+[[persistence]]
+description = "After re-run, 'Walk the dog' should still be in list"
+expect = "Walk the dog"

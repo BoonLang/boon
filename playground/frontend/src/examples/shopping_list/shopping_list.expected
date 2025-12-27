@@ -1,11 +1,11 @@
-# Shopping List example - input verification tests
+# Shopping List example - input verification and persistence tests
 #
-# These tests verify that the input is properly rendered and usable.
-# They will FAIL if there are rendering bugs that prevent user interaction.
+# These tests verify that the input is properly rendered and usable,
+# and that the shopping list items persist across re-runs.
 
 [test]
 category = "interactive"
-description = "Shopping list: verify input is rendered correctly and usable"
+description = "Shopping list: verify input and persistence"
 
 [output]
 text = "0 items"
@@ -30,3 +30,36 @@ expect = "0 items"
 description = "Step 0c: Verify placeholder text is visible"
 actions = [["assert_input_placeholder", 0, "Type and press Enter"]]
 expect = "0 items"
+
+# --- ADD ITEMS ---
+
+[[sequence]]
+description = "Step 1: Add 'Milk' to list"
+actions = [
+    ["type", "Milk"],
+    ["key", "Enter"]
+]
+expect = "1 items"
+
+[[sequence]]
+description = "Step 2: Add 'Bread' to list"
+actions = [
+    ["type", "Bread"],
+    ["key", "Enter"]
+]
+expect = "2 items"
+
+# --- PERSISTENCE TEST ---
+# Shopping list items (LIST/Bus) should persist across re-run
+
+[[persistence]]
+description = "After re-run, list should still have 2 items (LIST persisted)"
+expect = "2 items"
+
+[[persistence]]
+description = "After re-run, 'Milk' should still be in list"
+expect = "Milk"
+
+[[persistence]]
+description = "After re-run, 'Bread' should still be in list"
+expect = "Bread"

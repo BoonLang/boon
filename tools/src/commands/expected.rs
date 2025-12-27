@@ -18,6 +18,11 @@ pub struct ExpectedSpec {
     #[serde(default)]
     pub sequence: Vec<InteractionSequence>,
 
+    /// Persistence test: sequences to run AFTER re-running example (without clearing state)
+    /// This tests that state survives across re-runs (simulates page reload)
+    #[serde(default)]
+    pub persistence: Vec<InteractionSequence>,
+
     /// Timing configuration
     #[serde(default)]
     pub timing: TimingConfig,

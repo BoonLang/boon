@@ -52,3 +52,15 @@ expect = "Home"
 description = "Step 3b: Verify URL is back to root or /home"
 actions = [["assert_url", "/"]]
 expect = "Home"
+
+# --- PERSISTENCE TEST ---
+# Router state (current page) should persist across re-run
+
+[[persistence]]
+description = "After re-run, should still be on Home page (router state persisted)"
+expect = "Home"
+
+[[persistence]]
+description = "After re-run, URL should still be / (router state persisted)"
+actions = [["assert_url", "/"]]
+expect = "Home"

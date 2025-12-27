@@ -1,4 +1,18 @@
 # Hello world example - displays text
 
+[test]
+category = "static"
+description = "Displays Hello world!"
+
 [output]
 text = "Hello world!"
+
+[timing]
+timeout = 5000
+
+# --- PERSISTENCE TEST ---
+# Static display - verify consistent output after re-run
+
+[[persistence]]
+description = "After re-run, should still display Hello world!"
+expect = "Hello world!"

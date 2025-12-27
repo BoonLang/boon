@@ -1,4 +1,18 @@
 # Minimal example - displays number 123
 
+[test]
+category = "static"
+description = "Displays number 123"
+
 [output]
 text = "123"
+
+[timing]
+timeout = 5000
+
+# --- PERSISTENCE TEST ---
+# Static display - verify consistent output after re-run
+
+[[persistence]]
+description = "After re-run, should still display 123"
+expect = "123"

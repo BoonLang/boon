@@ -19,3 +19,12 @@ actions = [["wait", 1500]]
 expect_match = "regex"
 # After 1.5 seconds, counter should be at least 1 (not 0)
 expect = "^[1-9]\\d*$"
+
+# --- PERSISTENCE TEST ---
+# Counter HOLD state should persist - after re-run, should NOT reset to 0
+
+[[persistence]]
+description = "After re-run, counter should persist (not reset to 0)"
+expect_match = "regex"
+# Counter should still be > 0 (persisted value, not reset)
+expect = "^[1-9]\\d*$"

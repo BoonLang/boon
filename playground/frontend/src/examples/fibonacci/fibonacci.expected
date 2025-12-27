@@ -9,3 +9,11 @@ text = "10. Fibonacci number is 55"
 
 [timing]
 timeout = 5000
+
+# --- PERSISTENCE TEST ---
+# Static computation - verify consistent output after re-run
+# (No HOLD state, but ensures re-run doesn't break anything)
+
+[[persistence]]
+description = "After re-run, computation should produce same result"
+expect = "10. Fibonacci number is 55"

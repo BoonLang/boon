@@ -10,3 +10,10 @@ text = "Blue Card"
 
 [timing]
 timeout = 5000
+
+# --- PERSISTENCE TEST ---
+# Static display - verify consistent output after re-run
+
+[[persistence]]
+description = "After re-run, cards should still be displayed"
+expect = "Blue Card"
