@@ -2,13 +2,16 @@
 #
 # Test Flow:
 # 1. Initial state check (Home page)
-# 2. Click About → verify page content
-# 3. Click Contact → verify page content
-# 4. Click Home → verify back to home page
+# 2. Click About → verify page content AND URL changes
+# 3. Click Contact → verify page content AND URL changes
+# 4. Click Home → verify back to home page AND URL changes
+#
+# NOTE: This test verifies URL path changes, which is essential for
+# proper router behavior (back/forward buttons, bookmarking, sharing links)
 
 [test]
 category = "interactive"
-description = "Navigate between pages using router"
+description = "Navigate between pages and verify URL changes"
 
 [output]
 # Initial page should be Home
@@ -18,17 +21,34 @@ text = "Home"
 timeout = 8000
 poll_interval = 200
 
+# --- NAVIGATION WITH URL VERIFICATION ---
+
 [[sequence]]
-description = "Step 1: Click About link"
+description = "Step 1a: Click About link"
 actions = [["click_text", "About"]]
 expect = "About"
 
 [[sequence]]
-description = "Step 2: Click Contact link"
+description = "Step 1b: Verify URL contains /about"
+actions = [["assert_url", "/about"]]
+expect = "About"
+
+[[sequence]]
+description = "Step 2a: Click Contact link"
 actions = [["click_text", "Contact"]]
 expect = "Contact"
 
 [[sequence]]
-description = "Step 3: Click Home link"
+description = "Step 2b: Verify URL contains /contact"
+actions = [["assert_url", "/contact"]]
+expect = "Contact"
+
+[[sequence]]
+description = "Step 3a: Click Home link"
 actions = [["click_text", "Home"]]
+expect = "Home"
+
+[[sequence]]
+description = "Step 3b: Verify URL is back to root or /home"
+actions = [["assert_url", "/"]]
 expect = "Home"
