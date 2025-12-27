@@ -337,7 +337,17 @@ impl EventLoop {
             }
             NodeKind::Transformer { body_slot, .. } => {
                 // THEN: On input arrival, trigger body re-evaluation and get output
-                if msg.is_some() {
+                // Port::Input(0) = main input trigger - re-evaluate body and emit
+                // Port::Input(1) = body update - forward reactive updates from body
+
+                if entry.port == Port::Input(1) {
+                    // Body update - forward the value directly
+                    // This enables reactive function return values (like WHILE) to flow through
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::println!("Transformer {:?}: forwarding body update {:?}", entry.slot, msg);
+                    msg.clone()
+                } else if msg.is_some() {
+                    // Main input (Port::Input(0)) - re-evaluate body and emit
                     // Re-evaluate all nodes in the body subgraph.
                     // This is crucial because body nodes (Extractors, Arithmetic) may have
                     // cached stale values. We need to process them to read fresh state.
@@ -417,11 +427,41 @@ impl EventLoop {
             }
             NodeKind::SwitchedWire { arms, .. } => {
                 // WHILE: Find matching pattern and switch to that arm continuously
+                // Port::Input(0) = main input that determines which arm is active
+                // Port::Input(1+i) = body update from arm i (forward if it's the current arm)
                 #[cfg(target_arch = "wasm32")]
-                zoon::println!("SwitchedWire evaluating: msg={:?} arms={}", msg, arms.len());
+                zoon::println!("SwitchedWire evaluating: port={:?} msg={:?} arms={}", entry.port, msg, arms.len());
 
-                if let Some(payload) = msg.clone() {
-                    // Find first matching pattern index
+                // Check if this is a body update (Input(n) where n >= 1)
+                let body_arm_index = match entry.port {
+                    Port::Input(n) if n >= 1 => Some((n - 1) as usize),
+                    _ => None,
+                };
+
+                if let Some(arm_index) = body_arm_index {
+                    // Message from a body slot - forward if it's the current arm
+                    let current_arm = self.arena.get(entry.slot).and_then(|n| {
+                        if let Some(NodeKind::SwitchedWire { current_arm, .. }) = n.kind() {
+                            *current_arm
+                        } else {
+                            None
+                        }
+                    });
+
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::println!("  body update: arm_index={} current_arm={:?}", arm_index, current_arm);
+
+                    if current_arm == Some(arm_index) {
+                        // This is the active arm - forward its value
+                        #[cfg(target_arch = "wasm32")]
+                        zoon::println!("  forwarding body value: {:?}", msg);
+                        msg.clone()
+                    } else {
+                        // Not the active arm - ignore
+                        None
+                    }
+                } else if let Some(payload) = msg.clone() {
+                    // Main input (Port::Input(0)) - find matching pattern
                     let matching_idx = arms.iter()
                         .position(|(pattern, _)| pattern.matches(&payload));
 
@@ -440,13 +480,7 @@ impl EventLoop {
                         arms.get(idx).and_then(|(_, body_slot)| {
                             #[cfg(target_arch = "wasm32")]
                             zoon::println!("  body_slot={:?}", body_slot);
-                            let body_node = self.arena.get(*body_slot);
-                            #[cfg(target_arch = "wasm32")]
-                            zoon::println!("  body_node kind={:?}", body_node.and_then(|n| n.kind().cloned()));
-                            body_node.and_then(|n| {
-                                n.extension.as_ref()
-                                    .and_then(|ext| ext.current_value.clone())
-                            })
+                            self.get_current_value(*body_slot).cloned()
                         })
                     });
 
@@ -467,10 +501,7 @@ impl EventLoop {
                     };
                     current_arm.and_then(|idx| {
                         arms.get(idx).and_then(|(_, body_slot)| {
-                            self.arena.get(*body_slot).and_then(|n| {
-                                n.extension.as_ref()
-                                    .and_then(|ext| ext.current_value.clone())
-                            })
+                            self.get_current_value(*body_slot).cloned()
                         })
                     })
                 }
@@ -514,6 +545,27 @@ impl EventLoop {
                 None // ListAppender doesn't emit directly
             }
 
+            NodeKind::ListClearer { bus_slot, .. } => {
+                // When trigger emits any value, clear all items from the Bus
+                if msg.is_some() {
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::println!("ListClearer: trigger received, clearing bus {:?}", bus_slot);
+
+                    // Clear all items from the Bus
+                    if let Some(bus_node) = self.arena.get_mut(*bus_slot) {
+                        if let Some(NodeKind::Bus { items, .. }) = bus_node.kind_mut() {
+                            items.clear();
+                            #[cfg(target_arch = "wasm32")]
+                            zoon::println!("ListClearer: cleared all items from bus");
+                        }
+                    }
+
+                    // Re-emit the Bus to trigger re-render
+                    self.mark_dirty(*bus_slot, Port::Input(0));
+                }
+                None // ListClearer doesn't emit directly
+            }
+
             NodeKind::FilteredView { source_bus, .. } => {
                 // FilteredView is a compile-time construct for List/retain.
                 // It just forwards the ListHandle from the source bus.
@@ -544,6 +596,53 @@ impl EventLoop {
                 } else {
                     vec![]
                 };
+
+                // Find items that were removed (in existing_mapped but no longer in source)
+                let source_item_set: std::collections::HashSet<_> = source_items.iter().map(|(_, slot)| *slot).collect();
+                let removed_items: Vec<_> = existing_mapped.iter()
+                    .filter(|slot| !source_item_set.contains(*slot))
+                    .copied()
+                    .collect();
+
+                // Remove mapped items from output bus
+                if !removed_items.is_empty() {
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::println!("ListMapper: removing {} items from output bus", removed_items.len());
+
+                    // Get the mapped output slots to remove
+                    let slots_to_remove: Vec<_> = {
+                        if let Some(node) = self.arena.get(entry.slot) {
+                            if let Some(NodeKind::ListMapper { mapped_items, .. }) = node.kind() {
+                                removed_items.iter()
+                                    .filter_map(|item_slot| mapped_items.get(item_slot).copied())
+                                    .collect()
+                            } else {
+                                vec![]
+                            }
+                        } else {
+                            vec![]
+                        }
+                    };
+
+                    // Remove from output Bus
+                    if let Some(bus_node) = self.arena.get_mut(output_bus) {
+                        if let Some(NodeKind::Bus { items, .. }) = bus_node.kind_mut() {
+                            items.retain(|(_, slot)| !slots_to_remove.contains(slot));
+                        }
+                    }
+
+                    // Remove from mapped_items
+                    if let Some(node) = self.arena.get_mut(entry.slot) {
+                        if let Some(NodeKind::ListMapper { mapped_items, .. }) = node.kind_mut() {
+                            for item_slot in &removed_items {
+                                mapped_items.remove(item_slot);
+                            }
+                        }
+                    }
+
+                    // Mark output Bus dirty to trigger re-render
+                    self.mark_dirty(output_bus, Port::Input(0));
+                }
 
                 // Find new items not yet mapped
                 let mut new_mappings = Vec::new();
@@ -708,6 +807,10 @@ impl EventLoop {
                         _ => None,
                     })
                 });
+
+                #[cfg(target_arch = "wasm32")]
+                zoon::println!("Arithmetic {:?}: op={:?} left={:?} right={:?} fresh_left={:?} fresh_right={:?}",
+                    entry.slot, op, left, right, fresh_left, fresh_right);
 
                 // Update cached values for future reads via current_value
                 if let Some(node) = self.arena.get_mut(entry.slot) {
@@ -1517,9 +1620,10 @@ impl EventLoop {
                     if let Some(kind) = new_kind {
                         new_node.set_kind(kind);
                     }
-                    // Copy current value
+                    // Copy current value with remapped SlotIds
                     if let Some(cv) = current_value {
-                        new_node.extension_mut().current_value = Some(cv);
+                        let remapped_cv = Self::remap_payload(&cv, &slot_map);
+                        new_node.extension_mut().current_value = Some(remapped_cv);
                     }
                 }
             }
@@ -1605,7 +1709,9 @@ impl EventLoop {
         for &old_slot in &to_clone {
             let new_slot = slot_map[&old_slot];
             if let Some(node) = self.arena.get(new_slot) {
-                // Mark Wires and other input-receiving nodes dirty
+                // Mark entry nodes (Wire/Extractor) dirty - these read from source_item
+                // Don't mark TextTemplate directly; let dependency propagation trigger it
+                // after its dependencies (Wires) have been evaluated
                 match node.kind() {
                     Some(NodeKind::Wire { .. }) |
                     Some(NodeKind::Transformer { .. }) |
@@ -1807,20 +1913,24 @@ impl EventLoop {
                 self.count_list_items_with_conditions(*source_bus, depth + 1, Some(view_conditions))
             }
             NodeKind::Bus { items, .. } => {
-                // Count items, respecting visibility conditions
+                // Count items, respecting visibility conditions from FilteredView ONLY
+                // NOTE: Do NOT check global visibility_conditions here - those are for rendering.
+                // List/count should only respect conditions passed from FilteredView chain.
                 let mut count = 0.0;
+                #[cfg(target_arch = "wasm32")]
+                zoon::println!("count_list_items Bus {:?}: items={:?} has_conditions={}",
+                    slot, items.len(), conditions.is_some());
                 for (_key, item_slot) in items {
-                    // Check visibility: first from passed conditions (FilteredView chain),
-                    // then from global visibility_conditions (for mapped items)
+                    // Check visibility ONLY if conditions were passed from a FilteredView
                     let visible = if let Some(conds) = conditions {
-                        self.is_item_visible_with_conditions(*item_slot, conds)
-                    } else if let Some(&cond_slot) = self.visibility_conditions.get(item_slot) {
-                        // Check global visibility_conditions for mapped items
-                        self.get_current_value(cond_slot)
-                            .map(|p| matches!(p, Payload::Bool(true)))
-                            .unwrap_or(true)
+                        let has_cond = conds.contains_key(item_slot);
+                        let vis = self.is_item_visible_with_conditions(*item_slot, conds);
+                        #[cfg(target_arch = "wasm32")]
+                        zoon::println!("  item {:?}: has_cond_in_map={} visible={}", item_slot, has_cond, vis);
+                        vis
                     } else {
-                        // No visibility condition - count the item
+                        // No FilteredView conditions - count ALL items unconditionally
+                        // (global visibility_conditions are for rendering only, not counting)
                         true
                     };
                     if visible {

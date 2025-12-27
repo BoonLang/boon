@@ -149,6 +149,10 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                 // Tagged object - look inside its fields Router
                 self.get_field(*fields_slot, field)
             }
+            NodeKind::Producer { value: Some(Payload::ObjectHandle(router_slot)) } => {
+                // ObjectHandle - look inside the referenced Router
+                self.get_field(*router_slot, field)
+            }
             _ => None,
         }
     }
@@ -230,6 +234,23 @@ impl<'a, 'code> CompileContext<'a, 'code> {
         // Wire input to this transformer
         self.event_loop.routing.add_route(input_slot, slot, Port::Input(0));
 
+        // Wire body_slot ONLY if it's a streaming construct (WHILE/SwitchedWire).
+        // This is crucial for functions returning reactive values that produce
+        // values asynchronously (like fibonacci's WHILE).
+        //
+        // Do NOT wire for simple expressions (like `state |> Bool/not()`) because
+        // those would create spurious forwarding when dependencies change.
+        let is_streaming_body = self.event_loop.arena.get(body_slot)
+            .and_then(|n| n.kind())
+            .map(|k| matches!(k, NodeKind::SwitchedWire { .. }))
+            .unwrap_or(false);
+
+        if is_streaming_body {
+            #[cfg(target_arch = "wasm32")]
+            zoon::println!("compile_then: wiring streaming body {:?} to {:?}", body_slot, slot);
+            self.event_loop.routing.add_route(body_slot, slot, Port::Input(1));
+        }
+
         slot
     }
 
@@ -297,8 +318,18 @@ impl<'a, 'code> CompileContext<'a, 'code> {
             }
         }
 
-        // Wire input to this switched wire
+        // Wire input to this switched wire (Port::Input(0) for main input)
         self.event_loop.routing.add_route(input_slot, slot, Port::Input(0));
+
+        // Wire each arm's body slot to the WHILE (Port::Input(1+i) for arm bodies)
+        // This ensures body value updates flow to WHILE and can be forwarded
+        if let Some(node) = self.event_loop.arena.get(slot) {
+            if let Some(NodeKind::SwitchedWire { arms, .. }) = node.kind() {
+                for (i, (_, body_slot)) in arms.iter().enumerate() {
+                    self.event_loop.routing.add_route(*body_slot, slot, Port::Input(1 + i as u8));
+                }
+            }
+        }
 
         slot
     }
@@ -433,8 +464,6 @@ impl<'a, 'code> CompileContext<'a, 'code> {
         // Check if source is a Router and directly access the field slot
         if let Some(field_slot) = self.get_field(source, field_id) {
             // Direct access: wire to the field's actual slot
-            #[cfg(target_arch = "wasm32")]
-            zoon::println!("compile_field_access: direct access source={:?} field_id={:?} -> field_slot={:?}", source, field_id, field_slot);
             return self.compile_wire(field_slot);
         }
 
@@ -1537,6 +1566,9 @@ impl<'a, 'code> CompileContext<'a, 'code> {
             ["Element", "link"] => {
                 self.compile_element_link(arguments)
             }
+            ["Element", "stack"] => {
+                self.compile_element_stack(arguments)
+            }
             // Text operations (without pipe)
             ["Text", "empty"] => {
                 self.compile_constant(Payload::Text(Arc::from("")))
@@ -1737,6 +1769,14 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                     .map(|value| self.compile_expression(value))
                     .unwrap_or_else(|| self.compile_constant(Payload::Unit));
                 self.compile_list_append(input_slot, item_slot)
+            }
+            ["List", "clear"] => {
+                // List/clear(on: trigger_event)
+                let trigger_slot = arguments.iter()
+                    .find(|arg| arg.node.name == "on")
+                    .and_then(|arg| arg.node.value.as_ref())
+                    .map(|value| self.compile_expression(value));
+                self.compile_list_clear(input_slot, trigger_slot)
             }
             ["List", "remove"] => {
                 // List/remove(item, on: event)
@@ -2327,6 +2367,56 @@ impl<'a, 'code> CompileContext<'a, 'code> {
         slot
     }
 
+    /// Compile Element/stack function call.
+    /// Element/stack(element, style, layers) - a container that stacks layers on top of each other.
+    fn compile_element_stack(&mut self, arguments: &[Spanned<Argument<'code>>]) -> SlotId {
+        // First compile `element` and add to local_bindings so other args can reference it
+        let element_slot = self.get_argument_slot(arguments, "element");
+
+        // Save old binding and add element to local_bindings
+        let old_element_binding = self.local_bindings.insert("element".into(), element_slot);
+
+        // Now compile other arguments that may reference element.hovered, etc.
+        let style_slot = self.get_argument_slot(arguments, "style");
+        let layers_slot = self.get_argument_slot(arguments, "layers");
+
+        // Restore old binding
+        if let Some(old) = old_element_binding {
+            self.local_bindings.insert("element".into(), old);
+        } else {
+            self.local_bindings.remove("element");
+        }
+
+        let style_field_id = self.event_loop.arena.intern_field("style");
+        let layers_field_id = self.event_loop.arena.intern_field("layers");
+
+        let settings_slot = self.compile_object(vec![
+            (style_field_id, style_slot),
+            (layers_field_id, layers_slot),
+        ]);
+
+        let tag_id = self.event_loop.arena.intern_tag("ElementStack");
+        let element_field_id = self.event_loop.arena.intern_field("element");
+        let settings_field_id = self.event_loop.arena.intern_field("settings");
+
+        let wrapper_slot = self.compile_object(vec![
+            (element_field_id, element_slot),
+            (settings_field_id, settings_slot),
+        ]);
+
+        let slot = self.event_loop.arena.alloc();
+        if let Some(node) = self.event_loop.arena.get_mut(slot) {
+            node.set_kind(NodeKind::Producer {
+                value: Some(Payload::TaggedObject {
+                    tag: tag_id,
+                    fields: wrapper_slot,
+                }),
+            });
+        }
+
+        slot
+    }
+
     /// Compile Element/text_input function call.
     fn compile_element_text_input(&mut self, arguments: &[Spanned<Argument<'code>>]) -> SlotId {
         // First compile `element` and add to local_bindings so other args can reference it
@@ -2707,6 +2797,38 @@ impl<'a, 'code> CompileContext<'a, 'code> {
         }
     }
 
+    /// Compile List/clear - clears all items when trigger fires.
+    fn compile_list_clear(&mut self, input_slot: SlotId, trigger_slot: Option<SlotId>) -> SlotId {
+        // Find the target Bus
+        let bus_slot = self.find_bus_slot(input_slot);
+
+        if let Some(bus_slot) = bus_slot {
+            if let Some(trigger_slot) = trigger_slot {
+                // Create a ListClearer node that will clear items when trigger emits
+                let clearer_slot = self.event_loop.arena.alloc();
+                if let Some(node) = self.event_loop.arena.get_mut(clearer_slot) {
+                    node.set_kind(NodeKind::ListClearer {
+                        bus_slot,
+                        trigger: Some(trigger_slot),
+                    });
+                }
+
+                // Route from trigger to the clearer
+                self.event_loop.routing.add_route(trigger_slot, clearer_slot, Port::Input(0));
+
+                #[cfg(target_arch = "wasm32")]
+                zoon::println!("compile_list_clear: created ListClearer {:?} for bus {:?}, trigger {:?}",
+                    clearer_slot, bus_slot, trigger_slot);
+            }
+
+            // Return the bus slot (the list itself)
+            bus_slot
+        } else {
+            // No bus found, just return input
+            input_slot
+        }
+    }
+
     /// Compile List/remove - removes items based on an event.
     fn compile_list_remove(
         &mut self,
@@ -2781,8 +2903,6 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                 // Compile the visibility condition (reactive - will update when dependencies change)
                 if let Some(expr) = if_expr {
                     let cond_slot = self.compile_expression(expr);
-                    #[cfg(target_arch = "wasm32")]
-                    zoon::println!("List/retain: item={:?} cond={:?}", item_slot, cond_slot);
                     // Store in FilteredView's conditions, not globally
                     conditions.insert(*item_slot, cond_slot);
                     // Also store globally for rendering compatibility
@@ -3579,7 +3699,7 @@ impl<'a, 'code> CompileContext<'a, 'code> {
 }
 
 #[cfg(test)]
-impl CompileContext<'_> {
+impl CompileContext<'_, '_> {
     /// Create a probe node that stores received values (for testing).
     pub fn compile_probe(&mut self) -> SlotId {
         let slot = self.event_loop.arena.alloc();

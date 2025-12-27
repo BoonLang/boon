@@ -158,6 +158,28 @@ impl Action {
                             .context("focus_input requires index (0-indexed)")?;
                         Ok(ParsedAction::FocusInput { index: index as u32 })
                     }
+                    "click_text" => {
+                        let text = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .context("click_text requires text to click")?
+                            .to_string();
+                        Ok(ParsedAction::ClickText { text })
+                    }
+                    "click_button" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("click_button requires index (0-indexed)")?;
+                        Ok(ParsedAction::ClickButton { index: index as u32 })
+                    }
+                    "click_checkbox" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("click_checkbox requires index (0-indexed)")?;
+                        Ok(ParsedAction::ClickCheckbox { index: index as u32 })
+                    }
                     _ => anyhow::bail!("Unknown action type: {}", cmd),
                 }
             }
@@ -174,6 +196,9 @@ pub enum ParsedAction {
     ClearStates,
     Key { key: String },
     FocusInput { index: u32 },
+    ClickText { text: String },    // Click by text content
+    ClickButton { index: u32 },    // Click button by index
+    ClickCheckbox { index: u32 },  // Click checkbox by index
 }
 
 #[derive(Debug, Clone, Deserialize)]

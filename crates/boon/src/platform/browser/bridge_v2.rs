@@ -264,6 +264,7 @@ impl ReactiveEventLoop {
             "ElementTextInput" => self.render_text_input(fields_slot),
             "ElementLabel" => self.render_label(fields_slot),
             "ElementParagraph" => self.render_paragraph(fields_slot),
+            "ElementStack" => self.render_stack(fields_slot),
             _ => zoon::Text::new(format!("{}[...]", tag_name)).unify(),
         }
     }
@@ -679,6 +680,52 @@ impl ReactiveEventLoop {
         Paragraph::new()
             .content(text)
             .unify()
+    }
+
+    /// Render an ElementStack (stacked layers).
+    fn render_stack(&self, fields_slot: SlotId) -> RawElOrText {
+        // Get style properties
+        let width = self.get_nested_number(fields_slot, &["settings", "style", "width"]);
+        let height = self.get_nested_number(fields_slot, &["settings", "style", "height"]);
+        let bg_color = self.get_nested_value(fields_slot, &["settings", "style", "background", "color"]);
+
+        // Get layers from Bus
+        let layers_slot = self.get_nested_slot(fields_slot, &["settings", "layers"]);
+
+        let layers = layers_slot
+            .map(|slot| self.collect_bus_items(slot))
+            .unwrap_or_default();
+
+        // Render all layers to elements
+        let rendered: Vec<_> = layers.into_iter()
+            .map(|p| self.render_payload(p))
+            .collect();
+
+        // Convert bg_color to CSS string once (avoid borrow issues)
+        let bg_css = bg_color.and_then(|c| self.payload_to_css_color(&c));
+
+        // Use Stack with layers if we have any, otherwise empty El
+        if rendered.is_empty() {
+            let mut el = El::new()
+                .s(Align::new().center_x().center_y())
+                .s(if let Some(w) = width { Width::exact(w as u32) } else { Width::fill() })
+                .s(if let Some(h) = height { Height::exact(h as u32) } else { Height::fill() });
+
+            if let Some(ref css_color) = bg_css {
+                el = el.update_raw_el(|raw_el| raw_el.style("background-color", css_color));
+            }
+            el.unify()
+        } else {
+            let mut stack = Stack::new()
+                .s(Align::new().center_x().center_y())
+                .s(if let Some(w) = width { Width::exact(w as u32) } else { Width::fill() })
+                .s(if let Some(h) = height { Height::exact(h as u32) } else { Height::fill() });
+
+            if let Some(ref css_color) = bg_css {
+                stack = stack.update_raw_el(|raw_el| raw_el.style("background-color", css_color));
+            }
+            stack.layers(rendered).unify()
+        }
     }
 
     /// Render a list as a column.

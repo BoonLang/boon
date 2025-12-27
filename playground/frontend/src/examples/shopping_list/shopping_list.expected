@@ -35,6 +35,7 @@ expect = "1 item"
 [[sequence]]
 description = "Step 3: Add second item (Bread)"
 actions = [
+    ["focus_input", 0],
     ["type", "Bread"],
     ["key", "Enter"]
 ]
@@ -47,6 +48,7 @@ expect = "2 items"
 [[sequence]]
 description = "Step 5: Add third item (Eggs)"
 actions = [
+    ["focus_input", 0],
     ["type", "Eggs"],
     ["key", "Enter"]
 ]
@@ -58,7 +60,7 @@ expect = "3 items"
 
 [[sequence]]
 description = "Step 7: Clear all items"
-actions = [["click", "button"]]
+actions = [["click_text", "Clear"]]
 expect = "0 items"
 
 [[sequence]]

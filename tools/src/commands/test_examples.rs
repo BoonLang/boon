@@ -535,6 +535,27 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        ParsedAction::ClickText { text } => {
+            let response = send_command_to_server(port, WsCommand::ClickByText { text: text.clone(), exact: false }).await?;
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Click text failed: {}", message);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ParsedAction::ClickButton { index } => {
+            let response = send_command_to_server(port, WsCommand::ClickButton { index: *index }).await?;
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Click button failed: {}", message);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        ParsedAction::ClickCheckbox { index } => {
+            let response = send_command_to_server(port, WsCommand::ClickCheckbox { index: *index }).await?;
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Click checkbox failed: {}", message);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     Ok(())
 }

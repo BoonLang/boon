@@ -67,6 +67,14 @@ pub enum NodeKind {
         input: Option<SlotId>,
     },
 
+    /// List clearer - clears all items from a Bus when trigger emits
+    ListClearer {
+        /// Target Bus slot
+        bus_slot: SlotId,
+        /// Trigger source - when this emits, clear the bus
+        trigger: Option<SlotId>,
+    },
+
     /// Filtered view of a Bus - stores per-item visibility conditions
     FilteredView {
         /// Source Bus slot
