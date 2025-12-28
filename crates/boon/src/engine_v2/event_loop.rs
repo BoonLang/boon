@@ -2323,14 +2323,21 @@ impl EventLoop {
 
             // CRITICAL: Never clone external nodes. They should stay as references to originals.
             // External nodes include:
-            // 1. IOPads - event sources connected to DOM elements
+            // 1. IOPads with element_slot set - connected to external DOM elements
+            //    (IOPads with element_slot: None are internal template IOPads and SHOULD be cloned)
             // 2. Large Routers (>8 fields) - likely top-level objects like `store`
             //    (Internal objects like `todo_elements` have fewer fields)
             if let Some(node) = self.arena.get(slot) {
                 match node.kind() {
-                    Some(NodeKind::IOPad { .. }) => {
-                        // Skip IOPads - they stay as references to originals
+                    Some(NodeKind::IOPad { element_slot: Some(_), .. }) => {
+                        // Skip IOPads connected to external elements - they're references to originals
                         continue;
+                    }
+                    // IOPads with element_slot: None are internal template IOPads
+                    // They MUST be cloned to ensure each list item has its own unique IOPad
+                    // Otherwise, all dynamically-added items share the same event channel
+                    Some(NodeKind::IOPad { element_slot: None, .. }) => {
+                        // Internal IOPad - proceed with cloning (don't skip)
                     }
                     Some(NodeKind::Router { fields }) if fields.len() > 8 => {
                         // Skip large Routers - they're likely external top-level objects

@@ -37,6 +37,9 @@ pub struct Arena {
     /// Dependencies for each slot (slots this slot depends on)
     /// Used for topological sorting
     dependencies: Vec<HashSet<SlotId>>,
+    /// Topological index for each slot (lower = should be evaluated first)
+    /// Used for sorting dirty queue in correct order
+    topo_index: Vec<u32>,
     /// Next slot ID to allocate
     next_id: u32,
 }
@@ -49,6 +52,7 @@ impl Arena {
             dirty: Vec::new(),
             subscribers: Vec::new(),
             dependencies: Vec::new(),
+            topo_index: Vec::new(),
             next_id: 0,
         }
     }
@@ -62,7 +66,20 @@ impl Arena {
         self.dirty.push(Cell::new(false));
         self.subscribers.push(HashSet::new());
         self.dependencies.push(HashSet::new());
+        self.topo_index.push(u32::MAX); // Will be set by compute_topo_order
         id
+    }
+
+    /// Get topological index for a slot
+    pub fn get_topo_index(&self, slot: SlotId) -> u32 {
+        self.topo_index.get(slot.index()).copied().unwrap_or(u32::MAX)
+    }
+
+    /// Set topological index for a slot
+    pub fn set_topo_index(&mut self, slot: SlotId, index: u32) {
+        if slot.index() < self.topo_index.len() {
+            self.topo_index[slot.index()] = index;
+        }
     }
 
     /// Set the node for a slot
@@ -152,9 +169,33 @@ impl Arena {
             .flat_map(|s| s.iter())
     }
 
+    /// Assign incremental topo-index for a newly created slot
+    /// Sets topo_index = 1 + max(topo_index of dependencies)
+    /// This ensures new slots process after their dependencies without full recompute
+    pub fn assign_incremental_topo_index(&mut self, slot: SlotId) {
+        let max_dep_index = self.get_dependencies(slot)
+            .map(|dep| self.get_topo_index(*dep))
+            .filter(|&idx| idx != u32::MAX)
+            .max()
+            .unwrap_or(0);
+
+        // Set topo_index slightly after dependencies
+        // Using +1 ensures this slot processes after its deps
+        self.set_topo_index(slot, max_dep_index.saturating_add(1));
+    }
+
+    /// Assign incremental topo-indices for a range of new slots
+    /// Processes slots in index order, assigning proper indices based on dependencies
+    pub fn assign_incremental_topo_indices(&mut self, start_index: usize) {
+        for i in start_index..self.len() {
+            self.assign_incremental_topo_index(SlotId(i as u32));
+        }
+    }
+
     /// Compute topological order of all slots using Kahn's algorithm
     /// Returns slots ordered so that dependencies come before dependents
-    pub fn compute_topo_order(&self) -> Vec<SlotId> {
+    /// Also updates topo_index for each slot for O(1) lookup
+    pub fn compute_topo_order(&mut self) -> Vec<SlotId> {
         let n = self.len();
         if n == 0 {
             return Vec::new();
@@ -177,15 +218,20 @@ impl Arena {
         let mut result = Vec::with_capacity(n);
 
         while let Some(slot) = queue.pop_front() {
+            // Set topological index
+            self.topo_index[slot.index()] = result.len() as u32;
             result.push(slot);
 
             // For each subscriber (slot that depends on us), decrease in-degree
-            for &sub in self.get_subscribers(slot).collect::<Vec<_>>().iter() {
+            let subs: Vec<SlotId> = self.subscribers.get(slot.index())
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+            for sub in subs {
                 let sub_idx = sub.index();
                 if sub_idx < in_degree.len() {
                     in_degree[sub_idx] = in_degree[sub_idx].saturating_sub(1);
                     if in_degree[sub_idx] == 0 {
-                        queue.push_back(*sub);
+                        queue.push_back(sub);
                     }
                 }
             }
@@ -196,7 +242,8 @@ impl Arena {
         if result.len() < n {
             for idx in 0..n {
                 let slot = SlotId(idx as u32);
-                if !result.contains(&slot) {
+                if self.topo_index[idx] == u32::MAX {
+                    self.topo_index[idx] = result.len() as u32;
                     result.push(slot);
                 }
             }
@@ -205,8 +252,8 @@ impl Arena {
         result
     }
 
-    /// Get all dirty slots
-    pub fn dirty_slots(&self) -> Vec<SlotId> {
+    /// Get all dirty slots as an iterator (avoids Vec allocation)
+    pub fn dirty_slots(&self) -> impl Iterator<Item = SlotId> + '_ {
         self.dirty
             .iter()
             .enumerate()
@@ -217,7 +264,6 @@ impl Arena {
                     None
                 }
             })
-            .collect()
     }
 
     /// Number of allocated slots

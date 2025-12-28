@@ -1868,10 +1868,12 @@ fn process_work_item(
                 }
 
                 // Register LINK variable senders with LinkConnector
+                // IMPORTANT: Include scope to ensure LINK bindings inside functions
+                // (like new_todo() in List/map) get unique identities per list item
                 if vd.is_link {
                     if let Some(sender) = variable.link_value_sender() {
                         if let Some(link_connector) = ctx.try_link_connector() {
-                            link_connector.register_link(vd.span, sender);
+                            link_connector.register_link(vd.span, ctx.actor_context.scope.clone(), sender);
                         }
                     }
                 }
@@ -2035,10 +2037,12 @@ fn process_work_item(
                 }
 
                 // Register LINK variable senders with LinkConnector
+                // IMPORTANT: Include scope to ensure LINK bindings inside functions
+                // (like new_todo() in List/map) get unique identities per list item
                 if vd.is_link {
                     if let Some(sender) = variable.link_value_sender() {
                         if let Some(link_connector) = ctx.try_link_connector() {
-                            link_connector.register_link(vd.span, sender);
+                            link_connector.register_link(vd.span, ctx.actor_context.scope.clone(), sender);
                         }
                     }
                 }
@@ -5687,6 +5691,9 @@ fn static_spanned_variable_into_variable(
 
     let is_link = matches!(&value.node, static_expression::Expression::Link);
 
+    // Save scope before creating variable (actor_context may be moved)
+    let scope_for_link = actor_context.scope.clone();
+
     let variable = if is_link {
         Variable::new_link_arc(construct_info, construct_context, name_string, actor_context, persistence_id)
     } else {
@@ -5714,9 +5721,11 @@ fn static_spanned_variable_into_variable(
     // resolution doesn't correctly track references inside nested function calls.
     reference_connector.register_referenceable(span, variable.value_actor());
     // Register LINK variable senders with LinkConnector
+    // IMPORTANT: Include scope to ensure LINK bindings inside functions
+    // (like new_todo() in List/map) get unique identities per list item
     if is_link {
         if let Some(sender) = variable.link_value_sender() {
-            link_connector.register_link(span, sender);
+            link_connector.register_link(span, scope_for_link, sender);
         }
     }
     Ok(variable)

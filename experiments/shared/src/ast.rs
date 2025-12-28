@@ -112,6 +112,24 @@ pub enum ExprKind {
         list: Box<Expr>,
         item: Box<Expr>,
     },
+
+    /// List/clear(list)
+    ListClear {
+        list: Box<Expr>,
+    },
+
+    /// List/remove(list, index)
+    ListRemove {
+        list: Box<Expr>,
+        index: Box<Expr>,
+    },
+
+    /// List/retain(list, predicate_template)
+    ListRetain {
+        list: Box<Expr>,
+        item_name: String,
+        predicate: Box<Expr>,
+    },
 }
 
 /// Pattern for WHEN/WHILE matching
@@ -315,6 +333,36 @@ impl AstBuilder {
             ExprKind::ListAppend {
                 list: Box::new(list),
                 item: Box::new(item),
+            },
+        )
+    }
+
+    pub fn list_clear(&mut self, list: Expr) -> Expr {
+        Expr::new(
+            self.next_id(),
+            ExprKind::ListClear {
+                list: Box::new(list),
+            },
+        )
+    }
+
+    pub fn list_remove(&mut self, list: Expr, index: Expr) -> Expr {
+        Expr::new(
+            self.next_id(),
+            ExprKind::ListRemove {
+                list: Box::new(list),
+                index: Box::new(index),
+            },
+        )
+    }
+
+    pub fn list_retain(&mut self, list: Expr, item_name: impl Into<String>, predicate: Expr) -> Expr {
+        Expr::new(
+            self.next_id(),
+            ExprKind::ListRetain {
+                list: Box::new(list),
+                item_name: item_name.into(),
+                predicate: Box::new(predicate),
             },
         )
     }

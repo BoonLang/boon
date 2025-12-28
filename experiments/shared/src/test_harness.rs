@@ -3,21 +3,23 @@
 
 use crate::ast::Program;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Runtime value type shared between engines
+/// Uses Arc for aggregate types to make Clone O(1) instead of O(n)
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Int(i64),
     Float(f64),
-    String(String),
+    String(Arc<str>),  // Arc for O(1) clone
     Bool(bool),
     Unit,
     /// SKIP value - represents "no value" / unbound LINK
     Skip,
-    /// Object with named fields
-    Object(HashMap<String, Value>),
-    /// List of values
-    List(Vec<Value>),
+    /// Object with named fields - Arc-wrapped for O(1) clone
+    Object(Arc<HashMap<String, Value>>),
+    /// List of values - Arc-wrapped for O(1) clone
+    List(Arc<Vec<Value>>),
 }
 
 impl Value {
@@ -30,7 +32,7 @@ impl Value {
     }
 
     pub fn string(v: impl Into<String>) -> Self {
-        Value::String(v.into())
+        Value::String(v.into().into())  // String -> Arc<str>
     }
 
     pub fn unit() -> Self {
@@ -42,11 +44,11 @@ impl Value {
     }
 
     pub fn object(fields: impl IntoIterator<Item = (impl Into<String>, Value)>) -> Self {
-        Value::Object(fields.into_iter().map(|(k, v)| (k.into(), v)).collect())
+        Value::Object(Arc::new(fields.into_iter().map(|(k, v)| (k.into(), v)).collect()))
     }
 
     pub fn list(items: impl IntoIterator<Item = Value>) -> Self {
-        Value::List(items.into_iter().collect())
+        Value::List(Arc::new(items.into_iter().collect()))
     }
 
     pub fn as_int(&self) -> Option<i64> {
@@ -72,14 +74,14 @@ impl Value {
 
     pub fn as_object(&self) -> Option<&HashMap<String, Value>> {
         match self {
-            Value::Object(v) => Some(v),
+            Value::Object(v) => Some(v.as_ref()),
             _ => None,
         }
     }
 
     pub fn as_list(&self) -> Option<&Vec<Value>> {
         match self {
-            Value::List(v) => Some(v),
+            Value::List(v) => Some(v.as_ref()),
             _ => None,
         }
     }
@@ -174,7 +176,7 @@ impl<E: Engine> TestEngine<E> {
 
 /// Helper to create a text value (for event payloads)
 pub fn text(s: impl Into<String>) -> Value {
-    Value::String(s.into())
+    Value::String(s.into().into())  // String -> Arc<str>
 }
 
 /// Helper to create a click event payload

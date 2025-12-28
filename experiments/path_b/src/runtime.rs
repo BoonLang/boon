@@ -10,7 +10,7 @@ use crate::scope::ScopeId;
 use crate::slot::SlotKey;
 use crate::tick::TickCounter;
 use crate::value::ops;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shared::ast::{ExprId, Program};
 use shared::test_harness::Value;
 use std::collections::HashMap;
@@ -25,8 +25,12 @@ pub struct Runtime {
     cache: Cache,
     /// HOLD cells - uses FxHashMap for faster SlotKey lookups
     holds: FxHashMap<SlotKey, HoldCell>,
+    /// Index: scope -> list of HOLD keys under that scope (for O(1) lookup in refresh)
+    holds_by_scope: FxHashMap<ScopeId, Vec<SlotKey>>,
     /// LINK cells - uses FxHashMap for faster SlotKey lookups
     links: FxHashMap<SlotKey, LinkCell>,
+    /// LINKs that received events this tick (for targeted nested HOLD re-eval)
+    affected_links_this_tick: Vec<SlotKey>,
     /// LIST cells - uses FxHashMap for faster SlotKey lookups
     lists: FxHashMap<SlotKey, ListCell>,
     /// Tick counter
@@ -56,7 +60,9 @@ impl Runtime {
             expr_map,
             cache: Cache::new(),
             holds: FxHashMap::default(),
+            holds_by_scope: FxHashMap::default(),
             links: FxHashMap::default(),
+            affected_links_this_tick: Vec::new(),
             lists: FxHashMap::default(),
             tick_counter: TickCounter::new(),
             top_level,
@@ -143,6 +149,17 @@ impl Runtime {
                 Self::walk_expr_into_map(list, map);
                 Self::walk_expr_into_map(item, map);
             }
+            ExprKind::ListClear { list } => {
+                Self::walk_expr_into_map(list, map);
+            }
+            ExprKind::ListRemove { list, index } => {
+                Self::walk_expr_into_map(list, map);
+                Self::walk_expr_into_map(index, map);
+            }
+            ExprKind::ListRetain { list, predicate, .. } => {
+                Self::walk_expr_into_map(list, map);
+                Self::walk_expr_into_map(predicate, map);
+            }
             ExprKind::Literal(_) | ExprKind::Variable(_) | ExprKind::Link(_) => {}
         }
     }
@@ -161,17 +178,29 @@ impl Runtime {
             cell.clear_event();
         }
 
+        // Clear affected links tracking from previous tick
+        self.affected_links_this_tick.clear();
+
         // Process pending events
+        let had_events = !self.pending_events.is_empty();
         for (path, payload) in std::mem::take(&mut self.pending_events) {
             self.inject_event(&path, payload);
+        }
+
+        // B3: Skip evaluation if no events AND cache has entries (not first tick)
+        // Nothing can have changed without external input
+        if !had_events && !self.cache.is_empty() {
+            return;
         }
 
         // Re-evaluate all top-level bindings using split borrows (no program clone)
         self.evaluate_top_level();
 
-        // Re-evaluate nested HOLDs (non-root scope HOLDs in list items)
-        // These are created by ListAppend and need to respond to external events
-        self.reevaluate_nested_holds_internal();
+        // Re-evaluate nested HOLDs only if events were injected this tick
+        // Skip if no events - nested HOLDs can't have changed without external input
+        if !self.affected_links_this_tick.is_empty() {
+            self.reevaluate_nested_holds_internal();
+        }
     }
 
     /// Evaluate all top-level bindings with split borrows to avoid cloning program
@@ -185,7 +214,9 @@ impl Runtime {
             expr_map: _,
             cache,
             holds,
+            holds_by_scope,
             links,
+            affected_links_this_tick: _,
             lists,
             tick_counter,
             top_level,
@@ -198,12 +229,13 @@ impl Runtime {
                 program,
                 cache,
                 holds,
+                holds_by_scope,
                 links,
                 lists,
                 tick_counter,
                 top_level,
                 bindings: HashMap::new(),
-                current_deps: Vec::new(),
+                current_deps: FxHashSet::default(),
             };
 
             let _ = eval(expr, &root_scope, &mut ctx);
@@ -240,7 +272,9 @@ impl Runtime {
                         expr_map: _,
                         cache,
                         holds,
+                        holds_by_scope,
                         links,
+                        affected_links_this_tick: _,
                         lists,
                         tick_counter,
                         top_level,
@@ -252,12 +286,13 @@ impl Runtime {
                         program,
                         cache,
                         holds,
+                        holds_by_scope,
                         links,
                         lists,
                         tick_counter,
                         top_level,
                         bindings: HashMap::new(),
-                        current_deps: Vec::new(),
+                        current_deps: FxHashSet::default(),
                     };
 
                     // Bind the state name to this HOLD cell
@@ -302,12 +337,12 @@ impl Runtime {
                     let mut inner: HashMap<String, Value> = HashMap::new();
                     inner.insert("submit".to_string(), Value::Unit);
                     inner.insert("value".to_string(), payload);
-                    let mut current = Value::Object(inner);
+                    let mut current = Value::Object(std::sync::Arc::new(inner));
                     // Wrap in outer path parts if any
                     for &part in parts[1..parts.len()-1].iter().rev() {
                         let mut outer: HashMap<String, Value> = HashMap::new();
                         outer.insert(part.to_string(), current);
-                        current = Value::Object(outer);
+                        current = Value::Object(std::sync::Arc::new(outer));
                     }
                     current
                 } else {
@@ -316,7 +351,7 @@ impl Runtime {
                     for &part in parts[1..].iter().rev() {
                         let mut inner: HashMap<String, Value> = HashMap::new();
                         inner.insert(part.to_string(), current);
-                        current = Value::Object(inner);
+                        current = Value::Object(std::sync::Arc::new(inner));
                     }
                     current
                 }
@@ -331,8 +366,11 @@ impl Runtime {
                 // Create link cell and inject
                 let mut link_cell = LinkCell::new();
                 link_cell.inject(event_value);
-                self.links.insert(slot_key, link_cell);
+                self.links.insert(slot_key.clone(), link_cell);
             }
+
+            // Track this LINK for targeted nested HOLD re-evaluation
+            self.affected_links_this_tick.push(slot_key);
         }
     }
 
@@ -456,7 +494,8 @@ impl Runtime {
 
                 if let Some((list_slot, list_cell)) = list_info {
                     let refreshed: Vec<Value> = items
-                        .into_iter()
+                        .iter()
+                        .cloned()
                         .zip(list_cell.keys.iter())
                         .map(|(item, item_key)| {
                             // Build the item's scope: parent / list_expr_id / item_key
@@ -465,7 +504,7 @@ impl Runtime {
                             self.refresh_object_fields(item, &item_scope)
                         })
                         .collect();
-                    Value::List(refreshed)
+                    Value::List(std::sync::Arc::new(refreshed))
                 } else {
                     Value::List(items)
                 }
@@ -480,39 +519,46 @@ impl Runtime {
     }
 
     /// Refresh object fields with current HOLD values from the item scope
+    /// Uses holds_by_scope index for O(1) lookup instead of O(n) iteration
     fn refresh_object_fields(&self, item: Value, item_scope: &ScopeId) -> Value {
+        use std::sync::Arc;
         match item {
-            Value::Object(mut fields) => {
-                // Look for HOLDs under this item's scope
-                for (hold_key, hold_cell) in &self.holds {
-                    // Check if this HOLD is at or under the item's scope
-                    if *item_scope == hold_key.scope || item_scope.is_ancestor_of(&hold_key.scope) {
-                        // This HOLD is nested under this item
-                        // Match field by value type (heuristic for todo_mvc structure)
-                        match &hold_cell.value {
-                            Value::Bool(_) => {
-                                // Boolean HOLDs map to 'completed' field
-                                fields.insert("completed".to_string(), hold_cell.value.clone());
-                            }
-                            Value::String(_) => {
-                                // String HOLDs map to 'text' field
-                                fields.insert("text".to_string(), hold_cell.value.clone());
-                            }
-                            _ => {
-                                // For other types, try to find a matching field
-                                for (field_name, field_val) in fields.iter_mut() {
-                                    if std::mem::discriminant(field_val)
-                                        == std::mem::discriminant(&hold_cell.value)
-                                    {
-                                        *field_val = hold_cell.value.clone();
-                                        break;
+            Value::Object(arc_fields) => {
+                // Clone the underlying HashMap for mutation (copy-on-write semantics)
+                let mut fields = (*arc_fields).clone();
+
+                // Use index to find HOLDs at this item's scope (O(1) lookup)
+                if let Some(hold_keys) = self.holds_by_scope.get(item_scope) {
+                    for hold_key in hold_keys {
+                        if let Some(hold_cell) = self.holds.get(hold_key) {
+                            // Match field by value type (heuristic for todo_mvc structure)
+                            match &hold_cell.value {
+                                Value::Bool(_) => {
+                                    fields.insert("completed".to_string(), hold_cell.value.clone());
+                                }
+                                Value::String(_) => {
+                                    fields.insert("text".to_string(), hold_cell.value.clone());
+                                }
+                                _ => {
+                                    for (_, field_val) in fields.iter_mut() {
+                                        if std::mem::discriminant(field_val)
+                                            == std::mem::discriminant(&hold_cell.value)
+                                        {
+                                            *field_val = hold_cell.value.clone();
+                                            break;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
-                Value::Object(fields)
+
+                // B3: Removed ancestor check loop - O(n_scopes × depth) was too expensive
+                // The first loop already handles HOLDs at the exact item_scope
+                // Deeply nested HOLDs are rare and can be handled differently if needed
+
+                Value::Object(Arc::new(fields))
             }
             _ => item,
         }

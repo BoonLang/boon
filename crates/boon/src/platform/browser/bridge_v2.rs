@@ -192,8 +192,12 @@ impl ReactiveEventLoop {
 
                 // Check if this timer is still current (not from an old ReactiveEventLoop)
                 let current_gen = CURRENT_GENERATION.load(Ordering::SeqCst);
+                #[cfg(target_arch = "wasm32")]
+                zoon::println!("Timer check: my_gen={} current_gen={}", my_generation, current_gen);
                 if current_gen != my_generation {
                     // Stale timer from old code - don't fire
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::println!("  STALE timer - skipping (my_gen={} != current={})", my_generation, current_gen);
                     return;
                 }
 
@@ -718,8 +722,9 @@ impl ReactiveEventLoop {
         // Build outline CSS
         let outline_css = outline.and_then(|o| self.payload_to_css_outline(&o));
 
-        // Create button using RawHtmlEl directly (like Checkbox::new() does)
-        // Inject press event directly in click handler - simpler and more reliable
+        // Create button using same approach as Zoon's built-in Button
+        // Using <div> with role=button (same as Zoon::Button)
+        let label_for_debug = label_text.clone();
         let mut raw_btn = RawHtmlEl::<web_sys::HtmlDivElement>::new("div")
             .class("button")
             .attr("role", "button")
@@ -730,7 +735,10 @@ impl ReactiveEventLoop {
             .style("display", "inline-flex")
             .event_handler({
                 let reactive_el = reactive_el.clone();
-                move |_: zoon::events::Click| {
+                move |event: zoon::events::Click| {
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::println!(">>> BUTTON CLICK EVENT! label={} press_slot={:?} is_valid={} x={} y={}",
+                        label_for_debug, press_slot, press_slot.is_valid(), event.x(), event.y());
                     if press_slot.is_valid() {
                         reactive_el.inject_event(press_slot, Payload::Unit);
                     }

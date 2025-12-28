@@ -1,5 +1,5 @@
 {
-  "supervisor_prompt": "Make all `makers verify-playground` tests pass. You can change and experiment with anything related to Boon engine and test and mcp infrastructure but don't change examples or tests alone (until there isn't a real bug or you want to add more tests or examples).",
+  "supervisor_prompt": "Make all `makers verify-playground` tests pass. You can change and experiment with anything related to Boon engine and test and mcp infrastructure but don't change examples or tests alone (until there isn't a real bug or you want to add more tests or examples). When done, say +completed+.",
   "completion_condition": "+completed+",
   "completion_command": "makers verify-playground",
   "protected_patterns": [

@@ -19,6 +19,9 @@ pub struct CacheEntry {
     pub last_changed: TickSeq,
     /// Dependencies that were read during computation
     pub deps: SmallVec<[SlotKey; 8]>,
+    /// B2: Whether this expression is pure (no event/HOLD dependencies)
+    /// Pure expressions can be cached across ticks without re-evaluation
+    pub is_pure: bool,
 }
 
 impl CacheEntry {
@@ -28,6 +31,18 @@ impl CacheEntry {
             computed_at,
             last_changed,
             deps: SmallVec::new(),
+            is_pure: false, // Default to impure (safe)
+        }
+    }
+
+    /// Create a pure cache entry (for Literals and pure function calls)
+    pub fn new_pure(value: Value, computed_at: u64, last_changed: TickSeq) -> Self {
+        Self {
+            value,
+            computed_at,
+            last_changed,
+            deps: SmallVec::new(),
+            is_pure: true,
         }
     }
 
@@ -134,6 +149,11 @@ impl Cache {
                 None
             }
         })
+    }
+
+    /// Check if cache has any entries
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Clear all entries (for debugging/testing)

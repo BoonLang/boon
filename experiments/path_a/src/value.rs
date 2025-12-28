@@ -65,11 +65,13 @@ pub mod ops {
     }
 
     pub fn list_append(list: &Value, item: Value) -> Value {
+        use std::sync::Arc;
         match list {
             Value::List(items) => {
-                let mut new_items = items.clone();
+                // Clone the underlying Vec (not just the Arc) and append
+                let mut new_items = (**items).clone();
                 new_items.push(item);
-                Value::List(new_items)
+                Value::List(Arc::new(new_items))
             }
             _ => Value::Skip,
         }
@@ -81,6 +83,28 @@ pub mod ops {
     {
         match list {
             Value::List(items) => Value::Bool(items.iter().all(predicate)),
+            _ => Value::Skip,
+        }
+    }
+
+    pub fn list_clear(_list: &Value) -> Value {
+        use std::sync::Arc;
+        Value::List(Arc::new(Vec::new()))
+    }
+
+    pub fn list_remove(list: &Value, index: i64) -> Value {
+        use std::sync::Arc;
+        match list {
+            Value::List(items) => {
+                let idx = index as usize;
+                if idx < items.len() {
+                    let mut new_items = (**items).clone();
+                    new_items.remove(idx);
+                    Value::List(Arc::new(new_items))
+                } else {
+                    list.clone()
+                }
+            }
             _ => Value::Skip,
         }
     }

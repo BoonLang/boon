@@ -214,6 +214,173 @@ pub fn list_append_program() -> Program {
     b.build_program(vec![("button", button), ("items", hold)])
 }
 
+/// Build a list clear test program:
+/// ```boon
+/// add: LINK
+/// clear: LINK
+/// items: [] |> HOLD state {
+///     LATEST {
+///         add.click |> THEN { state |> List/append(List/len(state)) }
+///         clear.click |> THEN { state |> List/clear() }
+///     }
+/// }
+/// ```
+pub fn list_clear_program() -> Program {
+    let mut b = AstBuilder::new();
+
+    // add: LINK
+    let add = b.link(None);
+
+    // clear: LINK
+    let clear = b.link(None);
+
+    // List/len(state)
+    let state_var = b.var("state");
+    let len = b.call("List/len", vec![state_var]);
+
+    // state |> List/append(len) - using pipe to builtin function
+    let state_var2 = b.var("state");
+    let append = b.pipe(state_var2, "List/append", vec![len]);
+
+    // add.click |> THEN { append }
+    let add_var = b.var("add");
+    let add_click = b.path(add_var, "click");
+    let add_then = b.then(add_click, append);
+
+    // state |> List/clear() - using pipe to builtin function
+    let state_var3 = b.var("state");
+    let list_clear = b.pipe(state_var3, "List/clear", vec![]);
+
+    // clear.click |> THEN { list_clear }
+    let clear_var = b.var("clear");
+    let clear_click = b.path(clear_var, "click");
+    let clear_then = b.then(clear_click, list_clear);
+
+    // LATEST { add_then, clear_then }
+    let latest = b.latest(vec![add_then, clear_then]);
+
+    // [] |> HOLD state { latest }
+    let empty_list = b.list(vec![]);
+    let hold = b.hold(empty_list, "state", latest);
+
+    b.build_program(vec![("add", add), ("clear", clear), ("items", hold)])
+}
+
+/// Build a list remove test program:
+/// ```boon
+/// add: LINK
+/// remove: LINK
+/// items: [] |> HOLD state {
+///     LATEST {
+///         add.click |> THEN { state |> List/append({id: List/len(state)}) }
+///         remove.click |> THEN { state |> List/remove(0) }
+///     }
+/// }
+/// ```
+pub fn list_remove_program() -> Program {
+    let mut b = AstBuilder::new();
+
+    // add: LINK
+    let add = b.link(None);
+
+    // remove: LINK
+    let remove = b.link(None);
+
+    // List/len(state)
+    let state_var = b.var("state");
+    let len = b.call("List/len", vec![state_var]);
+
+    // { id: List/len(state) }
+    let item = b.object(vec![("id", len)]);
+
+    // state |> List/append(item) - using pipe to builtin function
+    let state_var2 = b.var("state");
+    let append = b.pipe(state_var2, "List/append", vec![item]);
+
+    // add.click |> THEN { append }
+    let add_var = b.var("add");
+    let add_click = b.path(add_var, "click");
+    let add_then = b.then(add_click, append);
+
+    // state |> List/remove(0) - using pipe to builtin function
+    let state_var3 = b.var("state");
+    let zero = b.int(0);
+    let list_remove = b.pipe(state_var3, "List/remove", vec![zero]);
+
+    // remove.click |> THEN { list_remove }
+    let remove_var = b.var("remove");
+    let remove_click = b.path(remove_var, "click");
+    let remove_then = b.then(remove_click, list_remove);
+
+    // LATEST { add_then, remove_then }
+    let latest = b.latest(vec![add_then, remove_then]);
+
+    // [] |> HOLD state { latest }
+    let empty_list = b.list(vec![]);
+    let hold = b.hold(empty_list, "state", latest);
+
+    b.build_program(vec![("add", add), ("remove", remove), ("items", hold)])
+}
+
+/// Build a list retain test program:
+/// ```boon
+/// add: LINK
+/// clear_completed: LINK
+/// items: [] |> HOLD state {
+///     LATEST {
+///         add.click |> THEN { state |> List/append({completed: False}) }
+///         clear_completed.click |> THEN {
+///             state |> List/retain(item => item.completed |> Bool/not())
+///         }
+///     }
+/// }
+/// ```
+pub fn list_retain_program() -> Program {
+    let mut b = AstBuilder::new();
+
+    // add: LINK
+    let add = b.link(None);
+
+    // clear_completed: LINK
+    let clear_completed = b.link(None);
+
+    // { completed: False }
+    let false_val = b.bool(false);
+    let item = b.object(vec![("completed", false_val)]);
+
+    // state |> List/append(item) - using pipe to builtin function
+    let state_var = b.var("state");
+    let append = b.pipe(state_var, "List/append", vec![item]);
+
+    // add.click |> THEN { append }
+    let add_var = b.var("add");
+    let add_click = b.path(add_var, "click");
+    let add_then = b.then(add_click, append);
+
+    // item.completed |> Bool/not()
+    let item_var = b.var("item");
+    let item_completed = b.path(item_var, "completed");
+    let not_completed = b.pipe(item_completed, "Bool/not", vec![]);
+
+    // state |> List/retain(item => not_completed) - uses ExprKind::ListRetain for predicate
+    let state_var2 = b.var("state");
+    let list_retain = b.list_retain(state_var2, "item", not_completed);
+
+    // clear_completed.click |> THEN { list_retain }
+    let clear_var = b.var("clear_completed");
+    let clear_click = b.path(clear_var, "click");
+    let clear_then = b.then(clear_click, list_retain);
+
+    // LATEST { add_then, clear_then }
+    let latest = b.latest(vec![add_then, clear_then]);
+
+    // [] |> HOLD state { latest }
+    let empty_list = b.list(vec![]);
+    let hold = b.hold(empty_list, "state", latest);
+
+    b.build_program(vec![("add", add), ("clear_completed", clear_completed), ("items", hold)])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +401,32 @@ mod tests {
         assert_eq!(program.bindings[1].0, "new_todo_input");
         assert_eq!(program.bindings[2].0, "todos");
         assert_eq!(program.bindings[3].0, "all_completed");
+    }
+
+    #[test]
+    fn test_list_clear_program_structure() {
+        let program = list_clear_program();
+        assert_eq!(program.bindings.len(), 3);
+        assert_eq!(program.bindings[0].0, "add");
+        assert_eq!(program.bindings[1].0, "clear");
+        assert_eq!(program.bindings[2].0, "items");
+    }
+
+    #[test]
+    fn test_list_remove_program_structure() {
+        let program = list_remove_program();
+        assert_eq!(program.bindings.len(), 3);
+        assert_eq!(program.bindings[0].0, "add");
+        assert_eq!(program.bindings[1].0, "remove");
+        assert_eq!(program.bindings[2].0, "items");
+    }
+
+    #[test]
+    fn test_list_retain_program_structure() {
+        let program = list_retain_program();
+        assert_eq!(program.bindings.len(), 3);
+        assert_eq!(program.bindings[0].0, "add");
+        assert_eq!(program.bindings[1].0, "clear_completed");
+        assert_eq!(program.bindings[2].0, "items");
     }
 }

@@ -1079,6 +1079,16 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        ParsedAction::ClickButtonNearText { text, button_text } => {
+            let response = send_command_to_server(port, WsCommand::ClickButtonNearText {
+                text: text.clone(),
+                button_text: button_text.clone()
+            }).await?;
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Click button near text failed: {}", message);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         ParsedAction::ClickCheckbox { index } => {
             let response = send_command_to_server(port, WsCommand::ClickCheckbox { index: *index }).await?;
             if let WsResponse::Error { message } = response {
@@ -1193,6 +1203,17 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
             }
         }
         ParsedAction::AssertButtonCount { expected } => {
+            // IMPORTANT: Clear hover state before counting buttons.
+            // Delete buttons (×) in TodoMVC only appear on hover.
+            //
+            // NOTE: Zoon's on_hovered_change doesn't respond to synthetic
+            // mouseenter/mouseleave events. We try multiple approaches but
+            // this is a known limitation of the test infrastructure.
+            //
+            // Attempt 1: Move mouse outside preview area via CDP
+            let _ = send_command_to_server(port, WsCommand::HoverAt { x: 0, y: 0 }).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
             // Get preview elements and count buttons
             let response = send_command_to_server(port, WsCommand::GetPreviewElements).await?;
             match response {
@@ -1229,38 +1250,81 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 _ => anyhow::bail!("Unexpected response for GetPreviewText"),
             }
         }
+        ParsedAction::AssertNotFocused { input_index } => {
+            // Verify that a specific input does NOT have focus
+            let response = send_command_to_server(port, WsCommand::GetFocusedElement).await?;
+            match response {
+                WsResponse::FocusedElement { input_index: actual_index, .. } => {
+                    if actual_index == Some(*input_index) {
+                        anyhow::bail!(
+                            "Assert not focused failed: expected input {} to NOT be focused, but it is",
+                            input_index
+                        );
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert not focused failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for GetFocusedElement"),
+            }
+        }
+        ParsedAction::AssertCheckboxUnchecked { index } => {
+            // Verify that a specific checkbox is NOT checked
+            let response = send_command_to_server(port, WsCommand::GetCheckboxState { index: *index }).await?;
+            match response {
+                WsResponse::CheckboxState { found, checked } => {
+                    if !found {
+                        anyhow::bail!("Assert checkbox unchecked failed: checkbox {} not found", index);
+                    }
+                    if checked {
+                        anyhow::bail!(
+                            "Assert checkbox unchecked failed: expected checkbox {} to be UNCHECKED, but it is checked",
+                            index
+                        );
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert checkbox unchecked failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for GetCheckboxState"),
+            }
+        }
     }
     Ok(())
 }
 
-/// Count buttons in preview elements JSON
+/// Count DELETE buttons (×) in preview elements JSON
+/// This specifically counts buttons that are delete buttons (text = "×"),
+/// not navigation buttons like All/Active/Completed/Clear.
 fn count_buttons_in_elements(data: &serde_json::Value) -> u32 {
     let mut count = 0;
-    count_buttons_recursive(data, &mut count);
+    count_delete_buttons_recursive(data, &mut count);
     count
 }
 
-fn count_buttons_recursive(value: &serde_json::Value, count: &mut u32) {
+fn count_delete_buttons_recursive(value: &serde_json::Value, count: &mut u32) {
     match value {
         serde_json::Value::Object(obj) => {
-            // Check if this element is a button
+            // Check if this element is a DELETE button (text = "×")
             let tag_name = obj.get("tagName").and_then(|v| v.as_str()).unwrap_or("");
             let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let text = obj.get("directText").and_then(|v| v.as_str()).unwrap_or("");
 
-            if tag_name.eq_ignore_ascii_case("button") || role == "button" {
+            // Only count buttons with × (delete buttons), not navigation buttons
+            if (tag_name.eq_ignore_ascii_case("button") || role == "button") && text == "×" {
                 *count += 1;
             }
 
             // Recurse into children and other values
             for (key, val) in obj {
-                if key != "tagName" && key != "role" {
-                    count_buttons_recursive(val, count);
+                if key != "tagName" && key != "role" && key != "directText" {
+                    count_delete_buttons_recursive(val, count);
                 }
             }
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
-                count_buttons_recursive(item, count);
+                count_delete_buttons_recursive(item, count);
             }
         }
         _ => {}

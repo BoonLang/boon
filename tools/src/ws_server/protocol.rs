@@ -98,6 +98,14 @@ pub enum Command {
     /// Click button by index in preview pane (0-indexed, buttons only)
     ClickButton { index: u32 },
 
+    /// Click a button near an element with specific text (e.g., × button for a todo item)
+    /// More reliable than hover + click_button because hover state can be unreliable
+    ClickButtonNearText {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        button_text: Option<String>,
+    },
+
     /// Click any element by its text content
     ClickByText { text: String, exact: bool },
 
@@ -137,6 +145,9 @@ pub enum Command {
     /// ATOMIC: Run code and capture initial preview BEFORE any async events fire
     /// This is critical for testing initial state before timer-based updates
     RunAndCaptureInitial,
+
+    /// Get checkbox state (checked/unchecked) by index in preview pane (0-indexed)
+    GetCheckboxState { index: u32 },
 }
 
 /// Response from Extension to CLI via Server
@@ -241,6 +252,14 @@ pub enum Response {
         initial_preview: String,
         /// Timestamp when capture was made
         timestamp: u64,
+    },
+
+    /// Checkbox state response
+    CheckboxState {
+        /// Whether the checkbox was found
+        found: bool,
+        /// Whether the checkbox is checked
+        checked: bool,
     },
 }
 

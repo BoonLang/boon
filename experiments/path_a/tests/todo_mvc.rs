@@ -22,7 +22,7 @@ fn todo_mvc_add_items() {
             assert_eq!(items.len(), 1);
             // Check text field
             if let Value::Object(obj) = &items[0] {
-                assert_eq!(obj.get("text"), Some(&Value::String("Buy groceries".to_string())));
+                assert_eq!(obj.get("text"), Some(&Value::string("Buy groceries")));
             }
         }
         _ => panic!("Expected list"),

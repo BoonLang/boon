@@ -129,6 +129,38 @@ pub enum NodeKind {
         instantiated_count: usize,
     },
 
+    /// List/clear - clears all items from a list
+    ListClear {
+        /// Source list slot
+        list: SlotId,
+        /// Trigger slot - when non-Skip, clear the list
+        trigger: Option<SlotId>,
+    },
+
+    /// List/remove - removes item at index from a list
+    ListRemove {
+        /// Source list slot
+        list: SlotId,
+        /// Index to remove
+        index: SlotId,
+        /// Trigger slot - when non-Skip, remove the item
+        trigger: Option<SlotId>,
+    },
+
+    /// List/retain - keeps items matching predicate
+    ListRetain {
+        /// Source list slot
+        list: SlotId,
+        /// Trigger slot - when non-Skip, filter the list
+        trigger: Option<SlotId>,
+        /// Predicate template AST (compiled fresh for each item)
+        predicate_template: Box<Expr>,
+        /// Item name for predicate binding
+        item_name: String,
+        /// Captured bindings from outer scope
+        captures: HashMap<String, SlotId>,
+    },
+
     /// Block with local bindings
     Block {
         /// Local binding slots

@@ -35,7 +35,7 @@ fn toggle_all_affects_new_items() {
     match &todos {
         Value::List(items) => {
             assert_eq!(items.len(), 2);
-            for item in items {
+            for item in items.iter() {
                 if let Value::Object(obj) = item {
                     assert_eq!(obj.get("completed"), Some(&Value::Bool(false)));
                 }

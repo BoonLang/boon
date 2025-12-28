@@ -110,6 +110,34 @@ impl ListCell {
         }
     }
 
+    /// Remove an item by index
+    pub fn remove_at(&mut self, index: usize) -> bool {
+        if index < self.keys.len() {
+            self.keys.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear all items
+    pub fn clear(&mut self) {
+        self.keys.clear();
+    }
+
+    /// Retain items matching predicate
+    pub fn retain<F>(&mut self, predicate: F)
+    where
+        F: Fn(usize) -> bool,
+    {
+        let mut i = 0;
+        self.keys.retain(|_| {
+            let keep = predicate(i);
+            i += 1;
+            keep
+        });
+    }
+
     /// Get number of items
     pub fn len(&self) -> usize {
         self.keys.len()

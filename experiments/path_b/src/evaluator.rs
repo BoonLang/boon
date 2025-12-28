@@ -8,7 +8,7 @@ use crate::scope::ScopeId;
 use crate::slot::SlotKey;
 use crate::tick::{TickCounter, TickSeq};
 use crate::value::{is_skip, ops};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shared::ast::{Expr, ExprId, ExprKind, Literal, Pattern, Program};
 use shared::test_harness::Value;
 use std::collections::HashMap;
@@ -21,6 +21,8 @@ pub struct EvalContext<'a> {
     pub cache: &'a mut Cache,
     /// HOLD cells - uses FxHashMap for faster lookups
     pub holds: &'a mut FxHashMap<SlotKey, HoldCell>,
+    /// Index: scope -> list of HOLD keys under that scope (for O(1) lookup in refresh)
+    pub holds_by_scope: &'a mut FxHashMap<ScopeId, Vec<SlotKey>>,
     /// LINK cells - uses FxHashMap for faster lookups
     pub links: &'a mut FxHashMap<SlotKey, LinkCell>,
     /// LIST cells - uses FxHashMap for faster lookups
@@ -31,8 +33,8 @@ pub struct EvalContext<'a> {
     pub top_level: &'a HashMap<String, ExprId>,
     /// Current scope bindings (name -> (scope, expr))
     pub bindings: HashMap<String, (ScopeId, ExprId)>,
-    /// Dependencies being tracked
-    pub current_deps: Vec<SlotKey>,
+    /// Dependencies being tracked (FxHashSet for O(1) contains check)
+    pub current_deps: FxHashSet<SlotKey>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -54,11 +56,9 @@ impl<'a> EvalContext<'a> {
         self.bindings.insert(name, (scope, expr));
     }
 
-    /// Track a dependency
+    /// Track a dependency (O(1) with FxHashSet)
     pub fn track_dep(&mut self, slot: SlotKey) {
-        if !self.current_deps.contains(&slot) {
-            self.current_deps.push(slot);
-        }
+        self.current_deps.insert(slot);
     }
 
     /// Get current tick
@@ -72,10 +72,17 @@ pub fn eval(expr: &Expr, scope: &ScopeId, ctx: &mut EvalContext) -> (Value, Tick
     let slot_key = SlotKey::new(scope.clone(), expr.id);
     let current_tick = ctx.current_tick();
 
-    // Check cache - use tick-based invalidation for correctness
-    // Note: is_valid() method exists for dependency-based invalidation
-    // but requires more integration with event/LINK system to work correctly
+    // B2: Check cache with pure expression optimization
+    // Pure expressions don't depend on events/HOLD, so they're valid across ticks
     if let Some(entry) = ctx.cache.get(&slot_key) {
+        // Pure expressions: return cached value regardless of tick
+        if entry.is_pure {
+            let value = entry.value.clone();
+            let ts = entry.last_changed;
+            ctx.track_dep(slot_key);
+            return (value, ts);
+        }
+        // Impure expressions: only valid for current tick
         if entry.is_current(current_tick) {
             let value = entry.value.clone();
             let ts = entry.last_changed;
@@ -84,107 +91,150 @@ pub fn eval(expr: &Expr, scope: &ScopeId, ctx: &mut EvalContext) -> (Value, Tick
         }
     }
 
-    // Evaluate
-    let (value, ts) = eval_inner(expr, scope, ctx);
+    // Evaluate and track purity
+    let (value, ts, is_pure) = eval_inner_with_purity(expr, scope, ctx);
 
     // Update cache
     let deps = std::mem::take(&mut ctx.current_deps);
-    let mut entry = CacheEntry::new(value.clone(), current_tick, ts);
-    entry.deps = deps.into();
+    let mut entry = if is_pure {
+        CacheEntry::new_pure(value.clone(), current_tick, ts)
+    } else {
+        CacheEntry::new(value.clone(), current_tick, ts)
+    };
+    entry.deps = deps.into_iter().collect();
     ctx.cache.insert(slot_key.clone(), entry);
 
     ctx.track_dep(slot_key);
     (value, ts)
 }
 
-/// Inner evaluation (no caching)
-fn eval_inner(expr: &Expr, scope: &ScopeId, ctx: &mut EvalContext) -> (Value, TickSeq) {
+/// B2: Evaluate with purity tracking
+/// Returns (value, timestamp, is_pure)
+/// Pure expressions don't depend on events/HOLD and can be cached across ticks
+fn eval_inner_with_purity(expr: &Expr, scope: &ScopeId, ctx: &mut EvalContext) -> (Value, TickSeq, bool) {
     let ts = ctx.tick_counter.next();
 
     match &expr.kind {
         ExprKind::Literal(lit) => {
             let value = literal_to_value(lit);
-            (value, ts)
+            (value, ts, true) // Literals are always pure
         }
 
         ExprKind::Variable(name) => {
             if let Some((var_scope, expr_id)) = ctx.lookup(name) {
-                // Check if this is a HOLD state reference - return held value directly
+                // Check if this is a HOLD state reference - NOT pure
                 let slot_key = SlotKey::new(var_scope.clone(), expr_id);
                 if let Some(cell) = ctx.holds.get(&slot_key) {
-                    return (cell.value.clone(), ts);
+                    return (cell.value.clone(), ts, false);
+                }
+
+                // Check if value is cached (for lambda bindings like List/retain item)
+                if let Some(entry) = ctx.cache.get(&slot_key) {
+                    return (entry.value.clone(), entry.last_changed, entry.is_pure);
                 }
 
                 // Find the expression in the program
                 if let Some((_, var_expr)) = ctx.program.bindings.iter().find(|(_, e)| e.id == expr_id) {
-                    return eval(var_expr, &var_scope, ctx);
+                    let (val, vts) = eval(var_expr, &var_scope, ctx);
+                    // Variable purity depends on what it references
+                    let is_pure = ctx.cache.get(&SlotKey::new(var_scope, expr_id))
+                        .map(|e| e.is_pure)
+                        .unwrap_or(false);
+                    return (val, vts, is_pure);
                 }
             }
-            (Value::Skip, ts)
+            (Value::Skip, ts, false)
         }
 
         ExprKind::Path(base, field) => {
             let (base_val, base_ts) = eval(base, scope, ctx);
             let value = ops::get_field(&base_val, field);
-            (value, base_ts)
+            // Path is pure if base is pure
+            let base_key = SlotKey::new(scope.clone(), base.id);
+            let is_pure = ctx.cache.get(&base_key).map(|e| e.is_pure).unwrap_or(false);
+            (value, base_ts, is_pure)
         }
 
         ExprKind::Object(fields) => {
             let mut obj = HashMap::new();
             let mut max_ts = ts;
+            let mut all_pure = true;
             for (name, field_expr) in fields {
                 let (val, field_ts) = eval(field_expr, scope, ctx);
                 obj.insert(name.clone(), val);
                 if field_ts > max_ts {
                     max_ts = field_ts;
                 }
+                // Check if this field is pure
+                let field_key = SlotKey::new(scope.clone(), field_expr.id);
+                if !ctx.cache.get(&field_key).map(|e| e.is_pure).unwrap_or(false) {
+                    all_pure = false;
+                }
             }
-            (Value::Object(obj), max_ts)
+            (Value::Object(std::sync::Arc::new(obj)), max_ts, all_pure)
         }
 
         ExprKind::List(items) => {
             let mut list = Vec::new();
             let mut max_ts = ts;
+            let mut all_pure = true;
             for item_expr in items {
                 let (val, item_ts) = eval(item_expr, scope, ctx);
                 list.push(val);
                 if item_ts > max_ts {
                     max_ts = item_ts;
                 }
+                let item_key = SlotKey::new(scope.clone(), item_expr.id);
+                if !ctx.cache.get(&item_key).map(|e| e.is_pure).unwrap_or(false) {
+                    all_pure = false;
+                }
             }
-            (Value::List(list), max_ts)
+            (Value::List(std::sync::Arc::new(list)), max_ts, all_pure)
         }
 
         ExprKind::Call(name, args) => {
             let mut arg_values = Vec::new();
             let mut max_ts = ts;
+            let mut all_pure = is_pure_function(name);
             for arg in args {
                 let (val, arg_ts) = eval(arg, scope, ctx);
                 arg_values.push(val);
                 if arg_ts > max_ts {
                     max_ts = arg_ts;
                 }
+                let arg_key = SlotKey::new(scope.clone(), arg.id);
+                if !ctx.cache.get(&arg_key).map(|e| e.is_pure).unwrap_or(false) {
+                    all_pure = false;
+                }
             }
             let result = call_builtin(name, &arg_values);
-            (result, max_ts)
+            (result, max_ts, all_pure)
         }
 
         ExprKind::Pipe(input, method, args) => {
             let (input_val, input_ts) = eval(input, scope, ctx);
             let mut arg_values = vec![input_val];
             let mut max_ts = input_ts;
+            let input_key = SlotKey::new(scope.clone(), input.id);
+            let mut all_pure = is_pure_function(method)
+                && ctx.cache.get(&input_key).map(|e| e.is_pure).unwrap_or(false);
             for arg in args {
                 let (val, arg_ts) = eval(arg, scope, ctx);
                 arg_values.push(val);
                 if arg_ts > max_ts {
                     max_ts = arg_ts;
                 }
+                let arg_key = SlotKey::new(scope.clone(), arg.id);
+                if !ctx.cache.get(&arg_key).map(|e| e.is_pure).unwrap_or(false) {
+                    all_pure = false;
+                }
             }
             let result = call_builtin(method, &arg_values);
-            (result, max_ts)
+            (result, max_ts, all_pure)
         }
 
         ExprKind::Latest(exprs) => {
+            // LATEST can depend on events - not pure
             let mut result = Value::Skip;
             let mut max_ts = ts;
             for sub_expr in exprs {
@@ -194,104 +244,115 @@ fn eval_inner(expr: &Expr, scope: &ScopeId, ctx: &mut EvalContext) -> (Value, Ti
                     max_ts = sub_ts;
                 }
             }
-            (result, max_ts)
+            (result, max_ts, false)
         }
 
         ExprKind::Hold { initial, state_name, body } => {
+            // HOLD is stateful - never pure
             let slot_key = SlotKey::new(scope.clone(), expr.id);
 
-            // Get or create hold cell
             let current_value = if let Some(cell) = ctx.holds.get(&slot_key) {
                 cell.value.clone()
             } else {
-                // Initialize the cell
                 let (init_val, _) = eval(initial, scope, ctx);
                 ctx.holds.insert(slot_key.clone(), HoldCell::new(init_val.clone()));
+                ctx.holds_by_scope
+                    .entry(scope.clone())
+                    .or_default()
+                    .push(slot_key.clone());
                 init_val
             };
 
-            // Bind state name
             ctx.bind(state_name.clone(), scope.clone(), expr.id);
-
-            // Evaluate body
             let (body_val, body_ts) = eval(body, scope, ctx);
 
-            // Update state if body produced a value
             if !is_skip(&body_val) {
                 if let Some(cell) = ctx.holds.get_mut(&slot_key) {
                     cell.value = body_val.clone();
                 }
-                (body_val, body_ts)
+                (body_val, body_ts, false)
             } else {
-                (current_value, ts)
+                (current_value, ts, false)
             }
         }
 
         ExprKind::Then { input, body } => {
+            // THEN depends on events - not pure
             let (input_val, _) = eval(input, scope, ctx);
             if is_skip(&input_val) {
-                (Value::Skip, ts)
+                (Value::Skip, ts, false)
             } else {
-                eval(body, scope, ctx)
+                let (val, vts) = eval(body, scope, ctx);
+                (val, vts, false)
             }
         }
 
         ExprKind::When { input, arms } => {
+            // WHEN depends on events - not pure
             let (input_val, _) = eval(input, scope, ctx);
             if is_skip(&input_val) {
-                return (Value::Skip, ts);
+                return (Value::Skip, ts, false);
             }
 
             for (pattern, body) in arms {
                 if pattern_matches(pattern, &input_val, &mut ctx.bindings, scope) {
-                    return eval(body, scope, ctx);
+                    let (val, vts) = eval(body, scope, ctx);
+                    return (val, vts, false);
                 }
             }
-            (Value::Skip, ts)
+            (Value::Skip, ts, false)
         }
 
         ExprKind::While { input, pattern, body } => {
+            // WHILE depends on events - not pure
             let (input_val, _) = eval(input, scope, ctx);
             if is_skip(&input_val) {
-                return (Value::Skip, ts);
+                return (Value::Skip, ts, false);
             }
 
             if pattern_matches(pattern, &input_val, &mut ctx.bindings, scope) {
-                eval(body, scope, ctx)
+                let (val, vts) = eval(body, scope, ctx);
+                (val, vts, false)
             } else {
-                (Value::Skip, ts)
+                (Value::Skip, ts, false)
             }
         }
 
         ExprKind::Link(_alias) => {
+            // LINK is event-driven - never pure
             let slot_key = SlotKey::new(scope.clone(), expr.id);
-
-            // Get or create link cell
             let cell = ctx.links.entry(slot_key.clone()).or_insert_with(LinkCell::new);
 
-            // Return pending event if any (peek, don't consume - multiple readers may need it)
             if let Some(event) = cell.peek_event() {
-                (event.clone(), ctx.tick_counter.next())
+                (event.clone(), ctx.tick_counter.next(), false)
             } else {
-                (Value::Skip, ts)
+                (Value::Skip, ts, false)
             }
         }
 
         ExprKind::Block { bindings, output } => {
-            // Evaluate bindings
+            let mut all_pure = true;
             for (name, binding_expr) in bindings {
                 let (val, _) = eval(binding_expr, scope, ctx);
                 ctx.bind(name.clone(), scope.clone(), binding_expr.id);
-                // Store the value in cache
                 let binding_key = SlotKey::new(scope.clone(), binding_expr.id);
+                let is_binding_pure = ctx.cache.get(&binding_key).map(|e| e.is_pure).unwrap_or(false);
+                if !is_binding_pure {
+                    all_pure = false;
+                }
                 ctx.cache.insert(binding_key, CacheEntry::new(val, ctx.current_tick(), ts));
             }
 
-            // Evaluate output
-            eval(output, scope, ctx)
+            let (val, vts) = eval(output, scope, ctx);
+            let output_key = SlotKey::new(scope.clone(), output.id);
+            if !ctx.cache.get(&output_key).map(|e| e.is_pure).unwrap_or(false) {
+                all_pure = false;
+            }
+            (val, vts, all_pure)
         }
 
         ExprKind::ListMap { list, item_name, template } => {
+            // ListMap is dynamic - not pure
             let _slot_key = SlotKey::new(scope.clone(), expr.id);
             let (list_val, _) = eval(list, scope, ctx);
 
@@ -299,49 +360,154 @@ fn eval_inner(expr: &Expr, scope: &ScopeId, ctx: &mut EvalContext) -> (Value, Ti
                 Value::List(items) => {
                     let mut results = Vec::new();
                     for (idx, item) in items.iter().enumerate() {
-                        // Create child scope for this item
                         let item_scope = scope.child(idx as u64);
-
-                        // Bind item name
                         ctx.bind(item_name.clone(), item_scope.clone(), template.id);
-
-                        // Store item value
                         let item_key = SlotKey::new(item_scope.clone(), template.id);
                         ctx.cache.insert(item_key, CacheEntry::new(item.clone(), ctx.current_tick(), ts));
-
-                        // Evaluate template
                         let (result, _) = eval(template, &item_scope, ctx);
                         results.push(result);
                     }
-                    (Value::List(results), ts)
+                    (Value::List(std::sync::Arc::new(results)), ts, false)
                 }
-                _ => (Value::Skip, ts),
+                _ => (Value::Skip, ts, false),
             }
         }
 
         ExprKind::ListAppend { list, item } => {
+            // ListAppend is stateful - not pure
             let (list_val, _) = eval(list, scope, ctx);
-
-            // Get or create a ListCell to track item allocations
             let list_slot = SlotKey::new(scope.clone(), expr.id);
             let item_key = {
                 let list_cell = ctx.lists.entry(list_slot).or_insert_with(ListCell::new);
                 list_cell.append()
             };
-
-            // Create a child scope for this item
-            // The scope path is: parent_scope -> list_expr_id -> item_key
-            // This ensures each item's nested HOLDs get unique cells
             let item_scope = scope.child(expr.id.0 as u64).child(item_key.0);
-
-            // Evaluate the item template IN the item's scope
             let (item_val, _) = eval(item, &item_scope, ctx);
-
-            // Append to the list value
             let result = ops::list_append(&list_val, item_val);
-            (result, ts)
+            (result, ts, false)
+        }
+
+        ExprKind::ListClear { list } => {
+            // ListClear is stateful - not pure
+            let (list_val, _) = eval(list, scope, ctx);
+            let list_slot = SlotKey::new(scope.clone(), list.id);
+            // Clear the ListCell if it exists
+            if let Some(list_cell) = ctx.lists.get_mut(&list_slot) {
+                list_cell.clear();
+            }
+            // Return empty list
+            let result = ops::list_clear(&list_val);
+            (result, ts, false)
+        }
+
+        ExprKind::ListRemove { list, index } => {
+            // ListRemove is stateful - not pure
+            let (list_val, _) = eval(list, scope, ctx);
+            let (index_val, _) = eval(index, scope, ctx);
+            let list_slot = SlotKey::new(scope.clone(), list.id);
+
+            if let Value::Int(idx) = index_val {
+                // Remove from ListCell if it exists
+                if let Some(list_cell) = ctx.lists.get_mut(&list_slot) {
+                    list_cell.remove_at(idx as usize);
+                }
+                let result = ops::list_remove(&list_val, idx);
+                (result, ts, false)
+            } else {
+                (list_val, ts, false)
+            }
+        }
+
+        ExprKind::ListRetain { list, item_name, predicate } => {
+            // ListRetain is stateful - not pure
+            let (list_val, _) = eval(list, scope, ctx);
+
+            match &list_val {
+                Value::List(items) => {
+                    // Evaluate predicate for each item using simple inline evaluation
+                    let mut retain_indices = Vec::new();
+                    for (idx, item) in items.iter().enumerate() {
+                        // Evaluate predicate inline by substituting the item value
+                        let pred_result = eval_predicate_inline(predicate, item_name, item);
+                        if pred_result {
+                            retain_indices.push(idx);
+                        }
+                    }
+
+                    // Filter the list to only retained items
+                    let retained: Vec<Value> = retain_indices
+                        .iter()
+                        .filter_map(|&idx| items.get(idx).cloned())
+                        .collect();
+
+                    // Update ListCell if it exists
+                    let list_slot = SlotKey::new(scope.clone(), list.id);
+                    if let Some(list_cell) = ctx.lists.get_mut(&list_slot) {
+                        let retain_set: std::collections::HashSet<usize> = retain_indices.into_iter().collect();
+                        list_cell.retain(|i| retain_set.contains(&i));
+                    }
+
+                    (Value::List(std::sync::Arc::new(retained)), ts, false)
+                }
+                _ => (list_val, ts, false),
+            }
         }
     }
+}
+
+/// Evaluate a predicate inline by substituting the item value
+/// Used for List/retain where we need to evaluate item => predicate patterns
+fn eval_predicate_inline(predicate: &Expr, item_name: &str, item: &Value) -> bool {
+    use shared::ast::ExprKind;
+    match &predicate.kind {
+        ExprKind::Pipe(base, method, _args) => {
+            // Evaluate base, then apply method
+            let base_val = eval_expr_inline(base, item_name, item);
+            match method.as_str() {
+                "Bool/not" => {
+                    match base_val {
+                        Value::Bool(b) => !b, // Bool/not returns the negation
+                        _ => false,
+                    }
+                }
+                _ => false,
+            }
+        }
+        ExprKind::Path(base, field) => {
+            let base_val = eval_expr_inline(base, item_name, item);
+            match ops::get_field(&base_val, field) {
+                Value::Bool(b) => b,
+                _ => false,
+            }
+        }
+        ExprKind::Variable(name) if name == item_name => {
+            matches!(item, Value::Bool(true))
+        }
+        _ => false,
+    }
+}
+
+/// Evaluate a simple expression inline by substituting the item value
+fn eval_expr_inline(expr: &Expr, item_name: &str, item: &Value) -> Value {
+    use shared::ast::ExprKind;
+    match &expr.kind {
+        ExprKind::Variable(name) if name == item_name => {
+            item.clone()
+        }
+        ExprKind::Path(base, field) => {
+            let base_val = eval_expr_inline(base, item_name, item);
+            ops::get_field(&base_val, field)
+        }
+        _ => Value::Skip,
+    }
+}
+
+/// Check if a function is pure (no side effects)
+fn is_pure_function(name: &str) -> bool {
+    matches!(
+        name,
+        "add" | "Bool/not" | "List/len" | "List/append" | "List/every" | "Math/sum"
+    )
 }
 
 /// Convert a literal to a value
@@ -349,7 +515,7 @@ fn literal_to_value(lit: &Literal) -> Value {
     match lit {
         Literal::Int(v) => Value::Int(*v),
         Literal::Float(v) => Value::Float(*v),
-        Literal::String(v) => Value::String(v.clone()),
+        Literal::String(v) => Value::String(v.as_str().into()),  // String -> Arc<str>
         Literal::Bool(v) => Value::Bool(*v),
         Literal::Unit => Value::Unit,
     }
@@ -415,6 +581,24 @@ fn call_builtin(name: &str, args: &[Value]) -> Value {
         "List/append" => {
             if args.len() >= 2 {
                 ops::list_append(&args[0], args[1].clone())
+            } else {
+                Value::Skip
+            }
+        }
+        "List/clear" => {
+            if !args.is_empty() {
+                ops::list_clear(&args[0])
+            } else {
+                Value::Skip
+            }
+        }
+        "List/remove" => {
+            if args.len() >= 2 {
+                if let Value::Int(idx) = &args[1] {
+                    ops::list_remove(&args[0], *idx)
+                } else {
+                    Value::Skip
+                }
             } else {
                 Value::Skip
             }

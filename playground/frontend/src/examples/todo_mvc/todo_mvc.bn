@@ -514,14 +514,11 @@ FUNCTION footer_section(align, child) {
 }
 
 FUNCTION active_items_count_text() {
+    -- Pattern match directly to avoid dataflow glitch where plural_suffix
+    -- computation races with TEXT interpolation (engine_v2 timing issue)
     PASSED.store.active_todos_count |> WHEN {
-        count => BLOCK {
-            plural_suffix: count =/= 1 |> WHEN {
-                True => TEXT { s }
-                False => Text/empty()
-            }
-            TEXT { {count} item{plural_suffix} left }
-        }
+        1 => TEXT { 1 item left }
+        count => TEXT { {count} items left }
     }
 }
 

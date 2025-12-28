@@ -1085,6 +1085,14 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
             }
         }
 
+        Response::CheckboxState { found, checked } => {
+            if found {
+                Ok(format!("Checkbox state: {}", if checked { "checked" } else { "unchecked" }))
+            } else {
+                Ok("Checkbox not found".to_string())
+            }
+        }
+
         Response::Error { message } => Err(message),
     }
 }

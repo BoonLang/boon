@@ -215,6 +215,8 @@ fn compile_expr_to_node(expr: &Expr, ctx: &mut EvalContext, _slot: SlotId) -> No
 
             // Compile body
             let body_slot = compile_expr(body, ctx);
+            // HOLD subscribes to body so it's notified when body value changes
+            ctx.arena.add_subscriber(body_slot, _slot);
 
             Node::new(NodeKind::Hold {
                 state: state_slot,
@@ -331,6 +333,61 @@ fn compile_expr_to_node(expr: &Expr, ctx: &mut EvalContext, _slot: SlotId) -> No
                 instantiated_count: 0,
             })
         }
+
+        ExprKind::ListClear { list } => {
+            let list_slot = compile_expr(list, ctx);
+            ctx.arena.add_subscriber(list_slot, _slot);
+
+            // Subscribe to trigger if present (from enclosing THEN)
+            if let Some(trigger) = ctx.trigger {
+                ctx.arena.add_subscriber(trigger, _slot);
+            }
+
+            Node::new(NodeKind::ListClear {
+                list: list_slot,
+                trigger: ctx.trigger,
+            })
+        }
+
+        ExprKind::ListRemove { list, index } => {
+            let list_slot = compile_expr(list, ctx);
+            ctx.arena.add_subscriber(list_slot, _slot);
+
+            let index_slot = compile_expr(index, ctx);
+            ctx.arena.add_subscriber(index_slot, _slot);
+
+            // Subscribe to trigger if present (from enclosing THEN)
+            if let Some(trigger) = ctx.trigger {
+                ctx.arena.add_subscriber(trigger, _slot);
+            }
+
+            Node::new(NodeKind::ListRemove {
+                list: list_slot,
+                index: index_slot,
+                trigger: ctx.trigger,
+            })
+        }
+
+        ExprKind::ListRetain { list, item_name, predicate } => {
+            let list_slot = compile_expr(list, ctx);
+            ctx.arena.add_subscriber(list_slot, _slot);
+
+            // Capture all current bindings for predicate evaluation
+            let captures = ctx.bindings.clone();
+
+            // Subscribe to trigger if present (from enclosing THEN)
+            if let Some(trigger) = ctx.trigger {
+                ctx.arena.add_subscriber(trigger, _slot);
+            }
+
+            Node::new(NodeKind::ListRetain {
+                list: list_slot,
+                trigger: ctx.trigger,
+                predicate_template: Box::new(predicate.as_ref().clone()),
+                item_name: item_name.clone(),
+                captures,
+            })
+        }
     }
 }
 
@@ -339,7 +396,7 @@ fn literal_to_value(lit: &Literal) -> Value {
     match lit {
         Literal::Int(v) => Value::Int(*v),
         Literal::Float(v) => Value::Float(*v),
-        Literal::String(v) => Value::String(v.clone()),
+        Literal::String(v) => Value::String(v.as_str().into()),
         Literal::Bool(v) => Value::Bool(*v),
         Literal::Unit => Value::Unit,
     }
@@ -350,14 +407,14 @@ fn eval_constant(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Literal(lit) => literal_to_value(lit),
         ExprKind::List(items) => {
-            Value::List(items.iter().map(eval_constant).collect())
+            Value::List(std::sync::Arc::new(items.iter().map(eval_constant).collect()))
         }
         ExprKind::Object(fields) => {
             let obj: std::collections::HashMap<String, Value> = fields
                 .iter()
                 .map(|(name, expr)| (name.clone(), eval_constant(expr)))
                 .collect();
-            Value::Object(obj)
+            Value::Object(std::sync::Arc::new(obj))
         }
         // For non-constant expressions, return Skip (will be computed at runtime)
         _ => Value::Skip,

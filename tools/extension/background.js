@@ -99,35 +99,17 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
 // ============ CDP OPERATIONS ============
 
-// Click at coordinates (trusted event)
-// NOTE: CDP mouse events may not trigger Zoon button handlers directly because
-// Zoon uses pointer events. We use a hybrid approach: CDP for coordinates,
-// then JS dispatch for pointer events.
-// IMPORTANT: x,y can be either page coordinates (from DOM.getBoxModel) or viewport coordinates.
-// CDP Input.dispatchMouseEvent expects viewport coordinates, so we convert if needed.
+// Click at coordinates using JavaScript events
+// NOTE: We do NOT use CDP Input.dispatchMouseEvent for clicks because CDP mouse events
+// trigger click handlers via the browser, AND we also dispatch JS click events for
+// cross-browser compatibility. This causes double-firing for Zoon buttons.
+// Instead, we just dispatch a single JS click event like clickButton does.
+// IMPORTANT: x,y are page coordinates (from DOM.getBoxModel).
 async function cdpClickAt(tabId, x, y) {
   await attachDebugger(tabId);
 
-  // Get scroll offset to convert page coords to viewport coords for CDP events
-  const scrollOffset = await cdpEvaluate(tabId, `({ scrollX: window.scrollX, scrollY: window.scrollY })`);
-  const viewportX = x - (scrollOffset?.scrollX || 0);
-  const viewportY = y - (scrollOffset?.scrollY || 0);
-
-  // First, move mouse to position (some UIs require this)
-  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
-    type: 'mouseMoved', x: viewportX, y: viewportY, button: 'none'
-  });
-
-  // Then send mouse press/release
-  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
-    type: 'mousePressed', x: viewportX, y: viewportY, button: 'left', clickCount: 1
-  });
-  await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
-    type: 'mouseReleased', x: viewportX, y: viewportY, button: 'left', clickCount: 1
-  });
-
-  // Also dispatch pointer events via JS since Zoon uses pointer events
-  // This ensures Zoon button handlers are triggered
+  // Dispatch only a JavaScript click event on the element at the coordinates.
+  // This matches the approach used by clickButton which works correctly.
   // NOTE: x,y from DOM.getBoxModel are page coordinates, but elementFromPoint needs viewport coordinates
   await cdpEvaluate(tabId, `
     (function() {
@@ -140,22 +122,17 @@ async function cdpClickAt(tabId, x, y) {
         return;
       }
 
-      // Dispatch pointer events for hover state handling
-      ['pointerdown', 'pointerup'].forEach(type => {
-        el.dispatchEvent(new PointerEvent(type, {
-          bubbles: true, cancelable: true, view: window,
-          clientX: viewportX, clientY: viewportY,
-          pointerId: 1, pointerType: 'mouse', isPrimary: true
-        }));
-      });
-
-      // NOTE: CDP mousePressed/mouseReleased above already generates a native click event.
-      // We do NOT dispatch another click here to avoid double-clicks.
-      // If clicks don't work for specific elements, investigate the element's event handling.
+      // Dispatch a single click event (no CDP mouse events to avoid double-firing)
+      el.dispatchEvent(new MouseEvent('click', {
+        bubbles: true, cancelable: true, view: window,
+        clientX: viewportX, clientY: viewportY,
+        detail: 1
+      }));
+      console.log('[Boon] Dispatched JS click event on:', el.tagName, el.className || '(no class)');
     })()
   `);
 
-  console.log(`[Boon] CDP: Clicked at (${x}, ${y}) with pointer events`);
+  console.log(`[Boon] Clicked at (${x}, ${y})`);
 }
 
 // Double-click at coordinates (trusted event)
@@ -181,6 +158,7 @@ async function cdpDoubleClickAt(tabId, x, y) {
   });
 
   // Also dispatch dblclick event via JS since Zoon may use it
+  // AND manage hover state tracking (same as cdpHoverAt) to ensure proper mouseleave later
   await cdpEvaluate(tabId, `
     (function() {
       const viewportX = ${x} - window.scrollX;
@@ -197,10 +175,52 @@ async function cdpDoubleClickAt(tabId, x, y) {
         clientX: viewportX, clientY: viewportY,
         detail: 2
       }));
+
+      // === HOVER STATE TRACKING ===
+      // This ensures that when we later hover elsewhere, proper mouseleave events are dispatched.
+      // Without this, double-click leaves hover state corrupted.
+
+      // Get previous hovered elements (all ancestors that received mouseenter)
+      const prevElements = window.__boonHoveredElements || [];
+
+      // Collect new hover path (from target up to document)
+      const newElements = [];
+      let current = el;
+      while (current && current !== document) {
+        newElements.push(current);
+        current = current.parentElement;
+      }
+
+      // Find elements to leave (in prevElements but not in newElements)
+      const toLeave = prevElements.filter(el => !newElements.includes(el));
+
+      // Find elements to enter (in newElements but not in prevElements)
+      const toEnter = newElements.filter(el => !prevElements.includes(el));
+
+      // Dispatch mouseleave on elements we're leaving (from innermost to outermost)
+      for (const target of toLeave) {
+        target.dispatchEvent(new MouseEvent('mouseleave', {
+          bubbles: false, cancelable: false, view: window,
+          clientX: viewportX, clientY: viewportY,
+          relatedTarget: el
+        }));
+      }
+
+      // Dispatch mouseenter on elements we're entering (from outermost to innermost)
+      for (let i = toEnter.length - 1; i >= 0; i--) {
+        toEnter[i].dispatchEvent(new MouseEvent('mouseenter', {
+          bubbles: false, cancelable: false, view: window,
+          clientX: viewportX, clientY: viewportY,
+          relatedTarget: null
+        }));
+      }
+
+      // Update tracked elements
+      window.__boonHoveredElements = newElements;
     })()
   `);
 
-  console.log(`[Boon] CDP: Double-clicked at (${x}, ${y})`);
+  console.log(`[Boon] CDP: Double-clicked at (${x}, ${y}) with hover state tracking`);
 }
 
 // Hover at coordinates (move mouse without clicking)
@@ -229,18 +249,20 @@ async function cdpHoverAt(tabId, x, y) {
       const viewportY = ${viewportY};
       const newTarget = document.elementFromPoint(viewportX, viewportY);
 
-      if (!newTarget) return { success: false, reason: 'no element at point' };
-
       // Get previous hovered elements (all ancestors that received mouseenter)
       // Filter out any elements that are no longer in the document (e.g., after page navigation)
       const prevElements = (window.__boonHoveredElements || []).filter(el => document.contains(el));
 
       // Collect all ancestors of newTarget including itself
+      // If newTarget is null (hovering empty area), newElements stays empty
+      // which will cause mouseleave on all previously hovered elements
       const newElements = [];
-      let el = newTarget;
-      while (el && el !== document.documentElement) {
-        newElements.push(el);
-        el = el.parentElement;
+      if (newTarget) {
+        let el = newTarget;
+        while (el && el !== document.documentElement) {
+          newElements.push(el);
+          el = el.parentElement;
+        }
       }
 
       // Find elements to leave (in prevElements but not in newElements)
@@ -249,8 +271,14 @@ async function cdpHoverAt(tabId, x, y) {
       // Find elements to enter (in newElements but not in prevElements)
       const toEnter = newElements.filter(el => !prevElements.includes(el));
 
-      // Dispatch mouseleave on elements we're leaving (from innermost to outermost)
+      // Dispatch leave events on elements we're leaving (from innermost to outermost)
+      // Dispatch both pointer and mouse events for broader compatibility
       for (const el of toLeave) {
+        el.dispatchEvent(new PointerEvent('pointerleave', {
+          bubbles: false, cancelable: false, view: window,
+          clientX: viewportX, clientY: viewportY,
+          relatedTarget: newTarget, pointerType: 'mouse', isPrimary: true
+        }));
         el.dispatchEvent(new MouseEvent('mouseleave', {
           bubbles: false, cancelable: false, view: window,
           clientX: viewportX, clientY: viewportY,
@@ -258,8 +286,14 @@ async function cdpHoverAt(tabId, x, y) {
         }));
       }
 
-      // Dispatch mouseenter on elements we're entering (from outermost to innermost)
+      // Dispatch enter events on elements we're entering (from outermost to innermost)
+      // Dispatch both pointer and mouse events for broader compatibility
       for (let i = toEnter.length - 1; i >= 0; i--) {
+        toEnter[i].dispatchEvent(new PointerEvent('pointerenter', {
+          bubbles: false, cancelable: false, view: window,
+          clientX: viewportX, clientY: viewportY,
+          relatedTarget: prevElements[0] || null, pointerType: 'mouse', isPrimary: true
+        }));
         toEnter[i].dispatchEvent(new MouseEvent('mouseenter', {
           bubbles: false, cancelable: false, view: window,
           clientX: viewportX, clientY: viewportY,
@@ -274,7 +308,7 @@ async function cdpHoverAt(tabId, x, y) {
         success: true,
         entered: toEnter.length,
         left: toLeave.length,
-        newTarget: newTarget.tagName
+        newTarget: newTarget ? newTarget.tagName : null
       };
     })()
   `);
@@ -858,8 +892,16 @@ async function handleCommand(id, command) {
             (function() {
               // Step 1: Invalidate all running timers (engine-v2)
               // This prevents old timers from saving state while we're clearing it
+              let invalidated = false;
               if (window.boonPlayground && window.boonPlayground.invalidateTimers) {
                 window.boonPlayground.invalidateTimers();
+                invalidated = true;
+                console.log('[Boon clearStates] invalidateTimers() called');
+              } else {
+                console.warn('[Boon clearStates] invalidateTimers not available:', {
+                  hasBoonPlayground: !!window.boonPlayground,
+                  hasInvalidateTimers: !!(window.boonPlayground && window.boonPlayground.invalidateTimers)
+                });
               }
 
               // Step 2: Clear ALL localStorage for a completely fresh state
@@ -870,7 +912,7 @@ async function handleCommand(id, command) {
               const keyCount = localStorage.length;
               localStorage.clear();
 
-              return { cleared: keyCount };
+              return { cleared: keyCount, invalidated };
             })()
           `);
           return { type: 'success', data: { method: 'cdp-evaluate', text: 'clear saved states' } };
@@ -1339,6 +1381,187 @@ async function handleCommand(id, command) {
           return { type: 'error', message: `Click by text failed: ${e.message}` };
         }
 
+      case 'clickButtonNearText':
+        // Click a button (e.g., ×) that's in the same row as an element containing the target text
+        // This handles hover-dependent buttons by first hovering the row to make the button appear
+        try {
+          const searchText = command.text;
+          const buttonText = command.buttonText || '×';  // Default to × for delete buttons
+
+          // Step 1: Find the target element and its row container
+          const findResult = await cdpEvaluate(tab.id, `
+            (function() {
+              const searchText = ${JSON.stringify(searchText)};
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { found: false, error: 'Preview panel not found' };
+
+              // Find the element containing the target text
+              const allElements = preview.querySelectorAll('*');
+              let targetElement = null;
+              let smallestSize = Infinity;
+
+              allElements.forEach((el) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return;
+
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return;
+
+                let directText = '';
+                for (const node of el.childNodes) {
+                  if (node.nodeType === Node.TEXT_NODE) {
+                    directText += node.textContent;
+                  }
+                }
+                directText = directText.trim();
+
+                if (directText === searchText) {
+                  const size = rect.width * rect.height;
+                  if (size < smallestSize) {
+                    smallestSize = size;
+                    targetElement = el;
+                  }
+                }
+              });
+
+              if (!targetElement) {
+                return { found: false, error: 'No element found with text: ' + searchText };
+              }
+
+              // Find the row container (walk up to find a reasonable parent)
+              let container = targetElement.parentElement;
+              let depth = 0;
+              while (container && depth < 3) {
+                // Look for a div that seems like a row container
+                if (container.style && container.children.length > 1) {
+                  break;
+                }
+                container = container.parentElement;
+                depth++;
+              }
+
+              if (!container) container = targetElement.parentElement;
+
+              const rect = container.getBoundingClientRect();
+              return {
+                found: true,
+                centerX: Math.round(rect.x + rect.width / 2),
+                centerY: Math.round(rect.y + rect.height / 2)
+              };
+            })()
+          `);
+
+          if (!findResult.found) {
+            return { type: 'error', message: findResult.error || 'Target element not found' };
+          }
+
+          // Step 2: Hover over the row to make hover-dependent buttons appear
+          await cdpHoverAt(tab.id, findResult.centerX, findResult.centerY);
+
+          // Small delay to let the hover state update the DOM
+          await new Promise(resolve => setTimeout(resolve, 100));
+
+          // Step 3: Now find and click the button
+          const clickResult = await cdpEvaluate(tab.id, `
+            (function() {
+              const searchText = ${JSON.stringify(searchText)};
+              const buttonText = ${JSON.stringify(buttonText)};
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { found: false, error: 'Preview panel not found' };
+
+              // Find the element containing the target text again
+              const allElements = preview.querySelectorAll('*');
+              let targetElement = null;
+              let smallestSize = Infinity;
+
+              allElements.forEach((el) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return;
+
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return;
+
+                let directText = '';
+                for (const node of el.childNodes) {
+                  if (node.nodeType === Node.TEXT_NODE) {
+                    directText += node.textContent;
+                  }
+                }
+                directText = directText.trim();
+
+                if (directText === searchText) {
+                  const size = rect.width * rect.height;
+                  if (size < smallestSize) {
+                    smallestSize = size;
+                    targetElement = el;
+                  }
+                }
+              });
+
+              if (!targetElement) {
+                return { found: false, error: 'Target element not found after hover' };
+              }
+
+              // Find the row container and look for the button
+              let container = targetElement.parentElement;
+              let foundButton = null;
+              let maxDepth = 5;
+
+              while (container && maxDepth > 0) {
+                const buttons = container.querySelectorAll('[role="button"]');
+                for (const btn of buttons) {
+                  let btnText = '';
+                  for (const node of btn.childNodes) {
+                    if (node.nodeType === Node.TEXT_NODE) {
+                      btnText += node.textContent;
+                    }
+                  }
+                  btnText = btnText.trim();
+
+                  if (btnText === buttonText) {
+                    const btnRect = btn.getBoundingClientRect();
+                    if (btnRect.width > 0 && btnRect.height > 0) {
+                      const btnStyle = window.getComputedStyle(btn);
+                      if (btnStyle.display !== 'none' && btnStyle.visibility !== 'hidden') {
+                        foundButton = btn;
+                        break;
+                      }
+                    }
+                  }
+                }
+
+                if (foundButton) break;
+                container = container.parentElement;
+                maxDepth--;
+              }
+
+              if (!foundButton) {
+                return { found: false, error: 'No button "' + buttonText + '" found near text: ' + searchText + ' (button may not appear on hover)' };
+              }
+
+              const btnRect = foundButton.getBoundingClientRect();
+              return {
+                found: true,
+                text: searchText,
+                buttonText: buttonText,
+                centerX: btnRect.x + btnRect.width / 2,
+                centerY: btnRect.y + btnRect.height / 2,
+                buttonRect: { x: btnRect.x, y: btnRect.y, w: btnRect.width, h: btnRect.height }
+              };
+            })()
+          `);
+
+          if (!clickResult.found) {
+            return { type: 'error', message: clickResult.error || 'Button not found after hover' };
+          }
+
+          // Step 4: Click the button
+          await cdpClickAt(tab.id, clickResult.centerX, clickResult.centerY);
+          return { type: 'success', data: clickResult };
+        } catch (e) {
+          return { type: 'error', message: `Click button near text failed: ${e.message}` };
+        }
+
       case 'focusInput':
         // Focus an input element in the preview panel by index
         try {
@@ -1742,6 +1965,72 @@ async function handleCommand(id, command) {
           return { type: 'inputTypeableStatus', ...result };
         } catch (e) {
           return { type: 'error', message: `Verify input typeable failed: ${e.message}` };
+        }
+
+      case 'getCheckboxState':
+        // Get the checked state of a checkbox by index (0-indexed) in the preview pane
+        try {
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { found: false, checked: false };
+
+              // Find checkboxes using same logic as clickCheckbox
+              const roleCheckboxes = Array.from(preview.querySelectorAll('[role="checkbox"]'));
+              const idCheckboxes = Array.from(preview.querySelectorAll('[id^="cb-"]'));
+              const seen = new Set();
+              const allCheckboxes = [];
+
+              roleCheckboxes.forEach(el => {
+                seen.add(el);
+                allCheckboxes.push(el);
+              });
+
+              idCheckboxes.forEach(el => {
+                if (!seen.has(el)) {
+                  seen.add(el);
+                  allCheckboxes.push(el);
+                }
+              });
+
+              // Sort by vertical position
+              allCheckboxes.sort((a, b) => {
+                const rectA = a.getBoundingClientRect();
+                const rectB = b.getBoundingClientRect();
+                return rectA.top - rectB.top;
+              });
+
+              const checkboxIndex = ${command.index};
+              if (checkboxIndex >= allCheckboxes.length) {
+                return { found: false, checked: false };
+              }
+
+              const checkbox = allCheckboxes[checkboxIndex];
+
+              // Determine checked state:
+              // 1. aria-checked attribute (most reliable for role="checkbox")
+              // 2. data-checked attribute
+              // 3. checked property (for native checkboxes)
+              const ariaChecked = checkbox.getAttribute('aria-checked');
+              const dataChecked = checkbox.getAttribute('data-checked');
+              const nativeChecked = checkbox.checked;
+
+              let checked = false;
+              if (ariaChecked !== null) {
+                checked = ariaChecked === 'true';
+              } else if (dataChecked !== null) {
+                checked = dataChecked === 'true';
+              } else if (nativeChecked !== undefined) {
+                checked = !!nativeChecked;
+              }
+
+              return { found: true, checked };
+            })()
+          `);
+
+          return { type: 'checkboxState', found: result.found, checked: result.checked };
+        } catch (e) {
+          return { type: 'error', message: `Get checkbox state failed: ${e.message}` };
         }
 
       default:

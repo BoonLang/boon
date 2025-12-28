@@ -14,7 +14,28 @@ use crate::template::TemplateRegistry;
 use crate::value::{is_skip, ops};
 use shared::ast::Program;
 use shared::test_harness::Value;
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
+
+/// Wrapper for SlotId with reverse ordering by topo_index (min-heap behavior)
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct TopoSlot {
+    slot: SlotId,
+    topo_index: u32,
+}
+
+impl Ord for TopoSlot {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse ordering: lower topo_index = higher priority
+        other.topo_index.cmp(&self.topo_index)
+    }
+}
+
+impl PartialOrd for TopoSlot {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 /// The Path A engine
 #[allow(dead_code)]
@@ -38,6 +59,15 @@ pub struct Engine {
     /// Topological order of slots (dependencies before dependents)
     /// Computed after compilation, allows single-pass evaluation
     topo_order: Vec<SlotId>,
+    // === A4 Optimization: Pre-classified node type indices ===
+    /// LINK slots - for Phase 0 (prepare_link_values)
+    link_slots: Vec<SlotId>,
+    /// Pulse slots (THEN/WHEN/WHILE) - for Phase 2
+    pulse_slots: Vec<SlotId>,
+    /// HOLD slots - for Phase 3.5 (refresh_hold_list_states)
+    hold_slots: Vec<SlotId>,
+    /// ListAppend slots - for Phase 1.5 (instantiate_triggered_list_appends)
+    list_append_slots: Vec<SlotId>,
 }
 
 impl Engine {
@@ -50,6 +80,30 @@ impl Engine {
         // Compute topological order after compilation
         let topo_order = arena.compute_topo_order();
 
+        // A4: Pre-classify nodes by type for O(k) iteration instead of O(n)
+        let mut link_slots = Vec::new();
+        let mut pulse_slots = Vec::new();
+        let mut hold_slots = Vec::new();
+        let mut list_append_slots = Vec::new();
+
+        for i in 0..arena.len() {
+            let slot = SlotId(i as u32);
+            if let Some(node) = arena.get_node(slot) {
+                match &node.kind {
+                    NodeKind::Link { .. } => link_slots.push(slot),
+                    NodeKind::Then { .. } | NodeKind::When { .. } | NodeKind::While { .. } => {
+                        pulse_slots.push(slot);
+                    }
+                    NodeKind::Hold { .. } => hold_slots.push(slot),
+                    NodeKind::ListAppend { .. } => list_append_slots.push(slot),
+                    _ => {}
+                }
+            }
+        }
+
+        // Sort pulse_slots by topo_index for Phase 2 (must process in dependency order)
+        pulse_slots.sort_by_key(|slot| arena.get_topo_index(*slot));
+
         let mut engine = Self {
             arena,
             templates,
@@ -60,6 +114,10 @@ impl Engine {
             active_events: HashMap::new(),
             fired_this_tick: std::collections::HashSet::new(),
             topo_order,
+            link_slots,
+            pulse_slots,
+            hold_slots,
+            list_append_slots,
         };
 
         // Mark all slots dirty for initial evaluation
@@ -78,7 +136,7 @@ impl Engine {
         self.pending_events.push((path.to_string(), payload));
     }
 
-    /// Run one tick of the engine
+    /// Run one tick of the engine using work-queue based dirty propagation
     pub fn tick(&mut self) {
         self.tick += 1;
 
@@ -91,182 +149,295 @@ impl Engine {
             self.inject_event(&path, payload);
         }
 
-        // Phase 0: Check for ListAppend triggers and instantiate new items
+        // Phase 0: Prepare LINK values (so Path nodes can read them)
+        self.prepare_link_values();
+
+        // Phase 1: Process dirty slots using work queue (non-pulse only)
+        // Uses topological ordering via sorted queue
+        self.process_dirty_queue_non_pulse();
+
+        // Phase 1.5: Check for ListAppend triggers and instantiate new items
+        // Must happen AFTER Phase 1 (Path values computed) but BEFORE Phase 2 (pulse nodes fire)
+        // Triggers are usually Path nodes (e.g., button.click) whose values are computed in Phase 1
         self.instantiate_triggered_list_appends();
 
-        // Phase 1: Stabilize all non-pulse nodes
-        // Use topological order but still do multiple passes for complex propagation
-        for _pass in 0..20 {
-            let mut changed = false;
-            for &slot in &self.topo_order {
-                let old_value = self.arena.get_value(slot).clone();
-
-                if let Some(node) = self.arena.get_node(slot).cloned() {
-                    // LINK: use event value for entire tick
-                    if let NodeKind::Link { .. } = &node.kind {
-                        if let Some(event_value) = self.active_events.get(&slot) {
-                            if old_value != *event_value {
-                                self.arena.set_value(slot, event_value.clone());
-                                changed = true;
-                            }
-                        } else if old_value != Value::Skip {
-                            self.arena.set_value(slot, Value::Skip);
-                            changed = true;
-                        }
-                        continue;
-                    }
-
-                    // Skip pulse nodes in stabilization phase
-                    let is_pulse_node = matches!(
-                        &node.kind,
-                        NodeKind::Then { .. } | NodeKind::When { .. } | NodeKind::While { .. }
-                    );
-                    if is_pulse_node {
-                        continue;
-                    }
-
-                    // Compute node value
-                    let new_value = self.compute_node(&node, slot);
-
-                    if old_value != new_value {
-                        self.arena.set_value(slot, new_value);
-                        changed = true;
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-
         // Phase 2: Fire pulse nodes (THEN/WHEN/WHILE) exactly once (in topo order)
-        for &slot in &self.topo_order {
+        // A4: Uses pre-classified and sorted pulse_slots for O(k) instead of O(n)
+        for &slot in &self.pulse_slots {
             if let Some(node) = self.arena.get_node(slot).cloned() {
-                let is_pulse_node = matches!(
-                    &node.kind,
-                    NodeKind::Then { .. } | NodeKind::When { .. } | NodeKind::While { .. }
-                );
-
-                if is_pulse_node {
-                    let new_value = self.compute_node(&node, slot);
-                    self.arena.set_value(slot, new_value.clone());
-
-                    // If pulse produced value, mark as fired
-                    if !is_skip(&new_value) {
-                        self.fired_this_tick.insert(slot);
-                    }
-                }
-            }
-        }
-
-        // Phase 3a: Propagate pulse results through LATEST to HOLD
-        // Use topological order with multiple passes for complex propagation
-        for _ in 0..10 {
-            let mut changed = false;
-            for &slot in &self.topo_order {
+                let new_value = self.compute_node(&node, slot);
                 let old_value = self.arena.get_value(slot).clone();
 
-                if let Some(node) = self.arena.get_node(slot).cloned() {
-                    // Skip LINK (already handled)
-                    if matches!(&node.kind, NodeKind::Link { .. }) {
-                        continue;
-                    }
-
-                    // Skip pulse nodes for now (don't reset yet)
-                    let is_pulse_node = matches!(
-                        &node.kind,
-                        NodeKind::Then { .. } | NodeKind::When { .. } | NodeKind::While { .. }
-                    );
-                    if is_pulse_node {
-                        continue;
-                    }
-
-                    // Compute node value (LATEST will read from pulse nodes)
-                    let new_value = self.compute_node(&node, slot);
-
-                    // HOLD: update state
-                    if let NodeKind::Hold { state, .. } = &node.kind {
-                        if !is_skip(&new_value) {
-                            let state_old = self.arena.get_value(*state).clone();
-                            if state_old != new_value {
-                                self.arena.set_value(*state, new_value.clone());
-                                changed = true;
-                            }
-                        }
-                    }
-
-                    if old_value != new_value {
-                        self.arena.set_value(slot, new_value);
-                        changed = true;
-                    }
+                if new_value != old_value {
+                    self.arena.set_value(slot, new_value.clone());
+                    // Mark subscribers dirty for phase 3
+                    self.mark_subscribers_dirty(slot);
                 }
-            }
-            if !changed {
-                break;
+
+                // If pulse produced value, mark as fired
+                if !is_skip(&new_value) {
+                    self.fired_this_tick.insert(slot);
+                }
             }
         }
 
-        // Phase 3b: Reset fired pulse nodes to Skip
-        for i in 0..self.arena.len() {
-            let slot = SlotId(i as u32);
-            if self.fired_this_tick.contains(&slot) {
-                self.arena.set_value(slot, Value::Skip);
-            }
+        // Phase 3: Propagate pulse results through LATEST to HOLD using work queue
+        self.process_dirty_queue_post_pulse();
+
+        // Phase 3.5: Refresh HOLD states that contain lists with updated objects
+        // This handles the case where nested Objects changed but THEN didn't fire
+        self.refresh_hold_list_states();
+
+        // Phase 4: Reset fired pulse nodes to Skip
+        for slot in self.fired_this_tick.iter().copied().collect::<Vec<_>>() {
+            self.arena.set_value(slot, Value::Skip);
         }
 
         // Clear events after processing
         self.active_events.clear();
     }
 
-    /// Instantiate new items for ListAppend nodes whose triggers fired
-    fn instantiate_triggered_list_appends(&mut self) {
-        // First, reset all LINK values to Skip, then set from active events
-        for i in 0..self.arena.len() {
-            let slot = SlotId(i as u32);
+    /// Process dirty queue for non-pulse nodes (Phase 1)
+    fn process_dirty_queue_non_pulse(&mut self) {
+        // Build priority queue (min-heap by topo_index)
+        let mut dirty_heap: BinaryHeap<TopoSlot> = BinaryHeap::new();
+
+        // Collect all dirty slots into heap
+        for slot in self.arena.dirty_slots() {
+            dirty_heap.push(TopoSlot {
+                slot,
+                topo_index: self.arena.get_topo_index(slot),
+            });
+        }
+
+        // Process queue (always gets lowest topo_index first)
+        while let Some(TopoSlot { slot, .. }) = dirty_heap.pop() {
+            // Skip if already processed (cleared dirty flag)
+            if !self.arena.is_dirty(slot) {
+                continue;
+            }
+            self.arena.clear_dirty(slot);
+
             if let Some(node) = self.arena.get_node(slot).cloned() {
-                if let NodeKind::Link { .. } = &node.kind {
+                // Skip pulse nodes - they're handled in phase 2
+                let is_pulse_node = matches!(
+                    &node.kind,
+                    NodeKind::Then { .. } | NodeKind::When { .. } | NodeKind::While { .. }
+                );
+                if is_pulse_node {
+                    continue;
+                }
+
+                let old_value = self.arena.get_value(slot).clone();
+
+                // LINK: use event value for entire tick
+                let new_value = if let NodeKind::Link { .. } = &node.kind {
                     if let Some(event_value) = self.active_events.get(&slot) {
-                        self.arena.set_value(slot, event_value.clone());
+                        event_value.clone()
                     } else {
-                        // Reset to Skip if no event this tick
-                        self.arena.set_value(slot, Value::Skip);
+                        Value::Skip
+                    }
+                } else {
+                    self.compute_node(&node, slot)
+                };
+
+                if old_value != new_value {
+                    self.arena.set_value(slot, new_value);
+                    // Mark subscribers dirty and add to heap
+                    self.add_subscribers_to_heap(&mut dirty_heap, slot);
+                }
+            }
+        }
+    }
+
+    /// Process dirty queue for post-pulse propagation (Phase 3)
+    fn process_dirty_queue_post_pulse(&mut self) {
+        // Build priority queue (min-heap by topo_index)
+        let mut dirty_heap: BinaryHeap<TopoSlot> = BinaryHeap::new();
+
+        for slot in self.arena.dirty_slots() {
+            dirty_heap.push(TopoSlot {
+                slot,
+                topo_index: self.arena.get_topo_index(slot),
+            });
+        }
+
+        // Process queue (always gets lowest topo_index first)
+        while let Some(TopoSlot { slot, .. }) = dirty_heap.pop() {
+            if !self.arena.is_dirty(slot) {
+                continue;
+            }
+            self.arena.clear_dirty(slot);
+
+            if let Some(node) = self.arena.get_node(slot).cloned() {
+                // Skip LINK (already handled)
+                if matches!(&node.kind, NodeKind::Link { .. }) {
+                    continue;
+                }
+
+                let old_value = self.arena.get_value(slot).clone();
+
+                // For pulse nodes in Phase 3: if they already fired this tick, they should
+                // pass through updated body values. If they didn't fire, they stay Skip.
+                let is_pulse_node = matches!(
+                    &node.kind,
+                    NodeKind::Then { .. } | NodeKind::When { .. } | NodeKind::While { .. }
+                );
+                let new_value = if is_pulse_node && self.fired_this_tick.contains(&slot) {
+                    // Pulse fired - re-read body value which may have been updated
+                    match &node.kind {
+                        NodeKind::Then { body, .. } => self.arena.get_value(*body).clone(),
+                        NodeKind::When { input, arms } => {
+                            let input_value = self.arena.get_value(*input);
+                            if is_skip(input_value) {
+                                Value::Skip
+                            } else {
+                                let mut result = Value::Skip;
+                                for (pattern, body_slot) in arms {
+                                    if pattern_matches(pattern, input_value) {
+                                        result = self.arena.get_value(*body_slot).clone();
+                                        break;
+                                    }
+                                }
+                                result
+                            }
+                        }
+                        NodeKind::While { input, pattern, body } => {
+                            let input_value = self.arena.get_value(*input);
+                            if is_skip(input_value) || !pattern_matches(pattern, input_value) {
+                                Value::Skip
+                            } else {
+                                self.arena.get_value(*body).clone()
+                            }
+                        }
+                        _ => self.compute_node(&node, slot),
+                    }
+                } else if is_pulse_node {
+                    // Pulse didn't fire - stay Skip
+                    continue;
+                } else {
+                    self.compute_node(&node, slot)
+                };
+
+                // HOLD: update state
+                if let NodeKind::Hold { state, .. } = &node.kind {
+                    if !is_skip(&new_value) {
+                        let state_old = self.arena.get_value(*state).clone();
+                        if state_old != new_value {
+                            self.arena.set_value(*state, new_value.clone());
+                            // Mark state's subscribers dirty
+                            self.add_subscribers_to_heap(&mut dirty_heap, *state);
+                        }
+                    }
+                }
+
+                if old_value != new_value {
+                    self.arena.set_value(slot, new_value);
+                    self.add_subscribers_to_heap(&mut dirty_heap, slot);
+                }
+            }
+        }
+    }
+
+    /// Mark subscribers of a slot as dirty
+    fn mark_subscribers_dirty(&self, slot: SlotId) {
+        let subs: Vec<SlotId> = self.arena.get_subscribers(slot).copied().collect();
+        for sub in subs {
+            self.arena.mark_dirty(sub);
+        }
+    }
+
+    /// Add subscribers to the priority heap (O(log n) per insertion)
+    fn add_subscribers_to_heap(&self, heap: &mut BinaryHeap<TopoSlot>, slot: SlotId) {
+        for sub in self.arena.get_subscribers(slot).copied() {
+            if !self.arena.is_dirty(sub) {
+                self.arena.mark_dirty(sub);
+                heap.push(TopoSlot {
+                    slot: sub,
+                    topo_index: self.arena.get_topo_index(sub),
+                });
+            }
+        }
+    }
+
+    /// Refresh HOLD states that contain lists with updated Objects (Phase 3.5)
+    /// When nested Objects change (e.g., via toggle_all), the HOLD state contains
+    /// stale Object VALUES. This refreshes them from the ListAppend.
+    /// A4: Uses pre-classified hold_slots for O(k) instead of O(n)
+    fn refresh_hold_list_states(&mut self) {
+        for &slot in &self.hold_slots {
+            if let Some(node) = self.arena.get_node(slot).cloned() {
+                if let NodeKind::Hold { state, body, .. } = &node.kind {
+                    // Check if state contains a list
+                    let state_value = self.arena.get_value(*state);
+                    if matches!(state_value, Value::List(_)) {
+                        // Find the ListAppend in the body chain
+                        // Body is usually THEN, whose body is ListAppend
+                        if let Some(body_node) = self.arena.get_node(*body) {
+                            let list_append_slot = match &body_node.kind {
+                                NodeKind::Then { body: then_body, .. } => Some(*then_body),
+                                NodeKind::ListAppend { .. } => Some(*body),
+                                _ => None,
+                            };
+
+                            if let Some(la_slot) = list_append_slot {
+                                // Get the fresh ListAppend value
+                                let fresh_list = self.arena.get_value(la_slot).clone();
+                                if matches!(&fresh_list, Value::List(_)) {
+                                    // Update state and slot if different
+                                    if *state_value != fresh_list {
+                                        self.arena.set_value(*state, fresh_list.clone());
+                                        self.arena.set_value(slot, fresh_list);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+    }
 
-        // Evaluate Wire nodes to propagate LINK values
-        for i in 0..self.arena.len() {
-            let slot = SlotId(i as u32);
-            if let Some(node) = self.arena.get_node(slot).cloned() {
-                if let NodeKind::Wire(source) = &node.kind {
-                    let source_value = self.arena.get_value(*source).clone();
-                    self.arena.set_value(slot, source_value);
+    /// Prepare LINK values for this tick (Phase 0)
+    /// A4: Uses pre-classified link_slots for O(k) instead of O(n)
+    fn prepare_link_values(&mut self) {
+        // Reset all LINK values to Skip, then set from active events
+        for &slot in &self.link_slots {
+            let old_value = self.arena.get_value(slot).clone();
+            let new_value = if let Some(event_value) = self.active_events.get(&slot) {
+                event_value.clone()
+            } else {
+                // Reset to Skip if no event this tick
+                Value::Skip
+            };
+
+            // If value changed, mark dirty and propagate to subscribers
+            if old_value != new_value {
+                self.arena.set_value(slot, new_value);
+                self.arena.mark_dirty(slot);
+                // Mark subscribers dirty so Path/Wire nodes propagate the change
+                for &sub in self.arena.get_subscribers(slot) {
+                    self.arena.mark_dirty(sub);
                 }
             }
         }
+    }
 
-        // Evaluate Path nodes so they can read LINK values
-        for i in 0..self.arena.len() {
-            let slot = SlotId(i as u32);
-            if let Some(node) = self.arena.get_node(slot).cloned() {
-                if let NodeKind::Path { base, field } = &node.kind {
-                    let base_value = self.arena.get_value(*base);
-                    let new_value = ops::get_field(base_value, field);
-                    self.arena.set_value(slot, new_value);
-                }
-            }
-        }
+    /// Instantiate new items for ListAppend nodes whose triggers fired (Phase 1.5)
+    /// A4: Uses pre-classified list_append_slots for O(k) instead of O(n)
+    fn instantiate_triggered_list_appends(&mut self) {
+        // Collect top-level slots for the snapshot logic
+        let top_level_slots: std::collections::HashSet<SlotId> =
+            self.top_level.values().copied().collect();
 
         // Collect slots that need instantiation (to avoid borrow issues)
         let mut to_instantiate: Vec<(SlotId, Box<shared::ast::Expr>, HashMap<String, SlotId>)> = Vec::new();
 
-        for i in 0..self.arena.len() {
-            let slot = SlotId(i as u32);
+        for &slot in &self.list_append_slots {
             if let Some(node) = self.arena.get_node(slot) {
                 if let NodeKind::ListAppend { trigger, item_template, captures, .. } = &node.kind {
                     if let Some(trigger_slot) = trigger {
-                        // Check if trigger has a non-Skip value
+                        // Check if trigger has a non-Skip value (THEN has fired)
                         let trigger_value = self.arena.get_value(*trigger_slot);
                         if !is_skip(trigger_value) {
                             to_instantiate.push((slot, item_template.clone(), captures.clone()));
@@ -278,7 +449,16 @@ impl Engine {
 
         // Instantiate new items
         for (list_append_slot, item_template, captures) in to_instantiate {
-            self.instantiate_list_item(list_append_slot, &item_template, &captures);
+            self.instantiate_list_item(list_append_slot, &item_template, &captures, &top_level_slots);
+
+            // Recompute the ListAppend's value IMMEDIATELY so THEN can read it in Phase 2
+            if let Some(node) = self.arena.get_node(list_append_slot).cloned() {
+                let new_value = self.compute_node(&node, list_append_slot);
+                self.arena.set_value(list_append_slot, new_value);
+            }
+
+            // Mark subscribers (HOLD) dirty for Phase 3
+            self.mark_subscribers_dirty(list_append_slot);
         }
     }
 
@@ -288,27 +468,43 @@ impl Engine {
         list_append_slot: SlotId,
         item_template: &shared::ast::Expr,
         captures: &HashMap<String, SlotId>,
+        top_level_slots: &std::collections::HashSet<SlotId>,
     ) {
-        // Check if the item is a simple expression (non-Object)
-        let is_simple = !matches!(&item_template.kind, shared::ast::ExprKind::Object(_));
+        // Snapshot captured values, but keep these reactive:
+        // 1. Event-LINKs (with Skip value) - for event handling (toggle_all.click)
+        // 2. Non-LINK top-level slots - computed values like all_completed
+        //
+        // Snapshot:
+        // - LINKs with data (new_todo_input with submit event) - instance-specific
+        // - Local intermediate values
+        let mut snapshotted_bindings = HashMap::new();
+        let mut new_const_slots = Vec::new();
+        for (name, slot) in captures {
+            let is_link = self.arena.get_node(*slot)
+                .map(|n| matches!(&n.kind, NodeKind::Link { .. }))
+                .unwrap_or(false);
+            let value = self.arena.get_value(*slot).clone();
+            let is_top_level = top_level_slots.contains(slot);
 
-        // For simple items, snapshot captured values first
-        let (snapshotted_bindings, new_const_slots): (HashMap<String, SlotId>, Vec<SlotId>) = if is_simple {
-            // Snapshot all captured values as Constants
-            let mut bindings = HashMap::new();
-            let mut const_slots = Vec::new();
-            for (name, slot) in captures {
-                let value = self.arena.get_value(*slot).clone();
+            // Keep reactive if:
+            // - It's a LINK with Skip (event source like toggle_all)
+            // - OR it's a non-LINK top-level (computed value like all_completed)
+            let keep_reactive = if is_link {
+                is_skip(&value)  // Only event-LINKs (Skip) stay reactive
+            } else {
+                is_top_level     // Non-LINK top-levels stay reactive
+            };
+
+            if keep_reactive {
+                snapshotted_bindings.insert(name.clone(), *slot);
+            } else {
                 let const_slot = self.arena.alloc();
                 self.arena.set_node(const_slot, Node::new(NodeKind::Constant(value.clone())));
                 self.arena.set_value(const_slot, value);
-                const_slots.push(const_slot);
-                bindings.insert(name.clone(), const_slot);
+                new_const_slots.push(const_slot);
+                snapshotted_bindings.insert(name.clone(), const_slot);
             }
-            (bindings, const_slots)
-        } else {
-            (captures.clone(), Vec::new())
-        };
+        }
 
         // Add snapshotted slots to topo_order
         for &slot in &new_const_slots {
@@ -332,6 +528,31 @@ impl Engine {
                 *instantiated_count += 1;
             }
         }
+
+        // Subscribe ListAppend to the instance so it updates when the instance changes
+        self.arena.add_subscriber(instance_slot, list_append_slot);
+
+        // Assign incremental topo-indices for all new slots (A3 optimization)
+        // This avoids full recompute while ensuring correct evaluation order
+        self.arena.assign_incremental_topo_indices(slot_count_before);
+
+        // A4: Register new slots in type indices
+        for i in slot_count_before..self.arena.len() {
+            let slot = SlotId(i as u32);
+            if let Some(node) = self.arena.get_node(slot) {
+                match &node.kind {
+                    NodeKind::Link { .. } => self.link_slots.push(slot),
+                    NodeKind::Then { .. } | NodeKind::When { .. } | NodeKind::While { .. } => {
+                        self.pulse_slots.push(slot);
+                    }
+                    NodeKind::Hold { .. } => self.hold_slots.push(slot),
+                    NodeKind::ListAppend { .. } => self.list_append_slots.push(slot),
+                    _ => {}
+                }
+            }
+        }
+        // Re-sort pulse_slots since new slots may have been added
+        self.pulse_slots.sort_by_key(|slot| self.arena.get_topo_index(*slot));
 
         // Evaluate new slots immediately (before continuing with rest of tick phases)
         // This ensures instance values are ready when ListAppend is evaluated
@@ -381,12 +602,12 @@ impl Engine {
                     let mut inner: HashMap<String, Value> = HashMap::new();
                     inner.insert("submit".to_string(), Value::Unit);
                     inner.insert("value".to_string(), payload);
-                    let mut current = Value::Object(inner);
+                    let mut current = Value::Object(std::sync::Arc::new(inner));
                     // Wrap in outer path parts if any
                     for &part in parts[1..parts.len()-1].iter().rev() {
                         let mut outer: HashMap<String, Value> = HashMap::new();
                         outer.insert(part.to_string(), current);
-                        current = Value::Object(outer);
+                        current = Value::Object(std::sync::Arc::new(outer));
                     }
                     current
                 } else {
@@ -395,7 +616,7 @@ impl Engine {
                     for &part in parts[1..].iter().rev() {
                         let mut inner: HashMap<String, Value> = HashMap::new();
                         inner.insert(part.to_string(), current);
-                        current = Value::Object(inner);
+                        current = Value::Object(std::sync::Arc::new(inner));
                     }
                     current
                 }
@@ -524,7 +745,7 @@ impl Engine {
                         (name.clone(), val)
                     })
                     .collect();
-                Value::Object(obj)
+                Value::Object(std::sync::Arc::new(obj))
             }
 
             NodeKind::List(items) => {
@@ -532,7 +753,7 @@ impl Engine {
                     .iter()
                     .map(|slot| self.arena.get_value(*slot).clone())
                     .collect();
-                Value::List(list)
+                Value::List(std::sync::Arc::new(list))
             }
 
             NodeKind::Path { base, field } => {
@@ -554,7 +775,7 @@ impl Engine {
                     .iter()
                     .map(|slot| self.arena.get_value(*slot).clone())
                     .collect();
-                Value::List(list)
+                Value::List(std::sync::Arc::new(list))
             }
 
             NodeKind::ListAppend { instances, .. } => {
@@ -563,7 +784,68 @@ impl Engine {
                     .iter()
                     .map(|slot| self.arena.get_value(*slot).clone())
                     .collect();
-                Value::List(list)
+                Value::List(std::sync::Arc::new(list))
+            }
+
+            NodeKind::ListClear { list, trigger } => {
+                // Only clear when triggered (or if no trigger)
+                let should_clear = match trigger {
+                    Some(trigger_slot) => !is_skip(self.arena.get_value(*trigger_slot)),
+                    None => true,
+                };
+                if should_clear {
+                    ops::list_clear(self.arena.get_value(*list))
+                } else {
+                    self.arena.get_value(*list).clone()
+                }
+            }
+
+            NodeKind::ListRemove { list, index, trigger } => {
+                // Only remove when triggered (or if no trigger)
+                let should_remove = match trigger {
+                    Some(trigger_slot) => !is_skip(self.arena.get_value(*trigger_slot)),
+                    None => true,
+                };
+                if should_remove {
+                    let list_val = self.arena.get_value(*list);
+                    let index_val = self.arena.get_value(*index);
+                    if let Value::Int(idx) = index_val {
+                        ops::list_remove(list_val, *idx)
+                    } else {
+                        list_val.clone()
+                    }
+                } else {
+                    self.arena.get_value(*list).clone()
+                }
+            }
+
+            NodeKind::ListRetain { list, trigger, predicate_template, item_name, captures } => {
+                // Only retain when triggered (or if no trigger)
+                let should_retain = match trigger {
+                    Some(trigger_slot) => !is_skip(self.arena.get_value(*trigger_slot)),
+                    None => true,
+                };
+                if should_retain {
+                    let list_val = self.arena.get_value(*list);
+                    match list_val {
+                        Value::List(items) => {
+                            // Evaluate predicate for each item, keep those that return true
+                            let retained: Vec<Value> = items
+                                .iter()
+                                .filter(|item| {
+                                    // Create a simple evaluation for the predicate
+                                    // For now, we evaluate the predicate by checking item properties
+                                    self.evaluate_predicate(predicate_template, item_name, item, captures)
+                                })
+                                .cloned()
+                                .collect();
+                            Value::List(std::sync::Arc::new(retained))
+                        }
+                        _ => list_val.clone(),
+                    }
+                } else {
+                    self.arena.get_value(*list).clone()
+                }
             }
 
             NodeKind::Block { bindings: _, output } => {
@@ -603,6 +885,24 @@ impl Engine {
                     Value::Skip
                 }
             }
+            "List/clear" => {
+                if args.len() >= 1 {
+                    ops::list_clear(&args[0])
+                } else {
+                    Value::Skip
+                }
+            }
+            "List/remove" => {
+                if args.len() >= 2 {
+                    if let Value::Int(idx) = &args[1] {
+                        ops::list_remove(&args[0], *idx)
+                    } else {
+                        Value::Skip
+                    }
+                } else {
+                    Value::Skip
+                }
+            }
             "List/every" => {
                 if args.len() >= 1 {
                     // Simplified: just check if all items are truthy
@@ -627,6 +927,65 @@ impl Engine {
                 } else {
                     Value::Skip
                 }
+            }
+            _ => Value::Skip,
+        }
+    }
+
+    /// Evaluate a predicate template for an item
+    /// Returns true if the predicate evaluates to Bool(true)
+    fn evaluate_predicate(
+        &self,
+        predicate_template: &shared::ast::Expr,
+        item_name: &str,
+        item: &Value,
+        _captures: &std::collections::HashMap<String, SlotId>,
+    ) -> bool {
+        // Simple predicate evaluation for item => predicate patterns
+        // The predicate is typically item.field |> Bool/not() or similar
+        match &predicate_template.kind {
+            shared::ast::ExprKind::Pipe(base, method, _args) => {
+                // Evaluate base
+                let base_val = self.eval_simple_expr(base, item_name, item);
+                // Apply method
+                match method.as_str() {
+                    "Bool/not" => {
+                        match base_val {
+                            Value::Bool(b) => !b,  // If Bool/not returns true, keep item
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            shared::ast::ExprKind::Path(base, field) => {
+                let base_val = self.eval_simple_expr(base, item_name, item);
+                match ops::get_field(&base_val, field) {
+                    Value::Bool(b) => b,
+                    _ => false,
+                }
+            }
+            shared::ast::ExprKind::Variable(name) if name == item_name => {
+                matches!(item, Value::Bool(true))
+            }
+            _ => false,
+        }
+    }
+
+    /// Simple expression evaluation for predicate checking
+    fn eval_simple_expr(
+        &self,
+        expr: &shared::ast::Expr,
+        item_name: &str,
+        item: &Value,
+    ) -> Value {
+        match &expr.kind {
+            shared::ast::ExprKind::Variable(name) if name == item_name => {
+                item.clone()
+            }
+            shared::ast::ExprKind::Path(base, field) => {
+                let base_val = self.eval_simple_expr(base, item_name, item);
+                ops::get_field(&base_val, field)
             }
             _ => Value::Skip,
         }

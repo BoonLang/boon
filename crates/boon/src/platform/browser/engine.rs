@@ -2480,13 +2480,32 @@ impl ReferenceConnector {
 
 // --- LinkConnector ---
 
+/// Key for LinkConnector that includes both span (source position) and scope.
+/// This ensures LINK bindings at the same source position but in different scopes
+/// (e.g., different list items created by List/map) have unique identities.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScopedSpan {
+    pub span: parser::Span,
+    pub scope: parser::Scope,
+}
+
+impl ScopedSpan {
+    pub fn new(span: parser::Span, scope: parser::Scope) -> Self {
+        Self { span, scope }
+    }
+}
+
 /// Actor for connecting LINK variables with their setters.
 /// Similar to ReferenceConnector but stores mpsc senders for LINK variables.
 /// Uses ActorLoop internally to encapsulate the async task.
+///
+/// IMPORTANT: Uses ScopedSpan (span + scope) as the key to ensure LINK bindings
+/// inside function calls (like new_todo() in List/map) get unique identities
+/// per list item, not just per source position.
 pub struct LinkConnector {
-    link_inserter_sender: NamedChannel<(parser::Span, NamedChannel<Value>)>,
+    link_inserter_sender: NamedChannel<(ScopedSpan, NamedChannel<Value>)>,
     link_getter_sender:
-        NamedChannel<(parser::Span, oneshot::Sender<NamedChannel<Value>>)>,
+        NamedChannel<(ScopedSpan, oneshot::Sender<NamedChannel<Value>>)>,
     actor_loop: ActorLoop,
 }
 
@@ -2500,9 +2519,9 @@ impl LinkConnector {
             link_inserter_sender,
             link_getter_sender,
             actor_loop: ActorLoop::new(async move {
-                let mut links = HashMap::<parser::Span, NamedChannel<Value>>::new();
+                let mut links = HashMap::<ScopedSpan, NamedChannel<Value>>::new();
                 let mut link_senders =
-                    HashMap::<parser::Span, Vec<oneshot::Sender<NamedChannel<Value>>>>::new();
+                    HashMap::<ScopedSpan, Vec<oneshot::Sender<NamedChannel<Value>>>>::new();
                 // Track whether channels are closed
                 let mut inserter_closed = false;
                 let mut getter_closed = false;
@@ -2563,22 +2582,26 @@ impl LinkConnector {
         }
     }
 
-    /// Register a LINK variable's sender with its span.
-    pub fn register_link(&self, span: parser::Span, sender: NamedChannel<Value>) {
+    /// Register a LINK variable's sender with its span and scope.
+    /// The scope is critical for distinguishing LINK bindings at the same source position
+    /// but in different contexts (e.g., different list items).
+    pub fn register_link(&self, span: parser::Span, scope: parser::Scope, sender: NamedChannel<Value>) {
+        let scoped_span = ScopedSpan::new(span, scope);
         if let Err(error) = self
             .link_inserter_sender
-            .try_send((span, sender))
+            .try_send((scoped_span, sender))
         {
             zoon::eprintln!("Failed to register link: {error:#}")
         }
     }
 
-    /// Get a LINK variable's sender by its span.
-    pub async fn link_sender(self: Arc<Self>, span: parser::Span) -> NamedChannel<Value> {
+    /// Get a LINK variable's sender by its span and scope.
+    pub async fn link_sender(self: Arc<Self>, span: parser::Span, scope: parser::Scope) -> NamedChannel<Value> {
+        let scoped_span = ScopedSpan::new(span, scope);
         let (link_sender, link_receiver) = oneshot::channel();
         if let Err(error) = self
             .link_getter_sender
-            .try_send((span, link_sender))
+            .try_send((scoped_span, link_sender))
         {
             zoon::eprintln!("Failed to get link sender: {error:#}")
         }

@@ -180,6 +180,19 @@ impl Action {
                             .context("click_button requires index (0-indexed)")?;
                         Ok(ParsedAction::ClickButton { index: index as u32 })
                     }
+                    "click_button_near_text" => {
+                        // ["click_button_near_text", "Walk the dog"] or ["click_button_near_text", "Walk the dog", "×"]
+                        let text = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .context("click_button_near_text requires target text")?
+                            .to_string();
+                        let button_text = arr
+                            .get(2)
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        Ok(ParsedAction::ClickButtonNearText { text, button_text })
+                    }
                     "click_checkbox" => {
                         let index = arr
                             .get(1)
@@ -252,6 +265,20 @@ impl Action {
                             .to_string();
                         Ok(ParsedAction::AssertNotContains { text })
                     }
+                    "assert_not_focused" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_not_focused requires input index")?;
+                        Ok(ParsedAction::AssertNotFocused { input_index: index as u32 })
+                    }
+                    "assert_checkbox_unchecked" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_checkbox_unchecked requires checkbox index")?;
+                        Ok(ParsedAction::AssertCheckboxUnchecked { index: index as u32 })
+                    }
                     _ => anyhow::bail!("Unknown action type: {}", cmd),
                 }
             }
@@ -271,6 +298,7 @@ pub enum ParsedAction {
     FocusInput { index: u32 },
     ClickText { text: String },    // Click by text content
     ClickButton { index: u32 },    // Click button by index
+    ClickButtonNearText { text: String, button_text: Option<String> },  // Click button near text (e.g., × button for a todo)
     ClickCheckbox { index: u32 },  // Click checkbox by index
     DblClickText { text: String }, // Double-click by text content
     HoverText { text: String },    // Hover over element by text content
@@ -280,6 +308,8 @@ pub enum ParsedAction {
     AssertInputTypeable { index: u32 },  // Assert input is actually typeable (not disabled/readonly/hidden)
     AssertButtonCount { expected: u32 },  // Assert number of visible buttons in preview
     AssertNotContains { text: String },  // Assert preview does NOT contain text
+    AssertNotFocused { input_index: u32 },  // Assert input does NOT have focus
+    AssertCheckboxUnchecked { index: u32 },  // Assert checkbox is NOT checked
 }
 
 #[derive(Debug, Clone, Deserialize)]

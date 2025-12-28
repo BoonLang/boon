@@ -3,7 +3,11 @@
 //! ScopeId is a path from the root that provides stable identity
 //! for values across ticks.
 
+use smallvec::SmallVec;
 use std::sync::Arc;
+
+/// B3: Use SmallVec to avoid heap allocation for common shallow scopes (depth ≤ 4)
+type ScopePath = SmallVec<[u64; 4]>;
 
 /// Hierarchical scope identifier
 /// Uses Arc for O(1) clone - expensive operations (child, parent) still allocate
@@ -11,22 +15,22 @@ use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ScopeId {
     /// Path from root - each segment is a discriminator
-    /// Wrapped in Arc for cheap cloning
-    path: Arc<Vec<u64>>,
+    /// Uses SmallVec<[u64; 4]> to avoid heap allocation for shallow scopes
+    path: Arc<ScopePath>,
 }
 
 impl ScopeId {
     /// Create the root scope
     pub fn root() -> Self {
         Self {
-            path: Arc::new(Vec::new()),
+            path: Arc::new(SmallVec::new()),
         }
     }
 
     /// Create a child scope with a discriminator
-    /// Note: This allocates a new Vec (can't reuse Arc without Arc::make_mut complexity)
+    /// Uses SmallVec - no heap allocation if depth ≤ 4
     pub fn child(&self, discriminator: u64) -> Self {
-        let mut new_path = (*self.path).clone();
+        let mut new_path: ScopePath = (*self.path).clone();
         new_path.push(discriminator);
         Self {
             path: Arc::new(new_path),
@@ -44,12 +48,11 @@ impl ScopeId {
     }
 
     /// Get parent scope (if not root)
-    /// Note: This allocates a new Vec
     pub fn parent(&self) -> Option<Self> {
         if self.is_root() {
             None
         } else {
-            let mut new_path = (*self.path).clone();
+            let mut new_path: ScopePath = (*self.path).clone();
             new_path.pop();
             Some(Self {
                 path: Arc::new(new_path),
