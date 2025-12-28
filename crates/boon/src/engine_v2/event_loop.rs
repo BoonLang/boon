@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use super::arena::{Arena, SlotId};
 use super::address::Port;
 use super::routing::RoutingTable;
-use super::message::Payload;
+use super::message::{FieldId, Payload};
 use super::node::{EffectType, NodeKind, RuntimePattern};
 
 /// Entry in the dirty node queue.
@@ -320,6 +320,17 @@ impl EventLoop {
                         // Body input (Port::Input(0))
                         #[cfg(target_arch = "wasm32")]
                         zoon::println!("HOLD_BODY_UPDATE: slot={:?} payload={:?}", entry.slot, payload);
+                        // DEBUG: Log HOLD body updates to localStorage
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            use zoon::{local_storage, WebStorage};
+                            let entry_str = format!("HOLD:{}|", entry.slot.index);
+                            let existing: String = match local_storage().get("hold_updates") {
+                                Some(Ok(s)) => s,
+                                _ => String::new(),
+                            };
+                            let _ = local_storage().insert("hold_updates", &format!("{}{}", existing, entry_str));
+                        }
 
                         match &payload {
                             Payload::Flushed(_) => {
@@ -562,6 +573,42 @@ impl EventLoop {
                             #[cfg(target_arch = "wasm32")]
                             zoon::println!("ListAppender: cloned template, output {:?}", cloned_output);
 
+                            // DEBUG: Inspect cloned Router's fields to verify remapping
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                use zoon::{local_storage, WebStorage};
+                                // cloned_output is a Transformer, its body is the Router
+                                if let Some(node) = self.arena.get(cloned_output) {
+                                    if let Some(NodeKind::Transformer { body_slot: Some(router_slot), .. }) = node.kind() {
+                                        if let Some(router_node) = self.arena.get(*router_slot) {
+                                            if let Some(NodeKind::Router { fields }) = router_node.kind() {
+                                                let completed_id = self.arena.get_field_id("completed");
+                                                let completed_slot = completed_id.and_then(|id| fields.get(&id).copied());
+                                                let completed_kind = completed_slot.and_then(|s| self.arena.get(s)).and_then(|n| n.kind())
+                                                    .map(|k| match k {
+                                                        NodeKind::Producer { .. } => "Prod",
+                                                        NodeKind::Register { .. } => "Reg",
+                                                        NodeKind::Wire { .. } => "Wire",
+                                                        _ => "Other",
+                                                    });
+                                                let entry = format!(
+                                                    "CLONED_TODO:out={}:rtr={}:completed={:?}:kind={:?};",
+                                                    cloned_output.index,
+                                                    router_slot.index,
+                                                    completed_slot.map(|s| s.index),
+                                                    completed_kind
+                                                );
+                                                let existing: String = match local_storage().get("cloned_todo_log") {
+                                                    Some(Ok(s)) => s,
+                                                    _ => String::new(),
+                                                };
+                                                let _ = local_storage().insert("cloned_todo_log", &format!("{}{}", existing, entry));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             // Mark source_slot dirty so it emits its value to all subscribers.
                             // This is critical for cloned HOLD nodes that have initial_input
                             // pointing to source_slot - they need to receive the initial value
@@ -618,10 +665,245 @@ impl EventLoop {
                 None // ListClearer doesn't emit directly
             }
 
-            NodeKind::FilteredView { source_bus, .. } => {
-                // FilteredView is a compile-time construct for List/retain.
-                // It just forwards the ListHandle from the source bus.
-                Some(Payload::ListHandle(*source_bus))
+            NodeKind::FilteredView { source_bus, conditions, template_input, template_output } => {
+                // FilteredView now handles dynamic items too.
+                // When source_bus changes (Port::Input(0)), check for new items and clone conditions.
+                let source_bus = *source_bus;
+                let template_input = *template_input;
+                let template_output = *template_output;
+                let existing_items: std::collections::HashSet<_> = conditions.keys().copied().collect();
+
+                // Get current items from source Bus
+                let source_items: Vec<_> = if let Some(node) = self.arena.get(source_bus) {
+                    if let Some(NodeKind::Bus { items, .. }) = node.kind() {
+                        items.clone()
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                };
+
+                // Find new items that need conditions
+                let mut new_conditions = Vec::new();
+                // DEBUG: Log FilteredView processing
+                #[cfg(target_arch = "wasm32")]
+                {
+                    use zoon::{local_storage, WebStorage};
+                    let entry_str = format!("FV:{},tmpl={},items={},existing={};",
+                        entry.slot.index,
+                        template_input.is_some() && template_output.is_some(),
+                        source_items.len(),
+                        existing_items.len());
+                    let existing: String = match local_storage().get("fv_log") {
+                        Some(Ok(s)) => s,
+                        _ => String::new(),
+                    };
+                    let _ = local_storage().insert("fv_log", &format!("{}{}", existing, entry_str));
+                }
+                if let (Some(tmpl_in), Some(tmpl_out)) = (template_input, template_output) {
+                    for (_key, item_slot) in &source_items {
+                        if !existing_items.contains(item_slot) {
+                            #[cfg(target_arch = "wasm32")]
+                            zoon::println!("FilteredView: new item {:?}, cloning condition template", item_slot);
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                use zoon::{local_storage, WebStorage};
+                                let entry_str = format!("NEW_ITEM:{};", item_slot.index);
+                                let existing: String = match local_storage().get("fv_new_items") {
+                                    Some(Ok(s)) => s,
+                                    _ => String::new(),
+                                };
+                                let _ = local_storage().insert("fv_new_items", &format!("{}{}", existing, entry_str));
+                            }
+
+                            // Clone the condition template for this new item
+                            // DEBUG: Log source item structure BEFORE cloning (REPLACE log, not append)
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                use zoon::{local_storage, WebStorage};
+                                let item_kind = self.arena.get(*item_slot).and_then(|n| n.kind());
+                                let debug_info = match item_kind {
+                                    Some(NodeKind::Transformer { body_slot: Some(bs), .. }) => {
+                                        let bk = self.arena.get(*bs).and_then(|n| n.kind());
+                                        match bk {
+                                            Some(NodeKind::Router { fields }) => {
+                                                let completed_id = self.arena.get_field_id("completed");
+                                                let cs = completed_id.and_then(|id| fields.get(&id).copied());
+                                                let ck = cs.and_then(|s| self.arena.get(s)).and_then(|n| n.kind())
+                                                    .map(|k| match k {
+                                                        NodeKind::Producer { .. } => "Prod",
+                                                        NodeKind::Register { .. } => "Reg",
+                                                        _ => "Other",
+                                                    });
+                                                format!("item={}:Xfmr:body={}:Router:comp={:?}:{:?}",
+                                                    item_slot.index, bs.index, cs.map(|s| s.index), ck)
+                                            }
+                                            Some(k) => format!("item={}:Xfmr:body={}:{:?}", item_slot.index, bs.index, std::mem::discriminant(k)),
+                                            None => format!("item={}:Xfmr:body={}:NoKind", item_slot.index, bs.index),
+                                        }
+                                    }
+                                    Some(k) => format!("item={}:{:?}", item_slot.index, std::mem::discriminant(k)),
+                                    None => format!("item={}:NoKind", item_slot.index),
+                                };
+                                // REPLACE, not append - shows only LAST clone
+                                let _ = local_storage().insert("fv_last_clone_src", &debug_info);
+                            }
+                            let cloned_cond = self.clone_transform_subgraph_runtime(
+                                tmpl_in,
+                                tmpl_out,
+                                *item_slot,
+                            );
+
+                            // DEBUG: After cloning, check what the cloned Extractor's source resolves to
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                use zoon::{local_storage, WebStorage};
+                                // Helper to format Extractor info
+                                let format_ext = |ext_slot: SlotId, src: SlotId, field: u32| -> String {
+                                    let field_name = self.arena.get_field_name(field)
+                                        .map(|s| s.as_ref().to_string())
+                                        .unwrap_or_else(|| format!("#{}", field));
+                                    let src_kind = self.arena.get(src).and_then(|n| n.kind());
+                                    let body_info = match src_kind {
+                                        Some(NodeKind::Transformer { body_slot: Some(bs), .. }) => {
+                                            let bs_kind = self.arena.get(*bs).and_then(|n| n.kind());
+                                            match bs_kind {
+                                                Some(NodeKind::Router { fields }) => {
+                                                    let fs = fields.get(&field).copied();
+                                                    let fk = fs.and_then(|s| self.arena.get(s)).and_then(|n| n.kind())
+                                                        .map(|k| match k {
+                                                            NodeKind::Producer { .. } => "Prod",
+                                                            NodeKind::Register { .. } => "Reg",
+                                                            _ => "Other",
+                                                        });
+                                                    format!("Rtr:fs={:?}:{:?}", fs.map(|s| s.index), fk)
+                                                }
+                                                _ => format!("NotRtr:{:?}", bs_kind.map(|k| std::mem::discriminant(k))),
+                                            }
+                                        }
+                                        _ => format!("NotXfmr:{:?}", src_kind.map(|k| std::mem::discriminant(k))),
+                                    };
+                                    format!("Ext={}:src={}:fld={}:{}", ext_slot.index, src.index, field_name, body_info)
+                                };
+
+                                let ext_info = if let Some(node) = self.arena.get(cloned_cond) {
+                                    match node.kind() {
+                                        // Case 1: BoolNot(Extractor) - for active_list
+                                        Some(NodeKind::BoolNot { source: Some(ext_slot), .. }) => {
+                                            if let Some(ext_node) = self.arena.get(*ext_slot) {
+                                                match ext_node.kind() {
+                                                    Some(NodeKind::Extractor { source: Some(src), field, .. }) => {
+                                                        format!("BoolNot:{}", format_ext(*ext_slot, *src, *field))
+                                                    }
+                                                    _ => "BoolNot:NotExt".to_string(),
+                                                }
+                                            } else { "BoolNot:NoExtNode".to_string() }
+                                        }
+                                        // Case 2: Direct Extractor - for completed_list
+                                        Some(NodeKind::Extractor { source: Some(src), field, .. }) => {
+                                            format!("Direct:{}", format_ext(cloned_cond, *src, *field))
+                                        }
+                                        // Case 3: Wire pointing to something
+                                        Some(NodeKind::Wire { source: Some(wire_src) }) => {
+                                            if let Some(wire_node) = self.arena.get(*wire_src) {
+                                                match wire_node.kind() {
+                                                    Some(NodeKind::Extractor { source: Some(src), field, .. }) => {
+                                                        format!("Wire->Ext:{}", format_ext(*wire_src, *src, *field))
+                                                    }
+                                                    _ => format!("Wire->{:?}", wire_node.kind().map(|k| std::mem::discriminant(k))),
+                                                }
+                                            } else { "Wire->None".to_string() }
+                                        }
+                                        Some(k) => format!("Other:{:?}", std::mem::discriminant(k)),
+                                        None => "NoKind".to_string(),
+                                    }
+                                } else { "NoCond".to_string() };
+                                let _ = local_storage().insert("fv_last_clone_ext", &ext_info);
+                            }
+
+                            new_conditions.push((*item_slot, cloned_cond));
+                        }
+                    }
+                }
+
+                // Add new conditions to FilteredView
+                if !new_conditions.is_empty() {
+                    if let Some(node) = self.arena.get_mut(entry.slot) {
+                        if let Some(NodeKind::FilteredView { conditions, .. }) = node.kind_mut() {
+                            for (item_slot, cond_slot) in &new_conditions {
+                                conditions.insert(*item_slot, *cond_slot);
+                                #[cfg(target_arch = "wasm32")]
+                                zoon::println!("FilteredView: added condition {:?} for item {:?}", cond_slot, item_slot);
+                            }
+                        }
+                    }
+
+                    // Also update global visibility_conditions for rendering
+                    for (item_slot, cond_slot) in &new_conditions {
+                        self.visibility_conditions.insert(*item_slot, *cond_slot);
+                    }
+
+                    // Subscribe ListCount nodes to the new conditions for reactive updates.
+                    // ListCount subscribes to FilteredView at compile time, but new conditions
+                    // added at runtime also need to trigger ListCount re-evaluation.
+                    let filtered_view_slot = entry.slot;
+                    let subscribers: Vec<_> = self.routing.get_subscribers(filtered_view_slot).to_vec();
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        use zoon::{local_storage, WebStorage};
+                        let entry_str = format!("FV_SUBS:{},subs={};", filtered_view_slot.index, subscribers.len());
+                        let existing: String = match local_storage().get("fv_subs_log") {
+                            Some(Ok(s)) => s,
+                            _ => String::new(),
+                        };
+                        let _ = local_storage().insert("fv_subs_log", &format!("{}{}", existing, entry_str));
+                    }
+                    for (subscriber_slot, _) in subscribers {
+                        // Check if subscriber is a ListCount node
+                        if let Some(node) = self.arena.get(subscriber_slot) {
+                            let is_list_count = matches!(node.kind(), Some(NodeKind::ListCount { .. }));
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                use zoon::{local_storage, WebStorage};
+                                let kind_name = node.kind().map(|k| std::mem::discriminant(k));
+                                let entry_str = format!("SUB_CHECK:{}:is_lc={};", subscriber_slot.index, is_list_count);
+                                let existing: String = match local_storage().get("fv_sub_check") {
+                                    Some(Ok(s)) => s,
+                                    _ => String::new(),
+                                };
+                                let _ = local_storage().insert("fv_sub_check", &format!("{}{}", existing, entry_str));
+                            }
+                            if is_list_count {
+                                // Add route from each new condition to this ListCount
+                                for (_, cond_slot) in &new_conditions {
+                                    self.routing.add_route(*cond_slot, subscriber_slot, Port::Input(0));
+                                    #[cfg(target_arch = "wasm32")]
+                                    zoon::println!("FilteredView: subscribed ListCount {:?} to new condition {:?}",
+                                        subscriber_slot, cond_slot);
+                                    #[cfg(target_arch = "wasm32")]
+                                    {
+                                        use zoon::{local_storage, WebStorage};
+                                        let entry_str = format!("LC_SUB:{}:{};", subscriber_slot.index, cond_slot.index);
+                                        let existing: String = match local_storage().get("lc_subscribed") {
+                                            Some(Ok(s)) => s,
+                                            _ => String::new(),
+                                        };
+                                        let _ = local_storage().insert("lc_subscribed", &format!("{}{}", existing, entry_str));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Mark condition slots dirty so they evaluate
+                    for (_, cond_slot) in &new_conditions {
+                        self.mark_dirty(*cond_slot, Port::Input(0));
+                    }
+                }
+
+                // Forward the ListHandle from the source bus
+                Some(Payload::ListHandle(source_bus))
             }
 
             NodeKind::ListMapper {
@@ -1048,11 +1330,39 @@ impl EventLoop {
                 #[cfg(target_arch = "wasm32")]
                 zoon::println!("Extractor {:?}: source={:?} field={} subscribed_field={:?} port={:?} msg={:?}", entry.slot, source, field, subscribed_field, entry.port, msg);
 
+                // Log high-slot Extractors for "completed" field to confirm they're processed
+                #[cfg(target_arch = "wasm32")]
+                {
+                    use zoon::{local_storage, WebStorage};
+                    let field_name = self.arena.get_field_name(*field)
+                        .map(|s| s.as_ref().to_string())
+                        .unwrap_or_else(|| format!("#{}", field));
+                    if field_name == "completed" && entry.slot.index > 1500 {
+                        let entry_str = format!(
+                            "EXT_ENTER:{}:src={:?}:sf={:?}:port={:?};",
+                            entry.slot.index,
+                            source.map(|s| s.index),
+                            subscribed_field.map(|s| s.index),
+                            entry.port
+                        );
+                        let existing: String = match local_storage().get("ext_enter_log") {
+                            Some(Ok(s)) => s,
+                            _ => String::new(),
+                        };
+                        let _ = local_storage().insert("ext_enter_log", &format!("{}{}", existing, entry_str));
+                    }
+                }
+
                 // Check if this message is from the subscribed field (Input(1)) vs source (Input(0))
                 if entry.port == Port::Input(1) && subscribed_field.is_some() {
                     // Message from subscribed field - read current value from it
                     #[cfg(target_arch = "wasm32")]
-                    zoon::println!("  Extractor: reading current value from subscribed field {:?}", subscribed_field);
+                    {
+                        let field_name = self.arena.get_field_name(*field);
+                        let current_val = subscribed_field.and_then(|fs| self.get_current_value(fs).cloned());
+                        zoon::println!("  Extractor {:?}: RECEIVED on Port::Input(1) field={:?} subscribed={:?} current_val={:?}",
+                            entry.slot, field_name, subscribed_field, current_val.as_ref().map(|v| std::mem::discriminant(v)));
+                    }
                     subscribed_field.and_then(|fs| self.get_current_value(fs).cloned())
                 } else {
                     // Extract a field from incoming Router/TaggedObject payload
@@ -1060,6 +1370,45 @@ impl EventLoop {
                     let source_payload = msg.clone().or_else(|| {
                         source.and_then(|s| self.get_current_value(s).cloned())
                     });
+
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        use zoon::{local_storage, WebStorage};
+                        let field_name = self.arena.get_field_name(*field)
+                            .map(|s| s.as_ref().to_string())
+                            .unwrap_or_else(|| format!("#{}", field));
+
+                        // For cloned Extractors (high slot) or "completed" field, log detailed trace
+                        if entry.slot.index > 1500 || field_name == "completed" {
+                            let src_kind = source.and_then(|s| self.arena.get(s)).and_then(|n| n.kind());
+                            let src_kind_str = match src_kind {
+                                Some(NodeKind::Transformer { body_slot, .. }) => format!("Xfmr(body={:?})", body_slot.map(|s| s.index)),
+                                Some(NodeKind::Router { fields }) => format!("Rtr({}f)", fields.len()),
+                                Some(NodeKind::Wire { source: ws }) => format!("Wire(src={:?})", ws.map(|s| s.index)),
+                                Some(k) => format!("{:?}", std::mem::discriminant(k)),
+                                None => "None".to_string(),
+                            };
+                            let pl_str = match source_payload.as_ref() {
+                                Some(Payload::ObjectHandle(s)) => format!("ObjH({})", s.index),
+                                Some(Payload::TaggedObject { tag, fields }) => format!("TagObj(t={},f={})", tag, fields.index),
+                                Some(p) => format!("{:?}", std::mem::discriminant(p)),
+                                None => "None".to_string(),
+                            };
+                            let entry_str = format!(
+                                "EXT_TRACE:{}:fld={}:src={:?}:sk={}:pl={};",
+                                entry.slot.index,
+                                field_name,
+                                source.map(|s| s.index),
+                                src_kind_str,
+                                pl_str
+                            );
+                            let existing: String = match local_storage().get("ext_trace_log") {
+                                Some(Ok(s)) => s,
+                                _ => String::new(),
+                            };
+                            let _ = local_storage().insert("ext_trace_log", &format!("{}{}", existing, entry_str));
+                        }
+                    }
 
                     // Helper to resolve field slot from a Router
                     let resolve_field = |arena: &Arena, router_slot: SlotId, field_id: u32| -> Option<SlotId> {
@@ -1071,8 +1420,38 @@ impl EventLoop {
                             })
                     };
 
+                    // Helper to find Router by traversing node structure
+                    // Follows Transformer.body_slot and Wire.source chains to find Router
+                    fn find_router_slot(arena: &Arena, slot: SlotId, depth: usize, trace: &mut String) -> Option<SlotId> {
+                        if depth > 10 { return None; }
+                        arena.get(slot).and_then(|node| {
+                            match node.kind() {
+                                Some(NodeKind::Router { .. }) => {
+                                    trace.push_str(&format!("R{}", slot.index));
+                                    Some(slot)
+                                }
+                                Some(NodeKind::Transformer { body_slot: Some(body), .. }) => {
+                                    trace.push_str(&format!("T{}->", slot.index));
+                                    find_router_slot(arena, *body, depth + 1, trace)
+                                }
+                                Some(NodeKind::Wire { source: Some(src) }) => {
+                                    trace.push_str(&format!("W{}->", slot.index));
+                                    find_router_slot(arena, *src, depth + 1, trace)
+                                }
+                                Some(k) => {
+                                    trace.push_str(&format!("?{}({:?})", slot.index, std::mem::discriminant(k)));
+                                    None
+                                }
+                                None => {
+                                    trace.push_str(&format!("!{}", slot.index));
+                                    None
+                                }
+                            }
+                        })
+                    }
+
                     // Find the field slot so we can subscribe to it
-                    let field_slot = source_payload.as_ref().and_then(|payload| {
+                    let mut field_slot = source_payload.as_ref().and_then(|payload| {
                         match payload {
                             Payload::TaggedObject { fields: fields_slot, .. } => {
                                 resolve_field(&self.arena, *fields_slot, *field)
@@ -1084,23 +1463,145 @@ impl EventLoop {
                         }
                     });
 
+                    // Fallback: if source_payload didn't give us a field, try traversing node structure directly
+                    // This handles cloned templates where current_value isn't set yet
+                    if field_slot.is_none() {
+                        if let Some(src) = source {
+                            let mut trace = String::new();
+                            let router_result = find_router_slot(&self.arena, *src, 0, &mut trace);
+                            if let Some(router_slot) = router_result {
+                                field_slot = resolve_field(&self.arena, router_slot, *field);
+                                #[cfg(target_arch = "wasm32")]
+                                {
+                                    let field_name = self.arena.get_field_name(*field);
+                                    zoon::println!("Extractor {:?}: FALLBACK found router {:?} field {:?} -> {:?}",
+                                        entry.slot, router_slot, field_name, field_slot);
+                                }
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                use zoon::{local_storage, WebStorage};
+                                let field_name = self.arena.get_field_name(*field)
+                                    .map(|s| s.as_ref().to_string())
+                                    .unwrap_or_else(|| format!("#{}", field));
+                                // Only log cloned condition Extractors (high slot) + "completed" field
+                                if field_name == "completed" && entry.slot.index > 1500 {
+                                    let entry_str = format!(
+                                        "CLONED_EXT:{}:src={}:tr=[{}]:rtr={:?}:fs={:?};",
+                                        entry.slot.index,
+                                        src.index,
+                                        trace,
+                                        router_result.map(|s| s.index),
+                                        field_slot.map(|s| s.index)
+                                    );
+                                    let existing: String = match local_storage().get("cloned_ext_fb") {
+                                        Some(Ok(s)) => s,
+                                        _ => String::new(),
+                                    };
+                                    let _ = local_storage().insert("cloned_ext_fb", &format!("{}{}", existing, entry_str));
+                                }
+                            }
+                        }
+                    }
+
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        use zoon::{local_storage, WebStorage};
+                        // Only log for "completed" field or very high slots
+                        let field_name = self.arena.get_field_name(*field)
+                            .map(|s| s.as_ref())
+                            .unwrap_or("?");
+                        if field_name == "completed" || entry.slot.index > 1900 {
+                            let entry_str = format!(
+                                "DYN_EXT:{}:fld={}:fs={:?};",
+                                entry.slot.index,
+                                field_name,
+                                field_slot.map(|s| s.index)
+                            );
+                            let existing: String = match local_storage().get("dyn_ext_log") {
+                                Some(Ok(s)) => s,
+                                _ => String::new(),
+                            };
+                            let _ = local_storage().insert("dyn_ext_log", &format!("{}{}", existing, entry_str));
+                        }
+                    }
+
                     // Subscribe to the field slot for future reactive updates
                     // But only subscribe to Producer or IOPad nodes (actual data sources).
                     // Subscribing to Extractor, Arithmetic, or other computed nodes
                     // can create cycles (E1 -> A -> E2 -> E1) that cause infinite loops.
                     // IOPad nodes handle external events (button presses, input changes) and
                     // must be subscribed to for event propagation to work.
+                    // Wire nodes must ALSO be subscribable because LINK converts IOPad->Wire,
+                    // and the Extractor still needs to receive events from the (now-Wire) slot.
                     if let Some(fs) = field_slot {
                         // Subscribe to Producer nodes (constants/values), IOPad nodes (events),
-                        // and Combiner nodes (LATEST - reactive stream mergers)
-                        let is_subscribable = self.arena.get(fs)
-                            .and_then(|n| n.kind())
-                            .map(|k| matches!(k, NodeKind::Producer { .. } | NodeKind::IOPad { .. } | NodeKind::Combiner { .. }))
+                        // Combiner nodes (LATEST), Wire nodes (LINK converts IOPad->Wire),
+                        // and Register nodes (HOLD state containers).
+                        // Register must be subscribable because fields like `item.completed` are often
+                        // HOLD expressions that emit new values on state changes.
+                        let fs_kind = self.arena.get(fs).and_then(|n| n.kind().cloned());
+                        let is_subscribable = fs_kind.as_ref()
+                            .map(|k| matches!(k, NodeKind::Producer { .. } | NodeKind::IOPad { .. } | NodeKind::Combiner { .. } | NodeKind::Wire { .. } | NodeKind::Register { .. }))
                             .unwrap_or(false);
+
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            use zoon::{local_storage, WebStorage};
+                            let kind_name = match fs_kind.as_ref() {
+                                Some(NodeKind::Producer { .. }) => "Prod",
+                                Some(NodeKind::Wire { .. }) => "Wire",
+                                Some(NodeKind::Router { .. }) => "Rtr",
+                                Some(NodeKind::Combiner { .. }) => "Cmb",
+                                Some(NodeKind::Register { .. }) => "Reg",
+                                Some(NodeKind::IOPad { .. }) => "IO",
+                                Some(NodeKind::Extractor { .. }) => "Ext",
+                                Some(NodeKind::Transformer { .. }) => "Xfm",
+                                Some(NodeKind::BoolNot { .. }) => "BNot",
+                                _ => "Oth",
+                            };
+                            // Log cloned "completed" Extractors specifically
+                            let field_name = self.arena.get_field_name(*field)
+                                .map(|s| s.as_ref().to_string())
+                                .unwrap_or_else(|| format!("#{}", field));
+                            if field_name == "completed" && entry.slot.index > 1500 {
+                                let entry_str = format!(
+                                    "CLONED_SUB:{}:fs={}:k={}:sub={};",
+                                    entry.slot.index,
+                                    fs.index,
+                                    kind_name,
+                                    is_subscribable
+                                );
+                                let existing: String = match local_storage().get("cloned_sub_log") {
+                                    Some(Ok(s)) => s,
+                                    _ => String::new(),
+                                };
+                                let _ = local_storage().insert("cloned_sub_log", &format!("{}{}", existing, entry_str));
+                            }
+                            // Only log high slot numbers (cloned nodes) to reduce noise
+                            if entry.slot.index > 1500 {
+                                let entry_str = format!(
+                                    "DYN_SUB:{}:fs={}:k={}:sub={};",
+                                    entry.slot.index,
+                                    fs.index,
+                                    kind_name,
+                                    is_subscribable
+                                );
+                                let existing: String = match local_storage().get("dyn_sub_log") {
+                                    Some(Ok(s)) => s,
+                                    _ => String::new(),
+                                };
+                                let _ = local_storage().insert("dyn_sub_log", &format!("{}{}", existing, entry_str));
+                            }
+                        }
 
                         if is_subscribable && *subscribed_field != Some(fs) && fs != entry.slot {
                             #[cfg(target_arch = "wasm32")]
-                            zoon::println!("  Extractor: subscribing to Producer/IOPad/Combiner field slot {:?}", fs);
+                            {
+                                let field_name = self.arena.get_field_name(*field);
+                                zoon::println!("  Extractor {:?}: SUBSCRIBING to {:?} field={:?} fs_kind={:?}",
+                                    entry.slot, fs, field_name, fs_kind.as_ref().map(|k| std::mem::discriminant(k)));
+                            }
 
                             // Add route from field slot to this Extractor
                             self.routing.add_route(fs, entry.slot, Port::Input(1));
@@ -1262,6 +1763,14 @@ impl EventLoop {
                 }
                 None // Probe doesn't emit
             }
+
+            // LinkResolver forwards input_element's value and is also processed at clone time
+            NodeKind::LinkResolver { input_element, .. } => {
+                // Forward the input_element's value (pass-through behavior)
+                msg.clone().or_else(|| {
+                    self.get_current_value(*input_element).cloned()
+                })
+            }
         };
 
         if let Some(payload) = output {
@@ -1272,6 +1781,61 @@ impl EventLoop {
             #[cfg(target_arch = "wasm32")]
             if !subscribers.is_empty() {
                 zoon::println!("Delivering from {:?} to {} subscribers", entry.slot, subscribers.len());
+            }
+            // DEBUG: Log emit chain to localStorage
+            #[cfg(target_arch = "wasm32")]
+            {
+                use zoon::{local_storage, WebStorage};
+                let kind_name = match &kind {
+                    NodeKind::Producer { .. } => "Prod",
+                    NodeKind::Wire { .. } => "Wire",
+                    NodeKind::Router { .. } => "Rout",
+                    NodeKind::Combiner { .. } => "Comb",
+                    NodeKind::Register { .. } => "Reg",
+                    NodeKind::Transformer { .. } => "Trans",
+                    NodeKind::PatternMux { .. } => "PMux",
+                    NodeKind::SwitchedWire { .. } => "SW",
+                    NodeKind::Bus { .. } => "Bus",
+                    NodeKind::ListAppender { .. } => "LApp",
+                    NodeKind::ListClearer { .. } => "LClr",
+                    NodeKind::FilteredView { .. } => "FV",
+                    NodeKind::ListMapper { .. } => "LMap",
+                    NodeKind::Timer { .. } => "Tmr",
+                    NodeKind::Pulses { .. } => "Pls",
+                    NodeKind::Skip { .. } => "Skip",
+                    NodeKind::Accumulator { .. } => "Acc",
+                    NodeKind::Arithmetic { .. } => "Arith",
+                    NodeKind::Comparison { .. } => "Cmp",
+                    NodeKind::Effect { .. } => "Eff",
+                    NodeKind::IOPad { .. } => "IO",
+                    NodeKind::Extractor { .. } => "Ext",
+                    NodeKind::TextTemplate { .. } => "TT",
+                    NodeKind::ListCount { .. } => "LCnt",
+                    NodeKind::ListIsEmpty { .. } => "LIsE",
+                    NodeKind::BoolNot { .. } => "BNot",
+                    NodeKind::TextTrim { .. } => "Trim",
+                    NodeKind::TextIsNotEmpty { .. } => "TIsN",
+                    NodeKind::LinkResolver { .. } => "LRes",
+                    #[cfg(test)]
+                    NodeKind::Probe { .. } => "Prb",
+                };
+                let subs_str: String = subscribers.iter()
+                    .map(|(s, p)| {
+                        let port_str = match p {
+                            Port::Input(i) => format!("i{}", i),
+                            Port::Output => "o".to_string(),
+                            Port::Field(f) => format!("f{}", f),
+                        };
+                        format!("{}:{}", s.index, port_str)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let entry_str = format!("[{}:{}->{}]", entry.slot.index, kind_name, subs_str);
+                let existing: String = match local_storage().get("emit_chain") {
+                    Some(Ok(s)) => s,
+                    _ => String::new(),
+                };
+                let _ = local_storage().insert("emit_chain", &format!("{}{}", existing, entry_str));
             }
             self.deliver_message(entry.slot, payload);
         }
@@ -1289,6 +1853,43 @@ impl EventLoop {
             // Store the payload for the target to consume
             self.inbox.insert((target, port), payload.clone());
             self.mark_dirty(target, port);
+        }
+    }
+
+    /// Get a field slot from a Router, following Wire chains if needed.
+    /// Used by LinkResolver to traverse object paths at runtime.
+    pub fn get_field_slot(&self, slot: SlotId, field_id: FieldId) -> Option<SlotId> {
+        self.get_field_slot_depth(slot, field_id, 0)
+    }
+
+    fn get_field_slot_depth(&self, slot: SlotId, field_id: FieldId, depth: usize) -> Option<SlotId> {
+        if depth > 20 {
+            return None;
+        }
+        let node = self.arena.get(slot)?;
+        match node.kind()? {
+            NodeKind::Router { fields } => fields.get(&field_id).copied(),
+            NodeKind::Wire { source: Some(source_slot) } => {
+                // Follow wire to find actual Router
+                self.get_field_slot_depth(*source_slot, field_id, depth + 1)
+            }
+            NodeKind::Producer { value: Some(Payload::ObjectHandle(router_slot)) } => {
+                // ObjectHandle - look inside the referenced Router
+                self.get_field_slot_depth(*router_slot, field_id, depth + 1)
+            }
+            NodeKind::Producer { value: Some(Payload::TaggedObject { fields: fields_slot, .. }) } => {
+                // TaggedObject - look inside its fields Router
+                self.get_field_slot_depth(*fields_slot, field_id, depth + 1)
+            }
+            NodeKind::Transformer { body_slot: Some(body), .. } => {
+                // Transformer's value comes from body_slot - follow it
+                self.get_field_slot_depth(*body, field_id, depth + 1)
+            }
+            NodeKind::Register { body_input: Some(body), .. } => {
+                // Register (HOLD) can also be traversed via body for structural access
+                self.get_field_slot_depth(*body, field_id, depth + 1)
+            }
+            _ => None,
         }
     }
 
@@ -1311,6 +1912,11 @@ impl EventLoop {
             if let Some(NodeKind::Wire { source: Some(source_slot) }) = node.kind() {
                 return self.get_current_value_depth(*source_slot, depth + 1);
             }
+            // Transformer: follow body_slot to get value (similar to Wire)
+            // This ensures we get values from cloned templates before they process
+            if let Some(NodeKind::Transformer { body_slot: Some(body), .. }) = node.kind() {
+                return self.get_current_value_depth(*body, depth + 1);
+            }
             // Register (HOLD): ALWAYS use stored_value (the authoritative state)
             if let Some(NodeKind::Register { stored_value: Some(val), .. }) = node.kind() {
                 return Some(val);
@@ -1331,22 +1937,35 @@ impl EventLoop {
                 if let Some(sub_slot) = subscribed_field {
                     return self.get_current_value_depth(*sub_slot, depth + 1);
                 }
-                // Otherwise, get the source value - should be an ObjectHandle or TaggedObject
+
+                // Try to get router_slot either from source_value or directly from source node
+                let mut router_slot: Option<SlotId> = None;
+
+                // First, try to get source_value (ObjectHandle or TaggedObject)
                 if let Some(source_value) = self.get_current_value_depth(*source_slot, depth + 1) {
-                    // Get the router slot from either ObjectHandle or TaggedObject
-                    let router_slot = match source_value {
-                        Payload::ObjectHandle(router_slot) => Some(*router_slot),
+                    router_slot = match source_value {
+                        Payload::ObjectHandle(rs) => Some(*rs),
                         Payload::TaggedObject { fields: fields_slot, .. } => Some(*fields_slot),
                         _ => None,
                     };
+                }
 
-                    if let Some(router_slot) = router_slot {
-                        // Get field from Router
-                        if let Some(router_node) = self.arena.get(router_slot) {
-                            if let Some(NodeKind::Router { fields }) = router_node.kind() {
-                                if let Some(field_slot) = fields.get(field) {
-                                    return self.get_current_value_depth(*field_slot, depth + 1);
-                                }
+                // Fallback: if source_value didn't give us a router, check if source IS a Router
+                // This handles cases where source is a cloned Router that hasn't processed yet
+                if router_slot.is_none() {
+                    if let Some(source_node) = self.arena.get(*source_slot) {
+                        if let Some(NodeKind::Router { .. }) = source_node.kind() {
+                            router_slot = Some(*source_slot);
+                        }
+                    }
+                }
+
+                if let Some(rs) = router_slot {
+                    // Get field from Router
+                    if let Some(router_node) = self.arena.get(rs) {
+                        if let Some(NodeKind::Router { fields }) = router_node.kind() {
+                            if let Some(field_slot) = fields.get(field) {
+                                return self.get_current_value_depth(*field_slot, depth + 1);
                             }
                         }
                     }
@@ -1418,6 +2037,47 @@ impl EventLoop {
                     }
                     NodeKind::Producer { .. } => {
                         // Producer is a leaf, no inputs
+                    }
+                    NodeKind::BoolNot { source, .. } => {
+                        // Traverse into source, but only if it's not a Wire or Extractor
+                        // (those point outside the body and shouldn't be processed)
+                        if let Some(src) = source {
+                            if let Some(src_node) = self.arena.get(*src) {
+                                match src_node.kind() {
+                                    Some(NodeKind::Wire { .. }) | Some(NodeKind::Extractor { .. }) => {
+                                        // Don't traverse - these point outside the body
+                                        // Just add the source itself so it gets processed
+                                        if !visited.contains(src) {
+                                            visited.insert(*src);
+                                            result.push(*src);
+                                        }
+                                    }
+                                    _ => {
+                                        // Traverse into other node types
+                                        self.collect_body_nodes_impl(*src, result, visited);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    NodeKind::Comparison { left, right, .. } => {
+                        // Traverse into both operands
+                        if let Some(l) = left {
+                            self.collect_body_nodes_impl(*l, result, visited);
+                        }
+                        if let Some(r) = right {
+                            self.collect_body_nodes_impl(*r, result, visited);
+                        }
+                    }
+                    NodeKind::TextTrim { source, .. } => {
+                        if let Some(src) = source {
+                            self.collect_body_nodes_impl(*src, result, visited);
+                        }
+                    }
+                    NodeKind::TextIsNotEmpty { source, .. } => {
+                        if let Some(src) = source {
+                            self.collect_body_nodes_impl(*src, result, visited);
+                        }
                     }
                     _ => {}
                 }
@@ -1530,6 +2190,28 @@ impl EventLoop {
         } else {
             zoon::println!("  template_output: NO NODE FOUND");
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let kind_desc = if let Some(node) = self.arena.get(source_item) {
+                match node.kind() {
+                    Some(NodeKind::Producer { value }) => format!("Producer({:?})", value.as_ref().map(|v| std::mem::discriminant(v))),
+                    Some(NodeKind::Router { fields }) => format!("Router({}f)", fields.len()),
+                    Some(NodeKind::Wire { source }) => format!("Wire(src={:?})", source),
+                    Some(NodeKind::Transformer { input, body_slot }) => format!("Transformer(in={:?},body={:?})", input, body_slot),
+                    Some(k) => format!("{:?}", std::mem::discriminant(k)),
+                    None => "NoKind".to_string(),
+                }
+            } else {
+                "NO_NODE".to_string()
+            };
+            zoon::println!("  source_item kind: {}", kind_desc);
+            // Store in localStorage for debugging
+            use zoon::WebStorage;
+            let _ = zoon::local_storage().insert("clone_source_item", &format!(
+                "ti={} to={} si={} kind={}",
+                template_input.index, template_output.index, source_item.index, kind_desc
+            ));
+        }
 
         // Collect all slots in the subgraph from template_input to template_output
         let mut to_clone = std::collections::HashSet::new();
@@ -1543,6 +2225,27 @@ impl EventLoop {
                 // Don't include template_input itself - we'll rewire to source_item
                 continue;
             }
+
+            // CRITICAL: Never clone external nodes. They should stay as references to originals.
+            // External nodes include:
+            // 1. IOPads - event sources connected to DOM elements
+            // 2. Large Routers (>8 fields) - likely top-level objects like `store`
+            //    (Internal objects like `todo_elements` have fewer fields)
+            if let Some(node) = self.arena.get(slot) {
+                match node.kind() {
+                    Some(NodeKind::IOPad { .. }) => {
+                        // Skip IOPads - they stay as references to originals
+                        continue;
+                    }
+                    Some(NodeKind::Router { fields }) if fields.len() > 8 => {
+                        // Skip large Routers - they're likely external top-level objects
+                        // that should not be cloned (e.g., `store` with many fields)
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
             to_clone.insert(slot);
 
             // Find dependencies of this slot
@@ -1646,7 +2349,28 @@ impl EventLoop {
                             to_visit.push(*el);
                         }
                     }
+                    // LinkResolver - traverse input_element (target_source may be template_input)
+                    Some(NodeKind::LinkResolver { input_element, target_source, .. }) => {
+                        to_visit.push(*input_element);
+                        // Only traverse target_source if it's not template_input
+                        // (template_input is handled specially - it's remapped, not cloned)
+                        if *target_source != template_input {
+                            to_visit.push(*target_source);
+                        }
+                    }
                     _ => {}
+                }
+            }
+
+            // Also check routing table for LinkResolver subscribers
+            // This ensures deferred LINK connections get cloned with the template
+            for (target_slot, _port) in self.routing.get_subscribers(slot) {
+                if !to_clone.contains(target_slot) {
+                    if let Some(node) = self.arena.get(*target_slot) {
+                        if matches!(node.kind(), Some(NodeKind::LinkResolver { .. })) {
+                            to_visit.push(*target_slot);
+                        }
+                    }
                 }
             }
         }
@@ -1683,6 +2407,8 @@ impl EventLoop {
         }
 
         // Create mapping from old slots to new slots
+        // Clone all slots reachable from template_output. External references
+        // (slots not in to_clone) will be preserved by remap() via unwrap_or().
         let mut slot_map = std::collections::HashMap::new();
         slot_map.insert(template_input, source_item); // Rewire template_input to source_item
 
@@ -1691,6 +2417,10 @@ impl EventLoop {
             template_input.index, to_clone.contains(&template_input));
 
         for &old_slot in &to_clone {
+            // Skip template_input - it's already mapped to source_item above
+            if old_slot == template_input {
+                continue;
+            }
             let new_slot = self.arena.alloc();
             slot_map.insert(old_slot, new_slot);
         }
@@ -1734,6 +2464,7 @@ impl EventLoop {
             if let Some(old_node) = self.arena.get(old_slot) {
                 let new_kind = self.remap_node_kind_runtime(old_node.kind(), &slot_map);
                 let current_value = old_node.extension.as_ref().and_then(|e| e.current_value.clone());
+                let is_router = matches!(old_node.kind(), Some(NodeKind::Router { .. }));
 
                 if let Some(new_node) = self.arena.get_mut(new_slot) {
                     if let Some(kind) = new_kind {
@@ -1743,6 +2474,12 @@ impl EventLoop {
                     if let Some(cv) = current_value {
                         let remapped_cv = Self::remap_payload(&cv, &slot_map);
                         new_node.extension_mut().current_value = Some(remapped_cv);
+                    } else if is_router {
+                        // For Routers, set current_value = ObjectHandle(self) so that
+                        // Extractors can access their fields via get_current_value.
+                        // This is needed because Routers don't produce values in process_node
+                        // but Extractors need to traverse through them.
+                        new_node.extension_mut().current_value = Some(Payload::ObjectHandle(new_slot));
                     }
                 }
             }
@@ -1761,7 +2498,12 @@ impl EventLoop {
                     Some(NodeKind::Transformer { input: Some(inp), .. }) => {
                         self.routing.add_route(inp, new_slot, Port::Input(0));
                     }
-                    Some(NodeKind::Extractor { source: Some(src), .. }) => {
+                    Some(NodeKind::Extractor { source: Some(src), subscribed_field: Some(sub), .. }) => {
+                        self.routing.add_route(src, new_slot, Port::Input(0));
+                        // Also add route from subscribed IOPad to receive events
+                        self.routing.add_route(sub, new_slot, Port::Input(1));
+                    }
+                    Some(NodeKind::Extractor { source: Some(src), subscribed_field: None, .. }) => {
                         self.routing.add_route(src, new_slot, Port::Input(0));
                     }
                     Some(NodeKind::Combiner { inputs, .. }) => {
@@ -1819,6 +2561,133 @@ impl EventLoop {
                     _ => {}
                 }
             }
+        }
+
+        // Process LinkResolver nodes - resolve deferred LINK connections
+        // This must happen after cloning/remapping so target_source points to the actual item
+        let mut link_resolver_count = 0;
+        let mut link_resolver_resolved = 0;
+        let mut link_resolver_failed = 0;
+        let mut debug_details = String::new();
+        for &old_slot in &to_clone {
+            let new_slot = slot_map[&old_slot];
+            // Also check OLD slot for LinkResolver to see original values
+            let old_target_info = if let Some(old_node) = self.arena.get(old_slot) {
+                if let Some(NodeKind::LinkResolver { target_source: old_ts, .. }) = old_node.kind() {
+                    let old_type = if let Some(n) = self.arena.get(*old_ts) {
+                        match n.kind() {
+                            Some(NodeKind::Wire { source }) => format!("Wire(src={:?})", source),
+                            Some(NodeKind::Transformer { input, body_slot }) =>
+                                format!("Transformer(in={:?},body={:?})", input, body_slot),
+                            Some(k) => format!("{:?}", std::mem::discriminant(k)),
+                            None => "NoKind".to_string(),
+                        }
+                    } else {
+                        "NoNode".to_string()
+                    };
+                    Some((*old_ts, old_type))
+                } else { None }
+            } else { None };
+
+            if let Some(node) = self.arena.get(new_slot) {
+                if let Some(NodeKind::LinkResolver { input_element, target_source, target_path }) = node.kind().cloned() {
+                    link_resolver_count += 1;
+
+                    // Debug: show target_source node type
+                    let target_node_type = if let Some(tgt_node) = self.arena.get(target_source) {
+                        match tgt_node.kind() {
+                            Some(NodeKind::Wire { source }) => format!("Wire(src={:?})", source),
+                            Some(NodeKind::Transformer { input, body_slot }) =>
+                                format!("Transformer(in={:?},body={:?})", input, body_slot),
+                            Some(k) => format!("{:?}", std::mem::discriminant(k)),
+                            None => "NoKind".to_string(),
+                        }
+                    } else {
+                        "None".to_string()
+                    };
+
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::println!("Processing LinkResolver #{}: input_element={:?} target_source={:?}({}) path_len={} old={:?}",
+                        link_resolver_count, input_element, target_source, target_node_type, target_path.len(), old_target_info);
+
+                    // Follow target_path from target_source to find the IOPad
+                    let mut current = target_source;
+                    let mut resolved = true;
+                    let mut step = 0;
+
+                    for field_id in &target_path {
+                        step += 1;
+                        // Debug: show current node type before get_field_slot
+                        let curr_node_type = if let Some(curr_node) = self.arena.get(current) {
+                            match curr_node.kind() {
+                                Some(NodeKind::Router { fields }) => format!("Router({}fields)", fields.len()),
+                                Some(NodeKind::Wire { source }) => format!("Wire(src={:?})", source),
+                                Some(NodeKind::Producer { value }) => format!("Producer({:?})", value.as_ref().map(|v| std::mem::discriminant(v))),
+                                Some(k) => format!("{:?}", std::mem::discriminant(k)),
+                                None => "NoKind".to_string(),
+                            }
+                        } else {
+                            "NoNode".to_string()
+                        };
+
+                        #[cfg(target_arch = "wasm32")]
+                        zoon::println!("  Step {}: get_field_slot({:?}={}, field={:?})",
+                            step, current, curr_node_type, field_id);
+
+                        if let Some(field_slot) = self.get_field_slot(current, *field_id) {
+                            current = field_slot;
+                        } else {
+                            #[cfg(target_arch = "wasm32")]
+                            zoon::println!("  LinkResolver: FAILED at step {} - field {:?} not found in {:?}({})",
+                                step, field_id, current, curr_node_type);
+                            debug_details.push_str(&format!("R{}:{}->{}@{};",
+                                link_resolver_count,
+                                old_target_info.as_ref().map(|(_, t)| t.as_str()).unwrap_or("?"),
+                                target_node_type,
+                                step));
+                            resolved = false;
+                            link_resolver_failed += 1;
+                            break;
+                        }
+                    }
+
+                    if resolved {
+                        link_resolver_resolved += 1;
+                        // Convert the target IOPad to a Wire pointing to input_element
+                        #[cfg(target_arch = "wasm32")]
+                        zoon::println!("  LinkResolver: resolved target={:?}, converting to Wire -> {:?}", current, input_element);
+
+                        if let Some(target_node) = self.arena.get_mut(current) {
+                            target_node.set_kind(NodeKind::Wire { source: Some(input_element) });
+                        }
+                        // IMPORTANT: Add routing so events propagate from input_element to this Wire
+                        self.routing.add_route(input_element, current, Port::Input(0));
+
+                        // CRITICAL: Mark the Wire dirty so it emits its value.
+                        // This triggers the Extractor chain that was waiting for this LINK
+                        // to be established (e.g., todo_elements.todo_checkbox.event.click).
+                        // Without this, Extractors processed before LinkResolver would see
+                        // None and never re-subscribe after the Wire is connected.
+                        self.mark_dirty(current, Port::Input(0));
+                    }
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!("clone_transform_subgraph_runtime: processed {} LinkResolvers", link_resolver_count);
+
+        // Debug: write to localStorage to verify this code path runs
+        #[cfg(target_arch = "wasm32")]
+        {
+            use zoon::WebStorage;
+            let _ = zoon::local_storage().insert("link_resolver_debug", &format!(
+                "cloned={} resolvers={} ok={} fail={} details={}",
+                to_clone.len(),
+                link_resolver_count,
+                link_resolver_resolved,
+                link_resolver_failed,
+                debug_details
+            ));
         }
 
         // Trigger evaluation by marking ALL cloned Wire nodes dirty
@@ -1892,8 +2761,32 @@ impl EventLoop {
                 Some(NodeKind::Wire { source: remap_opt(source) })
             }
             Some(NodeKind::Router { fields }) => {
-                let new_fields = fields.iter()
-                    .map(|(k, v)| (*k, remap(v)))
+                let new_fields: std::collections::HashMap<_, _> = fields.iter()
+                    .map(|(k, v)| {
+                        let remapped = remap(v);
+                        // Log if field slot wasn't remapped (original = remapped means not in slot_map)
+                        #[cfg(target_arch = "wasm32")]
+                        if *v == remapped {
+                            // Get field name
+                            let field_name = self.arena.get_field_name(*k)
+                                .map(|s| s.as_ref().to_string())
+                                .unwrap_or_else(|| format!("#{}", k));
+                            // Get slot kind
+                            let slot_kind = self.arena.get(*v)
+                                .and_then(|n| n.kind())
+                                .map(|k| match k {
+                                    NodeKind::Producer { .. } => "Prod",
+                                    NodeKind::Wire { .. } => "Wire",
+                                    NodeKind::Register { .. } => "Reg",
+                                    NodeKind::Router { .. } => "Rtr",
+                                    _ => "Other",
+                                })
+                                .unwrap_or("None");
+                            zoon::println!("REMAP_ROUTER_FIELD: '{}' slot {} ({}) NOT in slot_map, keeping original",
+                                field_name, v.index, slot_kind);
+                        }
+                        (*k, remapped)
+                    })
                     .collect();
                 Some(NodeKind::Router { fields: new_fields })
             }
@@ -1910,11 +2803,15 @@ impl EventLoop {
                     body_slot: remap_opt(body_slot),
                 })
             }
-            Some(NodeKind::Extractor { source, field, subscribed_field }) => {
+            // Extractor - remap source, reset subscribed_field
+            // CRITICAL: We reset subscribed_field to None because the subscribed slot may be
+            // outside the cloned subgraph. The cloned Extractor will re-establish subscription
+            // when it processes and finds its new field slot.
+            Some(NodeKind::Extractor { source, field, .. }) => {
                 Some(NodeKind::Extractor {
                     source: remap_opt(source),
                     field: *field,
-                    subscribed_field: remap_opt(subscribed_field),
+                    subscribed_field: None,
                 })
             }
             Some(NodeKind::TextTemplate { template, dependencies, cached }) => {
@@ -2006,6 +2903,14 @@ impl EventLoop {
                     connected: *connected,
                 })
             }
+            // LinkResolver - remap both input_element and target_source
+            Some(NodeKind::LinkResolver { input_element, target_source, target_path }) => {
+                Some(NodeKind::LinkResolver {
+                    input_element: remap(input_element),
+                    target_source: remap(target_source),
+                    target_path: target_path.clone(),
+                })
+            }
             _ => kind.cloned()
         }
     }
@@ -2028,7 +2933,7 @@ impl EventLoop {
         }
         let node = self.arena.get(slot)?;
         match node.kind()? {
-            NodeKind::FilteredView { source_bus, conditions: view_conditions } => {
+            NodeKind::FilteredView { source_bus, conditions: view_conditions, .. } => {
                 // Use this view's conditions when counting the source bus
                 self.count_list_items_with_conditions(*source_bus, depth + 1, Some(view_conditions))
             }
@@ -2328,6 +3233,206 @@ impl EventLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_resolver_found_via_routing() {
+        // Test that LinkResolver is found during traversal via routing table
+        let mut el = EventLoop::new();
+
+        // Create a simple template structure:
+        // template_input (Wire) -> element (Producer) -> resolver (LinkResolver)
+        //                                    ^routing
+        let template_input = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(template_input) {
+            node.set_kind(NodeKind::Wire { source: None });
+        }
+
+        // Element node (stands in for checkbox in the real case)
+        let element_slot = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(element_slot) {
+            node.set_kind(NodeKind::Wire { source: Some(template_input) });
+        }
+
+        // LinkResolver attached to element via routing (not via node dependencies)
+        let resolver_slot = el.arena.alloc();
+        let todo_elements_field = el.arena.intern_field("todo_elements");
+        let todo_checkbox_field = el.arena.intern_field("todo_checkbox");
+        if let Some(node) = el.arena.get_mut(resolver_slot) {
+            node.set_kind(NodeKind::LinkResolver {
+                input_element: element_slot,
+                target_source: template_input,
+                target_path: vec![todo_elements_field, todo_checkbox_field],
+            });
+        }
+
+        // Add routing from element to resolver (simulates what LINK setter does)
+        el.routing.add_route(element_slot, resolver_slot, Port::Input(0));
+
+        // Create source item (the todo data object)
+        let todo_checkbox_iopad = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(todo_checkbox_iopad) {
+            node.set_kind(NodeKind::IOPad {
+                element_slot: None,
+                event_type: "change".to_string(),
+                connected: false,
+            });
+        }
+
+        let todo_elements_router = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(todo_elements_router) {
+            let mut fields = std::collections::HashMap::new();
+            fields.insert(todo_checkbox_field, todo_checkbox_iopad);
+            node.set_kind(NodeKind::Router { fields });
+        }
+
+        let source_item = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(source_item) {
+            let mut fields = std::collections::HashMap::new();
+            fields.insert(todo_elements_field, todo_elements_router);
+            node.set_kind(NodeKind::Router { fields });
+        }
+
+        // Clone the template
+        let cloned_output = el.clone_transform_subgraph_runtime(
+            template_input,
+            element_slot,  // template_output is the element
+            source_item,
+        );
+
+        // Verify the IOPad was converted to a Wire pointing to the cloned element
+        // This happens in LinkResolver processing during cloning
+        if let Some(node) = el.arena.get(todo_checkbox_iopad) {
+            match node.kind() {
+                Some(NodeKind::Wire { source: Some(src) }) => {
+                    // Success! The IOPad was converted to Wire
+                    // src should point to cloned element, not original
+                    assert_ne!(*src, element_slot, "Should point to cloned element, not original");
+                }
+                kind => panic!("Expected IOPad to be converted to Wire, got {:?}", kind),
+            }
+        }
+    }
+
+    #[test]
+    fn link_resolver_with_intermediate_wire() {
+        // Test LinkResolver when target_source is a Wire pointing to template_input
+        // (not template_input directly) - this matches the real todo_mvc structure
+        let mut el = EventLoop::new();
+
+        let todo_elements_field = el.arena.intern_field("todo_elements");
+        let todo_checkbox_field = el.arena.intern_field("todo_checkbox");
+
+        // template_input is the List/map's item placeholder
+        let template_input = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(template_input) {
+            node.set_kind(NodeKind::Wire { source: None });
+        }
+
+        // 'todo' parameter Wire in todo_item function - points to template_input
+        let todo_param_wire = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(todo_param_wire) {
+            node.set_kind(NodeKind::Wire { source: Some(template_input) });
+        }
+
+        // Checkbox element
+        let checkbox_slot = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(checkbox_slot) {
+            node.set_kind(NodeKind::Producer { value: Some(Payload::Text("checkbox".into())) });
+        }
+
+        // LinkResolver - target_source is todo_param_wire (NOT template_input directly)
+        let resolver_slot = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(resolver_slot) {
+            node.set_kind(NodeKind::LinkResolver {
+                input_element: checkbox_slot,
+                target_source: todo_param_wire,  // Key difference: points to Wire, not template_input
+                target_path: vec![todo_elements_field, todo_checkbox_field],
+            });
+        }
+
+        // Routing: checkbox -> resolver
+        el.routing.add_route(checkbox_slot, resolver_slot, Port::Input(0));
+
+        // Container that holds checkbox (simulates Element/row structure)
+        let children_bus = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(children_bus) {
+            node.set_kind(NodeKind::Bus {
+                items: vec![(0, checkbox_slot)],
+                alloc_site: crate::engine_v2::node::AllocSite::new(crate::engine_v2::address::SourceId::default()),
+                static_item_count: 1,
+            });
+        }
+
+        // Template output (Element/row result) - a TaggedObject containing the bus
+        let children_field = el.arena.intern_field("children");
+        let wrapper_router = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(wrapper_router) {
+            let mut fields = std::collections::HashMap::new();
+            fields.insert(children_field, children_bus);
+            node.set_kind(NodeKind::Router { fields });
+        }
+
+        let element_row_tag = el.arena.intern_tag("ElementRow");
+        let template_output = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(template_output) {
+            node.set_kind(NodeKind::Producer {
+                value: Some(Payload::TaggedObject {
+                    tag: element_row_tag,
+                    fields: wrapper_router,
+                }),
+            });
+        }
+
+        // Source item (todo data object)
+        let todo_checkbox_iopad = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(todo_checkbox_iopad) {
+            node.set_kind(NodeKind::IOPad {
+                element_slot: None,
+                event_type: "change".to_string(),
+                connected: false,
+            });
+        }
+
+        let todo_elements_router = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(todo_elements_router) {
+            let mut fields = std::collections::HashMap::new();
+            fields.insert(todo_checkbox_field, todo_checkbox_iopad);
+            node.set_kind(NodeKind::Router { fields });
+        }
+
+        let source_item = el.arena.alloc();
+        if let Some(node) = el.arena.get_mut(source_item) {
+            let mut fields = std::collections::HashMap::new();
+            fields.insert(todo_elements_field, todo_elements_router);
+            node.set_kind(NodeKind::Router { fields });
+        }
+
+        // Debug: print what we're about to clone
+        println!("template_input={:?} template_output={:?} source_item={:?}",
+            template_input, template_output, source_item);
+        println!("todo_param_wire={:?} checkbox_slot={:?} resolver_slot={:?}",
+            todo_param_wire, checkbox_slot, resolver_slot);
+
+        // Clone the template
+        let cloned_output = el.clone_transform_subgraph_runtime(
+            template_input,
+            template_output,
+            source_item,
+        );
+
+        println!("cloned_output={:?}", cloned_output);
+
+        // Verify the IOPad was converted to a Wire
+        if let Some(node) = el.arena.get(todo_checkbox_iopad) {
+            match node.kind() {
+                Some(NodeKind::Wire { source }) => {
+                    println!("SUCCESS: IOPad converted to Wire with source={:?}", source);
+                    assert!(source.is_some(), "Wire should have a source");
+                }
+                kind => panic!("Expected IOPad to be converted to Wire, got {:?}", kind),
+            }
+        }
+    }
 
     #[test]
     fn event_loop_basic() {

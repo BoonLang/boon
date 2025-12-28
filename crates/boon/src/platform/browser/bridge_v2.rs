@@ -259,12 +259,131 @@ impl ReactiveEventLoop {
         }
     }
 
+    /// Get the current boolean value at a slot (for deduplication).
+    pub fn get_current_bool(&self, slot: SlotId) -> Option<bool> {
+        let el = self.inner.borrow();
+        el.arena.get(slot)
+            .and_then(|node| node.extension.as_ref())
+            .and_then(|ext| ext.current_value.as_ref())
+            .and_then(|v| match v {
+                Payload::Bool(b) => Some(*b),
+                _ => None,
+            })
+    }
+
     /// Inject an event and run tick.
     pub fn inject_event(&self, target_slot: SlotId, payload: Payload) {
+        // DEBUG: Log at very start to detect if we're even called
+        #[cfg(target_arch = "wasm32")]
+        {
+            let entry = format!("CALLED:{};", target_slot.index);
+            let existing: String = match zoon::local_storage().get("inject_start") {
+                Some(Ok(s)) => s,
+                _ => String::new(),
+            };
+            let _ = zoon::local_storage().insert("inject_start", &format!("{}{}", existing, entry));
+            // Clear emit_chain for this injection and mark the source
+            let _ = zoon::local_storage().insert("emit_chain", &format!("INJ:{}|", target_slot.index));
+        }
         #[cfg(target_arch = "wasm32")]
         zoon::println!("inject_event: target={:?} payload={:?}", target_slot, payload);
         {
-            let mut el = self.inner.borrow_mut();
+            // DEBUG: Check if borrow succeeds
+            let borrow_result = self.inner.try_borrow_mut();
+            #[cfg(target_arch = "wasm32")]
+            {
+                let status = if borrow_result.is_ok() { "OK" } else { "FAIL" };
+                let entry = format!("BORROW:{}:{};", target_slot.index, status);
+                let existing: String = match zoon::local_storage().get("borrow_log") {
+                    Some(Ok(s)) => s,
+                    _ => String::new(),
+                };
+                let _ = zoon::local_storage().insert("borrow_log", &format!("{}{}", existing, entry));
+            }
+            let mut el = match borrow_result {
+                Ok(el) => el,
+                Err(_) => {
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::println!("ERROR: RefCell already borrowed in inject_event for slot {:?}", target_slot);
+                    return;
+                }
+            };
+            // DEBUG: Log that we reached this point
+            #[cfg(target_arch = "wasm32")]
+            {
+                let entry = format!("AFTER_BORROW:{};", target_slot.index);
+                let existing: String = match zoon::local_storage().get("after_borrow") {
+                    Some(Ok(s)) => s,
+                    _ => String::new(),
+                };
+                let _ = zoon::local_storage().insert("after_borrow", &format!("{}{}", existing, entry));
+            }
+            // Debug: APPEND all inject_event calls to see sequence
+            #[cfg(target_arch = "wasm32")]
+            {
+                // Log before get_subscribers
+                {
+                    let entry = format!("BEFORE_SUBS:{};", target_slot.index);
+                    let existing: String = match zoon::local_storage().get("before_subs") {
+                        Some(Ok(s)) => s,
+                        _ => String::new(),
+                    };
+                    let _ = zoon::local_storage().insert("before_subs", &format!("{}{}", existing, entry));
+                }
+                let subscribers = el.routing.get_subscribers(target_slot);
+                // Log after get_subscribers
+                {
+                    let entry = format!("AFTER_SUBS:{}:len={};", target_slot.index, subscribers.len());
+                    let existing: String = match zoon::local_storage().get("after_subs") {
+                        Some(Ok(s)) => s,
+                        _ => String::new(),
+                    };
+                    let _ = zoon::local_storage().insert("after_subs", &format!("{}{}", existing, entry));
+                }
+                // Step 1: Build subs_str - with panic protection
+                let mut subs_parts = Vec::new();
+                for (i, (s, p)) in subscribers.iter().enumerate() {
+                    // Log each subscriber access with PORT TYPE
+                    let port_str = format!("{:?}", p);
+                    let entry = format!("SUB_ITEM:{}:i={}:s={}:p={};", target_slot.index, i, s.index, port_str);
+                    let existing: String = match zoon::local_storage().get("sub_item_log") {
+                        Some(Ok(s)) => s,
+                        _ => String::new(),
+                    };
+                    let _ = zoon::local_storage().insert("sub_item_log", &format!("{}{}", existing, entry));
+                    // Use safe port display to avoid panic
+                    let port_idx = match p {
+                        Port::Input(idx) => format!("i{}", idx),
+                        Port::Output => "out".to_string(),
+                        Port::Field(f) => format!("f{}", f),
+                    };
+                    subs_parts.push(format!("({},{})", s.index, port_idx));
+                }
+                let subs_str = subs_parts.join(",");
+                // Step 2: Log that we built subs_str
+                {
+                    let entry = format!("SUBS_STR:{}:[{}];", target_slot.index, subs_str);
+                    let existing: String = match zoon::local_storage().get("subs_str_log") {
+                        Some(Ok(s)) => s,
+                        _ => String::new(),
+                    };
+                    let _ = zoon::local_storage().insert("subs_str_log", &format!("{}{}", existing, entry));
+                }
+                let new_entry = format!("t={},s=[{}];", target_slot.index, subs_str);
+                // Also store the LAST entry separately for easy reading
+                let _ = zoon::local_storage().insert("inject_last", &new_entry);
+                // DEBUG: Store entry for high slot numbers (dynamic items)
+                if target_slot.index > 2000 {
+                    let _ = zoon::local_storage().insert("inject_dynamic", &new_entry);
+                }
+                // Append to existing log (get returns Option<Result<T, Error>>)
+                let existing: String = match zoon::local_storage().get("inject_log") {
+                    Some(Ok(s)) => s,
+                    _ => String::new(),
+                };
+                let updated = format!("{}{}", existing, new_entry);
+                let _ = zoon::local_storage().insert("inject_log", &updated);
+            }
             // Put payload in inbox so IOPad can forward it to subscribers
             el.inbox.insert((target_slot, Port::Input(0)), payload.clone());
             el.mark_dirty(target_slot, Port::Input(0));
@@ -436,6 +555,22 @@ impl ReactiveEventLoop {
             _ => true,
         };
 
+        // Get hovered slot for hover detection
+        // Path is ["settings", "element", "hovered"] since element is inside the settings object
+        let hovered_slot = self.get_nested_slot(fields_slot, &["settings", "element", "hovered"]);
+
+        #[cfg(target_arch = "wasm32")]
+        if let Some(slot) = hovered_slot {
+            let el = self.inner.borrow();
+            let node_info = if let Some(node) = el.arena.get(slot) {
+                format!("{:?}", node.kind())
+            } else {
+                "None".to_string()
+            };
+            drop(el);
+            zoon::println!("render_stripe: hovered_slot={} node_kind={}", slot.index, node_info);
+        }
+
         // Get items from Bus
         let items_slot = self.get_nested_slot(fields_slot, &["settings", "items"]);
 
@@ -469,6 +604,11 @@ impl ReactiveEventLoop {
             .map(|p| self.render_payload(p))
             .collect();
 
+        // Clone self for hover callback
+        let reactive_el_hover = self.clone();
+        let hovered_slot = hovered_slot.unwrap_or(SlotId::INVALID);
+
+        // Use Column/Row for layout, add hover via raw element
         if is_column {
             let mut col = Column::new()
                 .s(Width::fill())
@@ -490,6 +630,14 @@ impl ReactiveEventLoop {
                 row = row.s(Gap::both(g as u32));
             }
 
+            // TEMPORARILY DISABLED - testing if hover code breaks buttons
+            // Add hover detection for Row (todo items are Row direction)
+            // Check current arena value before injecting to avoid redundant updates
+            // #[cfg(target_arch = "wasm32")]
+            // zoon::println!("render_stripe ROW: hovered_slot_valid={}", hovered_slot.is_valid());
+            let _ = hovered_slot; // silence unused warning
+            let _ = reactive_el_hover; // silence unused warning
+
             row.unify()
         }
     }
@@ -501,6 +649,16 @@ impl ReactiveEventLoop {
         let press_slot = self.get_nested_slot(fields_slot, &["event", "press"]);
         // The hovered state is at path ["element", "hovered"] (not promoted like event)
         let hovered_slot = self.get_nested_slot(fields_slot, &["element", "hovered"]);
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let label_dbg = match &label {
+                Some(Payload::Text(s)) => s.to_string(),
+                _ => "?".to_string(),
+            };
+            zoon::println!(">>> render_button: label={:?} press_slot={:?} hovered_slot={:?}",
+                label_dbg, press_slot, hovered_slot);
+        }
 
         let label_text = match label {
             Some(Payload::Text(s)) => s.to_string(),
@@ -527,17 +685,29 @@ impl ReactiveEventLoop {
         let outline = style_slot.and_then(|s| self.get_nested_value(s, &["outline"]));
 
         // Build button with label and events
-        let mut btn = Button::new()
-            .label(label_text)
-            .on_press(move || {
-                if press_slot.is_valid() {
-                    reactive_el.inject_event(press_slot, Payload::Unit);
+        // Use simple El with click handler instead of Zoon Button
+        // (Zoon Button's on_press uses pointer events that CDP doesn't trigger reliably)
+        let label_for_debug = label_text.clone();
+        let mut btn = El::new()
+            .attr("role", "button")
+            .child(zoon::Text::new(label_text))
+            .on_click({
+                let label_for_debug = label_for_debug.clone();
+                move || {
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::println!(">>> BUTTON on_click: label={:?} press_slot={:?}", label_for_debug, press_slot);
+                    if press_slot.is_valid() {
+                        reactive_el.inject_event(press_slot, Payload::Unit);
+                    }
                 }
             })
             .on_hovered_change(move |is_hovered| {
                 if hovered_slot.is_valid() {
                     reactive_el_hover.inject_event(hovered_slot, Payload::Bool(is_hovered));
                 }
+            })
+            .update_raw_el(|raw_el| {
+                raw_el.style("cursor", "pointer")
             });
 
         // Apply padding
@@ -631,10 +801,12 @@ impl ReactiveEventLoop {
         // Check for custom icon element
         let icon_slot = self.get_nested_slot(fields_slot, &["settings", "icon"]);
         #[cfg(target_arch = "wasm32")]
-        zoon::println!("  icon_slot={:?} checked={:?}", icon_slot, checked);
+        zoon::println!("  icon_slot={:?} checked={:?} click_slot={:?}", icon_slot, checked, click_slot);
 
         let reactive_el = self.clone();
         let click_slot = click_slot.unwrap_or(SlotId::INVALID);
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!("  click_slot.is_valid()={}", click_slot.is_valid());
 
         // Need unique ID for each checkbox - use the fields_slot index
         let checkbox_id = format!("cb-{}", fields_slot.index);
@@ -653,7 +825,16 @@ impl ReactiveEventLoop {
                 .checked(checked_bool)
                 .on_click({
                     let reactive_el = reactive_el.clone();
+                    let fields_slot_copy = fields_slot;
                     move || {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            zoon::println!(">>> CHECKBOX CLICKED (custom icon) fields_slot={:?} click_slot={:?} is_valid={}", fields_slot_copy, click_slot, click_slot.is_valid());
+                            // Store click debug info in localStorage
+                            let debug_info = format!("custom_icon:fields={},click={},valid={}",
+                                fields_slot_copy.index, click_slot.index, click_slot.is_valid());
+                            let _ = zoon::local_storage().insert("checkbox_click_debug", &debug_info);
+                        }
                         if click_slot.is_valid() {
                             reactive_el.inject_event(click_slot, Payload::Bool(!checked_bool));
                         }
@@ -670,9 +851,21 @@ impl ReactiveEventLoop {
                     zoon::Text::new(icon_char)
                 })
                 .checked(checked_bool)
-                .on_click(move || {
-                    if click_slot.is_valid() {
-                        reactive_el.inject_event(click_slot, Payload::Bool(!checked_bool));
+                .on_click({
+                    let reactive_el_clone = reactive_el.clone();
+                    let fields_slot_copy = fields_slot;
+                    move || {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            zoon::println!(">>> CHECKBOX CLICKED (default icon) fields_slot={:?} click_slot={:?} is_valid={}", fields_slot_copy, click_slot, click_slot.is_valid());
+                            // Store click debug info in localStorage
+                            let debug_info = format!("default_icon:fields={},click={},valid={}",
+                                fields_slot_copy.index, click_slot.index, click_slot.is_valid());
+                            let _ = zoon::local_storage().insert("checkbox_click_debug", &debug_info);
+                        }
+                        if click_slot.is_valid() {
+                            reactive_el_clone.inject_event(click_slot, Payload::Bool(!checked_bool));
+                        }
                     }
                 })
         };

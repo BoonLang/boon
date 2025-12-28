@@ -1158,25 +1158,47 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                 // LINK setter: connects the input element's IOPads to target LINKs
                 // e.g., button |> LINK { store.filter_buttons.completed }
                 // Connects ALL event types: press, click, key_down, change, etc.
+                //
+                // For templates (where the target path can't be resolved at compile time),
+                // we create a LinkResolver node that will be processed at clone time.
 
                 use crate::parser::Alias;
 
                 let event_field_id = self.event_loop.arena.intern_field("event");
 
-                // Get the target LINK from alias
-                let target_link_slot = match &alias.node {
+                // Result type: either fully resolved slot, or deferred resolution info
+                enum LinkTarget {
+                    Resolved(SlotId),
+                    Deferred { source: SlotId, path: Vec<FieldId> },
+                }
+
+                // Get the target LINK from alias, tracking whether path was fully resolved
+                let target = match &alias.node {
                     Alias::WithPassed { extra_parts } => {
                         if let Some(passed_slot) = self.current_passed() {
                             let mut current = passed_slot;
+                            let mut resolved_count = 0;
+                            let path_len = extra_parts.len();
+
                             for field_name in extra_parts {
                                 let field_id = self.event_loop.arena.intern_field(field_name);
                                 if let Some(field_slot) = self.get_field(current, field_id) {
                                     current = field_slot;
+                                    resolved_count += 1;
                                 } else {
                                     break;
                                 }
                             }
-                            Some(current)
+
+                            if resolved_count == path_len {
+                                Some(LinkTarget::Resolved(current))
+                            } else {
+                                // Path couldn't be fully resolved - defer to clone time
+                                let path: Vec<FieldId> = extra_parts.iter()
+                                    .map(|name| self.event_loop.arena.intern_field(name))
+                                    .collect();
+                                Some(LinkTarget::Deferred { source: passed_slot, path })
+                            }
                         } else {
                             None
                         }
@@ -1184,15 +1206,29 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                     Alias::WithoutPassed { parts, .. } => {
                         if let Some(&first_slot) = parts.first().and_then(|name| self.local_bindings.get(*name)) {
                             let mut current = first_slot;
+                            let mut resolved_count = 0;
+                            let expected_parts = parts.len() - 1; // Skip first part (the variable name)
+
                             for field_name in parts.iter().skip(1) {
                                 let field_id = self.event_loop.arena.intern_field(field_name);
                                 if let Some(field_slot) = self.get_field(current, field_id) {
                                     current = field_slot;
+                                    resolved_count += 1;
                                 } else {
                                     break;
                                 }
                             }
-                            Some(current)
+
+                            if resolved_count == expected_parts {
+                                Some(LinkTarget::Resolved(current))
+                            } else {
+                                // Path couldn't be fully resolved (likely a template context)
+                                // Create a LinkResolver to defer the connection to clone time
+                                let path: Vec<FieldId> = parts.iter().skip(1)
+                                    .map(|name| self.event_loop.arena.intern_field(name))
+                                    .collect();
+                                Some(LinkTarget::Deferred { source: first_slot, path })
+                            }
                         } else {
                             None
                         }
@@ -1200,16 +1236,49 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                 };
 
                 #[cfg(target_arch = "wasm32")]
-                zoon::println!("LinkSetter: input_slot={:?} target_link_slot={:?}", input_slot, target_link_slot);
+                zoon::println!("LinkSetter: input_slot={:?} target={:?}", input_slot,
+                    match &target {
+                        Some(LinkTarget::Resolved(s)) => format!("Resolved({:?})", s),
+                        Some(LinkTarget::Deferred { source, path }) => format!("Deferred(source={:?}, path_len={})", source, path.len()),
+                        None => "None".to_string(),
+                    });
 
-                // Convert target LINK (IOPad) to a Wire pointing to the input element
-                // This makes field access like `target.event.key_down` follow through to the input element
-                if let Some(target) = target_link_slot {
-                    if let Some(node) = self.event_loop.arena.get_mut(target) {
+                // Handle the target based on whether it was fully resolved
+                match target {
+                    Some(LinkTarget::Resolved(target_slot)) => {
+                        // Convert target LINK (IOPad) to a Wire pointing to the input element
+                        // This makes field access like `target.event.key_down` follow through to the input element
+                        if let Some(node) = self.event_loop.arena.get_mut(target_slot) {
+                            #[cfg(target_arch = "wasm32")]
+                            zoon::println!("LinkSetter: converting target {:?} to Wire -> input {:?}", target_slot, input_slot);
+                            // Replace IOPad with Wire pointing to input element
+                            node.set_kind(NodeKind::Wire { source: Some(input_slot) });
+                        }
+                    }
+                    Some(LinkTarget::Deferred { source, path }) => {
+                        // Can't resolve path at compile time (template context)
+                        // Create a LinkResolver node that will be processed at clone time
+                        // The resolver is connected to input_slot via routing so it gets cloned
                         #[cfg(target_arch = "wasm32")]
-                        zoon::println!("LinkSetter: converting target {:?} to Wire -> input {:?}", target, input_slot);
-                        // Replace IOPad with Wire pointing to input element
-                        node.set_kind(NodeKind::Wire { source: Some(input_slot) });
+                        zoon::println!("LinkSetter: creating LinkResolver for deferred connection (source={:?}, path_len={})", source, path.len());
+
+                        let resolver_slot = self.event_loop.arena.alloc();
+                        if let Some(node) = self.event_loop.arena.get_mut(resolver_slot) {
+                            node.set_kind(NodeKind::LinkResolver {
+                                input_element: input_slot,
+                                target_source: source,
+                                target_path: path,
+                            });
+                        }
+                        // Add route so traversal can find the resolver via routing table
+                        self.event_loop.routing.add_route(input_slot, resolver_slot, Port::Input(0));
+
+                        // Return input_slot (pass-through) - LINK is a side-effect, not a transform
+                        // The resolver will be found during cloning via the routing table
+                    }
+                    None => {
+                        #[cfg(target_arch = "wasm32")]
+                        zoon::println!("LinkSetter: no target found, skipping");
                     }
                 }
 
@@ -2975,6 +3044,7 @@ impl<'a, 'code> CompileContext<'a, 'code> {
 
     /// Compile List/retain - filters the list based on a condition.
     /// Creates a FilteredView node that stores per-item visibility conditions.
+    /// Now also creates a template for dynamic items added at runtime.
     fn compile_list_retain(
         &mut self,
         input_slot: SlotId,
@@ -3022,6 +3092,32 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                 self.local_bindings = old_bindings;
             }
 
+            // Create template for dynamic items (if we have a filter expression)
+            let (template_input, template_output) = if let Some(expr) = if_expr {
+                // Create a Wire to receive the item slot at runtime
+                let tmpl_input = self.event_loop.arena.alloc();
+                if let Some(node) = self.event_loop.arena.get_mut(tmpl_input) {
+                    node.set_kind(NodeKind::Wire { source: None });
+                }
+
+                // Bind template input to the item parameter
+                let old_bindings = self.local_bindings.clone();
+                self.local_bindings.insert(item_param.to_string(), tmpl_input);
+
+                // Compile the condition expression with template input
+                let tmpl_output = self.compile_expression(expr);
+
+                // Restore bindings
+                self.local_bindings = old_bindings;
+
+                #[cfg(target_arch = "wasm32")]
+                zoon::println!("  created template: input={:?} output={:?}", tmpl_input, tmpl_output);
+
+                (Some(tmpl_input), Some(tmpl_output))
+            } else {
+                (None, None)
+            };
+
             // Create a FilteredView node that wraps the Bus
             let filtered_slot = self.event_loop.arena.alloc();
 
@@ -3032,8 +3128,13 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                 node.set_kind(NodeKind::FilteredView {
                     source_bus: bus_slot,
                     conditions,
+                    template_input,
+                    template_output,
                 });
             }
+
+            // Add route from source_bus to FilteredView so it gets notified of new items
+            self.event_loop.routing.add_route(bus_slot, filtered_slot, Port::Input(0));
 
             // Trigger condition slots to run so Extractors can set up subscriptions
             for cond_slot in cond_slots {

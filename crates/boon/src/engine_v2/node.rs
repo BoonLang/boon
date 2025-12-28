@@ -89,6 +89,10 @@ pub enum NodeKind {
         source_bus: SlotId,
         /// Per-item visibility conditions: item_slot -> condition_slot
         conditions: HashMap<SlotId, SlotId>,
+        /// Template input Wire - receives item slot for condition evaluation
+        template_input: Option<SlotId>,
+        /// Template output slot - the root of the condition subgraph
+        template_output: Option<SlotId>,
     },
 
     /// Reactive list mapper - transforms items when source Bus changes
@@ -229,6 +233,18 @@ pub enum NodeKind {
     TextIsNotEmpty {
         /// Source slot (input text)
         source: Option<SlotId>,
+    },
+
+    /// Deferred LINK resolver - used in templates where LINK target can't be resolved at compile time.
+    /// At clone time, this node is processed to set up the actual LINK connection.
+    /// Created when `|> LINK { item.path.to.iopad }` is compiled inside a List/map template.
+    LinkResolver {
+        /// The element to connect (e.g., the checkbox element)
+        input_element: SlotId,
+        /// Source slot to start path traversal (the template_input, remapped to source_item at clone time)
+        target_source: SlotId,
+        /// Path of field IDs to follow from target_source to reach the IOPad
+        target_path: Vec<FieldId>,
     },
 
     /// Test probe - stores last received value for assertions (test-only)
