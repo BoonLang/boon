@@ -58,7 +58,7 @@ actions = [["assert_input_typeable", 0]]
 expect = "2 items left"
 
 # ============================================
-# SECTION 2: ADD TODO
+# SECTION 2: ADD MULTIPLE TODOS
 # ============================================
 
 [[sequence]]
@@ -73,22 +73,53 @@ expect = "Walk the dog"
 description = "Verify item count shows 3"
 expect = "3 items left"
 
+[[sequence]]
+description = "Add another todo (Feed the cat)"
+actions = [
+    ["type", "Feed the cat"],
+    ["key", "Enter"]
+]
+expect = "Feed the cat"
+
+[[sequence]]
+description = "Verify item count shows 4"
+expect = "4 items left"
+
 # ============================================
-# SECTION 3: TOGGLE COMPLETE (CHECK/UNCHECK)
+# SECTION 3: TOGGLE ONE DYNAMIC TODO (isolation test)
+# Checking one dynamically added todo should NOT affect others
+# ============================================
+
+[[sequence]]
+description = "Toggle Walk the dog complete - should only affect that one todo"
+actions = [["click_checkbox", 3]]
+expect = "3 items left"
+
+[[sequence]]
+description = "Verify Feed the cat is still unchecked (still in active count)"
+expect = "Feed the cat"
+
+[[sequence]]
+description = "Uncheck Walk the dog"
+actions = [["click_checkbox", 3]]
+expect = "4 items left"
+
+# ============================================
+# SECTION 4: TOGGLE COMPLETE (CHECK/UNCHECK)
 # ============================================
 
 [[sequence]]
 description = "Toggle first todo complete (Buy groceries)"
 actions = [["click_checkbox", 1]]
-expect = "2 items left"
+expect = "3 items left"
 
 [[sequence]]
 description = "Uncheck same todo - toggle back to active"
 actions = [["click_checkbox", 1]]
-expect = "3 items left"
+expect = "4 items left"
 
 # ============================================
-# SECTION 4: TOGGLE ALL
+# SECTION 5: TOGGLE ALL
 # ============================================
 
 [[sequence]]
@@ -99,24 +130,24 @@ expect = "0 items left"
 [[sequence]]
 description = "Toggle all todos back to active"
 actions = [["click_checkbox", 0]]
-expect = "3 items left"
+expect = "4 items left"
 
 # ============================================
-# SECTION 5: CHECK DIFFERENT TODO
+# SECTION 6: CHECK DIFFERENT TODO
 # ============================================
 
 [[sequence]]
 description = "Check a different todo (Clean room)"
 actions = [["click_checkbox", 2]]
-expect = "2 items left"
+expect = "3 items left"
 
 [[sequence]]
 description = "Uncheck that todo"
 actions = [["click_checkbox", 2]]
-expect = "3 items left"
+expect = "4 items left"
 
 # ============================================
-# SECTION 5: EDIT TODO (DOUBLE-CLICK)
+# SECTION 7: EDIT TODO (DOUBLE-CLICK)
 # ============================================
 
 [[sequence]]
@@ -150,7 +181,7 @@ actions = [["key", "Enter"]]
 expect = "Buy vegetables"
 
 # ============================================
-# SECTION 6: ESCAPE CANCEL EDIT
+# SECTION 8: ESCAPE CANCEL EDIT
 # ============================================
 
 [[sequence]]
@@ -167,7 +198,7 @@ actions = [
 expect = "Clean room"
 
 # ============================================
-# SECTION 7: DELETE TODO
+# SECTION 9: DELETE TODO
 # ============================================
 
 [[sequence]]
@@ -178,22 +209,23 @@ expect = "items left"
 [[sequence]]
 description = "Click X button to delete todo"
 actions = [["click_button", 0]]
-expect = "2 items left"
+expect = "3 items left"
 
 # ============================================
-# SECTION 8: FILTER TODOS
+# SECTION 10: FILTER TODOS
 # ============================================
 
 # First complete a todo so we have something to filter
+# After delete we have: Buy vegetables, Clean room, Feed the cat (3 todos)
 [[sequence]]
 description = "Complete Buy vegetables for filter test"
 actions = [["click_checkbox", 1]]
-expect = "1 item left"
+expect = "2 items left"
 
 [[sequence]]
 description = "Click Active filter"
 actions = [["click_text", "Active"]]
-# Only uncompleted todos should be visible (Clean room)
+# Only uncompleted todos should be visible (Clean room, Feed the cat)
 expect = "Clean room"
 
 [[sequence]]
@@ -208,30 +240,34 @@ actions = [["click_text", "All"]]
 expect = "Buy vegetables"
 
 # ============================================
-# SECTION 9: CLEAR COMPLETED
+# SECTION 11: CLEAR COMPLETED
 # ============================================
 
 [[sequence]]
 description = "Clear completed todos"
 actions = [["click_text", "Clear completed"]]
-# Only "Clean room" should remain
+# Clean room and Feed the cat should remain
 expect = "Clean room"
 
 [[sequence]]
-description = "Verify count shows 1 item"
-expect = "1 item left"
+description = "Verify count shows 2 items"
+expect = "2 items left"
 
 # ============================================
-# SECTION 10: PERSISTENCE TESTS
+# SECTION 12: PERSISTENCE TESTS
 # ============================================
 
 [[persistence]]
-description = "After re-run, should still have 1 item (LIST persisted)"
-expect = "1 item left"
+description = "After re-run, should still have 2 items (LIST persisted)"
+expect = "2 items left"
 
 [[persistence]]
 description = "After re-run, 'Clean room' should still be in list"
 expect = "Clean room"
+
+[[persistence]]
+description = "After re-run, 'Feed the cat' should still be in list"
+expect = "Feed the cat"
 
 [[persistence]]
 description = "After persistence reload, no 'Element' artifact in output"

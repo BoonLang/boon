@@ -3008,14 +3008,16 @@ impl<'a, 'code> CompileContext<'a, 'code> {
     }
 
     /// Compile List/remove - removes items based on an event.
+    /// Creates a ListRemoveController node that manages removal for all items (static and dynamic).
     fn compile_list_remove(
         &mut self,
         input_slot: SlotId,
         item_param: &str,
         on_expr: Option<&Spanned<Expression<'code>>>,
     ) -> SlotId {
-        // For now, just compile the on_expr with proper item bindings (no-op for removal)
-        // Full implementation would set up event handlers for removal
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!("=== compile_list_remove CALLED === input_slot={:?} item_param={}", input_slot, item_param);
+
         if let Some(bus_slot) = self.find_bus_slot(input_slot) {
             // Get items from the bus
             let items: Vec<_> = if let Some(node) = self.event_loop.arena.get(bus_slot) {
@@ -3028,15 +3030,77 @@ impl<'a, 'code> CompileContext<'a, 'code> {
                 vec![]
             };
 
-            // Compile on_expr for each item to avoid "unknown variable" errors
-            for (_key, item_slot) in items {
+            #[cfg(target_arch = "wasm32")]
+            zoon::println!("  bus_slot={:?} items={}", bus_slot, items.len());
+
+            // Create template for dynamic items (like FilteredView does)
+            let (template_input, template_output) = if let Some(expr) = on_expr {
+                // Create a Wire to receive the item slot at runtime
+                let tmpl_input = self.event_loop.arena.alloc();
+                if let Some(node) = self.event_loop.arena.get_mut(tmpl_input) {
+                    node.set_kind(NodeKind::Wire { source: None });
+                }
+
+                // Bind template input to the item parameter
+                let old_bindings = self.local_bindings.clone();
+                self.local_bindings.insert(item_param.to_string(), tmpl_input);
+
+                // Compile the trigger expression with template input
+                let tmpl_output = self.compile_expression(expr);
+
+                // Restore bindings
+                self.local_bindings = old_bindings;
+
+                #[cfg(target_arch = "wasm32")]
+                zoon::println!("  created template: input={:?} output={:?}", tmpl_input, tmpl_output);
+
+                (Some(tmpl_input), Some(tmpl_output))
+            } else {
+                (None, None)
+            };
+
+            // Build per-item triggers for static items
+            let mut triggers = std::collections::HashMap::new();
+            for (_key, item_slot) in &items {
                 if let Some(expr) = on_expr {
+                    // Bind item to parameter
                     let old_bindings = self.local_bindings.clone();
-                    self.local_bindings.insert(item_param.to_string(), item_slot);
-                    let _ = self.compile_expression(expr);
+                    self.local_bindings.insert(item_param.to_string(), *item_slot);
+
+                    // Compile the trigger expression
+                    let trigger_slot = self.compile_expression(expr);
+                    triggers.insert(*item_slot, trigger_slot);
+
+                    #[cfg(target_arch = "wasm32")]
+                    zoon::println!("  static item={:?} trigger={:?}", item_slot, trigger_slot);
+
+                    // Restore bindings
                     self.local_bindings = old_bindings;
                 }
             }
+
+            // Create a ListRemoveController node
+            let controller_slot = self.event_loop.arena.alloc();
+            if let Some(node) = self.event_loop.arena.get_mut(controller_slot) {
+                node.set_kind(NodeKind::ListRemoveController {
+                    source_bus: bus_slot,
+                    triggers: triggers.clone(),
+                    template_input,
+                    template_output,
+                });
+            }
+
+            // Add routing: bus -> controller (for detecting new items)
+            self.event_loop.routing.add_route(bus_slot, controller_slot, Port::Input(0));
+
+            // Add routing: each trigger -> controller (for removal events)
+            for (idx, (_item_slot, trigger_slot)) in triggers.iter().enumerate() {
+                let port_num = (idx + 1) as u8;
+                self.event_loop.routing.add_route(*trigger_slot, controller_slot, Port::Input(port_num));
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            zoon::println!("  created ListRemoveController {:?} with {} static triggers", controller_slot, triggers.len());
         }
 
         self.compile_wire(input_slot)

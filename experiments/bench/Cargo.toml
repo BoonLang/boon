@@ -1,0 +1,17 @@
+[package]
+name = "bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bench]]
+name = "engine_bench"
+harness = false
+
+[dependencies]
+path_a = { path = "../path_a" }
+path_b = { path = "../path_b" }
+shared = { path = "../shared" }
+criterion = "0.5"
+
+[dev-dependencies]
+criterion = "0.5"

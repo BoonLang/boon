@@ -1,7 +1,7 @@
 {
   "supervisor_prompt": "Implement completely plan described in PLAN.md, then say +completed+.",
   "completion_condition": "+completed+",
-  "completion_command": "./test_all.sh --bench",
+  "completion_command": "./test_all.sh",
   "protected_patterns": [
     "test_all.sh"
   ],

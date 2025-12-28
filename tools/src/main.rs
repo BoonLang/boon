@@ -397,7 +397,7 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
             } else {
                 code
             };
-            let response = send_command_to_server(port, WsCommand::InjectCode { code }).await?;
+            let response = send_command_to_server(port, WsCommand::InjectCode { code, filename: None }).await?;
             print_response(response);
         }
 
@@ -517,7 +517,7 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
             };
             // Inject code
             println!("Injecting code...");
-            let response = send_command_to_server(port, WsCommand::InjectCode { code }).await?;
+            let response = send_command_to_server(port, WsCommand::InjectCode { code, filename: None }).await?;
             if matches!(response, WsResponse::Error { .. }) {
                 print_response(response);
                 return Ok(());

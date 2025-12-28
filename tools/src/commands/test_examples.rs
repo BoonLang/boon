@@ -232,8 +232,9 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
     let _ = send_command_to_server(opts.port, WsCommand::ClearStates).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Inject code
-    let response = send_command_to_server(opts.port, WsCommand::InjectCode { code }).await?;
+    // Inject code with filename for persistence
+    let filename = format!("{}.bn", example.name);
+    let response = send_command_to_server(opts.port, WsCommand::InjectCode { code, filename: Some(filename) }).await?;
     if let WsResponse::Error { message } = response {
         return Ok(TestResult {
             name: example.name.clone(),

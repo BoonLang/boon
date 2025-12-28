@@ -141,8 +141,6 @@ async function cdpClickAt(tabId, x, y) {
       }
 
       // Dispatch pointer events for hover state handling
-      // NOTE: CDP mousePressed/mouseReleased already triggers native click event,
-      // so we do NOT dispatch an extra click here to avoid double-clicks
       ['pointerdown', 'pointerup'].forEach(type => {
         el.dispatchEvent(new PointerEvent(type, {
           bubbles: true, cancelable: true, view: window,
@@ -150,6 +148,10 @@ async function cdpClickAt(tabId, x, y) {
           pointerId: 1, pointerType: 'mouse', isPrimary: true
         }));
       });
+
+      // NOTE: CDP mousePressed/mouseReleased above already generates a native click event.
+      // We do NOT dispatch another click here to avoid double-clicks.
+      // If clicks don't work for specific elements, investigate the element's event handling.
     })()
   `);
 
@@ -721,7 +723,11 @@ async function handleCommand(id, command) {
 
       case 'injectCode':
         // Use CDP Runtime.evaluate (still CDP, minimal JS injection)
+        // If filename is provided, set it first so code is saved under the correct name
         try {
+          if (command.filename) {
+            await cdpEvaluate(tab.id, `window.boonPlayground.setCurrentFile(${JSON.stringify(command.filename)})`);
+          }
           await cdpEvaluate(tab.id, `window.boonPlayground.setCode(${JSON.stringify(command.code)})`);
           return { type: 'success', data: null };
         } catch (e) {
@@ -845,9 +851,8 @@ async function handleCommand(id, command) {
         }
 
       case 'clearStates':
-        // Clear all persistence-related localStorage keys directly via CDP
-        // IMPORTANT: Invalidate timers FIRST to prevent race condition where running timers
-        // re-save state immediately after we clear it.
+        // Clear ALL localStorage to ensure a clean slate for tests
+        // This fixes quota exceeded errors from accumulated debug logs
         try {
           const result = await cdpEvaluate(tab.id, `
             (function() {
@@ -857,24 +862,15 @@ async function handleCommand(id, command) {
                 window.boonPlayground.invalidateTimers();
               }
 
-              // Step 2: Clear all known persistence keys
-              const keysToRemove = [
-                'boon-playground-states',           // Old engine state
-                'boon-playground-v2-states',        // Engine v2 state
-                'boon-playground-old-source-code',
-                'boon-playground-span-id-pairs'
-              ];
-              keysToRemove.forEach(key => localStorage.removeItem(key));
+              // Step 2: Clear ALL localStorage for a completely fresh state
+              // This clears everything including:
+              // - Playground states and project files
+              // - Debug logs that can fill up quota
+              // - Any other accumulated data
+              const keyCount = localStorage.length;
+              localStorage.clear();
 
-              // Clear prefixed keys (list_calls:*, list_removed:*)
-              const allKeys = Object.keys(localStorage);
-              allKeys.forEach(key => {
-                if (key.startsWith('list_calls:') || key.startsWith('list_removed:')) {
-                  localStorage.removeItem(key);
-                }
-              });
-
-              return { cleared: keysToRemove.length, prefixedCleared: allKeys.filter(k => k.startsWith('list_')).length };
+              return { cleared: keyCount };
             })()
           `);
           return { type: 'success', data: { method: 'cdp-evaluate', text: 'clear saved states' } };
@@ -991,83 +987,227 @@ async function handleCommand(id, command) {
 
       case 'clickCheckbox':
         // Click a checkbox by index (0-indexed) in the preview pane
+        // Use cdpEvaluate instead of cdpQuerySelectorAll for consistency with getPreviewElements
+        // (CDP DOM API can return stale trees, but page JavaScript always sees current DOM)
         try {
-          const checkboxElements = await cdpQuerySelectorAll(tab.id,
-            '[data-boon-panel="preview"] [role="checkbox"]');
-          const checkboxIndex = command.index;
-          if (checkboxIndex >= checkboxElements.length) {
-            return { type: 'error', message: `Checkbox index ${checkboxIndex} out of range (found ${checkboxElements.length} checkboxes)` };
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { error: 'Preview panel not found' };
+
+              const checkboxes = preview.querySelectorAll('[role="checkbox"]');
+              const results = [];
+
+              // Log all found checkboxes for debugging
+              console.log('[Boon Debug] Found', checkboxes.length, 'checkboxes with role="checkbox"');
+
+              checkboxes.forEach((el, i) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+
+                // Log each checkbox details
+                console.log('[Boon Debug] Checkbox', i, ':', {
+                  rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+                  display: style.display,
+                  visibility: style.visibility,
+                  pointerEvents: style.pointerEvents,
+                  text: (el.textContent || '').substring(0, 20)
+                });
+
+                if (rect.width === 0 || rect.height === 0) return;
+                if (style.display === 'none' || style.visibility === 'hidden') return;
+
+                results.push({
+                  centerX: rect.x + rect.width / 2,
+                  centerY: rect.y + rect.height / 2,
+                  text: (el.textContent || '').trim().substring(0, 50),
+                  width: rect.width,
+                  height: rect.height
+                });
+              });
+
+              return { checkboxes: results, totalFound: checkboxes.length };
+            })()
+          `);
+
+          if (result.error) {
+            return { type: 'error', message: result.error };
           }
-          const checkbox = checkboxElements[checkboxIndex];
-          await cdpClickAt(tab.id, checkbox.centerX, checkbox.centerY);
-          return { type: 'success', data: { index: checkboxIndex, text: checkbox.text, x: checkbox.centerX, y: checkbox.centerY } };
+
+          const checkboxes = result.checkboxes || [];
+          const checkboxIndex = command.index;
+          if (checkboxIndex >= checkboxes.length) {
+            return { type: 'error', message: `Checkbox index ${checkboxIndex} out of range (found ${checkboxes.length} checkboxes)` };
+          }
+          const checkbox = checkboxes[checkboxIndex];
+
+          // Try clicking directly on the checkbox element using JavaScript click()
+          // This ensures the click goes to the checkbox wrapper, not just coordinates
+          const clickResult = await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { error: 'Preview panel not found' };
+
+              const checkboxes = preview.querySelectorAll('[role="checkbox"]');
+              const checkbox = checkboxes[${checkboxIndex}];
+              if (!checkbox) return { error: 'Checkbox not found' };
+
+              // Get info about what we're clicking
+              const rect = checkbox.getBoundingClientRect();
+              const elementAtCenter = document.elementFromPoint(rect.x + rect.width/2, rect.y + rect.height/2);
+
+              // Dispatch click event directly on the checkbox element
+              // This ensures the checkbox handler receives it, not a child element
+              const clickEvent = new MouseEvent('click', {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                clientX: rect.x + rect.width/2,
+                clientY: rect.y + rect.height/2
+              });
+              checkbox.dispatchEvent(clickEvent);
+
+              return {
+                success: true,
+                rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+                elementAtCenter: elementAtCenter?.tagName,
+                elementAtCenterRole: elementAtCenter?.getAttribute('role')
+              };
+            })()
+          `);
+
+          if (clickResult.error) {
+            return { type: 'error', message: clickResult.error };
+          }
+
+          return { type: 'success', data: {
+            index: checkboxIndex,
+            text: checkbox.text,
+            x: checkbox.centerX,
+            y: checkbox.centerY,
+            width: checkbox.width,
+            height: checkbox.height,
+            clickResult
+          } };
         } catch (e) {
           return { type: 'error', message: `Click checkbox failed: ${e.message}` };
         }
 
       case 'clickButton':
         // Click a button by index (0-indexed) in the preview pane
-        // Since Boon/Zoon buttons don't have role="button", we find elements by looking at
-        // leaf elements (elements with no children that have text) and clickable appearance
+        // First try elements with role="button", then fall back to heuristics
         try {
-          const result = await cdpEvaluate(tab.id, `
+          const clickResult = await cdpEvaluate(tab.id, `
             (function() {
               const preview = document.querySelector('[data-boon-panel="preview"]');
-              if (!preview) return { elements: [], error: 'Preview panel not found' };
+              if (!preview) return { error: 'Preview panel not found' };
 
-              // Find all elements in preview
-              const allElements = preview.querySelectorAll('*');
-              const buttons = [];
+              const buttonIndex = ${command.index};
 
-              allElements.forEach((el) => {
+              // First try: elements with role="button"
+              let buttons = Array.from(preview.querySelectorAll('[role="button"]'));
+
+              // Filter visible buttons
+              buttons = buttons.filter(el => {
                 const rect = el.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0) return;
-
+                if (rect.width === 0 || rect.height === 0) return false;
                 const style = window.getComputedStyle(el);
-                if (style.display === 'none' || style.visibility === 'hidden') return;
-
-                // Get direct text content (text nodes that are direct children)
-                let directText = '';
-                for (const node of el.childNodes) {
-                  if (node.nodeType === Node.TEXT_NODE) {
-                    directText += node.textContent;
-                  }
-                }
-                directText = directText.trim();
-
-                // Consider it a button-like element if:
-                // 1. Has direct text content (leaf element with text)
-                // 2. Has pointer cursor OR has click handlers
-                // 3. Is relatively small (not a container)
-                const hasPointerCursor = style.cursor === 'pointer';
-                const isSmall = rect.width < 300 && rect.height < 100;
-                const hasText = directText.length > 0 && directText.length < 50;
-
-                if (hasText && isSmall && hasPointerCursor) {
-                  buttons.push({
-                    text: directText,
-                    x: Math.round(rect.x),
-                    y: Math.round(rect.y),
-                    width: Math.round(rect.width),
-                    height: Math.round(rect.height),
-                    centerX: Math.round(rect.x + rect.width / 2),
-                    centerY: Math.round(rect.y + rect.height / 2)
-                  });
-                }
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                return true;
               });
 
-              return { elements: buttons };
+              // If not enough role="button" elements, fall back to heuristics
+              if (buttons.length <= buttonIndex) {
+                const allElements = preview.querySelectorAll('*');
+                const heuristicButtons = [];
+
+                allElements.forEach((el) => {
+                  // Skip if already in buttons array
+                  if (el.getAttribute('role') === 'button') return;
+
+                  const rect = el.getBoundingClientRect();
+                  if (rect.width === 0 || rect.height === 0) return;
+
+                  const style = window.getComputedStyle(el);
+                  if (style.display === 'none' || style.visibility === 'hidden') return;
+
+                  let directText = '';
+                  for (const node of el.childNodes) {
+                    if (node.nodeType === Node.TEXT_NODE) {
+                      directText += node.textContent;
+                    }
+                  }
+                  directText = directText.trim();
+
+                  const hasPointerCursor = style.cursor === 'pointer';
+                  const isSmall = rect.width < 300 && rect.height < 100;
+                  const hasText = directText.length > 0 && directText.length < 50;
+
+                  if (hasText && isSmall && hasPointerCursor) {
+                    heuristicButtons.push(el);
+                  }
+                });
+
+                buttons = buttons.concat(heuristicButtons);
+              }
+
+              if (buttonIndex >= buttons.length) {
+                return { error: 'Button index ' + buttonIndex + ' out of range (found ' + buttons.length + ' buttons)' };
+              }
+
+              const button = buttons[buttonIndex];
+              const rect = button.getBoundingClientRect();
+              const text = (button.textContent || '').trim().substring(0, 50);
+
+              const centerX = rect.x + rect.width / 2;
+              const centerY = rect.y + rect.height / 2;
+
+              // Debug: check what element is at the click coordinates
+              const elementAtPoint = document.elementFromPoint(centerX, centerY);
+              const elementAtPointInfo = elementAtPoint ? {
+                tag: elementAtPoint.tagName,
+                role: elementAtPoint.getAttribute('role'),
+                text: (elementAtPoint.textContent || '').substring(0, 20),
+                isSameAsButton: elementAtPoint === button
+              } : null;
+
+              // Dispatch click directly on button element (same as checkbox approach)
+              const clickEvent = new MouseEvent('click', {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                clientX: centerX,
+                clientY: centerY
+              });
+              button.dispatchEvent(clickEvent);
+
+              // Also log that we dispatched the event
+              console.log('[Boon Debug] Dispatched click on button:', {
+                index: buttonIndex,
+                text: text,
+                role: button.getAttribute('role'),
+                tagName: button.tagName,
+                className: button.className
+              });
+
+              return {
+                success: true,
+                index: buttonIndex,
+                text: text,
+                rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+                role: button.getAttribute('role'),
+                centerX: centerX,
+                centerY: centerY,
+                elementAtPoint: elementAtPointInfo
+              };
             })()
           `);
 
-          const buttons = result.elements || [];
-          const buttonIndex = command.index;
-          if (buttonIndex >= buttons.length) {
-            return { type: 'error', message: `Button index ${buttonIndex} out of range (found ${buttons.length} buttons)` };
+          if (clickResult.error) {
+            return { type: 'error', message: clickResult.error };
           }
-          const button = buttons[buttonIndex];
-          await cdpClickAt(tab.id, button.centerX, button.centerY);
-          return { type: 'success', data: { index: buttonIndex, text: button.text, x: button.centerX, y: button.centerY } };
+
+          return { type: 'success', data: clickResult };
         } catch (e) {
           return { type: 'error', message: `Click button failed: ${e.message}` };
         }

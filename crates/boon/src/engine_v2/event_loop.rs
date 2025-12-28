@@ -665,6 +665,100 @@ impl EventLoop {
                 None // ListClearer doesn't emit directly
             }
 
+            NodeKind::ListRemoveController { source_bus, triggers, template_input, template_output } => {
+                // ListRemoveController handles both:
+                // 1. Watching source_bus for new items → clone trigger template
+                // 2. Receiving trigger events → remove corresponding item
+                let source_bus = *source_bus;
+                let template_input = *template_input;
+                let template_output = *template_output;
+                let existing_items: std::collections::HashSet<_> = triggers.keys().copied().collect();
+
+                // Check if this is a trigger event (Port::Input(1+)) or bus change (Port::Input(0))
+                let is_trigger_event = matches!(entry.port, Port::Input(n) if n > 0);
+
+                if is_trigger_event && msg.is_some() {
+                    // A trigger fired - find and remove the corresponding item
+                    // We match the SPECIFIC port that received the event to find the right trigger
+                    let trigger_slot_opt = triggers.iter()
+                        .find(|&(_, trig)| {
+                            // Check if this trigger routes to this EXACT port
+                            self.routing.get_subscribers(*trig).iter()
+                                .any(|(s, p)| *s == entry.slot && *p == entry.port)
+                        })
+                        .map(|(&item, _)| item);
+
+                    if let Some(item_to_remove) = trigger_slot_opt {
+                        #[cfg(target_arch = "wasm32")]
+                        zoon::println!("ListRemoveController: trigger fired, removing item {:?} from bus {:?}", item_to_remove, source_bus);
+
+                        // Remove the item from the Bus
+                        if let Some(bus_node) = self.arena.get_mut(source_bus) {
+                            if let Some(NodeKind::Bus { items, .. }) = bus_node.kind_mut() {
+                                let original_len = items.len();
+                                items.retain(|(_, slot)| *slot != item_to_remove);
+                                let new_len = items.len();
+                                #[cfg(target_arch = "wasm32")]
+                                zoon::println!("ListRemoveController: removed {} items (was {}, now {})", original_len - new_len, original_len, new_len);
+                            }
+                        }
+
+                        // Re-emit the Bus to trigger re-render
+                        self.mark_dirty(source_bus, Port::Input(0));
+                    }
+                } else {
+                    // Bus changed - check for new items that need trigger templates
+                    let source_items: Vec<_> = if let Some(node) = self.arena.get(source_bus) {
+                        if let Some(NodeKind::Bus { items, .. }) = node.kind() {
+                            items.clone()
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        vec![]
+                    };
+
+                    // Clone trigger template for new items
+                    let mut new_triggers = Vec::new();
+                    if let (Some(tmpl_in), Some(tmpl_out)) = (template_input, template_output) {
+                        for (_key, item_slot) in &source_items {
+                            if !existing_items.contains(item_slot) {
+                                #[cfg(target_arch = "wasm32")]
+                                zoon::println!("ListRemoveController: new item {:?}, cloning trigger template", item_slot);
+
+                                // Clone the trigger template for this item
+                                let cloned_trigger = self.clone_transform_subgraph_runtime(
+                                    tmpl_in,
+                                    tmpl_out,
+                                    *item_slot,
+                                );
+
+                                // Subscribe to the cloned trigger
+                                let port_num = (new_triggers.len() + existing_items.len() + 1) as u8;
+                                self.routing.add_route(cloned_trigger, entry.slot, Port::Input(port_num));
+
+                                new_triggers.push((*item_slot, cloned_trigger));
+
+                                #[cfg(target_arch = "wasm32")]
+                                zoon::println!("ListRemoveController: created trigger {:?} for item {:?} on port {}", cloned_trigger, item_slot, port_num);
+                            }
+                        }
+                    }
+
+                    // Update triggers map with new items
+                    if !new_triggers.is_empty() {
+                        if let Some(node) = self.arena.get_mut(entry.slot) {
+                            if let Some(NodeKind::ListRemoveController { triggers, .. }) = node.kind_mut() {
+                                for (item_slot, trigger_slot) in new_triggers {
+                                    triggers.insert(item_slot, trigger_slot);
+                                }
+                            }
+                        }
+                    }
+                }
+                None // ListRemoveController doesn't emit directly
+            }
+
             NodeKind::FilteredView { source_bus, conditions, template_input, template_output } => {
                 // FilteredView now handles dynamic items too.
                 // When source_bus changes (Port::Input(0)), check for new items and clone conditions.
@@ -1798,6 +1892,7 @@ impl EventLoop {
                     NodeKind::Bus { .. } => "Bus",
                     NodeKind::ListAppender { .. } => "LApp",
                     NodeKind::ListClearer { .. } => "LClr",
+                    NodeKind::ListRemoveController { .. } => "LRmC",
                     NodeKind::FilteredView { .. } => "FV",
                     NodeKind::ListMapper { .. } => "LMap",
                     NodeKind::Timer { .. } => "Tmr",
@@ -3118,10 +3213,14 @@ mod snapshot_support {
             SerializedPayload::Bool(b) => Payload::Bool(*b),
             SerializedPayload::Unit => Payload::Unit,
             SerializedPayload::Tag(t) => Payload::Tag(*t),
-            // Lists and objects not yet supported for restoration
+            // Lists and objects not yet fully supported for restoration
+            // TODO: Implement proper List/Object restoration with arena reconstruction
             SerializedPayload::List(_) => return None,
             SerializedPayload::Object(_) => return None,
-            SerializedPayload::TaggedObject { tag, .. } => Payload::Tag(*tag),
+            // TaggedObject fields cannot be restored without arena slot reconstruction
+            // For now, return just the Tag (loses structure but prevents panic)
+            // TODO: Implement proper TaggedObject restoration
+            SerializedPayload::TaggedObject { tag, fields: _ } => Payload::Tag(*tag),
         })
     }
 }

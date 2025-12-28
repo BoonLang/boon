@@ -273,6 +273,10 @@ impl ReactiveEventLoop {
 
     /// Inject an event and run tick.
     pub fn inject_event(&self, target_slot: SlotId, payload: Payload) {
+        // ABSOLUTE FIRST LINE
+        #[cfg(target_arch = "wasm32")]
+        zoon::println!("### inject_event ENTRY: slot={} payload={:?}", target_slot.index, payload);
+
         // DEBUG: Log at very start to detect if we're even called
         #[cfg(target_arch = "wasm32")]
         {
@@ -610,10 +614,16 @@ impl ReactiveEventLoop {
 
         // Use Column/Row for layout, add hover via raw element
         if is_column {
+            let reactive_el_col = reactive_el_hover.clone();
             let mut col = Column::new()
                 .s(Width::fill())
                 .s(Align::new().left())
-                .items(rendered);
+                .items(rendered)
+                .on_hovered_change(move |is_hovered| {
+                    if hovered_slot.is_valid() {
+                        reactive_el_col.inject_event(hovered_slot, Payload::Bool(is_hovered));
+                    }
+                });
 
             if let Some(g) = gap {
                 col = col.s(Gap::both(g as u32));
@@ -624,19 +634,16 @@ impl ReactiveEventLoop {
             let mut row = Row::new()
                 .s(Height::fill())
                 .s(Align::new().top())
-                .items(rendered);
+                .items(rendered)
+                .on_hovered_change(move |is_hovered| {
+                    if hovered_slot.is_valid() {
+                        reactive_el_hover.inject_event(hovered_slot, Payload::Bool(is_hovered));
+                    }
+                });
 
             if let Some(g) = gap {
                 row = row.s(Gap::both(g as u32));
             }
-
-            // TEMPORARILY DISABLED - testing if hover code breaks buttons
-            // Add hover detection for Row (todo items are Row direction)
-            // Check current arena value before injecting to avoid redundant updates
-            // #[cfg(target_arch = "wasm32")]
-            // zoon::println!("render_stripe ROW: hovered_slot_valid={}", hovered_slot.is_valid());
-            let _ = hovered_slot; // silence unused warning
-            let _ = reactive_el_hover; // silence unused warning
 
             row.unify()
         }
@@ -684,65 +691,84 @@ impl ReactiveEventLoop {
         let bg_color = style_slot.and_then(|s| self.get_nested_value(s, &["background", "color"]));
         let outline = style_slot.and_then(|s| self.get_nested_value(s, &["outline"]));
 
-        // Build button with label and events
-        // Use simple El with click handler instead of Zoon Button
-        // (Zoon Button's on_press uses pointer events that CDP doesn't trigger reliably)
+        // Build button - inject press event directly in click handler (simpler than Mutable pattern)
         let label_for_debug = label_text.clone();
-        let mut btn = El::new()
+
+        // Build padding CSS
+        let padding_css = if let Some(p) = padding {
+            format!("{}px", p as u32)
+        } else if padding_row.is_some() || padding_col.is_some() {
+            let row = padding_row.unwrap_or(0.0) as u32;
+            let col = padding_col.unwrap_or(0.0) as u32;
+            format!("{}px {}px", col, row)
+        } else {
+            String::new()
+        };
+
+        // Build border-radius CSS
+        let border_radius_css = if let Some(r) = rounded_corners {
+            format!("{}px", r as u32)
+        } else {
+            String::new()
+        };
+
+        // Build background color CSS
+        let bg_color_css = bg_color.and_then(|c| self.payload_to_css_color(&c));
+
+        // Build outline CSS
+        let outline_css = outline.and_then(|o| self.payload_to_css_outline(&o));
+
+        // Create button using RawHtmlEl directly (like Checkbox::new() does)
+        // Inject press event directly in click handler - simpler and more reliable
+        let mut raw_btn = RawHtmlEl::<web_sys::HtmlDivElement>::new("div")
+            .class("button")
             .attr("role", "button")
-            .child(zoon::Text::new(label_text))
-            .on_click({
-                let label_for_debug = label_for_debug.clone();
-                move || {
-                    #[cfg(target_arch = "wasm32")]
-                    zoon::println!(">>> BUTTON on_click: label={:?} press_slot={:?}", label_for_debug, press_slot);
+            .attr("tabindex", "0")
+            .style("cursor", "pointer")
+            .style("user-select", "none")
+            .style("text-align", "center")
+            .style("display", "inline-flex")
+            .event_handler({
+                let reactive_el = reactive_el.clone();
+                move |_: zoon::events::Click| {
                     if press_slot.is_valid() {
                         reactive_el.inject_event(press_slot, Payload::Unit);
                     }
                 }
             })
-            .on_hovered_change(move |is_hovered| {
-                if hovered_slot.is_valid() {
-                    reactive_el_hover.inject_event(hovered_slot, Payload::Bool(is_hovered));
+            // Hover tracking via mouseenter/mouseleave
+            .event_handler({
+                let reactive_el_hover = reactive_el_hover.clone();
+                move |_: zoon::events::MouseEnter| {
+                    if hovered_slot.is_valid() {
+                        reactive_el_hover.inject_event(hovered_slot, Payload::Bool(true));
+                    }
                 }
             })
-            .update_raw_el(|raw_el| {
-                raw_el.style("cursor", "pointer")
-            });
+            .event_handler({
+                move |_: zoon::events::MouseLeave| {
+                    if hovered_slot.is_valid() {
+                        reactive_el_hover.inject_event(hovered_slot, Payload::Bool(false));
+                    }
+                }
+            })
+            .child(zoon::Text::new(label_text));
 
-        // Apply padding
-        if let Some(p) = padding {
-            btn = btn.s(Padding::all(p as u32));
-        } else if padding_row.is_some() || padding_col.is_some() {
-            let row = padding_row.unwrap_or(0.0) as u32;
-            let col = padding_col.unwrap_or(0.0) as u32;
-            btn = btn.s(Padding::new().x(row).y(col));
+        // Apply optional styles
+        if !padding_css.is_empty() {
+            raw_btn = raw_btn.style("padding", &padding_css);
+        }
+        if !border_radius_css.is_empty() {
+            raw_btn = raw_btn.style("border-radius", &border_radius_css);
+        }
+        if let Some(bg) = bg_color_css {
+            raw_btn = raw_btn.style("background-color", &bg);
+        }
+        if let Some(outline) = outline_css {
+            raw_btn = raw_btn.style("outline", &outline);
         }
 
-        // Apply rounded corners
-        if let Some(r) = rounded_corners {
-            btn = btn.s(RoundedCorners::all(r as u32));
-        }
-
-        // Apply background color via raw CSS
-        if let Some(color_payload) = bg_color {
-            if let Some(css_color) = self.payload_to_css_color(&color_payload) {
-                btn = btn.update_raw_el(|raw_el| {
-                    raw_el.style("background-color", &css_color)
-                });
-            }
-        }
-
-        // Apply outline via raw CSS
-        if let Some(outline_payload) = outline {
-            if let Some(css_outline) = self.payload_to_css_outline(&outline_payload) {
-                btn = btn.update_raw_el(|raw_el| {
-                    raw_el.style("outline", &css_outline)
-                });
-            }
-        }
-
-        btn.unify()
+        raw_btn.into()
     }
 
     /// Convert a Payload to a CSS outline string.
@@ -812,6 +838,8 @@ impl ReactiveEventLoop {
         let checkbox_id = format!("cb-{}", fields_slot.index);
 
         // If custom icon is provided, render it; otherwise use default Unicode icons
+        // Use on_change() instead of on_click() because Zoon's internal click handler
+        // toggles the state, and on_change fires when the state actually changes.
         let checkbox_el = if let Some(icon_slot) = icon_slot {
             // Custom icon provided - render it as the checkbox icon
             let icon_reactive = self.clone();
@@ -823,20 +851,16 @@ impl ReactiveEventLoop {
                     icon_reactive.render_slot_element(icon_slot)
                 })
                 .checked(checked_bool)
-                .on_click({
+                .on_change({
                     let reactive_el = reactive_el.clone();
                     let fields_slot_copy = fields_slot;
-                    move || {
+                    move |new_checked| {
                         #[cfg(target_arch = "wasm32")]
                         {
-                            zoon::println!(">>> CHECKBOX CLICKED (custom icon) fields_slot={:?} click_slot={:?} is_valid={}", fields_slot_copy, click_slot, click_slot.is_valid());
-                            // Store click debug info in localStorage
-                            let debug_info = format!("custom_icon:fields={},click={},valid={}",
-                                fields_slot_copy.index, click_slot.index, click_slot.is_valid());
-                            let _ = zoon::local_storage().insert("checkbox_click_debug", &debug_info);
+                            zoon::println!(">>> CHECKBOX CHANGED (custom icon) fields_slot={:?} click_slot={:?} is_valid={} new_checked={}", fields_slot_copy, click_slot, click_slot.is_valid(), new_checked);
                         }
                         if click_slot.is_valid() {
-                            reactive_el.inject_event(click_slot, Payload::Bool(!checked_bool));
+                            reactive_el.inject_event(click_slot, Payload::Bool(new_checked));
                         }
                     }
                 })
@@ -851,20 +875,16 @@ impl ReactiveEventLoop {
                     zoon::Text::new(icon_char)
                 })
                 .checked(checked_bool)
-                .on_click({
+                .on_change({
                     let reactive_el_clone = reactive_el.clone();
                     let fields_slot_copy = fields_slot;
-                    move || {
+                    move |new_checked| {
                         #[cfg(target_arch = "wasm32")]
                         {
-                            zoon::println!(">>> CHECKBOX CLICKED (default icon) fields_slot={:?} click_slot={:?} is_valid={}", fields_slot_copy, click_slot, click_slot.is_valid());
-                            // Store click debug info in localStorage
-                            let debug_info = format!("default_icon:fields={},click={},valid={}",
-                                fields_slot_copy.index, click_slot.index, click_slot.is_valid());
-                            let _ = zoon::local_storage().insert("checkbox_click_debug", &debug_info);
+                            zoon::println!(">>> CHECKBOX CHANGED (default icon) fields_slot={:?} click_slot={:?} is_valid={} new_checked={}", fields_slot_copy, click_slot, click_slot.is_valid(), new_checked);
                         }
                         if click_slot.is_valid() {
-                            reactive_el_clone.inject_event(click_slot, Payload::Bool(!checked_bool));
+                            reactive_el_clone.inject_event(click_slot, Payload::Bool(new_checked));
                         }
                     }
                 })
@@ -1077,6 +1097,9 @@ impl ReactiveEventLoop {
             _ => String::new(),
         };
 
+        // Get double_click event slot from element.event.double_click
+        let double_click_slot = self.get_nested_slot(fields_slot, &["element", "event", "double_click"]);
+
         // Get style properties
         let style_slot = self.get_nested_slot(fields_slot, &["settings", "style"]);
 
@@ -1086,45 +1109,79 @@ impl ReactiveEventLoop {
         let rounded_corners = style_slot.and_then(|s| self.get_nested_number(s, &["rounded_corners"]));
         let bg_color = style_slot.and_then(|s| self.get_nested_value(s, &["background", "color"]));
         let font_color = style_slot.and_then(|s| self.get_nested_value(s, &["font", "color"]));
+        let font_strikethrough = style_slot.and_then(|s| self.get_nested_value(s, &["font", "line", "strikethrough"]));
 
-        // Build the styled element
-        let mut el = El::new();
+        // Clone self for event handler
+        let reactive_el = self.clone();
+        let double_click_slot = double_click_slot.unwrap_or(SlotId::INVALID);
 
-        // Apply padding
-        if let Some(p) = padding {
-            el = el.s(Padding::all(p as u32));
+        // Build using Zoon's Label element which has built-in on_double_click support
+        let mut lbl = Label::new()
+            .label(label_text.clone());
+
+        // Add double-click handler if slot is valid
+        if double_click_slot.is_valid() {
+            lbl = lbl.on_double_click({
+                let reactive_el = reactive_el.clone();
+                move || {
+                    reactive_el.inject_event(double_click_slot, Payload::Unit);
+                }
+            });
         }
 
-        // Apply width
-        if let Some(w) = width {
-            el = el.s(Width::exact(w as u32));
+        // Apply styles via update_raw_el
+        lbl = lbl.update_raw_el(move |mut raw_el| {
+            // Apply padding
+            if let Some(p) = padding {
+                raw_el = raw_el.style("padding", &format!("{}px", p as u32));
+            }
+
+            // Apply width
+            if let Some(w) = width {
+                raw_el = raw_el.style("width", &format!("{}px", w as u32));
+            }
+
+            // Apply rounded corners
+            if let Some(r) = rounded_corners {
+                raw_el = raw_el.style("border-radius", &format!("{}px", r as u32));
+            }
+
+            raw_el
+        });
+
+        // Apply colors and strikethrough via separate update_raw_el calls
+        if let Some(css_color) = bg_color.and_then(|c| self.payload_to_css_color(&c)) {
+            lbl = lbl.update_raw_el(move |raw_el| {
+                raw_el.style("background-color", &css_color)
+            });
         }
 
-        // Apply rounded corners
-        if let Some(r) = rounded_corners {
-            el = el.s(RoundedCorners::all(r as u32));
+        if let Some(css_color) = font_color.and_then(|c| self.payload_to_css_color(&c)) {
+            lbl = lbl.update_raw_el(move |raw_el| {
+                raw_el.style("color", &css_color)
+            });
         }
 
-        // Apply background color via CSS
-        if let Some(color_payload) = bg_color {
-            if let Some(css_color) = self.payload_to_css_color(&color_payload) {
-                // Use Zoon's style system with raw CSS color
-                el = el.update_raw_el(|raw_el| {
-                    raw_el.style("background-color", &css_color)
+        // Apply strikethrough if set
+        if let Some(strikethrough) = font_strikethrough {
+            let should_strikethrough = match strikethrough {
+                Payload::Tag(tag_id) => {
+                    let el = self.inner.borrow();
+                    let tag_name = el.arena.get_tag_name(tag_id).map(|s| s.to_string());
+                    drop(el);
+                    tag_name.as_deref() == Some("True")
+                }
+                Payload::Bool(b) => b,
+                _ => false,
+            };
+            if should_strikethrough {
+                lbl = lbl.update_raw_el(|raw_el| {
+                    raw_el.style("text-decoration", "line-through")
                 });
             }
         }
 
-        // Apply font color via CSS
-        if let Some(color_payload) = font_color {
-            if let Some(css_color) = self.payload_to_css_color(&color_payload) {
-                el = el.update_raw_el(|raw_el| {
-                    raw_el.style("color", &css_color)
-                });
-            }
-        }
-
-        el.child(label_text).unify()
+        lbl.unify()
     }
 
     /// Convert a Payload (Oklch tagged object or named color tag) to a CSS color string.

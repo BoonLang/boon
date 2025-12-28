@@ -16,7 +16,8 @@ pub enum Command {
     Key { key: String },
 
     /// Inject code into the CodeMirror editor
-    InjectCode { code: String },
+    /// If filename is provided, sets current file first (for persistence)
+    InjectCode { code: String, filename: Option<String> },
 
     /// Trigger run (call boonPlayground.run())
     TriggerRun,

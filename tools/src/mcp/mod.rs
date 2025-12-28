@@ -886,7 +886,7 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
                 .and_then(|v| v.as_str())
                 .ok_or("code parameter required")?
                 .to_string();
-            Command::InjectCode { code }
+            Command::InjectCode { code, filename: None }
         }
 
         "boon_get_code" => Command::GetEditorCode,

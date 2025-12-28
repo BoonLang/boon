@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "path_a",
+    "path_b",
+    "shared",
+    "bench",
+]
+
+[workspace.dependencies]
+smallvec = "1.11"

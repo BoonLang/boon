@@ -446,6 +446,7 @@ impl Playground {
             .update_raw_el({
                 let run_command = self.run_command.clone();
                 let source_code = self.source_code.clone();
+                let current_file = self.current_file.clone();
                 move |raw_el| {
                     use wasm_bindgen::prelude::*;
                     use wasm_bindgen::JsCast;
@@ -470,6 +471,14 @@ impl Playground {
                     }) as Box<dyn Fn(String)>);
                     js_sys::Reflect::set(&api, &"setCode".into(), set_code.as_ref()).ok();
                     set_code.forget();
+
+                    // setCurrentFile(filename) - set current file name (for persistence)
+                    let current_file_for_set = current_file.clone();
+                    let set_current_file = Closure::wrap(Box::new(move |filename: String| {
+                        current_file_for_set.set(filename);
+                    }) as Box<dyn Fn(String)>);
+                    js_sys::Reflect::set(&api, &"setCurrentFile".into(), set_current_file.as_ref()).ok();
+                    set_current_file.forget();
 
                     // getCode() - get current editor content
                     let source_code_for_get = source_code.clone();

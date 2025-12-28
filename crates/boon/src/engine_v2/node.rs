@@ -83,6 +83,21 @@ pub enum NodeKind {
         trigger: Option<SlotId>,
     },
 
+    /// List remove controller - manages removal of items from a Bus based on per-item triggers.
+    /// Created by `List/remove(item, on: trigger_expr)`.
+    /// Watches the source Bus and creates trigger subscriptions for each item.
+    ListRemoveController {
+        /// Source Bus slot to watch for items and remove from
+        source_bus: SlotId,
+        /// Per-item triggers: item_slot -> trigger_slot
+        /// When trigger fires, the corresponding item is removed
+        triggers: HashMap<SlotId, SlotId>,
+        /// Template input Wire - receives item slot for trigger evaluation
+        template_input: Option<SlotId>,
+        /// Template output slot - the root of the trigger subgraph
+        template_output: Option<SlotId>,
+    },
+
     /// Filtered view of a Bus - stores per-item visibility conditions
     FilteredView {
         /// Source Bus slot
