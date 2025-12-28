@@ -1,5 +1,5 @@
 {
-  "supervisor_prompt": "Don't stop until all tests defined in `makers verify-playground` pass, especially ones for todo_mvc, then say +completed+. Update our testing infrastructure and browser extension mcp code as needed. Add more tests when you find more bugs in examples or fix bad tests if you are sure there is a bug.",
+  "supervisor_prompt": "Don't stop until all tests defined in `makers verify-playground` pass, especially ones for todo_mvc, then say +completed+. Update our testing infrastructure and browser extension mcp code as needed. Add more tests when you find more bugs in examples or fix bad tests if you are sure there is a bug. Make sure you've also migrated Boon engine to one described and tested in folder experiments, variant B (read also PLAN.md in that experiments folder)",
   "completion_condition": "+completed+",
   "completion_command": "makers verify-playground",
   "protected_patterns": [

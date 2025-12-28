@@ -46,6 +46,17 @@ impl LinkCell {
     pub fn take_event(&mut self) -> Option<Value> {
         self.pending_event.take()
     }
+
+    /// Peek at the pending event without consuming it
+    /// Used for multi-reader scenarios (e.g., multiple list items reading the same event)
+    pub fn peek_event(&self) -> Option<&Value> {
+        self.pending_event.as_ref()
+    }
+
+    /// Clear the pending event (call at end of tick)
+    pub fn clear_event(&mut self) {
+        self.pending_event = None;
+    }
 }
 
 impl Default for LinkCell {

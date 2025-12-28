@@ -106,6 +106,12 @@ fn eval_inner(expr: &Expr, scope: &ScopeId, ctx: &mut EvalContext) -> (Value, Ti
 
         ExprKind::Variable(name) => {
             if let Some((var_scope, expr_id)) = ctx.lookup(name) {
+                // Check if this is a HOLD state reference - return held value directly
+                let slot_key = SlotKey::new(var_scope.clone(), expr_id);
+                if let Some(cell) = ctx.holds.get(&slot_key) {
+                    return (cell.value.clone(), ts);
+                }
+
                 // Find the expression in the program
                 if let Some((_, var_expr)) = ctx.program.bindings.iter().find(|(_, e)| e.id == expr_id) {
                     return eval(var_expr, &var_scope, ctx);
@@ -260,9 +266,9 @@ fn eval_inner(expr: &Expr, scope: &ScopeId, ctx: &mut EvalContext) -> (Value, Ti
             // Get or create link cell
             let cell = ctx.links.entry(slot_key.clone()).or_insert_with(LinkCell::new);
 
-            // Return pending event if any
-            if let Some(event) = cell.take_event() {
-                (event, ctx.tick_counter.next())
+            // Return pending event if any (peek, don't consume - multiple readers may need it)
+            if let Some(event) = cell.peek_event() {
+                (event.clone(), ctx.tick_counter.next())
             } else {
                 (Value::Skip, ts)
             }
@@ -312,7 +318,23 @@ fn eval_inner(expr: &Expr, scope: &ScopeId, ctx: &mut EvalContext) -> (Value, Ti
 
         ExprKind::ListAppend { list, item } => {
             let (list_val, _) = eval(list, scope, ctx);
-            let (item_val, _) = eval(item, scope, ctx);
+
+            // Get or create a ListCell to track item allocations
+            let list_slot = SlotKey::new(scope.clone(), expr.id);
+            let item_key = {
+                let list_cell = ctx.lists.entry(list_slot).or_insert_with(ListCell::new);
+                list_cell.append()
+            };
+
+            // Create a child scope for this item
+            // The scope path is: parent_scope -> list_expr_id -> item_key
+            // This ensures each item's nested HOLDs get unique cells
+            let item_scope = scope.child(expr.id.0 as u64).child(item_key.0);
+
+            // Evaluate the item template IN the item's scope
+            let (item_val, _) = eval(item, &item_scope, ctx);
+
+            // Append to the list value
             let result = ops::list_append(&list_val, item_val);
             (result, ts)
         }

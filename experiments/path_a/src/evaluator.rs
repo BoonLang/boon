@@ -17,6 +17,8 @@ pub struct EvalContext<'a> {
     pub bindings: HashMap<String, SlotId>,
     /// External dependencies found (for template capture analysis)
     pub external_refs: Vec<(String, SlotId)>,
+    /// Current trigger slot (from enclosing THEN/WHEN/WHILE)
+    pub trigger: Option<SlotId>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -26,6 +28,7 @@ impl<'a> EvalContext<'a> {
             templates,
             bindings: HashMap::new(),
             external_refs: Vec::new(),
+            trigger: None,
         }
     }
 
@@ -46,6 +49,18 @@ impl<'a> EvalContext<'a> {
             templates: self.templates,
             bindings: self.bindings.clone(),
             external_refs: Vec::new(),
+            trigger: self.trigger,
+        }
+    }
+
+    /// Create a child context with a specific trigger
+    pub fn with_trigger(&mut self, trigger: SlotId) -> EvalContext<'_> {
+        EvalContext {
+            arena: self.arena,
+            templates: self.templates,
+            bindings: self.bindings.clone(),
+            external_refs: Vec::new(),
+            trigger: Some(trigger),
         }
     }
 }
@@ -55,10 +70,22 @@ pub fn compile_program(program: &Program, arena: &mut Arena, templates: &mut Tem
     let mut ctx = EvalContext::new(arena, templates);
     let mut top_level = HashMap::new();
 
-    for (name, expr) in &program.bindings {
-        let slot = compile_expr(expr, &mut ctx);
-        ctx.bind(name.clone(), slot);
-        top_level.insert(name.clone(), slot);
+    // First pass: allocate slots for ALL top-level bindings
+    // This ensures forward references work (e.g., items can reference all_completed)
+    let binding_slots: Vec<(String, SlotId)> = program.bindings
+        .iter()
+        .map(|(name, _)| {
+            let slot = ctx.arena.alloc();
+            ctx.bind(name.clone(), slot);
+            top_level.insert(name.clone(), slot);
+            (name.clone(), slot)
+        })
+        .collect();
+
+    // Second pass: compile each expression into its pre-allocated slot
+    for ((_, expr), (_, slot)) in program.bindings.iter().zip(binding_slots.iter()) {
+        let node = compile_expr_to_node(expr, &mut ctx, *slot);
+        ctx.arena.set_node(*slot, node);
     }
 
     top_level
@@ -102,14 +129,21 @@ fn compile_expr_to_node(expr: &Expr, ctx: &mut EvalContext, _slot: SlotId) -> No
         }
 
         ExprKind::Object(fields) => {
-            let field_slots: Vec<(String, SlotId)> = fields
-                .iter()
-                .map(|(name, expr)| {
-                    let field_slot = compile_expr(expr, ctx);
-                    ctx.arena.add_subscriber(field_slot, _slot);
-                    (name.clone(), field_slot)
-                })
-                .collect();
+            // First pass: allocate slots and bind names (for forward references)
+            let mut field_slots: Vec<(String, SlotId)> = Vec::new();
+            for (name, _) in fields {
+                let slot = ctx.arena.alloc();
+                ctx.bind(name.clone(), slot);
+                field_slots.push((name.clone(), slot));
+            }
+
+            // Second pass: compile expressions into allocated slots
+            for ((_, expr), (_, slot)) in fields.iter().zip(field_slots.iter()) {
+                let node = compile_expr_to_node(expr, ctx, *slot);
+                ctx.arena.set_node(*slot, node);
+                ctx.arena.add_subscriber(*slot, _slot);
+            }
+
             Node::new(NodeKind::Object(field_slots))
         }
 
@@ -192,7 +226,9 @@ fn compile_expr_to_node(expr: &Expr, ctx: &mut EvalContext, _slot: SlotId) -> No
         ExprKind::Then { input, body } => {
             let input_slot = compile_expr(input, ctx);
             ctx.arena.add_subscriber(input_slot, _slot);
-            let body_slot = compile_expr(body, ctx);
+            // Compile body with this THEN's input as the trigger
+            let mut body_ctx = ctx.with_trigger(input_slot);
+            let body_slot = compile_expr(body, &mut body_ctx);
             Node::new(NodeKind::Then {
                 input: input_slot,
                 body: body_slot,
@@ -277,11 +313,22 @@ fn compile_expr_to_node(expr: &Expr, ctx: &mut EvalContext, _slot: SlotId) -> No
         ExprKind::ListAppend { list, item } => {
             let list_slot = compile_expr(list, ctx);
             ctx.arena.add_subscriber(list_slot, _slot);
-            let item_slot = compile_expr(item, ctx);
-            ctx.arena.add_subscriber(item_slot, _slot);
+
+            // Capture all current bindings for template instantiation
+            let captures = ctx.bindings.clone();
+
+            // Subscribe to trigger if present (from enclosing THEN)
+            if let Some(trigger) = ctx.trigger {
+                ctx.arena.add_subscriber(trigger, _slot);
+            }
+
             Node::new(NodeKind::ListAppend {
                 list: list_slot,
-                item: item_slot,
+                trigger: ctx.trigger,
+                item_template: Box::new(item.as_ref().clone()),
+                captures,
+                instances: Vec::new(),
+                instantiated_count: 0,
             })
         }
     }

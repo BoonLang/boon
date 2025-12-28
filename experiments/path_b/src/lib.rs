@@ -28,6 +28,11 @@ impl Engine {
         runtime.tick(); // Initial evaluation
         Self { runtime }
     }
+
+    /// Get the runtime for debugging
+    pub fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
 }
 
 impl shared::test_harness::Engine for Engine {

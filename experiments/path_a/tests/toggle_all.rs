@@ -18,28 +18,51 @@ use shared::examples::todo_mvc_program;
 use shared::test_harness::{text, TestEngine, Value};
 
 #[test]
-fn toggle_all_requires_template_instantiation() {
-    // This test documents what the toggle-all fix needs:
-    // - Each todo item needs its own HOLD instance
-    // - External dependencies (toggle_all, all_completed) must be captured
-    // - Template instantiation (List/map) must create new reactive graphs per item
+fn toggle_all_affects_new_items() {
+    // This test verifies that clicking toggle_all marks all items as completed.
+    // It requires template instantiation (List/map) where each todo item
+    // has its own reactive HOLD instance that captures toggle_all.click.
 
     let program = todo_mvc_program();
     let mut engine = TestEngine::<Engine>::new(&program);
 
-    // Add items
+    // Add items (they start as not completed)
     engine.inject_event("new_todo_input.submit", text("Buy milk"));
     engine.inject_event("new_todo_input.submit", text("Walk dog"));
 
-    // Verify items added (this works)
+    // Verify items added with completed: false
     let todos = engine.read("todos");
-    match todos {
+    match &todos {
         Value::List(items) => {
             assert_eq!(items.len(), 2);
+            for item in items {
+                if let Value::Object(obj) = item {
+                    assert_eq!(obj.get("completed"), Some(&Value::Bool(false)));
+                }
+            }
         }
         _ => panic!("Expected list"),
     }
 
-    // Note: Individual item toggles would require per-item HOLD instances
-    // which needs List/map template instantiation, not just List/append
+    // Click toggle_all - should mark all items as completed
+    engine.inject_event("toggle_all.click", shared::test_harness::click());
+
+    // Verify all items are now completed
+    let todos = engine.read("todos");
+    match todos {
+        Value::List(items) => {
+            assert_eq!(items.len(), 2);
+            for (i, item) in items.iter().enumerate() {
+                if let Value::Object(obj) = item {
+                    assert_eq!(
+                        obj.get("completed"),
+                        Some(&Value::Bool(true)),
+                        "Item {} should be completed after toggle_all",
+                        i
+                    );
+                }
+            }
+        }
+        _ => panic!("Expected list"),
+    }
 }

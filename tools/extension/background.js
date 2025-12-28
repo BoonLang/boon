@@ -987,37 +987,69 @@ async function handleCommand(id, command) {
 
       case 'clickCheckbox':
         // Click a checkbox by index (0-indexed) in the preview pane
-        // Use cdpEvaluate instead of cdpQuerySelectorAll for consistency with getPreviewElements
-        // (CDP DOM API can return stale trees, but page JavaScript always sees current DOM)
+        // Boon/Zoon checkboxes are identified by:
+        // 1. [role="checkbox"] attribute (standard)
+        // 2. id starting with "cb-" (Boon bridge convention from bridge_v2.rs)
         try {
           const result = await cdpEvaluate(tab.id, `
             (function() {
               const preview = document.querySelector('[data-boon-panel="preview"]');
               if (!preview) return { error: 'Preview panel not found' };
 
-              const checkboxes = preview.querySelectorAll('[role="checkbox"]');
+              // Find checkboxes by multiple methods:
+              // 1. Standard role="checkbox"
+              // 2. Boon's cb-* ID convention (bridge_v2.rs assigns id="cb-{slot_index}")
+              const roleCheckboxes = Array.from(preview.querySelectorAll('[role="checkbox"]'));
+              const idCheckboxes = Array.from(preview.querySelectorAll('[id^="cb-"]'));
+
+              // Merge and dedupe (prefer elements found by both methods)
+              const seen = new Set();
+              const allCheckboxes = [];
+
+              // First add role-based checkboxes (they're most reliable)
+              roleCheckboxes.forEach(el => {
+                seen.add(el);
+                allCheckboxes.push(el);
+              });
+
+              // Then add id-based checkboxes not already found
+              idCheckboxes.forEach(el => {
+                if (!seen.has(el)) {
+                  seen.add(el);
+                  allCheckboxes.push(el);
+                }
+              });
+
+              // Sort by vertical position (top to bottom) for consistent ordering
+              allCheckboxes.sort((a, b) => {
+                const rectA = a.getBoundingClientRect();
+                const rectB = b.getBoundingClientRect();
+                return rectA.top - rectB.top;
+              });
+
               const results = [];
 
               // Log all found checkboxes for debugging
-              console.log('[Boon Debug] Found', checkboxes.length, 'checkboxes with role="checkbox"');
+              console.log('[Boon Debug] Found', allCheckboxes.length, 'checkboxes (role:', roleCheckboxes.length, ', id:', idCheckboxes.length, ')');
 
-              checkboxes.forEach((el, i) => {
+              allCheckboxes.forEach((el, i) => {
                 const rect = el.getBoundingClientRect();
                 const style = window.getComputedStyle(el);
 
                 // Log each checkbox details
                 console.log('[Boon Debug] Checkbox', i, ':', {
+                  id: el.id,
+                  role: el.getAttribute('role'),
                   rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
                   display: style.display,
-                  visibility: style.visibility,
-                  pointerEvents: style.pointerEvents,
-                  text: (el.textContent || '').substring(0, 20)
+                  visibility: style.visibility
                 });
 
                 if (rect.width === 0 || rect.height === 0) return;
                 if (style.display === 'none' || style.visibility === 'hidden') return;
 
                 results.push({
+                  id: el.id,
                   centerX: rect.x + rect.width / 2,
                   centerY: rect.y + rect.height / 2,
                   text: (el.textContent || '').trim().substring(0, 50),
@@ -1026,7 +1058,7 @@ async function handleCommand(id, command) {
                 });
               });
 
-              return { checkboxes: results, totalFound: checkboxes.length };
+              return { checkboxes: results, totalFound: allCheckboxes.length };
             })()
           `);
 
@@ -1041,15 +1073,31 @@ async function handleCommand(id, command) {
           }
           const checkbox = checkboxes[checkboxIndex];
 
-          // Try clicking directly on the checkbox element using JavaScript click()
-          // This ensures the click goes to the checkbox wrapper, not just coordinates
+          // Click directly on the checkbox element using its ID or position
           const clickResult = await cdpEvaluate(tab.id, `
             (function() {
               const preview = document.querySelector('[data-boon-panel="preview"]');
               if (!preview) return { error: 'Preview panel not found' };
 
-              const checkboxes = preview.querySelectorAll('[role="checkbox"]');
-              const checkbox = checkboxes[${checkboxIndex}];
+              // Find checkbox by ID if available, otherwise by index in sorted list
+              let checkbox = null;
+              const checkboxId = ${JSON.stringify(checkbox.id)};
+              if (checkboxId) {
+                checkbox = document.getElementById(checkboxId);
+              }
+
+              if (!checkbox) {
+                // Fallback: find by position in sorted list
+                const roleCheckboxes = Array.from(preview.querySelectorAll('[role="checkbox"]'));
+                const idCheckboxes = Array.from(preview.querySelectorAll('[id^="cb-"]'));
+                const seen = new Set();
+                const allCheckboxes = [];
+                roleCheckboxes.forEach(el => { seen.add(el); allCheckboxes.push(el); });
+                idCheckboxes.forEach(el => { if (!seen.has(el)) { seen.add(el); allCheckboxes.push(el); } });
+                allCheckboxes.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+                checkbox = allCheckboxes[${checkboxIndex}];
+              }
+
               if (!checkbox) return { error: 'Checkbox not found' };
 
               // Get info about what we're clicking
@@ -1057,7 +1105,6 @@ async function handleCommand(id, command) {
               const elementAtCenter = document.elementFromPoint(rect.x + rect.width/2, rect.y + rect.height/2);
 
               // Dispatch click event directly on the checkbox element
-              // This ensures the checkbox handler receives it, not a child element
               const clickEvent = new MouseEvent('click', {
                 bubbles: true,
                 cancelable: true,
@@ -1069,6 +1116,7 @@ async function handleCommand(id, command) {
 
               return {
                 success: true,
+                id: checkbox.id,
                 rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
                 elementAtCenter: elementAtCenter?.tagName,
                 elementAtCenterRole: elementAtCenter?.getAttribute('role')
@@ -1082,6 +1130,7 @@ async function handleCommand(id, command) {
 
           return { type: 'success', data: {
             index: checkboxIndex,
+            id: checkbox.id,
             text: checkbox.text,
             x: checkbox.centerX,
             y: checkbox.centerY,

@@ -1,17 +1,29 @@
 //! List append test for Path B engine
-//!
-//! NOTE: Path B uses full re-evaluation approach. This test verifies
-//! the engine compiles and initializes correctly.
 
 use path_b::Engine;
 use shared::examples::list_append_program;
-use shared::test_harness::{TestEngine, Value};
+use shared::test_harness::{click, TestEngine, Value};
 
 #[test]
-fn list_initializes() {
+fn list_appends_on_click() {
     let program = list_append_program();
-    let engine = TestEngine::<Engine>::new(&program);
+    let mut engine = TestEngine::<Engine>::new(&program);
 
-    // Verify initial list is empty
+    // Initial list should be empty
     engine.assert_eq("items", Value::List(vec![]));
+
+    // Click button - appends 0 (current length)
+    engine.inject_event("button.click", click());
+    engine.assert_eq("items", Value::List(vec![Value::Int(0)]));
+
+    // Click again - appends 1
+    engine.inject_event("button.click", click());
+    engine.assert_eq("items", Value::List(vec![Value::Int(0), Value::Int(1)]));
+
+    // Click more
+    engine.inject_event("button.click", click());
+    engine.assert_eq(
+        "items",
+        Value::List(vec![Value::Int(0), Value::Int(1), Value::Int(2)]),
+    );
 }

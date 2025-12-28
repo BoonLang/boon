@@ -4,7 +4,9 @@
 
 use crate::arena::SlotId;
 use crate::template::TemplateId;
+use shared::ast::Expr;
 use shared::test_harness::Value;
+use std::collections::HashMap;
 
 /// A node in the reactive graph
 #[derive(Debug, Clone)]
@@ -111,10 +113,20 @@ pub enum NodeKind {
         instances: Vec<SlotId>,
     },
 
-    /// List/append - appends to a list
+    /// List/append - appends to a list with template instantiation
     ListAppend {
+        /// Source list slot (reads current list for HOLD state)
         list: SlotId,
-        item: SlotId,
+        /// Trigger slot - when non-Skip, instantiate a new item
+        trigger: Option<SlotId>,
+        /// Item template AST (compiled fresh for each append)
+        item_template: Box<Expr>,
+        /// Captured bindings from outer scope (name -> slot)
+        captures: HashMap<String, SlotId>,
+        /// Instantiated item slots (one per appended item)
+        instances: Vec<SlotId>,
+        /// Number of items instantiated (to track when to create new ones)
+        instantiated_count: usize,
     },
 
     /// Block with local bindings
