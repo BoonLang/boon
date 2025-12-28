@@ -35,6 +35,9 @@ pub struct Engine {
     active_events: HashMap<SlotId, Value>,
     /// Slots that have already fired this tick (for THEN/WHEN/WHILE pulse semantics)
     fired_this_tick: std::collections::HashSet<SlotId>,
+    /// Topological order of slots (dependencies before dependents)
+    /// Computed after compilation, allows single-pass evaluation
+    topo_order: Vec<SlotId>,
 }
 
 impl Engine {
@@ -43,6 +46,9 @@ impl Engine {
         let mut arena = Arena::new();
         let mut templates = TemplateRegistry::new();
         let top_level = compile_program(program, &mut arena, &mut templates);
+
+        // Compute topological order after compilation
+        let topo_order = arena.compute_topo_order();
 
         let mut engine = Self {
             arena,
@@ -53,6 +59,7 @@ impl Engine {
             pending_events: Vec::new(),
             active_events: HashMap::new(),
             fired_this_tick: std::collections::HashSet::new(),
+            topo_order,
         };
 
         // Mark all slots dirty for initial evaluation
@@ -88,11 +95,10 @@ impl Engine {
         self.instantiate_triggered_list_appends();
 
         // Phase 1: Stabilize all non-pulse nodes
-        // Multiple passes until no changes
-        for pass in 0..20 {
+        // Use topological order but still do multiple passes for complex propagation
+        for _pass in 0..20 {
             let mut changed = false;
-            for i in 0..self.arena.len() {
-                let slot = SlotId(i as u32);
+            for &slot in &self.topo_order {
                 let old_value = self.arena.get_value(slot).clone();
 
                 if let Some(node) = self.arena.get_node(slot).cloned() {
@@ -128,16 +134,13 @@ impl Engine {
                     }
                 }
             }
-
             if !changed {
                 break;
             }
         }
 
-        // Phase 2: Fire pulse nodes (THEN/WHEN/WHILE) exactly once
-        for i in 0..self.arena.len() {
-            let slot = SlotId(i as u32);
-
+        // Phase 2: Fire pulse nodes (THEN/WHEN/WHILE) exactly once (in topo order)
+        for &slot in &self.topo_order {
             if let Some(node) = self.arena.get_node(slot).cloned() {
                 let is_pulse_node = matches!(
                     &node.kind,
@@ -157,11 +160,10 @@ impl Engine {
         }
 
         // Phase 3a: Propagate pulse results through LATEST to HOLD
-        // (while pulse values are still available, before resetting to Skip)
+        // Use topological order with multiple passes for complex propagation
         for _ in 0..10 {
             let mut changed = false;
-            for i in 0..self.arena.len() {
-                let slot = SlotId(i as u32);
+            for &slot in &self.topo_order {
                 let old_value = self.arena.get_value(slot).clone();
 
                 if let Some(node) = self.arena.get_node(slot).cloned() {
@@ -199,7 +201,6 @@ impl Engine {
                     }
                 }
             }
-
             if !changed {
                 break;
             }
@@ -292,21 +293,30 @@ impl Engine {
         let is_simple = !matches!(&item_template.kind, shared::ast::ExprKind::Object(_));
 
         // For simple items, snapshot captured values first
-        let snapshotted_bindings: HashMap<String, SlotId> = if is_simple {
+        let (snapshotted_bindings, new_const_slots): (HashMap<String, SlotId>, Vec<SlotId>) = if is_simple {
             // Snapshot all captured values as Constants
-            captures
-                .iter()
-                .map(|(name, slot)| {
-                    let value = self.arena.get_value(*slot).clone();
-                    let const_slot = self.arena.alloc();
-                    self.arena.set_node(const_slot, Node::new(NodeKind::Constant(value.clone())));
-                    self.arena.set_value(const_slot, value);
-                    (name.clone(), const_slot)
-                })
-                .collect()
+            let mut bindings = HashMap::new();
+            let mut const_slots = Vec::new();
+            for (name, slot) in captures {
+                let value = self.arena.get_value(*slot).clone();
+                let const_slot = self.arena.alloc();
+                self.arena.set_node(const_slot, Node::new(NodeKind::Constant(value.clone())));
+                self.arena.set_value(const_slot, value);
+                const_slots.push(const_slot);
+                bindings.insert(name.clone(), const_slot);
+            }
+            (bindings, const_slots)
         } else {
-            captures.clone()
+            (captures.clone(), Vec::new())
         };
+
+        // Add snapshotted slots to topo_order
+        for &slot in &new_const_slots {
+            self.topo_order.push(slot);
+        }
+
+        // Track slot count before compilation to find new slots
+        let slot_count_before = self.arena.len();
 
         // Create evaluation context with the appropriate bindings
         let mut ctx = EvalContext::new(&mut self.arena, &mut self.templates);
@@ -323,8 +333,27 @@ impl Engine {
             }
         }
 
-        // Mark new slots dirty for evaluation
-        self.arena.mark_dirty(instance_slot);
+        // Evaluate new slots immediately (before continuing with rest of tick phases)
+        // This ensures instance values are ready when ListAppend is evaluated
+        for slot in new_const_slots.iter().copied() {
+            if let Some(node) = self.arena.get_node(slot).cloned() {
+                let new_value = self.compute_node(&node, slot);
+                self.arena.set_value(slot, new_value);
+            }
+        }
+        // Evaluate in reverse order: dependencies are allocated after dependents in compile_expr
+        // So iterating backwards processes dependencies before dependents
+        for i in (slot_count_before..self.arena.len()).rev() {
+            let slot = SlotId(i as u32);
+            if let Some(node) = self.arena.get_node(slot).cloned() {
+                let new_value = self.compute_node(&node, slot);
+                self.arena.set_value(slot, new_value);
+            }
+        }
+        // Add to topo_order in forward order (for future ticks)
+        for i in slot_count_before..self.arena.len() {
+            self.topo_order.push(SlotId(i as u32));
+        }
     }
 
     /// Inject an event at a path
@@ -378,64 +407,8 @@ impl Engine {
             self.active_events.insert(slot, event_value);
             self.arena.mark_dirty(slot);
 
-            // Mark subscribers dirty
-            for &sub in self.arena.get_subscribers(slot).to_vec().iter() {
-                self.arena.mark_dirty(sub);
-            }
-        }
-    }
-
-    /// Process a dirty slot
-    fn process_slot(&mut self, slot: SlotId) {
-        self.arena.clear_dirty(slot);
-
-        let node = match self.arena.get_node(slot) {
-            Some(n) => n.clone(),
-            None => return,
-        };
-
-        // Special handling for HOLD: update state slot when body produces value
-        if let NodeKind::Hold { state, body, initial } = &node.kind {
-            let body_value = self.arena.get_value(*body);
-            if !is_skip(body_value) {
-                // Update the state slot
-                self.arena.set_value(*state, body_value.clone());
-            } else {
-                // Initialize state if needed
-                let state_val = self.arena.get_value(*state);
-                if is_skip(state_val) {
-                    self.arena.set_value(*state, initial.clone());
-                }
-            }
-        }
-
-        // Special handling for LINK: check for active events
-        if let NodeKind::Link { .. } = &node.kind {
-            if let Some(event_value) = self.active_events.get(&slot) {
-                let new_value = event_value.clone();
-                self.arena.set_value(slot, new_value.clone());
-                // Mark subscribers dirty
-                for &sub in self.arena.get_subscribers(slot).to_vec().iter() {
-                    self.arena.mark_dirty(sub);
-                }
-                return;
-            }
-        }
-
-        let old_value = self.arena.get_value(slot).clone();
-        let new_value = self.compute_node(&node, slot);
-
-        if new_value != old_value {
-            self.ledger.record(self.tick, DeltaKind::Set {
-                slot,
-                old_value: old_value.clone(),
-                new_value: new_value.clone(),
-            });
-
-            self.arena.set_value(slot, new_value);
-
-            // Mark subscribers dirty
-            for &sub in self.arena.get_subscribers(slot).to_vec().iter() {
+            // Mark subscribers dirty (no to_vec needed - Cell-based dirty flags)
+            for &sub in self.arena.get_subscribers(slot) {
                 self.arena.mark_dirty(sub);
             }
         }

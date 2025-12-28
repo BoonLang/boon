@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
-use crate::ws_server::{send_command_to_server, Command as WsCommand, Response as WsResponse};
+use crate::commands::browser;
+use crate::ws_server::{self, send_command_to_server, Command as WsCommand, Response as WsResponse};
 
 use super::expected::{matches_inline, ExpectedSpec, MatchMode, ParsedAction};
 
@@ -81,45 +82,421 @@ pub fn discover_examples(examples_dir: &Path) -> Result<Vec<DiscoveredExample>> 
     Ok(examples)
 }
 
-/// Run all discovered examples
-pub async fn run_tests(opts: TestOptions) -> Result<Vec<TestResult>> {
-    // Pre-flight check: verify WebSocket server and browser extension are running
-    match check_server_connection(opts.port).await {
-        Ok(status) => {
-            if !status.connected {
-                eprintln!("ERROR: Browser extension not connected!");
-                eprintln!();
-                eprintln!("To run playground tests, you need:");
-                eprintln!("  1. WebSocket server running:");
-                eprintln!("     cd tools && cargo run --release -- server start");
-                eprintln!();
-                eprintln!("  2. Browser with extension loaded:");
-                eprintln!("     - Open Chromium");
-                eprintln!("     - Load extension from tools/extension/");
-                eprintln!("     - Navigate to http://localhost:8081");
-                eprintln!();
-                eprintln!("Or use MCP tools if available (boon_status, boon_launch_browser)");
-                anyhow::bail!("Browser extension not connected");
+/// Find the extension directory relative to the boon-tools binary
+fn find_extension_dir() -> Option<PathBuf> {
+    // Try relative to current exe (for installed binary)
+    if let Ok(exe_path) = std::env::current_exe() {
+        // Binary is at target/release/boon-tools, extension at tools/extension/
+        if let Some(parent) = exe_path.parent() {
+            // Check if we're in target/release/
+            let ext_path = parent.join("../../tools/extension");
+            if ext_path.exists() {
+                return Some(ext_path.canonicalize().ok()?);
             }
-            if !status.api_ready {
-                eprintln!("ERROR: Boon playground API not ready!");
-                eprintln!("Make sure the playground is loaded at http://localhost:8081");
-                anyhow::bail!("Playground API not ready");
+            // Also check parent/parent/parent for nested structures
+            let ext_path = parent.join("../../../tools/extension");
+            if ext_path.exists() {
+                return Some(ext_path.canonicalize().ok()?);
             }
-        }
-        Err(e) => {
-            eprintln!("ERROR: Cannot connect to WebSocket server on port {}!", opts.port);
-            eprintln!();
-            eprintln!("Error: {}", e);
-            eprintln!();
-            eprintln!("To run playground tests, start the WebSocket server first:");
-            eprintln!("  cd tools && cargo run --release -- server start");
-            eprintln!();
-            eprintln!("Or use MCP tools if available (boon_start_playground, boon_launch_browser)");
-            anyhow::bail!("WebSocket server not running");
         }
     }
 
+    // Try from current working directory
+    let cwd_paths = [
+        PathBuf::from("extension"),
+        PathBuf::from("tools/extension"),
+        PathBuf::from("../tools/extension"),
+    ];
+
+    for path in &cwd_paths {
+        if path.exists() {
+            return path.canonicalize().ok();
+        }
+    }
+
+    None
+}
+
+/// Find the boon repo root directory
+fn find_boon_root() -> Option<PathBuf> {
+    // Try relative to current exe
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            // target/release -> target -> boon
+            let root = parent.join("../..");
+            if root.join("playground").exists() {
+                return Some(root.canonicalize().ok()?);
+            }
+        }
+    }
+
+    // Try from current working directory
+    let cwd_paths = [
+        PathBuf::from("."),
+        PathBuf::from(".."),
+        PathBuf::from("../.."),
+    ];
+
+    for path in &cwd_paths {
+        if path.join("playground").exists() {
+            return path.canonicalize().ok();
+        }
+    }
+
+    None
+}
+
+/// Check if the playground dev server (mzoon) is running on port 8081
+async fn is_playground_running() -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    match client.get("http://localhost:8081").send().await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Start the playground dev server (mzoon) in background
+async fn start_playground_server() -> Result<()> {
+    use std::process::Command as StdCommand;
+
+    let boon_root = find_boon_root()
+        .context("Could not find boon repository root")?;
+
+    let playground_dir = boon_root.join("playground");
+
+    if !playground_dir.exists() {
+        anyhow::bail!("Playground directory not found: {}", playground_dir.display());
+    }
+
+    println!("Starting mzoon server in {}...", playground_dir.display());
+
+    // Start mzoon in background using nohup
+    let result = StdCommand::new("sh")
+        .args(["-c", &format!(
+            "cd {} && nohup makers mzoon start > /tmp/mzoon.log 2>&1 &",
+            playground_dir.display()
+        )])
+        .output();
+
+    match result {
+        Ok(_) => {
+            println!("Mzoon starting in background (log: /tmp/mzoon.log)");
+            println!("Note: Initial compilation takes 1-2 minutes...");
+
+            // Wait for server to become available (with progress)
+            let start = Instant::now();
+            let timeout = Duration::from_secs(180); // 3 minutes for initial compile
+            let mut last_dot = Instant::now();
+
+            print!("Waiting for playground server");
+            io::stdout().flush().ok();
+
+            while start.elapsed() < timeout {
+                if is_playground_running().await {
+                    println!(" ready!");
+                    return Ok(());
+                }
+
+                // Print progress dots every 5 seconds
+                if last_dot.elapsed() > Duration::from_secs(5) {
+                    print!(".");
+                    io::stdout().flush().ok();
+                    last_dot = Instant::now();
+                }
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+
+            anyhow::bail!(
+                "Playground server did not start within {}s. Check /tmp/mzoon.log for errors.",
+                timeout.as_secs()
+            );
+        }
+        Err(e) => anyhow::bail!("Failed to start mzoon: {}", e),
+    }
+}
+
+/// Result of checking server/extension status
+enum ConnectionStatus {
+    /// Server not running (TCP connection failed)
+    ServerNotRunning,
+    /// Server running but no extension connected
+    NoExtension,
+    /// Server running, extension connected, but API not ready
+    ExtensionConnectedNotReady,
+    /// Fully ready
+    Ready,
+}
+
+/// Check connection status, distinguishing between server issues and extension issues
+async fn get_connection_status(port: u16) -> ConnectionStatus {
+    match check_server_connection(port).await {
+        Ok(status) => {
+            if status.connected && status.api_ready {
+                ConnectionStatus::Ready
+            } else if status.connected {
+                ConnectionStatus::ExtensionConnectedNotReady
+            } else {
+                ConnectionStatus::NoExtension
+            }
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
+            // "No extension connected" means server IS running, just no extension
+            if error_msg.contains("No extension connected") {
+                ConnectionStatus::NoExtension
+            } else {
+                // Likely "Failed to connect" - server not running
+                ConnectionStatus::ServerNotRunning
+            }
+        }
+    }
+}
+
+/// Result of setup - tracks what we started so we can clean up
+pub struct SetupState {
+    /// Did we start mzoon ourselves? If so, we should kill it when done.
+    pub started_mzoon: bool,
+}
+
+/// Ensure WebSocket server is running and browser extension is connected.
+/// Will start server and launch browser if needed.
+/// Returns SetupState indicating what was started (for cleanup).
+async fn ensure_browser_connection(port: u16) -> Result<SetupState> {
+    let mut setup = SetupState { started_mzoon: false };
+
+    // Step 0: Ensure playground (mzoon) is running
+    if !is_playground_running().await {
+        println!("Playground server not running on port 8081.");
+        start_playground_server().await?;
+        setup.started_mzoon = true;
+    } else {
+        println!("Playground server running on port 8081.");
+    }
+
+    // Step 1: Check initial status
+    let initial_status = get_connection_status(port).await;
+
+    match initial_status {
+        ConnectionStatus::Ready => {
+            println!("Browser extension already connected and ready.");
+            return Ok(setup);
+        }
+        ConnectionStatus::ExtensionConnectedNotReady => {
+            // Extension connected, just wait for API
+            println!("Extension connected, waiting for playground API...");
+        }
+        ConnectionStatus::NoExtension => {
+            // Server running but no extension - need to launch browser
+            println!("WebSocket server running, but browser extension not connected.");
+        }
+        ConnectionStatus::ServerNotRunning => {
+            // Need to start server first
+            println!("WebSocket server not running, starting it...");
+
+            // Find extension directory for hot-reload watching
+            let extension_dir = find_extension_dir();
+
+            // Start WebSocket server in background
+            let watch_path = extension_dir.clone();
+            tokio::spawn(async move {
+                if let Err(e) = ws_server::start_server(port, watch_path.as_deref()).await {
+                    // Only log if it's not "address in use" (another server already running)
+                    if !e.to_string().contains("address in use") && !e.to_string().contains("bind") {
+                        eprintln!("WebSocket server error: {}", e);
+                    }
+                }
+            });
+
+            // Give the server a moment to start
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            println!("WebSocket server started on port {}", port);
+        }
+    }
+
+    // Step 2: Check if extension is connected now
+    let status = get_connection_status(port).await;
+
+    if matches!(status, ConnectionStatus::Ready) {
+        println!("Browser extension connected and ready.");
+        return Ok(setup);
+    }
+
+    // Step 3: Need to launch browser if extension not connected
+    if matches!(status, ConnectionStatus::NoExtension | ConnectionStatus::ServerNotRunning) {
+        println!("Browser extension not connected, launching Chromium...");
+
+        let opts = browser::LaunchOptions {
+            playground_port: 8081,
+            ws_port: port,
+            headless: false,
+            keep_open: true,  // Don't block waiting
+            browser_path: None,
+        };
+
+        match browser::launch_browser(opts) {
+            Ok(child) => {
+                println!("Chromium launched (PID: {}), waiting for extension to connect...", child.id());
+
+                // Wait for extension to connect
+                let timeout = Duration::from_secs(30);
+                match browser::wait_for_extension_connection(port, timeout).await {
+                    Ok(()) => {
+                        println!("Extension connected!");
+                    }
+                    Err(e) => {
+                        anyhow::bail!(
+                            "Browser launched but extension connection timed out: {}\n\
+                            Check that the playground is running at localhost:8081",
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "Failed to launch browser: {}\n\n\
+                    Make sure Chromium is installed:\n  \
+                    apt install chromium-browser (Debian/Ubuntu)\n  \
+                    pacman -S chromium (Arch)\n  \
+                    dnf install chromium (Fedora)",
+                    e
+                );
+            }
+        }
+    }
+
+    // Step 4: Final verification - wait for API to be ready
+    // Note: WASM compilation can take 60-90s on first run, so we need a longer timeout
+    let final_status = get_connection_status(port).await;
+    if !matches!(final_status, ConnectionStatus::Ready) {
+        // Wait for the playground WASM to load
+        let initial_wait = Duration::from_secs(15);
+        let max_retries = 3;
+
+        println!("Waiting for playground API to be ready...");
+
+        for retry in 0..max_retries {
+            let start = Instant::now();
+
+            // Wait with status updates
+            while start.elapsed() < initial_wait {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                let status = get_connection_status(port).await;
+                if matches!(status, ConnectionStatus::Ready) {
+                    println!("Playground API ready!");
+                    return Ok(setup);
+                }
+            }
+
+            // If extension connected but API not ready, try refreshing the page
+            // This fixes the issue where browser loads before WASM compilation finishes
+            let status = get_connection_status(port).await;
+            if matches!(status, ConnectionStatus::ExtensionConnectedNotReady) {
+                if retry < max_retries - 1 {
+                    println!("  WASM not ready after {}s, refreshing page (attempt {}/{})...",
+                             initial_wait.as_secs(), retry + 1, max_retries);
+
+                    // Send refresh command through WebSocket
+                    let _ = send_command_to_server(port, WsCommand::Refresh).await;
+
+                    // Wait a bit for refresh to complete
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+            } else if matches!(status, ConnectionStatus::NoExtension) {
+                println!("  Extension disconnected, waiting for reconnection...");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+
+        // Final check
+        if matches!(get_connection_status(port).await, ConnectionStatus::Ready) {
+            println!("Playground API ready!");
+            return Ok(setup);
+        }
+
+        anyhow::bail!(
+            "Playground API not ready after {} retries. \
+            Make sure the playground is running at localhost:8081",
+            max_retries
+        );
+    }
+
+    Ok(setup)
+}
+
+/// Kill mzoon server we started (port-based, like `makers kill`)
+fn kill_mzoon_server() {
+    use std::process::Command as StdCommand;
+
+    println!("Stopping mzoon server we started...");
+
+    // Find the process LISTENING on port 8081 (not browsers connecting to it)
+    // This matches the approach in playground/Makefile.toml [tasks.kill]
+    let pid_output = StdCommand::new("lsof")
+        .args(["-ti:8081", "-sTCP:LISTEN"])
+        .output();
+
+    if let Ok(output) = pid_output {
+        let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !pid_str.is_empty() {
+            // Send TERM signal first (graceful shutdown)
+            if let Ok(pid) = pid_str.parse::<i32>() {
+                let _ = StdCommand::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .output();
+                println!("Sent TERM signal to server on port 8081 (PID: {})", pid);
+
+                // Wait for graceful shutdown
+                std::thread::sleep(std::time::Duration::from_secs(2));
+
+                // Check if still running and force kill if needed
+                let still_running = StdCommand::new("lsof")
+                    .args(["-ti:8081", "-sTCP:LISTEN"])
+                    .output()
+                    .map(|o| !o.stdout.is_empty())
+                    .unwrap_or(false);
+
+                if still_running {
+                    let _ = StdCommand::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .output();
+                    println!("Force killed server (PID: {})", pid);
+                }
+            }
+        }
+    }
+
+    println!("Mzoon server stopped.");
+}
+
+/// Run all discovered examples
+pub async fn run_tests(opts: TestOptions) -> Result<Vec<TestResult>> {
+    // Pre-flight check: ensure WebSocket server and browser extension are ready
+    // This will auto-start the server and launch browser if needed
+    let setup = ensure_browser_connection(opts.port).await?;
+
+    // Run tests and ensure cleanup happens even on error
+    let result = run_tests_inner(&opts).await;
+
+    // Cleanup: if we started mzoon, kill it
+    if setup.started_mzoon {
+        kill_mzoon_server();
+    }
+
+    result
+}
+
+/// Inner test runner (separated for cleanup handling)
+async fn run_tests_inner(opts: &TestOptions) -> Result<Vec<TestResult>> {
     // Find examples directory
     let examples_dir = if let Some(ref dir) = opts.examples_dir {
         dir.clone()
@@ -815,8 +1192,88 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 _ => anyhow::bail!("Unexpected response for VerifyInputTypeable"),
             }
         }
+        ParsedAction::AssertButtonCount { expected } => {
+            // Get preview elements and count buttons
+            let response = send_command_to_server(port, WsCommand::GetPreviewElements).await?;
+            match response {
+                WsResponse::PreviewElements { data } => {
+                    let button_count = count_buttons_in_elements(&data);
+                    if button_count != *expected {
+                        anyhow::bail!(
+                            "Assert button count failed: expected {} buttons, found {}",
+                            expected, button_count
+                        );
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert button count failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for GetPreviewElements"),
+            }
+        }
+        ParsedAction::AssertNotContains { text } => {
+            // Get preview text and verify it does NOT contain the specified text
+            let response = send_command_to_server(port, WsCommand::GetPreviewText).await?;
+            match response {
+                WsResponse::PreviewText { text: preview } => {
+                    if preview.contains(text) {
+                        anyhow::bail!(
+                            "Assert not contains failed: preview should NOT contain '{}' but it does.\nPreview: {}",
+                            text, truncate_for_error(&preview, 200)
+                        );
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert not contains failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for GetPreviewText"),
+            }
+        }
     }
     Ok(())
+}
+
+/// Count buttons in preview elements JSON
+fn count_buttons_in_elements(data: &serde_json::Value) -> u32 {
+    let mut count = 0;
+    count_buttons_recursive(data, &mut count);
+    count
+}
+
+fn count_buttons_recursive(value: &serde_json::Value, count: &mut u32) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            // Check if this element is a button
+            let tag_name = obj.get("tagName").and_then(|v| v.as_str()).unwrap_or("");
+            let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
+
+            if tag_name.eq_ignore_ascii_case("button") || role == "button" {
+                *count += 1;
+            }
+
+            // Recurse into children and other values
+            for (key, val) in obj {
+                if key != "tagName" && key != "role" {
+                    count_buttons_recursive(val, count);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                count_buttons_recursive(item, count);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn truncate_for_error(s: &str, max_len: usize) -> String {
+    let s = s.replace('\n', " ").replace('\r', "");
+    if s.len() > max_len {
+        format!("{}...", &s[..max_len])
+    } else {
+        s
+    }
 }
 
 /// Print test result

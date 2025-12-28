@@ -10,6 +10,7 @@ use crate::scope::ScopeId;
 use crate::slot::SlotKey;
 use crate::tick::TickCounter;
 use crate::value::ops;
+use rustc_hash::FxHashMap;
 use shared::ast::{ExprId, Program};
 use shared::test_harness::Value;
 use std::collections::HashMap;
@@ -18,14 +19,16 @@ use std::collections::HashMap;
 pub struct Runtime {
     /// The program being executed
     program: Program,
+    /// Expression lookup table: ExprId -> Expr (O(1) lookup vs O(n) AST search)
+    expr_map: HashMap<ExprId, shared::ast::Expr>,
     /// Value cache
     cache: Cache,
-    /// HOLD cells
-    holds: HashMap<SlotKey, HoldCell>,
-    /// LINK cells
-    links: HashMap<SlotKey, LinkCell>,
-    /// LIST cells
-    lists: HashMap<SlotKey, ListCell>,
+    /// HOLD cells - uses FxHashMap for faster SlotKey lookups
+    holds: FxHashMap<SlotKey, HoldCell>,
+    /// LINK cells - uses FxHashMap for faster SlotKey lookups
+    links: FxHashMap<SlotKey, LinkCell>,
+    /// LIST cells - uses FxHashMap for faster SlotKey lookups
+    lists: FxHashMap<SlotKey, ListCell>,
     /// Tick counter
     tick_counter: TickCounter,
     /// Top-level bindings (name -> ExprId)
@@ -45,16 +48,102 @@ impl Runtime {
             .map(|(name, expr)| (name.clone(), expr.id))
             .collect();
 
+        // Build expression lookup table (O(1) lookup vs O(n) recursive search)
+        let expr_map = Self::build_expr_map(&program);
+
         Self {
             program,
+            expr_map,
             cache: Cache::new(),
-            holds: HashMap::new(),
-            links: HashMap::new(),
-            lists: HashMap::new(),
+            holds: FxHashMap::default(),
+            links: FxHashMap::default(),
+            lists: FxHashMap::default(),
             tick_counter: TickCounter::new(),
             top_level,
             diagnostics: DiagnosticsContext::new(),
             pending_events: Vec::new(),
+        }
+    }
+
+    /// Build a lookup table mapping ExprId -> Expr for O(1) expression lookup
+    fn build_expr_map(program: &Program) -> HashMap<ExprId, shared::ast::Expr> {
+        let mut map = HashMap::new();
+        for (_, expr) in &program.bindings {
+            Self::walk_expr_into_map(expr, &mut map);
+        }
+        map
+    }
+
+    /// Recursively walk an expression tree and insert all expressions into the map
+    fn walk_expr_into_map(expr: &shared::ast::Expr, map: &mut HashMap<ExprId, shared::ast::Expr>) {
+        // Insert this expression
+        map.insert(expr.id, expr.clone());
+
+        // Recursively walk children
+        use shared::ast::ExprKind;
+        match &expr.kind {
+            ExprKind::Hold { initial, body, .. } => {
+                Self::walk_expr_into_map(initial, map);
+                Self::walk_expr_into_map(body, map);
+            }
+            ExprKind::Then { input, body } => {
+                Self::walk_expr_into_map(input, map);
+                Self::walk_expr_into_map(body, map);
+            }
+            ExprKind::When { input, arms } => {
+                Self::walk_expr_into_map(input, map);
+                for (_, arm_body) in arms {
+                    Self::walk_expr_into_map(arm_body, map);
+                }
+            }
+            ExprKind::While { input, body, .. } => {
+                Self::walk_expr_into_map(input, map);
+                Self::walk_expr_into_map(body, map);
+            }
+            ExprKind::Latest(exprs) => {
+                for e in exprs {
+                    Self::walk_expr_into_map(e, map);
+                }
+            }
+            ExprKind::Object(fields) => {
+                for (_, field_expr) in fields {
+                    Self::walk_expr_into_map(field_expr, map);
+                }
+            }
+            ExprKind::List(items) => {
+                for item in items {
+                    Self::walk_expr_into_map(item, map);
+                }
+            }
+            ExprKind::Call(_, args) => {
+                for arg in args {
+                    Self::walk_expr_into_map(arg, map);
+                }
+            }
+            ExprKind::Pipe(input, _, args) => {
+                Self::walk_expr_into_map(input, map);
+                for arg in args {
+                    Self::walk_expr_into_map(arg, map);
+                }
+            }
+            ExprKind::Path(base, _) => {
+                Self::walk_expr_into_map(base, map);
+            }
+            ExprKind::Block { bindings, output } => {
+                for (_, binding_expr) in bindings {
+                    Self::walk_expr_into_map(binding_expr, map);
+                }
+                Self::walk_expr_into_map(output, map);
+            }
+            ExprKind::ListMap { list, template, .. } => {
+                Self::walk_expr_into_map(list, map);
+                Self::walk_expr_into_map(template, map);
+            }
+            ExprKind::ListAppend { list, item } => {
+                Self::walk_expr_into_map(list, map);
+                Self::walk_expr_into_map(item, map);
+            }
+            ExprKind::Literal(_) | ExprKind::Variable(_) | ExprKind::Link(_) => {}
         }
     }
 
@@ -77,33 +166,53 @@ impl Runtime {
             self.inject_event(&path, payload);
         }
 
-        // Re-evaluate all top-level bindings
+        // Re-evaluate all top-level bindings using split borrows (no program clone)
+        self.evaluate_top_level();
+
+        // Re-evaluate nested HOLDs (non-root scope HOLDs in list items)
+        // These are created by ListAppend and need to respond to external events
+        self.reevaluate_nested_holds_internal();
+    }
+
+    /// Evaluate all top-level bindings with split borrows to avoid cloning program
+    fn evaluate_top_level(&mut self) {
         let root_scope = ScopeId::root();
-        let program = self.program.clone();
+
+        // Destructure to split borrows - allows iterating program.bindings
+        // while mutably borrowing other fields
+        let Runtime {
+            program,
+            expr_map: _,
+            cache,
+            holds,
+            links,
+            lists,
+            tick_counter,
+            top_level,
+            diagnostics: _,
+            pending_events: _,
+        } = self;
 
         for (_name, expr) in &program.bindings {
             let mut ctx = EvalContext {
-                program: &program,
-                cache: &mut self.cache,
-                holds: &mut self.holds,
-                links: &mut self.links,
-                lists: &mut self.lists,
-                tick_counter: &mut self.tick_counter,
-                top_level: &self.top_level,
+                program,
+                cache,
+                holds,
+                links,
+                lists,
+                tick_counter,
+                top_level,
                 bindings: HashMap::new(),
                 current_deps: Vec::new(),
             };
 
             let _ = eval(expr, &root_scope, &mut ctx);
         }
-
-        // Re-evaluate nested HOLDs (non-root scope HOLDs in list items)
-        // These are created by ListAppend and need to respond to external events
-        self.reevaluate_nested_holds(&program);
     }
 
     /// Re-evaluate all nested HOLDs (those with non-root scopes)
-    fn reevaluate_nested_holds(&mut self, program: &Program) {
+    /// Uses expr_map for O(1) expression lookup instead of recursive AST search
+    fn reevaluate_nested_holds_internal(&mut self) {
         // Collect all nested HOLD keys (non-root scope)
         let nested_hold_keys: Vec<SlotKey> = self
             .holds
@@ -112,31 +221,50 @@ impl Runtime {
             .cloned()
             .collect();
 
-        // Find HOLD expressions in the AST
+        // Find HOLD expressions using O(1) lookup and re-evaluate
         for hold_key in nested_hold_keys {
-            if let Some(hold_expr) = self.find_hold_expr_by_id(program, hold_key.expr) {
+            // O(1) lookup using expr_map instead of O(n) AST search
+            if let Some(hold_expr) = self.expr_map.get(&hold_key.expr) {
                 // Re-evaluate the HOLD body
                 if let shared::ast::ExprKind::Hold {
                     state_name, body, ..
                 } = &hold_expr.kind
                 {
+                    // Clone the body expression for use after split borrow
+                    let body = body.clone();
+                    let state_name = state_name.clone();
+
+                    // Split borrows for evaluation
+                    let Runtime {
+                        program,
+                        expr_map: _,
+                        cache,
+                        holds,
+                        links,
+                        lists,
+                        tick_counter,
+                        top_level,
+                        diagnostics: _,
+                        pending_events: _,
+                    } = self;
+
                     let mut ctx = EvalContext {
                         program,
-                        cache: &mut self.cache,
-                        holds: &mut self.holds,
-                        links: &mut self.links,
-                        lists: &mut self.lists,
-                        tick_counter: &mut self.tick_counter,
-                        top_level: &self.top_level,
+                        cache,
+                        holds,
+                        links,
+                        lists,
+                        tick_counter,
+                        top_level,
                         bindings: HashMap::new(),
                         current_deps: Vec::new(),
                     };
 
                     // Bind the state name to this HOLD cell
-                    ctx.bind(state_name.clone(), hold_key.scope.clone(), hold_key.expr);
+                    ctx.bind(state_name, hold_key.scope.clone(), hold_key.expr);
 
                     // Evaluate body
-                    let (body_val, _) = eval(body, &hold_key.scope, &mut ctx);
+                    let (body_val, _) = eval(&body, &hold_key.scope, &mut ctx);
 
                     // Update cell if body produced a value
                     if !crate::value::is_skip(&body_val) {
@@ -149,112 +277,8 @@ impl Runtime {
         }
     }
 
-    /// Find a HOLD expression by its ExprId (recursive search)
-    fn find_hold_expr_by_id(
-        &self,
-        program: &Program,
-        target_id: ExprId,
-    ) -> Option<shared::ast::Expr> {
-        for (_, expr) in &program.bindings {
-            if let Some(found) = self.find_expr_by_id_recursive(expr, target_id) {
-                return Some(found);
-            }
-        }
-        None
-    }
-
-    /// Recursively search for an expression by id
-    fn find_expr_by_id_recursive(
-        &self,
-        expr: &shared::ast::Expr,
-        target_id: ExprId,
-    ) -> Option<shared::ast::Expr> {
-        if expr.id == target_id {
-            return Some(expr.clone());
-        }
-
-        use shared::ast::ExprKind;
-        match &expr.kind {
-            ExprKind::Hold { initial, body, .. } => {
-                self.find_expr_by_id_recursive(initial, target_id)
-                    .or_else(|| self.find_expr_by_id_recursive(body, target_id))
-            }
-            ExprKind::Then { input, body } => self
-                .find_expr_by_id_recursive(input, target_id)
-                .or_else(|| self.find_expr_by_id_recursive(body, target_id)),
-            ExprKind::When { input, arms } => {
-                self.find_expr_by_id_recursive(input, target_id).or_else(|| {
-                    for (_, arm_body) in arms {
-                        if let Some(found) = self.find_expr_by_id_recursive(arm_body, target_id) {
-                            return Some(found);
-                        }
-                    }
-                    None
-                })
-            }
-            ExprKind::While { input, body, .. } => self
-                .find_expr_by_id_recursive(input, target_id)
-                .or_else(|| self.find_expr_by_id_recursive(body, target_id)),
-            ExprKind::Latest(exprs) => {
-                for e in exprs {
-                    if let Some(found) = self.find_expr_by_id_recursive(e, target_id) {
-                        return Some(found);
-                    }
-                }
-                None
-            }
-            ExprKind::Object(fields) => {
-                for (_, field_expr) in fields {
-                    if let Some(found) = self.find_expr_by_id_recursive(field_expr, target_id) {
-                        return Some(found);
-                    }
-                }
-                None
-            }
-            ExprKind::List(items) => {
-                for item in items {
-                    if let Some(found) = self.find_expr_by_id_recursive(item, target_id) {
-                        return Some(found);
-                    }
-                }
-                None
-            }
-            ExprKind::Call(_, args) => {
-                for arg in args {
-                    if let Some(found) = self.find_expr_by_id_recursive(arg, target_id) {
-                        return Some(found);
-                    }
-                }
-                None
-            }
-            ExprKind::Pipe(input, _, args) => {
-                self.find_expr_by_id_recursive(input, target_id).or_else(|| {
-                    for arg in args {
-                        if let Some(found) = self.find_expr_by_id_recursive(arg, target_id) {
-                            return Some(found);
-                        }
-                    }
-                    None
-                })
-            }
-            ExprKind::Path(base, _) => self.find_expr_by_id_recursive(base, target_id),
-            ExprKind::Block { bindings, output } => {
-                for (_, binding_expr) in bindings {
-                    if let Some(found) = self.find_expr_by_id_recursive(binding_expr, target_id) {
-                        return Some(found);
-                    }
-                }
-                self.find_expr_by_id_recursive(output, target_id)
-            }
-            ExprKind::ListMap { list, template, .. } => self
-                .find_expr_by_id_recursive(list, target_id)
-                .or_else(|| self.find_expr_by_id_recursive(template, target_id)),
-            ExprKind::ListAppend { list, item } => self
-                .find_expr_by_id_recursive(list, target_id)
-                .or_else(|| self.find_expr_by_id_recursive(item, target_id)),
-            ExprKind::Literal(_) | ExprKind::Variable(_) | ExprKind::Link(_) => None,
-        }
-    }
+    // NOTE: find_hold_expr_by_id_static and find_expr_by_id_recursive_static removed.
+    // They were O(n × AST_size). Now using expr_map for O(1) lookup.
 
     /// Inject an event at a path
     fn inject_event(&mut self, path: &str, payload: Value) {

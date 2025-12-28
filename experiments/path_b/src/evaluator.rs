@@ -8,6 +8,7 @@ use crate::scope::ScopeId;
 use crate::slot::SlotKey;
 use crate::tick::{TickCounter, TickSeq};
 use crate::value::{is_skip, ops};
+use rustc_hash::FxHashMap;
 use shared::ast::{Expr, ExprId, ExprKind, Literal, Pattern, Program};
 use shared::test_harness::Value;
 use std::collections::HashMap;
@@ -18,12 +19,12 @@ pub struct EvalContext<'a> {
     pub program: &'a Program,
     /// Value cache
     pub cache: &'a mut Cache,
-    /// HOLD cells
-    pub holds: &'a mut HashMap<SlotKey, HoldCell>,
-    /// LINK cells
-    pub links: &'a mut HashMap<SlotKey, LinkCell>,
-    /// LIST cells
-    pub lists: &'a mut HashMap<SlotKey, ListCell>,
+    /// HOLD cells - uses FxHashMap for faster lookups
+    pub holds: &'a mut FxHashMap<SlotKey, HoldCell>,
+    /// LINK cells - uses FxHashMap for faster lookups
+    pub links: &'a mut FxHashMap<SlotKey, LinkCell>,
+    /// LIST cells - uses FxHashMap for faster lookups
+    pub lists: &'a mut FxHashMap<SlotKey, ListCell>,
     /// Tick counter
     pub tick_counter: &'a mut TickCounter,
     /// Top-level bindings (name -> ExprId)
@@ -71,7 +72,9 @@ pub fn eval(expr: &Expr, scope: &ScopeId, ctx: &mut EvalContext) -> (Value, Tick
     let slot_key = SlotKey::new(scope.clone(), expr.id);
     let current_tick = ctx.current_tick();
 
-    // Check cache
+    // Check cache - use tick-based invalidation for correctness
+    // Note: is_valid() method exists for dependency-based invalidation
+    // but requires more integration with event/LINK system to work correctly
     if let Some(entry) = ctx.cache.get(&slot_key) {
         if entry.is_current(current_tick) {
             let value = entry.value.clone();

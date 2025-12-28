@@ -77,10 +77,55 @@ impl Cache {
 
     /// Check if a key is cached and current
     pub fn is_cached(&self, key: &SlotKey, tick: u64) -> bool {
-        self.entries.get(key).map(|e| e.is_current(tick)).unwrap_or(false)
+        self.entries
+            .get(key)
+            .map(|e| e.is_current(tick))
+            .unwrap_or(false)
     }
 
-    /// Get cached value if current
+    /// Check if a cache entry is still valid based on dependencies.
+    /// An entry is valid if:
+    /// 1. It was computed in the current tick, OR
+    /// 2. None of its dependencies have changed since it was computed
+    ///
+    /// This enables skipping re-evaluation when inputs haven't changed.
+    pub fn is_valid(&self, key: &SlotKey, current_tick: u64) -> bool {
+        if let Some(entry) = self.entries.get(key) {
+            // If computed this tick, definitely valid
+            if entry.computed_at == current_tick {
+                return true;
+            }
+
+            // Check if any dependency changed after this entry was computed
+            for dep_key in &entry.deps {
+                if let Some(dep_entry) = self.entries.get(dep_key) {
+                    // If dependency changed after we computed, we're stale
+                    if dep_entry.last_changed > entry.last_changed {
+                        return false;
+                    }
+                } else {
+                    // Dependency not in cache - must recompute
+                    return false;
+                }
+            }
+
+            // No dependencies changed - entry is still valid!
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get cached value if valid (uses dependency-based invalidation)
+    pub fn get_if_valid(&self, key: &SlotKey, tick: u64) -> Option<&Value> {
+        if self.is_valid(key, tick) {
+            self.entries.get(key).map(|e| &e.value)
+        } else {
+            None
+        }
+    }
+
+    /// Get cached value if current (tick-based only, for backwards compatibility)
     pub fn get_if_current(&self, key: &SlotKey, tick: u64) -> Option<&Value> {
         self.entries.get(key).and_then(|e| {
             if e.is_current(tick) {

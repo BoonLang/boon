@@ -5,6 +5,8 @@
 
 use crate::node::Node;
 use shared::test_harness::Value;
+use std::cell::Cell;
+use std::collections::HashSet;
 
 /// Unique identifier for a slot in the arena
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,9 +29,14 @@ pub struct Arena {
     /// Current values for each slot
     values: Vec<Value>,
     /// Whether each slot is dirty (needs recomputation)
-    dirty: Vec<bool>,
+    /// Uses Cell for interior mutability - allows marking dirty while iterating subscribers
+    dirty: Vec<Cell<bool>>,
     /// Subscribers for each slot (slots that depend on this slot)
-    subscribers: Vec<Vec<SlotId>>,
+    /// Uses HashSet for O(1) duplicate checking in add_subscriber
+    subscribers: Vec<HashSet<SlotId>>,
+    /// Dependencies for each slot (slots this slot depends on)
+    /// Used for topological sorting
+    dependencies: Vec<HashSet<SlotId>>,
     /// Next slot ID to allocate
     next_id: u32,
 }
@@ -41,6 +48,7 @@ impl Arena {
             values: Vec::new(),
             dirty: Vec::new(),
             subscribers: Vec::new(),
+            dependencies: Vec::new(),
             next_id: 0,
         }
     }
@@ -51,8 +59,9 @@ impl Arena {
         self.next_id += 1;
         self.nodes.push(None);
         self.values.push(Value::Skip);
-        self.dirty.push(false);
-        self.subscribers.push(Vec::new());
+        self.dirty.push(Cell::new(false));
+        self.subscribers.push(HashSet::new());
+        self.dependencies.push(HashSet::new());
         id
     }
 
@@ -88,42 +97,112 @@ impl Arena {
     }
 
     /// Mark a slot as dirty
-    pub fn mark_dirty(&mut self, slot: SlotId) {
+    /// Uses interior mutability (Cell) to allow marking dirty while iterating subscribers
+    pub fn mark_dirty(&self, slot: SlotId) {
         let idx = slot.index();
         if idx < self.dirty.len() {
-            self.dirty[idx] = true;
+            self.dirty[idx].set(true);
         }
     }
 
     /// Check if a slot is dirty
     pub fn is_dirty(&self, slot: SlotId) -> bool {
-        self.dirty.get(slot.index()).copied().unwrap_or(false)
+        self.dirty.get(slot.index()).map(|c| c.get()).unwrap_or(false)
     }
 
     /// Clear dirty flag for a slot
-    pub fn clear_dirty(&mut self, slot: SlotId) {
+    pub fn clear_dirty(&self, slot: SlotId) {
         let idx = slot.index();
         if idx < self.dirty.len() {
-            self.dirty[idx] = false;
+            self.dirty[idx].set(false);
         }
     }
 
     /// Add a subscriber to a slot
+    /// O(1) with HashSet instead of O(n) with Vec
     pub fn add_subscriber(&mut self, source: SlotId, subscriber: SlotId) {
         let idx = source.index();
         if idx < self.subscribers.len() {
-            if !self.subscribers[idx].contains(&subscriber) {
-                self.subscribers[idx].push(subscriber);
-            }
+            self.subscribers[idx].insert(subscriber);
         }
     }
 
     /// Get subscribers for a slot
-    pub fn get_subscribers(&self, slot: SlotId) -> &[SlotId] {
+    /// Returns an iterator over the HashSet
+    pub fn get_subscribers(&self, slot: SlotId) -> impl Iterator<Item = &SlotId> {
         self.subscribers
             .get(slot.index())
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+            .into_iter()
+            .flat_map(|s| s.iter())
+    }
+
+    /// Add a dependency to a slot (for topological sorting)
+    pub fn add_dependency(&mut self, slot: SlotId, dependency: SlotId) {
+        let idx = slot.index();
+        if idx < self.dependencies.len() {
+            self.dependencies[idx].insert(dependency);
+        }
+    }
+
+    /// Get dependencies for a slot
+    pub fn get_dependencies(&self, slot: SlotId) -> impl Iterator<Item = &SlotId> {
+        self.dependencies
+            .get(slot.index())
+            .into_iter()
+            .flat_map(|s| s.iter())
+    }
+
+    /// Compute topological order of all slots using Kahn's algorithm
+    /// Returns slots ordered so that dependencies come before dependents
+    pub fn compute_topo_order(&self) -> Vec<SlotId> {
+        let n = self.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Count in-degrees (number of dependencies)
+        let mut in_degree: Vec<usize> = vec![0; n];
+        for idx in 0..n {
+            in_degree[idx] = self.dependencies.get(idx).map(|d| d.len()).unwrap_or(0);
+        }
+
+        // Start with slots that have no dependencies
+        let mut queue: std::collections::VecDeque<SlotId> = std::collections::VecDeque::new();
+        for idx in 0..n {
+            if in_degree[idx] == 0 {
+                queue.push_back(SlotId(idx as u32));
+            }
+        }
+
+        let mut result = Vec::with_capacity(n);
+
+        while let Some(slot) = queue.pop_front() {
+            result.push(slot);
+
+            // For each subscriber (slot that depends on us), decrease in-degree
+            for &sub in self.get_subscribers(slot).collect::<Vec<_>>().iter() {
+                let sub_idx = sub.index();
+                if sub_idx < in_degree.len() {
+                    in_degree[sub_idx] = in_degree[sub_idx].saturating_sub(1);
+                    if in_degree[sub_idx] == 0 {
+                        queue.push_back(*sub);
+                    }
+                }
+            }
+        }
+
+        // If we couldn't order all slots, there might be cycles
+        // Add remaining slots in index order as fallback
+        if result.len() < n {
+            for idx in 0..n {
+                let slot = SlotId(idx as u32);
+                if !result.contains(&slot) {
+                    result.push(slot);
+                }
+            }
+        }
+
+        result
     }
 
     /// Get all dirty slots
@@ -131,8 +210,8 @@ impl Arena {
         self.dirty
             .iter()
             .enumerate()
-            .filter_map(|(idx, &dirty)| {
-                if dirty {
+            .filter_map(|(idx, dirty)| {
+                if dirty.get() {
                     Some(SlotId(idx as u32))
                 } else {
                     None

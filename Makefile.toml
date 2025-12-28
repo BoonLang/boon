@@ -21,11 +21,12 @@ script = '''
 '''
 
 [tasks.verify-playground]
-description = "Run all playground example tests (requires browser extension)"
+description = "Run playground example tests. Use: makers verify-playground --filter todo_mvc"
 workspace = false
 dependencies = ["build-tools"]
+script_runner = "@shell"
 script = '''
-./target/release/boon-tools exec test-examples
+./target/release/boon-tools exec test-examples "$@"
 '''
 
 [tasks.verify-playground-interactive]

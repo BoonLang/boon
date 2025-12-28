@@ -237,6 +237,21 @@ impl Action {
                             .context("assert_input_typeable requires index (0-indexed)")?;
                         Ok(ParsedAction::AssertInputTypeable { index: index as u32 })
                     }
+                    "assert_button_count" => {
+                        let expected_count = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_button_count requires expected count")?;
+                        Ok(ParsedAction::AssertButtonCount { expected: expected_count as u32 })
+                    }
+                    "assert_not_contains" => {
+                        let text = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .context("assert_not_contains requires text that should NOT be present")?
+                            .to_string();
+                        Ok(ParsedAction::AssertNotContains { text })
+                    }
                     _ => anyhow::bail!("Unknown action type: {}", cmd),
                 }
             }
@@ -263,6 +278,8 @@ pub enum ParsedAction {
     AssertInputPlaceholder { index: u32, expected: String },  // Assert input placeholder
     AssertUrl { pattern: String },  // Assert current URL contains pattern
     AssertInputTypeable { index: u32 },  // Assert input is actually typeable (not disabled/readonly/hidden)
+    AssertButtonCount { expected: u32 },  // Assert number of visible buttons in preview
+    AssertNotContains { text: String },  // Assert preview does NOT contain text
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -87,20 +87,25 @@ expect = "4 items left"
 
 # ============================================
 # SECTION 3: TOGGLE ONE DYNAMIC TODO (isolation test)
-# Checking one dynamically added todo should NOT affect others
+# BUG TO CATCH: Clicking one dynamically-added todo's checkbox
+# should NOT check other dynamically-added todos.
+#
+# Known bug: Clicking "Walk the dog" checkbox checks BOTH
+# "Walk the dog" AND "Feed the cat" at once, giving "2 items left"
+# instead of the expected "3 items left".
 # ============================================
 
 [[sequence]]
-description = "Toggle Walk the dog complete - should only affect that one todo"
+description = "Toggle Walk the dog complete - BUG: also checks Feed the cat (expect 3, get 2)"
 actions = [["click_checkbox", 3]]
 expect = "3 items left"
 
 [[sequence]]
-description = "Verify Feed the cat is still unchecked (still in active count)"
+description = "Verify Feed the cat is still unchecked (should still be in list as active)"
 expect = "Feed the cat"
 
 [[sequence]]
-description = "Uncheck Walk the dog"
+description = "Uncheck Walk the dog - should restore to 4 items"
 actions = [["click_checkbox", 3]]
 expect = "4 items left"
 
@@ -199,7 +204,15 @@ expect = "Clean room"
 
 # ============================================
 # SECTION 9: DELETE TODO
+# Tests:
+# - X button only shows on hover (not visible normally)
+# - Only ONE X button appears (not multiple for each todo)
 # ============================================
+
+[[sequence]]
+description = "Before hover: verify no delete buttons visible"
+actions = [["assert_button_count", 0]]
+expect = "items left"
 
 [[sequence]]
 description = "Hover over todo to show delete button"
@@ -207,12 +220,26 @@ actions = [["hover_text", "Walk the dog"]]
 expect = "items left"
 
 [[sequence]]
+description = "After hover: verify exactly ONE delete button visible"
+actions = [["assert_button_count", 1]]
+expect = "items left"
+
+[[sequence]]
 description = "Click X button to delete todo"
 actions = [["click_button", 0]]
 expect = "3 items left"
 
+[[sequence]]
+description = "After delete: verify no delete buttons visible (hover ended)"
+actions = [["assert_button_count", 0]]
+expect = "3 items left"
+
 # ============================================
 # SECTION 10: FILTER TODOS
+# Tests:
+# - Filters change URL (like pages example)
+# - Filtering actually shows correct todos
+# - Items count remains correct during filtering
 # ============================================
 
 # First complete a todo so we have something to filter
@@ -222,6 +249,7 @@ description = "Complete Buy vegetables for filter test"
 actions = [["click_checkbox", 1]]
 expect = "2 items left"
 
+# --- ACTIVE FILTER ---
 [[sequence]]
 description = "Click Active filter"
 actions = [["click_text", "Active"]]
@@ -229,15 +257,63 @@ actions = [["click_text", "Active"]]
 expect = "Clean room"
 
 [[sequence]]
+description = "Verify URL contains /active"
+actions = [["assert_url", "/active"]]
+expect = "Clean room"
+
+[[sequence]]
+description = "Verify Feed the cat is visible (active todo)"
+expect = "Feed the cat"
+
+[[sequence]]
+description = "Verify Buy vegetables is NOT visible (completed todo)"
+actions = [["assert_not_contains", "Buy vegetables"]]
+expect = "Clean room"
+
+[[sequence]]
+description = "Items count still shows 2 (filtering doesn't change count)"
+expect = "2 items left"
+
+# --- COMPLETED FILTER ---
+[[sequence]]
 description = "Click Completed filter"
 actions = [["click_text", "Completed"]]
 # Only completed "Buy vegetables" should be visible
 expect = "Buy vegetables"
 
 [[sequence]]
+description = "Verify URL contains /completed"
+actions = [["assert_url", "/completed"]]
+expect = "Buy vegetables"
+
+[[sequence]]
+description = "Verify Clean room is NOT visible (active todo)"
+actions = [["assert_not_contains", "Clean room"]]
+expect = "Buy vegetables"
+
+[[sequence]]
+description = "Verify Feed the cat is NOT visible (active todo)"
+actions = [["assert_not_contains", "Feed the cat"]]
+expect = "Buy vegetables"
+
+# --- ALL FILTER ---
+[[sequence]]
 description = "Click All filter to show all todos"
 actions = [["click_text", "All"]]
 expect = "Buy vegetables"
+
+[[sequence]]
+description = "Verify URL is back to root (no filter path)"
+actions = [["assert_url", "/"]]
+expect = "Buy vegetables"
+
+[[sequence]]
+description = "Verify all todos visible again - Clean room"
+expect = "Clean room"
+
+[[sequence]]
+description = "Verify all todos visible again - Feed the cat"
+expect = "Feed the cat"
 
 # ============================================
 # SECTION 11: CLEAR COMPLETED
