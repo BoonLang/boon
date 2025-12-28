@@ -1,5 +1,5 @@
 {
-  "supervisor_prompt": "Don't stop until all todo_mvc example tests pass, then say +completed+",
+  "supervisor_prompt": "Don't stop until all tests defined in `makers verify-playground` pass, especially ones for todo_mvc, then say +completed+. Update our testing infrastructure and browser extension mcp code as needed. Add more tests when you find more bugs in examples or fix bad tests if you are sure there is a bug.",
   "completion_condition": "+completed+",
   "completion_command": "makers verify-playground",
   "protected_patterns": [
