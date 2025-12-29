@@ -1,9 +1,9 @@
 {
-  "supervisor_prompt": "Implement completely your plan with experiments optimizations, then say +completed+.",
+  "supervisor_prompt": "Implement completely your plan.",
   "completion_condition": "+completed+",
   "completion_command": "./test_all.sh",
   "protected_patterns": [
     "test_all.sh"
   ],
-  "command_timeout_secs": 3600
+  "command_timeout_mins": 10
 }
