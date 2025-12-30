@@ -747,10 +747,27 @@ async function handleCommand(id, command) {
 
       case 'key':
         // Press a special key (Enter, Tab, Escape, etc.)
-        // Use JavaScript dispatchEvent to properly trigger web_sys event listeners
+        // Also supports modifier combinations like "Ctrl+A", "Shift+Tab", "Ctrl+Shift+Z"
         try {
-          const result = await jsDispatchKeyEvent(tab.id, command.key);
-          return { type: 'success', data: result };
+          const keyStr = command.key;
+
+          // Parse modifier keys
+          const hasCtrl = keyStr.includes('Ctrl+');
+          const hasShift = keyStr.includes('Shift+');
+          const hasAlt = keyStr.includes('Alt+');
+
+          // Extract the actual key (last part after modifiers)
+          const actualKey = keyStr.replace(/Ctrl\+/g, '').replace(/Shift\+/g, '').replace(/Alt\+/g, '');
+
+          if (hasCtrl || hasShift || hasAlt) {
+            // Use CDP keyboard shortcut for modifier combinations
+            await cdpKeyboardShortcut(tab.id, actualKey.toLowerCase(), hasCtrl, hasShift, hasAlt);
+            return { type: 'success', data: { key: actualKey, ctrl: hasCtrl, shift: hasShift, alt: hasAlt, method: 'cdp' } };
+          } else {
+            // Use JavaScript dispatchEvent for simple keys (triggers web_sys event listeners)
+            const result = await jsDispatchKeyEvent(tab.id, command.key);
+            return { type: 'success', data: result };
+          }
         } catch (e) {
           return { type: 'error', message: e.message };
         }

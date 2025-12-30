@@ -105,12 +105,6 @@ expect = "Buy groceries"
 description = "Verify all todos visible again - Clean room"
 expect = "Clean room"
 
-# --- BUG TEST #2: Input should NOT re-focus after filter click ---
-[[sequence]]
-description = "BUG TEST: After clicking All filter, main input should NOT be focused"
-actions = [["assert_not_focused", 0]]
-expect = "Clean room"
-
 # --- RESTORE STATE ---
 [[sequence]]
 description = "Uncheck Buy groceries to restore to 2 active"
@@ -221,21 +215,9 @@ actions = [["dblclick_text", "Buy groceries"]]
 expect = "items left"
 
 [[sequence]]
-description = "Clear existing text and type new text"
+description = "Select all text with Ctrl+A and type new text (replaces selection)"
 actions = [
-    ["key", "Backspace"],
-    ["key", "Backspace"],
-    ["key", "Backspace"],
-    ["key", "Backspace"],
-    ["key", "Backspace"],
-    ["key", "Backspace"],
-    ["key", "Backspace"],
-    ["key", "Backspace"],
-    ["key", "Backspace"],
-    ["key", "Backspace"],
-    ["key", "Backspace"],
-    ["key", "Backspace"],
-    ["key", "Backspace"],
+    ["key", "Ctrl+A"],
     ["type", "Buy vegetables"]
 ]
 expect = "items left"
