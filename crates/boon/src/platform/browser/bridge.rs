@@ -1185,10 +1185,11 @@ async fn oklch_to_css(value: Value) -> Option<String> {
     match value {
         Value::TaggedObject(tagged, _) => {
             if tagged.tag() == "Oklch" {
-                // Helper to extract number from Variable's current value
+                // Helper to extract number from Variable (waits for first value if needed)
                 async fn get_num(tagged: &TaggedObject, name: &str, default: f64) -> f64 {
                     if let Some(v) = tagged.variable(name) {
-                        match v.value_actor().current_value().await {
+                        // Use value() which checks version first, then streams if needed
+                        match v.value_actor().value().await {
                             Ok(Value::Number(n, _)) => n.number(),
                             _ => default,
                         }
@@ -1197,7 +1198,7 @@ async fn oklch_to_css(value: Value) -> Option<String> {
                     }
                 }
 
-                let lightness = get_num(&tagged, "lightness", 0.0).await;
+                let lightness = get_num(&tagged, "lightness", 0.5).await; // 0.5 = visible gray as fallback
                 let chroma = get_num(&tagged, "chroma", 0.0).await;
                 let hue = get_num(&tagged, "hue", 0.0).await;
                 let alpha = get_num(&tagged, "alpha", 1.0).await;
@@ -1584,7 +1585,25 @@ fn element_button(
             .boxed_local()
     );
 
-    // Outline signal
+    // Background color signal
+    let sv_background = settings_variable.clone();
+    let background_signal = signal::from_stream(
+        sv_background
+            .stream()
+            .flat_map(|value| value.expect_object().expect_variable("style").stream())
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("background")).flat_map(|var| var.stream())
+            })
+            .flat_map(|value| {
+                let obj = value.expect_object();
+                stream::iter(obj.variable("color")).flat_map(|var| var.stream())
+            })
+            .filter_map(|value| oklch_to_css(value))
+            .boxed_local()
+    );
+
+    // Outline signal - handles both NoOutline tag and Object with reactive color field
     let sv_outline = settings_variable.clone();
     let outline_signal = signal::from_stream(
         sv_outline
@@ -1594,24 +1613,26 @@ fn element_button(
                 let obj = value.expect_object();
                 stream::iter(obj.variable("outline")).flat_map(|var| var.stream())
             })
-            .filter_map(|value| async move {
+            .flat_map(|value| {
                 match value {
                     Value::Tag(tag, _) if tag.tag() == "NoOutline" => {
-                        Some("none".to_string())
+                        // NoOutline tag - emit "none" once and stay alive
+                        stream::once(future::ready("none".to_string()))
+                            .chain(stream::pending())
+                            .boxed_local()
                     }
                     Value::Object(obj, _) => {
-                        // Get color from outline object
-                        if let Some(color_var) = obj.variable("color") {
-                            if let Ok(color_value) = color_var.value_actor().current_value().await {
-                                if let Some(css_color) = oklch_to_css(color_value).await {
-                                    // Default to 1px solid outline
-                                    return Some(format!("1px solid {}", css_color));
-                                }
-                            }
-                        }
-                        None
+                        // Object with color field - subscribe to color's stream reactively
+                        stream::iter(obj.variable("color"))
+                            .flat_map(|var| var.stream())
+                            .filter_map(|color_value| async move {
+                                oklch_to_css(color_value).await.map(|css_color| {
+                                    format!("1px solid {}", css_color)
+                                })
+                            })
+                            .boxed_local()
                     }
-                    _ => None,
+                    _ => stream::pending::<String>().boxed_local(),
                 }
             })
             .boxed_local()
@@ -1644,6 +1665,7 @@ fn element_button(
                 .style_signal("transform", transform_signal)
                 .style_signal("text-align", font_align_signal)
                 .style_signal("outline", outline_signal)
+                .style_signal("background-color", background_signal)
         })
         .after_remove(move |_| {
             drop(event_handler_loop);

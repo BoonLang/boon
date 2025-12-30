@@ -1,6 +1,6 @@
 -- Test: Do multiple buttons have independent click states?
 -- Click-based version of button_hover_test for easier automated testing
--- BUG: The WHILE inside style doesn't react to state changes (same bug as button_hover_test)
+-- Background and outline now react to state changes
 
 store: [
     btn_a: make_button(name: TEXT { A })
@@ -27,7 +27,7 @@ document: Document/new(root: Element/stripe(
         Element/label(
             element: []
             style: []
-            label: TEXT { Click each button - only clicked one should show border }
+            label: TEXT { Click each button - clicked ones turn darker with outline }
         )
 
         Element/stripe(
@@ -42,14 +42,11 @@ document: Document/new(root: Element/stripe(
                         padding: [row: 20, column: 10]
                         rounded_corners: 5
                         background: [color: store.btn_a.clicked |> WHILE {
-                            True => Oklch[lightness: 0.85]
+                            True => Oklch[lightness: 0.7]
                             False => Oklch[lightness: 0.95]
                         }]
                         outline: store.btn_a.clicked |> WHILE {
-                            True => [
-                                side: Inner
-                                color: Oklch[lightness: 0.3, chroma: 0.15, hue: 250]
-                            ]
+                            True => [color: Oklch[lightness: 0.3, chroma: 0.15, hue: 250]]
                             False => NoOutline
                         }
                     ]
@@ -62,14 +59,11 @@ document: Document/new(root: Element/stripe(
                         padding: [row: 20, column: 10]
                         rounded_corners: 5
                         background: [color: store.btn_b.clicked |> WHILE {
-                            True => Oklch[lightness: 0.85]
+                            True => Oklch[lightness: 0.7]
                             False => Oklch[lightness: 0.95]
                         }]
                         outline: store.btn_b.clicked |> WHILE {
-                            True => [
-                                side: Inner
-                                color: Oklch[lightness: 0.3, chroma: 0.15, hue: 250]
-                            ]
+                            True => [color: Oklch[lightness: 0.3, chroma: 0.15, hue: 250]]
                             False => NoOutline
                         }
                     ]
@@ -82,14 +76,11 @@ document: Document/new(root: Element/stripe(
                         padding: [row: 20, column: 10]
                         rounded_corners: 5
                         background: [color: store.btn_c.clicked |> WHILE {
-                            True => Oklch[lightness: 0.85]
+                            True => Oklch[lightness: 0.7]
                             False => Oklch[lightness: 0.95]
                         }]
                         outline: store.btn_c.clicked |> WHILE {
-                            True => [
-                                side: Inner
-                                color: Oklch[lightness: 0.3, chroma: 0.15, hue: 250]
-                            ]
+                            True => [color: Oklch[lightness: 0.3, chroma: 0.15, hue: 250]]
                             False => NoOutline
                         }
                     ]
@@ -98,7 +89,6 @@ document: Document/new(root: Element/stripe(
             }
         )
 
-        -- Debug: show click states to prove state IS changing even though style doesn't update
         Element/label(
             element: []
             style: []
