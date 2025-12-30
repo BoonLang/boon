@@ -922,29 +922,14 @@ async function handleCommand(id, command) {
         try {
           const result = await cdpEvaluate(tab.id, `
             (function() {
-              // Step 1: Invalidate all running timers (engine-v2)
-              // This prevents old timers from saving state while we're clearing it
-              let invalidated = false;
-              if (window.boonPlayground && window.boonPlayground.invalidateTimers) {
-                window.boonPlayground.invalidateTimers();
-                invalidated = true;
-                console.log('[Boon clearStates] invalidateTimers() called');
-              } else {
-                console.warn('[Boon clearStates] invalidateTimers not available:', {
-                  hasBoonPlayground: !!window.boonPlayground,
-                  hasInvalidateTimers: !!(window.boonPlayground && window.boonPlayground.invalidateTimers)
-                });
-              }
-
-              // Step 2: Clear ALL localStorage for a completely fresh state
+              // Clear ALL localStorage for a completely fresh state
               // This clears everything including:
               // - Playground states and project files
               // - Debug logs that can fill up quota
               // - Any other accumulated data
               const keyCount = localStorage.length;
               localStorage.clear();
-
-              return { cleared: keyCount, invalidated };
+              return { cleared: keyCount };
             })()
           `);
           return { type: 'success', data: { method: 'cdp-evaluate', text: 'clear saved states' } };
