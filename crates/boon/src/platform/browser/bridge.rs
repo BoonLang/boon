@@ -978,7 +978,7 @@ fn element_stripe(
             })
             .filter_map(|value| async move {
                 if let Some(color) = oklch_to_css(value).await {
-                    Some(format!("1px solid {}", color))
+                    Some(format!("3px solid {}", color))
                 } else {
                     None
                 }
@@ -1643,7 +1643,7 @@ fn element_button(
                             .flat_map(|var| var.stream())
                             .filter_map(|color_value| async move {
                                 oklch_to_css(color_value).await.map(|css_color| {
-                                    format!("1px solid {}", css_color)
+                                    format!("3px solid {}", css_color)
                                 })
                             })
                             .boxed_local()

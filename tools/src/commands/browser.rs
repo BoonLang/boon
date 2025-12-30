@@ -103,7 +103,7 @@ impl Default for LaunchOptions {
     fn default() -> Self {
         Self {
             playground_port: 8083,
-            ws_port: 9223,
+            ws_port: 9224,
             headless: false,
             keep_open: false,
             browser_path: None,

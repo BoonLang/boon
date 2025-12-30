@@ -46,7 +46,7 @@ document: Document/new(root: Element/stripe(
                             False => Oklch[lightness: 0.95]
                         }]
                         outline: store.btn_a.clicked |> WHILE {
-                            True => [color: Oklch[lightness: 0.3, chroma: 0.15, hue: 250]]
+                            True => [color: Oklch[lightness: 0.55, chroma: 0.25, hue: 25]]
                             False => NoOutline
                         }
                     ]
@@ -63,7 +63,7 @@ document: Document/new(root: Element/stripe(
                             False => Oklch[lightness: 0.95]
                         }]
                         outline: store.btn_b.clicked |> WHILE {
-                            True => [color: Oklch[lightness: 0.3, chroma: 0.15, hue: 250]]
+                            True => [color: Oklch[lightness: 0.55, chroma: 0.25, hue: 25]]
                             False => NoOutline
                         }
                     ]
@@ -80,7 +80,7 @@ document: Document/new(root: Element/stripe(
                             False => Oklch[lightness: 0.95]
                         }]
                         outline: store.btn_c.clicked |> WHILE {
-                            True => [color: Oklch[lightness: 0.3, chroma: 0.15, hue: 250]]
+                            True => [color: Oklch[lightness: 0.55, chroma: 0.25, hue: 25]]
                             False => NoOutline
                         }
                     ]

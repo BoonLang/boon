@@ -1,7 +1,7 @@
 // Boon Browser Control - Background Service Worker
 // Connects to WebSocket server and routes commands to content script
 
-const WS_URL = 'ws://127.0.0.1:9223';
+const WS_URL = 'ws://127.0.0.1:9224';
 let ws = null;
 let reconnectTimer = null;
 let contentPort = null;

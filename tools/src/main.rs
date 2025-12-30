@@ -35,14 +35,14 @@ enum Commands {
         action: ExecAction,
 
         /// Server port
-        #[arg(short, long, default_value = "9223")]
+        #[arg(short, long, default_value = "9224")]
         port: u16,
     },
 
     /// Run MCP server for Claude Code integration (stdio JSON-RPC)
     Mcp {
         /// WebSocket server port to connect to
-        #[arg(long, default_value = "9223")]
+        #[arg(long, default_value = "9224")]
         port: u16,
     },
 }
@@ -56,7 +56,7 @@ enum BrowserAction {
         playground_port: u16,
 
         /// WebSocket server port
-        #[arg(long, default_value = "9223")]
+        #[arg(long, default_value = "9224")]
         ws_port: u16,
 
         /// Run in headless mode
@@ -88,7 +88,7 @@ enum ServerAction {
     /// Start the WebSocket server
     Start {
         /// Port to listen on
-        #[arg(short, long, default_value = "9223")]
+        #[arg(short, long, default_value = "9224")]
         port: u16,
 
         /// Watch directory for extension hot reload

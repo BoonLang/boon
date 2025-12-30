@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Boon Browser Control",
+  "name": "Boon Browser Control (actors)",
   "version": "1.0.0",
   "description": "Browser automation for Boon Playground development",
   "permissions": [
@@ -19,7 +19,7 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Boon Browser Control"
+    "default_title": "Boon Browser Control (actors)"
   },
   "icons": {
     "16": "icon16.png",
