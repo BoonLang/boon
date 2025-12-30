@@ -1,9 +1,0 @@
-{
-  "supervisor_prompt": "Implement completely your plan.",
-  "completion_condition": "+completed+",
-  "completion_command": "./test_all.sh",
-  "protected_patterns": [
-    "test_all.sh"
-  ],
-  "command_timeout_mins": 10
-}

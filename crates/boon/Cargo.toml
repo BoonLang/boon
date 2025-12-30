@@ -41,7 +41,3 @@ debug-channels = []
 
 # CLI platform support with serde_json for output formatting
 cli = ["dep:serde_json"]
-
-# Use the new arena-based engine (engine_v2) instead of the old actor-based engine.
-# This is the new reactive engine being developed in M0/M1.
-engine-v2 = []

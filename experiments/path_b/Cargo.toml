@@ -1,9 +1,0 @@
-[package]
-name = "path_b"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-shared = { path = "../shared" }
-smallvec = { workspace = true }
-rustc-hash = "2.0"

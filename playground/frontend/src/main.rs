@@ -12,12 +12,6 @@ use boon::platform::browser::{
     bridge::object_with_document_to_element_signal, engine::VirtualFilesystem, interpreter,
 };
 
-#[cfg(feature = "engine-v2")]
-use boon::platform::browser::interpreter_v2;
-
-#[cfg(feature = "engine-v2")]
-use boon::platform::browser::bridge_v2::invalidate_all_timers;
-
 mod code_editor;
 use code_editor::CodeEditor;
 
@@ -498,17 +492,6 @@ impl Playground {
                     }) as Box<dyn Fn()>);
                     js_sys::Reflect::set(&api, &"run".into(), run_fn.as_ref()).ok();
                     run_fn.forget();
-
-                    // invalidateTimers() - stop all running timers (engine-v2 only)
-                    // Call this BEFORE clearing localStorage to prevent race conditions
-                    #[cfg(feature = "engine-v2")]
-                    {
-                        let invalidate_fn = Closure::wrap(Box::new(move || {
-                            invalidate_all_timers();
-                        }) as Box<dyn Fn()>);
-                        js_sys::Reflect::set(&api, &"invalidateTimers".into(), invalidate_fn.as_ref()).ok();
-                        invalidate_fn.forget();
-                    }
 
                     // getPreview() - get preview panel text content
                     let get_preview = Closure::wrap(Box::new(|| -> String {
@@ -1235,9 +1218,6 @@ impl Playground {
                 local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
                 // Clear dynamically-keyed persistence data (list calls, removed sets)
                 clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
-                // Clear engine-v2 persistence state
-                #[cfg(feature = "engine-v2")]
-                local_storage().remove(interpreter_v2::STATES_STORAGE_KEY);
             })
     }
 
@@ -1486,53 +1466,40 @@ impl Playground {
             println!("BUILD.bn completed");
         }
 
-        // Use engine-v2 if feature is enabled
-        #[cfg(feature = "engine-v2")]
-        {
-            drop(virtual_fs);
-            let source_code = source_code.to_string();
-            let result = interpreter_v2::run_and_render(source_code);
-            result.unify()
-        }
-
-        // Use old engine if engine-v2 feature is not enabled
-        #[cfg(not(feature = "engine-v2"))]
-        {
-            // Run the main file (uses ModuleLoader for imports, no shared registry)
-            // We keep reference_connector and link_connector alive to preserve all actors.
-            // Dropping them (via after_remove) will trigger cleanup of all actors.
-            let evaluation_result = interpreter::run_with_registry(
-                filename,
-                &source_code,
-                STATES_STORAGE_KEY,
-                OLD_SOURCE_CODE_STORAGE_KEY,
-                OLD_SPAN_ID_PAIRS_STORAGE_KEY,
-                virtual_fs,
-                None,
-            );
-            drop(source_code);
-            if let Some((object, construct_context, _registry, _module_loader, reference_connector, link_connector, pass_through_connector)) = evaluation_result {
-                El::new()
-                    .s(Width::fill())
-                    .s(Height::fill())
-                    .child_signal(object_with_document_to_element_signal(
-                        object.clone(),
-                        construct_context,
-                    ))
-                    .after_remove(move |_| {
-                        // Drop object first, then drop connectors to trigger actor cleanup
-                        drop(object);
-                        drop(reference_connector);
-                        drop(link_connector);
-                        drop(pass_through_connector);
-                    })
-                    .unify()
-            } else {
-                El::new()
-                    .s(Font::new().color(color!("LightCoral")))
-                    .child("Failed to run the example. See errors in dev console.")
-                    .unify()
-            }
+        // Run the main file (uses ModuleLoader for imports, no shared registry)
+        // We keep reference_connector and link_connector alive to preserve all actors.
+        // Dropping them (via after_remove) will trigger cleanup of all actors.
+        let evaluation_result = interpreter::run_with_registry(
+            filename,
+            &source_code,
+            STATES_STORAGE_KEY,
+            OLD_SOURCE_CODE_STORAGE_KEY,
+            OLD_SPAN_ID_PAIRS_STORAGE_KEY,
+            virtual_fs,
+            None,
+        );
+        drop(source_code);
+        if let Some((object, construct_context, _registry, _module_loader, reference_connector, link_connector, pass_through_connector)) = evaluation_result {
+            El::new()
+                .s(Width::fill())
+                .s(Height::fill())
+                .child_signal(object_with_document_to_element_signal(
+                    object.clone(),
+                    construct_context,
+                ))
+                .after_remove(move |_| {
+                    // Drop object first, then drop connectors to trigger actor cleanup
+                    drop(object);
+                    drop(reference_connector);
+                    drop(link_connector);
+                    drop(pass_through_connector);
+                })
+                .unify()
+        } else {
+            El::new()
+                .s(Font::new().color(color!("LightCoral")))
+                .child("Failed to run the example. See errors in dev console.")
+                .unify()
         }
     }
 
@@ -1608,9 +1575,6 @@ impl Playground {
                         local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                         local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
                         clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
-                        // Clear engine-v2 persistence state
-                        #[cfg(feature = "engine-v2")]
-                        local_storage().remove(interpreter_v2::STATES_STORAGE_KEY);
                     }
 
                     // Update URL to share this example
@@ -1713,9 +1677,6 @@ impl Playground {
                     local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                     local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
                     clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
-                    // Clear engine-v2 persistence state
-                    #[cfg(feature = "engine-v2")]
-                    local_storage().remove(interpreter_v2::STATES_STORAGE_KEY);
 
                     // Update URL (use custom-example parameter)
                     set_custom_example_in_url(&name);
@@ -1934,9 +1895,6 @@ impl Playground {
                                             local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                                             local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
                                             clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
-                                            // Clear engine-v2 persistence state
-                                            #[cfg(feature = "engine-v2")]
-                                            local_storage().remove(interpreter_v2::STATES_STORAGE_KEY);
 
                                             // Update URL (use custom-example parameter)
                                             set_custom_example_in_url(&name);
