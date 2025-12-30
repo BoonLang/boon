@@ -337,7 +337,7 @@ fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "boon_launch_browser".to_string(),
-            description: "Launch Chromium browser with the Boon extension pre-loaded. Opens the playground at localhost:8081. The browser will automatically connect to the WebSocket server.".to_string(),
+            description: "Launch Chromium browser with the Boon extension pre-loaded. Opens the playground at localhost:8083. The browser will automatically connect to the WebSocket server.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -825,7 +825,7 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
         let headless = args.get("headless").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let opts = browser::LaunchOptions {
-            playground_port: 8081,
+            playground_port: 8083,
             ws_port,
             headless,
             keep_open: true,  // Don't block waiting
@@ -843,7 +843,7 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
                     )),
                     Err(e) => Ok(format!(
                         "Browser launched (PID: {}) but extension connection timed out: {}\n\
-                        Check that the playground is running at localhost:8081",
+                        Check that the playground is running at localhost:8083",
                         child.id(), e
                     )),
                 }
@@ -1103,19 +1103,19 @@ async fn check_playground_status() -> Result<String, String> {
 
     let mut status = String::new();
 
-    // Check if port 8081 is listening
+    // Check if port 8083 is listening
     let port_check = StdCommand::new("sh")
-        .args(["-c", "lsof -i :8081 2>/dev/null | grep LISTEN | head -5"])
+        .args(["-c", "lsof -i :8083 2>/dev/null | grep LISTEN | head -5"])
         .output();
 
     match port_check {
         Ok(output) if !output.stdout.is_empty() => {
-            status.push_str("Port 8081: LISTENING\n");
+            status.push_str("Port 8083: LISTENING\n");
             let processes = String::from_utf8_lossy(&output.stdout);
             status.push_str(&format!("Processes:\n{}\n", processes));
         }
         _ => {
-            status.push_str("Port 8081: NOT LISTENING\n");
+            status.push_str("Port 8083: NOT LISTENING\n");
             status.push_str("Playground server is not running.\n");
             status.push_str("Start with: cd playground && makers mzoon start\n");
             return Ok(status);
@@ -1128,7 +1128,7 @@ async fn check_playground_status() -> Result<String, String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    match client.get("http://localhost:8081").send().await {
+    match client.get("http://localhost:8083").send().await {
         Ok(response) => {
             status.push_str(&format!("HTTP Status: {}\n", response.status()));
 

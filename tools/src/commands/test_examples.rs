@@ -146,7 +146,7 @@ fn find_boon_root() -> Option<PathBuf> {
     None
 }
 
-/// Check if the playground dev server (mzoon) is running on port 8081
+/// Check if the playground dev server (mzoon) is running on port 8083
 async fn is_playground_running() -> bool {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -156,7 +156,7 @@ async fn is_playground_running() -> bool {
         Err(_) => return false,
     };
 
-    match client.get("http://localhost:8081").send().await {
+    match client.get("http://localhost:8083").send().await {
         Ok(response) => response.status().is_success(),
         Err(_) => false,
     }
@@ -274,11 +274,11 @@ async fn ensure_browser_connection(port: u16) -> Result<SetupState> {
 
     // Step 0: Ensure playground (mzoon) is running
     if !is_playground_running().await {
-        println!("Playground server not running on port 8081.");
+        println!("Playground server not running on port 8083.");
         start_playground_server().await?;
         setup.started_mzoon = true;
     } else {
-        println!("Playground server running on port 8081.");
+        println!("Playground server running on port 8083.");
     }
 
     // Step 1: Check initial status
@@ -334,7 +334,7 @@ async fn ensure_browser_connection(port: u16) -> Result<SetupState> {
         println!("Browser extension not connected, launching Chromium...");
 
         let opts = browser::LaunchOptions {
-            playground_port: 8081,
+            playground_port: 8083,
             ws_port: port,
             headless: false,
             keep_open: true,  // Don't block waiting
@@ -354,7 +354,7 @@ async fn ensure_browser_connection(port: u16) -> Result<SetupState> {
                     Err(e) => {
                         anyhow::bail!(
                             "Browser launched but extension connection timed out: {}\n\
-                            Check that the playground is running at localhost:8081",
+                            Check that the playground is running at localhost:8083",
                             e
                         );
                     }
@@ -425,7 +425,7 @@ async fn ensure_browser_connection(port: u16) -> Result<SetupState> {
 
         anyhow::bail!(
             "Playground API not ready after {} retries. \
-            Make sure the playground is running at localhost:8081",
+            Make sure the playground is running at localhost:8083",
             max_retries
         );
     }
@@ -439,10 +439,10 @@ fn kill_mzoon_server() {
 
     println!("Stopping mzoon server we started...");
 
-    // Find the process LISTENING on port 8081 (not browsers connecting to it)
+    // Find the process LISTENING on port 8083 (not browsers connecting to it)
     // This matches the approach in playground/Makefile.toml [tasks.kill]
     let pid_output = StdCommand::new("lsof")
-        .args(["-ti:8081", "-sTCP:LISTEN"])
+        .args(["-ti:8083", "-sTCP:LISTEN"])
         .output();
 
     if let Ok(output) = pid_output {
@@ -453,14 +453,14 @@ fn kill_mzoon_server() {
                 let _ = StdCommand::new("kill")
                     .args(["-TERM", &pid.to_string()])
                     .output();
-                println!("Sent TERM signal to server on port 8081 (PID: {})", pid);
+                println!("Sent TERM signal to server on port 8083 (PID: {})", pid);
 
                 // Wait for graceful shutdown
                 std::thread::sleep(std::time::Duration::from_secs(2));
 
                 // Check if still running and force kill if needed
                 let still_running = StdCommand::new("lsof")
-                    .args(["-ti:8081", "-sTCP:LISTEN"])
+                    .args(["-ti:8083", "-sTCP:LISTEN"])
                     .output()
                     .map(|o| !o.stdout.is_empty())
                     .unwrap_or(false);

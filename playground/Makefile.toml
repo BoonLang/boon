@@ -30,7 +30,7 @@ args = ["${@}"]
 [tasks.kill]
 description = "Stop all MoonZoon development processes (mzoon, makers)"
 script = '''
-PORT=$(grep "^port = " MoonZoon.toml | head -1 | cut -d' ' -f3 || echo "8081")
+PORT=$(grep "^port = " MoonZoon.toml | head -1 | cut -d' ' -f3 || echo "8083")
 KILLED_ANY=false
 
 echo "Stopping development processes on port $PORT..."

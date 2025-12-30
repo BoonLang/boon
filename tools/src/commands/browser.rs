@@ -102,8 +102,8 @@ pub struct LaunchOptions {
 impl Default for LaunchOptions {
     fn default() -> Self {
         Self {
-            playground_port: 8081,
-            ws_port: 9222,
+            playground_port: 8083,
+            ws_port: 9223,
             headless: false,
             keep_open: false,
             browser_path: None,

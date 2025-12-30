@@ -1,7 +1,7 @@
 //! WebSocket server for browser extension communication
 //!
 //! Architecture:
-//! - Server listens on localhost:9222 (configurable)
+//! - Server listens on localhost:9223 (configurable)
 //! - Chrome extension connects via WebSocket
 //! - CLI sends commands to server, server forwards to extension
 //! - Extension executes in browser, returns response
@@ -206,7 +206,7 @@ pub async fn start_server(port: u16, watch_path: Option<&Path>) -> Result<()> {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, addr)) => {
-                        println!("New connection from: {}", addr);
+                        log::debug!("New connection from: {}", addr);
                         let state_clone = state.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection(stream, state_clone).await {
@@ -418,7 +418,7 @@ async fn handle_cli_connection(
     let request: Request = serde_json::from_str(&first_msg)
         .context(format!("Failed to parse CLI request: {}", first_msg))?;
 
-    println!("CLI request: {:?}", request.command);
+    log::debug!("CLI request: {:?}", request.command);
 
     // Forward command to extension and wait for response
     let response = state.send_command(request.command).await;
@@ -440,7 +440,7 @@ async fn handle_cli_connection(
     let json = serde_json::to_string(&response_msg)?;
     ws_tx.send(Message::Text(json)).await?;
 
-    println!("CLI connection closed");
+    log::debug!("CLI connection closed");
     Ok(())
 }
 

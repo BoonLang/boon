@@ -57,10 +57,10 @@ cargo test -p boon
 
 ### Running the playground (development server)
 
-**DO NOT** kill processes on port 8081 aggressively (e.g., `lsof -ti:8081 | xargs -r kill -9`).
+**DO NOT** kill processes on port 8083 aggressively (e.g., `lsof -ti:8083 | xargs -r kill -9`).
 
 Reasons:
-1. This can kill the user's browser if it's using port 8081
+1. This can kill the user's browser if it's using port 8083
 2. MoonZoon (mzoon) supports **auto-reload** and **auto-compilation** - manual restarts are unnecessary
 3. When you edit Rust files, mzoon will automatically recompile and hot-reload
 
@@ -78,7 +78,7 @@ cd playground && mzoon/bin/mzoon start &
 
 Wait for compilation (1-2 minutes fresh, seconds incremental). Check if running:
 ```bash
-curl -s http://localhost:8081 | head -5
+curl -s http://localhost:8083 | head -5
 ```
 
 **Stopping the playground (kill zombie processes on Linux):**
@@ -121,7 +121,7 @@ cd tools && cargo run --release -- server start --watch ./extension
 # 1. Open chrome://extensions/
 # 2. Enable "Developer mode"
 # 3. Click "Load unpacked" → select tools/extension/
-# 4. Navigate to http://localhost:8081
+# 4. Navigate to http://localhost:8083
 
 # Terminal 4: Execute commands
 boon-tools exec status                    # Check connection

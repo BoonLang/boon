@@ -7,14 +7,14 @@ This document covers browser automation for testing and debugging the Boon Playg
 ```
 +----------------+      WebSocket      +------------------+                    +------------------+
 |   boon-tools   | <----------------> |  Rust WebSocket  | <----------------> |  Chrome Extension|
-|   CLI          |    localhost:9222  |  Server (tokio)  |                    |  (Manifest V3)   |
+|   CLI          |    localhost:9223  |  Server (tokio)  |                    |  (Manifest V3)   |
 +----------------+                    +------------------+                    +------------------+
                                                                                       |
                                                                                       | DOM Access
                                                                                       v
                                                                              +------------------+
                                                                              |  Boon Playground |
-                                                                             |  (localhost:8081)|
+                                                                             |  (localhost:8083)|
                                                                              +------------------+
 ```
 
@@ -30,13 +30,13 @@ The browser control stack consists of:
 ```bash
 cd playground && makers mzoon start
 ```
-Wait for compilation (~1-2 minutes). Server runs on http://localhost:8081
+Wait for compilation (~1-2 minutes). Server runs on http://localhost:8083
 
 ### Terminal 2: Start the WebSocket Server with Hot Reload
 ```bash
-cd tools && cargo run --release -- server start --port 9222 --watch ./extension
+cd tools && cargo run --release -- server start --port 9223 --watch ./extension
 ```
-Server listens on ws://127.0.0.1:9222 and watches for extension file changes.
+Server listens on ws://127.0.0.1:9223 and watches for extension file changes.
 
 ### Terminal 3: Open Browser and Load Extension
 
@@ -46,7 +46,7 @@ google-chrome-canary \
   --user-data-dir=/tmp/boon-canary \
   --no-first-run \
   --no-default-browser-check \
-  http://localhost:8081
+  http://localhost:8083
 ```
 
 Then manually load the extension (one-time setup):
@@ -54,7 +54,7 @@ Then manually load the extension (one-time setup):
 2. Enable "Developer mode" (top right toggle)
 3. Click "Load unpacked"
 4. Select the `tools/extension/` directory
-5. Navigate to http://localhost:8081
+5. Navigate to http://localhost:8083
 
 **Alternative: Regular Chrome with isolated profile:**
 ```bash
@@ -62,7 +62,7 @@ google-chrome \
   --user-data-dir=/tmp/boon-automation \
   --no-first-run \
   --no-default-browser-check \
-  http://localhost:8081
+  http://localhost:8083
 ```
 
 **Note:** The `--load-extension` flag is often silently ignored by Chrome. Manual extension loading is more reliable.
@@ -98,13 +98,13 @@ boon-tools exec test "document: Document/new(root: 123)" --expect "123" --screen
 2. Enable "Developer mode" (top right)
 3. Click "Load unpacked"
 4. Select the `tools/extension/` directory
-5. Navigate to http://localhost:8081
+5. Navigate to http://localhost:8083
 
 ### Option 2: Command Line with Isolated Profile
 ```bash
 google-chrome --user-data-dir=/tmp/boon-automation \
               --load-extension=$(pwd)/tools/extension \
-              http://localhost:8081
+              http://localhost:8083
 ```
 
 This creates an isolated Chrome profile that won't affect your main browser.
@@ -114,10 +114,10 @@ This creates an isolated Chrome profile that won't affect your main browser.
 ### Server Commands
 ```bash
 # Start WebSocket server
-boon-tools server start --port 9222
+boon-tools server start --port 9223
 
 # Start with extension hot reload (watches for file changes)
-boon-tools server start --port 9222 --watch ./extension
+boon-tools server start --port 9223 --watch ./extension
 ```
 
 ### Exec Commands (via Extension)
@@ -226,7 +226,7 @@ CDP's `Input.dispatchMouseEvent` creates events with `isTrusted: true` because t
 ```
 ┌─────────────────┐     WebSocket      ┌─────────────────────┐     CDP API      ┌─────────────┐
 │   boon-tools    │ ◄──────────────────► │  Chrome Extension   │ ◄───────────────► │   Browser   │
-│   (CLI/Rust)    │     port 9222      │  (background.js)    │  chrome.debugger │   (Tab)     │
+│   (CLI/Rust)    │     port 9223      │  (background.js)    │  chrome.debugger │   (Tab)     │
 └─────────────────┘                    └─────────────────────┘                  └─────────────┘
 ```
 
@@ -311,7 +311,7 @@ And still uses executeScript for:
 ### Server Logs
 The WebSocket server prints connection status:
 ```
-WebSocket server listening on ws://127.0.0.1:9222
+WebSocket server listening on ws://127.0.0.1:9223
 Waiting for Chrome extension to connect...
 Extension connected!
 ```
@@ -369,7 +369,7 @@ cd playground && makers kill && makers mzoon start
 | Error | Solution |
 |-------|----------|
 | "Another debugger is already attached" | `boon-tools exec detach` then retry |
-| "No extension connected" | Refresh browser tab at localhost:8081 |
+| "No extension connected" | Refresh browser tab at localhost:8083 |
 | Extension stops responding | `boon-tools exec refresh` (NOT reload) |
 | Complete failure | Kill Chromium: `pkill -f boon-chromium`, then relaunch |
 
@@ -385,7 +385,7 @@ cd playground && makers kill && makers mzoon start
 
    # Terminal 3: Start Chromium (stays running, one tab, one extension instance)
    chromium --load-extension=./extension --user-data-dir=/tmp/boon-chromium \
-            --no-first-run http://localhost:8081
+            --no-first-run http://localhost:8083
    ```
 
 2. **Testing cycle (no restarts needed)**:

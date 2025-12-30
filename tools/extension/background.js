@@ -1,7 +1,7 @@
 // Boon Browser Control - Background Service Worker
 // Connects to WebSocket server and routes commands to content script
 
-const WS_URL = 'ws://127.0.0.1:9222';
+const WS_URL = 'ws://127.0.0.1:9223';
 let ws = null;
 let reconnectTimer = null;
 let contentPort = null;
@@ -655,8 +655,8 @@ async function handleCommand(id, command) {
   const type = command.type;
 
   try {
-    // Get the active tab with localhost:8081
-    const tabs = await chrome.tabs.query({ url: 'http://localhost:8081/*' });
+    // Get the active tab with localhost:8083
+    const tabs = await chrome.tabs.query({ url: 'http://localhost:8083/*' });
 
     if (tabs.length === 0) {
       return { type: 'error', message: 'No Boon Playground tab found' };
@@ -2628,7 +2628,7 @@ async function registerEarlyConsoleCapture() {
 
     await chrome.scripting.registerContentScripts([{
       id: 'boon-console-capture',
-      matches: ['http://localhost:8081/*'],
+      matches: ['http://localhost:8083/*'],
       js: ['console-capture.js'],
       runAt: 'document_start',
       world: 'MAIN'

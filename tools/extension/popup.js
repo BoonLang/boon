@@ -9,8 +9,8 @@ async function updateStatus() {
 
   // Check WebSocket connection by trying to send a message
   try {
-    // Get tabs with localhost:8081
-    const tabs = await chrome.tabs.query({ url: 'http://localhost:8081/*' });
+    // Get tabs with localhost:8083
+    const tabs = await chrome.tabs.query({ url: 'http://localhost:8083/*' });
 
     if (tabs.length === 0) {
       wsDot.className = 'status-dot disconnected';
