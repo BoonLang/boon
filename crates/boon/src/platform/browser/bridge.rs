@@ -6,7 +6,7 @@ use zoon::*;
 use super::engine::{
     ActorContext, ActorLoop, ConstructContext, ConstructInfo, ListChange, NamedChannel, Object,
     TaggedObject, TypedStream, Value, ValueActor, ValueIdempotencyKey, Variable,
-    Text as EngineText, Tag as EngineTag,
+    Text as EngineText, Tag as EngineTag, switch_map,
 };
 use crate::parser;
 
@@ -1619,39 +1619,50 @@ fn element_button(
             .boxed_local()
     );
 
-    // Outline signal - handles both NoOutline tag and Object with reactive color field
+    // Outline signal - handles both NoOutline tag and Object with reactive color field.
+    // IMPORTANT: Uses switch_map (not flat_map) so that when outline value changes,
+    // the old inner stream (with stream::pending()) is cancelled and replaced.
+    // Without switch_map, flat_map would wait for the pending() stream to complete (never).
     let sv_outline = settings_variable.clone();
+    let outline_value_stream = sv_outline
+        .stream()
+        .flat_map(|value| value.expect_object().expect_variable("style").stream())
+        .flat_map(|value| {
+            let obj = value.expect_object();
+            stream::iter(obj.variable("outline")).flat_map(|var| {
+                var.value_actor().clone().stream()
+            })
+        });
     let outline_signal = signal::from_stream(
-        sv_outline
-            .stream()
-            .flat_map(|value| value.expect_object().expect_variable("style").stream())
-            .flat_map(|value| {
-                let obj = value.expect_object();
-                stream::iter(obj.variable("outline")).flat_map(|var| var.stream())
-            })
-            .flat_map(|value| {
-                match value {
-                    Value::Tag(tag, _) if tag.tag() == "NoOutline" => {
-                        // NoOutline tag - emit "none" once and stay alive
-                        stream::once(future::ready("none".to_string()))
-                            .chain(stream::pending())
-                            .boxed_local()
-                    }
-                    Value::Object(obj, _) => {
-                        // Object with color field - subscribe to color's stream reactively
-                        stream::iter(obj.variable("color"))
-                            .flat_map(|var| var.stream())
-                            .filter_map(|color_value| async move {
-                                oklch_to_css(color_value).await.map(|css_color| {
-                                    format!("3px solid {}", css_color)
-                                })
-                            })
-                            .boxed_local()
-                    }
-                    _ => stream::pending::<String>().boxed_local(),
+        switch_map(outline_value_stream, |value| {
+            match value {
+                Value::Tag(tag, _) if tag.tag() == "NoOutline" => {
+                    stream::once(future::ready("none".to_string()))
+                        .chain(stream::pending())
+                        .boxed_local()
                 }
-            })
-            .boxed_local()
+                Value::Object(obj, _) => {
+                    if let Some(color_var) = obj.variable("color") {
+                        stream::once(async move {
+                            match color_var.value_actor().value().await {
+                                Ok(color_value) => {
+                                    oklch_to_css(color_value).await.map(|css_color| {
+                                        format!("3px solid {}", css_color)
+                                    })
+                                },
+                                Err(_) => None,
+                            }
+                        })
+                        .filter_map(|x| async move { x })
+                        .chain(stream::pending())
+                        .boxed_local()
+                    } else {
+                        stream::pending::<String>().boxed_local()
+                    }
+                }
+                _ => stream::pending::<String>().boxed_local(),
+            }
+        })
     );
 
     Button::new()

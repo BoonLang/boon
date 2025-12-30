@@ -2259,7 +2259,7 @@ impl VariableOrArgumentReference {
         } else {
             // Streaming: continuous updates
             stream::once(async move { root_value_actor.await })
-                .then(|actor| async move { actor.stream() })
+                .then(move |actor| async move { actor.stream() })
                 .flatten()
                 .boxed_local()
         };
@@ -3689,6 +3689,7 @@ impl ValueActor {
                                 }
                             }
                             let new_version = current_version.fetch_add(1, Ordering::SeqCst) + 1;
+
                             value_history.add(new_version, new_value.clone());
 
                             // Push value to all subscribers
@@ -3696,9 +3697,8 @@ impl ValueActor {
                             subscribers.retain_mut(|tx| {
                                 match tx.try_send(new_value.clone()) {
                                     Ok(()) => true,
-                                    Err(e) if e.is_disconnected() => false, // Remove dead subscribers
-                                    Err(e) if e.is_full() => true, // Keep on backpressure (Full)
-                                    Err(_) => true,
+                                    Err(e) if e.is_disconnected() => false,
+                                    Err(_) => true, // Full or other - keep subscriber
                                 }
                             });
 
