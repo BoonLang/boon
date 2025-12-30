@@ -37,9 +37,10 @@ FUNCTION simple_button(name) {
             padding: [row: 20, column: 10]
             rounded_corners: 5
             background: [color: element.hovered |> WHILE {
-                True => Oklch[lightness: 0.85]
-                False => Oklch[lightness: 0.95]
+                True => Oklch[lightness: 0.35, chroma: 0.1, hue: 250]
+                False => Oklch[lightness: 0.25]
             }]
+            font: [color: White]
             outline: element.hovered |> WHILE {
                 True => [
                     side: Inner

@@ -42,9 +42,10 @@ document: Document/new(root: Element/stripe(
                         padding: [row: 20, column: 10]
                         rounded_corners: 5
                         background: [color: store.btn_a.clicked |> WHILE {
-                            True => Oklch[lightness: 0.7]
-                            False => Oklch[lightness: 0.95]
+                            True => Oklch[lightness: 0.35, chroma: 0.1, hue: 25]
+                            False => Oklch[lightness: 0.25]
                         }]
+                        font: [color: White]
                         outline: store.btn_a.clicked |> WHILE {
                             True => [color: Oklch[lightness: 0.55, chroma: 0.25, hue: 25]]
                             False => NoOutline
@@ -59,9 +60,10 @@ document: Document/new(root: Element/stripe(
                         padding: [row: 20, column: 10]
                         rounded_corners: 5
                         background: [color: store.btn_b.clicked |> WHILE {
-                            True => Oklch[lightness: 0.7]
-                            False => Oklch[lightness: 0.95]
+                            True => Oklch[lightness: 0.35, chroma: 0.1, hue: 25]
+                            False => Oklch[lightness: 0.25]
                         }]
+                        font: [color: White]
                         outline: store.btn_b.clicked |> WHILE {
                             True => [color: Oklch[lightness: 0.55, chroma: 0.25, hue: 25]]
                             False => NoOutline
@@ -76,9 +78,10 @@ document: Document/new(root: Element/stripe(
                         padding: [row: 20, column: 10]
                         rounded_corners: 5
                         background: [color: store.btn_c.clicked |> WHILE {
-                            True => Oklch[lightness: 0.7]
-                            False => Oklch[lightness: 0.95]
+                            True => Oklch[lightness: 0.35, chroma: 0.1, hue: 25]
+                            False => Oklch[lightness: 0.25]
                         }]
+                        font: [color: White]
                         outline: store.btn_c.clicked |> WHILE {
                             True => [color: Oklch[lightness: 0.55, chroma: 0.25, hue: 25]]
                             False => NoOutline

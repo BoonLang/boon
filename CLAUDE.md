@@ -29,6 +29,7 @@ The sections below marked **(Old Engine)** document the current engine and will 
   - For type annotations: `as` is fine (e.g., `0usize` or `0 as usize`)
   - For pointer casting in FFI: `as` is appropriate but rare in Boon
 - **When fixing subtle bugs, document the architectural principle in `docs/new_boon/`.** The fix itself solves the immediate problem, but documenting *why* the code must be structured that way prevents the bug from being reintroduced. For example, the "Wire Transparency Principle" (§2.3.6.1) explains why Wire nodes must always follow their source chain instead of returning cached values - a subtle invariant that, if violated, breaks HOLD state updates.
+- **Use `switch_map` instead of `flat_map` when inner streams are infinite.** When a `flat_map` closure contains branching (match/if) that returns inner streams with `stream::pending()`, use `switch_map` instead. `flat_map` waits for inner streams to complete before processing new outer values - since `stream::pending()` never completes, subsequent values are silently ignored. `switch_map` cancels the previous inner stream when a new outer value arrives, which is the correct behavior for reactive UI updates. See `bridge.rs` outline_signal for an example.
 
 ## Project Structure
 
