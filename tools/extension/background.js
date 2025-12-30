@@ -16,6 +16,7 @@ const MAX_RECONNECT_DELAY = 30000; // 30 seconds max
 
 let debuggerAttached = new Map(); // tabId -> boolean
 let cdpConsoleMessages = new Map(); // tabId -> messages[]
+let cachedPlaygroundTabId = null; // Cache tab ID for consistent targeting
 
 async function attachDebugger(tabId) {
   if (debuggerAttached.get(tabId)) return;
@@ -94,6 +95,14 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       debuggerAttached.delete(tabId);
       cdpConsoleMessages.delete(tabId);
     }
+  }
+});
+
+// Listen for tab removal to clear cached tab ID
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (tabId === cachedPlaygroundTabId) {
+    console.log(`[Boon] Cached playground tab ${tabId} was closed`);
+    cachedPlaygroundTabId = null;
   }
 });
 
@@ -656,13 +665,36 @@ async function handleCommand(id, command) {
 
   try {
     // Get the active tab with localhost:8083
-    const tabs = await chrome.tabs.query({ url: 'http://localhost:8083/*' });
+    // Use cached tab ID if valid, otherwise find and cache a new one
+    let tab = null;
 
-    if (tabs.length === 0) {
-      return { type: 'error', message: 'No Boon Playground tab found' };
+    if (cachedPlaygroundTabId !== null) {
+      try {
+        tab = await chrome.tabs.get(cachedPlaygroundTabId);
+        // Verify the tab is still on localhost:8083
+        if (!tab.url || !tab.url.startsWith('http://localhost:8083')) {
+          console.log('[Boon] Cached tab no longer on playground, finding new tab');
+          cachedPlaygroundTabId = null;
+          tab = null;
+        }
+      } catch (e) {
+        // Tab no longer exists
+        console.log('[Boon] Cached tab no longer exists, finding new tab');
+        cachedPlaygroundTabId = null;
+        tab = null;
+      }
     }
 
-    const tab = tabs[0];
+    if (tab === null) {
+      const tabs = await chrome.tabs.query({ url: 'http://localhost:8083/*' });
+      if (tabs.length === 0) {
+        return { type: 'error', message: 'No Boon Playground tab found' };
+      }
+      // Prefer the most recently accessed tab, or the active one
+      tab = tabs.find(t => t.active) || tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
+      cachedPlaygroundTabId = tab.id;
+      console.log(`[Boon] Selected playground tab ${tab.id} (${tabs.length} tabs found)`);
+    }
 
     switch (type) {
       case 'ping':

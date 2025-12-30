@@ -136,6 +136,9 @@ pub fn launch_browser(opts: LaunchOptions) -> Result<Child> {
         "--disable-popup-blocking",
         "--disable-translate",
         "--disable-sync",
+        // Disable session restore to prevent multiple tabs from previous sessions
+        "--disable-session-crashed-bubble",
+        "--hide-crash-restore-bubble",
         // Disable background throttling so extension stays responsive
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
