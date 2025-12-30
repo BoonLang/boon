@@ -1,0 +1,108 @@
+-- Test: Do multiple buttons have independent click states?
+-- Click-based version of button_hover_test for easier automated testing
+-- BUG: The WHILE inside style doesn't react to state changes (same bug as button_hover_test)
+
+store: [
+    btn_a: make_button(name: TEXT { A })
+    btn_b: make_button(name: TEXT { B })
+    btn_c: make_button(name: TEXT { C })
+]
+
+FUNCTION make_button(name) {
+    [
+        elements: [button: LINK]
+        name: name
+        clicked: False |> HOLD state {
+            elements.button.event.press |> THEN { state |> Bool/not() }
+        }
+    ]
+}
+
+document: Document/new(root: Element/stripe(
+    element: []
+    direction: Column
+    gap: 20
+    style: [padding: 20]
+    items: LIST {
+        Element/label(
+            element: []
+            style: []
+            label: TEXT { Click each button - only clicked one should show border }
+        )
+
+        Element/stripe(
+            element: []
+            direction: Row
+            gap: 10
+            style: []
+            items: LIST {
+                Element/button(
+                    element: [event: [press: LINK]]
+                    style: [
+                        padding: [row: 20, column: 10]
+                        rounded_corners: 5
+                        background: [color: store.btn_a.clicked |> WHILE {
+                            True => Oklch[lightness: 0.85]
+                            False => Oklch[lightness: 0.95]
+                        }]
+                        outline: store.btn_a.clicked |> WHILE {
+                            True => [
+                                side: Inner
+                                color: Oklch[lightness: 0.3, chroma: 0.15, hue: 250]
+                            ]
+                            False => NoOutline
+                        }
+                    ]
+                    label: TEXT { Button {store.btn_a.name} }
+                ) |> LINK { store.btn_a.elements.button }
+
+                Element/button(
+                    element: [event: [press: LINK]]
+                    style: [
+                        padding: [row: 20, column: 10]
+                        rounded_corners: 5
+                        background: [color: store.btn_b.clicked |> WHILE {
+                            True => Oklch[lightness: 0.85]
+                            False => Oklch[lightness: 0.95]
+                        }]
+                        outline: store.btn_b.clicked |> WHILE {
+                            True => [
+                                side: Inner
+                                color: Oklch[lightness: 0.3, chroma: 0.15, hue: 250]
+                            ]
+                            False => NoOutline
+                        }
+                    ]
+                    label: TEXT { Button {store.btn_b.name} }
+                ) |> LINK { store.btn_b.elements.button }
+
+                Element/button(
+                    element: [event: [press: LINK]]
+                    style: [
+                        padding: [row: 20, column: 10]
+                        rounded_corners: 5
+                        background: [color: store.btn_c.clicked |> WHILE {
+                            True => Oklch[lightness: 0.85]
+                            False => Oklch[lightness: 0.95]
+                        }]
+                        outline: store.btn_c.clicked |> WHILE {
+                            True => [
+                                side: Inner
+                                color: Oklch[lightness: 0.3, chroma: 0.15, hue: 250]
+                            ]
+                            False => NoOutline
+                        }
+                    ]
+                    label: TEXT { Button {store.btn_c.name} }
+                ) |> LINK { store.btn_c.elements.button }
+            }
+        )
+
+        -- Debug: show click states to prove state IS changing even though style doesn't update
+        Element/label(
+            element: []
+            style: []
+            label: TEXT { States - A: {store.btn_a.clicked}, B: {store.btn_b.clicked}, C: {store.btn_c.clicked} }
+        )
+    }
+))
