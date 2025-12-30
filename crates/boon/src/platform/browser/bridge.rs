@@ -475,6 +475,14 @@ fn element_stripe(
                 select! {
                     new_sender = hovered_stream.next() => {
                         if let Some(sender) = new_sender {
+                            // Send initial hover state (false) when link is established
+                            let initial_hover_value = EngineTag::new_value(
+                                ConstructInfo::new("stripe::hovered::initial", None, "Initial stripe hovered state"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                "False",
+                            );
+                            sender.send_or_drop(initial_hover_value);
                             hovered_link_value_sender = Some(sender);
                         }
                     }
@@ -1287,6 +1295,14 @@ fn element_button(
                     }
                     new_sender = hovered_stream.next() => {
                         if let Some(sender) = new_sender {
+                            // Send initial hover state (false) when link is established
+                            let initial_hover_value = EngineTag::new_value(
+                                ConstructInfo::new("button::hovered::initial", None, "Initial button hovered state"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                "False",
+                            );
+                            sender.send_or_drop(initial_hover_value);
                             hovered_link_value_sender = Some(sender);
                         }
                     }
@@ -2268,6 +2284,14 @@ fn element_label(
                     }
                     new_sender = hovered_stream.next() => {
                         if let Some(sender) = new_sender {
+                            // Send initial hover state (false) when link is established
+                            let initial_hover_value = EngineTag::new_value(
+                                ConstructInfo::new("label::hovered::initial", None, "Initial label hovered state"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                "False",
+                            );
+                            sender.send_or_drop(initial_hover_value);
                             _hovered_link_value_sender = Some(sender);
                         }
                     }
@@ -2419,6 +2443,14 @@ fn element_link(
             loop {
                 select! {
                     sender = hovered_stream.select_next_some() => {
+                        // Send initial hover state (false) when link is established
+                        let initial_hover_value = EngineTag::new_value(
+                            ConstructInfo::new("link::hovered::initial", None, "Initial link hovered state"),
+                            construct_context.clone(),
+                            ValueIdempotencyKey::new(),
+                            "False",
+                        );
+                        sender.send_or_drop(initial_hover_value);
                         hovered_link_value_sender = Some(sender);
                     }
                     is_hovered = hovered_receiver.select_next_some() => {
