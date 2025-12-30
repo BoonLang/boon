@@ -1619,7 +1619,7 @@ fn element_button(
             .boxed_local()
     );
 
-    // Outline signal - handles both NoOutline tag and Object with reactive color field.
+    // Outline signal - handles both NoOutline tag and Object with color/thickness/style fields.
     // IMPORTANT: Uses switch_map (not flat_map) so that when outline value changes,
     // the old inner stream (with stream::pending()) is cancelled and replaced.
     // Without switch_map, flat_map would wait for the pending() stream to complete (never).
@@ -1642,23 +1642,44 @@ fn element_button(
                         .boxed_local()
                 }
                 Value::Object(obj, _) => {
-                    if let Some(color_var) = obj.variable("color") {
-                        stream::once(async move {
-                            match color_var.value_actor().value().await {
-                                Ok(color_value) => {
-                                    oklch_to_css(color_value).await.map(|css_color| {
-                                        format!("3px solid {}", css_color)
-                                    })
-                                },
-                                Err(_) => None,
+                    stream::once(async move {
+                        // Parse thickness (default: 3)
+                        let thickness = if let Some(thickness_var) = obj.variable("thickness") {
+                            match thickness_var.value_actor().value().await {
+                                Ok(Value::Number(n, _)) => n.number() as u32,
+                                _ => 3,
                             }
-                        })
-                        .filter_map(|x| async move { x })
-                        .chain(stream::pending())
-                        .boxed_local()
-                    } else {
-                        stream::pending::<String>().boxed_local()
-                    }
+                        } else {
+                            3
+                        };
+
+                        // Parse line_style: solid (default), dashed, dotted
+                        let line_style = if let Some(style_var) = obj.variable("line_style") {
+                            match style_var.value_actor().value().await {
+                                Ok(Value::Tag(tag, _)) => match tag.tag() {
+                                    "Dashed" => "dashed",
+                                    "Dotted" => "dotted",
+                                    _ => "solid",
+                                },
+                                _ => "solid",
+                            }
+                        } else {
+                            "solid"
+                        };
+
+                        // Parse color (required)
+                        if let Some(color_var) = obj.variable("color") {
+                            if let Ok(color_value) = color_var.value_actor().value().await {
+                                if let Some(css_color) = oklch_to_css(color_value).await {
+                                    return Some(format!("{}px {} {}", thickness, line_style, css_color));
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .filter_map(|x| async move { x })
+                    .chain(stream::pending())
+                    .boxed_local()
                 }
                 _ => stream::pending::<String>().boxed_local(),
             }
