@@ -59,6 +59,11 @@ description = "Verify input is actually typeable (not disabled/readonly/hidden)"
 actions = [["assert_input_typeable", 0]]
 expect = "2 items left"
 
+[[sequence]]
+description = "BUG TEST #C: All filter button has outline at app startup (before any clicks)"
+actions = [["assert_button_has_outline", "All"]]
+expect = "2 items left"
+
 # ============================================
 # SECTION 2: FILTER TESTS (with initial todos only)
 # These tests run BEFORE adding dynamic todos to avoid the engine bug.
