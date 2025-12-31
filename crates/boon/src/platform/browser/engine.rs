@@ -2288,6 +2288,14 @@ impl VariableOrArgumentReference {
                     Value::Object(object, _) => {
                         let variable = object.expect_variable(&alias_part);
                         let variable_actor = variable.value_actor();
+                        // Check if this is an EVENT LINK (click, press, key_down, etc.)
+                        // Event LINKs should use stream_from_now() to avoid replaying old events.
+                        // Element binding LINKs should use stream() to get the current value.
+                        let is_link = variable.link_value_sender().is_some();
+                        let is_event_link = is_link && matches!(
+                            alias_part.as_str(),
+                            "click" | "press" | "key_down" | "change" | "blur" | "double_click" | "hovered"
+                        );
                         // Use value() or stream() based on context - type-safe subscription
                         if use_snapshot {
                             // Snapshot: get current value once
@@ -2300,20 +2308,28 @@ impl VariableOrArgumentReference {
                             .filter_map(|v| future::ready(v.ok()))
                             .boxed_local()
                         } else {
-                            // Streaming: continuous updates - use stream() and keep alive
+                            // Streaming: continuous updates
+                            // For EVENT LINKs, use stream_from_now() to avoid replaying historical
+                            // events. This prevents bugs like old toggle_all clicks being replayed
+                            // when a new todo is created. For other LINKs (element bindings),
+                            // use stream() to get the current value.
                             stream::unfold(
-                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), object, variable),
-                                move |(subscription_opt, actor_opt, object, variable)| {
+                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), object, variable, is_event_link),
+                                move |(subscription_opt, actor_opt, object, variable, is_event_link)| {
                                     async move {
                                         let mut subscription = match subscription_opt {
                                             Some(s) => s,
                                             None => {
                                                 let actor = actor_opt.unwrap();
-                                                actor.stream()
+                                                if is_event_link {
+                                                    actor.stream_from_now()
+                                                } else {
+                                                    actor.stream()
+                                                }
                                             }
                                         };
                                         let value = subscription.next().await;
-                                        value.map(|value| (value, (Some(subscription), None, object, variable)))
+                                        value.map(|value| (value, (Some(subscription), None, object, variable, is_event_link)))
                                     }
                                 }
                             ).boxed_local()
@@ -2322,6 +2338,14 @@ impl VariableOrArgumentReference {
                     Value::TaggedObject(tagged_object, _) => {
                         let variable = tagged_object.expect_variable(&alias_part);
                         let variable_actor = variable.value_actor();
+                        // Check if this is an EVENT LINK (click, press, key_down, etc.)
+                        // Event LINKs should use stream_from_now() to avoid replaying old events.
+                        // Element binding LINKs should use stream() to get the current value.
+                        let is_link = variable.link_value_sender().is_some();
+                        let is_event_link = is_link && matches!(
+                            alias_part.as_str(),
+                            "click" | "press" | "key_down" | "change" | "blur" | "double_click" | "hovered"
+                        );
                         // Use value() or stream() based on context - type-safe subscription
                         if use_snapshot {
                             // Snapshot: get current value once
@@ -2334,20 +2358,26 @@ impl VariableOrArgumentReference {
                             .filter_map(|v| future::ready(v.ok()))
                             .boxed_local()
                         } else {
-                            // Streaming: continuous updates - use stream() and keep alive
+                            // Streaming: continuous updates
+                            // For EVENT LINKs, use stream_from_now() to avoid replaying historical
+                            // events. For other LINKs (element bindings), use stream() to get the current value.
                             stream::unfold(
-                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), tagged_object, variable),
-                                move |(subscription_opt, actor_opt, tagged_object, variable)| {
+                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), tagged_object, variable, is_event_link),
+                                move |(subscription_opt, actor_opt, tagged_object, variable, is_event_link)| {
                                     async move {
                                         let mut subscription = match subscription_opt {
                                             Some(s) => s,
                                             None => {
                                                 let actor = actor_opt.unwrap();
-                                                actor.stream()
+                                                if is_event_link {
+                                                    actor.stream_from_now()
+                                                } else {
+                                                    actor.stream()
+                                                }
                                             }
                                         };
                                         let value = subscription.next().await;
-                                        value.map(|value| (value, (Some(subscription), None, tagged_object, variable)))
+                                        value.map(|value| (value, (Some(subscription), None, tagged_object, variable, is_event_link)))
                                     }
                                 }
                             ).boxed_local()

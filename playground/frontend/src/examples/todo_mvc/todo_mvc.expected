@@ -192,6 +192,33 @@ actions = [["click_checkbox", 0]]
 expect = "4 items left"
 
 # ============================================
+# SECTION 6b: BUG TEST - New todo after double toggle
+# BUG: After Toggle All twice, new todos are created already checked
+# ============================================
+
+[[sequence]]
+description = "Add todo after double toggle to test bug"
+actions = [
+    ["type", "Test toggle bug"],
+    ["key", "Enter"]
+]
+expect = "Test toggle bug"
+
+[[sequence]]
+description = "Verify item count is 5 (new todo added)"
+expect = "5 items left"
+
+[[sequence]]
+description = "BUG TEST: New todo checkbox (index 5) should be UNCHECKED"
+actions = [["assert_checkbox_unchecked", 5]]
+expect = "5 items left"
+
+[[sequence]]
+description = "Delete test todo to restore state"
+actions = [["click_button_near_text", "Test toggle bug"]]
+expect = "4 items left"
+
+# ============================================
 # SECTION 7: CHECK DIFFERENT TODO
 # ============================================
 

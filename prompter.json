@@ -1,5 +1,10 @@
 {
-  "supervisor_prompt": "Make all `makers verify-playground` tests pass. You can change and experiment with anything related to Boon engine and test and mcp infrastructure but don't change examples or tests alone (until there isn't a real bug or you want to add more tests or examples). When done, say +completed+.",
+  "instance_label": "boon_actors",
+  "port": 4567,
+  "command": [
+    "cl"
+  ],
+  "supervisor_prompt": "Finish you plan, then make all `makers verify-playground` tests pass. You can change and experiment with anything related to Boon engine and test and mcp infrastructure but don't change examples or tests alone (until there isn't a real bug or you want to add more tests or examples).",
   "completion_condition": "+completed+",
   "completion_command": "makers verify-playground",
   "protected_patterns": [
@@ -8,5 +13,5 @@
     "playground/frontend/src/examples/**/*.expected",
     "playground/frontend/src/examples/**/*.bn"
   ],
-  "command_timeout_secs": 600
+  "command_timeout_mins": 10
 }
