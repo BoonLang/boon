@@ -47,7 +47,7 @@ document: Document/new(root: Element/stripe(
                         }]
                         font: [color: White]
                         outline: store.btn_a.clicked |> WHILE {
-                            True => [color: Oklch[lightness: 0.55, chroma: 0.25, hue: 25]]
+                            True => [thickness: 2, color: Oklch[lightness: 0.6, chroma: 0.25, hue: 25]]
                             False => NoOutline
                         }
                     ]
@@ -65,7 +65,7 @@ document: Document/new(root: Element/stripe(
                         }]
                         font: [color: White]
                         outline: store.btn_b.clicked |> WHILE {
-                            True => [color: Oklch[lightness: 0.55, chroma: 0.25, hue: 25]]
+                            True => [thickness: 2, color: Oklch[lightness: 0.6, chroma: 0.25, hue: 25]]
                             False => NoOutline
                         }
                     ]
@@ -83,7 +83,7 @@ document: Document/new(root: Element/stripe(
                         }]
                         font: [color: White]
                         outline: store.btn_c.clicked |> WHILE {
-                            True => [color: Oklch[lightness: 0.55, chroma: 0.25, hue: 25]]
+                            True => [thickness: 2, color: Oklch[lightness: 0.6, chroma: 0.25, hue: 25]]
                             False => NoOutline
                         }
                     ]

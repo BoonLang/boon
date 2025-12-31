@@ -88,13 +88,13 @@ document: Document/new(root: Element/stripe(
             items: LIST {
                 Element/button(
                     element: [event: [press: LINK]]
-                    style: [padding: 10, background: [color: Oklch[lightness: 0.9]]]
+                    style: [padding: 10, background: [color: Oklch[lightness: 0.3]], font: [color: White]]
                     label: TEXT { All }
                 ) |> LINK { store.filter_buttons.all }
 
                 Element/button(
                     element: [event: [press: LINK]]
-                    style: [padding: 10, background: [color: Oklch[lightness: 0.9]]]
+                    style: [padding: 10, background: [color: Oklch[lightness: 0.3]], font: [color: White]]
                     label: TEXT { Active }
                 ) |> LINK { store.filter_buttons.active }
             }

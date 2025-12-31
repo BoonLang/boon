@@ -117,7 +117,7 @@ document: Document/new(root: Element/stripe(
             items: LIST {
                 Element/button(
                     element: [event: [press: LINK]]
-                    style: [padding: 10, background: [color: Oklch[lightness: 0.85]]]
+                    style: [padding: 10, background: [color: Oklch[lightness: 0.3]], font: [color: White]]
                     label: TEXT { Add Item }
                 ) |> LINK { store.elements.add_button }
 
@@ -125,7 +125,7 @@ document: Document/new(root: Element/stripe(
                     True => NoElement
                     False => Element/button(
                         element: [event: [press: LINK]]
-                        style: [padding: 10, background: [color: Oklch[lightness: 0.9, chroma: 0.05, hue: 25]]]
+                        style: [padding: 10, background: [color: Oklch[lightness: 0.35, chroma: 0.1, hue: 25]], font: [color: White]]
                         label: TEXT { Clear completed }
                     ) |> LINK { store.elements.clear_completed_button }
                 }

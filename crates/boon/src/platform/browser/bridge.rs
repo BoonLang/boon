@@ -1643,14 +1643,14 @@ fn element_button(
                 }
                 Value::Object(obj, _) => {
                     stream::once(async move {
-                        // Parse thickness (default: 3)
+                        // Parse thickness (default: 1)
                         let thickness = if let Some(thickness_var) = obj.variable("thickness") {
                             match thickness_var.value_actor().value().await {
                                 Ok(Value::Number(n, _)) => n.number() as u32,
-                                _ => 3,
+                                _ => 1,
                             }
                         } else {
-                            3
+                            1
                         };
 
                         // Parse line_style: solid (default), dashed, dotted

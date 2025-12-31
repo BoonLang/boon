@@ -38,7 +38,7 @@ document: Document/new(root: Element/stripe(
 
         Element/button(
             element: [event: [press: LINK]]
-            style: [padding: 10]
+            style: [padding: 10, background: [color: Oklch[lightness: 0.3]], font: [color: White]]
             label: TEXT { Toggle View }
         ) |> LINK { store.view_toggle }
 
@@ -53,7 +53,7 @@ document: Document/new(root: Element/stripe(
                     Element/label(element: [], style: [font: [size: 18]], label: TEXT { Item A clicks: {store.item_a.click_count} })
                     Element/button(
                         element: [event: [press: LINK]]
-                        style: [padding: [row: 20, column: 15], background: [color: Oklch[lightness: 0.8, chroma: 0.1, hue: 120]]]
+                        style: [padding: [row: 20, column: 15], background: [color: Oklch[lightness: 0.35, chroma: 0.1, hue: 120]], font: [color: White]]
                         label: TEXT { Click Item A }
                     ) |> LINK { store.item_a.item_elements.button }
                 }
@@ -68,7 +68,7 @@ document: Document/new(root: Element/stripe(
                     Element/label(element: [], style: [font: [size: 18]], label: TEXT { Item B clicks: {store.item_b.click_count} })
                     Element/button(
                         element: [event: [press: LINK]]
-                        style: [padding: [row: 20, column: 15], background: [color: Oklch[lightness: 0.8, chroma: 0.1, hue: 240]]]
+                        style: [padding: [row: 20, column: 15], background: [color: Oklch[lightness: 0.35, chroma: 0.1, hue: 240]], font: [color: White]]
                         label: TEXT { Click Item B }
                     ) |> LINK { store.item_b.item_elements.button }
                 }

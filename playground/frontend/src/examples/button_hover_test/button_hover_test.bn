@@ -43,8 +43,8 @@ FUNCTION simple_button(name) {
             font: [color: White]
             outline: element.hovered |> WHILE {
                 True => [
-                    side: Inner
-                    color: Oklch[lightness: 0.3, chroma: 0.15, hue: 250]
+                    thickness: 2
+                    color: Oklch[lightness: 0.6, chroma: 0.2, hue: 250]
                 ]
                 False => NoOutline
             }
