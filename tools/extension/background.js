@@ -736,10 +736,34 @@ async function handleCommand(id, command) {
 
       case 'type':
         // Use CDP: focus element, then type
+        // After typing, dispatch input/change events to trigger Zoon callbacks
         try {
           await cdpFocusElement(tab.id, command.selector);
           await cdpKeyboardShortcut(tab.id, 'a', true); // Ctrl+A to select all
           await cdpTypeText(tab.id, command.text);
+          // CDP Input.insertText doesn't reliably trigger DOM events
+          // Dispatch input and change events to ensure Zoon's on_change fires
+          const dispatchScript = `
+            (function() {
+              const el = document.querySelector('${command.selector}');
+              if (el) {
+                console.log('[boon-tools] Input value after CDP type:', el.value);
+                // Create InputEvent (not just Event) for better compatibility
+                el.dispatchEvent(new InputEvent('input', {
+                  bubbles: true,
+                  inputType: 'insertText',
+                  data: el.value
+                }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                console.log('[boon-tools] Dispatched input/change events');
+              } else {
+                console.log('[boon-tools] Element not found:', '${command.selector}');
+              }
+            })();
+          `;
+          await chrome.debugger.sendCommand({ tabId: tab.id }, 'Runtime.evaluate', {
+            expression: dispatchScript
+          });
           return { type: 'success', data: null };
         } catch (e) {
           return { type: 'error', message: e.message };
@@ -1638,8 +1662,23 @@ async function handleCommand(id, command) {
 
       case 'typeText':
         // Type text into the currently focused element using CDP
+        // After typing, dispatch input/change events to trigger Zoon callbacks
         try {
           await cdpTypeText(tab.id, command.text);
+          // CDP Input.insertText doesn't reliably trigger DOM events
+          // Dispatch input and change events on the focused element
+          const dispatchScript = `
+            (function() {
+              const el = document.activeElement;
+              if (el && el.tagName === 'INPUT') {
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+            })();
+          `;
+          await chrome.debugger.sendCommand({ tabId: tab.id }, 'Runtime.evaluate', {
+            expression: dispatchScript
+          });
           return { type: 'success', data: { text: command.text } };
         } catch (e) {
           return { type: 'error', message: `Type text failed: ${e.message}` };
@@ -2065,6 +2104,63 @@ async function handleCommand(id, command) {
           return { type: 'checkboxState', found: result.found, checked: result.checked };
         } catch (e) {
           return { type: 'error', message: `Get checkbox state failed: ${e.message}` };
+        }
+
+      case 'assertButtonHasOutline':
+        // Check if a button with the given text has a visible outline
+        try {
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { found: false, hasOutline: false, error: 'Preview panel not found' };
+
+              const buttonText = ${JSON.stringify(command.text)};
+
+              // Find buttons (button tags and role="button" elements)
+              const allButtons = Array.from(preview.querySelectorAll('button, [role="button"]'));
+
+              // Find button with matching text
+              const button = allButtons.find(btn => {
+                const text = btn.textContent.trim();
+                return text === buttonText;
+              });
+
+              if (!button) {
+                return { found: false, hasOutline: false, error: 'Button with text "' + buttonText + '" not found' };
+              }
+
+              // Check if button has a visible outline
+              const style = window.getComputedStyle(button);
+              const outline = style.outline;
+              const outlineWidth = style.outlineWidth;
+              const outlineStyle = style.outlineStyle;
+
+              // Outline is visible if:
+              // 1. outlineStyle is not 'none'
+              // 2. outlineWidth is not '0px' or '0'
+              const hasOutline = outlineStyle !== 'none' &&
+                                 outlineWidth !== '0px' &&
+                                 outlineWidth !== '0';
+
+              return {
+                found: true,
+                hasOutline: hasOutline,
+                outline: outline,
+                outlineWidth: outlineWidth,
+                outlineStyle: outlineStyle
+              };
+            })()
+          `);
+
+          if (!result.found) {
+            return { type: 'error', message: result.error || 'Button not found' };
+          }
+          if (!result.hasOutline) {
+            return { type: 'error', message: `Button "${command.text}" does not have a visible outline. Got: outline="${result.outline}", outlineWidth="${result.outlineWidth}", outlineStyle="${result.outlineStyle}"` };
+          }
+          return { type: 'success', data: { outline: result.outline, outlineWidth: result.outlineWidth } };
+        } catch (e) {
+          return { type: 'error', message: `Assert button has outline failed: ${e.message}` };
         }
 
       default:

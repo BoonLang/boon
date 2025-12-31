@@ -148,6 +148,9 @@ pub enum Command {
 
     /// Get checkbox state (checked/unchecked) by index in preview pane (0-indexed)
     GetCheckboxState { index: u32 },
+
+    /// Check if a button has a visible outline (outline CSS property is not "none")
+    AssertButtonHasOutline { text: String },
 }
 
 /// Response from Extension to CLI via Server

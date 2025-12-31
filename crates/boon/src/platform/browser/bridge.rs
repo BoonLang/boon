@@ -1726,12 +1726,21 @@ fn element_text_input(
     construct_context: ConstructContext,
 ) -> impl Element {
     type ChangeEvent = String;
-    type KeyDownEvent = String;
+    // KeyDownEvent includes (key_name, current_text) to avoid data race.
+    // The race occurs because on_change and on_key_down fire to separate channels,
+    // and select! may process key_down before the final change event.
+    // Including text in key_down ensures Boon code can reliably access the text
+    // at the moment Enter was pressed.
+    type KeyDownEvent = (String, String);
     type BlurEvent = ();
 
     let (change_event_sender, mut change_event_receiver) = NamedChannel::new("text_input.change", 16);
-    let (key_down_event_sender, mut key_down_event_receiver) = NamedChannel::<String>::new("text_input.key_down", 32);
+    let (key_down_event_sender, mut key_down_event_receiver) = NamedChannel::<KeyDownEvent>::new("text_input.key_down", 32);
     let (blur_event_sender, mut blur_event_receiver) = NamedChannel::new("text_input.blur", 8);
+
+    // Shared text storage for synchronous capture in key_down handler.
+    // This is UI code (not engine code), so Rc<RefCell> is safe here.
+    let current_text = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -1773,7 +1782,7 @@ fn element_text_input(
             let mut key_down_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut blur_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut pending_change_events: Vec<String> = Vec::new();
-            let mut pending_key_down_events: Vec<String> = Vec::new();
+            let mut pending_key_down_events: Vec<(String, String)> = Vec::new();
 
             loop {
                 select! {
@@ -1815,29 +1824,49 @@ fn element_text_input(
                             key_down_link_value_sender = Some(sender.clone());
 
                             // Flush any pending key_down events
-                            for key in pending_key_down_events.drain(..) {
+                            for (key, text) in pending_key_down_events.drain(..) {
                                 let event_value = Object::new_value(
                                     ConstructInfo::new("text_input::key_down_event", None, "TextInput key_down event"),
                                     construct_context.clone(),
                                     ValueIdempotencyKey::new(),
-                                    [Variable::new_arc(
-                                        ConstructInfo::new("text_input::key_down_event::key", None, "key_down key"),
-                                        construct_context.clone(),
-                                        "key",
-                                        ValueActor::new_arc(
-                                            ConstructInfo::new("text_input::key_down_event::key_actor", None, "key_down key actor"),
-                                            ActorContext::default(),
-                                            TypedStream::infinite(stream::once(future::ready(EngineTag::new_value(
-                                                ConstructInfo::new("text_input::key_down_event::key_value", None, "key_down key value"),
-                                                construct_context.clone(),
-                                                ValueIdempotencyKey::new(),
-                                                key.clone(),
-                                            ))).chain(stream::pending())),
-                                            parser::PersistenceId::new(),
+                                    [
+                                        Variable::new_arc(
+                                            ConstructInfo::new("text_input::key_down_event::key", None, "key_down key"),
+                                            construct_context.clone(),
+                                            "key",
+                                            ValueActor::new_arc(
+                                                ConstructInfo::new("text_input::key_down_event::key_actor", None, "key_down key actor"),
+                                                ActorContext::default(),
+                                                TypedStream::infinite(stream::once(future::ready(EngineTag::new_value(
+                                                    ConstructInfo::new("text_input::key_down_event::key_value", None, "key_down key value"),
+                                                    construct_context.clone(),
+                                                    ValueIdempotencyKey::new(),
+                                                    key.clone(),
+                                                ))).chain(stream::pending())),
+                                                parser::PersistenceId::new(),
+                                            ),
+                                            parser::PersistenceId::default(),
+                                            parser::Scope::Root,
                                         ),
-                                        parser::PersistenceId::default(),
-                                        parser::Scope::Root,
-                                    )],
+                                        Variable::new_arc(
+                                            ConstructInfo::new("text_input::key_down_event::text", None, "key_down text"),
+                                            construct_context.clone(),
+                                            "text",
+                                            ValueActor::new_arc(
+                                                ConstructInfo::new("text_input::key_down_event::text_actor", None, "key_down text actor"),
+                                                ActorContext::default(),
+                                                TypedStream::infinite(stream::once(future::ready(EngineText::new_value(
+                                                    ConstructInfo::new("text_input::key_down_event::text_value", None, "key_down text value"),
+                                                    construct_context.clone(),
+                                                    ValueIdempotencyKey::new(),
+                                                    text,
+                                                ))).chain(stream::pending())),
+                                                parser::PersistenceId::new(),
+                                            ),
+                                            parser::PersistenceId::default(),
+                                            parser::Scope::Root,
+                                        ),
+                                    ],
                                 );
                                 sender.send_or_drop(event_value);
                             }
@@ -1879,35 +1908,54 @@ fn element_text_input(
                             pending_change_events.push(text);
                         }
                     }
-                    key = key_down_event_receiver.select_next_some() => {
+                    (key, text) = key_down_event_receiver.select_next_some() => {
                         if let Some(sender) = key_down_link_value_sender.as_ref() {
                             let event_value = Object::new_value(
                                 ConstructInfo::new("text_input::key_down_event", None, "TextInput key_down event"),
                                 construct_context.clone(),
                                 ValueIdempotencyKey::new(),
-                                [Variable::new_arc(
-                                    ConstructInfo::new("text_input::key_down_event::key", None, "key_down key"),
-                                    construct_context.clone(),
-                                    "key",
-                                    ValueActor::new_arc(
-                                        ConstructInfo::new("text_input::key_down_event::key_actor", None, "key_down key actor"),
-                                        ActorContext::default(),
-                                        // Already infinite via chain(pending())
-                                        TypedStream::infinite(stream::once(future::ready(EngineTag::new_value(
-                                            ConstructInfo::new("text_input::key_down_event::key_value", None, "key_down key value"),
-                                            construct_context.clone(),
-                                            ValueIdempotencyKey::new(),
-                                            key.clone(),
-                                        ))).chain(stream::pending())),
-                                        parser::PersistenceId::new(),
+                                [
+                                    Variable::new_arc(
+                                        ConstructInfo::new("text_input::key_down_event::key", None, "key_down key"),
+                                        construct_context.clone(),
+                                        "key",
+                                        ValueActor::new_arc(
+                                            ConstructInfo::new("text_input::key_down_event::key_actor", None, "key_down key actor"),
+                                            ActorContext::default(),
+                                            TypedStream::infinite(stream::once(future::ready(EngineTag::new_value(
+                                                ConstructInfo::new("text_input::key_down_event::key_value", None, "key_down key value"),
+                                                construct_context.clone(),
+                                                ValueIdempotencyKey::new(),
+                                                key.clone(),
+                                            ))).chain(stream::pending())),
+                                            parser::PersistenceId::new(),
+                                        ),
+                                        parser::PersistenceId::default(),
+                                        parser::Scope::Root,
                                     ),
-                                    parser::PersistenceId::default(),
-                                    parser::Scope::Root,
-                                )],
+                                    Variable::new_arc(
+                                        ConstructInfo::new("text_input::key_down_event::text", None, "key_down text"),
+                                        construct_context.clone(),
+                                        "text",
+                                        ValueActor::new_arc(
+                                            ConstructInfo::new("text_input::key_down_event::text_actor", None, "key_down text actor"),
+                                            ActorContext::default(),
+                                            TypedStream::infinite(stream::once(future::ready(EngineText::new_value(
+                                                ConstructInfo::new("text_input::key_down_event::text_value", None, "key_down text value"),
+                                                construct_context.clone(),
+                                                ValueIdempotencyKey::new(),
+                                                text.clone(),
+                                            ))).chain(stream::pending())),
+                                            parser::PersistenceId::new(),
+                                        ),
+                                        parser::PersistenceId::default(),
+                                        parser::Scope::Root,
+                                    ),
+                                ],
                             );
                             sender.send_or_drop(event_value);
                         } else {
-                            pending_key_down_events.push(key);
+                            pending_key_down_events.push((key, text));
                         }
                     }
                     _blur = blur_event_receiver.select_next_some() => {
@@ -2118,19 +2166,36 @@ fn element_text_input(
         .placeholder(Placeholder::with_signal(placeholder_signal.map(|t| t.unwrap_or_default())))
         .on_change({
             let sender = change_event_sender.clone();
+            let current_text = current_text.clone();
             move |text| {
+                // Update shared text synchronously BEFORE sending to channel.
+                // This ensures on_key_down_event always sees the latest text.
+                *current_text.borrow_mut() = text.clone();
                 sender.send_or_drop(text.clone());
             }
         })
         .on_key_down_event({
             let sender = key_down_event_sender.clone();
+            let current_text = current_text.clone();
             move |event| {
                 let key_name = match event.key() {
                     Key::Enter => "Enter".to_string(),
                     Key::Escape => "Escape".to_string(),
                     Key::Other(k) => k.clone(),
                 };
-                sender.send_or_drop(key_name);
+                // Try to read text from focused element (handles CDP typing case).
+                // Fall back to cached current_text for normal user input.
+                let text = {
+                    use wasm_bindgen::JsCast;
+                    web_sys::window()
+                        .and_then(|w| w.document())
+                        .and_then(|d| d.active_element())
+                        .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
+                        .map(|el| el.value())
+                        .unwrap_or_else(|| current_text.borrow().clone())
+                };
+                zoon::println!("[BRIDGE] on_key_down_event: key={}, text={}", key_name, text);
+                sender.send_or_drop((key_name, text));
             }
         })
         .on_blur({

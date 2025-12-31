@@ -605,9 +605,11 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
     let code = std::fs::read_to_string(&example.bn_path)
         .with_context(|| format!("Failed to read {}", example.bn_path.display()))?;
 
-    // Clear states before test
+    // Clear states and refresh page before each test to ensure clean slate
     let _ = send_command_to_server(opts.port, WsCommand::ClearStates).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = send_command_to_server(opts.port, WsCommand::Refresh).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Inject code with filename for persistence
     let filename = format!("{}.bn", example.name);
@@ -1059,9 +1061,31 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         ParsedAction::TypeText { text } => {
-            let response = send_command_to_server(port, WsCommand::TypeText { text: text.clone() }).await?;
-            if let WsResponse::Error { message } = response {
-                anyhow::bail!("Type text failed: {}", message);
+            // Check if there's already a focused input (e.g., in edit mode after dblclick)
+            let focused_response = send_command_to_server(port, WsCommand::GetFocusedElement).await?;
+            let input_already_focused = match focused_response {
+                WsResponse::FocusedElement { tag_name, .. } => {
+                    tag_name.as_deref() == Some("INPUT")
+                }
+                _ => false,
+            };
+
+            if input_already_focused {
+                // Already in edit mode or input is focused, just type directly
+                let response = send_command_to_server(port, WsCommand::TypeText { text: text.clone() }).await?;
+                if let WsResponse::Error { message } = response {
+                    anyhow::bail!("Type text failed: {}", message);
+                }
+            } else {
+                // Use the Type command with selector which is more reliable
+                // It focuses the element via CDP and selects all text before typing
+                let response = send_command_to_server(port, WsCommand::Type {
+                    selector: "input".to_string(),
+                    text: text.clone()
+                }).await?;
+                if let WsResponse::Error { message } = response {
+                    anyhow::bail!("Type into input failed: {}", message);
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1287,6 +1311,17 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                     anyhow::bail!("Assert checkbox unchecked failed: {}", message);
                 }
                 _ => anyhow::bail!("Unexpected response for GetCheckboxState"),
+            }
+        }
+        ParsedAction::AssertButtonHasOutline { text } => {
+            // Verify that a button with the given text has a visible outline
+            let response = send_command_to_server(port, WsCommand::AssertButtonHasOutline { text: text.clone() }).await?;
+            match response {
+                WsResponse::Success { .. } => {}
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert button has outline failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for AssertButtonHasOutline"),
             }
         }
     }

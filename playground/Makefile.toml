@@ -27,6 +27,12 @@ args = ["${@}"]
 # command = "cargo"
 # args = ["run", "--manifest-path", "../../MoonZoon/crates/mzoon/Cargo.toml", "${@}"]
 
+[tasks.verify-playground]
+description = "Run all playground example tests using boon-tools"
+script = '''
+cd ../tools && ../target/release/boon-tools exec test-examples
+'''
+
 [tasks.kill]
 description = "Stop all MoonZoon development processes (mzoon, makers)"
 script = '''

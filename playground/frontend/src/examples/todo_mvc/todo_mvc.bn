@@ -24,18 +24,18 @@ store: [
         __ => All
     }
     title_to_add:
-        elements.new_todo_title_text_input.event.key_down.key
+        -- key_down event now contains both .key and .text fields.
+        -- Matching full pattern [key: Enter, text: t] to capture text directly.
+        elements.new_todo_title_text_input.event.key_down
         |> WHEN {
-            Enter => BLOCK {
-                trimmed:
-                    elements.new_todo_title_text_input.text
-                    |> Text/trim()
-            trimmed
-                |> Text/is_not_empty()
-                |> WHEN { True => trimmed, False => SKIP }
+            [key: Enter, text: t] => BLOCK {
+                trimmed: t |> Text/trim()
+                trimmed
+                    |> Text/is_not_empty()
+                    |> WHEN { True => trimmed, False => SKIP }
+            }
+            __ => SKIP
         }
-        __ => SKIP
-    }
     todos:
         LIST {
             new_todo(title: TEXT { Buy groceries })
@@ -73,6 +73,7 @@ FUNCTION new_todo(title) {
         ]
         title: title |> HOLD state { BLOCK {
             edit_el: todo_elements.editing_todo_title_element
+            -- confirm_title uses edit_el.text for blur events (text is stable by then)
             confirm_title: edit_el.text
                 |> Text/trim()
                 |> WHEN {
@@ -81,8 +82,17 @@ FUNCTION new_todo(title) {
                         |> WHEN { True => t, False => SKIP }
                 }
             LATEST {
-                edit_el.event.key_down.key |> WHEN {
-                    Enter => confirm_title
+                -- For Enter, use key_down.text to avoid data race.
+                -- Use destructuring pattern [key: Enter, text: t] to capture text directly,
+                -- same pattern that works for new_todo_title_text_input.
+                edit_el.event.key_down |> WHEN {
+                    [key: Enter, text: t] => t
+                        |> Text/trim()
+                        |> WHEN {
+                            trimmed => trimmed
+                                |> Text/is_not_empty()
+                                |> WHEN { True => trimmed, False => SKIP }
+                        }
                     __ => SKIP
                 }
                 edit_el.event.blur |> THEN { confirm_title }
@@ -93,9 +103,9 @@ FUNCTION new_todo(title) {
             LATEST {
                 todo_elements.todo_title_element.event.double_click
                     |> THEN { True }
-                edit_el.event.key_down.key |> WHEN {
-                    Enter => False
-                    Escape => False
+                edit_el.event.key_down |> WHEN {
+                    [key: Enter] => False
+                    [key: Escape] => False
                     __ => SKIP
                 }
                 edit_el.event.blur |> THEN { False }
@@ -554,26 +564,29 @@ FUNCTION filter_button(filter) {
         style: [
             padding: [row: 8, column: 4]
             rounded_corners: 3
-            outline: BLOCK {
-                selected: PASSED.store.selected_filter == filter
-                alpha: LIST { selected, element.hovered } |> WHEN {
-                    LIST { True, __ } => 0.2
-                    LIST { False, True } => 0.1
-                    LIST { False, False } => 0
-                }
-                selected |> Bool/or(that: element.hovered) |> WHILE {
+            -- Workaround for BLOCK reactive chain bug:
+            -- Inline the selected_filter comparison directly to avoid
+            -- stale BLOCK local variables. When selected_filter changes,
+            -- the WHILE will re-evaluate both its condition and body.
+            outline:
+                PASSED.store.selected_filter == filter
+                |> Bool/or(that: element.hovered)
+                |> WHILE {
                     True => [
                         side: Inner
                         color: Oklch[
                             lightness: 0.5
                             chroma: 0.165
                             hue: 25.36
-                            alpha: alpha
+                            -- Compute alpha inline: 0.2 if selected, 0.1 if only hovered
+                            alpha: PASSED.store.selected_filter == filter |> WHEN {
+                                True => 0.2
+                                False => 0.1
+                            }
                         ]
                     ]
                     False => NoOutline
                 }
-            }
         ]
         label: filter |> WHEN {
             All => TEXT { All }

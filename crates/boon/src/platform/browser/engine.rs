@@ -26,6 +26,52 @@ use zoon::{Task, TaskHandle};
 use zoon::{WebStorage, local_storage};
 use zoon::futures_util::SinkExt;
 
+use std::cell::Cell;
+
+// --- Lamport Clock ---
+//
+// Provides happened-before ordering for values without global state.
+// Used to filter "stale" events that existed before a subscription was created.
+//
+// Algorithm:
+// 1. Each execution context maintains a local counter
+// 2. On value creation: increment counter, stamp value with current time
+// 3. On value receive: local = max(local, received) + 1
+//
+// This ensures that if event A causes event B, then timestamp(A) < timestamp(B).
+
+thread_local! {
+    /// Thread-local Lamport clock for the current execution context.
+    /// In browser WASM, there's only one thread so this acts as a global clock.
+    /// If Boon moves to WebWorkers, each worker gets its own clock that syncs
+    /// on message passing - exactly how Lamport clocks are designed to work.
+    static LOCAL_CLOCK: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Advance local clock and return new timestamp (for value creation).
+pub fn lamport_tick() -> u64 {
+    LOCAL_CLOCK.with(|c| {
+        let new_time = c.get() + 1;
+        c.set(new_time);
+        new_time
+    })
+}
+
+/// Update local clock on receiving a value (Lamport receive rule).
+/// local = max(local, received) + 1
+pub fn lamport_receive(received_time: u64) -> u64 {
+    LOCAL_CLOCK.with(|c| {
+        let new_time = c.get().max(received_time) + 1;
+        c.set(new_time);
+        new_time
+    })
+}
+
+/// Get current local clock value (for recording subscription time).
+pub fn lamport_now() -> u64 {
+    LOCAL_CLOCK.with(|c| c.get())
+}
+
 // --- List Item Origin Tracking ---
 //
 // Each list item carries its own origin info (no global registry).
@@ -1753,6 +1799,18 @@ pub struct ActorContext {
     /// Incremented for each recorded call to ensure unique, sequential IDs.
     /// Used together with list_append_storage_key for ListItemOrigin.
     pub recording_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Lamport timestamp at which this context was created.
+    ///
+    /// Used by THEN/WHEN to filter "stale" values that existed before subscription.
+    /// When set, values with `lamport_time <= subscription_time` are filtered out
+    /// in VariableOrArgumentReference, preventing replay of old events.
+    ///
+    /// - `None` = no filtering (streaming context, accept all values)
+    /// - `Some(time)` = filter values with `lamport_time <= time`
+    ///
+    /// This implements "glitch freedom" from FRP theory: ensuring that a late
+    /// subscriber doesn't receive events that happened before it subscribed.
+    pub subscription_time: Option<u64>,
 }
 
 impl ActorContext {
@@ -2235,6 +2293,7 @@ impl VariableOrArgumentReference {
         let construct_info = construct_info.complete(ConstructType::VariableOrArgumentReference);
         // Capture context flags before closures
         let use_snapshot = actor_context.is_snapshot_context;
+        let subscription_time = actor_context.subscription_time;
         let mut skip_alias_parts = 0;
         let alias_parts = match alias {
             static_expression::Alias::WithoutPassed {
@@ -2288,14 +2347,6 @@ impl VariableOrArgumentReference {
                     Value::Object(object, _) => {
                         let variable = object.expect_variable(&alias_part);
                         let variable_actor = variable.value_actor();
-                        // Check if this is an EVENT LINK (click, press, key_down, etc.)
-                        // Event LINKs should use stream_from_now() to avoid replaying old events.
-                        // Element binding LINKs should use stream() to get the current value.
-                        let is_link = variable.link_value_sender().is_some();
-                        let is_event_link = is_link && matches!(
-                            alias_part.as_str(),
-                            "click" | "press" | "key_down" | "change" | "blur" | "double_click" | "hovered"
-                        );
                         // Use value() or stream() based on context - type-safe subscription
                         if use_snapshot {
                             // Snapshot: get current value once
@@ -2309,27 +2360,42 @@ impl VariableOrArgumentReference {
                             .boxed_local()
                         } else {
                             // Streaming: continuous updates
-                            // For EVENT LINKs, use stream_from_now() to avoid replaying historical
-                            // events. This prevents bugs like old toggle_all clicks being replayed
-                            // when a new todo is created. For other LINKs (element bindings),
-                            // use stream() to get the current value.
+                            // Always use stream() - stale events are filtered by Lamport timestamps.
+                            // This replaces the old hardcoded is_event_link pattern.
                             stream::unfold(
-                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), object, variable, is_event_link),
-                                move |(subscription_opt, actor_opt, object, variable, is_event_link)| {
+                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), object, variable, subscription_time),
+                                move |(subscription_opt, actor_opt, object, variable, sub_time)| {
                                     async move {
                                         let mut subscription = match subscription_opt {
                                             Some(s) => s,
                                             None => {
                                                 let actor = actor_opt.unwrap();
-                                                if is_event_link {
-                                                    actor.stream_from_now()
-                                                } else {
-                                                    actor.stream()
-                                                }
+                                                actor.stream()
                                             }
                                         };
-                                        let value = subscription.next().await;
-                                        value.map(|value| (value, (Some(subscription), None, object, variable, is_event_link)))
+                                        // Poll until we get a non-stale value (or stream ends)
+                                        loop {
+                                            match subscription.next().await {
+                                                Some(value) => {
+                                                    // Apply Lamport receive rule
+                                                    lamport_receive(value.lamport_time());
+
+                                                    // Filter stale values based on subscription_time
+                                                    if let Some(time) = sub_time {
+                                                        if value.happened_before(time) {
+                                                            // Skip stale value, keep polling
+                                                            continue;
+                                                        }
+                                                    }
+                                                    // Fresh value - emit it
+                                                    return Some((value, (Some(subscription), None, object, variable, sub_time)));
+                                                }
+                                                None => {
+                                                    // Stream ended
+                                                    return None;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             ).boxed_local()
@@ -2338,14 +2404,6 @@ impl VariableOrArgumentReference {
                     Value::TaggedObject(tagged_object, _) => {
                         let variable = tagged_object.expect_variable(&alias_part);
                         let variable_actor = variable.value_actor();
-                        // Check if this is an EVENT LINK (click, press, key_down, etc.)
-                        // Event LINKs should use stream_from_now() to avoid replaying old events.
-                        // Element binding LINKs should use stream() to get the current value.
-                        let is_link = variable.link_value_sender().is_some();
-                        let is_event_link = is_link && matches!(
-                            alias_part.as_str(),
-                            "click" | "press" | "key_down" | "change" | "blur" | "double_click" | "hovered"
-                        );
                         // Use value() or stream() based on context - type-safe subscription
                         if use_snapshot {
                             // Snapshot: get current value once
@@ -2359,25 +2417,42 @@ impl VariableOrArgumentReference {
                             .boxed_local()
                         } else {
                             // Streaming: continuous updates
-                            // For EVENT LINKs, use stream_from_now() to avoid replaying historical
-                            // events. For other LINKs (element bindings), use stream() to get the current value.
+                            // Always use stream() - stale events are filtered by Lamport timestamps.
+                            // This replaces the old hardcoded is_event_link pattern.
                             stream::unfold(
-                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), tagged_object, variable, is_event_link),
-                                move |(subscription_opt, actor_opt, tagged_object, variable, is_event_link)| {
+                                (None::<LocalBoxStream<'static, Value>>, Some(variable_actor), tagged_object, variable, subscription_time),
+                                move |(subscription_opt, actor_opt, tagged_object, variable, sub_time)| {
                                     async move {
                                         let mut subscription = match subscription_opt {
                                             Some(s) => s,
                                             None => {
                                                 let actor = actor_opt.unwrap();
-                                                if is_event_link {
-                                                    actor.stream_from_now()
-                                                } else {
-                                                    actor.stream()
-                                                }
+                                                actor.stream()
                                             }
                                         };
-                                        let value = subscription.next().await;
-                                        value.map(|value| (value, (Some(subscription), None, tagged_object, variable, is_event_link)))
+                                        // Poll until we get a non-stale value (or stream ends)
+                                        loop {
+                                            match subscription.next().await {
+                                                Some(value) => {
+                                                    // Apply Lamport receive rule
+                                                    lamport_receive(value.lamport_time());
+
+                                                    // Filter stale values based on subscription_time
+                                                    if let Some(time) = sub_time {
+                                                        if value.happened_before(time) {
+                                                            // Skip stale value, keep polling
+                                                            continue;
+                                                        }
+                                                    }
+                                                    // Fresh value - emit it
+                                                    return Some((value, (Some(subscription), None, tagged_object, variable, sub_time)));
+                                                }
+                                                None => {
+                                                    // Stream ended
+                                                    return None;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             ).boxed_local()
@@ -4538,6 +4613,19 @@ pub type ValueIdempotencyKey = parser::PersistenceId;
 #[derive(Clone, Copy)]
 pub struct ValueMetadata {
     pub idempotency_key: ValueIdempotencyKey,
+    /// Lamport timestamp when this value was created.
+    /// Used for happened-before ordering to filter stale events.
+    pub lamport_time: u64,
+}
+
+impl ValueMetadata {
+    /// Create new metadata with a fresh Lamport timestamp.
+    pub fn new(idempotency_key: ValueIdempotencyKey) -> Self {
+        Self {
+            idempotency_key,
+            lamport_time: lamport_tick(),
+        }
+    }
 }
 
 // --- Value ---
@@ -4592,6 +4680,21 @@ impl Value {
         }
     }
 
+    /// Get the Lamport timestamp of when this value was created.
+    pub fn lamport_time(&self) -> u64 {
+        self.metadata().lamport_time
+    }
+
+    /// Returns true if this value happened-before the given timestamp.
+    /// Such values are considered "stale" and should be filtered by late subscribers.
+    ///
+    /// The happened-before relation uses Lamport clock semantics:
+    /// if value.lamport_time <= subscription_time, the value existed before
+    /// the subscription was created and should not be replayed.
+    pub fn happened_before(&self, timestamp: u64) -> bool {
+        self.lamport_time() <= timestamp
+    }
+
     /// Check if this value is a FLUSHED wrapper
     pub fn is_flushed(&self) -> bool {
         matches!(self, Self::Flushed(_, _))
@@ -4608,9 +4711,7 @@ impl Value {
 
     /// Create a FLUSHED wrapper around this value
     pub fn into_flushed(self) -> Value {
-        let metadata = ValueMetadata {
-            idempotency_key: parser::PersistenceId::new(),
-        };
+        let metadata = ValueMetadata::new(parser::PersistenceId::new());
         Value::Flushed(Box::new(self), metadata)
     }
 
@@ -5116,7 +5217,7 @@ impl Object {
     ) -> Value {
         Value::Object(
             Self::new_arc(construct_info, construct_context, variables),
-            ValueMetadata { idempotency_key },
+            ValueMetadata::new(idempotency_key),
         )
     }
 
@@ -5250,7 +5351,7 @@ impl TaggedObject {
     ) -> Value {
         Value::TaggedObject(
             Self::new_arc(construct_info, construct_context, tag, variables),
-            ValueMetadata { idempotency_key },
+            ValueMetadata::new(idempotency_key),
         )
     }
 
@@ -5387,7 +5488,7 @@ impl Text {
     ) -> Value {
         Value::Text(
             Self::new_arc(construct_info, construct_context, text),
-            ValueMetadata { idempotency_key },
+            ValueMetadata::new(idempotency_key),
         )
     }
 
@@ -5428,7 +5529,7 @@ impl Text {
         // Create the initial value directly (avoid cloning ConstructInfo)
         let initial_value = Value::Text(
             Self::new_arc(construct_info, construct_context, text.clone()),
-            ValueMetadata { idempotency_key },
+            ValueMetadata::new(idempotency_key),
         );
         // Use pending() stream - initial value is already set, no need for stream to emit
         // Using constant() here would cause duplicate emissions (version 1 from initial,
@@ -5492,7 +5593,7 @@ impl Tag {
     ) -> Value {
         Value::Tag(
             Self::new_arc(construct_info, construct_context, tag),
-            ValueMetadata { idempotency_key },
+            ValueMetadata::new(idempotency_key),
         )
     }
 
@@ -5533,7 +5634,7 @@ impl Tag {
         // Create the initial value directly (avoid cloning ConstructInfo)
         let initial_value = Value::Tag(
             Self::new_arc(construct_info, construct_context, tag.clone()),
-            ValueMetadata { idempotency_key },
+            ValueMetadata::new(idempotency_key),
         );
         // Use pending() stream - initial value is already set, no need for stream to emit
         // Using constant() here would cause duplicate emissions (version 1 from initial,
@@ -5597,7 +5698,7 @@ impl Number {
     ) -> Value {
         Value::Number(
             Self::new_arc(construct_info, construct_context, number),
-            ValueMetadata { idempotency_key },
+            ValueMetadata::new(idempotency_key),
         )
     }
 
@@ -5638,7 +5739,7 @@ impl Number {
         // Create the initial value directly (avoid cloning ConstructInfo)
         let initial_value = Value::Number(
             Self::new_arc(construct_info, construct_context, number),
-            ValueMetadata { idempotency_key },
+            ValueMetadata::new(idempotency_key),
         );
         // Use pending() stream - initial value is already set, no need for stream to emit
         // Using constant() here would cause duplicate emissions (version 1 from initial,
@@ -5964,7 +6065,7 @@ impl List {
     ) -> Value {
         Value::List(
             Self::new_arc(construct_info, construct_context, actor_context, items),
-            ValueMetadata { idempotency_key },
+            ValueMetadata::new(idempotency_key),
         )
     }
 
@@ -6400,7 +6501,7 @@ impl List {
                             }
                         });
 
-                        let value = Value::List(list_arc, ValueMetadata { idempotency_key });
+                        let value = Value::List(list_arc, ValueMetadata::new(idempotency_key));
                         Some((value, InitState::Initialized { persistence_loop }))
                     }
                     InitState::Initialized { persistence_loop } => {
@@ -7084,7 +7185,7 @@ impl ListBindingFunction {
             actor_context,
             constant(Value::List(
                 Arc::new(list),
-                ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+                ValueMetadata::new(ValueIdempotencyKey::new()),
             )),
             parser::PersistenceId::new(),
         ))
@@ -7594,7 +7695,7 @@ impl ListBindingFunction {
             actor_context_for_result,
             constant(Value::List(
                 Arc::new(list),
-                ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+                ValueMetadata::new(ValueIdempotencyKey::new()),
             )),
             parser::PersistenceId::new(),
         ))
@@ -7911,7 +8012,7 @@ impl ListBindingFunction {
             actor_context_for_result,
             constant(Value::List(
                 Arc::new(list),
-                ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+                ValueMetadata::new(ValueIdempotencyKey::new()),
             )),
             parser::PersistenceId::new(),
         ))
@@ -8324,7 +8425,7 @@ impl ListBindingFunction {
             actor_context_for_result,
             constant(Value::List(
                 Arc::new(list),
-                ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+                ValueMetadata::new(ValueIdempotencyKey::new()),
             )),
             parser::PersistenceId::new(),
         ))

@@ -2478,6 +2478,7 @@ fn process_work_item(
                             is_restoring: ctx.actor_context.is_restoring,
                             list_append_storage_key: ctx.actor_context.list_append_storage_key,
                             recording_counter: ctx.actor_context.recording_counter,
+                            subscription_time: ctx.actor_context.subscription_time,
                         },
                         reference_connector: ctx.reference_connector,
                         link_connector: ctx.link_connector,
@@ -2800,6 +2801,9 @@ fn build_then_actor(
                 is_restoring: actor_context_clone.is_restoring,
                 list_append_storage_key: actor_context_clone.list_append_storage_key.clone(),
                 recording_counter: actor_context_clone.recording_counter.clone(),
+                // THEN body uses snapshot semantics for variables - don't filter stale values
+                // The filtering should only happen on the piped stream, not all variable refs
+                subscription_time: None,
             };
 
             let new_ctx = EvaluationContext {
@@ -2870,7 +2874,7 @@ fn build_then_actor(
     };
 
     // =========================================================================
-    // REACTIVE SUBSCRIPTION
+    // REACTIVE SUBSCRIPTION WITH LAMPORT FILTERING
     // =========================================================================
     // Use then + flatten_unordered instead of then + filter_map
     // flatten_unordered processes inner streams concurrently, so even if one stream
@@ -2878,16 +2882,26 @@ fn build_then_actor(
     //
     // NOTE: We use async-only architecture. All values flow through the subscription
     // stream. No synchronous initial processing - let the async runtime handle ordering.
+    //
+    // LAMPORT FILTERING: Record the current Lamport time when this THEN is created.
+    // Any values from the piped stream that happened-before this time are stale
+    // (e.g., old click events) and should not trigger body evaluation.
+    // This fixes the Toggle All bug where new todos receive old toggle events.
+    let subscription_time = lamport_now();
+    let filtered_piped = piped.clone().stream().filter(move |value| {
+        let should_pass = !value.happened_before(subscription_time);
+        future::ready(should_pass)
+    });
 
     let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if backpressure_permit.is_some() || sequential {
         // For sequential mode, use regular flatten (processes one stream at a time)
-        let stream = piped.clone().stream()
+        let stream = filtered_piped
             .then(eval_body)
             .flatten();
         Box::pin(stream)
     } else {
         // For non-sequential mode, use flatten_unordered for concurrent processing
-        let stream = piped.clone().stream()
+        let stream = filtered_piped
             .then(eval_body)
             .flatten_unordered(None);
         Box::pin(stream)
@@ -3039,6 +3053,9 @@ fn build_when_actor(
                         is_restoring: actor_context_clone.is_restoring,
                         list_append_storage_key: actor_context_clone.list_append_storage_key.clone(),
                         recording_counter: actor_context_clone.recording_counter.clone(),
+                        // WHEN body uses snapshot semantics for variables - don't filter stale values
+                        // The filtering should only happen on the piped stream, not all variable refs
+                        subscription_time: None,
                     };
 
                     let new_ctx = EvaluationContext {
@@ -3084,9 +3101,20 @@ fn build_when_actor(
         })
     };
 
+    // =========================================================================
+    // REACTIVE SUBSCRIPTION (NO LAMPORT FILTERING FOR WHEN)
+    // =========================================================================
     // Use then + flatten_unordered instead of then + filter_map
     // flatten_unordered processes inner streams concurrently, so even if one stream
     // never emits (SKIP case), others can still produce values
+    //
+    // NOTE: WHEN does NOT use Lamport filtering because WHEN is typically used
+    // with DATA sources (computed values, state) which should provide their
+    // current value to new subscribers. Unlike THEN which handles EVENTS,
+    // WHEN handles pattern matching on data which needs immediate current values.
+    //
+    // Example: `count |> WHEN { 1 => "1 item", n => "{n} items" }` needs the
+    // current count immediately, not just future changes.
     let flattened_stream: Pin<Box<dyn Stream<Item = Value>>> = if backpressure_permit.is_some() || sequential {
         // For sequential mode, use regular flatten (processes one stream at a time)
         let stream = piped.clone().stream()
@@ -3251,6 +3279,8 @@ fn build_while_actor(
                     is_restoring: actor_context_clone.is_restoring,
                     list_append_storage_key: actor_context_clone.list_append_storage_key.clone(),
                     recording_counter: actor_context_clone.recording_counter.clone(),
+                    // WHILE is streaming context - don't filter stale values, accept all
+                    subscription_time: None,
                 };
 
                 let new_ctx = EvaluationContext {
@@ -3756,6 +3786,8 @@ fn build_hold_actor(
         is_restoring: ctx.actor_context.is_restoring,
         list_append_storage_key: ctx.actor_context.list_append_storage_key.clone(),
         recording_counter: ctx.actor_context.recording_counter.clone(),
+        // Inherit parent's subscription_time - HOLD body is streaming context
+        subscription_time: ctx.actor_context.subscription_time,
     };
 
     // Create new context for body evaluation
@@ -4199,9 +4231,7 @@ fn build_text_literal_actor(
                     construct_context_for_combine.clone(),
                     combined_text,
                 )),
-                ValueMetadata {
-                    idempotency_key: ValueIdempotencyKey::new(),
-                },
+                ValueMetadata::new(ValueIdempotencyKey::new()),
             )
         });
 
@@ -4769,7 +4799,7 @@ fn build_list_append_with_recording(
 
     let result_stream = constant(Value::List(
         Arc::new(list),
-        ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+        ValueMetadata::new(ValueIdempotencyKey::new()),
     ));
 
     let result_actor = ValueActor::new_arc(
@@ -4928,6 +4958,8 @@ fn call_function(
                     is_restoring: ctx_for_closure.actor_context.is_restoring,
                     list_append_storage_key: ctx_for_closure.actor_context.list_append_storage_key.clone(),
                     recording_counter: ctx_for_closure.actor_context.recording_counter.clone(),
+                    // Inherit subscription_time - function bodies should respect caller's filtering
+                    subscription_time: ctx_for_closure.actor_context.subscription_time,
                 };
 
                 let new_ctx = EvaluationContext {
@@ -5010,6 +5042,8 @@ fn call_function(
             is_restoring: ctx.actor_context.is_restoring,
             list_append_storage_key: ctx.actor_context.list_append_storage_key.clone(),
             recording_counter: ctx.actor_context.recording_counter.clone(),
+            // Inherit subscription_time - function bodies should respect caller's filtering
+            subscription_time: ctx.actor_context.subscription_time,
         };
 
         let new_ctx = EvaluationContext {
@@ -5087,6 +5121,8 @@ fn call_function(
                 is_restoring: ctx.actor_context.is_restoring,
                 list_append_storage_key: ctx.actor_context.list_append_storage_key.clone(),
                 recording_counter: ctx.actor_context.recording_counter.clone(),
+                // Inherit subscription_time - builtin function calls should respect caller's filtering
+                subscription_time: ctx.actor_context.subscription_time,
             };
 
             Ok(Some(FunctionCall::new_arc_value_actor(

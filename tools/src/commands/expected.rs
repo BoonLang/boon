@@ -279,6 +279,14 @@ impl Action {
                             .context("assert_checkbox_unchecked requires checkbox index")?;
                         Ok(ParsedAction::AssertCheckboxUnchecked { index: index as u32 })
                     }
+                    "assert_button_has_outline" => {
+                        let text = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .context("assert_button_has_outline requires button text")?
+                            .to_string();
+                        Ok(ParsedAction::AssertButtonHasOutline { text })
+                    }
                     _ => anyhow::bail!("Unknown action type: {}", cmd),
                 }
             }
@@ -310,6 +318,7 @@ pub enum ParsedAction {
     AssertNotContains { text: String },  // Assert preview does NOT contain text
     AssertNotFocused { input_index: u32 },  // Assert input does NOT have focus
     AssertCheckboxUnchecked { index: u32 },  // Assert checkbox is NOT checked
+    AssertButtonHasOutline { text: String },  // Assert button has visible outline
 }
 
 #[derive(Debug, Clone, Deserialize)]

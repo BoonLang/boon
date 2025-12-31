@@ -76,6 +76,11 @@ actions = [["click_text", "Active"]]
 expect = "Clean room"
 
 [[sequence]]
+description = "BUG TEST #C: Verify Active filter button has visible outline (focus indicator)"
+actions = [["assert_button_has_outline", "Active"]]
+expect = "Clean room"
+
+[[sequence]]
 description = "Verify Buy groceries is NOT visible (completed todo)"
 actions = [["assert_not_contains", "Buy groceries"]]
 expect = "Clean room"

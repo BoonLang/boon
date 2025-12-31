@@ -4,7 +4,7 @@
   "command": [
     "cl"
   ],
-  "supervisor_prompt": "Finish you plan, then make all `makers verify-playground` tests pass. You can change and experiment with anything related to Boon engine and test and mcp infrastructure but don't change examples or tests alone (until there isn't a real bug or you want to add more tests or examples).",
+  "supervisor_prompt": "Finish you plan, \n\nMake sure these test cases are among the tests in `makers verify-playground`:\nA) Two clicks on Toggle All causes to create new todos checked in todo_mvc example. This should be resolved my lamport clock or similar mechanism described in your plan or in docs/experiments/lamport-clock-stale-event-filtering.md\nB) Often not possible to add new todo to list in todo_mvc.\nC) Filter buttons outline is visible (find a way how to test it).\n\nthen make all `makers verify-playground` tests pass. You can change and experiment with anything related to Boon engine and test and mcp infrastructure but don't change examples or tests alone (until there isn't a real bug or you want to add more tests or examples).",
   "completion_condition": "+completed+",
   "completion_command": "makers verify-playground",
   "protected_patterns": [

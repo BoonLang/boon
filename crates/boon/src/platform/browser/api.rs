@@ -1826,7 +1826,7 @@ pub fn function_list_append(
 
     constant(Value::List(
         Arc::new(list),
-        ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+        ValueMetadata::new(ValueIdempotencyKey::new()),
     ))
     .right_stream()
 }
@@ -1955,7 +1955,7 @@ pub fn function_list_clear(
 
     constant(Value::List(
         Arc::new(list),
-        ValueMetadata { idempotency_key: ValueIdempotencyKey::new() },
+        ValueMetadata::new(ValueIdempotencyKey::new()),
     ))
     .right_stream()
 }
