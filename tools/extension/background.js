@@ -310,6 +310,21 @@ async function cdpHoverAt(tabId, x, y) {
         }));
       }
 
+      // Also dispatch bubbling over/out events on the target element
+      // Some frameworks use these instead of enter/leave
+      if (newTarget) {
+        newTarget.dispatchEvent(new PointerEvent('pointerover', {
+          bubbles: true, cancelable: true, view: window,
+          clientX: viewportX, clientY: viewportY,
+          relatedTarget: prevElements[0] || null, pointerType: 'mouse', isPrimary: true
+        }));
+        newTarget.dispatchEvent(new MouseEvent('mouseover', {
+          bubbles: true, cancelable: true, view: window,
+          clientX: viewportX, clientY: viewportY,
+          relatedTarget: prevElements[0] || null
+        }));
+      }
+
       // Update tracked elements
       window.__boonHoveredElements = newElements;
 
@@ -978,6 +993,26 @@ async function handleCommand(id, command) {
           return { type: 'error', message: e.message };
         }
 
+      case 'navigateTo':
+        // Navigate to a specific route using history.pushState and trigger popstate
+        // This is essential for resetting Router state in tests
+        try {
+          const path = command.path;
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const path = '${path}';
+              // Use history.pushState to change URL without reload
+              history.pushState(null, '', path);
+              // Dispatch popstate event so Router/route() picks up the change
+              window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+              return { navigated: path, currentPath: location.pathname };
+            })()
+          `);
+          return { type: 'success', data: result };
+        } catch (e) {
+          return { type: 'error', message: e.message };
+        }
+
       case 'selectExample':
         // Select an example by name (e.g., "todo_mvc.bn", "counter.bn")
         // Uses CDP trusted clicks (Input.dispatchMouseEvent) for proper Zoon event handling
@@ -1363,6 +1398,8 @@ async function handleCommand(id, command) {
 
       case 'clickByText':
         // Click any element by its text content (more flexible than clickButton)
+        // IMPORTANT: Find and click in a SINGLE cdpEvaluate call to avoid timing issues
+        // where the DOM may be rebuilt by Boon's reactive system between find and click
         try {
           const searchText = command.text;
           const exact = command.exact || false;
@@ -1377,6 +1414,7 @@ async function handleCommand(id, command) {
               // Find all elements and look for matching text
               const allElements = preview.querySelectorAll('*');
               let bestMatch = null;
+              let bestMatchElement = null;
               let bestMatchSize = Infinity;
 
               allElements.forEach((el) => {
@@ -1408,6 +1446,7 @@ async function handleCommand(id, command) {
                   const size = rect.width * rect.height;
                   if (size < bestMatchSize) {
                     bestMatchSize = size;
+                    bestMatchElement = el;
                     bestMatch = {
                       text: directText,
                       x: Math.round(rect.x),
@@ -1421,10 +1460,27 @@ async function handleCommand(id, command) {
                 }
               });
 
-              if (bestMatch) {
-                return { found: true, element: bestMatch };
+              if (!bestMatchElement) {
+                return { found: false, error: 'No element found with text: ' + searchText };
               }
-              return { found: false, error: 'No element found with text: ' + searchText };
+
+              // Click the element IMMEDIATELY within this same evaluation
+              // This prevents timing issues where DOM is rebuilt between find and click
+              const rect = bestMatchElement.getBoundingClientRect();
+              const centerX = rect.x + rect.width / 2;
+              const centerY = rect.y + rect.height / 2;
+
+              bestMatchElement.dispatchEvent(new MouseEvent('click', {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                clientX: centerX,
+                clientY: centerY,
+                detail: 1
+              }));
+
+              console.log('[Boon] clickByText: clicked', bestMatch.text, 'at', Math.round(centerX), Math.round(centerY));
+              return { found: true, clicked: true, element: bestMatch };
             })()
           `);
 
@@ -1432,9 +1488,7 @@ async function handleCommand(id, command) {
             return { type: 'error', message: result.error || 'Element not found' };
           }
 
-          const element = result.element;
-          await cdpClickAt(tab.id, element.centerX, element.centerY);
-          return { type: 'success', data: { text: element.text, x: element.centerX, y: element.centerY } };
+          return { type: 'success', data: { text: result.element.text, x: result.element.centerX, y: result.element.centerY } };
         } catch (e) {
           return { type: 'error', message: `Click by text failed: ${e.message}` };
         }
@@ -1519,7 +1573,8 @@ async function handleCommand(id, command) {
           // Small delay to let the hover state update the DOM
           await new Promise(resolve => setTimeout(resolve, 100));
 
-          // Step 3: Now find and click the button
+          // Step 3: Find AND click the button in a single atomic operation
+          // This prevents timing issues where DOM is rebuilt between find and click
           const clickResult = await cdpEvaluate(tab.id, `
             (function() {
               const searchText = ${JSON.stringify(searchText)};
@@ -1578,9 +1633,13 @@ async function handleCommand(id, command) {
 
                   if (btnText === buttonText) {
                     const btnRect = btn.getBoundingClientRect();
+                    // Allow buttons that exist in DOM even if hidden by CSS (opacity:0, etc.)
+                    // This handles Zoon's hover-dependent buttons that may not respond to synthetic hover
                     if (btnRect.width > 0 && btnRect.height > 0) {
                       const btnStyle = window.getComputedStyle(btn);
-                      if (btnStyle.display !== 'none' && btnStyle.visibility !== 'hidden') {
+                      // Only reject display:none (element truly removed from layout)
+                      // Allow opacity:0, visibility:hidden (element exists but invisible)
+                      if (btnStyle.display !== 'none') {
                         foundButton = btn;
                         break;
                       }
@@ -1597,13 +1656,30 @@ async function handleCommand(id, command) {
                 return { found: false, error: 'No button "' + buttonText + '" found near text: ' + searchText + ' (button may not appear on hover)' };
               }
 
+              // Click the button IMMEDIATELY within this same evaluation
+              // This prevents timing issues where DOM is rebuilt between find and click
               const btnRect = foundButton.getBoundingClientRect();
+              const centerX = btnRect.x + btnRect.width / 2;
+              const centerY = btnRect.y + btnRect.height / 2;
+
+              foundButton.dispatchEvent(new MouseEvent('click', {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                clientX: centerX,
+                clientY: centerY,
+                detail: 1
+              }));
+
+              console.log('[Boon] clickButtonNearText: clicked', buttonText, 'near', searchText, 'at', Math.round(centerX), Math.round(centerY));
+
               return {
                 found: true,
+                clicked: true,
                 text: searchText,
                 buttonText: buttonText,
-                centerX: btnRect.x + btnRect.width / 2,
-                centerY: btnRect.y + btnRect.height / 2,
+                centerX: Math.round(centerX),
+                centerY: Math.round(centerY),
                 buttonRect: { x: btnRect.x, y: btnRect.y, w: btnRect.width, h: btnRect.height }
               };
             })()
@@ -1613,8 +1689,6 @@ async function handleCommand(id, command) {
             return { type: 'error', message: clickResult.error || 'Button not found after hover' };
           }
 
-          // Step 4: Click the button
-          await cdpClickAt(tab.id, clickResult.centerX, clickResult.centerY);
           return { type: 'success', data: clickResult };
         } catch (e) {
           return { type: 'error', message: `Click button near text failed: ${e.message}` };

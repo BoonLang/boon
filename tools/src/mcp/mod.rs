@@ -400,6 +400,20 @@ fn get_tools() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "boon_navigate".to_string(),
+            description: "Navigate to a specific route/path in the Boon playground. Uses history.pushState + popstate event to trigger Router/route() updates.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The path to navigate to (e.g., '/', '/active', '/completed')"
+                    }
+                },
+                "required": ["path"]
+            }),
+        },
+        Tool {
             name: "boon_run_and_capture".to_string(),
             description: "ATOMIC: Run Boon code and immediately capture the preview text BEFORE any timers fire. Critical for testing initial state of timer-based examples. Returns the initial preview text captured synchronously after run.".to_string(),
             input_schema: json!({
@@ -907,6 +921,11 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
         "boon_accessibility_tree" => Command::GetAccessibilityTree,
 
         "boon_clear_states" => Command::ClearStates,
+
+        "boon_navigate" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("/").to_string();
+            Command::NavigateTo { path }
+        },
 
         "boon_run_and_capture" => Command::RunAndCaptureInitial,
 

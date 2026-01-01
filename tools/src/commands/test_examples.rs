@@ -605,8 +605,11 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
     let code = std::fs::read_to_string(&example.bn_path)
         .with_context(|| format!("Failed to read {}", example.bn_path.display()))?;
 
-    // Clear states and refresh page before each test to ensure clean slate
+    // Clear states, reset URL to root, and refresh page before each test to ensure clean slate
     let _ = send_command_to_server(opts.port, WsCommand::ClearStates).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Navigate to root route - critical for Router/route() based apps like todo_mvc
+    let _ = send_command_to_server(opts.port, WsCommand::NavigateTo { path: "/".to_string() }).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let _ = send_command_to_server(opts.port, WsCommand::Refresh).await;
     tokio::time::sleep(Duration::from_millis(500)).await;

@@ -2042,6 +2042,7 @@ pub fn function_router_route(
 
     // Send initial route
     let initial_path = get_current_pathname();
+    zoon::println!("[ROUTER] Initial route: '{}'", initial_path);
     if let Err(e) = route_sender.try_send(initial_path) {
         zoon::println!("[ROUTER] Failed to send initial route: {e}");
     }
@@ -2071,6 +2072,7 @@ pub fn function_router_route(
 
     // Convert route strings to Text values
     route_receiver.map(move |path| {
+        zoon::println!("[ROUTER] Emitting route: '{}'", path);
         // Prevent drop: captured by `move` closure, lives as long as stream combinator
         let _popstate_closure = &popstate_closure;
         Text::new_value(
@@ -2103,6 +2105,7 @@ pub fn function_router_go_to(
             Value::Text(text, _) => text.text().to_string(),
             _ => "/".to_string(),
         };
+        zoon::println!("[ROUTER] go_to called with route: '{}'", route);
 
         // Navigate using browser history API
         if route.starts_with('/') {

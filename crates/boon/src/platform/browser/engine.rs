@@ -2205,7 +2205,8 @@ impl Variable {
 
         // Log the actor's unique ID (pointer address) for correlation with forwarding loops
         let actor_addr = Arc::as_ptr(&value_actor) as usize;
-        zoon::println!("[LINK_ACTOR] Created link_value_actor addr={:x} for {}", actor_addr, variable_description_for_log);
+        zoon::println!("[LINK_ACTOR] Created link_value_actor addr={:x} pid={} scope={:?} for {}",
+            actor_addr, persistence_id, scope, variable_description_for_log);
 
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
@@ -2374,9 +2375,15 @@ impl VariableOrArgumentReference {
         let parts_vec: Vec<_> = alias_parts.into_iter().skip(skip_alias_parts).collect();
         let num_parts = parts_vec.len();
 
+        // Log subscription_time for debugging
+        if let Some(sub_time) = subscription_time {
+            zoon::println!("[VAR_REF] Creating path subscription with subscription_time={}", sub_time);
+        }
+
         for (idx, alias_part) in parts_vec.into_iter().enumerate() {
             let alias_part = alias_part.to_string();
             let _is_last = idx == num_parts - 1;
+            let step_idx = idx;
 
             // Process each field in the path using switch_map.
             // switch_map switches to a new inner stream whenever the outer emits.
@@ -2387,10 +2394,19 @@ impl VariableOrArgumentReference {
             // 2. Subscription stream ends (receiver gone)
             // 3. switch_map creates new subscription when outer emits again
             // 4. When WHILE switches back, new Variables get new subscription
+            let alias_part_for_log = alias_part.clone();
             value_stream = switch_map(
                 value_stream,
                 move |value| {
                 let alias_part = alias_part.clone();
+                let alias_part_log = alias_part_for_log.clone();
+                let value_type = match &value {
+                    Value::Object(_, _) => "Object",
+                    Value::TaggedObject(tagged, _) => tagged.tag(),
+                    Value::Tag(tag, _) => tag.tag(),
+                    _ => "Other",
+                };
+                zoon::println!("[VAR_REF] step {} outer received {} for field '{}'", step_idx, value_type, alias_part_log);
                 match value {
                     Value::Object(object, _) => {
                         let variable = object.expect_variable(&alias_part);
@@ -2432,10 +2448,26 @@ impl VariableOrArgumentReference {
                                                     if let Some(time) = sub_time {
                                                         if value.happened_before(time) {
                                                             // Skip stale value, keep polling
+                                                            let value_type = match &value {
+                                                                Value::Object(_, _) => "Object",
+                                                                Value::TaggedObject(tagged, _) => tagged.tag(),
+                                                                Value::Tag(tag, _) => tag.tag(),
+                                                                _ => "Other",
+                                                            };
+                                                            zoon::println!("[ALIAS_PATH] FILTERED stale {} (value.lamport={:?} < sub_time={})",
+                                                                value_type, value.lamport_time(), time);
                                                             continue;
                                                         }
                                                     }
                                                     // Fresh value - emit it
+                                                    let emit_value_type = match &value {
+                                                        Value::Object(_, _) => "Object",
+                                                        Value::TaggedObject(tagged, _) => tagged.tag(),
+                                                        Value::Tag(tag, _) => tag.tag(),
+                                                        _ => "Other",
+                                                    };
+                                                    zoon::println!("[VAR_REF] Emitting {} (lamport={:?}, sub_time={:?})",
+                                                        emit_value_type, value.lamport_time(), sub_time);
                                                     return Some((value, (Some(subscription), None, object, variable, sub_time)));
                                                 }
                                                 None => {

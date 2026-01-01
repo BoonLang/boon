@@ -151,6 +151,9 @@ pub enum Command {
 
     /// Check if a button has a visible outline (outline CSS property is not "none")
     AssertButtonHasOutline { text: String },
+
+    /// Navigate to a specific route/path (uses history.pushState + popstate event)
+    NavigateTo { path: String },
 }
 
 /// Response from Extension to CLI via Server
