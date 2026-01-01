@@ -2980,10 +2980,21 @@ fn build_when_actor(
         let arms_clone = arms.clone();
 
         Box::pin(async move {
+            // Debug: log what WHEN receives
+            let value_desc = match &value {
+                Value::Tag(tag, _) => format!("Tag({})", tag.tag()),
+                Value::Object(_, _) => "Object".to_string(),
+                Value::Text(t, _) => format!("Text({})", t.text()),
+                Value::List(_, _) => "List".to_string(),
+                _ => "Other".to_string(),
+            };
+            zoon::println!("[WHEN] Received value: {}", value_desc);
+
             // Try to match against each arm
             for arm in &arms_clone {
                 // Use async pattern matching to properly extract bindings from Objects
                 if let Some(bindings) = match_pattern(&arm.pattern, &value).await {
+                    zoon::println!("[WHEN] Pattern MATCHED: {:?}", arm.pattern);
                     let value_actor = ValueActor::new_arc(
                         ConstructInfo::new(
                             "WHEN input value".to_string(),

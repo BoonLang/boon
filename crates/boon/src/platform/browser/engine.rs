@@ -72,6 +72,34 @@ pub fn lamport_now() -> u64 {
     LOCAL_CLOCK.with(|c| c.get())
 }
 
+// --- TimestampedEvent ---
+//
+// Wrapper type that ENFORCES Lamport timestamp on all DOM events.
+// Using this type instead of raw data prevents future bugs where
+// developers forget to capture timestamps.
+
+/// DOM event data with captured Lamport timestamp.
+/// The timestamp is captured at the moment the DOM callback fires,
+/// BEFORE the event is sent through channels. This ensures correct
+/// happened-before ordering even when `select!` processes events
+/// out of order.
+#[derive(Debug, Clone)]
+pub struct TimestampedEvent<T> {
+    pub data: T,
+    pub lamport_time: u64,
+}
+
+impl<T> TimestampedEvent<T> {
+    /// Create a timestamped event - captures Lamport clock at this moment.
+    /// Call this in DOM callbacks, BEFORE sending to channels.
+    pub fn now(data: T) -> Self {
+        Self {
+            data,
+            lamport_time: lamport_tick(),
+        }
+    }
+}
+
 // --- List Item Origin Tracking ---
 //
 // Each list item carries its own origin info (no global registry).
@@ -2144,6 +2172,8 @@ impl Variable {
             persistence,
             description: variable_description,
         } = construct_info;
+        // Clone description for logging before moving it
+        let variable_description_for_log = variable_description.clone();
         let construct_info = ConstructInfo::new(
             actor_id.with_child_id("wrapped Variable"),
             persistence,
@@ -2155,9 +2185,27 @@ impl Variable {
         let (link_value_sender, link_value_receiver) = NamedChannel::new("link.values", 128);
         // Capture the scope before actor_context is moved
         let scope = actor_context.scope.clone();
+
+        // Wrap the receiver stream with logging to trace values reaching the link_value_actor
+        // We'll capture the actor's address after Arc creation for correlation
+        let desc_for_closure = variable_description_for_log.clone();
+        let logged_receiver = link_value_receiver.map(move |value| {
+            let value_desc = match &value {
+                Value::Tag(tag, _) => format!("Tag({})", tag.tag()),
+                Value::Object(_, _) => "Object".to_string(),
+                _ => "Other".to_string(),
+            };
+            zoon::println!("[LINK_ACTOR] Received from channel: {} for {}", value_desc, desc_for_closure);
+            value
+        });
+
         let value_actor =
-            ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(link_value_receiver), persistence_id);
+            ValueActor::new(actor_construct_info, actor_context, TypedStream::infinite(logged_receiver), persistence_id);
         let value_actor = Arc::new(value_actor);
+
+        // Log the actor's unique ID (pointer address) for correlation with forwarding loops
+        let actor_addr = Arc::as_ptr(&value_actor) as usize;
+        zoon::println!("[LINK_ACTOR] Created link_value_actor addr={:x} for {}", actor_addr, variable_description_for_log);
 
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
@@ -4243,21 +4291,38 @@ impl ValueActor {
         source_actor: Arc<ValueActor>,
         initial_value_future: impl Future<Output = Option<Value>> + 'static,
     ) -> ActorLoop {
+        // Capture source actor address for correlation logging
+        let source_addr = Arc::as_ptr(&source_actor) as usize;
         ActorLoop::new(async move {
+            zoon::println!("[FWD2] connect_forwarding loop STARTED, source_actor addr={:x}", source_addr);
             // Send initial value first (awaiting if needed)
             if let Some(value) = initial_value_future.await {
+                zoon::println!("[FORWARDING] Sending initial value (source={:x})", source_addr);
                 if let Err(e) = forwarding_sender.send(value).await {
-                    zoon::println!("[VALUE_ACTOR] Initial forwarding failed: {e}");
+                    zoon::println!("[FORWARDING] Initial forwarding FAILED: {e} - EXITING! (source={:x})", source_addr);
                     return;
                 }
+                zoon::println!("[FORWARDING] Initial value sent OK (source={:x})", source_addr);
+            } else {
+                zoon::println!("[FORWARDING] No initial value (source={:x})", source_addr);
             }
 
+            zoon::println!("[FORWARDING] Subscribing to source_actor addr={:x}...", source_addr);
             let mut subscription = source_actor.stream();
+            zoon::println!("[FORWARDING] Subscribed to addr={:x}, entering forwarding loop", source_addr);
             while let Some(value) = subscription.next().await {
+                let value_desc = match &value {
+                    Value::Tag(tag, _) => format!("Tag({})", tag.tag()),
+                    Value::Object(_, _) => "Object".to_string(),
+                    _ => "Other".to_string(),
+                };
+                zoon::println!("[FORWARDING] Received value from source addr={:x}: {}", source_addr, value_desc);
                 if forwarding_sender.send(value).await.is_err() {
+                    zoon::println!("[FORWARDING] Forwarding FAILED (source={:x}) - breaking loop", source_addr);
                     break;
                 }
             }
+            zoon::println!("[FORWARDING] Forwarding loop ENDED (source={:x})", source_addr);
         })
     }
 
@@ -4640,6 +4705,19 @@ impl ValueMetadata {
         Self {
             idempotency_key,
             lamport_time: lamport_tick(),
+        }
+    }
+
+    /// Create metadata with a pre-captured Lamport timestamp from DOM callback.
+    /// Used when the timestamp was captured earlier (e.g., in a DOM event handler)
+    /// and needs to be preserved through async processing.
+    pub fn with_lamport_time(idempotency_key: ValueIdempotencyKey, lamport_time: u64) -> Self {
+        // Update local clock to maintain Lamport semantics:
+        // our clock must be at least as high as any timestamp we've seen
+        lamport_receive(lamport_time);
+        Self {
+            idempotency_key,
+            lamport_time,
         }
     }
 }
@@ -5237,6 +5315,20 @@ impl Object {
         )
     }
 
+    /// Create a Value with a pre-captured Lamport timestamp from DOM callback.
+    pub fn new_value_with_lamport_time(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        idempotency_key: ValueIdempotencyKey,
+        lamport_time: u64,
+        variables: impl Into<Vec<Arc<Variable>>>,
+    ) -> Value {
+        Value::Object(
+            Self::new_arc(construct_info, construct_context, variables),
+            ValueMetadata::with_lamport_time(idempotency_key, lamport_time),
+        )
+    }
+
     pub fn new_constant(
         construct_info: ConstructInfo,
         construct_context: ConstructContext,
@@ -5508,6 +5600,20 @@ impl Text {
         )
     }
 
+    /// Create a Value with a pre-captured Lamport timestamp from DOM callback.
+    pub fn new_value_with_lamport_time(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        idempotency_key: ValueIdempotencyKey,
+        lamport_time: u64,
+        text: impl Into<Cow<'static, str>>,
+    ) -> Value {
+        Value::Text(
+            Self::new_arc(construct_info, construct_context, text),
+            ValueMetadata::with_lamport_time(idempotency_key, lamport_time),
+        )
+    }
+
     pub fn new_constant(
         construct_info: ConstructInfo,
         construct_context: ConstructContext,
@@ -5610,6 +5716,20 @@ impl Tag {
         Value::Tag(
             Self::new_arc(construct_info, construct_context, tag),
             ValueMetadata::new(idempotency_key),
+        )
+    }
+
+    /// Create a Value with a pre-captured Lamport timestamp from DOM callback.
+    pub fn new_value_with_lamport_time(
+        construct_info: ConstructInfo,
+        construct_context: ConstructContext,
+        idempotency_key: ValueIdempotencyKey,
+        lamport_time: u64,
+        tag: impl Into<Cow<'static, str>>,
+    ) -> Value {
+        Value::Tag(
+            Self::new_arc(construct_info, construct_context, tag),
+            ValueMetadata::with_lamport_time(idempotency_key, lamport_time),
         )
     }
 

@@ -5,7 +5,7 @@ use zoon::*;
 
 use super::engine::{
     ActorContext, ActorLoop, ConstructContext, ConstructInfo, ListChange, NamedChannel, Object,
-    TaggedObject, TypedStream, Value, ValueActor, ValueIdempotencyKey, Variable,
+    TaggedObject, TimestampedEvent, TypedStream, Value, ValueActor, ValueIdempotencyKey, Variable,
     Text as EngineText, Tag as EngineTag, switch_map,
 };
 use crate::parser;
@@ -447,7 +447,8 @@ fn element_stripe(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
-    let (hovered_sender, mut hovered_receiver) = NamedChannel::new("element.hovered", 2);
+    // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
+    let (hovered_sender, mut hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("element.hovered", 2);
 
     // Set up hovered link if element field exists with hovered property
     // Access element through settings, like other properties (style, direction, etc.)
@@ -486,13 +487,14 @@ fn element_stripe(
                             hovered_link_value_sender = Some(sender);
                         }
                     }
-                    is_hovered = hovered_receiver.select_next_some() => {
+                    event = hovered_receiver.select_next_some() => {
                         if let Some(sender) = hovered_link_value_sender.as_ref() {
-                            let hover_tag = if is_hovered { "True" } else { "False" };
-                            let event_value = EngineTag::new_value(
+                            let hover_tag = if event.data { "True" } else { "False" };
+                            let event_value = EngineTag::new_value_with_lamport_time(
                                 ConstructInfo::new("stripe::hovered", None, "Stripe hovered state"),
                                 construct_context.clone(),
                                 ValueIdempotencyKey::new(),
+                                event.lamport_time,
                                 hover_tag,
                             );
                             sender.send_or_drop(event_value);
@@ -1071,7 +1073,8 @@ fn element_stripe(
             },
         ))
         .on_hovered_change(move |is_hovered| {
-            hovered_sender.send_or_drop(is_hovered);
+            // Capture Lamport time NOW at DOM callback, before channel
+            hovered_sender.send_or_drop(TimestampedEvent::now(is_hovered));
         })
         .update_raw_el(|raw_el| {
             raw_el
@@ -1251,10 +1254,9 @@ fn element_button(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
-    type PressEvent = ();
-
-    let (press_event_sender, mut press_event_receiver) = NamedChannel::new("button.press_event", 8);
-    let (hovered_sender, mut hovered_receiver) = NamedChannel::new("button.hovered", 2);
+    // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
+    let (press_event_sender, mut press_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("button.press_event", 8);
+    let (hovered_sender, mut hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("button.hovered", 2);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -1306,25 +1308,27 @@ fn element_button(
                             hovered_link_value_sender = Some(sender);
                         }
                     }
-                    press_event = press_event_receiver.select_next_some() => {
+                    event = press_event_receiver.select_next_some() => {
                         if let Some(press_link_value_sender) = press_link_value_sender.as_ref() {
-                            let press_event_object_value = Object::new_value(
+                            let press_event_object_value = Object::new_value_with_lamport_time(
                                 ConstructInfo::new(format!("bridge::element_button::press_event, version: {press_event_object_value_version}"), None, "Button press event"),
                                 construct_context.clone(),
                                 ValueIdempotencyKey::new(),
+                                event.lamport_time,
                                 [],
                             );
                             press_event_object_value_version += 1;
                             press_link_value_sender.send_or_drop(press_event_object_value);
                         }
                     }
-                    is_hovered = hovered_receiver.select_next_some() => {
+                    event = hovered_receiver.select_next_some() => {
                         if let Some(sender) = hovered_link_value_sender.as_ref() {
-                            let hover_tag = if is_hovered { "True" } else { "False" };
-                            let event_value = EngineTag::new_value(
+                            let hover_tag = if event.data { "True" } else { "False" };
+                            let event_value = EngineTag::new_value_with_lamport_time(
                                 ConstructInfo::new("button::hovered", None, "Button hovered state"),
                                 construct_context.clone(),
                                 ValueIdempotencyKey::new(),
+                                event.lamport_time,
                                 hover_tag,
                             );
                             sender.send_or_drop(event_value);
@@ -1696,11 +1700,12 @@ fn element_button(
         }))
         // @TODO Handle press event only when it's defined in Boon code? Add `.on_press_signal` to Zoon?
         .on_press(move || {
-            let press_event: PressEvent = ();
-            press_event_sender.send_or_drop(press_event);
+            // Capture Lamport time NOW at DOM callback, before channel
+            press_event_sender.send_or_drop(TimestampedEvent::now(()));
         })
         .on_hovered_change(move |is_hovered| {
-            hovered_sender.send_or_drop(is_hovered);
+            // Capture Lamport time NOW at DOM callback, before channel
+            hovered_sender.send_or_drop(TimestampedEvent::now(is_hovered));
         })
         .update_raw_el(|raw_el| {
             raw_el
@@ -1725,11 +1730,13 @@ fn element_text_input(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
+    zoon::println!("[EVENT:TextInput] element_text_input CALLED - creating new TextInput");
     // Separate channels for each event type.
-    // Lamport timestamps on all values ensure correct ordering when combined with LATEST.
-    let (change_event_sender, mut change_event_receiver) = NamedChannel::<String>::new("text_input.change", 16);
-    let (key_down_event_sender, mut key_down_event_receiver) = NamedChannel::<String>::new("text_input.key_down", 32);
-    let (blur_event_sender, mut blur_event_receiver) = NamedChannel::<()>::new("text_input.blur", 8);
+    // TimestampedEvent captures Lamport time at DOM callback, ensuring correct ordering
+    // even when select! processes events out of order.
+    let (change_event_sender, mut change_event_receiver) = NamedChannel::<TimestampedEvent<String>>::new("text_input.change", 16);
+    let (key_down_event_sender, mut key_down_event_receiver) = NamedChannel::<TimestampedEvent<String>>::new("text_input.key_down", 32);
+    let (blur_event_sender, mut blur_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("text_input.blur", 8);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -1764,12 +1771,13 @@ fn element_text_input(
         .chain(stream::pending())
         .fuse();
 
-    // Helper to create change event value
-    fn create_change_event_value(construct_context: &ConstructContext, text: String) -> Value {
-        Object::new_value(
+    // Helper to create change event value with captured Lamport timestamp
+    fn create_change_event_value(construct_context: &ConstructContext, text: String, lamport_time: u64) -> Value {
+        Object::new_value_with_lamport_time(
             ConstructInfo::new("text_input::change_event", None, "TextInput change event"),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
+            lamport_time,
             [Variable::new_arc(
                 ConstructInfo::new("text_input::change_event::text", None, "change text"),
                 construct_context.clone(),
@@ -1777,10 +1785,11 @@ fn element_text_input(
                 ValueActor::new_arc(
                     ConstructInfo::new("text_input::change_event::text_actor", None, "change text actor"),
                     ActorContext::default(),
-                    TypedStream::infinite(stream::once(future::ready(EngineText::new_value(
+                    TypedStream::infinite(stream::once(future::ready(EngineText::new_value_with_lamport_time(
                         ConstructInfo::new("text_input::change_event::text_value", None, "change text value"),
                         construct_context.clone(),
                         ValueIdempotencyKey::new(),
+                        lamport_time,
                         text,
                     ))).chain(stream::pending())),
                     parser::PersistenceId::new(),
@@ -1791,13 +1800,14 @@ fn element_text_input(
         )
     }
 
-    // Helper to create key_down event value - only contains 'key', no 'text'
-    // Text should be obtained from the change event using LATEST { change.text, key_down.key }
-    fn create_key_down_event_value(construct_context: &ConstructContext, key: String) -> Value {
-        Object::new_value(
+    // Helper to create key_down event value with captured Lamport timestamp
+    // Only contains 'key', no 'text' - text should be obtained from the change event using LATEST
+    fn create_key_down_event_value(construct_context: &ConstructContext, key: String, lamport_time: u64) -> Value {
+        Object::new_value_with_lamport_time(
             ConstructInfo::new("text_input::key_down_event", None, "TextInput key_down event"),
             construct_context.clone(),
             ValueIdempotencyKey::new(),
+            lamport_time,
             [
                 Variable::new_arc(
                     ConstructInfo::new("text_input::key_down_event::key", None, "key_down key"),
@@ -1806,10 +1816,11 @@ fn element_text_input(
                     ValueActor::new_arc(
                         ConstructInfo::new("text_input::key_down_event::key_actor", None, "key_down key actor"),
                         ActorContext::default(),
-                        TypedStream::infinite(stream::once(future::ready(EngineTag::new_value(
+                        TypedStream::infinite(stream::once(future::ready(EngineTag::new_value_with_lamport_time(
                             ConstructInfo::new("text_input::key_down_event::key_value", None, "key_down key value"),
                             construct_context.clone(),
                             ValueIdempotencyKey::new(),
+                            lamport_time,
                             key,
                         ))).chain(stream::pending())),
                         parser::PersistenceId::new(),
@@ -1824,6 +1835,7 @@ fn element_text_input(
     let event_handler_loop = ActorLoop::new({
         let construct_context = construct_context.clone();
         async move {
+            zoon::println!("[EVENT:TextInput] Event handler loop STARTED");
             let mut change_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut key_down_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut blur_link_value_sender: Option<NamedChannel<Value>> = None;
@@ -1833,37 +1845,54 @@ fn element_text_input(
                     // These branches get the Boon-side senders for each event type
                     result = change_stream.next() => {
                         if let Some(sender) = result {
+                            zoon::println!("[EVENT:TextInput] change_link_value_sender READY");
                             change_link_value_sender = Some(sender);
                         }
                     }
                     result = key_down_stream.next() => {
                         if let Some(sender) = result {
+                            zoon::println!("[EVENT:TextInput] key_down_link_value_sender READY");
                             key_down_link_value_sender = Some(sender);
                         }
                     }
                     result = blur_stream.next() => {
                         if let Some(sender) = result {
+                            zoon::println!("[EVENT:TextInput] blur_link_value_sender READY");
                             blur_link_value_sender = Some(sender);
                         }
                     }
-                    // Separate channels for each event type - Lamport ordering in engine
-                    // ensures correct happened-before semantics when combined with LATEST
-                    text = change_event_receiver.select_next_some() => {
+                    // TimestampedEvent carries Lamport time captured at DOM callback
+                    // This ensures correct ordering even when select! processes events out of order
+                    event = change_event_receiver.select_next_some() => {
+                        zoon::println!("[EVENT:TextInput] LOOP received change: text='{}', lamport={}, sender_ready={}",
+                            if event.data.len() > 50 { format!("{}...", &event.data[..50]) } else { event.data.clone() },
+                            event.lamport_time,
+                            change_link_value_sender.is_some());
                         if let Some(sender) = change_link_value_sender.as_ref() {
-                            sender.send_or_drop(create_change_event_value(&construct_context, text));
+                            sender.send_or_drop(create_change_event_value(&construct_context, event.data, event.lamport_time));
                         }
                     }
-                    key = key_down_event_receiver.select_next_some() => {
+                    event = key_down_event_receiver.select_next_some() => {
+                        zoon::println!("[EVENT:TextInput] LOOP received key_down: key='{}', lamport={}, sender_ready={}",
+                            event.data, event.lamport_time, key_down_link_value_sender.is_some());
                         if let Some(sender) = key_down_link_value_sender.as_ref() {
-                            sender.send_or_drop(create_key_down_event_value(&construct_context, key));
+                            let event_value = create_key_down_event_value(&construct_context, event.data, event.lamport_time);
+                            let result = sender.try_send(event_value);
+                            zoon::println!("[EVENT:TextInput] LINK send key_down result: {:?}", result.is_ok());
+                            if result.is_err() {
+                                zoon::println!("[EVENT:TextInput] LINK send FAILED - channel closed or full!");
+                            }
                         }
                     }
-                    _ = blur_event_receiver.select_next_some() => {
+                    event = blur_event_receiver.select_next_some() => {
+                        zoon::println!("[EVENT:TextInput] LOOP received blur: lamport={}, sender_ready={}",
+                            event.lamport_time, blur_link_value_sender.is_some());
                         if let Some(sender) = blur_link_value_sender.as_ref() {
-                            let event_value = Object::new_value(
+                            let event_value = Object::new_value_with_lamport_time(
                                 ConstructInfo::new("text_input::blur_event", None, "TextInput blur event"),
                                 construct_context.clone(),
                                 ValueIdempotencyKey::new(),
+                                event.lamport_time,
                                 [],
                             );
                             sender.send_or_drop(event_value);
@@ -2067,7 +2096,12 @@ fn element_text_input(
         .on_change({
             let sender = change_event_sender.clone();
             move |text| {
-                sender.send_or_drop(text);
+                // Capture Lamport time NOW at DOM callback, before channel
+                let event = TimestampedEvent::now(text);
+                zoon::println!("[EVENT:TextInput] on_change fired: text='{}', lamport={}",
+                    if event.data.len() > 50 { format!("{}...", &event.data[..50]) } else { event.data.clone() },
+                    event.lamport_time);
+                sender.send_or_drop(event);
             }
         })
         .on_key_down_event({
@@ -2078,13 +2112,20 @@ fn element_text_input(
                     Key::Escape => "Escape".to_string(),
                     Key::Other(k) => k.clone(),
                 };
-                sender.send_or_drop(key_name);
+                // Capture Lamport time NOW at DOM callback, before channel
+                let ts_event = TimestampedEvent::now(key_name);
+                zoon::println!("[EVENT:TextInput] on_key_down fired: key='{}', lamport={}",
+                    ts_event.data, ts_event.lamport_time);
+                sender.send_or_drop(ts_event);
             }
         })
         .on_blur({
             let sender = blur_event_sender.clone();
             move || {
-                sender.send_or_drop(());
+                // Capture Lamport time NOW at DOM callback, before channel
+                let event = TimestampedEvent::now(());
+                zoon::println!("[EVENT:TextInput] on_blur fired: lamport={}", event.lamport_time);
+                sender.send_or_drop(event);
             }
         })
         .focus_signal(focus_signal)
@@ -2098,6 +2139,7 @@ fn element_text_input(
                 .style_signal("background-color", background_color_signal)
         })
         .after_remove(move |_| {
+            zoon::println!("[EVENT:TextInput] Element REMOVED - dropping event handlers");
             drop(event_handler_loop);
             drop(focus_loop);
         })
@@ -2107,9 +2149,8 @@ fn element_checkbox(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
-    type ClickEvent = ();
-
-    let (click_event_sender, mut click_event_receiver) = NamedChannel::new("checkbox.click", 8);
+    // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
+    let (click_event_sender, mut click_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("checkbox.click", 8);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -2156,17 +2197,19 @@ fn element_checkbox(
                             pending_clicks = 0;
                         }
                     }
-                    _click = click_event_receiver.select_next_some() => {
+                    event = click_event_receiver.select_next_some() => {
                         if let Some(sender) = click_link_value_sender.as_ref() {
-                            let event_value = Object::new_value(
+                            let event_value = Object::new_value_with_lamport_time(
                                 ConstructInfo::new("checkbox::click_event", None, "Checkbox click event"),
                                 construct_context.clone(),
                                 ValueIdempotencyKey::new(),
+                                event.lamport_time,
                                 [],
                             );
                             sender.send_or_drop(event_value);
                         } else {
                             // Buffer the click to send when sender becomes available
+                            // Note: Buffered clicks use fresh timestamps when processed (edge case)
                             pending_clicks += 1;
                         }
                     }
@@ -2202,7 +2245,8 @@ fn element_checkbox(
         .on_click({
             let sender = click_event_sender.clone();
             move || {
-                sender.send_or_drop(());
+                // Capture Lamport time NOW at DOM callback, before channel
+                sender.send_or_drop(TimestampedEvent::now(()));
             }
         })
         .after_remove(move |_| {
@@ -2214,10 +2258,9 @@ fn element_label(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
-    type DoubleClickEvent = ();
-
-    let (double_click_sender, mut double_click_receiver) = NamedChannel::new("double_click.event", 8);
-    let (hovered_sender, _hovered_receiver) = NamedChannel::<bool>::new("double_click.hovered", 2);
+    // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
+    let (double_click_sender, mut double_click_receiver) = NamedChannel::<TimestampedEvent<()>>::new("double_click.event", 8);
+    let (hovered_sender, _hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("double_click.hovered", 2);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -2275,12 +2318,13 @@ fn element_label(
                             _hovered_link_value_sender = Some(sender);
                         }
                     }
-                    _click = double_click_receiver.select_next_some() => {
+                    event = double_click_receiver.select_next_some() => {
                         if let Some(sender) = double_click_link_value_sender.as_ref() {
-                            let event_value = Object::new_value(
+                            let event_value = Object::new_value_with_lamport_time(
                                 ConstructInfo::new("label::double_click_event", None, "Label double_click event"),
                                 construct_context.clone(),
                                 ValueIdempotencyKey::new(),
+                                event.lamport_time,
                                 [],
                             );
                             sender.send_or_drop(event_value);
@@ -2367,7 +2411,8 @@ fn element_label(
         .on_double_click({
             let sender = double_click_sender.clone();
             move || {
-                sender.send_or_drop(());
+                // Capture Lamport time NOW at DOM callback, before channel
+                sender.send_or_drop(TimestampedEvent::now(()));
             }
         })
         .after_remove(move |_| drop(event_handler_loop))
@@ -2402,7 +2447,8 @@ fn element_link(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
-    let (hovered_sender, mut hovered_receiver) = NamedChannel::new("link.hovered", 2);
+    // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
+    let (hovered_sender, mut hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("link.hovered", 2);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -2433,13 +2479,14 @@ fn element_link(
                         sender.send_or_drop(initial_hover_value);
                         hovered_link_value_sender = Some(sender);
                     }
-                    is_hovered = hovered_receiver.select_next_some() => {
+                    event = hovered_receiver.select_next_some() => {
                         if let Some(sender) = hovered_link_value_sender.as_ref() {
-                            let hover_tag = if is_hovered { "True" } else { "False" };
-                            let event_value = EngineTag::new_value(
+                            let hover_tag = if event.data { "True" } else { "False" };
+                            let event_value = EngineTag::new_value_with_lamport_time(
                                 ConstructInfo::new("link::hovered", None, "Link hovered state"),
                                 construct_context.clone(),
                                 ValueIdempotencyKey::new(),
+                                event.lamport_time,
                                 hover_tag,
                             );
                             sender.send_or_drop(event_value);
@@ -2513,7 +2560,8 @@ fn element_link(
         .to_signal(signal::from_stream(to_stream).map(|t| t.unwrap_or_default()))
         .new_tab(NewTab::new())
         .on_hovered_change(move |is_hovered| {
-            hovered_sender.send_or_drop(is_hovered);
+            // Capture Lamport time NOW at DOM callback, before channel
+            hovered_sender.send_or_drop(TimestampedEvent::now(is_hovered));
         })
         .update_raw_el(|raw_el| {
             raw_el.style_signal("text-decoration", underline_signal)

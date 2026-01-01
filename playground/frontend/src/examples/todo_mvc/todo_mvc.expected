@@ -229,6 +229,68 @@ actions = [["click_button_near_text", "Test toggle bug"]]
 expect = "4 items left"
 
 # ============================================
+# SECTION 6c: EVENT ORDERING TEST (Lamport timestamp fix)
+# ============================================
+# This section tests that DOM events (change, key_down) are processed
+# in the correct order using Lamport timestamps. Before the fix,
+# the select! loop could pick key_down before change, causing the
+# todo to be added with empty text.
+#
+# The fix captures Lamport time at DOM callback (before channels),
+# not at Value creation (after select! picks), ensuring proper ordering.
+
+[[sequence]]
+description = "EVENT ORDER: Add first rapid todo after interactions"
+actions = [
+    ["type", "Rapid todo 1"],
+    ["key", "Enter"]
+]
+expect = "Rapid todo 1"
+
+[[sequence]]
+description = "EVENT ORDER: Verify first rapid todo has correct text (not empty)"
+expect = "5 items left"
+
+[[sequence]]
+description = "EVENT ORDER: Add second rapid todo immediately"
+actions = [
+    ["type", "Rapid todo 2"],
+    ["key", "Enter"]
+]
+expect = "Rapid todo 2"
+
+[[sequence]]
+description = "EVENT ORDER: Verify second rapid todo has correct text"
+expect = "6 items left"
+
+[[sequence]]
+description = "EVENT ORDER: Add third rapid todo to verify consistency"
+actions = [
+    ["type", "Rapid todo 3"],
+    ["key", "Enter"]
+]
+expect = "Rapid todo 3"
+
+[[sequence]]
+description = "EVENT ORDER: All 3 rapid todos should be present with correct text"
+expect = "7 items left"
+
+[[sequence]]
+description = "EVENT ORDER: Delete rapid todos to restore state"
+actions = [["click_button_near_text", "Rapid todo 3"]]
+expect = "6 items left"
+
+[[sequence]]
+description = "EVENT ORDER: Delete second rapid todo"
+actions = [["click_button_near_text", "Rapid todo 2"]]
+expect = "5 items left"
+
+[[sequence]]
+description = "EVENT ORDER: Delete first rapid todo"
+actions = [["click_button_near_text", "Rapid todo 1"]]
+expect = "4 items left"
+
+# ============================================
 # SECTION 7: CHECK DIFFERENT TODO
 # ============================================
 
