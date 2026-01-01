@@ -4127,10 +4127,10 @@ async fn get_link_sender_from_alias(
             // Start from PASSED value and traverse extra_parts
             let passed = ctx.actor_context.passed.as_ref()?;
 
-            // Wait for the first value from PASSED using subscription
+            // Wait for the first value from PASSED using value()
             // This fixes the race condition where store object isn't assigned to PASSED yet
-            // when element tries to bind (NoValueYet error). stream().next() waits for the value.
-            let mut current_value = passed.clone().stream().next().await?;
+            // when element tries to bind. value() returns immediately if available, else waits.
+            let mut current_value = passed.clone().value().await.ok()?;
 
             // Traverse the path
             for (i, part) in extra_parts.iter().enumerate() {
@@ -4152,9 +4152,9 @@ async fn get_link_sender_from_alias(
                     // At the end of the path, this should be a LINK variable
                     return variable.link_value_sender();
                 } else {
-                    // Not at the end yet, wait for next value using subscription
-                    // This handles the case where intermediate objects aren't ready yet
-                    current_value = variable.value_actor().stream().next().await?;
+                    // Not at the end yet, wait for next value
+                    // value() returns immediately if available, else waits
+                    current_value = variable.value_actor().value().await.ok()?;
                 }
             }
 
@@ -4198,8 +4198,9 @@ async fn get_link_sender_from_alias(
                 return None;
             }
 
-            // Wait for the first value using subscription (handles race conditions)
-            let mut current_value = root_actor.stream().next().await?;
+            // Wait for the first value (handles race conditions)
+            // value() returns immediately if available, else waits
+            let mut current_value = root_actor.value().await.ok()?;
 
             // Traverse the remaining path (skip first part since we already resolved it)
             for (i, part) in parts.iter().skip(1).enumerate() {
@@ -4225,8 +4226,8 @@ async fn get_link_sender_from_alias(
                     }
                     return sender;
                 } else {
-                    // Not at the end yet, wait for next value using subscription
-                    current_value = variable.value_actor().stream().next().await?;
+                    // Not at the end yet, wait for next value
+                    current_value = variable.value_actor().value().await.ok()?;
                 }
             }
 
