@@ -93,9 +93,9 @@ FUNCTION new_todo(title) {
             LATEST {
                 todo_elements.todo_title_element.event.double_click
                     |> THEN { True }
-                todo_elements.editing_todo_title_element.event.key_down |> WHEN {
-                    [key: Enter] => False
-                    [key: Escape] => False
+                todo_elements.editing_todo_title_element.event.key_down.key |> WHEN {
+                    Enter => False
+                    Escape => False
                     __ => SKIP
                 }
                 todo_elements.editing_todo_title_element.event.blur
@@ -557,10 +557,12 @@ FUNCTION filter_button(filter) {
             rounded_corners: 3
             outline: BLOCK {
                 selected: PASSED.store.selected_filter == filter
-                alpha: LIST { selected, element.hovered } |> WHEN {
-                    LIST { True, __ } => 0.2
-                    LIST { False, True } => 0.1
-                    LIST { False, False } => 0
+                alpha: selected |> WHILE {
+                    True => 0.2
+                    False => element.hovered |> WHILE {
+                        True => 0.1
+                        False => 0
+                    }
                 }
                 selected |> Bool/or(that: element.hovered) |> WHILE {
                     True => [
