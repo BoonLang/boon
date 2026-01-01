@@ -71,37 +71,38 @@ FUNCTION new_todo(title) {
             todo_title_element: LINK
             todo_checkbox: LINK
         ]
-        title: title |> HOLD state { BLOCK {
-            edit_el: todo_elements.editing_todo_title_element
-            -- confirm_title uses edit_el.text for blur events (text is stable by then)
-            confirm_title: edit_el.text
+        title: title |> HOLD state {
+            -- Read text AFTER event fires (not cached from BLOCK creation)
+            LATEST {
+                todo_elements.editing_todo_title_element.event.key_down.key
+                    |> WHEN { Enter => [], __ => SKIP }
+                todo_elements.editing_todo_title_element.event.blur
+                    |> THEN { [] }
+            }
+            |> THEN {
+                todo_elements.editing_todo_title_element.text
                 |> Text/trim()
                 |> WHEN {
-                    t => t
+                    trimmed_text =>
+                        trimmed_text
                         |> Text/is_not_empty()
-                        |> WHEN { True => t, False => SKIP }
+                        |> WHEN { True => trimmed_text, False => SKIP }
                 }
-            LATEST {
-                edit_el.event.key_down.key |> WHEN {
-                    Enter => confirm_title
-                    __ => SKIP
-                }
-                edit_el.event.blur |> THEN { confirm_title }
             }
-        }}
-        editing: False |> HOLD state { BLOCK {
-            edit_el: todo_elements.editing_todo_title_element
+        }
+        editing: False |> HOLD state {
             LATEST {
                 todo_elements.todo_title_element.event.double_click
                     |> THEN { True }
-                edit_el.event.key_down |> WHEN {
+                todo_elements.editing_todo_title_element.event.key_down |> WHEN {
                     [key: Enter] => False
                     [key: Escape] => False
                     __ => SKIP
                 }
-                edit_el.event.blur |> THEN { False }
+                todo_elements.editing_todo_title_element.event.blur
+                    |> THEN { False }
             }
-        }}
+        }
         completed: False |> HOLD state {
             LATEST {
                 todo_elements.todo_checkbox.event.click
