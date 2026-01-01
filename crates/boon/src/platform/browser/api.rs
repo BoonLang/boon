@@ -2008,9 +2008,14 @@ pub fn function_list_latest(
             // Return current items for merging
             future::ready(Some(items.clone()))
         }).flat_map(move |items| {
-            // Merge all item streams
+            // Merge all item streams, sorted by Lamport timestamp
             let streams: Vec<_> = items.iter().map(|item| item.clone().stream()).collect();
             stream::select_all(streams)
+                .ready_chunks(16)
+                .flat_map(|mut chunk| {
+                    chunk.sort_by_key(|value| value.lamport_time());
+                    stream::iter(chunk)
+                })
         })
     })
 }

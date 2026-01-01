@@ -3016,11 +3016,20 @@ impl LatestCombinator {
             .unwrap_or_else(parser::PersistenceId::new);
         let storage = construct_context.construct_storage.clone();
 
+        // Merge all input streams, then sort by Lamport timestamp to restore temporal ordering.
+        // `stream::select_all` races between channels, but events that arrived at nearly
+        // the same time (within the same poll) should be processed in Lamport order.
         let value_stream =
             stream::select_all(inputs.iter().enumerate().map(|(index, value_actor)| {
                 // Use stream() to properly handle lazy actors in HOLD body context
                 value_actor.clone().stream().map(move |value| (index, value))
             }))
+            .ready_chunks(16)  // Buffer up to 16 concurrent values
+            .flat_map(|mut chunk| {
+                // Sort by Lamport timestamp to restore happened-before ordering
+                chunk.sort_by_key(|(_, value)| value.lamport_time());
+                stream::iter(chunk)
+            })
             .scan(true, {
                 let storage = storage.clone();
                 move |first_run, (index, value)| {
@@ -3099,12 +3108,19 @@ impl BinaryOperatorCombinator {
     {
         let construct_info = construct_info.complete(ConstructType::ValueActor);
 
-        // Merge both operand streams, tracking which operand changed
-        // Use stream() to properly handle lazy actors in HOLD body context
+        // Merge both operand streams, tracking which operand changed.
+        // Use stream() to properly handle lazy actors in HOLD body context.
+        // Sort by Lamport timestamp to restore happened-before ordering when both
+        // operands have values ready at the same time.
         let value_stream = stream::select_all([
             operand_a.clone().stream().map(|v| (0usize, v)).boxed_local(),
             operand_b.clone().stream().map(|v| (1usize, v)).boxed_local(),
         ])
+        .ready_chunks(4)  // Buffer concurrent values
+        .flat_map(|mut chunk| {
+            chunk.sort_by_key(|(_, value)| value.lamport_time());
+            stream::iter(chunk)
+        })
         .scan(
             (None::<Value>, None::<Value>),
             move |(latest_a, latest_b), (index, value)| {

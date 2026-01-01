@@ -24,12 +24,12 @@ store: [
         __ => All
     }
     title_to_add:
-        -- key_down event now contains both .key and .text fields.
-        -- Matching full pattern [key: Enter, text: t] to capture text directly.
-        elements.new_todo_title_text_input.event.key_down
+        elements.new_todo_title_text_input.event.key_down.key
         |> WHEN {
-            [key: Enter, text: t] => BLOCK {
-                trimmed: t |> Text/trim()
+            Enter => BLOCK {
+                trimmed:
+                    elements.new_todo_title_text_input.text
+                    |> Text/trim()
                 trimmed
                     |> Text/is_not_empty()
                     |> WHEN { True => trimmed, False => SKIP }
@@ -82,17 +82,8 @@ FUNCTION new_todo(title) {
                         |> WHEN { True => t, False => SKIP }
                 }
             LATEST {
-                -- For Enter, use key_down.text to avoid data race.
-                -- Use destructuring pattern [key: Enter, text: t] to capture text directly,
-                -- same pattern that works for new_todo_title_text_input.
-                edit_el.event.key_down |> WHEN {
-                    [key: Enter, text: t] => t
-                        |> Text/trim()
-                        |> WHEN {
-                            trimmed => trimmed
-                                |> Text/is_not_empty()
-                                |> WHEN { True => trimmed, False => SKIP }
-                        }
+                edit_el.event.key_down.key |> WHEN {
+                    Enter => confirm_title
                     __ => SKIP
                 }
                 edit_el.event.blur |> THEN { confirm_title }

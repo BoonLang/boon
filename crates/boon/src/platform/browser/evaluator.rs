@@ -4178,10 +4178,16 @@ fn build_text_literal_actor(
             .map(|(_, actor)| actor.clone().stream())
             .collect();
 
-        // For simplicity, use select_all and latest values approach
+        // For simplicity, use select_all and latest values approach.
+        // Sort by Lamport timestamp to restore happened-before ordering.
         let merged = stream::select_all(part_subscriptions.into_iter().enumerate().map(|(idx, s)| {
             s.map(move |v| (idx, v))
-        }));
+        }))
+        .ready_chunks(8)
+        .flat_map(|mut chunk| {
+            chunk.sort_by_key(|(_, value)| value.lamport_time());
+            stream::iter(chunk)
+        });
 
         let part_count = part_actors.len();
         // Move forwarding_loops into scan state to keep them alive

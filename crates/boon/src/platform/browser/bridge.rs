@@ -1725,23 +1725,11 @@ fn element_text_input(
     tagged_object: Arc<TaggedObject>,
     construct_context: ConstructContext,
 ) -> impl Element {
-    // Single ordered queue for all text input events.
-    // This ensures DOM event order is preserved: change always processed before key_down.
-    //
-    // THE BUG THIS FIXES:
-    // With separate channels + select!, key_down could be processed before change
-    // even though change fires first in the DOM. This caused Enter to see stale text.
-    //
-    // THE FIX:
-    // All events go through one FIFO channel. DOM order = processing order.
-    #[derive(Clone, Debug)]
-    enum TextInputEvent {
-        Change(String),
-        KeyDown { key: String, text: String },
-        Blur,
-    }
-
-    let (event_sender, mut event_receiver) = NamedChannel::<TextInputEvent>::new("text_input.events", 64);
+    // Separate channels for each event type.
+    // Lamport timestamps on all values ensure correct ordering when combined with LATEST.
+    let (change_event_sender, mut change_event_receiver) = NamedChannel::<String>::new("text_input.change", 16);
+    let (key_down_event_sender, mut key_down_event_receiver) = NamedChannel::<String>::new("text_input.key_down", 32);
+    let (blur_event_sender, mut blur_event_receiver) = NamedChannel::<()>::new("text_input.blur", 8);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -1803,8 +1791,9 @@ fn element_text_input(
         )
     }
 
-    // Helper to create key_down event value
-    fn create_key_down_event_value(construct_context: &ConstructContext, key: String, text: String) -> Value {
+    // Helper to create key_down event value - only contains 'key', no 'text'
+    // Text should be obtained from the change event using LATEST { change.text, key_down.key }
+    fn create_key_down_event_value(construct_context: &ConstructContext, key: String) -> Value {
         Object::new_value(
             ConstructInfo::new("text_input::key_down_event", None, "TextInput key_down event"),
             construct_context.clone(),
@@ -1828,24 +1817,6 @@ fn element_text_input(
                     parser::PersistenceId::default(),
                     parser::Scope::Root,
                 ),
-                Variable::new_arc(
-                    ConstructInfo::new("text_input::key_down_event::text", None, "key_down text"),
-                    construct_context.clone(),
-                    "text",
-                    ValueActor::new_arc(
-                        ConstructInfo::new("text_input::key_down_event::text_actor", None, "key_down text actor"),
-                        ActorContext::default(),
-                        TypedStream::infinite(stream::once(future::ready(EngineText::new_value(
-                            ConstructInfo::new("text_input::key_down_event::text_value", None, "key_down text value"),
-                            construct_context.clone(),
-                            ValueIdempotencyKey::new(),
-                            text,
-                        ))).chain(stream::pending())),
-                        parser::PersistenceId::new(),
-                    ),
-                    parser::PersistenceId::default(),
-                    parser::Scope::Root,
-                ),
             ],
         )
     }
@@ -1857,119 +1828,45 @@ fn element_text_input(
             let mut key_down_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut blur_link_value_sender: Option<NamedChannel<Value>> = None;
 
-            // Pending events buffer - for events that arrive before LINK is set up.
-            // Uses the same TextInputEvent enum, preserving order.
-            let mut pending_events: Vec<TextInputEvent> = Vec::new();
-
-            // Current text value - updated by Change events, used by KeyDown.
-            // This is the key to fixing the race: we track text internally,
-            // and KeyDown uses this tracked value instead of racing with Change.
-            let mut current_text = String::new();
-
             loop {
                 select! {
                     // These branches get the Boon-side senders for each event type
                     result = change_stream.next() => {
                         if let Some(sender) = result {
-                            change_link_value_sender = Some(sender.clone());
-                            // Flush pending Change events
-                            let pending = std::mem::take(&mut pending_events);
-                            for event in pending {
-                                match event {
-                                    TextInputEvent::Change(text) => {
-                                        current_text = text.clone();
-                                        sender.send_or_drop(create_change_event_value(&construct_context, text));
-                                    }
-                                    other => pending_events.push(other),
-                                }
-                            }
+                            change_link_value_sender = Some(sender);
                         }
                     }
                     result = key_down_stream.next() => {
                         if let Some(sender) = result {
-                            key_down_link_value_sender = Some(sender.clone());
-                            // Flush pending KeyDown events
-                            let pending = std::mem::take(&mut pending_events);
-                            for event in pending {
-                                match event {
-                                    TextInputEvent::KeyDown { key, text } => {
-                                        // Use the text that was current when this event was queued
-                                        sender.send_or_drop(create_key_down_event_value(&construct_context, key, text));
-                                    }
-                                    other => pending_events.push(other),
-                                }
-                            }
+                            key_down_link_value_sender = Some(sender);
                         }
                     }
                     result = blur_stream.next() => {
                         if let Some(sender) = result {
-                            blur_link_value_sender = Some(sender.clone());
-                            // Flush pending Blur events
-                            let pending = std::mem::take(&mut pending_events);
-                            for event in pending {
-                                match event {
-                                    TextInputEvent::Blur => {
-                                        let event_value = Object::new_value(
-                                            ConstructInfo::new("text_input::blur_event", None, "TextInput blur event"),
-                                            construct_context.clone(),
-                                            ValueIdempotencyKey::new(),
-                                            [],
-                                        );
-                                        sender.send_or_drop(event_value);
-                                    }
-                                    other => pending_events.push(other),
-                                }
-                            }
+                            blur_link_value_sender = Some(sender);
                         }
                     }
-                    // SINGLE ORDERED QUEUE: All DOM events arrive here in FIFO order.
-                    // This is the fix for the race condition - events are processed
-                    // in the order they were fired by the DOM.
-                    event = event_receiver.select_next_some() => {
-                        zoon::println!("[BRIDGE] Processing event: {:?}", event);
-                        match event {
-                            TextInputEvent::Change(text) => {
-                                // Update tracked text BEFORE sending to Boon.
-                                // This ensures any subsequent KeyDown sees this text.
-                                current_text = text.clone();
-
-                                if let Some(sender) = change_link_value_sender.as_ref() {
-                                    sender.send_or_drop(create_change_event_value(&construct_context, text));
-                                } else {
-                                    pending_events.push(TextInputEvent::Change(text));
-                                }
-                            }
-                            TextInputEvent::KeyDown { key, text: dom_text } => {
-                                // Use current_text (updated by prior Change events in this queue).
-                                // Fall back to DOM-captured text only if current_text is empty
-                                // and DOM text is not (handles CDP edge case).
-                                let text = if current_text.is_empty() && !dom_text.is_empty() {
-                                    zoon::println!("[BRIDGE] KeyDown using DOM text fallback: {}", dom_text);
-                                    dom_text
-                                } else {
-                                    zoon::println!("[BRIDGE] KeyDown using tracked text: {}", current_text);
-                                    current_text.clone()
-                                };
-
-                                if let Some(sender) = key_down_link_value_sender.as_ref() {
-                                    sender.send_or_drop(create_key_down_event_value(&construct_context, key, text));
-                                } else {
-                                    pending_events.push(TextInputEvent::KeyDown { key, text });
-                                }
-                            }
-                            TextInputEvent::Blur => {
-                                if let Some(sender) = blur_link_value_sender.as_ref() {
-                                    let event_value = Object::new_value(
-                                        ConstructInfo::new("text_input::blur_event", None, "TextInput blur event"),
-                                        construct_context.clone(),
-                                        ValueIdempotencyKey::new(),
-                                        [],
-                                    );
-                                    sender.send_or_drop(event_value);
-                                } else {
-                                    pending_events.push(TextInputEvent::Blur);
-                                }
-                            }
+                    // Separate channels for each event type - Lamport ordering in engine
+                    // ensures correct happened-before semantics when combined with LATEST
+                    text = change_event_receiver.select_next_some() => {
+                        if let Some(sender) = change_link_value_sender.as_ref() {
+                            sender.send_or_drop(create_change_event_value(&construct_context, text));
+                        }
+                    }
+                    key = key_down_event_receiver.select_next_some() => {
+                        if let Some(sender) = key_down_link_value_sender.as_ref() {
+                            sender.send_or_drop(create_key_down_event_value(&construct_context, key));
+                        }
+                    }
+                    _ = blur_event_receiver.select_next_some() => {
+                        if let Some(sender) = blur_link_value_sender.as_ref() {
+                            let event_value = Object::new_value(
+                                ConstructInfo::new("text_input::blur_event", None, "TextInput blur event"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                [],
+                            );
+                            sender.send_or_drop(event_value);
                         }
                     }
                 }
@@ -2168,39 +2065,26 @@ fn element_text_input(
         .text_signal(signal::from_stream(text_stream).map(|t| t.unwrap_or_default()))
         .placeholder(Placeholder::with_signal(placeholder_signal.map(|t| t.unwrap_or_default())))
         .on_change({
-            let sender = event_sender.clone();
+            let sender = change_event_sender.clone();
             move |text| {
-                // All events go to single ordered queue - preserves DOM event order
-                sender.send_or_drop(TextInputEvent::Change(text));
+                sender.send_or_drop(text);
             }
         })
         .on_key_down_event({
-            let sender = event_sender.clone();
+            let sender = key_down_event_sender.clone();
             move |event| {
                 let key_name = match event.key() {
                     Key::Enter => "Enter".to_string(),
                     Key::Escape => "Escape".to_string(),
                     Key::Other(k) => k.clone(),
                 };
-                // Capture DOM text as fallback for CDP edge case.
-                // The queue processor will prefer its tracked current_text.
-                let dom_text = {
-                    use wasm_bindgen::JsCast;
-                    web_sys::window()
-                        .and_then(|w| w.document())
-                        .and_then(|d| d.active_element())
-                        .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
-                        .map(|el| el.value())
-                        .unwrap_or_default()
-                };
-                zoon::println!("[BRIDGE] on_key_down_event enqueue: key={}, dom_text={}", key_name, dom_text);
-                sender.send_or_drop(TextInputEvent::KeyDown { key: key_name, text: dom_text });
+                sender.send_or_drop(key_name);
             }
         })
         .on_blur({
-            let sender = event_sender.clone();
+            let sender = blur_event_sender.clone();
             move || {
-                sender.send_or_drop(TextInputEvent::Blur);
+                sender.send_or_drop(());
             }
         })
         .focus_signal(focus_signal)
