@@ -72,7 +72,6 @@ FUNCTION new_todo(title) {
             todo_checkbox: LINK
         ]
         title: title |> HOLD state {
-            -- Read text AFTER event fires (not cached from BLOCK creation)
             LATEST {
                 todo_elements.editing_todo_title_element.event.key_down.key
                     |> WHEN { Enter => [], __ => SKIP }
@@ -516,11 +515,11 @@ FUNCTION footer_section(align, child) {
 }
 
 FUNCTION active_items_count_text() {
-    -- Pattern match directly to avoid dataflow glitch where plural_suffix
-    -- computation races with TEXT interpolation (engine_v2 timing issue)
     PASSED.store.active_todos_count |> WHEN {
-        1 => TEXT { 1 item left }
-        count => TEXT { {count} items left }
+        count => BLOCK {
+            maybe_s: count |> WHEN { 1 => Text/empty(), __ => TEXT { s } }
+            TEXT { {count} item{maybe_s} left }
+        }
     }
 }
 
@@ -556,29 +555,26 @@ FUNCTION filter_button(filter) {
         style: [
             padding: [row: 8, column: 4]
             rounded_corners: 3
-            -- Workaround for BLOCK reactive chain bug:
-            -- Inline the selected_filter comparison directly to avoid
-            -- stale BLOCK local variables. When selected_filter changes,
-            -- the WHILE will re-evaluate both its condition and body.
-            outline:
-                PASSED.store.selected_filter == filter
-                |> Bool/or(that: element.hovered)
-                |> WHILE {
+            outline: BLOCK {
+                selected: PASSED.store.selected_filter == filter
+                alpha: LIST { selected, element.hovered } |> WHEN {
+                    LIST { True, __ } => 0.2
+                    LIST { False, True } => 0.1
+                    LIST { False, False } => 0
+                }
+                selected |> Bool/or(that: element.hovered) |> WHILE {
                     True => [
                         side: Inner
                         color: Oklch[
                             lightness: 0.5
                             chroma: 0.165
                             hue: 25.36
-                            -- Compute alpha inline: 0.2 if selected, 0.1 if only hovered
-                            alpha: PASSED.store.selected_filter == filter |> WHEN {
-                                True => 0.2
-                                False => 0.1
-                            }
+                            alpha: alpha
                         ]
                     ]
                     False => NoOutline
                 }
+            }
         ]
         label: filter |> WHEN {
             All => TEXT { All }
