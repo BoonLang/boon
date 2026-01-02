@@ -197,6 +197,11 @@ actions = [["click_checkbox", 0]]
 expect = "0 items left"
 
 [[sequence]]
+description = "BUG TEST: Toggle all icon should be DARK when all todos completed"
+actions = [["assert_toggle_all_darker"]]
+expect = "0 items left"
+
+[[sequence]]
 description = "Toggle all todos back to active"
 actions = [["click_checkbox", 0]]
 expect = "4 items left"

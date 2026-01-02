@@ -287,6 +287,7 @@ impl Action {
                             .to_string();
                         Ok(ParsedAction::AssertButtonHasOutline { text })
                     }
+                    "assert_toggle_all_darker" => Ok(ParsedAction::AssertToggleAllDarker),
                     _ => anyhow::bail!("Unknown action type: {}", cmd),
                 }
             }
@@ -319,6 +320,7 @@ pub enum ParsedAction {
     AssertNotFocused { input_index: u32 },  // Assert input does NOT have focus
     AssertCheckboxUnchecked { index: u32 },  // Assert checkbox is NOT checked
     AssertButtonHasOutline { text: String },  // Assert button has visible outline
+    AssertToggleAllDarker,  // Assert toggle all icon is dark (all todos completed)
 }
 
 #[derive(Debug, Clone, Deserialize)]

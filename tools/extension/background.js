@@ -2237,6 +2237,103 @@ async function handleCommand(id, command) {
           return { type: 'error', message: `Assert button has outline failed: ${e.message}` };
         }
 
+      case 'assertToggleAllDarker':
+        // Check if the toggle all checkbox icon is dark (all todos completed)
+        // The icon should have Oklch lightness ~0.40 when dark, ~0.75 when light
+        try {
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { found: false, error: 'Preview panel not found' };
+
+              // Find the toggle all checkbox - it's the first checkbox (index 0) containing the ❯ chevron
+              const checkboxes = preview.querySelectorAll('[role="checkbox"]');
+              if (checkboxes.length === 0) {
+                return { found: false, error: 'No checkboxes found' };
+              }
+
+              // The toggle all is the first checkbox
+              const toggleAll = checkboxes[0];
+
+              // Find the element containing ❯ (the icon) - look for deepest element with that text
+              let iconEl = null;
+              const allElements = toggleAll.querySelectorAll('*');
+              for (const el of allElements) {
+                let directText = '';
+                for (const node of el.childNodes) {
+                  if (node.nodeType === Node.TEXT_NODE) {
+                    directText += node.textContent;
+                  }
+                }
+                if (directText.trim() === '❯') {
+                  iconEl = el;
+                  break;
+                }
+              }
+
+              if (!iconEl) {
+                // Fallback: check the toggle all element itself or its first child
+                iconEl = toggleAll.querySelector('*') || toggleAll;
+              }
+
+              const style = window.getComputedStyle(iconEl);
+              const color = style.color;
+
+              // Parse the color to calculate luminance (without regex to avoid CDP issues)
+              // Color will be like "rgb(102, 102, 102)" or "oklch(40% 0 0)"
+              let actualLuminance = null;
+
+              if (color.indexOf('oklch') === 0) {
+                // Parse oklch(40% 0 0) or oklch(0.4 0 0) without regex
+                // Extract the first number after 'oklch('
+                const start = color.indexOf('(') + 1;
+                const end = color.indexOf('%') !== -1 ? color.indexOf('%') : color.indexOf(' ', start);
+                if (start > 0 && end > start) {
+                  const value = parseFloat(color.substring(start, end));
+                  actualLuminance = value > 1 ? value / 100 : value;
+                }
+              } else if (color.indexOf('rgb') === 0) {
+                // Parse rgb(102, 102, 102) without regex
+                const inner = color.substring(color.indexOf('(') + 1, color.indexOf(')'));
+                const parts = inner.split(',').map(function(s) { return parseInt(s.trim()); });
+                if (parts.length >= 3) {
+                  const r = parts[0] / 255;
+                  const g = parts[1] / 255;
+                  const b = parts[2] / 255;
+                  // sRGB to relative luminance (simplified)
+                  actualLuminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                }
+              }
+
+              return {
+                found: true,
+                color: color,
+                luminance: actualLuminance
+              };
+            })()
+          `);
+
+          if (!result.found) {
+            return { type: 'error', message: result.error || 'Toggle all icon not found' };
+          }
+
+          if (result.luminance === null) {
+            return { type: 'error', message: 'Could not parse color from: ' + result.color };
+          }
+
+          // For Oklch colors, we use lightness directly (not converted luminance)
+          // Dark = Oklch lightness 0.40, Light = Oklch lightness 0.75
+          // Threshold: if lightness < 0.55, it's dark enough (midpoint between 0.4 and 0.75 is ~0.575)
+          const isDark = result.luminance < 0.55;
+          if (!isDark) {
+            return { type: 'error', message: 'Toggle all icon is NOT dark. Lightness: ' + result.luminance.toFixed(3) + ', color: ' + result.color + ' (expected lightness < 0.55)' };
+          }
+
+          return { type: 'success', data: { luminance: result.luminance, color: result.color } };
+        } catch (e) {
+          return { type: 'error', message: 'Assert toggle all darker failed: ' + e.message };
+        }
+
       default:
         return { type: 'error', message: `Unknown command: ${type}` };
     }

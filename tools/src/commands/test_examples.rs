@@ -1327,6 +1327,17 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 _ => anyhow::bail!("Unexpected response for AssertButtonHasOutline"),
             }
         }
+        ParsedAction::AssertToggleAllDarker => {
+            // Verify that the toggle all checkbox icon is dark (all todos completed)
+            let response = send_command_to_server(port, WsCommand::AssertToggleAllDarker).await?;
+            match response {
+                WsResponse::Success { .. } => {}
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert toggle all darker failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for AssertToggleAllDarker"),
+            }
+        }
     }
     Ok(())
 }

@@ -1011,9 +1011,14 @@ fn schedule_expression(
             }
 
             // Create context with object_locals for variable expression evaluation
+            // IMPORTANT: BLOCK variables should always be reactive (not snapshot mode),
+            // even if the calling context has is_snapshot_context: true.
+            // Snapshot semantics should only apply to the immediate output of THEN/WHEN bodies,
+            // not to intermediate data structures like BLOCKs.
             let ctx_with_locals = EvaluationContext {
                 actor_context: ActorContext {
                     object_locals: object_locals.clone(),
+                    is_snapshot_context: false,
                     ..ctx.actor_context.clone()
                 },
                 ..ctx.clone()

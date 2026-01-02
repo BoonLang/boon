@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use zoon::futures_util::{future, select, stream, StreamExt};
+use zoon::futures_util::stream::LocalBoxStream;
 use zoon::*;
 
 use super::engine::{
@@ -231,6 +232,7 @@ fn element_container(
 
     // Font color
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
+    // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let font_color_signal = signal::from_stream({
         let style_stream = switch_map(
             sv_font_color.stream(),
@@ -247,16 +249,18 @@ fn element_container(
             }
         );
         switch_map(
-            font_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("color") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
+            switch_map(
+                font_stream,
+                |value| {
+                    let obj = value.expect_object();
+                    match obj.variable("color") {
+                        Some(var) => var.stream().left_stream(),
+                        None => stream::empty().right_stream(),
+                    }
                 }
-            }
+            ),
+            |value| oklch_to_css_stream(value)
         )
-        .filter_map(|value| oklch_to_css(value))
         .boxed_local()
     });
 
@@ -400,6 +404,7 @@ fn element_container(
     });
 
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
+    // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let background_signal = signal::from_stream({
         let style_stream = switch_map(
             sv4.stream(),
@@ -416,16 +421,18 @@ fn element_container(
             }
         );
         switch_map(
-            bg_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("color") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
+            switch_map(
+                bg_stream,
+                |value| {
+                    let obj = value.expect_object();
+                    match obj.variable("color") {
+                        Some(var) => var.stream().left_stream(),
+                        None => stream::empty().right_stream(),
+                    }
                 }
-            }
+            ),
+            |value| oklch_to_css_stream(value)
         )
-        .filter_map(|value| oklch_to_css(value))
         .boxed_local()
     });
 
@@ -896,6 +903,7 @@ fn element_stripe(
 
     // Background color
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
+    // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let sv_bg = tagged_object.expect_variable("settings");
     let background_signal = signal::from_stream({
         let style_stream = switch_map(
@@ -913,16 +921,18 @@ fn element_stripe(
             }
         );
         switch_map(
-            bg_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("color") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
+            switch_map(
+                bg_stream,
+                |value| {
+                    let obj = value.expect_object();
+                    match obj.variable("color") {
+                        Some(var) => var.stream().left_stream(),
+                        None => stream::empty().right_stream(),
+                    }
                 }
-            }
+            ),
+            |value| oklch_to_css_stream(value)
         )
-        .filter_map(|value| oklch_to_css(value))
         .boxed_local()
     });
 
@@ -1094,6 +1104,7 @@ fn element_stripe(
 
     // Font color
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
+    // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let sv_font_color = tagged_object.expect_variable("settings");
     let font_color_signal = signal::from_stream({
         let style_stream = switch_map(
@@ -1111,16 +1122,18 @@ fn element_stripe(
             }
         );
         switch_map(
-            font_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("color") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
+            switch_map(
+                font_stream,
+                |value| {
+                    let obj = value.expect_object();
+                    match obj.variable("color") {
+                        Some(var) => var.stream().left_stream(),
+                        None => stream::empty().right_stream(),
+                    }
                 }
-            }
+            ),
+            |value| oklch_to_css_stream(value)
         )
-        .filter_map(|value| oklch_to_css(value))
         .boxed_local()
     });
 
@@ -1546,6 +1559,7 @@ fn element_stack(
         }))
     });
 
+    // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let background_signal = signal::from_stream({
         let style_stream = switch_map(
             settings_variable_4.stream(),
@@ -1562,16 +1576,18 @@ fn element_stack(
             }
         );
         switch_map(
-            bg_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("color") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
+            switch_map(
+                bg_stream,
+                |value| {
+                    let obj = value.expect_object();
+                    match obj.variable("color") {
+                        Some(var) => var.stream().left_stream(),
+                        None => stream::empty().right_stream(),
+                    }
                 }
-            }
+            ),
+            |value| oklch_to_css_stream(value)
         )
-        .filter_map(|value| oklch_to_css(value))
         .boxed_local()
     });
 
@@ -1653,6 +1669,125 @@ async fn oklch_to_css(value: Value) -> Option<String> {
             Some(color.to_string())
         }
         _ => None,
+    }
+}
+
+/// Create a reactive stream that emits CSS color strings whenever Oklch components change.
+/// This fixes the bug where Oklch internal variables (lightness, chroma, hue) weren't subscribed to.
+/// When any Oklch component (lightness, chroma, hue, alpha) changes, a new CSS string is emitted.
+fn oklch_to_css_stream(value: Value) -> LocalBoxStream<'static, String> {
+    match value {
+        Value::TaggedObject(tagged, _) if tagged.tag() == "Oklch" => {
+            // Create streams for each component, with defaults for missing variables
+            // Use enum to identify which component is emitting
+            #[derive(Clone, Copy)]
+            enum Component { Lightness, Chroma, Hue, Alpha }
+
+            let lightness_stream: LocalBoxStream<'static, (Component, f64)> =
+                if let Some(v) = tagged.variable("lightness") {
+                    v.stream()
+                        .filter_map(|val| future::ready(match &val {
+                            Value::Number(n, _) => Some((Component::Lightness, n.number())),
+                            _ => None,
+                        }))
+                        .boxed_local()
+                } else {
+                    stream::once(future::ready((Component::Lightness, 0.5)))
+                        .chain(stream::pending())
+                        .boxed_local()
+                };
+
+            let chroma_stream: LocalBoxStream<'static, (Component, f64)> =
+                if let Some(v) = tagged.variable("chroma") {
+                    v.stream()
+                        .filter_map(|val| future::ready(match val {
+                            Value::Number(n, _) => Some((Component::Chroma, n.number())),
+                            _ => None,
+                        }))
+                        .boxed_local()
+                } else {
+                    stream::once(future::ready((Component::Chroma, 0.0)))
+                        .chain(stream::pending())
+                        .boxed_local()
+                };
+
+            let hue_stream: LocalBoxStream<'static, (Component, f64)> =
+                if let Some(v) = tagged.variable("hue") {
+                    v.stream()
+                        .filter_map(|val| future::ready(match val {
+                            Value::Number(n, _) => Some((Component::Hue, n.number())),
+                            _ => None,
+                        }))
+                        .boxed_local()
+                } else {
+                    stream::once(future::ready((Component::Hue, 0.0)))
+                        .chain(stream::pending())
+                        .boxed_local()
+                };
+
+            let alpha_stream: LocalBoxStream<'static, (Component, f64)> =
+                if let Some(v) = tagged.variable("alpha") {
+                    v.stream()
+                        .filter_map(|val| future::ready(match val {
+                            Value::Number(n, _) => Some((Component::Alpha, n.number())),
+                            _ => None,
+                        }))
+                        .boxed_local()
+                } else {
+                    stream::once(future::ready((Component::Alpha, 1.0)))
+                        .chain(stream::pending())
+                        .boxed_local()
+                };
+
+            // Combine all streams - emit new CSS whenever any component changes
+            // Use scan to maintain state of all components
+            stream::select_all([
+                lightness_stream,
+                chroma_stream,
+                hue_stream,
+                alpha_stream,
+            ])
+            .scan((0.5, 0.0, 0.0, 1.0), |state, (component, value)| {
+                match component {
+                    Component::Lightness => state.0 = value,
+                    Component::Chroma => state.1 = value,
+                    Component::Hue => state.2 = value,
+                    Component::Alpha => state.3 = value,
+                }
+                let (l, c, h, a) = *state;
+                let css = if a < 1.0 {
+                    format!("oklch({}% {} {} / {})", l * 100.0, c, h, a)
+                } else {
+                    format!("oklch({}% {} {})", l * 100.0, c, h)
+                };
+                future::ready(Some(css))
+            })
+            .boxed_local()
+        }
+        Value::Tag(tag, _) => {
+            // Handle named CSS colors - return constant infinite stream
+            let color = match tag.tag() {
+                "White" => "white",
+                "Black" => "black",
+                "Red" => "red",
+                "Green" => "green",
+                "Blue" => "blue",
+                "Yellow" => "yellow",
+                "Cyan" => "cyan",
+                "Magenta" => "magenta",
+                "Orange" => "orange",
+                "Purple" => "purple",
+                "Pink" => "pink",
+                "Brown" => "brown",
+                "Gray" | "Grey" => "gray",
+                "Transparent" => "transparent",
+                _ => return stream::empty().boxed_local(),
+            };
+            stream::once(future::ready(color.to_string()))
+                .chain(stream::pending())
+                .boxed_local()
+        }
+        _ => stream::empty().boxed_local(),
     }
 }
 
@@ -1797,6 +1932,7 @@ fn element_button(
 
     // Font color signal
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
+    // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let sv_font_color = settings_variable.clone();
     let font_color_signal = signal::from_stream({
         let style_stream = switch_map(
@@ -1810,14 +1946,16 @@ fn element_button(
                 None => stream::empty().right_stream(),
             }
         });
-        switch_map(font_stream, |value| {
-            let obj = value.expect_object();
-            match obj.variable("color") {
-                Some(var) => var.stream().left_stream(),
-                None => stream::empty().right_stream(),
-            }
-        })
-        .filter_map(|value| oklch_to_css(value))
+        switch_map(
+            switch_map(font_stream, |value| {
+                let obj = value.expect_object();
+                match obj.variable("color") {
+                    Some(var) => var.stream().left_stream(),
+                    None => stream::empty().right_stream(),
+                }
+            }),
+            |value| oklch_to_css_stream(value)
+        )
         .boxed_local()
     });
 
@@ -2068,6 +2206,7 @@ fn element_button(
 
     // Background color signal
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
+    // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let sv_background = settings_variable.clone();
     let background_signal = signal::from_stream({
         let style_stream = switch_map(
@@ -2081,14 +2220,16 @@ fn element_button(
                 None => stream::empty().right_stream(),
             }
         });
-        switch_map(bg_stream, |value| {
-            let obj = value.expect_object();
-            match obj.variable("color") {
-                Some(var) => var.stream().left_stream(),
-                None => stream::empty().right_stream(),
-            }
-        })
-        .filter_map(|value| oklch_to_css(value))
+        switch_map(
+            switch_map(bg_stream, |value| {
+                let obj = value.expect_object();
+                match obj.variable("color") {
+                    Some(var) => var.stream().left_stream(),
+                    None => stream::empty().right_stream(),
+                }
+            }),
+            |value| oklch_to_css_stream(value)
+        )
         .boxed_local()
     });
 
@@ -2606,6 +2747,7 @@ fn element_text_input(
 
     // Font color signal from style
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
+    // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let sv_font_color = tagged_object.expect_variable("settings");
     let font_color_signal = signal::from_stream({
         let style_stream = switch_map(
@@ -2619,19 +2761,22 @@ fn element_text_input(
                 None => stream::empty().right_stream(),
             }
         });
-        switch_map(font_stream, |value| {
-            let obj = value.expect_object();
-            match obj.variable("color") {
-                Some(var) => var.stream().left_stream(),
-                None => stream::empty().right_stream(),
-            }
-        })
-        .filter_map(|value| oklch_to_css(value))
+        switch_map(
+            switch_map(font_stream, |value| {
+                let obj = value.expect_object();
+                match obj.variable("color") {
+                    Some(var) => var.stream().left_stream(),
+                    None => stream::empty().right_stream(),
+                }
+            }),
+            |value| oklch_to_css_stream(value)
+        )
         .boxed_local()
     });
 
     // Background color signal from style
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
+    // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let sv_bg_color = tagged_object.expect_variable("settings");
     let background_color_signal = signal::from_stream({
         let style_stream = switch_map(
@@ -2645,14 +2790,16 @@ fn element_text_input(
                 None => stream::empty().right_stream(),
             }
         });
-        switch_map(bg_stream, |value| {
-            let obj = value.expect_object();
-            match obj.variable("color") {
-                Some(var) => var.stream().left_stream(),
-                None => stream::empty().right_stream(),
-            }
-        })
-        .filter_map(|value| oklch_to_css(value))
+        switch_map(
+            switch_map(bg_stream, |value| {
+                let obj = value.expect_object();
+                match obj.variable("color") {
+                    Some(var) => var.stream().left_stream(),
+                    None => stream::empty().right_stream(),
+                }
+            }),
+            |value| oklch_to_css_stream(value)
+        )
         .boxed_local()
     });
 
@@ -2980,6 +3127,7 @@ fn element_label(
     });
 
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
+    // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
     let font_color_signal = signal::from_stream({
         let style_stream = switch_map(
             sv3.stream(),
@@ -2992,14 +3140,16 @@ fn element_label(
                 None => stream::empty().right_stream(),
             }
         });
-        switch_map(font_stream, |value| {
-            let obj = value.expect_object();
-            match obj.variable("color") {
-                Some(var) => var.stream().left_stream(),
-                None => stream::empty().right_stream(),
-            }
-        })
-        .filter_map(|value| oklch_to_css(value))
+        switch_map(
+            switch_map(font_stream, |value| {
+                let obj = value.expect_object();
+                match obj.variable("color") {
+                    Some(var) => var.stream().left_stream(),
+                    None => stream::empty().right_stream(),
+                }
+            }),
+            |value| oklch_to_css_stream(value)
+        )
         .boxed_local()
     });
 

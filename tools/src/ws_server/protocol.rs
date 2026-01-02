@@ -152,6 +152,9 @@ pub enum Command {
     /// Check if a button has a visible outline (outline CSS property is not "none")
     AssertButtonHasOutline { text: String },
 
+    /// Assert the toggle all checkbox icon is dark (all todos completed)
+    AssertToggleAllDarker,
+
     /// Navigate to a specific route/path (uses history.pushState + popstate event)
     NavigateTo { path: String },
 }
