@@ -32,6 +32,7 @@ After researching five major incremental computation systems, the key findings a
 6. [Browser WASM + WebWorkers Architecture](#6-browser-wasm--webworkers-architecture)
 7. [Implementation Priorities](#7-implementation-priorities)
 8. [References](#8-references)
+9. [Nested Collections & Hybrid Solution](#9-nested-collections--hybrid-solution)
 
 ---
 
@@ -954,6 +955,390 @@ impl EpochCoordinator {
 - `docs/language/storage/DATALOG_INCREMENTAL_RESEARCH.md` - Datalog systems
 - `docs/language/storage/RUST_STREAMING_ECOSYSTEM.md` - Ecosystem overview
 - `docs/engine/ACTOR_MODEL.md` - Boon's actor architecture
+
+---
+
+## 9. Nested Collections & Hybrid Solution
+
+### 9.1 The Nested Reactivity Problem
+
+Boon's actor model handles **nested reactive structures** (lists within lists, objects with reactive fields) correctly by design—each actor owns its subscriptions and propagates changes through the hierarchy. However, most incremental computation libraries were designed for **flat collections**:
+
+| Library | Nesting Model | Limitation |
+|---------|---------------|------------|
+| **Differential Dataflow** | Flat collections | Must flatten to `(parent_id, child_id, value)` |
+| **DBSP** | Flat Z-sets | Same flattening required |
+| **Jane Street Incremental** | DAG of scalars | Collections aren't native |
+| **RisingWave** | Relational tables | Foreign key joins for hierarchy |
+
+**Example: Todo with Subtasks**
+
+```boon
+todos: [
+    [
+        id: "todo-1",
+        title: "Main Task",
+        subtasks: [
+            [id: "sub-1", done: false],
+            [id: "sub-2", done: true]
+        ]
+    ]
+]
+```
+
+In DD/DBSP, this becomes three flat collections:
+```
+todos:    {("todo-1", "Main Task"): +1}
+subtasks: {("sub-1", "todo-1", false): +1, ("sub-2", "todo-1", true): +1}
+-- parent-child relationship via foreign key
+```
+
+**Boon's actor model preserves structure naturally** through nested actors.
+
+### 9.2 Libraries That Handle Nesting Well
+
+| Library | Language | Nesting | Patches | Incremental | Snapshots |
+|---------|----------|---------|---------|-------------|-----------|
+| **MobX-State-Tree** | JS/TS | ✅ Native tree | ✅ JSON-Patch | ⚠️ Manual | ✅ Built-in |
+| **Signia** | JS/TS | ⚠️ Manual | ✅ Diff history | ✅ Built-in | ✅ Epochs |
+| **Adapton** | Rust/OCaml | ⚠️ Via IDs | ❌ | ✅ Memoization | ❌ |
+| **Salsa** | Rust | ⚠️ Via IDs | ❌ | ✅ Queries | ❌ |
+
+#### MobX-State-Tree (MST)
+
+**Core Innovation:** Tree of typed nodes where identity is determined by position.
+
+```typescript
+const TodoModel = types.model({
+  id: types.identifier,
+  title: types.string,
+  subtasks: types.array(SubtaskModel)  // Nested!
+})
+
+// Every mutation produces JSON-Patch
+[
+  { op: "replace", path: "/todos/0/subtasks/1/done", value: true }
+]
+```
+
+**Strengths:**
+- Full path in every patch (which subtask changed?)
+- Snapshots are immutable (time-travel, undo)
+- Middleware can intercept all changes
+
+**Weakness:** No automatic incremental derivations—`computed` values recompute fully.
+
+#### Signia
+
+**Core Innovation:** Epoch-based diff history with incremental computed values.
+
+```typescript
+const atom = atom("items", []);
+const computed = computed("filtered", () => {
+  return atom.value.filter(x => x.active);
+}, {
+  computeDiff: (prev, next) => {
+    // Incremental: only diff the changed items
+    return computeArrayDiff(prev, next);
+  }
+});
+```
+
+**Strengths:**
+- `getDiffSince(epoch)` returns only changes
+- Derived values can update incrementally
+- Explicit epoch tracking
+
+**Weakness:** Nesting requires manual tree construction.
+
+### 9.3 Boon's Current Limitations (with Code Evidence)
+
+| Limitation | Impact | Location |
+|------------|--------|----------|
+| **No unified diff/patch format** | Can't serialize/replay changes | Actor emits `Value`, not "what changed" |
+| **No path information** | Can't pinpoint nested changes | Subscribers see whole object, not field path |
+| **Full recomputation** | O(n) work for O(1) change | `engine.rs:7576-7591` |
+| **No snapshot/time-travel** | No undo, no debugging history | No epoch tracking in actors |
+
+#### Evidence: Full Recomputation in List/retain
+
+In `crates/boon/src/platform/browser/engine.rs:7576-7591`:
+
+```rust
+// Emit updated filtered result
+let filtered: Vec<_> = items.iter()                    // O(n) - iterate ALL items
+    .filter(|item| predicate_results.get(&item.persistence_id()) == Some(&true))
+    .cloned()                                           // O(n) - clone ALL matching
+    .collect();
+
+// ... deduplication check ...
+
+return Some((
+    Some(ListChange::Replace { items: filtered }),     // Full replacement!
+    // ...
+));
+```
+
+**The problem:** When item #42 in a 1000-item list changes its `done` field:
+
+1. Predicate for item #42 updates → triggers merged predicate stream
+2. Code updates `predicate_results` for that one item ✓ (O(1))
+3. But then it **iterates ALL 1000 items** to rebuild `filtered` ✗ (O(n))
+4. Emits `Replace { items: ... }` with ALL matching items ✗ (O(n))
+
+**Downstream cascade:** `List/count` in `api.rs:1650-1676` receives the full list and must recount entirely:
+
+```rust
+list.stream().scan((None, 0usize), |(last_count, current_count), change| {
+    match change {
+        ListChange::Replace { items } => {
+            *current_count = items.len();  // Must count ALL items
+        }
+        // ...
+    }
+})
+```
+
+**What incremental would look like:**
+
+```rust
+// Instead of Replace, emit granular change:
+ListChange::Insert { index: 42, item: item_42 }  // O(1) to emit
+
+// Then List/count can do:
+match change {
+    ListChange::Insert { .. } => *current_count += 1,  // O(1)!
+    ListChange::Remove { .. } => *current_count -= 1,
+}
+```
+
+### 9.4 Proposed Hybrid Solution
+
+**Keep Boon's actor hierarchy** (like MST's tree) but add:
+1. **Path-aware patches** (from MST)
+2. **Diff history with epochs** (from Signia)
+3. **Incremental derivations** (from Signia)
+
+#### Core Types
+
+```rust
+/// Epoch counter for change tracking
+pub type Epoch = u64;
+
+/// Path segment for nested access
+pub enum PathSegment {
+    Field(String),      // .field_name
+    Index(usize),       // [0]
+    Key(String),        // map key
+}
+
+/// A patch describes a single change with full path
+pub struct Patch {
+    pub epoch: Epoch,
+    pub path: Vec<PathSegment>,  // e.g., [Index(0), Field("subtasks"), Index(1), Field("done")]
+    pub op: PatchOp,
+}
+
+pub enum PatchOp {
+    Replace { old: Value, new: Value },
+    Insert { value: Value },
+    Remove { value: Value },
+}
+```
+
+#### ReactiveNode Trait
+
+```rust
+pub trait ReactiveNode: Send + Sync {
+    type Snapshot: Clone + Send;
+
+    /// Current epoch (increments on any change)
+    fn last_modified(&self) -> Epoch;
+
+    /// Immutable snapshot for time-travel
+    fn snapshot(&self) -> Self::Snapshot;
+
+    /// Get patches since given epoch
+    fn patches_since(&self, since: Epoch) -> PatchResult;
+
+    /// Subscribe to patch stream
+    fn subscribe_patches(&self) -> Receiver<Patch>;
+
+    /// Apply external patch (for undo, sync)
+    fn apply_patch(&mut self, patch: &Patch) -> Result<(), PatchError>;
+}
+
+pub enum PatchResult {
+    Patches(Vec<Patch>),           // Incremental update possible
+    TooOld,                        // Epoch predates history
+    Snapshot(Value),               // Fall back to full value
+}
+```
+
+#### Automatic Path Building
+
+When a nested actor changes, paths build automatically as the change bubbles up:
+
+```
+subtask.done changes (false → true)
+    │
+    ├── subtask emits: Patch { path: [Field("done")], op: Replace }
+    │
+    ▼
+parent actor receives, prepends index:
+    │
+    ├── Patch { path: [Index(1), Field("done")], op: Replace }
+    │
+    ▼
+grandparent prepends field:
+    │
+    └── Patch { path: [Field("subtasks"), Index(1), Field("done")], op: Replace }
+```
+
+#### Incremental Computed Values
+
+```rust
+pub struct IncrementalComputed<T, Input: ReactiveNode> {
+    input: Arc<Input>,
+    cached_value: Option<T>,
+    last_computed_epoch: Epoch,
+
+    /// Full recompute function
+    compute_full: Box<dyn Fn(&Input::Snapshot) -> T>,
+
+    /// Optional incremental update (if None, falls back to full)
+    compute_incremental: Option<Box<dyn Fn(&T, &[Patch]) -> Option<T>>>,
+}
+
+impl<T, Input: ReactiveNode> IncrementalComputed<T, Input> {
+    pub fn get(&mut self) -> &T {
+        let current_epoch = self.input.last_modified();
+
+        if self.last_computed_epoch == current_epoch {
+            return self.cached_value.as_ref().unwrap();
+        }
+
+        // Try incremental update first
+        if let Some(ref incremental_fn) = self.compute_incremental {
+            if let Some(cached) = &self.cached_value {
+                match self.input.patches_since(self.last_computed_epoch) {
+                    PatchResult::Patches(patches) => {
+                        if let Some(updated) = incremental_fn(cached, &patches) {
+                            self.cached_value = Some(updated);
+                            self.last_computed_epoch = current_epoch;
+                            return self.cached_value.as_ref().unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Fall back to full recompute
+        let snapshot = self.input.snapshot();
+        self.cached_value = Some((self.compute_full)(&snapshot));
+        self.last_computed_epoch = current_epoch;
+        self.cached_value.as_ref().unwrap()
+    }
+}
+```
+
+#### Diff History Buffer
+
+```rust
+pub struct DiffHistory {
+    patches: VecDeque<Patch>,
+    capacity: usize,
+    oldest_epoch: Epoch,
+}
+
+impl DiffHistory {
+    pub fn push(&mut self, patch: Patch) {
+        self.patches.push_back(patch);
+
+        // Evict old entries if over capacity
+        while self.patches.len() > self.capacity {
+            if let Some(old) = self.patches.pop_front() {
+                self.oldest_epoch = old.epoch + 1;
+            }
+        }
+    }
+
+    pub fn since(&self, epoch: Epoch) -> PatchResult {
+        if epoch < self.oldest_epoch {
+            return PatchResult::TooOld;
+        }
+
+        let patches: Vec<_> = self.patches
+            .iter()
+            .filter(|p| p.epoch > epoch)
+            .cloned()
+            .collect();
+
+        PatchResult::Patches(patches)
+    }
+}
+```
+
+### 9.5 Architecture Synthesis
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        BOON ACTOR HIERARCHY                          │
+│                     (MST-style tree semantics)                       │
+│                                                                      │
+│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐          │
+│   │   Parent    │────▶│    Child    │────▶│  Grandchild │          │
+│   │   Actor     │     │   Actor     │     │   Actor     │          │
+│   │             │     │             │     │             │          │
+│   │ DiffHistory │     │ DiffHistory │     │ DiffHistory │          │
+│   └──────┬──────┘     └──────┬──────┘     └──────┬──────┘          │
+│          │                   │                   │                  │
+│          │                   │                   │                  │
+│          ▼                   ▼                   ▼                  │
+│   ┌──────────────────────────────────────────────────────────┐     │
+│   │              PATCH STREAM (path-aware)                    │     │
+│   │   { epoch: 42, path: [Index(0), Field("done")],          │     │
+│   │     op: Replace { old: false, new: true } }              │     │
+│   └──────────────────────────────────────────────────────────┘     │
+│                              │                                      │
+│                              ▼                                      │
+│   ┌──────────────────────────────────────────────────────────┐     │
+│   │            INCREMENTAL COMPUTED                           │     │
+│   │                                                           │     │
+│   │   completed_count: IncrementalComputed {                 │     │
+│   │       compute_full: |todos| todos.iter()                 │     │
+│   │                          .filter(|t| t.done).count(),    │     │
+│   │       compute_incremental: |&old, patches| {             │     │
+│   │           // Only adjust count based on done changes     │     │
+│   │           patches.iter().fold(old, |acc, p| ...)         │     │
+│   │       }                                                   │     │
+│   │   }                                                       │     │
+│   └──────────────────────────────────────────────────────────┘     │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.6 What This Enables
+
+| Capability | Benefit | Example |
+|------------|---------|---------|
+| **Path-aware patches** | Precise change tracking | "Which todo's subtask changed?" |
+| **Diff history** | Time-travel debugging | "What changed in last 5 updates?" |
+| **Incremental derivations** | O(delta) for derived values | `completed_count` adjusts by ±1 |
+| **Snapshots** | Undo/redo, persistence replay | Serialize/restore exact state |
+| **External sync** | Collaborative editing | Merge patches from other clients |
+
+### 9.7 Implementation Priority
+
+| Phase | Task | Complexity | Impact |
+|-------|------|------------|--------|
+| **1** | Add `Epoch` to actors | Low | Foundation |
+| **1** | Define `Patch` and `PathSegment` | Low | Foundation |
+| **2** | Implement `DiffHistory` | Medium | Time-travel |
+| **2** | Auto path building in subscriptions | Medium | Observability |
+| **3** | `IncrementalComputed` wrapper | High | Performance |
+| **3** | `apply_patch` for external changes | High | Undo/sync |
 
 ---
 
