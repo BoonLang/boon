@@ -111,6 +111,7 @@ where
                     name,
                     is_referenced: false,
                     value,
+                    value_changed: false, // Set by persistence resolver
                 }
             });
 
@@ -582,6 +583,7 @@ where
                 name,
                 is_referenced: false,
                 value,
+                value_changed: false, // Set by persistence resolver
             }
         });
         let block_variable = variable_for_block
@@ -964,6 +966,9 @@ pub struct Variable<'code> {
     pub name: &'code str,
     pub is_referenced: bool,
     pub value: Spanned<Expression<'code>>,
+    /// Set by persistence resolver: true if value expression has NewOrChanged status.
+    /// Used to skip restoration from storage when code has changed.
+    pub value_changed: bool,
 }
 
 #[derive(Debug, Clone)]

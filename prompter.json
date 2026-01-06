@@ -1,5 +1,5 @@
 {
-  "instance_label": "boon_actors",
+  "instance_label": "boon",
   "port": 4567,
   "command": [
     "cl"

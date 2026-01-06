@@ -1,4 +1,4 @@
-use super::{ArithmeticOperator, Comparator, Expression, Literal, ParseError, Span, Spanned, Token};
+use super::{ArithmeticOperator, Comparator, Expression, Literal, ParseError, Span, Spanned, TextPart, Token};
 
 use std::collections::HashMap;
 
@@ -274,8 +274,13 @@ fn set_persistence<'a, 'code, 'old_code>(
                     &old_span_id_pairs,
                     new_span_id_pairs,
                     errors,
-                )
+                );
             }
+            // Set value_changed based on value expression's persistence status
+            variable.value_changed = variable.value.persistence
+                .as_ref()
+                .map(|p| p.status == PersistenceStatus::NewOrChanged)
+                .unwrap_or(true); // If no persistence, treat as changed
         }
         Expression::Object(object) => {
             let old_object_variables_and_id =
@@ -340,8 +345,13 @@ fn set_persistence<'a, 'code, 'old_code>(
                             &old_span_id_pairs,
                             new_span_id_pairs,
                             errors,
-                        )
+                        );
                     }
+                    // Set value_changed based on value expression's persistence status
+                    variable.value_changed = variable.value.persistence
+                        .as_ref()
+                        .map(|p| p.status == PersistenceStatus::NewOrChanged)
+                        .unwrap_or(true);
                 }
             } else {
                 let id = PersistenceId::new();
@@ -369,6 +379,11 @@ fn set_persistence<'a, 'code, 'old_code>(
                         new_span_id_pairs,
                         errors,
                     );
+                    // Set value_changed based on value expression's persistence status
+                    variable.value_changed = variable.value.persistence
+                        .as_ref()
+                        .map(|p| p.status == PersistenceStatus::NewOrChanged)
+                        .unwrap_or(true);
                 }
             }
         }
@@ -441,8 +456,13 @@ fn set_persistence<'a, 'code, 'old_code>(
                             &old_span_id_pairs,
                             new_span_id_pairs,
                             errors,
-                        )
+                        );
                     }
+                    // Set value_changed based on value expression's persistence status
+                    variable.value_changed = variable.value.persistence
+                        .as_ref()
+                        .map(|p| p.status == PersistenceStatus::NewOrChanged)
+                        .unwrap_or(true);
                 }
             } else {
                 let id = PersistenceId::new();
@@ -470,6 +490,11 @@ fn set_persistence<'a, 'code, 'old_code>(
                         new_span_id_pairs,
                         errors,
                     );
+                    // Set value_changed based on value expression's persistence status
+                    variable.value_changed = variable.value.persistence
+                        .as_ref()
+                        .map(|p| p.status == PersistenceStatus::NewOrChanged)
+                        .unwrap_or(true);
                 }
             }
         }
@@ -559,6 +584,23 @@ fn set_persistence<'a, 'code, 'old_code>(
                             )
                         }
                     }
+                }
+                // If any argument value has NewOrChanged status, give FunctionCall a NEW ID.
+                // This ensures function calls with changed argument values get new scopes,
+                // so variables inside the function that depend on parameters will refresh.
+                // Just changing the status isn't enough - the scope is determined by the ID.
+                let any_arg_changed = arguments.iter().any(|arg| {
+                    arg.node.value.as_ref().map_or(false, |v| {
+                        v.persistence.as_ref().map_or(false, |p| p.status == PersistenceStatus::NewOrChanged)
+                    })
+                });
+                if any_arg_changed {
+                    let new_id = PersistenceId::new();
+                    new_span_id_pairs.insert(*span, new_id);
+                    *persistence = Some(Persistence {
+                        id: new_id,
+                        status: PersistenceStatus::NewOrChanged,
+                    });
                 }
             } else {
                 let id = PersistenceId::new();
@@ -654,8 +696,13 @@ fn set_persistence<'a, 'code, 'old_code>(
                             &old_span_id_pairs,
                             new_span_id_pairs,
                             errors,
-                        )
+                        );
                     }
+                    // Set value_changed based on value expression's persistence status
+                    variable.value_changed = variable.value.persistence
+                        .as_ref()
+                        .map(|p| p.status == PersistenceStatus::NewOrChanged)
+                        .unwrap_or(true);
                 }
                 set_persistence(
                     output,
@@ -690,6 +737,11 @@ fn set_persistence<'a, 'code, 'old_code>(
                         new_span_id_pairs,
                         errors,
                     );
+                    // Set value_changed based on value expression's persistence status
+                    variable.value_changed = variable.value.persistence
+                        .as_ref()
+                        .map(|p| p.status == PersistenceStatus::NewOrChanged)
+                        .unwrap_or(true);
                 }
                 set_persistence(output, &[], &old_span_id_pairs, new_span_id_pairs, errors)
             }
@@ -1127,14 +1179,32 @@ fn set_persistence<'a, 'code, 'old_code>(
                 });
             }
         }
-        Expression::TextLiteral { parts: _ } => {
-            // TextLiteral is like a Literal - just assign a new ID
-            let id = PersistenceId::new();
-            new_span_id_pairs.insert(*span, id);
-            *persistence = Some(Persistence {
-                id,
-                status: PersistenceStatus::NewOrChanged,
-            });
+        Expression::TextLiteral { parts } => {
+            // Try to find matching TextLiteral with same parts (like Literal matches by value)
+            let id = old_expressions
+                .iter()
+                .find_map(|old_expression| match old_expression {
+                    Spanned {
+                        span,
+                        persistence: _,
+                        node: Expression::TextLiteral { parts: old_parts },
+                    } if text_parts_match(parts, old_parts) => Some(old_span_id_pairs[span]),
+                    _ => None,
+                });
+            if let Some(id) = id {
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::Unchanged,
+                });
+            } else {
+                let id = PersistenceId::new();
+                new_span_id_pairs.insert(*span, id);
+                *persistence = Some(Persistence {
+                    id,
+                    status: PersistenceStatus::NewOrChanged,
+                });
+            }
         }
         Expression::Hold { state_param, body } => {
             let old_body_and_id =
@@ -1370,4 +1440,20 @@ fn set_persistence<'a, 'code, 'old_code>(
             });
         }
     }
+}
+
+/// Compares two TextLiteral parts slices for equality.
+/// Two TextLiterals match if they have the same parts structure:
+/// - Same number of parts
+/// - Text parts have identical content
+/// - Interpolation parts have the same variable name (ignore referenced_span)
+fn text_parts_match<'a, 'b>(new_parts: &[TextPart<'a>], old_parts: &[TextPart<'b>]) -> bool {
+    if new_parts.len() != old_parts.len() {
+        return false;
+    }
+    new_parts.iter().zip(old_parts.iter()).all(|(new, old)| match (new, old) {
+        (TextPart::Text(a), TextPart::Text(b)) => a == b,
+        (TextPart::Interpolation { var: a, .. }, TextPart::Interpolation { var: b, .. }) => a == b,
+        _ => false,
+    })
 }

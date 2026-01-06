@@ -30,7 +30,7 @@ async fn yield_once() {
 }
 
 use super::super::super::parser::{
-    Persistence, PersistenceId, Scope, SourceCode, Span, span_at, static_expression, lexer, parser, resolve_references, Token, Spanned,
+    Persistence, PersistenceId, PersistenceStatus, Scope, SourceCode, Span, span_at, static_expression, lexer, parser, resolve_references, Token, Spanned,
 };
 use super::api;
 use super::engine::*;
@@ -55,14 +55,15 @@ fn create_variable_persistence_stream(
     scope: Scope,
     construct_context: ConstructContext,
     actor_context: ActorContext,
+    value_changed: bool,
 ) -> impl Stream<Item = Value> {
     let scoped_id = persistence_id.in_scope(&scope);
 
-    // Inside HOLD body (sequential_processing), skip restoration logic.
-    // HOLD itself handles state persistence. Variables inside HOLD body are
-    // recreated each iteration with fresh values that should NOT be overwritten
-    // by stored values from previous iterations.
-    if actor_context.sequential_processing {
+    // Skip restoration in two cases:
+    // 1. If value expression changed in code - ensures `width: 300` → `width: 400` uses the new value
+    // 2. Inside HOLD body (sequential_processing) - HOLD handles state persistence;
+    //    variables inside HOLD body are recreated each iteration with fresh values
+    if value_changed || actor_context.sequential_processing {
         return source_actor.stream()
             .then(move |value| {
                 let storage = storage.clone();
@@ -468,6 +469,8 @@ pub enum WorkItem {
         persistence_id: PersistenceId,
         ctx: EvaluationContext,
         result_slot: SlotId,
+        /// True if the expression's value changed in code (NewOrChanged status).
+        value_changed: bool,
     },
 }
 
@@ -507,6 +510,9 @@ pub struct ObjectVariableData {
     /// This allows the actor to be registered with ReferenceConnector before
     /// the field expression is evaluated, fixing forward reference race conditions.
     pub forwarding_actor: Option<(Arc<ValueActor>, NamedChannel<Value>)>,
+    /// True if the value expression has changed since last run.
+    /// Used to skip restoration from storage when code has changed.
+    pub value_changed: bool,
 }
 
 /// Holds the state of an ongoing work queue evaluation.
@@ -1002,6 +1008,7 @@ fn schedule_expression(
                     span: var_span,
                     persistence: var_persistence.clone(),
                     forwarding_actor,
+                    value_changed: var.node.value_changed,
                 });
 
                 // Collect for later scheduling (skip Link)
@@ -1108,6 +1115,7 @@ fn schedule_expression(
                     span: var_span,
                     persistence: var_persistence.clone(),
                     forwarding_actor,
+                    value_changed: var.node.value_changed,
                 });
 
                 // Collect for later scheduling (skip Link)
@@ -1206,6 +1214,7 @@ fn schedule_expression(
                     span: var_span,
                     persistence: var_persistence.clone(),
                     forwarding_actor,
+                    value_changed: var.node.value_changed,
                 });
 
                 // Collect for later scheduling (skip Link)
@@ -1423,7 +1432,10 @@ fn schedule_expression(
                         .filter_map(|(expr, slot)| {
                             // Only wrap LATEST expressions with value persistence
                             if matches!(expr.node, static_expression::Expression::Latest { .. }) {
-                                expr.persistence.as_ref().map(|p| (*slot, p.id))
+                                expr.persistence.as_ref().map(|p| {
+                                    let value_changed = p.status == PersistenceStatus::NewOrChanged;
+                                    (*slot, p.id, value_changed)
+                                })
                             } else {
                                 None
                             }
@@ -1436,13 +1448,14 @@ fn schedule_expression(
                     }
 
                     // Push persistence wrappers for LATEST args
-                    for (arg_slot, persistence_id) in latest_args_with_persistence {
+                    for (arg_slot, persistence_id, value_changed) in latest_args_with_persistence {
                         zoon::println!("[DEBUG] Pushing WrapWithPersistence for LATEST slot {:?} with id {}", arg_slot, persistence_id);
                         state.push(WorkItem::WrapWithPersistence {
                             source_slot: arg_slot,
                             persistence_id,
                             ctx: ctx_with_arg_locals.clone(),
                             result_slot: arg_slot, // wrap in place
+                            value_changed,
                         });
                     }
 
@@ -1833,6 +1846,7 @@ fn process_work_item(
                         ctx.actor_context.scope.clone(),
                         ctx.construct_context.clone(),
                         ctx.actor_context.clone(),
+                        vd.value_changed,
                     );
 
                     let persisted_actor = Arc::new(ValueActor::new(
@@ -2002,6 +2016,7 @@ fn process_work_item(
                         ctx.actor_context.scope.clone(),
                         ctx.construct_context.clone(),
                         ctx.actor_context.clone(),
+                        vd.value_changed,
                     );
 
                     let persisted_actor = Arc::new(ValueActor::new(
@@ -2561,7 +2576,7 @@ fn process_work_item(
             }
         }
 
-        WorkItem::WrapWithPersistence { source_slot, persistence_id, ctx, result_slot } => {
+        WorkItem::WrapWithPersistence { source_slot, persistence_id, ctx, result_slot, value_changed } => {
             // Wrap an evaluated function argument with persistence.
             // This enables persistence for LATEST and other constructs used as function arguments.
             zoon::println!("[DEBUG] Processing WrapWithPersistence for slot {:?} with id {}", source_slot, persistence_id);
@@ -2574,6 +2589,7 @@ fn process_work_item(
                     ctx.actor_context.scope.clone(),
                     ctx.construct_context.clone(),
                     ctx.actor_context.clone(),
+                    value_changed,
                 );
 
                 let persisted_actor = Arc::new(ValueActor::new(
@@ -5548,6 +5564,7 @@ fn static_spanned_variable_into_variable(
         name,
         value,
         is_referenced,
+        value_changed: _,
     } = variable;
 
     let persistence_id = persistence.clone().ok_or("Failed to get Persistence")?.id;

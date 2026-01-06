@@ -178,6 +178,9 @@ pub struct Variable {
     pub name: StrSlice,
     pub is_referenced: bool,
     pub value: Spanned<Expression>,
+    /// True if value expression has NewOrChanged persistence status.
+    /// Used to skip restoration from storage when code has changed.
+    pub value_changed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -408,6 +411,7 @@ impl ExpressionConverter {
             name: self.str_to_slice(var.name),
             is_referenced: var.is_referenced,
             value: self.convert_spanned(&var.value),
+            value_changed: var.value_changed,
         }
     }
 

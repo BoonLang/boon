@@ -6,7 +6,7 @@ document: Document/new(root: Element/stack(
         background: [color: Oklch[lightness: 0.15]]
     ]
     layers: LIST {
-        card(label: TEXT { Red Card }, hue: 0, x: 20, y: 20)
+        card(label: TEXT { Red Card }, hue: 25, x: 20, y: 20)
         card(label: TEXT { Green Card }, hue: 150, x: 60, y: 60)
         card(label: TEXT { Blue Card }, hue: 240, x: 100, y: 100)
     }
