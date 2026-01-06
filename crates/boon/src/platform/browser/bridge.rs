@@ -11,6 +11,38 @@ use super::engine::{
 };
 use crate::parser;
 
+/// Convert a Boon tag name to a Zoon Tag.
+/// Maps common semantic HTML tags and falls back to Custom for unknown tags.
+/// NOTE: Currently unused - ready for when HTML tag support is implemented.
+#[allow(dead_code)]
+fn boon_tag_to_zoon_tag(tag_name: &str) -> zoon::Tag<'static> {
+    match tag_name {
+        "Header" => zoon::Tag::Header,
+        "Footer" => zoon::Tag::Footer,
+        "Section" => zoon::Tag::Section,
+        "Article" => zoon::Tag::Article,
+        "Aside" => zoon::Tag::Aside,
+        "Main" => zoon::Tag::Main,
+        "Nav" => zoon::Tag::Nav,
+        "H1" => zoon::Tag::H1,
+        "H2" => zoon::Tag::H2,
+        "H3" => zoon::Tag::H3,
+        "H4" => zoon::Tag::H4,
+        "H5" => zoon::Tag::H5,
+        "H6" => zoon::Tag::H6,
+        // List elements not in Zoon's Tag enum - use Custom
+        "Ul" => zoon::Tag::Custom("ul"),
+        "Ol" => zoon::Tag::Custom("ol"),
+        "Li" => zoon::Tag::Custom("li"),
+        // Fallback for any other tag
+        other => {
+            let tag_lower = other.to_lowercase();
+            // Leak the string to get 'static lifetime - acceptable for small set of tags
+            zoon::Tag::Custom(Box::leak(tag_lower.into_boxed_str()))
+        }
+    }
+}
+
 /// Log unexpected type in debug mode. Call this in filter_map when receiving an unexpected type.
 /// This helps catch bugs where type mismatches would otherwise be silently swallowed.
 /// In release mode, this is a no-op.
@@ -129,9 +161,10 @@ fn element_container(
     let sv_bg_url = tagged_object.expect_variable("settings");
     let sv_size = tagged_object.expect_variable("settings");
 
-    // Padding with directional support
+    // Padding with directional support - produces tuple (top, right, bottom, left) as u32
+    // Uses Zoon's Padding::*_signal APIs for typed styling
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
-    let padding_signal = signal::from_stream({
+    let padding_tuple_signal = signal::from_stream({
         let style_stream = switch_map(
             sv7.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -148,53 +181,61 @@ fn element_container(
         )
         .filter_map(|value| async move {
                 match value {
-                    Value::Number(n, _) => Some(format!("{}px", n.number())),
+                    Value::Number(n, _) => {
+                        let all = n.number() as u32;
+                        Some((all, all, all, all))
+                    },
                     Value::Object(obj, _) => {
                         let top = if let Some(v) = obj.variable("top") {
                             if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number()
-                            } else { 0.0 }
+                                n.number() as u32
+                            } else { 0 }
                         } else if let Some(v) = obj.variable("column") {
                             if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number()
-                            } else { 0.0 }
-                        } else { 0.0 };
+                                n.number() as u32
+                            } else { 0 }
+                        } else { 0 };
                         let right = if let Some(v) = obj.variable("right") {
                             if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number()
-                            } else { 0.0 }
+                                n.number() as u32
+                            } else { 0 }
                         } else if let Some(v) = obj.variable("row") {
                             if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number()
-                            } else { 0.0 }
-                        } else { 0.0 };
+                                n.number() as u32
+                            } else { 0 }
+                        } else { 0 };
                         let bottom = if let Some(v) = obj.variable("bottom") {
                             if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number()
-                            } else { 0.0 }
+                                n.number() as u32
+                            } else { 0 }
                         } else if let Some(v) = obj.variable("column") {
                             if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number()
-                            } else { 0.0 }
-                        } else { 0.0 };
+                                n.number() as u32
+                            } else { 0 }
+                        } else { 0 };
                         let left = if let Some(v) = obj.variable("left") {
                             if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number()
-                            } else { 0.0 }
+                                n.number() as u32
+                            } else { 0 }
                         } else if let Some(v) = obj.variable("row") {
                             if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                                n.number()
-                            } else { 0.0 }
-                        } else { 0.0 };
-                        Some(format!("{}px {}px {}px {}px", top, right, bottom, left))
+                                n.number() as u32
+                            } else { 0 }
+                        } else { 0 };
+                        Some((top, right, bottom, left))
                     }
                     _ => None,
                 }
             })
             .boxed_local()
-    });
+    }).broadcast();
+    // Derive individual padding signals from the broadcasted tuple
+    let padding_top_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(t, _, _, _)| t));
+    let padding_right_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, r, _, _)| r));
+    let padding_bottom_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, _, b, _)| b));
+    let padding_left_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, _, _, l)| l));
 
-    // Font size
+    // Font size - produces u32 for typed Font API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let font_size_signal = signal::from_stream({
         let style_stream = switch_map(
@@ -223,7 +264,7 @@ fn element_container(
         )
         .filter_map(|value| {
             let result = if let Value::Number(n, _) = value {
-                Some(format!("{}px", n.number()))
+                Some(n.number() as u32)
             } else { None };
             future::ready(result)
         })
@@ -264,7 +305,7 @@ fn element_container(
         .boxed_local()
     });
 
-    // Font weight
+    // Font weight - produces FontWeight typed values
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let font_weight_signal = signal::from_stream({
         let style_stream = switch_map(
@@ -295,19 +336,20 @@ fn element_container(
             let result = match value {
                 Value::Tag(tag, _) => {
                     match tag.tag() {
-                        "Hairline" => Some("100"),
-                        "ExtraLight" | "UltraLight" => Some("200"),
-                        "Light" => Some("300"),
-                        "Regular" | "Normal" => Some("400"),
-                        "Medium" => Some("500"),
-                        "SemiBold" | "DemiBold" => Some("600"),
-                        "Bold" => Some("700"),
-                        "ExtraBold" | "UltraBold" => Some("800"),
-                        "Black" | "Heavy" => Some("900"),
+                        "Hairline" => Some(FontWeight::Hairline),
+                        "ExtraLight" | "UltraLight" => Some(FontWeight::ExtraLight),
+                        "Light" => Some(FontWeight::Light),
+                        "Regular" | "Normal" => Some(FontWeight::Regular),
+                        "Medium" => Some(FontWeight::Medium),
+                        "SemiBold" | "DemiBold" => Some(FontWeight::SemiBold),
+                        "Bold" => Some(FontWeight::Bold),
+                        "ExtraBold" | "UltraBold" => Some(FontWeight::ExtraBold),
+                        "Black" | "Heavy" => Some(FontWeight::Heavy),
+                        "ExtraHeavy" => Some(FontWeight::ExtraHeavy),
                         _ => None,
-                    }.map(|s| s.to_string())
+                    }
                 }
-                Value::Number(n, _) => Some(n.number().to_string()),
+                Value::Number(n, _) => Some(FontWeight::Number(n.number() as u32)),
                 _ => None,
             };
             future::ready(result)
@@ -315,9 +357,10 @@ fn element_container(
         .boxed_local()
     });
 
-    // Align (row: Center -> text-align: center + display: flex + justify-content)
+    // Align (row: Center -> text-align via Font typed API)
+    // Produces Font values for Font::with_signal_self() - no FontAlignment enum needed
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
-    let align_signal = signal::from_stream({
+    let align_font_signal = signal::from_stream({
         let style_stream = switch_map(
             sv_align.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -343,14 +386,15 @@ fn element_container(
             }
         )
         .filter_map(|value| {
-            let result = match value {
+            let result: Option<Font<'static>> = match value {
                 Value::Tag(tag, _) => {
                     match tag.tag() {
-                        "Center" => Some("center"),
-                        "Left" | "Start" => Some("flex-start"),
-                        "Right" | "End" => Some("flex-end"),
+                        "Center" => Some(Font::new().center()),
+                        "Left" | "Start" => Some(Font::new().left()),
+                        "Right" | "End" => Some(Font::new().right()),
+                        "Justify" => Some(Font::new().justify()),
                         _ => None,
-                    }.map(|s| s.to_string())
+                    }
                 }
                 _ => None,
             };
@@ -359,6 +403,7 @@ fn element_container(
         .boxed_local()
     });
 
+    // Width signal - produces u32 for typed Width API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let width_signal = signal::from_stream({
         let style_stream = switch_map(
@@ -376,11 +421,12 @@ fn element_container(
             }
         )
         .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(format!("{}px", n.number())),
+            Value::Number(n, _) => Some(n.number() as u32),
             _ => None,
         }))
     });
 
+    // Height signal - produces u32 for typed Height API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let height_signal = signal::from_stream({
         let style_stream = switch_map(
@@ -398,7 +444,7 @@ fn element_container(
             }
         )
         .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(format!("{}px", n.number())),
+            Value::Number(n, _) => Some(n.number() as u32),
             _ => None,
         }))
     });
@@ -436,7 +482,7 @@ fn element_container(
         .boxed_local()
     });
 
-    // Background image URL
+    // Background image URL - produces raw URL string for typed Background::url_signal API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let background_image_signal = signal::from_stream({
         let style_stream = switch_map(
@@ -464,12 +510,12 @@ fn element_container(
             }
         )
         .filter_map(|value| future::ready(match value {
-            Value::Text(text, _) => Some(format!("url(\"{}\")", text.text())),
+            Value::Text(text, _) => Some(text.text().to_string()),
             _ => None,
         }))
     });
 
-    // Size (shorthand for width + height)
+    // Size (shorthand for width + height) - produces u32 for typed Width/Height API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let size_signal = signal::from_stream({
         let style_stream = switch_map(
@@ -487,11 +533,12 @@ fn element_container(
             }
         )
         .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(format!("{}px", n.number())),
+            Value::Number(n, _) => Some(n.number() as u32),
             _ => None,
         }))
     });
 
+    // Border radius - produces u32 for typed RoundedCorners API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let border_radius_signal = signal::from_stream({
         let style_stream = switch_map(
@@ -509,12 +556,12 @@ fn element_container(
             }
         )
         .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(format!("{}px", n.number())),
+            Value::Number(n, _) => Some(n.number() as u32),
             _ => None,
         }))
     });
 
-    // Transform: move_right, move_down, and rotate
+    // Transform: move_right, move_down, and rotate - produces Transform typed values
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let transform_signal = signal::from_stream({
         let style_stream = switch_map(
@@ -557,23 +604,28 @@ fn element_container(
                 } else {
                     0.0
                 };
-                let mut transforms = Vec::new();
-                if move_right != 0.0 || move_down != 0.0 {
-                    transforms.push(format!("translate({}px, {}px)", move_right, move_down));
-                }
-                if rotate != 0.0 {
-                    transforms.push(format!("rotate({}deg)", rotate));
-                }
-                if transforms.is_empty() {
-                    None
+                // Build Transform using typed API
+                let has_transform = move_right != 0.0 || move_down != 0.0 || rotate != 0.0;
+                if has_transform {
+                    let mut transform = Transform::new();
+                    if move_right != 0.0 {
+                        transform = transform.move_right(move_right);
+                    }
+                    if move_down != 0.0 {
+                        transform = transform.move_down(move_down);
+                    }
+                    if rotate != 0.0 {
+                        transform = transform.rotate(rotate);
+                    }
+                    Some(transform)
                 } else {
-                    Some(transforms.join(" "))
+                    None
                 }
             })
             .boxed_local()
     });
 
-    // Size signal for height (duplicate for separate signal)
+    // Size signal for height (duplicate for separate signal) - produces u32
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_size2 = tagged_object.expect_variable("settings");
     let size_for_height_signal = signal::from_stream({
@@ -592,35 +644,46 @@ fn element_container(
             }
         )
         .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(format!("{}px", n.number())),
+            Value::Number(n, _) => Some(n.number() as u32),
             _ => None,
         }))
     });
 
-    El::new()
-        .update_raw_el(|raw_el| {
-            raw_el
-                .style_signal("padding", padding_signal)
-                // Apply width from style.width, then size overrides if present
-                .style_signal("width", width_signal)
-                .style_signal("width", size_signal)
-                .style_signal("height", height_signal)
-                .style_signal("height", size_for_height_signal)
-                .style_signal("background-color", background_signal)
-                .style_signal("background-image", background_image_signal)
-                .style("background-size", "contain")
-                .style("background-repeat", "no-repeat")
-                .style_signal("border-radius", border_radius_signal)
-                .style_signal("transform", transform_signal)
-                .style_signal("font-size", font_size_signal)
-                .style_signal("color", font_color_signal)
-                .style_signal("font-weight", font_weight_signal)
-                .style_signal("text-align", align_signal)
-                .style("display", "flex")
-                .style("flex-direction", "column")
-                .style("align-items", "center")
-        })
-        .child_signal(signal::from_stream(child_stream))
+    // Use Stripe (flex container by design) with typed styles
+    // display: flex, flex-direction: column are built into Stripe
+    // align-items: center is handled by Align::center_x()
+    // background-size: contain and background-repeat: no-repeat are global in MoonZoon's basic.css
+    //
+    // TODO: Implement HTML tag support (element.tag property)
+    // Currently element: [tag: Header] is IGNORED because:
+    // 1. Stripe::with_tag(tag) must be called at compile time, but tag is known at runtime
+    // 2. Stripe::new() and Stripe::with_tag() return different generic types
+    // Solutions:
+    //   a) Use Box<dyn Element> for dynamic dispatch (performance cost)
+    //   b) Add async element construction phase to read tag before construction
+    //   c) Request Zoon API: Stripe::new().tag_signal(tag_signal) for runtime tag changes
+    // The helper function boon_tag_to_zoon_tag() is already implemented and ready.
+    Stripe::new()
+        .direction(Direction::Column)
+        .s(AlignContent::new().center_x())  // Center children horizontally (not the element itself)
+        .s(Width::exact_signal(width_signal))
+        .s(Width::exact_signal(size_signal))  // size overrides width
+        .s(Height::exact_signal(height_signal))
+        .s(Height::exact_signal(size_for_height_signal))  // size overrides height
+        .s(Background::new().color_signal(background_signal).url_signal(background_image_signal))
+        .s(RoundedCorners::all_signal(border_radius_signal))
+        .s(Transform::with_signal_self(transform_signal))
+        .s(Font::new()
+            .size_signal(font_size_signal)
+            .color_signal(font_color_signal)
+            .weight_signal(font_weight_signal))
+        .s(Padding::new()
+            .top_signal(padding_top_signal)
+            .right_signal(padding_right_signal)
+            .bottom_signal(padding_bottom_signal)
+            .left_signal(padding_left_signal))
+        .s(Font::with_signal_self(align_font_signal))
+        .item_signal(signal::from_stream(child_stream))
         .after_remove(move |_| {
             drop(tagged_object);
         })
@@ -714,6 +777,7 @@ fn element_stripe(
         other => panic!("Invalid Stripe element direction value: Found: '{other}', Expected: 'Column' or 'Row'"),
     });
 
+    // Gap - produces u32 for typed Gap API
     let gap_stream = switch_map(
         settings_variable.clone().stream(),
         |value| {
@@ -723,16 +787,17 @@ fn element_stripe(
     )
     .filter_map(|value| {
         future::ready(match value {
-            Value::Number(n, _) => Some(format!("{}px", n.number())),
+            Value::Number(n, _) => Some(n.number() as u32),
             _ => None,
         })
     });
 
     // Style property streams for element_stripe
-    // Width with Fill and min/max support: Fill | number | [sizing: Fill, minimum: X, maximum: Y]
+    // Width - produces typed Width values with optional min/max constraints
+    // Supports: Fill | number | [sizing: Fill, minimum: X, maximum: Y]
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_width = tagged_object.expect_variable("settings");
-    let width_signal = signal::from_stream({
+    let width_typed_signal = signal::from_stream({
         let style_stream = switch_map(
             sv_width.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -749,18 +814,38 @@ fn element_stripe(
         )
         .filter_map(|value| async move {
             match value {
-                Value::Number(n, _) => Some(format!("{}px", n.number())),
-                Value::Tag(tag, _) if tag.tag() == "Fill" => Some("100%".to_string()),
+                Value::Number(n, _) => Some(Width::exact(n.number() as u32)),
+                Value::Tag(tag, _) if tag.tag() == "Fill" => Some(Width::fill()),
                 Value::Object(obj, _) => {
                     // Handle [sizing: Fill, minimum: X, maximum: Y]
-                    if let Some(v) = obj.variable("sizing") {
-                        if let Ok(Value::Tag(tag, _)) = v.value_actor().current_value().await {
-                            if tag.tag() == "Fill" {
-                                return Some("100%".to_string());
-                            }
+                    // Parse sizing (Fill or exact value)
+                    let base_width = if let Some(v) = obj.variable("sizing") {
+                        match v.value_actor().current_value().await {
+                            Ok(Value::Tag(tag, _)) if tag.tag() == "Fill" => Some(Width::fill()),
+                            Ok(Value::Number(n, _)) => Some(Width::exact(n.number() as u32)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    let mut width = base_width?;
+
+                    // Apply minimum constraint
+                    if let Some(v) = obj.variable("minimum") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            width = width.min(n.number() as u32);
                         }
                     }
-                    None
+
+                    // Apply maximum constraint
+                    if let Some(v) = obj.variable("maximum") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            width = width.max(n.number() as u32);
+                        }
+                    }
+
+                    Some(width)
                 }
                 _ => None,
             }
@@ -768,72 +853,11 @@ fn element_stripe(
         .boxed_local()
     });
 
-    // Min-width
-    // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
-    let sv_min_width = tagged_object.expect_variable("settings");
-    let min_width_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_min_width.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("width") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
-            }
-        )
-        .filter_map(|value| async move {
-            if let Value::Object(obj, _) = value {
-                if let Some(v) = obj.variable("minimum") {
-                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                        return Some(format!("{}px", n.number()));
-                    }
-                }
-            }
-            None
-        })
-        .boxed_local()
-    });
-
-    // Max-width
-    // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
-    let sv_max_width = tagged_object.expect_variable("settings");
-    let max_width_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_max_width.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("width") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
-            }
-        )
-        .filter_map(|value| async move {
-            if let Value::Object(obj, _) = value {
-                if let Some(v) = obj.variable("maximum") {
-                    if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                        return Some(format!("{}px", n.number()));
-                    }
-                }
-            }
-            None
-        })
-        .boxed_local()
-    });
-
-    // Height with Fill and minimum: Screen support
+    // Height - produces typed Height values with optional min constraint (supports Screen -> 100vh)
+    // Supports: Fill | number | [sizing: Fill, minimum: Screen | number]
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_height = tagged_object.expect_variable("settings");
-    let height_signal = signal::from_stream({
+    let height_typed_signal = signal::from_stream({
         let style_stream = switch_map(
             sv_height.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -850,53 +874,39 @@ fn element_stripe(
         )
         .filter_map(|value| async move {
             match value {
-                Value::Number(n, _) => Some(format!("{}px", n.number())),
-                Value::Tag(tag, _) if tag.tag() == "Fill" => Some("100%".to_string()),
+                Value::Number(n, _) => Some(Height::exact(n.number() as u32)),
+                Value::Tag(tag, _) if tag.tag() == "Fill" => Some(Height::fill()),
                 Value::Object(obj, _) => {
-                    if let Some(v) = obj.variable("sizing") {
-                        if let Ok(Value::Tag(tag, _)) = v.value_actor().current_value().await {
-                            if tag.tag() == "Fill" {
-                                return Some("100%".to_string());
+                    // Parse sizing (Fill or exact value)
+                    let base_height = if let Some(v) = obj.variable("sizing") {
+                        match v.value_actor().current_value().await {
+                            Ok(Value::Tag(tag, _)) if tag.tag() == "Fill" => Some(Height::fill()),
+                            Ok(Value::Number(n, _)) => Some(Height::exact(n.number() as u32)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    let mut height = base_height?;
+
+                    // Apply minimum constraint (supports Screen for 100vh and pixel values)
+                    if let Some(v) = obj.variable("minimum") {
+                        match v.value_actor().current_value().await {
+                            Ok(Value::Tag(tag, _)) if tag.tag() == "Screen" => {
+                                height = height.min_screen();
                             }
+                            Ok(Value::Number(n, _)) => {
+                                height = height.min(n.number() as u32);
+                            }
+                            _ => {}
                         }
                     }
-                    None
+
+                    Some(height)
                 }
                 _ => None,
             }
-        })
-        .boxed_local()
-    });
-
-    // Min-height (supports Screen -> 100vh)
-    // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
-    let sv_min_height = tagged_object.expect_variable("settings");
-    let min_height_signal = signal::from_stream({
-        let style_stream = switch_map(
-            sv_min_height.stream(),
-            |value| value.expect_object().expect_variable("style").stream()
-        );
-        switch_map(
-            style_stream,
-            |value| {
-                let obj = value.expect_object();
-                match obj.variable("height") {
-                    Some(var) => var.stream().left_stream(),
-                    None => stream::empty().right_stream(),
-                }
-            }
-        )
-        .filter_map(|value| async move {
-            if let Value::Object(obj, _) = value {
-                if let Some(v) = obj.variable("minimum") {
-                    match v.value_actor().current_value().await {
-                        Ok(Value::Number(n, _)) => return Some(format!("{}px", n.number())),
-                        Ok(Value::Tag(tag, _)) if tag.tag() == "Screen" => return Some("100vh".to_string()),
-                        _ => {}
-                    }
-                }
-            }
-            None
         })
         .boxed_local()
     });
@@ -936,10 +946,10 @@ fn element_stripe(
         .boxed_local()
     });
 
-    // Padding (directional: [top, column, left, right, row, bottom])
+    // Padding (directional: [top, column, left, right, row, bottom]) - produces tuple (top, right, bottom, left) as u32
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_padding = tagged_object.expect_variable("settings");
-    let padding_signal = signal::from_stream({
+    let padding_tuple_signal = signal::from_stream({
         let style_stream = switch_map(
             sv_padding.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -956,16 +966,19 @@ fn element_stripe(
         )
         .filter_map(|value| async move {
                 match value {
-                    Value::Number(n, _) => Some(format!("{}px", n.number())),
+                    Value::Number(n, _) => {
+                        let all = n.number() as u32;
+                        Some((all, all, all, all))
+                    },
                     Value::Object(obj, _) => {
-                        async fn get_num(obj: &Object, name: &str) -> f64 {
+                        async fn get_num(obj: &Object, name: &str) -> u32 {
                             if let Some(v) = obj.variable(name) {
                                 match v.value_actor().current_value().await {
-                                    Ok(Value::Number(n, _)) => n.number(),
-                                    _ => 0.0,
+                                    Ok(Value::Number(n, _)) => n.number() as u32,
+                                    _ => 0,
                                 }
                             } else {
-                                0.0
+                                0
                             }
                         }
                         let top = get_num(&obj, "top").await;
@@ -975,23 +988,28 @@ fn element_stripe(
                         let column = get_num(&obj, "column").await;
                         let row = get_num(&obj, "row").await;
 
-                        let final_top = if top > 0.0 { top } else { column };
-                        let final_bottom = if bottom > 0.0 { bottom } else { column };
-                        let final_left = if left > 0.0 { left } else { row };
-                        let final_right = if right > 0.0 { right } else { row };
+                        let final_top = if top > 0 { top } else { column };
+                        let final_bottom = if bottom > 0 { bottom } else { column };
+                        let final_left = if left > 0 { left } else { row };
+                        let final_right = if right > 0 { right } else { row };
 
-                        Some(format!("{}px {}px {}px {}px", final_top, final_right, final_bottom, final_left))
+                        Some((final_top, final_right, final_bottom, final_left))
                     }
                     _ => None,
                 }
             })
             .boxed_local()
-    });
+    }).broadcast();
+    // Derive individual padding signals from the broadcasted tuple
+    let padding_top_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(t, _, _, _)| t));
+    let padding_right_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, r, _, _)| r));
+    let padding_bottom_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, _, b, _)| b));
+    let padding_left_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, _, _, l)| l));
 
-    // Shadows (box-shadow from LIST of shadow objects)
+    // Shadows (box-shadow from LIST of shadow objects) - produces Vec<Shadow> for typed Shadows API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_shadows = tagged_object.expect_variable("settings");
-    let shadows_signal = signal::from_stream({
+    let shadows_typed_signal = signal::from_stream({
         let style_stream = switch_map(
             sv_shadows.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -1008,7 +1026,7 @@ fn element_stripe(
         )
         .filter_map(|value| async move {
                 if let Value::List(list, _) = &value {
-                    let mut shadow_parts = Vec::new();
+                    let mut shadows: Vec<Shadow> = Vec::new();
                     // Get all items from the list (snapshot returns (ItemId, Arc<ValueActor>) pairs)
                     let snapshot = list.snapshot().await;
                     for (_item_id, actor) in snapshot {
@@ -1024,10 +1042,10 @@ fn element_stripe(
                                     0.0
                                 }
                             }
-                            let x = get_num(&obj, "x").await;
-                            let y = get_num(&obj, "y").await;
-                            let blur = get_num(&obj, "blur").await;
-                            let spread = get_num(&obj, "spread").await;
+                            let x = get_num(&obj, "x").await as i32;
+                            let y = get_num(&obj, "y").await as i32;
+                            let blur = get_num(&obj, "blur").await as u32;
+                            let spread = get_num(&obj, "spread").await as i32;
 
                             // Check for inset (direction: Inwards)
                             let inset = if let Some(v) = obj.variable("direction") {
@@ -1039,23 +1057,34 @@ fn element_stripe(
                                 false
                             };
 
-                            // Get color
-                            let color_css = if let Some(v) = obj.variable("color") {
+                            // Get color using typed API
+                            let color: Option<Color> = if let Some(v) = obj.variable("color") {
                                 if let Ok(color_value) = v.value_actor().current_value().await {
-                                    oklch_to_css(color_value).await.unwrap_or_else(|| "rgba(0,0,0,0.2)".to_string())
+                                    oklch_to_color(color_value).await
                                 } else {
-                                    "rgba(0,0,0,0.2)".to_string()
+                                    None
                                 }
                             } else {
-                                "rgba(0,0,0,0.2)".to_string()
+                                None
                             };
 
-                            let inset_str = if inset { "inset " } else { "" };
-                            shadow_parts.push(format!("{}{}px {}px {}px {}px {}", inset_str, x, y, blur, spread, color_css));
+                            // Build typed Shadow
+                            let mut shadow = Shadow::new()
+                                .x(x)
+                                .y(y)
+                                .blur(blur)
+                                .spread(spread);
+                            if inset {
+                                shadow = shadow.inner();
+                            }
+                            if let Some(c) = color {
+                                shadow = shadow.color(c);
+                            }
+                            shadows.push(shadow);
                         }
                     }
-                    if !shadow_parts.is_empty() {
-                        Some(shadow_parts.join(", "))
+                    if !shadows.is_empty() {
+                        Some(shadows)
                     } else {
                         None
                     }
@@ -1066,7 +1095,7 @@ fn element_stripe(
             .boxed_local()
     });
 
-    // Font size (cascading to children)
+    // Font size - produces u32 for typed Font API (cascading to children)
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_font_size = tagged_object.expect_variable("settings");
     let font_size_signal = signal::from_stream({
@@ -1096,7 +1125,7 @@ fn element_stripe(
         )
         .filter_map(|value| {
             future::ready(match value {
-                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                Value::Number(n, _) => Some(n.number() as u32),
                 _ => None,
             })
         })
@@ -1137,7 +1166,7 @@ fn element_stripe(
         .boxed_local()
     });
 
-    // Font weight
+    // Font weight - produces FontWeight for typed Font API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_font_weight = tagged_object.expect_variable("settings");
     let font_weight_signal = signal::from_stream({
@@ -1169,19 +1198,20 @@ fn element_stripe(
             let result = match value {
                 Value::Tag(tag, _) => {
                     match tag.tag() {
-                        "Hairline" => Some("100"),
-                        "ExtraLight" | "UltraLight" => Some("200"),
-                        "Light" => Some("300"),
-                        "Regular" | "Normal" => Some("400"),
-                        "Medium" => Some("500"),
-                        "SemiBold" | "DemiBold" => Some("600"),
-                        "Bold" => Some("700"),
-                        "ExtraBold" | "UltraBold" => Some("800"),
-                        "Black" | "Heavy" => Some("900"),
+                        "Hairline" => Some(FontWeight::Hairline),
+                        "ExtraLight" | "UltraLight" => Some(FontWeight::ExtraLight),
+                        "Light" => Some(FontWeight::Light),
+                        "Regular" | "Normal" => Some(FontWeight::Regular),
+                        "Medium" => Some(FontWeight::Medium),
+                        "SemiBold" | "DemiBold" => Some(FontWeight::SemiBold),
+                        "Bold" => Some(FontWeight::Bold),
+                        "ExtraBold" | "UltraBold" => Some(FontWeight::ExtraBold),
+                        "Black" | "Heavy" => Some(FontWeight::Heavy),
+                        "ExtraHeavy" => Some(FontWeight::ExtraHeavy),
                         _ => None,
-                    }.map(|s| s.to_string())
+                    }
                 }
-                Value::Number(n, _) => Some(n.number().to_string()),
+                Value::Number(n, _) => Some(FontWeight::Number(n.number() as u32)),
                 _ => None,
             };
             future::ready(result)
@@ -1189,10 +1219,10 @@ fn element_stripe(
         .boxed_local()
     });
 
-    // Font family
+    // Font family - produces Vec<FontFamily> for typed Font API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_font_family = tagged_object.expect_variable("settings");
-    let font_family_signal = signal::from_stream({
+    let font_family_typed_signal = signal::from_stream({
         let style_stream = switch_map(
             sv_font_family.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -1221,15 +1251,19 @@ fn element_stripe(
             if let Value::List(list, _) = &value {
                 // Get all items from list (snapshot returns (ItemId, Arc<ValueActor>) pairs)
                 let snapshot = list.snapshot().await;
-                let mut families = Vec::new();
+                let mut families: Vec<FontFamily<'static>> = Vec::new();
                 for (_item_id, actor) in snapshot {
                     if let Ok(item) = actor.current_value().await {
                         match item {
-                            Value::Text(t, _) => families.push(format!("\"{}\"", t.text())),
+                            Value::Text(t, _) => {
+                                // Custom font name - leak to get 'static lifetime
+                                let name: &'static str = Box::leak(t.text().to_string().into_boxed_str());
+                                families.push(FontFamily::new(name));
+                            }
                             Value::Tag(tag, _) => match tag.tag() {
-                                "SansSerif" => families.push("sans-serif".to_string()),
-                                "Serif" => families.push("serif".to_string()),
-                                "Monospace" => families.push("monospace".to_string()),
+                                "SansSerif" => families.push(FontFamily::SansSerif),
+                                "Serif" => families.push(FontFamily::Serif),
+                                "Monospace" => families.push(FontFamily::Monospace),
                                 _ => {}
                             },
                             _ => {}
@@ -1237,7 +1271,7 @@ fn element_stripe(
                     }
                 }
                 if !families.is_empty() {
-                    Some(families.join(", "))
+                    Some(families)
                 } else {
                     None
                 }
@@ -1248,10 +1282,10 @@ fn element_stripe(
         .boxed_local()
     });
 
-    // Font align (text-align)
+    // Font align - produces Font values for typed API (text-align)
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_font_align = tagged_object.expect_variable("settings");
-    let font_align_signal = signal::from_stream({
+    let font_align_font_signal = signal::from_stream({
         let style_stream = switch_map(
             sv_font_align.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -1277,14 +1311,15 @@ fn element_stripe(
             }
         )
         .filter_map(|value| {
-            let result = match value {
+            let result: Option<Font<'static>> = match value {
                 Value::Tag(tag, _) => {
                     match tag.tag() {
-                        "Center" => Some("center"),
-                        "Left" => Some("left"),
-                        "Right" => Some("right"),
+                        "Center" => Some(Font::new().center()),
+                        "Left" => Some(Font::new().left()),
+                        "Right" => Some(Font::new().right()),
+                        "Justify" => Some(Font::new().justify()),
                         _ => None,
-                    }.map(|s| s.to_string())
+                    }
                 }
                 _ => None,
             };
@@ -1293,10 +1328,10 @@ fn element_stripe(
         .boxed_local()
     });
 
-    // Borders (supports [top: [color: Oklch[...]]])
+    // Borders (supports [top: [color: Oklch[...]]]) - produces Border for typed Borders API
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_borders = tagged_object.expect_variable("settings");
-    let border_top_signal = signal::from_stream({
+    let border_top_typed_signal = signal::from_stream({
         let style_stream = switch_map(
             sv_borders.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -1332,8 +1367,9 @@ fn element_stripe(
             }
         )
         .filter_map(|value| async move {
-            if let Some(color) = oklch_to_css(value).await {
-                Some(format!("3px solid {}", color))
+            if let Some(color) = oklch_to_color(value).await {
+                // Create typed Border with width 3, solid style, and the color
+                Some(Border::new().width(3).solid().color(color))
             } else {
                 None
             }
@@ -1341,12 +1377,19 @@ fn element_stripe(
         .boxed_local()
     });
 
-    // Align (row: Center -> justify-content: center for Row, align-items: center for Column)
+    // AlignContent (row: horizontal content alignment, column: vertical content alignment)
+    // Uses Zoon's AlignContent API which controls how CONTAINER aligns its CHILDREN
+    // (unlike Align which positions elements within their parent)
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
-    let sv_align = tagged_object.expect_variable("settings");
-    let align_items_signal = signal::from_stream({
+
+    // Horizontal alignment signal (align.row) - produces Option<HorizontalAlignment>
+    #[derive(Clone, Copy, Debug)]
+    enum HorizontalContentAlignment { Center, Left, Right }
+
+    let sv_align_row = tagged_object.expect_variable("settings");
+    let horizontal_content_align_signal = signal::from_stream({
         let style_stream = switch_map(
-            sv_align.stream(),
+            sv_align_row.stream(),
             |value| value.expect_object().expect_variable("style").stream()
         );
         let align_stream = switch_map(
@@ -1373,25 +1416,27 @@ fn element_stripe(
             let result = match value {
                 Value::Tag(tag, _) => {
                     match tag.tag() {
-                        "Center" => Some("center"),
-                        "Start" => Some("flex-start"),
-                        "End" => Some("flex-end"),
+                        "Center" => Some(HorizontalContentAlignment::Center),
+                        "Start" => Some(HorizontalContentAlignment::Left),
+                        "End" => Some(HorizontalContentAlignment::Right),
                         _ => None,
-                    }.map(|s| s.to_string())
+                    }
                 }
                 _ => None,
             };
             future::ready(result)
         })
         .boxed_local()
-    });
+    }).broadcast();
 
-    // Justify content signal for column alignment (controls main axis - vertical for Column direction)
-    // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
-    let sv_justify = tagged_object.expect_variable("settings");
-    let justify_content_signal = signal::from_stream({
+    // Vertical alignment signal (align.column) - produces Option<VerticalContentAlignment>
+    #[derive(Clone, Copy, Debug)]
+    enum VerticalContentAlignment { Center, Top, Bottom }
+
+    let sv_align_col = tagged_object.expect_variable("settings");
+    let vertical_content_align_signal = signal::from_stream({
         let style_stream = switch_map(
-            sv_justify.stream(),
+            sv_align_col.stream(),
             |value| value.expect_object().expect_variable("style").stream()
         );
         let align_stream = switch_map(
@@ -1418,18 +1463,45 @@ fn element_stripe(
             let result = match value {
                 Value::Tag(tag, _) => {
                     match tag.tag() {
-                        "Center" => Some("center"),
-                        "Start" => Some("flex-start"),
-                        "End" => Some("flex-end"),
+                        "Center" => Some(VerticalContentAlignment::Center),
+                        "Start" => Some(VerticalContentAlignment::Top),
+                        "End" => Some(VerticalContentAlignment::Bottom),
                         _ => None,
-                    }.map(|s| s.to_string())
+                    }
                 }
                 _ => None,
             };
             future::ready(result)
         })
         .boxed_local()
-    });
+    }).broadcast();
+
+    // Combined content alignment signal - combines horizontal and vertical into AlignContent values
+    // Uses map_ref! to combine both signals when either changes
+    let combined_content_align_signal = map_ref! {
+        let h_align = horizontal_content_align_signal.signal(),
+        let v_align = vertical_content_align_signal.signal() =>
+        {
+            let mut align = AlignContent::new();
+            // Apply horizontal content alignment
+            if let Some(h) = h_align {
+                align = match h {
+                    HorizontalContentAlignment::Center => align.center_x(),
+                    HorizontalContentAlignment::Left => align.left(),
+                    HorizontalContentAlignment::Right => align.right(),
+                };
+            }
+            // Apply vertical content alignment
+            if let Some(v) = v_align {
+                align = match v {
+                    VerticalContentAlignment::Center => align.center_y(),
+                    VerticalContentAlignment::Top => align.top(),
+                    VerticalContentAlignment::Bottom => align.bottom(),
+                };
+            }
+            align
+        }
+    };
 
     // Use switch_map for items stream - critical for proper re-rendering when example switches
     let items_vec_diff_stream = switch_map(
@@ -1461,26 +1533,25 @@ fn element_stripe(
             // Capture Lamport time NOW at DOM callback, before channel
             hovered_sender.send_or_drop(TimestampedEvent::now(is_hovered));
         })
-        .update_raw_el(|raw_el| {
-            raw_el
-                .style_signal("gap", signal::from_stream(gap_stream))
-                .style_signal("width", width_signal)
-                .style_signal("min-width", min_width_signal)
-                .style_signal("max-width", max_width_signal)
-                .style_signal("height", height_signal)
-                .style_signal("min-height", min_height_signal)
-                .style_signal("background-color", background_signal)
-                .style_signal("padding", padding_signal)
-                .style_signal("box-shadow", shadows_signal)
-                .style_signal("font-size", font_size_signal)
-                .style_signal("color", font_color_signal)
-                .style_signal("font-weight", font_weight_signal)
-                .style_signal("font-family", font_family_signal)
-                .style_signal("text-align", font_align_signal)
-                .style_signal("border-top", border_top_signal)
-                .style_signal("align-items", align_items_signal)
-                .style_signal("justify-content", justify_content_signal)
-        })
+        // Typed styles
+        .s(Gap::both_signal(signal::from_stream(gap_stream)))
+        .s(Background::new().color_signal(background_signal))
+        .s(Font::new()
+            .size_signal(font_size_signal)
+            .color_signal(font_color_signal)
+            .weight_signal(font_weight_signal)
+            .family_signal(font_family_typed_signal.map(|opt| opt.unwrap_or_default())))
+        .s(Padding::new()
+            .top_signal(padding_top_signal)
+            .right_signal(padding_right_signal)
+            .bottom_signal(padding_bottom_signal)
+            .left_signal(padding_left_signal))
+        .s(Font::with_signal_self(font_align_font_signal))
+        .s(Width::with_signal_self(width_typed_signal))
+        .s(Height::with_signal_self(height_typed_signal))
+        .s(Shadows::with_signal(shadows_typed_signal.map(|opt| opt.unwrap_or_default())))
+        .s(Borders::new().top_signal(border_top_typed_signal))
+        .s(AlignContent::with_signal_self(combined_content_align_signal))
         // Keep tagged_object alive for the lifetime of this element
         .after_remove(move |_| {
             drop(tagged_object);
@@ -1517,6 +1588,7 @@ fn element_stack(
     let settings_variable_3 = tagged_object.expect_variable("settings");
     let settings_variable_4 = tagged_object.expect_variable("settings");
 
+    // Width - produces u32 for typed Width API
     let width_signal = signal::from_stream({
         let style_stream = switch_map(
             settings_variable_2.stream(),
@@ -1533,11 +1605,12 @@ fn element_stack(
             }
         )
         .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(format!("{}px", n.number())),
+            Value::Number(n, _) => Some(n.number() as u32),
             _ => None,
         }))
     });
 
+    // Height - produces u32 for typed Height API
     let height_signal = signal::from_stream({
         let style_stream = switch_map(
             settings_variable_3.stream(),
@@ -1554,7 +1627,7 @@ fn element_stack(
             }
         )
         .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(format!("{}px", n.number())),
+            Value::Number(n, _) => Some(n.number() as u32),
             _ => None,
         }))
     });
@@ -1592,12 +1665,9 @@ fn element_stack(
     });
 
     Stack::new()
-        .update_raw_el(|raw_el| {
-            raw_el
-                .style_signal("width", width_signal)
-                .style_signal("height", height_signal)
-                .style_signal("background-color", background_signal)
-        })
+        .s(Width::exact_signal(width_signal))
+        .s(Height::exact_signal(height_signal))
+        .s(Background::new().color_signal(background_signal))
         .layers_signal_vec(VecDiffStreamSignalVec(layers_vec_diff_stream).map_signal(
             move |value_actor| {
                 signal::from_stream(value_actor.stream().map({
@@ -1667,6 +1737,59 @@ async fn oklch_to_css(value: Value) -> Option<String> {
                 _ => return None,
             };
             Some(color.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Convert a Boon color value to a Zoon Color.
+/// Supports Oklch tagged objects and named color tags.
+/// Unlike oklch_to_css which returns CSS strings, this returns typed Zoon Color values
+/// for use with typed style APIs like Shadow::color(), Border::color(), etc.
+async fn oklch_to_color(value: Value) -> Option<Color> {
+    match value {
+        Value::TaggedObject(tagged, _) if tagged.tag() == "Oklch" => {
+            // Helper to extract number from Variable (waits for first value if needed)
+            async fn get_num(tagged: &TaggedObject, name: &str, default: f64) -> f64 {
+                if let Some(v) = tagged.variable(name) {
+                    match v.value_actor().value().await {
+                        Ok(Value::Number(n, _)) => n.number(),
+                        _ => default,
+                    }
+                } else {
+                    default
+                }
+            }
+
+            let lightness = get_num(&tagged, "lightness", 0.5).await;
+            let chroma = get_num(&tagged, "chroma", 0.0).await;
+            let hue = get_num(&tagged, "hue", 0.0).await;
+            let alpha = get_num(&tagged, "alpha", 1.0).await;
+
+            // Create Zoon Color using oklch() builder
+            Some(oklch().l(lightness).c(chroma).h(hue).a(alpha).into_color())
+        }
+        Value::Tag(tag, _) => {
+            // Handle named CSS colors by parsing them as CSS strings
+            let css_color = match tag.tag() {
+                "White" => "white",
+                "Black" => "black",
+                "Red" => "red",
+                "Green" => "green",
+                "Blue" => "blue",
+                "Yellow" => "yellow",
+                "Cyan" => "cyan",
+                "Magenta" => "magenta",
+                "Orange" => "orange",
+                "Purple" => "purple",
+                "Pink" => "pink",
+                "Brown" => "brown",
+                "Gray" | "Grey" => "gray",
+                "Transparent" => "transparent",
+                _ => return None,
+            };
+            // Parse the CSS color string into a Zoon Color
+            Some(css_color.into_color())
         }
         _ => None,
     }
@@ -1921,7 +2044,7 @@ fn element_button(
         })
         .filter_map(|value| {
             let result = if let Value::Number(n, _) = value {
-                Some(format!("{}px", n.number()))
+                Some(n.number() as u32)
             } else {
                 None
             };
@@ -1959,10 +2082,10 @@ fn element_button(
         .boxed_local()
     });
 
-    // Padding signal
+    // Padding signal - produces tuple (top, right, bottom, left) as u32
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_padding = settings_variable.clone();
-    let padding_signal = signal::from_stream({
+    let padding_tuple_signal = signal::from_stream({
         let style_stream = switch_map(
             sv_padding.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -1976,51 +2099,59 @@ fn element_button(
         })
         .filter_map(|value| async move {
             match value {
-                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                Value::Number(n, _) => {
+                    let all = n.number() as u32;
+                    Some((all, all, all, all))
+                },
                 Value::Object(obj, _) => {
                     let top = if let Some(v) = obj.variable("top") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                            n.number()
-                        } else { 0.0 }
+                            n.number() as u32
+                        } else { 0 }
                     } else if let Some(v) = obj.variable("column") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                            n.number()
-                        } else { 0.0 }
-                    } else { 0.0 };
+                            n.number() as u32
+                        } else { 0 }
+                    } else { 0 };
                     let right = if let Some(v) = obj.variable("right") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                            n.number()
-                        } else { 0.0 }
+                            n.number() as u32
+                        } else { 0 }
                     } else if let Some(v) = obj.variable("row") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                            n.number()
-                        } else { 0.0 }
-                    } else { 0.0 };
+                            n.number() as u32
+                        } else { 0 }
+                    } else { 0 };
                     let bottom = if let Some(v) = obj.variable("bottom") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                            n.number()
-                        } else { 0.0 }
+                            n.number() as u32
+                        } else { 0 }
                     } else if let Some(v) = obj.variable("column") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                            n.number()
-                        } else { 0.0 }
-                    } else { 0.0 };
+                            n.number() as u32
+                        } else { 0 }
+                    } else { 0 };
                     let left = if let Some(v) = obj.variable("left") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                            n.number()
-                        } else { 0.0 }
+                            n.number() as u32
+                        } else { 0 }
                     } else if let Some(v) = obj.variable("row") {
                         if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
-                            n.number()
-                        } else { 0.0 }
-                    } else { 0.0 };
-                    Some(format!("{}px {}px {}px {}px", top, right, bottom, left))
+                            n.number() as u32
+                        } else { 0 }
+                    } else { 0 };
+                    Some((top, right, bottom, left))
                 }
                 _ => None,
             }
         })
         .boxed_local()
-    });
+    }).broadcast();
+    // Derive individual padding signals from the broadcasted tuple
+    let padding_top_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(t, _, _, _)| t));
+    let padding_right_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, r, _, _)| r));
+    let padding_bottom_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, _, b, _)| b));
+    let padding_left_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, _, _, l)| l));
 
     // Size (width) signal
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
@@ -2039,7 +2170,7 @@ fn element_button(
         })
         .filter_map(|value| {
             let result = if let Value::Number(n, _) = value {
-                Some(format!("{}px", n.number()))
+                Some(n.number() as u32)
             } else {
                 None
             };
@@ -2065,7 +2196,7 @@ fn element_button(
         })
         .filter_map(|value| {
             let result = if let Value::Number(n, _) = value {
-                Some(format!("{}px", n.number()))
+                Some(n.number() as u32)
             } else {
                 None
             };
@@ -2091,7 +2222,7 @@ fn element_button(
         })
         .filter_map(|value| {
             let result = if let Value::Number(n, _) = value {
-                Some(format!("{}px", n.number()))
+                Some(n.number() as u32)
             } else {
                 None
             };
@@ -2142,21 +2273,29 @@ fn element_button(
                         n.number()
                     } else { 0.0 }
                 } else { 0.0 };
-                // Calculate final x (negative for move_left, positive for move_right)
-                let x = move_right - move_left;
-                // Calculate final y (positive for move_down, negative for move_up)
-                let y = move_down - move_up;
-                let mut transforms = Vec::new();
-                if x != 0.0 || y != 0.0 {
-                    transforms.push(format!("translate({}px, {}px)", x, y));
+
+                // Build typed Transform value
+                let mut transform = zoon::Transform::new();
+                if move_left != 0.0 {
+                    transform = transform.move_left(move_left);
+                }
+                if move_right != 0.0 {
+                    transform = transform.move_right(move_right);
+                }
+                if move_up != 0.0 {
+                    transform = transform.move_up(move_up);
+                }
+                if move_down != 0.0 {
+                    transform = transform.move_down(move_down);
                 }
                 if rotate != 0.0 {
-                    transforms.push(format!("rotate({}deg)", rotate));
+                    transform = transform.rotate(rotate);
                 }
-                if transforms.is_empty() {
+                // Return None if no transformations were applied
+                if move_left == 0.0 && move_right == 0.0 && move_up == 0.0 && move_down == 0.0 && rotate == 0.0 {
                     None
                 } else {
-                    Some(transforms.join(" "))
+                    Some(transform)
                 }
             } else {
                 None
@@ -2165,10 +2304,10 @@ fn element_button(
         .boxed_local()
     });
 
-    // Font align signal (text-align)
+    // Font align - produces Font values for typed API (text-align)
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_font_align = settings_variable.clone();
-    let font_align_signal = signal::from_stream({
+    let font_align_font_signal = signal::from_stream({
         let style_stream = switch_map(
             sv_font_align.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -2188,12 +2327,13 @@ fn element_button(
             }
         })
         .filter_map(|value| {
-            let result = match value {
+            let result: Option<Font<'static>> = match value {
                 Value::Tag(tag, _) => {
                     match tag.tag() {
-                        "Center" => Some("center".to_string()),
-                        "Left" => Some("left".to_string()),
-                        "Right" => Some("right".to_string()),
+                        "Center" => Some(Font::new().center()),
+                        "Left" => Some(Font::new().left()),
+                        "Right" => Some(Font::new().right()),
+                        "Justify" => Some(Font::new().justify()),
                         _ => None,
                     }
                 }
@@ -2271,7 +2411,8 @@ fn element_button(
         switch_map(outline_value_stream, |value| {
             match &value {
                 Value::Tag(tag, _) if tag.tag() == "NoOutline" => {
-                    stream::once(future::ready("none".to_string()))
+                    // Return None to remove outline
+                    stream::once(future::ready(None::<zoon::Outline>))
                         .chain(stream::pending())
                         .boxed_local()
                 }
@@ -2306,8 +2447,15 @@ fn element_button(
                         if let Some(color_var) = obj.variable("color") {
                             if let Ok(color_value) = color_var.value_actor().value().await {
                                 if let Some(css_color) = oklch_to_css(color_value).await {
-                                    zoon::println!("[OUTLINE] Generated CSS: {}px {} {}", thickness, line_style, css_color);
-                                    return Some(format!("{}px {} {}", thickness, line_style, css_color));
+                                    zoon::println!("[OUTLINE] Generated typed Outline: width={}, style={}, color={}", thickness, line_style, css_color);
+                                    // Build typed Outline value
+                                    let mut outline = zoon::Outline::outer().width(thickness).color(css_color);
+                                    outline = match line_style {
+                                        "dashed" => outline.dashed(),
+                                        "dotted" => outline.dotted(),
+                                        _ => outline.solid(),
+                                    };
+                                    return Some(outline);
                                 } else {
                                     zoon::eprintln!("[OUTLINE] oklch_to_css returned None for color");
                                 }
@@ -2319,13 +2467,12 @@ fn element_button(
                         }
                         None
                     })
-                    .filter_map(|x| async move { x })
                     .chain(stream::pending())
                     .boxed_local()
                 }
                 other => {
                     log_unexpected_type("button outline", "Object or NoOutline tag", other);
-                    stream::pending::<String>().boxed_local()
+                    stream::pending::<Option<zoon::Outline>>().boxed_local()
                 }
             }
         })
@@ -2348,19 +2495,21 @@ fn element_button(
             // Capture Lamport time NOW at DOM callback, before channel
             hovered_sender.send_or_drop(TimestampedEvent::now(is_hovered));
         })
-        .update_raw_el(|raw_el| {
-            raw_el
-                .style_signal("font-size", font_size_signal)
-                .style_signal("color", font_color_signal)
-                .style_signal("padding", padding_signal)
-                .style_signal("width", size_width_signal)
-                .style_signal("height", size_height_signal)
-                .style_signal("border-radius", rounded_signal)
-                .style_signal("transform", transform_signal)
-                .style_signal("text-align", font_align_signal)
-                .style_signal("outline", outline_signal)
-                .style_signal("background-color", background_signal)
-        })
+        .s(Width::exact_signal(size_width_signal))
+        .s(Height::exact_signal(size_height_signal))
+        .s(RoundedCorners::all_signal(rounded_signal))
+        .s(Transform::with_signal_self(transform_signal))
+        .s(Outline::with_signal_self(outline_signal.map(|opt| opt.flatten())))
+        .s(Background::new().color_signal(background_signal))
+        .s(Font::new()
+            .size_signal(font_size_signal)
+            .color_signal(font_color_signal))
+        .s(Padding::new()
+            .top_signal(padding_top_signal)
+            .right_signal(padding_right_signal)
+            .bottom_signal(padding_bottom_signal)
+            .left_signal(padding_left_signal))
+        .s(Font::with_signal_self(font_align_font_signal))
         .after_remove(move |_| {
             drop(event_handler_loop);
             drop(tagged_object);
@@ -2641,9 +2790,10 @@ fn element_text_input(
     let placeholder_signal = signal::from_stream(placeholder_text_stream);
 
     // Width signal from style
+    // Width signal - produces Width values for typed API (supports Fill and pixel values)
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_width = tagged_object.expect_variable("settings");
-    let width_signal = signal::from_stream({
+    let width_typed_signal = signal::from_stream({
         let style_stream = switch_map(
             sv_width.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -2657,17 +2807,17 @@ fn element_text_input(
         })
         .filter_map(|value| {
             future::ready(match value {
-                Value::Number(n, _) => Some(format!("{}px", n.number())),
-                Value::Tag(tag, _) if tag.tag() == "Fill" => Some("100%".to_string()),
+                Value::Number(n, _) => Some(Width::exact(n.number() as u32)),
+                Value::Tag(tag, _) if tag.tag() == "Fill" => Some(Width::fill()),
                 _ => None,
             })
         })
     });
 
-    // Padding signal from style - supports simple number or directional object
+    // Padding signal from style - produces tuple (top, right, bottom, left) as u32
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_padding = tagged_object.expect_variable("settings");
-    let padding_signal = signal::from_stream({
+    let padding_tuple_signal = signal::from_stream({
         let style_stream = switch_map(
             sv_padding.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -2681,17 +2831,20 @@ fn element_text_input(
         })
         .filter_map(|value| async move {
             match value {
-                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                Value::Number(n, _) => {
+                    let all = n.number() as u32;
+                    Some((all, all, all, all))
+                },
                 Value::Object(obj, _) => {
                     // Handle directional padding: [top, column, left, right, row, bottom]
-                    async fn get_num(obj: &Object, name: &str) -> f64 {
+                    async fn get_num(obj: &Object, name: &str) -> u32 {
                         if let Some(v) = obj.variable(name) {
                             match v.value_actor().current_value().await {
-                                Ok(Value::Number(n, _)) => n.number(),
-                                _ => 0.0,
+                                Ok(Value::Number(n, _)) => n.number() as u32,
+                                _ => 0,
                             }
                         } else {
-                            0.0
+                            0
                         }
                     }
                     let top = get_num(&obj, "top").await;
@@ -2702,18 +2855,23 @@ fn element_text_input(
                     let row = get_num(&obj, "row").await;
 
                     // column applies to top/bottom, row applies to left/right
-                    let final_top = if top > 0.0 { top } else { column };
-                    let final_bottom = if bottom > 0.0 { bottom } else { column };
-                    let final_left = if left > 0.0 { left } else { row };
-                    let final_right = if right > 0.0 { right } else { row };
+                    let final_top = if top > 0 { top } else { column };
+                    let final_bottom = if bottom > 0 { bottom } else { column };
+                    let final_left = if left > 0 { left } else { row };
+                    let final_right = if right > 0 { right } else { row };
 
-                    Some(format!("{}px {}px {}px {}px", final_top, final_right, final_bottom, final_left))
+                    Some((final_top, final_right, final_bottom, final_left))
                 }
                 _ => None,
             }
         })
         .boxed_local()
-    });
+    }).broadcast();
+    // Derive individual padding signals from the broadcasted tuple
+    let padding_top_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(t, _, _, _)| t));
+    let padding_right_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, r, _, _)| r));
+    let padding_bottom_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, _, b, _)| b));
+    let padding_left_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, _, _, l)| l));
 
     // Font size signal from style
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
@@ -2739,7 +2897,7 @@ fn element_text_input(
         })
         .filter_map(|value| {
             future::ready(match value {
-                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                Value::Number(n, _) => Some(n.number() as u32),
                 _ => None,
             })
         })
@@ -2872,15 +3030,16 @@ fn element_text_input(
             }
         })
         .focus_signal(focus_signal)
-        .update_raw_el(|raw_el| {
-            raw_el
-                .style("box-sizing", "border-box")
-                .style_signal("width", width_signal)
-                .style_signal("padding", padding_signal)
-                .style_signal("font-size", font_size_signal)
-                .style_signal("color", font_color_signal)
-                .style_signal("background-color", background_color_signal)
-        })
+        .s(Background::new().color_signal(background_color_signal))
+        .s(Font::new()
+            .size_signal(font_size_signal)
+            .color_signal(font_color_signal))
+        .s(Padding::new()
+            .top_signal(padding_top_signal)
+            .right_signal(padding_right_signal)
+            .bottom_signal(padding_bottom_signal)
+            .left_signal(padding_left_signal))
+        .s(Width::with_signal_self(width_typed_signal))
         .after_remove(move |_| {
             zoon::println!("[EVENT:TextInput] Element REMOVED - dropping event handlers");
             drop(event_handler_loop);
@@ -3108,7 +3267,8 @@ fn element_label(
     let sv4 = tagged_object.expect_variable("settings");
 
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
-    let padding_signal = signal::from_stream({
+    // Produces u32 for Padding::all_signal (uniform padding from simple number)
+    let padding_all_signal = signal::from_stream({
         let style_stream = switch_map(
             sv2.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -3121,7 +3281,7 @@ fn element_label(
             }
         })
         .filter_map(|value| future::ready(match value {
-            Value::Number(n, _) => Some(format!("{}px", n.number())),
+            Value::Number(n, _) => Some(n.number() as u32),
             _ => None,
         }))
     });
@@ -3175,19 +3335,17 @@ fn element_label(
         })
         .filter_map(|value| {
             future::ready(match value {
-                Value::Number(n, _) => Some(format!("{}px", n.number())),
+                Value::Number(n, _) => Some(n.number() as u32),
                 _ => None,
             })
         })
     });
 
     Label::new()
-        .update_raw_el(|raw_el| {
-            raw_el
-                .style_signal("padding", padding_signal)
-                .style_signal("color", font_color_signal)
-                .style_signal("font-size", font_size_signal)
-        })
+        .s(Font::new()
+            .size_signal(font_size_signal)
+            .color_signal(font_color_signal))
+        .s(Padding::all_signal(padding_all_signal))
         .label_signal(signal::from_stream(label_stream).map(|l| {
             l.unwrap_or_else(|| zoon::Text::new("").unify())
         }))
@@ -3218,9 +3376,7 @@ fn element_paragraph(
     );
 
     Paragraph::new()
-        .update_raw_el(|raw_el| {
-            raw_el.style("white-space", "pre-wrap")
-        })
+        // white-space: pre-wrap is already global in MoonZoon's basic.css
         .contents_signal_vec(
             VecDiffStreamSignalVec(contents_vec_diff_stream).map_signal(move |value_actor| {
                 signal::from_stream(value_actor.stream().map({
@@ -3311,10 +3467,10 @@ fn element_link(
         })
     });
 
-    // Underline signal (font.line.underline)
+    // Underline signal (font.line.underline) - produces bool for FontLine::underline_signal()
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     let sv_underline = settings_variable.clone();
-    let underline_signal = signal::from_stream({
+    let underline_bool_signal = signal::from_stream({
         let style_stream = switch_map(
             sv_underline.stream(),
             |value| value.expect_object().expect_variable("style").stream()
@@ -3344,8 +3500,8 @@ fn element_link(
             let result = match value {
                 Value::Tag(tag, _) => {
                     match tag.tag() {
-                        "True" => Some("underline".to_string()),
-                        "False" => Some("none".to_string()),
+                        "True" => Some(true),
+                        "False" => Some(false),
                         _ => None,
                     }
                 }
@@ -3366,9 +3522,7 @@ fn element_link(
             // Capture Lamport time NOW at DOM callback, before channel
             hovered_sender.send_or_drop(TimestampedEvent::now(is_hovered));
         })
-        .update_raw_el(|raw_el| {
-            raw_el.style_signal("text-decoration", underline_signal)
-        })
+        .s(Font::new().line(FontLine::new().underline_signal(underline_bool_signal.map(|opt| opt.unwrap_or(false)))))
         .after_remove(move |_| {
             drop(event_handler_loop);
             drop(tagged_object);

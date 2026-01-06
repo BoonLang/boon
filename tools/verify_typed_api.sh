@@ -57,7 +57,10 @@ TYPED_STYLE_COUNT=$(grep -c '\.s(' "$BRIDGE_FILE" 2>/dev/null | head -1 || echo 
 
 # ─────────────────────────────────────────────────────────────────────
 # Expected after full migration:
-# - All .style_signal() calls migrated to .s() with typed styles
+# - ALL .style_signal() calls migrated to .s() with typed styles
+# - Container content alignment uses AlignContent API (not raw CSS):
+#   * align.row → AlignContent::center_x() / left() / right()
+#   * align.column → AlignContent::center_y() / top() / bottom()
 # - All .style() static calls REMOVED because:
 #   1. box-sizing: border-box      → GLOBAL (modern-normalize.css)
 #   2. background-repeat: no-repeat → GLOBAL (basic.css)
@@ -65,7 +68,6 @@ TYPED_STYLE_COUNT=$(grep -c '\.s(' "$BRIDGE_FILE" 2>/dev/null | head -1 || echo 
 #   4. white-space: pre-wrap       → GLOBAL (basic.css)
 #   5. display: flex               → Use Stripe::new() instead of El::new()
 #   6. flex-direction: column      → Use Stripe.direction(Direction::Column)
-#   7. align-items: center         → Use .s(Align::center())
 # ─────────────────────────────────────────────────────────────────────
 EXPECTED_STYLE_SIGNAL=0
 EXPECTED_STYLE_STATIC=0
@@ -145,7 +147,8 @@ UPDATE_RAW_EL_COUNT=$(grep -c '\.update_raw_el(' "$BRIDGE_FILE" 2>/dev/null | he
 
 # Baseline and target
 BASELINE_UPDATE_RAW_EL=8
-EXPECTED_UPDATE_RAW_EL=0  # Ideal: none needed (fully typed)
+# All update_raw_el calls eliminated - using AlignContent for container alignment
+EXPECTED_UPDATE_RAW_EL=0
 
 echo "  Current:"
 echo "    .update_raw_el() calls: $UPDATE_RAW_EL_COUNT (baseline: $BASELINE_UPDATE_RAW_EL)"
