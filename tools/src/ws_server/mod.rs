@@ -133,10 +133,16 @@ impl ServerState {
 
         // Transform screenshot responses: save to file and return filepath
         let response = match response {
-            Response::Screenshot { base64 } => {
+            Response::Screenshot { base64, width, height, dpr } => {
                 let hint = screenshot_hint.unwrap_or("screenshot");
                 match save_screenshot_to_file(&base64, hint) {
-                    Ok(filepath) => Response::ScreenshotFile { filepath },
+                    Ok(filepath) => {
+                        // Log metadata if present
+                        if let (Some(w), Some(h)) = (width, height) {
+                            log::debug!("Screenshot saved: {}x{} px (dpr: {:?})", w, h, dpr);
+                        }
+                        Response::ScreenshotFile { filepath }
+                    }
                     Err(e) => Response::Error {
                         message: format!("Failed to save screenshot: {}", e),
                     },

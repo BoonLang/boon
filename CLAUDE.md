@@ -89,6 +89,10 @@ cd playground && makers kill
 
 This is necessary because on Linux, process hierarchy auto-killing doesn't work properly, leaving zombie mzoon processes. The `kill` task gracefully terminates all mzoon-related processes and force-kills any that don't respond.
 
+**IMPORTANT: Always use mzoon for playground builds**
+
+Do NOT use `cargo build -p frontend` directly - it will fail with type errors because MoonZoon requires special build configuration (wasm-bindgen, wasm-opt, etc.) that only mzoon provides. The mzoon dev server handles all compilation automatically when files change.
+
 ### TypeScript/CodeMirror (separate watcher)
 
 MoonZoon does NOT auto-compile TypeScript. When editing TypeScript files:

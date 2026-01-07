@@ -24,6 +24,7 @@ static STATES_STORAGE_KEY: &str = "boon-playground-states";
 static PANEL_SPLIT_STORAGE_KEY: &str = "boon-playground-panel-split";
 static DEBUG_COLLAPSED_STORAGE_KEY: &str = "boon-playground-debug-collapsed";
 static CUSTOM_EXAMPLES_STORAGE_KEY: &str = "boon-playground-custom-examples";
+static FORCED_PREVIEW_SIZE_STORAGE_KEY: &str = "boon-playground-forced-preview-size";
 
 /// Clear all localStorage keys that match given prefixes.
 /// Used to clean up dynamically-keyed persistence data.
@@ -138,6 +139,18 @@ fn find_example_by_name(name: &str) -> Option<ExampleData> {
     }).copied()
 }
 
+/// Panel layout mode for screenshot and viewing modes
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum PanelLayout {
+    /// Both code editor and preview panels visible (default)
+    #[default]
+    Normal,
+    /// Only code editor visible (for code screenshots)
+    CodeOnly,
+    /// Only preview panel visible (for preview screenshots)
+    PreviewOnly,
+}
+
 #[derive(Clone, Copy)]
 struct ExampleData {
     filename: &'static str,
@@ -200,7 +213,7 @@ struct Playground {
     /// Current file content for the code editor
     source_code: Mutable<Rc<Cow<'static, str>>>,
     run_command: Mutable<Option<RunCommand>>,
-    snippet_screenshot_mode: Mutable<bool>,
+    panel_layout: Mutable<PanelLayout>,
     panel_split_ratio: Mutable<f64>,
     panel_container_width: Mutable<u32>,
     is_dragging_panel_split: Mutable<bool>,
@@ -212,11 +225,16 @@ struct Playground {
     selected_custom_example: Mutable<Option<String>>,
     /// Currently being renamed custom example (old_name)
     editing_custom_example: Mutable<Option<String>>,
+    /// Forced preview size (width, height) - None means auto
+    forced_preview_size: Mutable<Option<(u32, u32)>>,
+    /// Whether the force size UI is expanded
+    force_size_expanded: Mutable<bool>,
     _store_files_task: Rc<TaskHandle>,
     _store_current_file_task: Rc<TaskHandle>,
     _store_panel_split_task: Rc<TaskHandle>,
     _store_debug_collapsed_task: Rc<TaskHandle>,
     _store_custom_examples_task: Rc<TaskHandle>,
+    _store_forced_preview_size_task: Rc<TaskHandle>,
     _sync_source_to_files_task: Rc<TaskHandle>,
     _sync_source_to_custom_example_task: Rc<TaskHandle>,
 }
@@ -348,6 +366,29 @@ impl Playground {
                 }),
         ));
 
+        // Load forced preview size from storage
+        let forced_preview_size: Mutable<Option<(u32, u32)>> = Mutable::new(
+            local_storage()
+                .get::<(u32, u32)>(FORCED_PREVIEW_SIZE_STORAGE_KEY)
+                .and_then(Result::ok)
+        );
+        let force_size_expanded = Mutable::new(forced_preview_size.get().is_some());
+
+        let _store_forced_preview_size_task = Rc::new(Task::start_droppable({
+            let forced_preview_size = forced_preview_size.clone();
+            forced_preview_size
+                .signal()
+                .for_each_sync(move |size| {
+                    if let Some(size) = size {
+                        if let Err(error) = local_storage().insert(FORCED_PREVIEW_SIZE_STORAGE_KEY, &size) {
+                            eprintln!("Failed to store forced preview size: {error:#?}");
+                        }
+                    } else {
+                        local_storage().remove(FORCED_PREVIEW_SIZE_STORAGE_KEY);
+                    }
+                })
+        }));
+
         // Sync source_code changes back to files map
         let _sync_source_to_files_task = {
             let files = files.clone();
@@ -390,7 +431,7 @@ impl Playground {
             current_file,
             source_code,
             run_command: Mutable::new(None),
-            snippet_screenshot_mode: Mutable::new(false),
+            panel_layout: Mutable::new(PanelLayout::Normal),
             panel_split_ratio,
             panel_container_width: Mutable::new(0),
             is_dragging_panel_split: Mutable::new(false),
@@ -398,11 +439,14 @@ impl Playground {
             custom_examples,
             selected_custom_example,
             editing_custom_example: Mutable::new(None),
+            forced_preview_size,
+            force_size_expanded,
             _store_files_task,
             _store_current_file_task,
             _store_panel_split_task,
             _store_debug_collapsed_task,
             _store_custom_examples_task,
+            _store_forced_preview_size_task,
             _sync_source_to_files_task,
             _sync_source_to_custom_example_task,
         }
@@ -442,6 +486,8 @@ impl Playground {
                 let run_command = self.run_command.clone();
                 let source_code = self.source_code.clone();
                 let current_file = self.current_file.clone();
+                let forced_preview_size = self.forced_preview_size.clone();
+                let panel_layout = self.panel_layout.clone();
                 move |raw_el| {
                     use wasm_bindgen::prelude::*;
                     use wasm_bindgen::JsCast;
@@ -513,6 +559,75 @@ impl Playground {
                     js_sys::Reflect::set(&api, &"getPreview".into(), get_preview.as_ref()).ok();
                     get_preview.forget();
 
+                    // setPreviewSize(width, height) - force preview pane to exact pixel dimensions
+                    let forced_preview_size_for_set = forced_preview_size.clone();
+                    let set_preview_size = Closure::wrap(Box::new(move |width: u32, height: u32| -> js_sys::Object {
+                        forced_preview_size_for_set.set(Some((width, height)));
+                        let result = js_sys::Object::new();
+                        js_sys::Reflect::set(&result, &"success".into(), &true.into()).ok();
+                        js_sys::Reflect::set(&result, &"width".into(), &width.into()).ok();
+                        js_sys::Reflect::set(&result, &"height".into(), &height.into()).ok();
+                        result
+                    }) as Box<dyn Fn(u32, u32) -> js_sys::Object>);
+                    js_sys::Reflect::set(&api, &"setPreviewSize".into(), set_preview_size.as_ref()).ok();
+                    set_preview_size.forget();
+
+                    // resetPreviewSize() - reset preview pane to auto size
+                    let forced_preview_size_for_reset = forced_preview_size.clone();
+                    let reset_preview_size = Closure::wrap(Box::new(move || {
+                        forced_preview_size_for_reset.set(None);
+                    }) as Box<dyn Fn()>);
+                    js_sys::Reflect::set(&api, &"resetPreviewSize".into(), reset_preview_size.as_ref()).ok();
+                    reset_preview_size.forget();
+
+                    // getPreviewSize() - get current preview size setting
+                    let forced_preview_size_for_get = forced_preview_size.clone();
+                    let get_preview_size = Closure::wrap(Box::new(move || -> JsValue {
+                        match forced_preview_size_for_get.get() {
+                            Some((w, h)) => {
+                                let result = js_sys::Object::new();
+                                js_sys::Reflect::set(&result, &"forced".into(), &true.into()).ok();
+                                js_sys::Reflect::set(&result, &"width".into(), &w.into()).ok();
+                                js_sys::Reflect::set(&result, &"height".into(), &h.into()).ok();
+                                result.into()
+                            }
+                            None => {
+                                let result = js_sys::Object::new();
+                                js_sys::Reflect::set(&result, &"forced".into(), &false.into()).ok();
+                                result.into()
+                            }
+                        }
+                    }) as Box<dyn Fn() -> JsValue>);
+                    js_sys::Reflect::set(&api, &"getPreviewSize".into(), get_preview_size.as_ref()).ok();
+                    get_preview_size.forget();
+
+                    // setPanelLayout(layout) - set panel layout mode ('normal', 'code', 'preview')
+                    let panel_layout_for_set = panel_layout.clone();
+                    let set_panel_layout = Closure::wrap(Box::new(move |layout_str: String| -> bool {
+                        let new_layout = match layout_str.to_lowercase().as_str() {
+                            "normal" | "both" => PanelLayout::Normal,
+                            "code" | "codeonly" | "code_only" => PanelLayout::CodeOnly,
+                            "preview" | "previewonly" | "preview_only" => PanelLayout::PreviewOnly,
+                            _ => return false,
+                        };
+                        panel_layout_for_set.set(new_layout);
+                        true
+                    }) as Box<dyn Fn(String) -> bool>);
+                    js_sys::Reflect::set(&api, &"setPanelLayout".into(), set_panel_layout.as_ref()).ok();
+                    set_panel_layout.forget();
+
+                    // getPanelLayout() - get current panel layout mode
+                    let panel_layout_for_get = panel_layout.clone();
+                    let get_panel_layout = Closure::wrap(Box::new(move || -> String {
+                        match panel_layout_for_get.get() {
+                            PanelLayout::Normal => "normal".to_string(),
+                            PanelLayout::CodeOnly => "code".to_string(),
+                            PanelLayout::PreviewOnly => "preview".to_string(),
+                        }
+                    }) as Box<dyn Fn() -> String>);
+                    js_sys::Reflect::set(&api, &"getPanelLayout".into(), get_panel_layout.as_ref()).ok();
+                    get_panel_layout.forget();
+
                     // Set window.boonPlayground
                     js_sys::Reflect::set(&window, &"boonPlayground".into(), &api).ok();
 
@@ -563,9 +678,9 @@ impl Playground {
             .s(Gap::new().y(8))
             .s(Font::new().color(primary_text_color()))
             .s(Scrollbars::both())
-            .item_signal(self.snippet_screenshot_mode.signal().map({
+            .item_signal(self.panel_layout.signal().map({
                 let this = self.clone();
-                move |enabled| if enabled {
+                move |layout| if layout != PanelLayout::Normal {
                     None
                 } else {
                     Some(this.header_bar())
@@ -598,9 +713,9 @@ impl Playground {
                 RoundedCorners::new()
                     .top(32)
                     .bottom_signal(
-                        self.snippet_screenshot_mode
+                        self.panel_layout
                             .signal()
-                            .map_bool(|| 0, || 32),
+                            .map(|layout| if layout != PanelLayout::Normal { 0 } else { 32 }),
                     ),
             )
             .s(Borders::all(
@@ -805,13 +920,14 @@ impl Playground {
             .s(Align::new().center_y())
             .s(Gap::new().x(12).y(8))
             .multiline()
-            .item(El::new().s(Align::new().left()).child(self.snippet_screenshot_mode_button()))
-            .item(El::new().s(Align::new().center_x()).child(self.run_button()))
+            .item(El::new().s(Align::new().left()).child(self.panel_layout_button()))
             .item(
                 El::new()
                     .s(Font::new().size(12).color(color!("rgba(255, 255, 255, 0.5)")))
                     .child("F12 → dev tools for logs & errors")
             )
+            .item(El::new().s(Align::new().center_x()).child(self.run_button()))
+            .item(self.force_size_controls())
             .item(El::new().s(Align::new().right()).child(self.clear_saved_states_button()))
     }
 
@@ -821,18 +937,38 @@ impl Playground {
             .s(Height::fill())
             .s(Scrollbars::both())
             .s(Background::new().color(primary_surface_color()))
-            .s(RoundedCorners::all(24))
-            .s(Borders::all(
-                Border::new().color(color!("rgba(255, 255, 255, 0.05)")).width(1),
-            ))
-            .s(Shadows::new([
-                Shadow::new()
-                    .color(color!("rgba(4, 12, 24, 0.32)"))
-                    .y(30)
-                    .blur(60)
-                    .spread(-18),
-            ]))
-            .update_raw_el(|raw_el| raw_el.style("backdrop-filter", "blur(20px)"))
+            .s(RoundedCorners::all_signal(self.panel_layout.signal().map(|layout| {
+                match layout {
+                    PanelLayout::PreviewOnly => Some(0),  // No rounded corners for screenshots
+                    _ => Some(24),
+                }
+            })))
+            .s(Borders::all_signal(self.panel_layout.signal().map(|layout| {
+                match layout {
+                    PanelLayout::PreviewOnly => Border::new(),  // No border for screenshots
+                    _ => Border::new().color(color!("rgba(255, 255, 255, 0.05)")).width(1),
+                }
+            })))
+            .s(Shadows::with_signal_self(self.panel_layout.signal().map(|layout| {
+                match layout {
+                    PanelLayout::PreviewOnly => None,  // No shadow for screenshots
+                    _ => Some(Shadows::new([
+                        Shadow::new()
+                            .color(color!("rgba(4, 12, 24, 0.32)"))
+                            .y(30)
+                            .blur(60)
+                            .spread(-18),
+                    ])),
+                }
+            })))
+            .update_raw_el({
+                let panel_layout = self.panel_layout.clone();
+                move |raw_el| {
+                    raw_el.style_signal("backdrop-filter", panel_layout.signal().map(|layout| {
+                        if layout == PanelLayout::PreviewOnly { "none" } else { "blur(20px)" }
+                    }))
+                }
+            })
             .child(content)
     }
 
@@ -852,21 +988,33 @@ impl Playground {
                     panel_split_ratio.set_neq(clamped);
                 }
             })
-            .item(self.code_editor_panel_container())
-            .item_signal(self.snippet_screenshot_mode.signal().map_bool(
-                || None,
-                {
-                    let this = self.clone();
-                    move || Some(this.panel_divider())
-                },
-            ))
-            .item_signal(self.snippet_screenshot_mode.signal().map_bool(
-                || None,
-                {
-                    let this = self.clone();
-                    move || Some(this.example_panel_container())
-                },
-            ))
+            // Code editor - hide when PreviewOnly
+            .item_signal(self.panel_layout.signal().map({
+                let this = self.clone();
+                move |layout| if layout == PanelLayout::PreviewOnly {
+                    None
+                } else {
+                    Some(this.code_editor_panel_container())
+                }
+            }))
+            // Panel divider - only show when Normal
+            .item_signal(self.panel_layout.signal().map({
+                let this = self.clone();
+                move |layout| if layout == PanelLayout::Normal {
+                    Some(this.panel_divider())
+                } else {
+                    None
+                }
+            }))
+            // Preview panel - hide when CodeOnly
+            .item_signal(self.panel_layout.signal().map({
+                let this = self.clone();
+                move |layout| if layout == PanelLayout::CodeOnly {
+                    None
+                } else {
+                    Some(this.example_panel_container())
+                }
+            }))
     }
 
     fn code_editor_panel_container(&self) -> impl Element + use<> {
@@ -874,15 +1022,15 @@ impl Playground {
             .s(Align::new().top())
             .s(Height::fill())
             .s(Padding::new().right_signal(
-                self.snippet_screenshot_mode
+                self.panel_layout
                     .signal()
-                    .map_bool(|| 0, || 6),
+                    .map(|layout| if layout == PanelLayout::CodeOnly { 0 } else { 6 }),
             ))
             .s(Width::with_signal_self(map_ref! {
-                let snippet = self.snippet_screenshot_mode.signal(),
+                let layout = self.panel_layout.signal(),
                 let ratio = self.panel_split_ratio.signal(),
                 let container = self.panel_container_width.signal() =>
-                if *snippet {
+                if *layout == PanelLayout::CodeOnly {
                     Some(Width::fill())
                 } else {
                     let container_width = *container as f64;
@@ -899,11 +1047,11 @@ impl Playground {
                     }
                 }
             }))
-            .child_signal(self.snippet_screenshot_mode.signal().map({
+            .child_signal(self.panel_layout.signal().map({
                 let this = self.clone();
-                move |snippet| {
+                move |layout| {
                     let playground = this.clone();
-                    if snippet {
+                    if layout == PanelLayout::CodeOnly {
                         Some(Either::Left(playground.snippet_screenshot_surface()))
                     } else {
                         Some(Either::Right(playground.code_editor_panel()))
@@ -952,15 +1100,15 @@ impl Playground {
             .s(Align::new().top())
             .s(Height::fill())
             .s(Padding::new().left_signal(
-                self.snippet_screenshot_mode
+                self.panel_layout
                     .signal()
-                    .map_bool(|| 0, || 6),
+                    .map(|layout| if layout == PanelLayout::PreviewOnly { 0 } else { 6 }),
             ))
             .s(Width::with_signal_self(map_ref! {
-                let snippet = self.snippet_screenshot_mode.signal(),
+                let layout = self.panel_layout.signal(),
                 let ratio = self.panel_split_ratio.signal(),
                 let container = self.panel_container_width.signal() =>
-                if *snippet {
+                if *layout == PanelLayout::PreviewOnly {
                     Some(Width::fill())
                 } else {
                     let container_width = *container as f64;
@@ -1128,12 +1276,10 @@ impl Playground {
             })
     }
 
-    fn snippet_screenshot_mode_button(&self) -> impl Element {
-        let hovered = Mutable::new(false);
-        Button::new()
-            .s(Padding::new().x(12).y(7))
+    fn panel_layout_button(&self) -> impl Element {
+        Row::new()
             .s(RoundedCorners::all(22))
-            .s(Font::new().size(13).color(primary_text_color()))
+            .s(Background::new().color(color!("rgba(26, 36, 58, 0.32)")))
             .s(Shadows::new([
                 Shadow::new()
                     .color(color!("rgba(8, 13, 28, 0.26)"))
@@ -1141,47 +1287,41 @@ impl Playground {
                     .blur(22)
                     .spread(-8),
             ]))
+            .s(Padding::all(3))
+            .item(self.layout_segment("Both", PanelLayout::Normal))
+            .item(self.layout_segment("Code", PanelLayout::CodeOnly))
+            .item(self.layout_segment("Preview", PanelLayout::PreviewOnly))
+    }
+
+    fn layout_segment(&self, label: &'static str, layout: PanelLayout) -> impl Element {
+        let hovered = Mutable::new(false);
+        let hovered_for_signal = hovered.clone();
+        Button::new()
+            .s(Padding::new().x(10).y(5))
+            .s(RoundedCorners::all(18))
+            .s(Font::new().size(13).color(primary_text_color()))
             .s(Background::new().color_signal(map_ref! {
-                let hovered = hovered.signal(),
-                let active = self.snippet_screenshot_mode.signal() =>
-                match (*active, *hovered) {
-                    (true, true) => color!("rgba(70, 104, 178, 0.6)"),
-                    (true, false) => color!("rgba(60, 94, 168, 0.52)"),
-                    (false, true) => color!("rgba(36, 48, 72, 0.44)"),
-                    (false, false) => color!("rgba(26, 36, 58, 0.32)"),
+                let current = self.panel_layout.signal(),
+                let hovered = hovered_for_signal.signal() =>
+                {
+                    let is_active = *current == layout;
+                    match (is_active, *hovered) {
+                        (true, true) => color!("rgba(70, 104, 178, 0.7)"),
+                        (true, false) => color!("rgba(60, 94, 168, 0.6)"),
+                        (false, true) => color!("rgba(50, 68, 108, 0.5)"),
+                        (false, false) => color!("transparent"),
+                    }
                 }
             }))
             .label(
-                Row::new()
-                    .s(Align::new().center_y())
-                    .s(Gap::new().x(6))
-                    .item(
-                        El::new()
-                            .s(Font::new().size(14).weight(FontWeight::Medium).no_wrap())
-                            .child("Screenshot mode"),
-                    )
-                    .item(
-                        El::new()
-                            .s(Padding::new().x(9).y(3))
-                            .s(RoundedCorners::all(999))
-                            .s(Font::new().size(11).weight(FontWeight::SemiBold).no_wrap())
-                            .s(Background::new().color_signal(map_ref! {
-                                let active = self.snippet_screenshot_mode.signal() =>
-                                if *active {
-                                    color!("rgba(0, 0, 0, 0.18)")
-                                } else {
-                                    color!("rgba(0, 0, 0, 0.12)")
-                                }
-                            }))
-                            .child_signal(self.snippet_screenshot_mode.signal().map_bool(|| "ON", || "OFF")),
-                    ),
+                El::new()
+                    .s(Font::new().size(13).weight(FontWeight::Medium).no_wrap())
+                    .child(label),
             )
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press({
-                let snippet_screenshot_mode = self.snippet_screenshot_mode.clone();
-                move || {
-                    snippet_screenshot_mode.update(|mode| not(mode));
-                }
+                let panel_layout = self.panel_layout.clone();
+                move || panel_layout.set(layout)
             })
     }
 
@@ -1220,6 +1360,57 @@ impl Playground {
                 // Clear dynamically-keyed persistence data (list calls, removed sets)
                 clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
             })
+    }
+
+    fn force_size_controls(&self) -> impl Element + use<> {
+        let width_input = Mutable::new(
+            self.forced_preview_size.get().map(|(w, _)| w.to_string()).unwrap_or_else(|| "700".to_string())
+        );
+        let height_input = Mutable::new(
+            self.forced_preview_size.get().map(|(_, h)| h.to_string()).unwrap_or_else(|| "700".to_string())
+        );
+
+        Row::new()
+            .s(Gap::new().x(6))
+            .s(Align::new().center_y())
+            .item_signal(self.force_size_expanded.signal().map({
+                let this = self.clone();
+                let force_size_expanded = self.force_size_expanded.clone();
+                let width_input = width_input.clone();
+                let height_input = height_input.clone();
+                move |expanded| {
+                    if expanded {
+                        // Show inputs and Auto button
+                        let forced_preview_size = this.forced_preview_size.clone();
+                        let force_size_expanded = force_size_expanded.clone();
+                        let width_input = width_input.clone();
+                        let height_input = height_input.clone();
+                        Some(Row::new()
+                            .s(Gap::new().x(4))
+                            .s(Align::new().center_y())
+                            .item(self::force_size_input(width_input.clone(), "W"))
+                            .item(El::new().s(Font::new().size(12).color(color!("rgba(255,255,255,0.5)"))).child("×"))
+                            .item(self::force_size_input(height_input.clone(), "H"))
+                            .item(self::force_size_apply_button(width_input, height_input, forced_preview_size.clone()))
+                            .item(self::force_size_auto_button(forced_preview_size, force_size_expanded))
+                        )
+                    } else {
+                        None
+                    }
+                }
+            }))
+            .item_signal(self.force_size_expanded.signal().map({
+                let force_size_expanded = self.force_size_expanded.clone();
+                move |expanded| {
+                    if !expanded {
+                        // Show "Force size" button
+                        let force_size_expanded = force_size_expanded.clone();
+                        Some(self::force_size_toggle_button(force_size_expanded))
+                    } else {
+                        None
+                    }
+                }
+            }))
     }
 
     fn code_editor_panel(&self) -> impl Element + use<> {
@@ -1371,7 +1562,9 @@ impl Playground {
             .s(Width::fill())
             .s(Height::fill())
             .content_signal(self.source_code.signal_cloned())
-            .snippet_screenshot_mode_signal(self.snippet_screenshot_mode.signal())
+            .snippet_screenshot_mode_signal(
+                self.panel_layout.signal().map(|layout| layout == PanelLayout::CodeOnly)
+            )
             .on_change({
                 let source_code = self.source_code.clone();
                 move |content| source_code.set_neq(Rc::new(Cow::from(content)))
@@ -1388,26 +1581,73 @@ impl Playground {
                 Stack::new()
                     .s(Width::fill())
                     .s(Height::fill())
-                    .s(RoundedCorners::all(24))
+                    .s(RoundedCorners::all_signal(self.panel_layout.signal().map(|layout| {
+                        match layout {
+                            PanelLayout::PreviewOnly => Some(0),  // No rounded corners for screenshots
+                            _ => Some(24),
+                        }
+                    })))
                     .s(Clip::both())
                     .layer(
                         El::new()
                             .s(Width::fill())
                             .s(Height::fill())
-                            .update_raw_el(|raw_el| {
-                                raw_el.style(
-                                    "background",
-                                    "radial-gradient(120% 120% at 84% 0%, rgba(76, 214, 255, 0.16) 0%, rgba(5, 9, 18, 0.0) 55%), linear-gradient(165deg, rgba(9, 13, 24, 0.94) 15%, rgba(5, 8, 14, 0.96) 85%)",
-                                )
+                            .update_raw_el({
+                                let panel_layout = self.panel_layout.clone();
+                                move |raw_el| {
+                                    raw_el.style_signal(
+                                        "background",
+                                        panel_layout.signal().map(|layout| {
+                                            if layout == PanelLayout::PreviewOnly {
+                                                "transparent"
+                                            } else {
+                                                "radial-gradient(120% 120% at 84% 0%, rgba(76, 214, 255, 0.16) 0%, rgba(5, 9, 18, 0.0) 55%), linear-gradient(165deg, rgba(9, 13, 24, 0.94) 15%, rgba(5, 8, 14, 0.96) 85%)"
+                                            }
+                                        })
+                                    )
+                                }
                             }),
                     )
                     .layer(
                         El::new()
-                            .s(Width::fill())
-                            .s(Height::fill())
-                            .s(Padding::new().x(12).y(12))
-                            .s(Scrollbars::both())
-                            .update_raw_el(|raw_el| raw_el.attr("data-boon-panel", "preview"))
+                            // Keep forced_preview_size for actual dimensions
+                            .s(Width::with_signal_self(self.forced_preview_size.signal().map(|size| {
+                                match size {
+                                    Some((w, _)) => Some(Width::exact(w)),
+                                    None => Some(Width::fill()),
+                                }
+                            })))
+                            .s(Height::with_signal_self(self.forced_preview_size.signal().map(|size| {
+                                match size {
+                                    Some((_, h)) => Some(Height::exact(h)),
+                                    None => Some(Height::fill()),
+                                }
+                            })))
+                            // Use panel_layout for padding styling
+                            .s(Padding::new()
+                                .x_signal(self.panel_layout.signal().map(|layout| {
+                                    match layout {
+                                        PanelLayout::PreviewOnly => Some(0),
+                                        _ => Some(12),
+                                    }
+                                }))
+                                .y_signal(self.panel_layout.signal().map(|layout| {
+                                    match layout {
+                                        PanelLayout::PreviewOnly => Some(0),
+                                        _ => Some(12),
+                                    }
+                                })))
+                            .s(Scrollbars::y_and_clip_x())
+                            .update_raw_el({
+                                let forced_preview_size = self.forced_preview_size.clone();
+                                move |raw_el| {
+                                    raw_el
+                                        .attr("data-boon-panel", "preview")
+                                        .style_signal("overflow", forced_preview_size.signal().map(|size| {
+                                            if size.is_some() { "hidden" } else { "auto" }
+                                        }))
+                                }
+                            })
                             .child_signal(self.run_command.signal().map({
                                 let this = self.clone();
                                 move |maybe_run| Some(match maybe_run {
@@ -1983,4 +2223,112 @@ impl Playground {
             )
     }
 
+}
+
+// Force size UI helper functions
+fn force_size_input(value: Mutable<String>, label_text: &'static str) -> impl Element {
+    let focused = Mutable::new(false);
+    Row::new()
+        .s(Gap::new().x(2))
+        .s(Align::new().center_y())
+        .item(
+            El::new()
+                .s(Font::new().size(10).color(color!("rgba(255,255,255,0.4)")))
+                .child(label_text)
+        )
+        .item(
+            TextInput::new()
+                .s(Width::exact(45))
+                .s(Height::exact(22))
+                .s(Padding::new().x(4))
+                .s(Font::new().size(12).color(color!("rgba(255,255,255,0.9)")))
+                .s(Background::new().color_signal(
+                    focused.signal().map_bool(
+                        || color!("rgba(255,255,255,0.15)"),
+                        || color!("rgba(255,255,255,0.08)")
+                    )
+                ))
+                .s(RoundedCorners::all(4))
+                .s(Borders::all_signal(
+                    focused.signal().map_bool(
+                        || Border::new().width(1).color(color!("rgba(100,150,255,0.5)")),
+                        || Border::new().width(1).color(color!("rgba(255,255,255,0.1)"))
+                    )
+                ))
+                .label_hidden(label_text)
+                .text_signal(value.signal_cloned())
+                .on_focused_change(move |is_focused| focused.set(is_focused))
+                .on_change({
+                    let value = value.clone();
+                    move |text| value.set(text)
+                })
+                .placeholder(Placeholder::new("700"))
+        )
+}
+
+fn force_size_apply_button(
+    width_input: Mutable<String>,
+    height_input: Mutable<String>,
+    forced_preview_size: Mutable<Option<(u32, u32)>>,
+) -> impl Element {
+    let hovered = Mutable::new(false);
+    Button::new()
+        .s(Padding::new().x(8).y(4))
+        .s(RoundedCorners::all(4))
+        .s(Background::new().color_signal(
+            hovered.signal().map_bool(
+                || color!("rgba(100,180,100,0.3)"),
+                || color!("rgba(100,180,100,0.15)")
+            )
+        ))
+        .s(Font::new().size(11).weight(FontWeight::Medium).color(color!("rgba(180,255,180,0.9)")))
+        .label("Apply")
+        .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+        .on_press(move || {
+            let w = width_input.get_cloned().parse::<u32>().unwrap_or(700);
+            let h = height_input.get_cloned().parse::<u32>().unwrap_or(700);
+            forced_preview_size.set(Some((w, h)));
+        })
+}
+
+fn force_size_auto_button(
+    forced_preview_size: Mutable<Option<(u32, u32)>>,
+    force_size_expanded: Mutable<bool>,
+) -> impl Element {
+    let hovered = Mutable::new(false);
+    Button::new()
+        .s(Padding::new().x(8).y(4))
+        .s(RoundedCorners::all(4))
+        .s(Background::new().color_signal(
+            hovered.signal().map_bool(
+                || color!("rgba(180,180,255,0.3)"),
+                || color!("rgba(180,180,255,0.15)")
+            )
+        ))
+        .s(Font::new().size(11).weight(FontWeight::Medium).color(color!("rgba(200,200,255,0.9)")))
+        .label("Auto")
+        .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+        .on_press(move || {
+            forced_preview_size.set(None);
+            force_size_expanded.set(false);
+        })
+}
+
+fn force_size_toggle_button(force_size_expanded: Mutable<bool>) -> impl Element {
+    let hovered = Mutable::new(false);
+    Button::new()
+        .s(Padding::new().x(10).y(5))
+        .s(RoundedCorners::all(4))
+        .s(Background::new().color_signal(
+            hovered.signal().map_bool(
+                || color!("rgba(255,255,255,0.12)"),
+                || color!("rgba(255,255,255,0.06)")
+            )
+        ))
+        .s(Font::new().size(12).weight(FontWeight::Medium).color(color!("rgba(255,255,255,0.7)")))
+        .label("Force size")
+        .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+        .on_press(move || {
+            force_size_expanded.set(true);
+        })
 }

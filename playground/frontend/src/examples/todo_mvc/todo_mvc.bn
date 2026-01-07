@@ -39,7 +39,9 @@ store: [
     todos:
         LIST {
             new_todo(title: TEXT { Buy groceries })
-            new_todo(title: TEXT { Clean room })
+            new_todo(title: TEXT { Walk the dog })
+            new_todo_completed(title: TEXT { Finish TodoMVC renderer })
+            new_todo(title: TEXT { Read documentation })
         }
         |> List/append(item: title_to_add |> new_todo())
         |> List/remove(
@@ -64,6 +66,14 @@ store: [
 ]
 
 FUNCTION new_todo(title) {
+    new_todo_with_completed(title: title, initial_completed: False)
+}
+
+FUNCTION new_todo_completed(title) {
+    new_todo_with_completed(title: title, initial_completed: True)
+}
+
+FUNCTION new_todo_with_completed(title, initial_completed) {
     [
         todo_elements: [
             remove_todo_button: LINK
@@ -102,7 +112,7 @@ FUNCTION new_todo(title) {
                     |> THEN { False }
             }
         }
-        completed: False |> HOLD state {
+        completed: initial_completed |> HOLD state {
             LATEST {
                 todo_elements.todo_checkbox.event.click
                     |> THEN { state |> Bool/not() }
@@ -173,10 +183,9 @@ FUNCTION header() {
             font: [
                 size: 100
                 color: Oklch[
-                    lightness: 0.54
-                    chroma: 0.156
-                    hue: 21.24
-                    alpha: 0.15
+                    lightness: 0.50
+                    chroma: 0.14
+                    hue: 22
                 ]
                 weight: Hairline
             ]
@@ -626,8 +635,8 @@ FUNCTION footer() {
                     TEXT { Created by }
                     Text/space()
                     footer_link(
-                        label: TEXT { Martin Kavík }
-                        to: TEXT { https://github.com/MartinKavik }
+                        label: TEXT { the TodoMVC Team }
+                        to: TEXT { http://todomvc.com }
                     )
                 }
             )
@@ -652,6 +661,11 @@ FUNCTION footer_link(label, to) {
         element: [hovered: LINK]
         style: [
             font: [
+                color: Oklch[
+                    lightness: 0.50
+                    chroma: 0.14
+                    hue: 22
+                ]
                 line: [underline: element.hovered]
             ]
         ]

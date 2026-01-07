@@ -45,6 +45,25 @@ enum Commands {
         #[arg(long, default_value = "9224")]
         port: u16,
     },
+
+    /// Compare two images using SSIM (Structural Similarity Index)
+    PixelDiff {
+        /// Path to reference image
+        #[arg(long, short)]
+        reference: String,
+
+        /// Path to current/candidate image
+        #[arg(long, short)]
+        current: String,
+
+        /// Path to save diff visualization (optional)
+        #[arg(long, short)]
+        output: Option<String>,
+
+        /// SSIM threshold (0.0 to 1.0), exits 0 if score >= threshold
+        #[arg(long, short, default_value = "0.95")]
+        threshold: f64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -91,9 +110,13 @@ enum ServerAction {
         #[arg(short, long, default_value = "9224")]
         port: u16,
 
-        /// Watch directory for extension hot reload
+        /// Watch directory for extension hot reload (default: auto-detect)
         #[arg(short, long)]
         watch: Option<String>,
+
+        /// Disable file watching for extension hot reload
+        #[arg(long)]
+        no_watch: bool,
     },
 }
 
@@ -113,6 +136,23 @@ enum ExecAction {
         /// Output file path
         #[arg(short, long, default_value = "screenshot.png")]
         output: String,
+    },
+
+    /// Take screenshot of the preview pane at specified dimensions (default 700x700)
+    /// Output is at CSS pixel resolution (700x700 CSS -> 700x700 px image)
+    ScreenshotPreview {
+        /// Output file path
+        #[arg(short, long, default_value = "preview.png")]
+        output: String,
+        /// Preview width in CSS pixels
+        #[arg(short = 'W', long, default_value = "700")]
+        width: u32,
+        /// Preview height in CSS pixels
+        #[arg(short = 'H', long, default_value = "700")]
+        height: u32,
+        /// Output at native device resolution (e.g., 1400x1400 on 2x display)
+        #[arg(long)]
+        hidpi: bool,
     },
 
     /// Get preview text
@@ -292,6 +332,7 @@ enum ExecAction {
         #[arg(long)]
         examples_dir: Option<PathBuf>,
     },
+
 }
 
 fn main() -> Result<()> {
@@ -301,10 +342,26 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Server { action } => match action {
-            ServerAction::Start { port, watch } => {
+            ServerAction::Start { port, watch, no_watch } => {
                 let rt = tokio::runtime::Runtime::new()?;
-                let watch_path = watch.as_ref().map(std::path::Path::new);
-                rt.block_on(ws_server::start_server(port, watch_path))?;
+
+                // Determine watch path: explicit > auto-detect > none
+                let watch_path: Option<PathBuf> = if no_watch {
+                    None
+                } else if let Some(ref explicit_path) = watch {
+                    Some(PathBuf::from(explicit_path))
+                } else {
+                    // Auto-detect extension directory
+                    find_extension_dir()
+                };
+
+                if let Some(ref path) = watch_path {
+                    println!("Hot-reload enabled: watching {}", path.display());
+                } else {
+                    println!("Hot-reload disabled (use --watch to specify directory)");
+                }
+
+                rt.block_on(ws_server::start_server(port, watch_path.as_deref()))?;
             }
         },
 
@@ -321,6 +378,18 @@ fn main() -> Result<()> {
         Commands::Mcp { port } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(mcp::run_mcp_server(port));
+        }
+
+        Commands::PixelDiff {
+            reference,
+            current,
+            output,
+            threshold,
+        } => {
+            if let Err(e) = commands::pixel_diff::run(&reference, &current, output.as_deref(), threshold) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
         }
     }
 
@@ -409,7 +478,7 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
         ExecAction::Screenshot { output } => {
             let response = send_command_to_server(port, WsCommand::Screenshot).await?;
             match response {
-                WsResponse::Screenshot { base64 } => {
+                WsResponse::Screenshot { base64, .. } => {
                     let data = base64::Engine::decode(
                         &base64::engine::general_purpose::STANDARD,
                         &base64,
@@ -422,6 +491,37 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
                 }
                 _ => {
                     eprintln!("Unexpected response");
+                }
+            }
+        }
+
+        ExecAction::ScreenshotPreview { output, width, height, hidpi } => {
+            // Use new ScreenshotPreview command with size params
+            let response = send_command_to_server(port, WsCommand::ScreenshotPreview {
+                width: Some(width),
+                height: Some(height),
+                hidpi: Some(hidpi),
+            }).await?;
+            match response {
+                WsResponse::Screenshot { base64, width: w, height: h, dpr } => {
+                    let data = base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &base64,
+                    )?;
+                    std::fs::write(&output, data)?;
+                    if let (Some(w), Some(h)) = (w, h) {
+                        println!("Preview screenshot saved to: {} ({}x{} px, dpr: {:?})", output, w, h, dpr);
+                    } else {
+                        println!("Preview screenshot saved to: {}", output);
+                    }
+                }
+                WsResponse::Error { message } => {
+                    eprintln!("Error: {}", message);
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("Unexpected response");
+                    std::process::exit(1);
                 }
             }
         }
@@ -555,7 +655,7 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
             // Take screenshot if requested
             if let Some(output) = screenshot {
                 let response = send_command_to_server(port, WsCommand::Screenshot).await?;
-                if let WsResponse::Screenshot { base64 } = response {
+                if let WsResponse::Screenshot { base64, .. } = response {
                     let data = base64::Engine::decode(
                         &base64::engine::general_purpose::STANDARD,
                         &base64,
@@ -755,9 +855,45 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
                 std::process::exit(1);
             }
         }
+
     }
 
     Ok(())
+}
+
+/// Find the extension directory relative to the binary or workspace
+fn find_extension_dir() -> Option<PathBuf> {
+    // Try relative to current exe (for installed binary)
+    if let Ok(exe_path) = std::env::current_exe() {
+        // Binary is at target/release/boon-tools, extension at tools/extension/
+        if let Some(parent) = exe_path.parent() {
+            // Check if we're in target/release/
+            let ext_path = parent.join("../../tools/extension");
+            if ext_path.exists() {
+                return Some(ext_path.canonicalize().ok()?);
+            }
+            // Also check parent/parent/parent for nested structures
+            let ext_path = parent.join("../../../tools/extension");
+            if ext_path.exists() {
+                return Some(ext_path.canonicalize().ok()?);
+            }
+        }
+    }
+
+    // Try from current working directory
+    let cwd_paths = [
+        PathBuf::from("extension"),
+        PathBuf::from("tools/extension"),
+        PathBuf::from("../tools/extension"),
+    ];
+
+    for path in &cwd_paths {
+        if path.exists() {
+            return path.canonicalize().ok();
+        }
+    }
+
+    None
 }
 
 /// Element bounds for click-by-text

@@ -3265,6 +3265,7 @@ fn element_label(
     let sv2 = tagged_object.expect_variable("settings");
     let sv3 = tagged_object.expect_variable("settings");
     let sv4 = tagged_object.expect_variable("settings");
+    let sv5 = tagged_object.expect_variable("settings");
 
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     // Produces u32 for Padding::all_signal (uniform padding from simple number)
@@ -3341,10 +3342,55 @@ fn element_label(
         })
     });
 
+    // Strikethrough signal (font.line.strikethrough) - produces bool for FontLine::strike_signal()
+    // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
+    let strikethrough_bool_signal = signal::from_stream({
+        let style_stream = switch_map(
+            sv5.stream(),
+            |value| value.expect_object().expect_variable("style").stream()
+        );
+        let font_stream = switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("font") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        });
+        let line_stream = switch_map(font_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("line") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        });
+        switch_map(line_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("strikethrough") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            let result = match value {
+                Value::Tag(tag, _) => {
+                    match tag.tag() {
+                        "True" => Some(true),
+                        "False" => Some(false),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            future::ready(result)
+        })
+        .boxed_local()
+    });
+
     Label::new()
         .s(Font::new()
             .size_signal(font_size_signal)
-            .color_signal(font_color_signal))
+            .color_signal(font_color_signal)
+            .line(FontLine::new().strike_signal(strikethrough_bool_signal.map(|opt| opt.unwrap_or(false)))))
         .s(Padding::all_signal(padding_all_signal))
         .label_signal(signal::from_stream(label_stream).map(|l| {
             l.unwrap_or_else(|| zoon::Text::new("").unify())

@@ -360,10 +360,27 @@ fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "boon_screenshot_preview".to_string(),
-            description: "Take a screenshot of just the preview pane (not the whole page). Saves PNG to /tmp/boon-screenshots/ and returns the file path.".to_string(),
+            description: "Take a screenshot of the preview pane at specified dimensions (default 700×700). Output is at CSS pixel resolution (700x700 CSS -> 700x700 px). Saves PNG to /tmp/boon-screenshots/ and returns the file path.".to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "width": {
+                        "type": "integer",
+                        "description": "Preview width in CSS pixels (default: 700)",
+                        "minimum": 100,
+                        "maximum": 4096
+                    },
+                    "height": {
+                        "type": "integer",
+                        "description": "Preview height in CSS pixels (default: 700)",
+                        "minimum": 100,
+                        "maximum": 4096
+                    },
+                    "hidpi": {
+                        "type": "boolean",
+                        "description": "If true, output at native device resolution (e.g., 1400x1400 on 2x display). Default: false"
+                    }
+                },
                 "required": []
             }),
         },
@@ -584,6 +601,15 @@ fn get_tools() -> Vec<Tool> {
                         "description": "Filter keys containing this pattern (e.g., '019b4290' to find specific persistence IDs)"
                     }
                 },
+                "required": []
+            }),
+        },
+        Tool {
+            name: "boon_reload_extension".to_string(),
+            description: "Explicitly reload the Chrome extension. Use when you've modified extension JavaScript files and need to pick up changes. Note: Hot-reload is automatic when the MCP server detects file changes, but this provides manual control.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
                 "required": []
             }),
         },
@@ -905,9 +931,12 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
 
         "boon_get_code" => Command::GetEditorCode,
 
-        "boon_screenshot_preview" => Command::ScreenshotElement {
-            selector: "[data-boon-panel=\"preview\"]".to_string(),
-        },
+        "boon_screenshot_preview" => {
+            let width = args.get("width").and_then(|v| v.as_u64()).map(|v| v as u32);
+            let height = args.get("height").and_then(|v| v.as_u64()).map(|v| v as u32);
+            let hidpi = args.get("hidpi").and_then(|v| v.as_bool());
+            Command::ScreenshotPreview { width, height, hidpi }
+        }
 
         "boon_screenshot_element" => {
             let selector = args
@@ -933,6 +962,8 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
             let pattern = args.get("pattern").and_then(|v| v.as_str()).map(|s| s.to_string());
             Command::GetLocalStorage { pattern }
         }
+
+        "boon_reload_extension" => Command::Reload,
 
         _ => return Err(format!("Unknown tool: {}", name)),
     };
@@ -973,7 +1004,7 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
             }
         }
 
-        Response::Screenshot { base64: _ } => {
+        Response::Screenshot { base64: _, width: _, height: _, dpr: _ } => {
             // This shouldn't happen - WS server transforms to ScreenshotFile
             Err("Unexpected base64 screenshot response".to_string())
         }

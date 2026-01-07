@@ -157,6 +157,20 @@ pub enum Command {
 
     /// Navigate to a specific route/path (uses history.pushState + popstate event)
     NavigateTo { path: String },
+
+    /// Take screenshot of preview pane at specified dimensions
+    /// Temporarily forces size, captures, then resets to auto
+    ScreenshotPreview {
+        /// Preview width in CSS pixels (default: 700)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        /// Preview height in CSS pixels (default: 700)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+        /// If true, output at native device resolution; false = CSS pixel resolution (default)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hidpi: Option<bool>,
+    },
 }
 
 /// Response from Extension to CLI via Server
@@ -173,7 +187,18 @@ pub enum Response {
     Error { message: String },
 
     /// Screenshot data (base64, from extension)
-    Screenshot { base64: String },
+    Screenshot {
+        base64: String,
+        /// Output image width in pixels
+        #[serde(skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        /// Output image height in pixels
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+        /// Device pixel ratio (informational)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dpr: Option<f64>,
+    },
 
     /// Screenshot saved to file (filepath, transformed by WS server)
     ScreenshotFile { filepath: String },

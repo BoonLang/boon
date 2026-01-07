@@ -1063,6 +1063,7 @@ async function handleCommand(id, command) {
 
       case 'screenshotElement':
         // Take screenshot of a specific element by clipping to its bounds
+        // Note: Screenshot will be at device pixel ratio. Use ImageMagick to resize if needed.
         try {
           const box = await cdpGetElementBox(tab.id, command.selector);
           if (!box) return { type: 'error', message: `Element not found: ${command.selector}` };
@@ -2332,6 +2333,113 @@ async function handleCommand(id, command) {
           return { type: 'success', data: { luminance: result.luminance, color: result.color } };
         } catch (e) {
           return { type: 'error', message: 'Assert toggle all darker failed: ' + e.message };
+        }
+
+      case 'screenshotPreview':
+        // Take screenshot of preview pane at specified dimensions (v3)
+        // Uses PreviewOnly panel layout mode for clean screenshots
+        try {
+          const width = command.width || 700;
+          const height = command.height || 700;
+          const useHidpi = command.hidpi || false;
+
+          // 1. Get devicePixelRatio and save current panel layout
+          const dpr = await cdpEvaluate(tab.id, `window.devicePixelRatio || 1`);
+          const originalLayout = await cdpEvaluate(tab.id, `
+            window.boonPlayground.getPanelLayout()
+          `);
+
+          // 2. Switch to PreviewOnly mode for clean screenshot styling
+          await cdpEvaluate(tab.id, `
+            window.boonPlayground.setPanelLayout('preview')
+          `);
+          await new Promise(r => setTimeout(r, 50));
+
+          // 3. Force preview to requested size
+          await cdpEvaluate(tab.id, `
+            window.boonPlayground.setPreviewSize(${width}, ${height})
+          `);
+          await new Promise(r => setTimeout(r, 100));
+
+          // 4. Verify preview fits in viewport
+          const verification = await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { error: 'Preview panel not found' };
+
+              const rect = preview.getBoundingClientRect();
+              const viewportWidth = window.innerWidth;
+              const viewportHeight = window.innerHeight;
+
+              // Check if preview is fully visible (not clipped by viewport)
+              if (rect.right > viewportWidth || rect.bottom > viewportHeight) {
+                return {
+                  error: 'Browser window too small. Preview would be clipped. Needed: ' +
+                         Math.ceil(rect.right) + 'x' + Math.ceil(rect.bottom) +
+                         ', Viewport: ' + viewportWidth + 'x' + viewportHeight
+                };
+              }
+
+              // Check if preview is positioned off-screen
+              if (rect.left < 0 || rect.top < 0) {
+                return { error: 'Preview is positioned off-screen' };
+              }
+
+              return {
+                ok: true,
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height
+              };
+            })()
+          `);
+
+          if (verification.error) {
+            // Reset and fail
+            await cdpEvaluate(tab.id, `window.boonPlayground.resetPreviewSize()`);
+            await cdpEvaluate(tab.id, `window.boonPlayground.setPanelLayout('${originalLayout}')`);
+            return { type: 'error', message: verification.error };
+          }
+
+          // 5. Take screenshot with HiDPI normalization
+          // scale: 1/dpr normalizes output to CSS pixels (700x700 CSS -> 700x700 px)
+          // scale: 1 gives native device resolution (700x700 CSS -> 1400x1400 px on 2x)
+          await attachDebugger(tab.id);
+          const scale = useHidpi ? 1 : (1 / dpr);
+          const { data } = await chrome.debugger.sendCommand({ tabId: tab.id }, 'Page.captureScreenshot', {
+            format: 'png',
+            clip: {
+              x: verification.x,
+              y: verification.y,
+              width: verification.width,
+              height: verification.height,
+              scale: scale
+            }
+          });
+
+          // 6. Reset preview size and restore original panel layout
+          await cdpEvaluate(tab.id, `window.boonPlayground.resetPreviewSize()`);
+          await cdpEvaluate(tab.id, `window.boonPlayground.setPanelLayout('${originalLayout}')`);
+
+          // 7. Return with metadata
+          const outputWidth = useHidpi ? Math.round(width * dpr) : width;
+          const outputHeight = useHidpi ? Math.round(height * dpr) : height;
+
+          return {
+            type: 'screenshot',
+            base64: data,
+            width: outputWidth,
+            height: outputHeight,
+            dpr: dpr
+          };
+        } catch (e) {
+          // Always try to reset on error
+          try {
+            await cdpEvaluate(tab.id, `window.boonPlayground.resetPreviewSize()`);
+            await cdpEvaluate(tab.id, `window.boonPlayground.setPanelLayout('normal')`);
+          } catch {}
+          return { type: 'error', message: 'Screenshot preview failed: ' + e.message };
         }
 
       default:

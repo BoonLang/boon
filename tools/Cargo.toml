@@ -54,3 +54,7 @@ reqwest = { version = "0.12", features = ["json"] }
 # SHA256 hashing for integrity verification
 sha2 = "0.10"
 hex = "0.4"
+
+# Image processing for visual comparison
+image = "0.25"
+image-compare = "0.4"

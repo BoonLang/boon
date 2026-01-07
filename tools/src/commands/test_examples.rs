@@ -1509,7 +1509,7 @@ async fn interactive_menu(port: u16, example: &DiscoveredExample) -> Result<Inte
 async fn save_screenshot(port: u16, path: &str) -> Result<()> {
     let response = send_command_to_server(port, WsCommand::Screenshot).await?;
     match response {
-        WsResponse::Screenshot { base64 } => {
+        WsResponse::Screenshot { base64, .. } => {
             let data = base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD,
                 &base64,
