@@ -18,7 +18,7 @@ set -e
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REFERENCE="$SCRIPT_DIR/reference_700x700.png"
+REFERENCE="$SCRIPT_DIR/reference_700x700_(1400x1400).png"
 OUTPUT_DIR="/tmp/boon-visual-tests"
 OUTPUT="$OUTPUT_DIR/todo_mvc_screenshot.png"
 DIFF="$OUTPUT_DIR/todo_mvc_diff.png"
@@ -85,7 +85,7 @@ echo "[2/4] Selecting todo_mvc example..."
 # Step 3: Wait for render and take screenshot of preview pane
 echo "[3/4] Taking screenshot of preview pane..."
 sleep 1  # Allow time for render
-"$BOON_TOOLS" exec screenshot-preview --output "$OUTPUT" --port 9224 || {
+"$BOON_TOOLS" exec screenshot-preview --output "$OUTPUT" --hidpi --port 9224 || {
     echo "ERROR: Failed to take screenshot"
     exit 1
 }
