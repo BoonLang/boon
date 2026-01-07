@@ -216,7 +216,16 @@ FUNCTION main_panel() {
                 element: []
                 direction: Row
                 gap: 0
-                style: [width: Fill]
+                style: [
+                    width: Fill
+                    outline: [
+                        color: Oklch[
+                            lightness: 0.50
+                            chroma: 0.14
+                            hue: 22
+                        ]
+                    ]
+                ]
                 items: LIST {
                     PASSED.store.todos |> List/is_empty() |> WHILE {
                         True => NoElement

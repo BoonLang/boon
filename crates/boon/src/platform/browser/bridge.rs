@@ -1377,6 +1377,85 @@ fn element_stripe(
         .boxed_local()
     });
 
+    // Outline signal - handles both NoOutline tag and Object with color/thickness/style fields.
+    // CRITICAL: Uses nested switch_map (not flat_map) because all variable streams are infinite.
+    let sv_outline = tagged_object.expect_variable("settings");
+    let outline_value_stream = {
+        let style_stream = switch_map(
+            sv_outline.stream(),
+            |value| value.expect_object().expect_variable("style").stream()
+        );
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("outline") {
+                Some(var) => var.value_actor().clone().stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+    };
+    let outline_signal = signal::from_stream(
+        switch_map(outline_value_stream, |value| {
+            match &value {
+                Value::Tag(tag, _) if tag.tag() == "NoOutline" => {
+                    // Return None to remove outline
+                    stream::once(future::ready(None::<zoon::Outline>))
+                        .chain(stream::pending())
+                        .boxed_local()
+                }
+                Value::Object(obj, _) => {
+                    let obj = obj.clone();
+                    stream::once(async move {
+                        // Parse thickness (default: 1)
+                        let thickness = if let Some(thickness_var) = obj.variable("thickness") {
+                            match thickness_var.value_actor().value().await {
+                                Ok(Value::Number(n, _)) => n.number() as u32,
+                                _ => 1,
+                            }
+                        } else {
+                            1
+                        };
+
+                        // Parse line_style: solid (default), dashed, dotted
+                        let line_style = if let Some(style_var) = obj.variable("line_style") {
+                            match style_var.value_actor().value().await {
+                                Ok(Value::Tag(tag, _)) => match tag.tag() {
+                                    "Dashed" => "dashed",
+                                    "Dotted" => "dotted",
+                                    _ => "solid",
+                                },
+                                _ => "solid",
+                            }
+                        } else {
+                            "solid"
+                        };
+
+                        // Parse color (required)
+                        if let Some(color_var) = obj.variable("color") {
+                            if let Ok(color_value) = color_var.value_actor().value().await {
+                                if let Some(css_color) = oklch_to_css(color_value).await {
+                                    // Build typed Outline value
+                                    let mut outline = zoon::Outline::outer().width(thickness).color(css_color);
+                                    outline = match line_style {
+                                        "dashed" => outline.dashed(),
+                                        "dotted" => outline.dotted(),
+                                        _ => outline.solid(),
+                                    };
+                                    return Some(outline);
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .chain(stream::pending())
+                    .boxed_local()
+                }
+                _ => {
+                    stream::pending::<Option<zoon::Outline>>().boxed_local()
+                }
+            }
+        })
+    );
+
     // AlignContent (row: horizontal content alignment, column: vertical content alignment)
     // Uses Zoon's AlignContent API which controls how CONTAINER aligns its CHILDREN
     // (unlike Align which positions elements within their parent)
@@ -1551,6 +1630,7 @@ fn element_stripe(
         .s(Height::with_signal_self(height_typed_signal))
         .s(Shadows::with_signal(shadows_typed_signal.map(|opt| opt.unwrap_or_default())))
         .s(Borders::new().top_signal(border_top_typed_signal))
+        .s(Outline::with_signal_self(outline_signal.map(|opt| opt.flatten())))
         .s(AlignContent::with_signal_self(combined_content_align_signal))
         // Keep tagged_object alive for the lifetime of this element
         .after_remove(move |_| {

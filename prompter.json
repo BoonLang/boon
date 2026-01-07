@@ -4,14 +4,15 @@
   "command": [
     "cl"
   ],
-  "supervisor_prompt": "Finish your plan. Then make all `makers verify-playground` tests pass. You can change and experiment with anything related to Boon engine and test and mcp infrastructure but don't change examples or tests alone (until there isn't a real bug or you want to add more tests or examples).",
+  "supervisor_prompt": "Finish your plan to make todo_mvc example the same like the referenced screenshot.",
   "completion_condition": "+completed+",
-  "completion_command": "makers verify-playground",
+  "completion_command": "playground/frontend/src/examples/todo_mvc/verify_visual.sh",
   "protected_patterns": [
     "tools/**/*.rs",
     "crates/boon-cli/tests/*.bn.test",
     "playground/frontend/src/examples/**/*.expected",
-    "playground/frontend/src/examples/**/*.bn"
+    "playground/frontend/src/examples/**/*.bn",
+    "playground/frontend/src/examples/todo_mvc/verify_visual.sh"
   ],
   "command_timeout_mins": 10
 }
