@@ -38,10 +38,10 @@ store: [
         }
     todos:
         LIST {
-            new_todo(title: TEXT { Buy groceries })
-            new_todo(title: TEXT { Walk the dog })
-            new_todo_completed(title: TEXT { Finish TodoMVC renderer })
             new_todo(title: TEXT { Read documentation })
+            new_todo_completed(title: TEXT { Finish TodoMVC renderer })
+            new_todo(title: TEXT { Walk the dog })
+            new_todo(title: TEXT { Buy groceries })
         }
         |> List/append(item: title_to_add |> new_todo())
         |> List/remove(
@@ -635,8 +635,8 @@ FUNCTION footer() {
                     TEXT { Created by }
                     Text/space()
                     footer_link(
-                        label: TEXT { the TodoMVC Team }
-                        to: TEXT { http://todomvc.com }
+                        label: TEXT { Martin Kavík }
+                        to: TEXT { https://kavik.cz/ }
                     )
                 }
             )
