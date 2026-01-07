@@ -25,6 +25,7 @@ static PANEL_SPLIT_STORAGE_KEY: &str = "boon-playground-panel-split";
 static DEBUG_COLLAPSED_STORAGE_KEY: &str = "boon-playground-debug-collapsed";
 static CUSTOM_EXAMPLES_STORAGE_KEY: &str = "boon-playground-custom-examples";
 static FORCED_PREVIEW_SIZE_STORAGE_KEY: &str = "boon-playground-forced-preview-size";
+static PANEL_LAYOUT_STORAGE_KEY: &str = "boon-playground-panel-layout";
 
 /// Clear all localStorage keys that match given prefixes.
 /// Used to clean up dynamically-keyed persistence data.
@@ -140,7 +141,8 @@ fn find_example_by_name(name: &str) -> Option<ExampleData> {
 }
 
 /// Panel layout mode for screenshot and viewing modes
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(crate = "boon::zoon::serde")]
 enum PanelLayout {
     /// Both code editor and preview panels visible (default)
     #[default]
@@ -235,6 +237,7 @@ struct Playground {
     _store_debug_collapsed_task: Rc<TaskHandle>,
     _store_custom_examples_task: Rc<TaskHandle>,
     _store_forced_preview_size_task: Rc<TaskHandle>,
+    _store_panel_layout_task: Rc<TaskHandle>,
     _sync_source_to_files_task: Rc<TaskHandle>,
     _sync_source_to_custom_example_task: Rc<TaskHandle>,
 }
@@ -389,6 +392,24 @@ impl Playground {
                 })
         }));
 
+        // Load panel layout from storage (default: Normal)
+        let panel_layout_value = local_storage()
+            .get::<PanelLayout>(PANEL_LAYOUT_STORAGE_KEY)
+            .and_then(Result::ok)
+            .unwrap_or(PanelLayout::Normal);
+        let panel_layout = Mutable::new(panel_layout_value);
+
+        let _store_panel_layout_task = Rc::new(Task::start_droppable({
+            let panel_layout = panel_layout.clone();
+            panel_layout
+                .signal()
+                .for_each_sync(move |layout| {
+                    if let Err(error) = local_storage().insert(PANEL_LAYOUT_STORAGE_KEY, &layout) {
+                        eprintln!("Failed to store panel layout: {error:#?}");
+                    }
+                })
+        }));
+
         // Sync source_code changes back to files map
         let _sync_source_to_files_task = {
             let files = files.clone();
@@ -431,7 +452,7 @@ impl Playground {
             current_file,
             source_code,
             run_command: Mutable::new(None),
-            panel_layout: Mutable::new(PanelLayout::Normal),
+            panel_layout,
             panel_split_ratio,
             panel_container_width: Mutable::new(0),
             is_dragging_panel_split: Mutable::new(false),
@@ -447,6 +468,7 @@ impl Playground {
             _store_debug_collapsed_task,
             _store_custom_examples_task,
             _store_forced_preview_size_task,
+            _store_panel_layout_task,
             _sync_source_to_files_task,
             _sync_source_to_custom_example_task,
         }
@@ -988,33 +1010,12 @@ impl Playground {
                     panel_split_ratio.set_neq(clamped);
                 }
             })
-            // Code editor - hide when PreviewOnly
-            .item_signal(self.panel_layout.signal().map({
-                let this = self.clone();
-                move |layout| if layout == PanelLayout::PreviewOnly {
-                    None
-                } else {
-                    Some(this.code_editor_panel_container())
-                }
-            }))
-            // Panel divider - only show when Normal
-            .item_signal(self.panel_layout.signal().map({
-                let this = self.clone();
-                move |layout| if layout == PanelLayout::Normal {
-                    Some(this.panel_divider())
-                } else {
-                    None
-                }
-            }))
-            // Preview panel - hide when CodeOnly
-            .item_signal(self.panel_layout.signal().map({
-                let this = self.clone();
-                move |layout| if layout == PanelLayout::CodeOnly {
-                    None
-                } else {
-                    Some(this.example_panel_container())
-                }
-            }))
+            // Code editor - CSS hide when PreviewOnly (preserves DOM state)
+            .item(self.code_editor_panel_container())
+            // Panel divider - CSS hide when not Normal
+            .item(self.panel_divider())
+            // Preview panel - CSS hide when CodeOnly (preserves DOM state)
+            .item(self.example_panel_container())
     }
 
     fn code_editor_panel_container(&self) -> impl Element + use<> {
@@ -1030,23 +1031,43 @@ impl Playground {
                 let layout = self.panel_layout.signal(),
                 let ratio = self.panel_split_ratio.signal(),
                 let container = self.panel_container_width.signal() =>
-                if *layout == PanelLayout::CodeOnly {
-                    Some(Width::fill())
-                } else {
-                    let container_width = *container as f64;
-                    let min_total = MIN_EDITOR_WIDTH_PX + MIN_PREVIEW_WIDTH_PX + PANEL_DIVIDER_WIDTH;
-                    if container_width >= min_total {
-                        let available = container_width - PANEL_DIVIDER_WIDTH;
-                        let desired = (available * ratio).clamp(
-                            MIN_EDITOR_WIDTH_PX,
-                            available - MIN_PREVIEW_WIDTH_PX,
-                        );
-                        Some(Width::exact(desired.max(0.0) as u32))
-                    } else {
-                        Some(Width::percent((ratio * 100.0).clamp(0.0, 100.0)))
+                match *layout {
+                    // When hidden via display:none, width doesn't matter but we set fill for consistency
+                    PanelLayout::PreviewOnly => Some(Width::fill()),
+                    PanelLayout::CodeOnly => Some(Width::fill()),
+                    PanelLayout::Normal => {
+                        let container_width = *container as f64;
+                        let min_total = MIN_EDITOR_WIDTH_PX + MIN_PREVIEW_WIDTH_PX + PANEL_DIVIDER_WIDTH;
+                        if container_width >= min_total {
+                            let available = container_width - PANEL_DIVIDER_WIDTH;
+                            let desired = (available * ratio).clamp(
+                                MIN_EDITOR_WIDTH_PX,
+                                available - MIN_PREVIEW_WIDTH_PX,
+                            );
+                            Some(Width::exact(desired.max(0.0) as u32))
+                        } else {
+                            Some(Width::percent((ratio * 100.0).clamp(0.0, 100.0)))
+                        }
                     }
                 }
             }))
+            // TODO: Add Display style to MoonZoon (display: none/block/flex/etc.)
+            // Using raw style for now to properly hide panel instead of Width::exact(0) antipattern
+            .update_raw_el({
+                let panel_layout = self.panel_layout.clone();
+                move |raw_el| {
+                    raw_el.style_signal(
+                        "display",
+                        panel_layout.signal().map(|layout| {
+                            if layout == PanelLayout::PreviewOnly {
+                                Some("none")
+                            } else {
+                                None::<&str> // Remove display style, use default
+                            }
+                        }),
+                    )
+                }
+            })
             .child_signal(self.panel_layout.signal().map({
                 let this = self.clone();
                 move |layout| {
@@ -1093,6 +1114,22 @@ impl Playground {
                 let this = self.clone();
                 move |event| this.start_panel_drag(event)
             })
+            // TODO: Add Display style to MoonZoon
+            .update_raw_el({
+                let panel_layout = self.panel_layout.clone();
+                move |raw_el| {
+                    raw_el.style_signal(
+                        "display",
+                        panel_layout.signal().map(|layout| {
+                            if layout == PanelLayout::Normal {
+                                None::<&str> // Remove display style, use default
+                            } else {
+                                Some("none")
+                            }
+                        }),
+                    )
+                }
+            })
     }
 
     fn example_panel_container(&self) -> impl Element + use<> {
@@ -1108,24 +1145,43 @@ impl Playground {
                 let layout = self.panel_layout.signal(),
                 let ratio = self.panel_split_ratio.signal(),
                 let container = self.panel_container_width.signal() =>
-                if *layout == PanelLayout::PreviewOnly {
-                    Some(Width::fill())
-                } else {
-                    let container_width = *container as f64;
-                    let min_total = MIN_EDITOR_WIDTH_PX + MIN_PREVIEW_WIDTH_PX + PANEL_DIVIDER_WIDTH;
-                    if container_width >= min_total {
-                        let available = container_width - PANEL_DIVIDER_WIDTH;
-                        let editor = (available * ratio).clamp(
-                            MIN_EDITOR_WIDTH_PX,
-                            available - MIN_PREVIEW_WIDTH_PX,
-                        );
-                        let preview = (available - editor).max(0.0);
-                        Some(Width::exact(preview as u32))
-                    } else {
-                        Some(Width::percent(((1.0 - ratio) * 100.0).clamp(0.0, 100.0)))
+                match *layout {
+                    // When hidden via display:none, width doesn't matter but we set fill for consistency
+                    PanelLayout::CodeOnly => Some(Width::fill()),
+                    PanelLayout::PreviewOnly => Some(Width::fill()),
+                    PanelLayout::Normal => {
+                        let container_width = *container as f64;
+                        let min_total = MIN_EDITOR_WIDTH_PX + MIN_PREVIEW_WIDTH_PX + PANEL_DIVIDER_WIDTH;
+                        if container_width >= min_total {
+                            let available = container_width - PANEL_DIVIDER_WIDTH;
+                            let editor = (available * ratio).clamp(
+                                MIN_EDITOR_WIDTH_PX,
+                                available - MIN_PREVIEW_WIDTH_PX,
+                            );
+                            let preview = (available - editor).max(0.0);
+                            Some(Width::exact(preview as u32))
+                        } else {
+                            Some(Width::percent(((1.0 - ratio) * 100.0).clamp(0.0, 100.0)))
+                        }
                     }
                 }
             }))
+            // TODO: Add Display style to MoonZoon
+            .update_raw_el({
+                let panel_layout = self.panel_layout.clone();
+                move |raw_el| {
+                    raw_el.style_signal(
+                        "display",
+                        panel_layout.signal().map(|layout| {
+                            if layout == PanelLayout::CodeOnly {
+                                Some("none")
+                            } else {
+                                None::<&str> // Remove display style, use default
+                            }
+                        }),
+                    )
+                }
+            })
             .child(self.primary_panel(self.example_panel()))
     }
 

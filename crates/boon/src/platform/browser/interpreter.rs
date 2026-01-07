@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::io::{Cursor, Read};
 use std::sync::Arc;
@@ -7,7 +6,7 @@ use std::sync::Arc;
 use ariadne::{Config, Label, Report, ReportKind, Source};
 use chumsky::input::Stream;
 use serde_json_any_key::MapIterToJson;
-use zoon::{UnwrapThrowExt, WebStorage, eprintln, local_storage, println, serde_json};
+use zoon::{UnwrapThrowExt, WebStorage, eprintln, local_storage, println};
 
 /// Set to false to disable verbose source code and AST logging in console
 const LOG_SOURCE_AND_AST: bool = false;

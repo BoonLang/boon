@@ -8,7 +8,6 @@ use chumsky::Parser as ChumskyParser;
 use chumsky::input::{Input as ChumskyInput, Stream as ChumskyStream};
 use ulid::Ulid;
 use zoon::futures_channel::oneshot;
-use zoon::futures_util::select;
 use zoon::futures_util::future;
 use zoon::futures_util::stream::{self, LocalBoxStream};
 use zoon::{Stream, StreamExt, SinkExt, mpsc, Task, TaskHandle};
@@ -4995,8 +4994,6 @@ async fn match_pattern(
     pattern: &static_expression::Pattern,
     value: &Value,
 ) -> Option<HashMap<String, Value>> {
-    use zoon::futures_util::StreamExt;
-
     let mut bindings = HashMap::new();
 
     match pattern {
