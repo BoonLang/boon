@@ -24,6 +24,10 @@ OUTPUT="$OUTPUT_DIR/todo_mvc_screenshot.png"
 DIFF="$OUTPUT_DIR/todo_mvc_diff.png"
 SSIM_THRESHOLD="0.90"
 
+# Anti-cheat: Canonical reference hash
+# MUST NOT be changed without explicit team review and commit message explanation
+REFERENCE_HASH="4eed3835c50064087a378cae337df2a5e4b3499afd638e7e1afed79b6647d1d5"
+
 # Find boon-tools binary
 BOON_ROOT="$SCRIPT_DIR/../../../../.."
 BOON_TOOLS="$BOON_ROOT/target/release/boon-tools"
@@ -62,8 +66,29 @@ if [[ ! -f "$REFERENCE" ]]; then
     exit 1
 fi
 
+# Verify reference image hasn't been tampered with (anti-cheat)
+ACTUAL_HASH=$(sha256sum "$REFERENCE" | cut -d' ' -f1)
+if [[ "$ACTUAL_HASH" != "$REFERENCE_HASH" ]]; then
+    echo "========================================"
+    echo "ERROR: Reference image has been modified!"
+    echo "========================================"
+    echo ""
+    echo "Expected hash: $REFERENCE_HASH"
+    echo "Actual hash:   $ACTUAL_HASH"
+    echo ""
+    echo "The reference image is protected to prevent 'cheating' by"
+    echo "replacing it with the current render instead of fixing the code."
+    echo ""
+    echo "If this change is intentional (e.g., approved design update):"
+    echo "  1. Update REFERENCE_HASH in this script"
+    echo "  2. Document the reason in your commit message"
+    echo ""
+    exit 1
+fi
+
 echo "=== TodoMVC Visual Verification ==="
 echo "Reference: $REFERENCE"
+echo "Reference hash: verified ✓"
 echo "Threshold: $SSIM_THRESHOLD"
 echo ""
 

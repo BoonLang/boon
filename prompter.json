@@ -4,7 +4,7 @@
   "command": [
     "cl"
   ],
-  "supervisor_prompt": "Finish your plan to make todo_mvc example the same like the referenced screenshot.",
+  "supervisor_prompt": "Make todo_mvc visually identical to its reference screenshot.",
   "completion_condition": "+completed+",
   "completion_command": "playground/frontend/src/examples/todo_mvc/verify_visual.sh",
   "protected_patterns": [
@@ -12,7 +12,8 @@
     "crates/boon-cli/tests/*.bn.test",
     "playground/frontend/src/examples/**/*.expected",
     "playground/frontend/src/examples/**/*.bn",
-    "playground/frontend/src/examples/todo_mvc/verify_visual.sh"
+    "playground/frontend/src/examples/todo_mvc/verify_visual.sh",
+    "playground/frontend/src/examples/todo_mvc/reference_700x700_(1400x1400).png"
   ],
   "command_timeout_mins": 10
 }

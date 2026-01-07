@@ -613,6 +613,24 @@ fn get_tools() -> Vec<Tool> {
                 "required": []
             }),
         },
+        Tool {
+            name: "boon_visual_debug".to_string(),
+            description: "Compare the current preview against a reference image and return detailed spatial analysis. Returns JSON with region grid, bounding box, line-based diffs, and CSS coordinates to guide visual debugging.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "reference": {
+                        "type": "string",
+                        "description": "Path to the reference image (e.g., '/path/to/reference.png')"
+                    },
+                    "threshold": {
+                        "type": "number",
+                        "description": "SSIM threshold (0.0 to 1.0). Default: 0.90"
+                    }
+                },
+                "required": ["reference"]
+            }),
+        },
     ]
 }
 
@@ -654,6 +672,20 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
     // Handle playground start (no WebSocket)
     if name == "boon_start_playground" {
         return start_playground().await;
+    }
+
+    // Handle visual debug (screenshot + pixel-diff analysis)
+    if name == "boon_visual_debug" {
+        let reference = args
+            .get("reference")
+            .and_then(|v| v.as_str())
+            .ok_or("reference parameter required")?;
+        let threshold = args
+            .get("threshold")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.90);
+
+        return run_visual_debug(reference, threshold, ws_port).await;
     }
 
     // Handle click-by-text (compound command)
@@ -1570,4 +1602,82 @@ fn truncate_json_tree_recursive(
         }
         _ => value.clone(),
     }
+}
+
+/// Run visual debug: take screenshot and compare against reference
+async fn run_visual_debug(reference: &str, threshold: f64, ws_port: u16) -> Result<String, String> {
+    use std::path::Path;
+
+    // Check reference exists
+    if !Path::new(reference).exists() {
+        return Err(format!("Reference image not found: {}", reference));
+    }
+
+    // Create output directory
+    let output_dir = "/tmp/boon-visual-debug";
+    std::fs::create_dir_all(output_dir).map_err(|e| e.to_string())?;
+
+    let current = format!("{}/current.png", output_dir);
+    let diff = format!("{}/diff.png", output_dir);
+
+    // Take screenshot of preview pane (HiDPI for visual fidelity)
+    let response = ws_server::send_command_to_server(
+        ws_port,
+        Command::ScreenshotPreview {
+            width: Some(700),
+            height: Some(700),
+            hidpi: Some(true),
+        },
+    )
+    .await
+    .map_err(|e| format!("Failed to take screenshot: {}", e))?;
+
+    // Get the screenshot file path
+    let screenshot_path = match response {
+        Response::ScreenshotFile { filepath } => filepath,
+        Response::Error { message } => return Err(format!("Screenshot failed: {}", message)),
+        _ => return Err("Unexpected response from screenshot".to_string()),
+    };
+
+    // Copy screenshot to our working directory
+    std::fs::copy(&screenshot_path, &current)
+        .map_err(|e| format!("Failed to copy screenshot: {}", e))?;
+
+    // Run pixel-diff with JSON output via subprocess
+    let output = std::process::Command::new("sh")
+        .args([
+            "-c",
+            &format!(
+                "{} pixel-diff --reference '{}' --current '{}' --output '{}' --threshold {} --json 2>&1",
+                std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "boon-tools".to_string()),
+                reference,
+                current,
+                diff,
+                threshold
+            ),
+        ])
+        .output()
+        .map_err(|e| format!("Failed to run pixel-diff: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Combine output
+    let mut result = String::new();
+
+    if !stdout.is_empty() {
+        result.push_str(&stdout);
+    }
+
+    if !stderr.is_empty() && !stderr.contains("SSIM below threshold") {
+        result.push_str("\n--- Errors ---\n");
+        result.push_str(&stderr);
+    }
+
+    // Add file paths at the end
+    result.push_str(&format!("\n\nScreenshot: {}\nDiff image: {}", current, diff));
+
+    Ok(result)
 }

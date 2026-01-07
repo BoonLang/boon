@@ -181,6 +181,46 @@ When Claude has access to the Boon Browser MCP server, **always prefer MCP tools
 - `boon_watch_compile` - Stream compilation status changes
 - `boon_test` - Run specific playground tests
 
+### Visual Regression Testing
+
+When debugging visual differences between renders and reference images:
+
+1. **Use spatial analysis first** to find WHERE differences are:
+   ```bash
+   boon-tools pixel-diff --reference ref.png --current cur.png --grid
+   ```
+   This shows a 7×7 grid identifying problem regions, with CSS coordinates.
+
+2. **Use semantic analysis** to understand WHAT TYPE of difference:
+   ```bash
+   boon-tools pixel-diff --reference ref.png --current cur.png --analyze-semantic
+   ```
+   This identifies COLOR_SHIFT, POSITION_SHIFT, FONT_CHANGE, SIZE_CHANGE with specific recommendations.
+
+3. **Zoom into problem regions** for detailed inspection:
+   ```bash
+   boon-tools pixel-diff --reference ref.png --current cur.png --zoom-region 3,3 --output zoom.png
+   ```
+   Creates 4× magnified side-by-side comparison with CSS coordinates.
+
+4. **Use the interactive helper** for convergence loops:
+   ```bash
+   cd tools/scripts && ./visual_debug.sh --reference /path/to/ref.png
+   ```
+
+**Semantic Analysis Types:**
+
+| Type | Detection | Action |
+|------|-----------|--------|
+| `COLOR_SHIFT` | RGB delta + LAB ΔE | Fix CSS `color`, `background` |
+| `POSITION_SHIFT` | Cross-correlation | Fix `margin`, `padding` |
+| `FONT_CHANGE` | Edge variance | Check `font-family` loading |
+| `SIZE_CHANGE` | Edge density | Fix `font-size`, `zoom` |
+
+**Anti-cheat protection:** Reference images are SHA256-verified in `verify_visual.sh` to prevent replacing reference with broken render. Any change requires updating the hash and documenting in the commit message.
+
+See `docs/VISUAL_DEBUGGING.md` for the complete workflow guide.
+
 ## Architecture
 
 ### Parser (`crates/boon/src/parser/`)

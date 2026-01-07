@@ -47,6 +47,9 @@ enum Commands {
     },
 
     /// Compare two images using SSIM (Structural Similarity Index)
+    ///
+    /// Provides detailed spatial analysis including region grid, line diffs,
+    /// bounding box, and CSS coordinate mapping for debugging.
     PixelDiff {
         /// Path to reference image
         #[arg(long, short)]
@@ -63,6 +66,36 @@ enum Commands {
         /// SSIM threshold (0.0 to 1.0), exits 0 if score >= threshold
         #[arg(long, short, default_value = "0.95")]
         threshold: f64,
+
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+
+        /// Add grid overlay to diff image showing region boundaries
+        #[arg(long)]
+        grid: bool,
+
+        /// Generate heatmap visualization instead of diff
+        #[arg(long)]
+        heatmap: bool,
+
+        /// Generate side-by-side composite: [Reference] | [Current] | [Diff]
+        #[arg(long)]
+        composite: bool,
+
+        /// Zoom into a specific region (format: "row,col", e.g., "3,3")
+        /// Creates a magnified side-by-side comparison of that region
+        #[arg(long)]
+        zoom_region: Option<String>,
+
+        /// Zoom scale factor (default: 4)
+        #[arg(long, default_value = "4")]
+        zoom_scale: u32,
+
+        /// Run semantic analysis to identify difference types
+        /// (COLOR_SHIFT, POSITION_SHIFT, FONT_CHANGE, SIZE_CHANGE)
+        #[arg(long)]
+        analyze_semantic: bool,
     },
 }
 
@@ -385,8 +418,25 @@ fn main() -> Result<()> {
             current,
             output,
             threshold,
+            json,
+            grid,
+            heatmap,
+            composite,
+            zoom_region,
+            zoom_scale,
+            analyze_semantic,
         } => {
-            if let Err(e) = commands::pixel_diff::run(&reference, &current, output.as_deref(), threshold) {
+            let options = commands::pixel_diff::OutputOptions {
+                diff_path: output,
+                json,
+                grid,
+                heatmap,
+                composite,
+                zoom_region,
+                zoom_scale,
+                analyze_semantic,
+            };
+            if let Err(e) = commands::pixel_diff::run_with_options(&reference, &current, threshold, options) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
