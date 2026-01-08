@@ -3073,7 +3073,7 @@ fn element_text_input(
     TextInput::new()
         .label_hidden("text input")
         .text_signal(signal::from_stream(text_stream).map(|t| t.unwrap_or_default()))
-        .placeholder(Placeholder::with_signal(placeholder_signal.map(|t| t.unwrap_or_default())))
+        .placeholder(Placeholder::with_signal(placeholder_signal.map(|t| t.unwrap_or_default())).s(Font::new().italic()))
         .on_change({
             let sender = change_event_sender.clone();
             move |text| {
