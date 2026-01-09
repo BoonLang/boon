@@ -30,13 +30,26 @@ zoon = { git = "https://github.com/MoonZoon/MoonZoon", rev = "19c6cf6b4d07cd27be
 # Enable `sink` feature for Sender to implement Sink trait (required for async .send())
 futures-channel = { version = "0.3", features = ["sink"] }
 
+# Differential Dataflow engine dependencies (optional, used with engine-dd feature)
+ordered-float = { version = "4", optional = true }
+timely = { version = "0.12", optional = true }
+differential-dataflow = { version = "0.12", optional = true }
+
 [features]
-default = ["debug-channels"]
+default = ["debug-channels", "engine-actors"]
+
+# Engine selection features - at least one must be enabled
+# Use engine-actors (default) for the actor-based reactive engine
+# Use engine-dd for the differential dataflow engine
+# Use engine-both to enable runtime engine switching
+engine-actors = []
+engine-dd = ["dep:ordered-float", "dep:timely", "dep:differential-dataflow"]
+engine-both = ["engine-actors", "engine-dd"]
 
 # Enable debug logging and timeouts for channel operations.
 # Useful for detecting deadlocks and monitoring backpressure.
 # Enabled by default. To disable for production:
-# `cargo build --no-default-features`
+# `cargo build --no-default-features --features engine-actors`
 debug-channels = []
 
 # CLI platform support with serde_json for output formatting

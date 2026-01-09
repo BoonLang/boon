@@ -28,10 +28,10 @@ async fn yield_once() {
     }).await
 }
 
-use super::super::super::parser::{
+use crate::parser::{
     Persistence, PersistenceId, PersistenceStatus, Scope, SourceCode, Span, span_at, static_expression, lexer, parser, resolve_references, Token, Spanned,
 };
-use super::api;
+use super::super::api;
 use super::engine::*;
 
 /// Creates a persistence-wrapped stream for a variable.
@@ -3293,7 +3293,7 @@ fn build_while_actor(
                     // The key insight: we want HOLD to subscribe to the Variable that bridge
                     // is connected to. Using stable scope (arm index) ensures key consistency.
                     scope: {
-                        use super::super::super::parser::Scope;
+                        use crate::parser::Scope;
                         let scope_id = format!("while_arm_{}", arm_idx);
                         match &actor_context_clone.scope {
                             Scope::Root => Scope::Nested(scope_id),

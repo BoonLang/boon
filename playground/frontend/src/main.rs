@@ -9,7 +9,10 @@ use std::rc::Rc;
 use ulid::Ulid;
 
 use boon::platform::browser::{
-    bridge::object_with_document_to_element_signal, engine::VirtualFilesystem, interpreter,
+    bridge::object_with_document_to_element_signal,
+    common::{EngineType, default_engine},
+    engine::VirtualFilesystem,
+    interpreter,
 };
 
 mod code_editor;
@@ -26,6 +29,7 @@ static DEBUG_COLLAPSED_STORAGE_KEY: &str = "boon-playground-debug-collapsed";
 static CUSTOM_EXAMPLES_STORAGE_KEY: &str = "boon-playground-custom-examples";
 static FORCED_PREVIEW_SIZE_STORAGE_KEY: &str = "boon-playground-forced-preview-size";
 static PANEL_LAYOUT_STORAGE_KEY: &str = "boon-playground-panel-layout";
+static ENGINE_TYPE_STORAGE_KEY: &str = "boon-playground-engine-type";
 
 /// Clear all localStorage keys that match given prefixes.
 /// Used to clean up dynamically-keyed persistence data.
@@ -133,6 +137,37 @@ fn set_custom_example_in_url(example_name: &str) {
     }
 }
 
+/// Get engine type from URL query parameter (?engine=actors or ?engine=dd)
+fn get_engine_from_url() -> Option<EngineType> {
+    let window = web_sys::window()?;
+    let location = window.location();
+    let search = location.search().ok()?;
+    if search.is_empty() {
+        return None;
+    }
+    let params = web_sys::UrlSearchParams::new_with_str(&search).ok()?;
+    match params.get("engine").as_deref() {
+        Some("actors") => Some(EngineType::Actors),
+        Some("dd") => Some(EngineType::DifferentialDataflow),
+        _ => None,
+    }
+}
+
+/// Load engine type from localStorage
+fn load_engine_from_storage() -> Option<EngineType> {
+    let stored = local_storage().get::<String>(ENGINE_TYPE_STORAGE_KEY)?.ok()?;
+    match stored.as_str() {
+        "Actors" => Some(EngineType::Actors),
+        "DD" => Some(EngineType::DifferentialDataflow),
+        _ => None,
+    }
+}
+
+/// Save engine type to localStorage
+fn save_engine_to_storage(engine: EngineType) {
+    let _ = local_storage().insert(ENGINE_TYPE_STORAGE_KEY, &engine.short_name().to_string());
+}
+
 /// Find example data by name (filename without .bn extension)
 fn find_example_by_name(name: &str) -> Option<ExampleData> {
     EXAMPLE_DATAS.iter().find(|e| {
@@ -231,6 +266,8 @@ struct Playground {
     forced_preview_size: Mutable<Option<(u32, u32)>>,
     /// Whether the force size UI is expanded
     force_size_expanded: Mutable<bool>,
+    /// Selected engine type (for engine-both feature)
+    engine_type: Mutable<EngineType>,
     _store_files_task: Rc<TaskHandle>,
     _store_current_file_task: Rc<TaskHandle>,
     _store_panel_split_task: Rc<TaskHandle>,
@@ -238,6 +275,7 @@ struct Playground {
     _store_custom_examples_task: Rc<TaskHandle>,
     _store_forced_preview_size_task: Rc<TaskHandle>,
     _store_panel_layout_task: Rc<TaskHandle>,
+    _store_engine_type_task: Rc<TaskHandle>,
     _sync_source_to_files_task: Rc<TaskHandle>,
     _sync_source_to_custom_example_task: Rc<TaskHandle>,
 }
@@ -410,6 +448,21 @@ impl Playground {
                 })
         }));
 
+        // Load engine type: URL param > localStorage > default
+        let engine_type_value = get_engine_from_url()
+            .or_else(load_engine_from_storage)
+            .unwrap_or_else(default_engine);
+        let engine_type = Mutable::new(engine_type_value);
+
+        let _store_engine_type_task = Rc::new(Task::start_droppable({
+            let engine_type = engine_type.clone();
+            engine_type
+                .signal()
+                .for_each_sync(move |engine| {
+                    save_engine_to_storage(engine);
+                })
+        }));
+
         // Sync source_code changes back to files map
         let _sync_source_to_files_task = {
             let files = files.clone();
@@ -469,8 +522,10 @@ impl Playground {
             _store_custom_examples_task,
             _store_forced_preview_size_task,
             _store_panel_layout_task,
+            _store_engine_type_task,
             _sync_source_to_files_task,
             _sync_source_to_custom_example_task,
+            engine_type,
         }
         .root()
     }
@@ -948,9 +1003,76 @@ impl Playground {
                     .s(Font::new().size(12).color(color!("rgba(255, 255, 255, 0.5)")))
                     .child("F12 → dev tools for logs & errors")
             )
+            .item(self.engine_indicator())
             .item(El::new().s(Align::new().center_x()).child(self.run_button()))
             .item(self.force_size_controls())
             .item(El::new().s(Align::new().right()).child(self.clear_saved_states_button()))
+    }
+
+    /// Display the current engine type with tooltip.
+    /// When engine-both feature is enabled, this becomes a clickable toggle.
+    fn engine_indicator(&self) -> impl Element + use<> {
+        let engine_type = self.engine_type.clone();
+        let run_command = self.run_command.clone();
+        let hovered = Mutable::new(false);
+
+        // Check if engine switching is available (engine-both feature)
+        let is_switchable = boon::platform::browser::common::is_engine_switchable();
+
+        El::new()
+            .s(Font::new().size(12).color_signal(
+                hovered.signal().map(move |h| {
+                    if h && is_switchable {
+                        color!("rgba(100, 200, 255, 1.0)")
+                    } else {
+                        color!("rgba(100, 200, 255, 0.8)")
+                    }
+                })
+            ))
+            .s(Padding::new().x(8).y(4))
+            .s(Background::new().color_signal(
+                hovered.signal().map(move |h| {
+                    if h && is_switchable {
+                        color!("rgba(100, 200, 255, 0.2)")
+                    } else {
+                        color!("rgba(100, 200, 255, 0.1)")
+                    }
+                })
+            ))
+            .s(RoundedCorners::all(4))
+            .s(Cursor::new(if is_switchable { CursorIcon::Pointer } else { CursorIcon::Default }))
+            .update_raw_el({
+                let engine_type = engine_type.clone();
+                move |raw_el| {
+                    raw_el.attr_signal("title", engine_type.signal().map(move |engine| {
+                        if is_switchable {
+                            format!("{} (click to switch)", engine.full_name())
+                        } else {
+                            engine.full_name().to_string()
+                        }
+                    }))
+                }
+            })
+            .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
+            .on_click_event({
+                let engine_type = engine_type.clone();
+                let run_command = run_command.clone();
+                move |_| {
+                    if is_switchable {
+                        // Toggle engine
+                        let new_engine = match engine_type.get() {
+                            EngineType::Actors => EngineType::DifferentialDataflow,
+                            EngineType::DifferentialDataflow => EngineType::Actors,
+                        };
+                        engine_type.set(new_engine);
+                        // Trigger re-run with new engine
+                        run_command.set(Some(RunCommand { filename: None }));
+                    }
+                }
+            })
+            .child_signal(engine_type.signal().map(|engine| {
+                format!("Engine: {}", engine.short_name())
+            }))
     }
 
     fn primary_panel<T: Element>(&self, content: T) -> impl Element + use<T> {
