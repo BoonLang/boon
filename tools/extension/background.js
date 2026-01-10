@@ -2442,6 +2442,54 @@ async function handleCommand(id, command) {
           return { type: 'error', message: 'Screenshot preview failed: ' + e.message };
         }
 
+      case 'getEngine':
+        // Get the currently selected engine type from the playground
+        try {
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              if (typeof window.boonPlayground === 'undefined') {
+                return { error: 'boonPlayground not available' };
+              }
+              if (typeof window.boonPlayground.getEngine !== 'function') {
+                return { error: 'getEngine API not available' };
+              }
+              return window.boonPlayground.getEngine();
+            })()
+          `);
+          if (result && result.error) {
+            return { type: 'error', message: result.error };
+          }
+          return { type: 'engineInfo', engine: result.engine, switchable: result.switchable };
+        } catch (e) {
+          return { type: 'error', message: 'GetEngine failed: ' + e.message };
+        }
+
+      case 'setEngine':
+        // Set the engine type and trigger re-run
+        try {
+          const engineToSet = command.engine;
+          if (engineToSet !== 'Actors' && engineToSet !== 'DD') {
+            return { type: 'error', message: `Invalid engine '${engineToSet}'. Must be 'Actors' or 'DD'` };
+          }
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              if (typeof window.boonPlayground === 'undefined') {
+                return { error: 'boonPlayground not available' };
+              }
+              if (typeof window.boonPlayground.setEngine !== 'function') {
+                return { error: 'setEngine API not available' };
+              }
+              return window.boonPlayground.setEngine('${engineToSet}');
+            })()
+          `);
+          if (result && result.error) {
+            return { type: 'error', message: result.error };
+          }
+          return { type: 'success', data: { engine: result.engine, previous: result.previous } };
+        } catch (e) {
+          return { type: 'error', message: 'SetEngine failed: ' + e.message };
+        }
+
       default:
         return { type: 'error', message: `Unknown command: ${type}` };
     }

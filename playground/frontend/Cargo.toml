@@ -15,4 +15,4 @@ default = ["engine-both"]
 # Engine feature passthrough - these enable the corresponding boon engine features
 engine-actors = ["boon/engine-actors"]
 engine-dd = ["boon/engine-dd"]
-engine-both = ["boon/engine-both"]
+engine-both = ["engine-actors", "engine-dd"]

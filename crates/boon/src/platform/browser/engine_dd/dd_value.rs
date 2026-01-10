@@ -31,6 +31,8 @@ pub enum DdValue {
         tag: Arc<str>,
         fields: Arc<BTreeMap<Arc<str>, DdValue>>,
     },
+    /// Reference to a HOLD state - resolved at render time
+    HoldRef(Arc<str>),
 }
 
 impl DdValue {
@@ -103,6 +105,8 @@ impl DdValue {
             Self::List(items) => !items.is_empty(),
             // False tag is falsy, True and all other tags are truthy
             Self::Tagged { tag, .. } => tag.as_ref() != "False",
+            // HoldRef is truthy (the actual value is resolved at render time)
+            Self::HoldRef(_) => true,
         }
     }
 
@@ -123,6 +127,7 @@ impl DdValue {
             Self::Object(_) => "[object]".to_string(),
             Self::List(items) => format!("[list of {}]", items.len()),
             Self::Tagged { tag, .. } => format!("[{tag}]"),
+            Self::HoldRef(name) => format!("[hold:{}]", name),
         }
     }
 

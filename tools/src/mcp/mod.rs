@@ -631,6 +631,30 @@ fn get_tools() -> Vec<Tool> {
                 "required": ["reference"]
             }),
         },
+        Tool {
+            name: "boon_get_engine".to_string(),
+            description: "Get the currently selected Boon engine. Returns 'Actors' or 'DD'. Also indicates whether engine switching is available.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        Tool {
+            name: "boon_set_engine".to_string(),
+            description: "Set the Boon engine and trigger re-run. Use 'Actors' for the actor-based reactive engine or 'DD' for the Differential Dataflow engine.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "engine": {
+                        "type": "string",
+                        "enum": ["Actors", "DD"],
+                        "description": "Engine to use: 'Actors' (actor-based reactive) or 'DD' (Differential Dataflow)"
+                    }
+                },
+                "required": ["engine"]
+            }),
+        },
     ]
 }
 
@@ -997,6 +1021,21 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
 
         "boon_reload_extension" => Command::Reload,
 
+        "boon_get_engine" => Command::GetEngine,
+
+        "boon_set_engine" => {
+            let engine = args
+                .get("engine")
+                .and_then(|v| v.as_str())
+                .ok_or("engine parameter required")?
+                .to_string();
+            // Validate engine value
+            if engine != "Actors" && engine != "DD" {
+                return Err(format!("Invalid engine '{}'. Must be 'Actors' or 'DD'", engine));
+            }
+            Command::SetEngine { engine }
+        }
+
         _ => return Err(format!("Unknown tool: {}", name)),
     };
 
@@ -1173,6 +1212,16 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
             } else {
                 Ok("Checkbox not found".to_string())
             }
+        }
+
+        Response::EngineInfo { engine, switchable } => {
+            let mut result = format!("Engine: {}", engine);
+            if switchable {
+                result.push_str("\nSwitching: available (both engines compiled)");
+            } else {
+                result.push_str("\nSwitching: not available (single engine only)");
+            }
+            Ok(result)
         }
 
         Response::Error { message } => Err(message),

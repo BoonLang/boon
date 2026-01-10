@@ -37,23 +37,26 @@ impl Default for EngineType {
 
 /// Returns the default engine based on compile-time feature flags.
 pub fn default_engine() -> EngineType {
+    // When both engines are available (either via engine-both or both individual features)
+    #[cfg(all(feature = "engine-actors", feature = "engine-dd"))]
+    {
+        EngineType::Actors // Default to Actors when both are available
+    }
+
+    // Actors-only (DD not available)
     #[cfg(all(feature = "engine-actors", not(feature = "engine-dd")))]
     {
         EngineType::Actors
     }
 
+    // DD-only (Actors not available)
     #[cfg(all(feature = "engine-dd", not(feature = "engine-actors")))]
     {
         EngineType::DifferentialDataflow
-    }
-
-    #[cfg(feature = "engine-both")]
-    {
-        EngineType::Actors // Default to Actors when both are available
     }
 }
 
 /// Returns true if both engines are available for runtime switching.
 pub fn is_engine_switchable() -> bool {
-    cfg!(feature = "engine-both")
+    cfg!(all(feature = "engine-actors", feature = "engine-dd"))
 }

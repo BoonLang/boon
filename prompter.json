@@ -4,9 +4,9 @@
   "command": [
     "cl"
   ],
-  "supervisor_prompt": "Make todo_mvc visually identical to its reference screenshot.",
+  "supervisor_prompt": "Make DD engine fully working according to the plan or as needed and remove all stubs or workarounds that were used to make it work by cheating.",
   "completion_condition": "+completed+",
-  "completion_command": "playground/frontend/src/examples/todo_mvc/verify_visual.sh",
+  "completion_command": "makers verify-playground",
   "protected_patterns": [
     "tools/**/*.rs",
     "crates/boon-cli/tests/*.bn.test",

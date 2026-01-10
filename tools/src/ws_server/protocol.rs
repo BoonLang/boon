@@ -171,6 +171,15 @@ pub enum Command {
         #[serde(skip_serializing_if = "Option::is_none")]
         hidpi: Option<bool>,
     },
+
+    /// Get the currently selected engine type
+    GetEngine,
+
+    /// Set the engine type and trigger re-run
+    SetEngine {
+        /// Engine name: "Actors" or "DD"
+        engine: String,
+    },
 }
 
 /// Response from Extension to CLI via Server
@@ -294,6 +303,14 @@ pub enum Response {
         found: bool,
         /// Whether the checkbox is checked
         checked: bool,
+    },
+
+    /// Engine info response
+    EngineInfo {
+        /// Current engine: "Actors" or "DD"
+        engine: String,
+        /// Whether engine switching is available
+        switchable: bool,
     },
 }
 

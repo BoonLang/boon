@@ -13,6 +13,7 @@ use crate::parser::{
 };
 use super::{
     dd_evaluator::BoonDdRuntime,
+    dd_reactive_eval::{DdReactiveContext, DdReactiveEvaluator},
     dd_value::DdValue,
 };
 
@@ -106,6 +107,103 @@ pub fn run_dd_with_injections(
 
     // Return the document output
     runtime.get_document().cloned()
+}
+
+/// Result of reactive DD evaluation.
+pub struct DdReactiveResult {
+    pub document: Option<DdValue>,
+    pub context: DdReactiveContext,
+}
+
+/// Run a Boon program with reactive evaluation.
+///
+/// Returns the document value and the reactive context for event wiring.
+pub fn run_dd_reactive(
+    filename: &str,
+    source_code: &str,
+) -> Option<DdReactiveResult> {
+    run_dd_reactive_with_persistence(filename, source_code, None)
+}
+
+/// Run a Boon program with reactive evaluation and optional persistence.
+pub fn run_dd_reactive_with_persistence(
+    filename: &str,
+    source_code: &str,
+    storage_prefix: Option<&str>,
+) -> Option<DdReactiveResult> {
+    // Create SourceCode for parsing
+    let source_code_for_storage = source_code.to_string();
+    let source_code_arc = SourceCode::new(source_code_for_storage.clone());
+    let source_code = source_code_arc.as_str();
+
+    if LOG_SOURCE_AND_AST {
+        println!("[DD Reactive Source Code ({filename})]");
+        println!("{source_code}");
+    }
+
+    // Lex
+    let (tokens, errors) = lexer().parse(source_code).into_output_errors();
+    if !errors.is_empty() {
+        println!("[DD Lex Errors]");
+    }
+    report_errors(errors, filename, source_code);
+    let Some(mut tokens) = tokens else {
+        return None;
+    };
+
+    tokens.retain(|spanned_token| !matches!(spanned_token.node, Token::Comment(_)));
+
+    // Parse
+    reset_expression_depth();
+    let (ast, errors) = parser()
+        .parse(tokens.map(
+            span_at(source_code.len()),
+            |Spanned {
+                 node,
+                 span,
+                 persistence: _,
+             }| { (node, span) },
+        ))
+        .into_output_errors();
+    if !errors.is_empty() {
+        println!("[DD Parse Errors]");
+    }
+    report_errors(errors, filename, source_code);
+    let Some(ast) = ast else {
+        return None;
+    };
+
+    // Resolve references
+    let ast = match resolve_references(ast) {
+        Ok(ast) => ast,
+        Err(errors) => {
+            println!("[DD Reference Errors]");
+            report_errors(errors, filename, source_code);
+            return None;
+        }
+    };
+
+    // Convert to static expressions
+    let static_ast = static_expression::convert_expressions(source_code_arc.clone(), ast);
+
+    if LOG_SOURCE_AND_AST {
+        println!("[DD Reactive Static AST]");
+        println!("{static_ast:#?}");
+    }
+
+    // Evaluate with reactive evaluator
+    let mut evaluator = if let Some(prefix) = storage_prefix {
+        DdReactiveEvaluator::new_with_persistence(prefix)
+    } else {
+        DdReactiveEvaluator::new()
+    };
+
+    evaluator.evaluate(&static_ast);
+
+    let document = evaluator.get_document().cloned();
+    let context = evaluator.into_reactive_context();
+
+    Some(DdReactiveResult { document, context })
 }
 
 fn report_errors<'code, T: fmt::Display + 'code>(

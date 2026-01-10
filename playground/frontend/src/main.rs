@@ -15,6 +15,13 @@ use boon::platform::browser::{
     interpreter,
 };
 
+// DD engine imports (feature-gated)
+#[cfg(feature = "engine-dd")]
+use boon::platform::browser::engine_dd::{
+    dd_bridge::render_dd_document_reactive_signal,
+    dd_interpreter::run_dd_reactive_with_persistence,
+};
+
 mod code_editor;
 use code_editor::CodeEditor;
 
@@ -565,6 +572,7 @@ impl Playground {
                 let current_file = self.current_file.clone();
                 let forced_preview_size = self.forced_preview_size.clone();
                 let panel_layout = self.panel_layout.clone();
+                let engine_type = self.engine_type.clone();
                 move |raw_el| {
                     use wasm_bindgen::prelude::*;
                     use wasm_bindgen::JsCast;
@@ -704,6 +712,54 @@ impl Playground {
                     }) as Box<dyn Fn() -> String>);
                     js_sys::Reflect::set(&api, &"getPanelLayout".into(), get_panel_layout.as_ref()).ok();
                     get_panel_layout.forget();
+
+                    // getEngine() - get current engine type and switchability
+                    let engine_type_for_get = engine_type.clone();
+                    let get_engine = Closure::wrap(Box::new(move || -> JsValue {
+                        let result = js_sys::Object::new();
+                        let engine_name = engine_type_for_get.get().short_name();
+                        js_sys::Reflect::set(&result, &"engine".into(), &engine_name.into()).ok();
+                        js_sys::Reflect::set(&result, &"switchable".into(), &boon::platform::browser::common::is_engine_switchable().into()).ok();
+                        result.into()
+                    }) as Box<dyn Fn() -> JsValue>);
+                    js_sys::Reflect::set(&api, &"getEngine".into(), get_engine.as_ref()).ok();
+                    get_engine.forget();
+
+                    // setEngine(engine) - set engine type and trigger re-run
+                    let engine_type_for_set = engine_type.clone();
+                    let run_command_for_engine = run_command.clone();
+                    let set_engine = Closure::wrap(Box::new(move |engine_str: String| -> JsValue {
+                        let result = js_sys::Object::new();
+                        let previous = engine_type_for_set.get().short_name().to_string();
+
+                        // Check if switching is available
+                        if !boon::platform::browser::common::is_engine_switchable() {
+                            js_sys::Reflect::set(&result, &"error".into(), &"Engine switching not available (single engine compiled)".into()).ok();
+                            return result.into();
+                        }
+
+                        // Parse engine string
+                        let new_engine = match engine_str.as_str() {
+                            "Actors" => EngineType::Actors,
+                            "DD" => EngineType::DifferentialDataflow,
+                            _ => {
+                                js_sys::Reflect::set(&result, &"error".into(), &format!("Invalid engine '{}'. Use 'Actors' or 'DD'", engine_str).into()).ok();
+                                return result.into();
+                            }
+                        };
+
+                        // Set the engine
+                        engine_type_for_set.set(new_engine);
+
+                        // Trigger re-run
+                        run_command_for_engine.set(Some(RunCommand { filename: None }));
+
+                        js_sys::Reflect::set(&result, &"engine".into(), &new_engine.short_name().into()).ok();
+                        js_sys::Reflect::set(&result, &"previous".into(), &previous.into()).ok();
+                        result.into()
+                    }) as Box<dyn Fn(String) -> JsValue>);
+                    js_sys::Reflect::set(&api, &"setEngine".into(), set_engine.as_ref()).ok();
+                    set_engine.forget();
 
                     // Set window.boonPlayground
                     js_sys::Reflect::set(&window, &"boonPlayground".into(), &api).ok();
@@ -1857,6 +1913,35 @@ impl Playground {
         let current_file_name = self.current_file.lock_ref().clone();
         let filename = run_command.filename.unwrap_or(&current_file_name);
         let source_code = self.source_code.lock_ref();
+        let engine_type = self.engine_type.get();
+
+        // Check which engine to use
+        #[cfg(feature = "engine-dd")]
+        if engine_type == EngineType::DifferentialDataflow {
+            println!("[DD Engine] Running with DD engine");
+
+            // Run with DD engine (reactive evaluation)
+            let result = run_dd_reactive_with_persistence(
+                filename,
+                &source_code,
+                Some(STATES_STORAGE_KEY),
+            );
+            drop(source_code);
+            drop(files);
+
+            if let Some(dd_result) = result {
+                if let Some(document) = dd_result.document {
+                    println!("[DD Engine] Document rendered successfully");
+                    return render_dd_document_reactive_signal(document, dd_result.context)
+                        .unify();
+                }
+            }
+
+            return El::new()
+                .s(Font::new().color(color!("LightCoral")))
+                .child("DD Engine: Failed to run. See errors in dev console.")
+                .unify();
+        }
 
         // Create VirtualFilesystem with all project files
         let virtual_fs = VirtualFilesystem::with_files(
