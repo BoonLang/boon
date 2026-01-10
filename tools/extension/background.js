@@ -973,19 +973,29 @@ async function handleCommand(id, command) {
         }
 
       case 'clearStates':
-        // Clear ALL localStorage to ensure a clean slate for tests
+        // Clear localStorage for tests, but preserve playground settings
         // This fixes quota exceeded errors from accumulated debug logs
         try {
           const result = await cdpEvaluate(tab.id, `
             (function() {
-              // Clear ALL localStorage for a completely fresh state
-              // This clears everything including:
-              // - Playground states and project files
-              // - Debug logs that can fill up quota
-              // - Any other accumulated data
+              // Preserve playground settings (engine type, etc.)
+              const preserveKeys = ['boon-playground-engine-type'];
+              const preserved = {};
+              for (const key of preserveKeys) {
+                const val = localStorage.getItem(key);
+                if (val !== null) preserved[key] = val;
+              }
+
+              // Clear everything
               const keyCount = localStorage.length;
               localStorage.clear();
-              return { cleared: keyCount };
+
+              // Restore preserved keys
+              for (const [key, val] of Object.entries(preserved)) {
+                localStorage.setItem(key, val);
+              }
+
+              return { cleared: keyCount, preserved: Object.keys(preserved) };
             })()
           `);
           return { type: 'success', data: { method: 'cdp-evaluate', text: 'clear saved states' } };

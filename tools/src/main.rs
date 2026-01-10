@@ -366,6 +366,14 @@ enum ExecAction {
         examples_dir: Option<PathBuf>,
     },
 
+    /// Get the currently selected engine (Actors or DD)
+    GetEngine,
+
+    /// Set the engine and trigger re-run
+    SetEngine {
+        /// Engine to use: "Actors" or "DD"
+        engine: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -903,6 +911,42 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
             let passed = run_integrity_check(examples_dir)?;
             if !passed {
                 std::process::exit(1);
+            }
+        }
+
+        ExecAction::GetEngine => {
+            let response = send_command_to_server(port, WsCommand::GetEngine).await?;
+            match response {
+                WsResponse::EngineInfo { engine, switchable } => {
+                    println!("Engine: {}", engine);
+                    if switchable {
+                        println!("Switching: available (both engines compiled)");
+                    } else {
+                        println!("Switching: not available (single engine only)");
+                    }
+                }
+                _ => print_response(response),
+            }
+        }
+
+        ExecAction::SetEngine { engine } => {
+            // Validate engine value
+            if engine != "Actors" && engine != "DD" {
+                anyhow::bail!("Invalid engine '{}'. Must be 'Actors' or 'DD'", engine);
+            }
+            println!("Setting engine to: {}", engine);
+            let response = send_command_to_server(port, WsCommand::SetEngine { engine: engine.clone() }).await?;
+            match response {
+                WsResponse::Success { data } => {
+                    if let Some(d) = data {
+                        let prev = d.get("previous").and_then(|v| v.as_str()).unwrap_or("?");
+                        let curr = d.get("engine").and_then(|v| v.as_str()).unwrap_or(&engine);
+                        println!("Switched: {} -> {}", prev, curr);
+                    } else {
+                        println!("Engine set to: {}", engine);
+                    }
+                }
+                _ => print_response(response),
             }
         }
 

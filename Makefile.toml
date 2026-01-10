@@ -36,3 +36,13 @@ dependencies = ["build-tools"]
 script = '''
 ./target/release/boon-tools exec test-examples --interactive
 '''
+
+[tasks.verify-playground-dd]
+description = "Run playground tests with DD engine. Use: makers verify-playground-dd --filter todo_mvc"
+workspace = false
+dependencies = ["build-tools"]
+script_runner = "@shell"
+script = '''
+./target/release/boon-tools exec set-engine DD
+./target/release/boon-tools exec test-examples "$@"
+'''
