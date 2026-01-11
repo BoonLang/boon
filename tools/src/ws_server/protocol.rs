@@ -115,6 +115,9 @@ pub enum Command {
     /// Type text into the currently focused element
     TypeText { text: String },
 
+    /// Type text character by character (simulates real keyboard typing)
+    TypeTextCharByChar { text: String },
+
     /// Press a special key (Enter, Escape, Tab, Backspace, Delete)
     PressKey { key: String },
 

@@ -18,8 +18,9 @@ use boon::platform::browser::{
 // DD engine imports (feature-gated)
 #[cfg(feature = "engine-dd")]
 use boon::platform::browser::engine_dd::{
-    dd_bridge::render_dd_document_reactive_signal,
+    dd_bridge::{render_dd_document_reactive_signal, render_dd_result_reactive_signal},
     dd_interpreter::run_dd_reactive_with_persistence,
+    dd_reactive_eval::invalidate_timers,
 };
 
 mod code_editor;
@@ -1588,11 +1589,16 @@ impl Playground {
             )
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press(|| {
+                // Invalidate DD engine timers FIRST to prevent race condition where
+                // old timers re-save values before the new run starts
+                #[cfg(feature = "engine-dd")]
+                invalidate_timers();
+
                 local_storage().remove(STATES_STORAGE_KEY);
                 local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                 local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
-                // Clear dynamically-keyed persistence data (list calls, removed sets)
-                clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
+                // Clear dynamically-keyed persistence data (list calls, removed sets, DD engine state)
+                clear_prefixed_storage_keys(&["list_calls:", "list_removed:", "dd_"]);
             })
     }
 
@@ -1930,10 +1936,21 @@ impl Playground {
             drop(files);
 
             if let Some(dd_result) = result {
-                if let Some(document) = dd_result.document {
+                if let Some(document) = dd_result.document.clone() {
                     println!("[DD Engine] Document rendered successfully");
-                    return render_dd_document_reactive_signal(document, dd_result.context)
-                        .unify();
+
+                    // Use simple rendering for examples with timers or sum accumulators
+                    // (re-evaluation breaks timers and accumulator IDs are unstable)
+                    // Use re-evaluation for HOLD-only examples (needed for derived values)
+                    let has_timers = !dd_result.context.get_timers().is_empty();
+                    let has_accumulators = dd_result.context.has_sum_accumulators();
+                    if has_timers || has_accumulators {
+                        return render_dd_document_reactive_signal(document, dd_result.context)
+                            .unify();
+                    } else {
+                        return render_dd_result_reactive_signal(dd_result)
+                            .unify();
+                    }
                 }
             }
 

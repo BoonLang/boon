@@ -382,6 +382,41 @@ async function cdpTypeText(tabId, text) {
   await chrome.debugger.sendCommand({ tabId }, 'Input.insertText', { text });
 }
 
+// Type text character by character using CDP Input.dispatchKeyEvent
+// This simulates real keyboard typing behavior - each key generates keyDown, char, keyUp events
+async function cdpTypeTextCharByChar(tabId, text) {
+  await attachDebugger(tabId);
+
+  for (const char of text) {
+    const code = char.toUpperCase().charCodeAt(0);
+    const keyCode = code >= 65 && code <= 90 ? code : char.charCodeAt(0);
+
+    // keyDown - don't include text, just key info
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+      type: 'keyDown',
+      key: char,
+      code: `Key${char.toUpperCase()}`,
+      windowsVirtualKeyCode: keyCode,
+      nativeVirtualKeyCode: keyCode
+    });
+
+    // char event - this is what actually inserts the character
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+      type: 'char',
+      text: char
+    });
+
+    // keyUp
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+      type: 'keyUp',
+      key: char,
+      code: `Key${char.toUpperCase()}`,
+      windowsVirtualKeyCode: keyCode,
+      nativeVirtualKeyCode: keyCode
+    });
+  }
+}
+
 // Press special key (Enter, Tab, Escape, etc.) using CDP Input.dispatchKeyEvent
 // NOTE: This may not trigger JavaScript event listeners attached via web_sys
 async function cdpPressKey(tabId, key, modifiers = 0) {
@@ -973,32 +1008,34 @@ async function handleCommand(id, command) {
         }
 
       case 'clearStates':
-        // Clear localStorage for tests, but preserve playground settings
-        // This fixes quota exceeded errors from accumulated debug logs
+        // Click the "Clear saved states" button to trigger Rust/WASM handler
+        // This is important because the button handler calls invalidate_timers()
+        // which stops old timers before clearing localStorage (prevents race conditions)
         try {
-          const result = await cdpEvaluate(tab.id, `
-            (function() {
-              // Preserve playground settings (engine type, etc.)
-              const preserveKeys = ['boon-playground-engine-type'];
-              const preserved = {};
-              for (const key of preserveKeys) {
-                const val = localStorage.getItem(key);
-                if (val !== null) preserved[key] = val;
-              }
-
-              // Clear everything
-              const keyCount = localStorage.length;
-              localStorage.clear();
-
-              // Restore preserved keys
-              for (const [key, val] of Object.entries(preserved)) {
-                localStorage.setItem(key, val);
-              }
-
-              return { cleared: keyCount, preserved: Object.keys(preserved) };
-            })()
-          `);
-          return { type: 'success', data: { method: 'cdp-evaluate', text: 'clear saved states' } };
+          const result = await cdpEvaluate(tab.id, `(${clearSavedStates.toString()})()`);
+          if (result.type === 'success') {
+            return { type: 'success', data: result.data || { method: 'button-click', text: 'clear saved states' } };
+          } else {
+            // Fallback: if button not found, clear localStorage directly
+            // (but warn that timers may not be invalidated)
+            const fallbackResult = await cdpEvaluate(tab.id, `
+              (function() {
+                const preserveKeys = ['boon-playground-engine-type'];
+                const preserved = {};
+                for (const key of preserveKeys) {
+                  const val = localStorage.getItem(key);
+                  if (val !== null) preserved[key] = val;
+                }
+                const keyCount = localStorage.length;
+                localStorage.clear();
+                for (const [key, val] of Object.entries(preserved)) {
+                  localStorage.setItem(key, val);
+                }
+                return { cleared: keyCount, preserved: Object.keys(preserved), warning: 'Button not found, timers may not be invalidated' };
+              })()
+            `);
+            return { type: 'success', data: { method: 'fallback-clear', ...fallbackResult } };
+          }
         } catch (e) {
           return { type: 'error', message: e.message };
         }
@@ -1767,6 +1804,16 @@ async function handleCommand(id, command) {
           return { type: 'success', data: { text: command.text } };
         } catch (e) {
           return { type: 'error', message: `Type text failed: ${e.message}` };
+        }
+
+      case 'typeTextCharByChar':
+        // Type text character by character using CDP dispatchKeyEvent
+        // This simulates real keyboard typing - each character generates keyDown, char, keyUp
+        try {
+          await cdpTypeTextCharByChar(tab.id, command.text);
+          return { type: 'success', data: { text: command.text, method: 'char-by-char' } };
+        } catch (e) {
+          return { type: 'error', message: `Type text char-by-char failed: ${e.message}` };
         }
 
       case 'pressKey':
@@ -3031,8 +3078,34 @@ function clearSavedStates() {
                         return text === 'clear saved states' || text.includes('clear saved states');
                       });
   if (clearButton) {
-    clearButton.click();
-    return { type: 'success', data: null };
+    // Dispatch proper MouseEvent instead of synthetic click() to trigger Zoon handlers
+    const rect = clearButton.getBoundingClientRect();
+    const centerX = rect.x + rect.width / 2;
+    const centerY = rect.y + rect.height / 2;
+
+    clearButton.dispatchEvent(new MouseEvent('pointerdown', {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: centerX,
+      clientY: centerY
+    }));
+    clearButton.dispatchEvent(new MouseEvent('pointerup', {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: centerX,
+      clientY: centerY
+    }));
+    clearButton.dispatchEvent(new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: centerX,
+      clientY: centerY,
+      detail: 1
+    }));
+    return { type: 'success', data: { method: 'proper-events', text: 'clear saved states' } };
   }
 
   // Fallback: try to find by partial match on any clickable element
@@ -3040,8 +3113,21 @@ function clearSavedStates() {
   for (const el of allElements) {
     const text = normalizeText(el.textContent);
     if (text.includes('clear') && text.includes('states')) {
-      el.click();
-      return { type: 'success', data: { foundBy: 'partial match', text: el.textContent.trim() } };
+      // Dispatch proper MouseEvent instead of synthetic click() to trigger Zoon handlers
+      const rect = el.getBoundingClientRect();
+      const centerX = rect.x + rect.width / 2;
+      const centerY = rect.y + rect.height / 2;
+
+      el.dispatchEvent(new MouseEvent('pointerdown', {
+        bubbles: true, cancelable: true, view: window, clientX: centerX, clientY: centerY
+      }));
+      el.dispatchEvent(new MouseEvent('pointerup', {
+        bubbles: true, cancelable: true, view: window, clientX: centerX, clientY: centerY
+      }));
+      el.dispatchEvent(new MouseEvent('click', {
+        bubbles: true, cancelable: true, view: window, clientX: centerX, clientY: centerY, detail: 1
+      }));
+      return { type: 'success', data: { foundBy: 'partial match', method: 'proper-events', text: el.textContent.trim() } };
     }
   }
 

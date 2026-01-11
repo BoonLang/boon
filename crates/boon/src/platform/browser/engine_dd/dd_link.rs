@@ -66,6 +66,11 @@ impl Link {
     pub fn trigger_count(&self) -> u64 {
         *self.trigger_count.borrow()
     }
+
+    /// Clear the link's value (consume the event).
+    pub fn clear_value(&self) {
+        self.signal.set(None);
+    }
 }
 
 impl Default for Link {
@@ -96,11 +101,11 @@ impl LinkRegistry {
         self.links.borrow().get(id).cloned()
     }
 
-    /// Fire a LINK by ID.
+    /// Fire a LINK by ID (auto-registers if not exists).
     pub fn fire(&self, id: &LinkId, value: DdValue) {
-        if let Some(link) = self.get(id) {
-            link.fire(value);
-        }
+        // Auto-register the link if it doesn't exist
+        let link = self.register(id.clone());
+        link.fire(value);
     }
 
     /// Fire a LINK with Unit.
@@ -111,6 +116,13 @@ impl LinkRegistry {
     /// Get all registered link IDs.
     pub fn all_ids(&self) -> Vec<LinkId> {
         self.links.borrow().keys().cloned().collect()
+    }
+
+    /// Clear a specific link's value (consume the event).
+    pub fn clear_link_value(&self, id: &LinkId) {
+        if let Some(link) = self.links.borrow().get(id) {
+            link.clear_value();
+        }
     }
 
     /// Clear all links (for re-evaluation).

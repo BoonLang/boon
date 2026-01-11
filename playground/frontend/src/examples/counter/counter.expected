@@ -27,3 +27,21 @@ expect = "2+"
 [[persistence]]
 description = "After re-run, counter should still be 2 (persisted)"
 expect = "2+"
+
+# --- CLEAR STATES TEST ---
+# Verify that "Clear saved states" button resets counter
+# This is placed in a persistence section so it runs after the main persistence test
+
+[[persistence]]
+description = "Click increment to get to 3"
+actions = [["click", "[data-boon-panel='preview'] [role='button']"]]
+expect = "3+"
+
+[[persistence]]
+description = "Clear states and re-run - counter should reset to 0"
+actions = [
+    ["clear_states"],
+    ["run"],
+    ["wait", 500]
+]
+expect = "0+"

@@ -1074,20 +1074,23 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
             };
 
             if input_already_focused {
-                // Already in edit mode or input is focused, just type directly
-                let response = send_command_to_server(port, WsCommand::TypeText { text: text.clone() }).await?;
+                // Already in edit mode or input is focused
+                // Use character-by-character typing to simulate real keyboard behavior
+                let response = send_command_to_server(port, WsCommand::TypeTextCharByChar { text: text.clone() }).await?;
                 if let WsResponse::Error { message } = response {
-                    anyhow::bail!("Type text failed: {}", message);
+                    anyhow::bail!("Type text char-by-char failed: {}", message);
                 }
             } else {
-                // Use the Type command with selector which is more reliable
-                // It focuses the element via CDP and selects all text before typing
-                let response = send_command_to_server(port, WsCommand::Type {
-                    selector: "input".to_string(),
-                    text: text.clone()
-                }).await?;
+                // Focus input first, then use char-by-char typing
+                let focus_response = send_command_to_server(port, WsCommand::FocusInput { index: 0 }).await?;
+                if let WsResponse::Error { message } = focus_response {
+                    anyhow::bail!("Focus input failed: {}", message);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                let response = send_command_to_server(port, WsCommand::TypeTextCharByChar { text: text.clone() }).await?;
                 if let WsResponse::Error { message } = response {
-                    anyhow::bail!("Type into input failed: {}", message);
+                    anyhow::bail!("Type text char-by-char failed: {}", message);
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

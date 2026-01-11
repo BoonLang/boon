@@ -49,12 +49,38 @@ actions = [
 ]
 expect = "2 items"
 
+# --- MULTI-CHARACTER TYPING TEST ---
+# Verify that multi-character text can be typed (not just one letter)
+
+[[sequence]]
+description = "Step 3: Type multi-character item 'Apple' and add"
+actions = [
+    ["type", "Apple"],
+    ["key", "Enter"]
+]
+expect = "3 items"
+
+[[sequence]]
+description = "Step 3b: Verify 'Apple' appears in list"
+expect = "Apple"
+
+# --- DUPLICATE ITEMS TEST ---
+# Verify that duplicate items can be added (e.g., 'Milk' twice)
+
+[[sequence]]
+description = "Step 4: Add another 'Milk' (duplicate allowed)"
+actions = [
+    ["type", "Milk"],
+    ["key", "Enter"]
+]
+expect = "4 items"
+
 # --- PERSISTENCE TEST ---
 # Shopping list items (LIST/Bus) should persist across re-run
 
 [[persistence]]
-description = "After re-run, list should still have 2 items (LIST persisted)"
-expect = "2 items"
+description = "After re-run, list should still have 4 items (LIST persisted)"
+expect = "4 items"
 
 [[persistence]]
 description = "After re-run, 'Milk' should still be in list"
@@ -63,3 +89,7 @@ expect = "Milk"
 [[persistence]]
 description = "After re-run, 'Bread' should still be in list"
 expect = "Bread"
+
+[[persistence]]
+description = "After re-run, 'Apple' should still be in list"
+expect = "Apple"
