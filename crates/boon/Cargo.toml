@@ -31,9 +31,11 @@ zoon = { git = "https://github.com/MoonZoon/MoonZoon", rev = "19c6cf6b4d07cd27be
 futures-channel = { version = "0.3", features = ["sink"] }
 
 # Differential Dataflow engine dependencies (optional, used with engine-dd feature)
+# timely 0.25+ has WASM support (PR #663 merged May 2025)
+# differential-dataflow 0.18+ is compatible with timely 0.25
 ordered-float = { version = "4", optional = true }
-timely = { version = "0.12", optional = true }
-differential-dataflow = { version = "0.12", optional = true }
+timely = { version = "0.25", optional = true }
+differential-dataflow = { version = "0.18", optional = true }
 
 [features]
 default = ["debug-channels", "engine-actors"]

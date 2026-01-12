@@ -1262,6 +1262,25 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 _ => anyhow::bail!("Unexpected response for GetPreviewElements"),
             }
         }
+        ParsedAction::AssertCheckboxCount { expected } => {
+            // Get preview elements and count checkboxes
+            let response = send_command_to_server(port, WsCommand::GetPreviewElements).await?;
+            match response {
+                WsResponse::PreviewElements { data } => {
+                    let checkbox_count = count_checkboxes_in_elements(&data);
+                    if checkbox_count != *expected {
+                        anyhow::bail!(
+                            "Assert checkbox count failed: expected {} checkboxes, found {}",
+                            expected, checkbox_count
+                        );
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert checkbox count failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for GetPreviewElements"),
+            }
+        }
         ParsedAction::AssertNotContains { text } => {
             // Get preview text and verify it does NOT contain the specified text
             let response = send_command_to_server(port, WsCommand::GetPreviewText).await?;
@@ -1319,6 +1338,27 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 _ => anyhow::bail!("Unexpected response for GetCheckboxState"),
             }
         }
+        ParsedAction::AssertCheckboxChecked { index } => {
+            // Verify that a specific checkbox IS checked
+            let response = send_command_to_server(port, WsCommand::GetCheckboxState { index: *index }).await?;
+            match response {
+                WsResponse::CheckboxState { found, checked } => {
+                    if !found {
+                        anyhow::bail!("Assert checkbox checked failed: checkbox {} not found", index);
+                    }
+                    if !checked {
+                        anyhow::bail!(
+                            "Assert checkbox checked failed: expected checkbox {} to be CHECKED, but it is unchecked",
+                            index
+                        );
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert checkbox checked failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for GetCheckboxState"),
+            }
+        }
         ParsedAction::AssertButtonHasOutline { text } => {
             // Verify that a button with the given text has a visible outline
             let response = send_command_to_server(port, WsCommand::AssertButtonHasOutline { text: text.clone() }).await?;
@@ -1339,6 +1379,46 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                     anyhow::bail!("Assert toggle all darker failed: {}", message);
                 }
                 _ => anyhow::bail!("Unexpected response for AssertToggleAllDarker"),
+            }
+        }
+        ParsedAction::AssertInputEmpty { index } => {
+            // Verify that the input value is empty (cleared after action)
+            let response = send_command_to_server(port, WsCommand::GetInputProperties { index: *index }).await?;
+            match response {
+                WsResponse::InputProperties { found, value, .. } => {
+                    if !found {
+                        anyhow::bail!("Assert input empty failed: input {} not found", index);
+                    }
+                    let actual_value = value.unwrap_or_default();
+                    if !actual_value.is_empty() {
+                        anyhow::bail!(
+                            "Assert input empty failed: expected input {} to be empty, but got '{}'",
+                            index, actual_value
+                        );
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert input empty failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for GetInputProperties"),
+            }
+        }
+        ParsedAction::AssertContains { text } => {
+            // Verify that the preview contains the specified text
+            let response = send_command_to_server(port, WsCommand::GetPreviewText).await?;
+            match response {
+                WsResponse::PreviewText { text: preview } => {
+                    if !preview.contains(text) {
+                        anyhow::bail!(
+                            "Assert contains failed: preview should contain '{}' but it doesn't.\nPreview: {}",
+                            text, truncate_for_error(&preview, 200)
+                        );
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert contains failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for GetPreviewText"),
             }
         }
     }
@@ -1377,6 +1457,42 @@ fn count_delete_buttons_recursive(value: &serde_json::Value, count: &mut u32) {
         serde_json::Value::Array(arr) => {
             for item in arr {
                 count_delete_buttons_recursive(item, count);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Count checkboxes in preview elements.
+fn count_checkboxes_in_elements(data: &serde_json::Value) -> u32 {
+    let mut count = 0;
+    count_checkboxes_recursive(data, &mut count);
+    count
+}
+
+fn count_checkboxes_recursive(value: &serde_json::Value, count: &mut u32) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            // Check if this element is a checkbox
+            let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let tag_name = obj.get("tagName").and_then(|v| v.as_str()).unwrap_or("");
+            let input_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+            // Count elements with role="checkbox" or input type="checkbox"
+            if role == "checkbox" || (tag_name.eq_ignore_ascii_case("input") && input_type == "checkbox") {
+                *count += 1;
+            }
+
+            // Recurse into children and other values
+            for (key, val) in obj {
+                if key != "tagName" && key != "role" && key != "type" {
+                    count_checkboxes_recursive(val, count);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                count_checkboxes_recursive(item, count);
             }
         }
         _ => {}

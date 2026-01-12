@@ -37,10 +37,83 @@ script = '''
 ./target/release/boon-tools exec test-examples --interactive
 '''
 
-[tasks.verify-playground-dd]
-description = "Run playground tests with DD engine. Use: makers verify-playground-dd --filter todo_mvc"
+[tasks.verify-dd-no-cheats]
+description = "Verify DD engine has no sync/mutable cheats (runs before tests)"
 workspace = false
-dependencies = ["build-tools"]
+script = '''
+echo "=== DD Engine Anti-Cheat Verification ==="
+echo "Checking for forbidden patterns in engine_dd/..."
+
+CHEAT_FOUND=0
+
+# Helper: filter out comment lines and ALLOWED markers
+filter_comments() {
+    grep -v "// ALLOWED:" | grep -v "//!" | grep -v "^\s*//"
+}
+
+# Forbidden: Mutable<T> (Zoon's mutable signal) - actual usage
+MATCHES=$(grep -r "Mutable<" crates/boon/src/platform/browser/engine_dd/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" | grep -v "//!" | grep -v ":.*//.*Mutable" || true)
+if [ -n "$MATCHES" ]; then
+    echo "$MATCHES"
+    echo "❌ ERROR: Found Mutable<T> in engine_dd/ - this is cheating!"
+    CHEAT_FOUND=1
+fi
+
+# Forbidden: RefCell<T> - actual usage
+MATCHES=$(grep -r "RefCell<" crates/boon/src/platform/browser/engine_dd/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" | grep -v "//!" | grep -v ":.*//.*RefCell" || true)
+if [ -n "$MATCHES" ]; then
+    echo "$MATCHES"
+    echo "❌ ERROR: Found RefCell<T> in engine_dd/ - this is cheating!"
+    CHEAT_FOUND=1
+fi
+
+# Forbidden: .borrow() / .borrow_mut() - actual usage
+MATCHES=$(grep -rE "\.borrow(_mut)?\(\)" crates/boon/src/platform/browser/engine_dd/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" | grep -v "//!" | grep -v ":.*//.*borrow" || true)
+if [ -n "$MATCHES" ]; then
+    echo "$MATCHES"
+    echo "❌ ERROR: Found .borrow() in engine_dd/ - this is cheating!"
+    CHEAT_FOUND=1
+fi
+
+# Forbidden: trigger_render() function call
+MATCHES=$(grep -r "trigger_render\s*(" crates/boon/src/platform/browser/engine_dd/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" | grep -v "//!" | grep -v ":.*//.*trigger_render" || true)
+if [ -n "$MATCHES" ]; then
+    echo "$MATCHES"
+    echo "❌ ERROR: Found trigger_render() in engine_dd/ - this is cheating!"
+    CHEAT_FOUND=1
+fi
+
+# Forbidden: handle_link_fire() function call
+MATCHES=$(grep -r "handle_link_fire\s*(" crates/boon/src/platform/browser/engine_dd/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" || true)
+if [ -n "$MATCHES" ]; then
+    echo "$MATCHES"
+    echo "❌ ERROR: Found handle_link_fire() in engine_dd/ - this is cheating!"
+    CHEAT_FOUND=1
+fi
+
+# Forbidden: handle_timer_fire() function call
+MATCHES=$(grep -r "handle_timer_fire\s*(" crates/boon/src/platform/browser/engine_dd/ --include="*.rs" 2>/dev/null | grep -v "// ALLOWED:" || true)
+if [ -n "$MATCHES" ]; then
+    echo "$MATCHES"
+    echo "❌ ERROR: Found handle_timer_fire() in engine_dd/ - this is cheating!"
+    CHEAT_FOUND=1
+fi
+
+if [ $CHEAT_FOUND -eq 1 ]; then
+    echo ""
+    echo "=== ANTI-CHEAT VERIFICATION FAILED ==="
+    echo "Fix the above issues before running tests."
+    exit 1
+fi
+
+echo "✅ No cheating patterns detected in engine_dd/"
+echo "=== Anti-cheat verification passed ==="
+'''
+
+[tasks.verify-playground-dd]
+description = "Run playground tests with DD engine (includes anti-cheat checks)"
+workspace = false
+dependencies = ["build-tools", "verify-dd-no-cheats"]
 script_runner = "@shell"
 script = '''
 ./target/release/boon-tools exec set-engine DD

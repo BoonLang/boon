@@ -42,11 +42,31 @@ actions = [
 expect = "1 items"
 
 [[sequence]]
+description = "BUG TEST: Input should be cleared after pressing Enter"
+actions = [["assert_input_empty", 0]]
+expect = "1 items"
+
+[[sequence]]
+description = "BUG TEST: 'Milk' should appear as actual text (not [object])"
+actions = [["assert_contains", "Milk"]]
+expect = "1 items"
+
+[[sequence]]
+description = "BUG TEST: No [object] should appear in the list"
+actions = [["assert_not_contains", "[object]"]]
+expect = "1 items"
+
+[[sequence]]
 description = "Step 2: Add 'Bread' to list"
 actions = [
     ["type", "Bread"],
     ["key", "Enter"]
 ]
+expect = "2 items"
+
+[[sequence]]
+description = "BUG TEST: 'Bread' should appear as actual text"
+actions = [["assert_contains", "Bread"]]
 expect = "2 items"
 
 # --- MULTI-CHARACTER TYPING TEST ---
@@ -75,21 +95,52 @@ actions = [
 ]
 expect = "4 items"
 
+# --- CLEAR BUTTON TEST ---
+# Verify the Clear button removes all items from the list
+
+[[sequence]]
+description = "BUG TEST: Click Clear button to remove all items"
+actions = [["click_text", "Clear"]]
+expect = "0 items"
+
+[[sequence]]
+description = "BUG TEST: After Clear, 'Milk' should NOT be in list"
+actions = [["assert_not_contains", "Milk"]]
+expect = "0 items"
+
+[[sequence]]
+description = "BUG TEST: After Clear, 'Bread' should NOT be in list"
+actions = [["assert_not_contains", "Bread"]]
+expect = "0 items"
+
+[[sequence]]
+description = "BUG TEST: After Clear, 'Apple' should NOT be in list"
+actions = [["assert_not_contains", "Apple"]]
+expect = "0 items"
+
+# --- RE-ADD ITEMS AFTER CLEAR ---
+# Verify we can add items again after clearing
+
+[[sequence]]
+description = "After Clear, add 'Orange' to list"
+actions = [
+    ["type", "Orange"],
+    ["key", "Enter"]
+]
+expect = "1 items"
+
+[[sequence]]
+description = "Verify 'Orange' appears after re-adding"
+actions = [["assert_contains", "Orange"]]
+expect = "1 items"
+
 # --- PERSISTENCE TEST ---
 # Shopping list items (LIST/Bus) should persist across re-run
 
 [[persistence]]
-description = "After re-run, list should still have 4 items (LIST persisted)"
-expect = "4 items"
+description = "After re-run, list should still have 1 item (LIST persisted after clear+add)"
+expect = "1 items"
 
 [[persistence]]
-description = "After re-run, 'Milk' should still be in list"
-expect = "Milk"
-
-[[persistence]]
-description = "After re-run, 'Bread' should still be in list"
-expect = "Bread"
-
-[[persistence]]
-description = "After re-run, 'Apple' should still be in list"
-expect = "Apple"
+description = "After re-run, 'Orange' should still be in list"
+expect = "Orange"

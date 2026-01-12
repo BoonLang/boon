@@ -1,1010 +1,1709 @@
-//! DD Bridge - Renders DdValues to Zoon DOM elements.
+//! DD Bridge - Converts DD values to Zoon elements.
 //!
-//! This is the DD equivalent of bridge.rs, but works with
-//! simple DdValue types instead of actor-based Values.
+//! This module provides functions to render `DdValue` as Zoon elements.
+//! Currently implements static rendering; reactive rendering will use
+//! DdOutput streams in a future phase.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::dd_interpreter::{DdContext, DdResult};
+use super::dd_value::DdValue;
 use zoon::*;
 
-use super::dd_value::DdValue;
-use super::dd_link::LinkId;
-use super::dd_reactive_eval::{DdReactiveContext as GenericReactiveContext, HoldId, SumAccumulatorId};
-use super::dd_interpreter::{DdReactiveResult, run_dd_reactive_with_context};
+use super::io::{fire_global_link, fire_global_link_with_bool, fire_global_key_down, hold_states_signal, get_hold_value};
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
+/// Get the current value of the DD text input via DOM access.
+/// This is used when Enter is pressed to capture the input text for List/append.
+#[cfg(target_arch = "wasm32")]
+fn get_dd_text_input_value() -> String {
+    use zoon::*;
+    document()
+        .get_element_by_id("dd_text_input")
+        .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
+        .map(|input| input.value())
+        .unwrap_or_default()
+}
 
-/// Convert an Oklch color DdValue to a CSS string.
-/// Returns None if the value is not an Oklch color tag.
-fn oklch_to_css(value: &DdValue) -> Option<String> {
-    if let DdValue::Tagged { tag, fields } = value {
-        if tag.as_ref() == "Oklch" {
+/// Clear the DD text input value via DOM access.
+/// This implements the Boon pattern: text_to_add |> THEN { Text/empty() }
+/// Called when the text_input_text HOLD is updated after a successful List/append.
+#[cfg(target_arch = "wasm32")]
+pub fn clear_dd_text_input_value() {
+    use zoon::*;
+    if let Some(el) = document().get_element_by_id("dd_text_input") {
+        if let Ok(input) = el.dyn_into::<web_sys::HtmlInputElement>() {
+            input.set_value("");
+            zoon::println!("[DD Bridge] Cleared text input value");
+        }
+    }
+}
+
+/// Convert a DdValue Oklch color to CSS color string.
+fn dd_oklch_to_css(value: &DdValue) -> Option<String> {
+    match value {
+        DdValue::Tagged { tag, fields } if tag.as_ref() == "Oklch" => {
             let lightness = fields.get("lightness")
-                .and_then(|v| v.as_float())
+                .and_then(|v| if let DdValue::Number(n) = v { Some(n.0) } else { None })
                 .unwrap_or(0.5);
             let chroma = fields.get("chroma")
-                .and_then(|v| v.as_float())
+                .and_then(|v| if let DdValue::Number(n) = v { Some(n.0) } else { None })
                 .unwrap_or(0.0);
             let hue = fields.get("hue")
-                .and_then(|v| v.as_float())
+                .and_then(|v| if let DdValue::Number(n) = v { Some(n.0) } else { None })
                 .unwrap_or(0.0);
             let alpha = fields.get("alpha")
-                .and_then(|v| v.as_float());
+                .and_then(|v| if let DdValue::Number(n) = v { Some(n.0) } else { None });
 
+            // oklch(lightness% chroma hue / alpha)
             if let Some(a) = alpha {
-                if a < 1.0 {
-                    return Some(format!("oklch({}% {} {} / {})", lightness * 100.0, chroma, hue, a));
-                }
-            }
-            return Some(format!("oklch({}% {} {})", lightness * 100.0, chroma, hue));
-        }
-    }
-    None
-}
-
-/// Extract outline CSS from a style object.
-/// Returns "none" for NoOutline tag, or a CSS outline string for outline Object.
-fn extract_outline_css(style: Option<&DdValue>) -> Option<String> {
-    let style = style?;
-    let outline = style.get("outline")?;
-
-    // Check for NoOutline tag
-    if let DdValue::Tagged { tag, .. } = outline {
-        if tag.as_ref() == "NoOutline" {
-            return Some("none".to_string());
-        }
-    }
-
-    // Check for outline Object with color
-    if let Some(color) = outline.get("color") {
-        if let Some(css_color) = oklch_to_css(color) {
-            // Default outline: 1px solid color
-            return Some(format!("1px solid {}", css_color));
-        }
-    }
-
-    None
-}
-
-// ============================================================================
-// Generic Reactive Bridge
-// ============================================================================
-
-/// Render a DdValue document using the generic reactive context.
-///
-/// This is the generic implementation that works with any Boon program.
-pub fn render_dd_document_reactive(
-    document: &DdValue,
-    ctx: &GenericReactiveContext,
-) -> RawElOrText {
-    render_reactive_element(document, ctx, "")
-}
-
-/// Recursively render a DdValue with reactive context.
-fn render_reactive_element(
-    value: &DdValue,
-    ctx: &GenericReactiveContext,
-    path: &str,
-) -> RawElOrText {
-    // Log what we're rendering for debugging
-    let value_type = match value {
-        DdValue::Text(_) => "Text",
-        DdValue::Number(_) => "Number",
-        DdValue::Bool(_) => "Bool",
-        DdValue::Unit => "Unit",
-        DdValue::HoldRef(name) => {
-            zoon::println!("[render_element] HoldRef({})", name);
-            "HoldRef"
-        }
-        DdValue::Tagged { tag, .. } => {
-            zoon::println!("[render_element] Tagged({})", tag);
-            tag.as_ref()
-        }
-        DdValue::Object(_) => "Object",
-        DdValue::List(items) => {
-            zoon::println!("[render_element] List(len={})", items.len());
-            "List"
-        }
-    };
-    let _ = value_type; // suppress unused warning
-
-    match value {
-        DdValue::Text(s) => zoon::Text::new(s.as_ref()).unify(),
-        DdValue::Number(n) => zoon::Text::new(n.to_string()).unify(),
-        DdValue::Bool(b) => zoon::Text::new(b.to_string()).unify(),
-        DdValue::Unit => zoon::Text::new("").unify(),
-
-        // HoldRef - look up current value from reactive context
-        DdValue::HoldRef(hold_name) => {
-            let hold_id = HoldId::new(hold_name.as_ref());
-            if let Some(signal) = ctx.get_hold(&hold_id) {
-                let current = signal.get();
-                // Recursively render the current value
-                render_reactive_element(&current, ctx, path)
+                Some(format!("oklch({}% {} {} / {})", lightness * 100.0, chroma, hue, a))
             } else {
-                zoon::Text::new(format!("[hold:{}]", hold_name)).unify()
+                Some(format!("oklch({}% {} {})", lightness * 100.0, chroma, hue))
             }
+        }
+        _ => None,
+    }
+}
+
+/// Render a DD document as a Zoon element.
+///
+/// # Arguments
+///
+/// * `document` - The document value from DD evaluation
+/// * `_context` - The evaluation context (unused in static rendering)
+///
+/// # Returns
+///
+/// A Zoon element representing the document.
+pub fn render_dd_document_reactive_signal(
+    document: DdValue,
+    _context: DdContext,
+) -> impl Element {
+    render_dd_value(&document)
+}
+
+/// Render a DD result as a Zoon element.
+///
+/// # Arguments
+///
+/// * `result` - The full DD result including document and context
+///
+/// # Returns
+///
+/// A Zoon element representing the result.
+pub fn render_dd_result_reactive_signal(
+    result: DdResult,
+) -> impl Element {
+    match result.document {
+        Some(doc) => render_dd_value(&doc).unify(),
+        None => El::new()
+            .s(Font::new().color(color!("LightCoral")))
+            .child("DD Engine: No document produced")
+            .unify(),
+    }
+}
+
+/// Render a DdValue as a Zoon element.
+fn render_dd_value(value: &DdValue) -> RawElOrText {
+    match value {
+        DdValue::Unit => El::new().unify(),
+
+        DdValue::Bool(b) => Text::new(if *b { "true" } else { "false" }).unify(),
+
+        DdValue::Number(n) => {
+            // Format number nicely (no trailing .0 for integers)
+            let num = n.0;
+            let text = if num.fract() == 0.0 {
+                format!("{}", num as i64)
+            } else {
+                format!("{}", num)
+            };
+            Text::new(text).unify()
+        }
+
+        DdValue::Text(s) => {
+            // Check if this is an "N items left" pattern that should be reactive
+            let text_str = s.to_string();
+            if text_str.ends_with(" items left") || text_str.ends_with(" item left") {
+                // Make this reactive based on "todos" HOLD which is the authoritative source
+                return El::new()
+                    .child_signal(
+                        hold_states_signal()
+                            .map(move |states| {
+                                if !states.contains_key("todos") {
+                                    // No todos HOLD, fall back to static text
+                                    return Text::new(text_str.clone());
+                                }
+
+                                // Count active (not completed) items from "todos" HOLD
+                                // The todos list is authoritative - after Clear completed, it only contains remaining items
+                                let total_active = match states.get("todos") {
+                                    Some(DdValue::List(todos)) => {
+                                        todos.iter().filter(|todo| {
+                                            // Check completed field - could be HoldRef or Bool
+                                            match todo.get("completed") {
+                                                // Completed via direct Bool
+                                                Some(DdValue::Bool(true)) => false,
+                                                // Completed via HoldRef - look up the HOLD value
+                                                Some(DdValue::HoldRef(hold_id)) => {
+                                                    match states.get(hold_id.as_ref()) {
+                                                        Some(DdValue::Bool(true)) => false,
+                                                        Some(DdValue::Tagged { tag, .. }) if tag.as_ref() == "True" => false,
+                                                        _ => true,  // not completed
+                                                    }
+                                                }
+                                                // No completed field or other - assume active
+                                                _ => true,
+                                            }
+                                        }).count()
+                                    }
+                                    _ => 0,
+                                };
+
+                                // Format the text
+                                let item_text = if total_active == 1 { "item" } else { "items" };
+                                Text::new(format!("{} {} left", total_active, item_text))
+                            })
+                    )
+                    .unify();
+            }
+            Text::new(text_str).unify()
+        }
+
+        DdValue::List(items) => {
+            // Render list as column of items
+            let children: Vec<RawElOrText> = items.iter().map(|item| render_dd_value(item)).collect();
+            Column::new()
+                .items(children)
+                .unify()
+        }
+
+        DdValue::Object(fields) => {
+            // Render object as debug representation
+            let debug = fields
+                .iter()
+                .map(|(k, v)| format!("{}: {:?}", k, v))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Text::new(format!("[{}]", debug)).unify()
         }
 
         DdValue::Tagged { tag, fields } => {
-            match tag.as_ref() {
-                "Element" => render_reactive_typed_element(fields, ctx, path),
-                "NoElement" => El::new().unify(),
-                // __HoldWithSkip__ marker: resolve to HOLD value with skip checking
-                "__HoldWithSkip__" => {
-                    if let Some(DdValue::Text(hold_name)) = fields.get("hold_id") {
-                        let hold_id = HoldId::new(hold_name.as_ref());
-                        // Get value with skip checking - returns Unit if still skipping
-                        let value = ctx.get_hold_value_with_skip(&hold_id);
-                        render_reactive_element(&value, ctx, path)
-                    } else {
-                        zoon::Text::new("").unify()
-                    }
-                }
-                // __ReactiveSum__ marker: resolve to sum accumulator value
-                "__ReactiveSum__" => {
-                    if let Some(DdValue::Text(acc_id_str)) = fields.get("accumulator_id") {
-                        let acc_id = SumAccumulatorId::new(acc_id_str.as_ref());
-                        if let Some(signal) = ctx.get_sum_accumulator(&acc_id) {
-                            let value = signal.get();
-                            // Unit means no value yet (timer hasn't fired) - render empty
-                            if value == DdValue::Unit {
-                                zoon::Text::new("").unify()
+            render_tagged_element(tag.as_ref(), fields)
+        }
+
+        DdValue::HoldRef(name) => {
+            // HoldRef is a reactive reference to a HOLD value
+            // Observe hold_states_signal and render current value reactively
+            let hold_id = name.to_string();
+
+            // Create reactive element that updates when HOLD_STATES change
+            El::new()
+                .child_signal(
+                    hold_states_signal()
+                        .map(move |states| {
+                            let text = states
+                                .get(&hold_id)
+                                .map(|v| v.to_display_string())
+                                .unwrap_or_else(|| "?".to_string());
+                            Text::new(text)
+                        })
+                )
+                .unify()
+        }
+
+        DdValue::LinkRef(link_id) => {
+            // LinkRef is a placeholder for an event source
+            // In static rendering, show as unit (events are wired at button level)
+            El::new().unify()
+        }
+
+        DdValue::TimerRef { id, interval_ms: _ } => {
+            // TimerRef represents a timer-driven HOLD accumulator
+            // The `id` is the HOLD id - render its reactive value
+            let hold_id = id.to_string();
+
+            // Create reactive element that updates when HOLD_STATES change
+            // NOTE: Returns empty string if HOLD hasn't been set yet (timer not fired)
+            El::new()
+                .child_signal(
+                    hold_states_signal()
+                        .map(move |states| {
+                            let text = states
+                                .get(&hold_id)
+                                .map(|v| v.to_display_string())
+                                .unwrap_or_default(); // Empty until first timer tick
+                            Text::new(text)
+                        })
+                )
+                .unify()
+        }
+
+        DdValue::WhileRef { hold_id, computation, arms, default } => {
+            // WhileRef is a reactive WHILE/WHEN expression
+            // Observe the hold value and render the matching arm
+            let hold_id = hold_id.to_string();
+            let computation = computation.clone();
+            let arms = arms.clone();
+            let default = default.clone();
+
+            zoon::println!("[DD Bridge] Rendering WhileRef for hold {} with {} arms, computation: {:?}", hold_id, arms.len(), computation.is_some());
+
+            // Create reactive element that updates when the hold value changes
+            El::new()
+                .child_signal(
+                    hold_states_signal()
+                        .map(move |states| {
+                            let source_value = states.get(&hold_id);
+
+                            // Determine the value to match against patterns
+                            // If there's a computation, evaluate it first
+                            let current_value: Option<DdValue> = if let Some(ref comp) = computation {
+                                // Evaluate the computation to get a boolean
+                                if let Some(source) = source_value {
+                                    use super::dd_value::evaluate_computed;
+                                    let result = evaluate_computed(comp, source);
+                                    zoon::println!("[DD Bridge] WhileRef {} computation result: {:?}", hold_id, result);
+                                    Some(result)
+                                } else {
+                                    None
+                                }
                             } else {
-                                render_reactive_element(&value, ctx, path)
+                                source_value.cloned()
+                            };
+
+                            zoon::println!("[DD Bridge] WhileRef {} value to match: {:?}", hold_id, current_value);
+
+                            // Find matching arm based on current value
+                            if let Some(ref current) = current_value {
+                                // For text values (like route paths), match against text patterns
+                                for (pattern, body) in arms.iter() {
+                                    let matches = match (current, pattern) {
+                                        // Bool to True/False tag comparison
+                                        (DdValue::Bool(b), DdValue::Tagged { tag, .. }) => {
+                                            (*b && tag.as_ref() == "True") || (!*b && tag.as_ref() == "False")
+                                        }
+                                        // Text to text comparison
+                                        (DdValue::Text(curr), DdValue::Text(pat)) => curr == pat,
+                                        // Tag comparison (e.g., Home, About)
+                                        (DdValue::Tagged { tag: curr_tag, .. }, DdValue::Tagged { tag: pat_tag, .. }) => curr_tag == pat_tag,
+                                        // Text to tag comparison for route matching
+                                        // e.g., current="/" pattern=Tagged{Home} - need to map routes to tags
+                                        (DdValue::Text(text), DdValue::Tagged { tag, .. }) => {
+                                            // Map route paths to tags
+                                            match (text.as_ref(), tag.as_ref()) {
+                                                ("/", "Home") | ("", "Home") => true,
+                                                ("/about", "About") => true,
+                                                ("/contact", "Contact") => true,
+                                                _ => false,
+                                            }
+                                        }
+                                        _ => current == pattern,
+                                    };
+
+                                    if matches {
+                                        zoon::println!("[DD Bridge] WhileRef {} matched pattern {:?}", hold_id, pattern);
+                                        return render_dd_value(body);
+                                    }
+                                }
                             }
-                        } else {
-                            zoon::Text::new("").unify()
-                        }
-                    } else {
-                        zoon::Text::new("").unify()
-                    }
-                }
-                _ => zoon::Text::new(tag.as_ref()).unify(),
-            }
+
+                            // No match - use default if available
+                            if let Some(ref def) = default {
+                                zoon::println!("[DD Bridge] WhileRef {} using default", hold_id);
+                                return render_dd_value(def.as_ref());
+                            }
+
+                            // No match and no default - render empty
+                            zoon::println!("[DD Bridge] WhileRef {} no match, no default", hold_id);
+                            El::new().unify()
+                        })
+                )
+                .unify()
         }
 
-        DdValue::Object(_obj) => {
-            // Render object as debug text
-            zoon::Text::new("[object]").unify()
+        DdValue::ComputedRef { computation, source_hold } => {
+            // ComputedRef is a reactive computed value that depends on a HOLD
+            // Observe hold_states_signal and re-evaluate computation when source changes
+            use super::dd_value::evaluate_computed;
+
+            let source_hold = source_hold.to_string();
+            let computation = computation.clone();
+
+            El::new()
+                .child_signal(
+                    hold_states_signal()
+                        .map(move |states| {
+                            // Get source HOLD value
+                            let source_value = states.get(&source_hold)
+                                .cloned()
+                                .unwrap_or(DdValue::Unit);
+
+                            // Evaluate the computation
+                            let result = evaluate_computed(&computation, &source_value);
+
+                            // Render the result as text
+                            Text::new(result.to_display_string())
+                        })
+                )
+                .unify()
         }
 
-        DdValue::List(items) => {
-            if items.is_empty() {
-                El::new().unify()
-            } else {
-                let children: Vec<RawElOrText> = items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, item)| {
-                        let item_path = format!("{}/items[{}]", path, i);
-                        render_reactive_element(item, ctx, &item_path)
-                    })
-                    .collect();
-                Column::new().items(children).unify()
-            }
+        DdValue::FilteredListRef { source_hold, filter_field, filter_value: _ } => {
+            // FilteredListRef is an intermediate value - shouldn't normally be rendered directly
+            // If it is rendered, show debug info
+            Text::new(format!("[filtered:{}@{}]", filter_field, source_hold)).unify()
+        }
+
+        DdValue::ReactiveFilteredList { items, filter_field, filter_value: _, hold_ids: _ } => {
+            // ReactiveFilteredList is an intermediate value - shouldn't normally be rendered directly
+            // If it is rendered, show debug info
+            Text::new(format!("[reactive-filtered:{}#{}]", filter_field, items.len())).unify()
         }
     }
 }
 
-/// Render a typed Element with reactive context.
-fn render_reactive_typed_element(
-    fields: &Arc<BTreeMap<Arc<str>, DdValue>>,
-    ctx: &GenericReactiveContext,
-    path: &str,
-) -> RawElOrText {
+/// Render a tagged object as a Zoon element.
+fn render_tagged_element(tag: &str, fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) -> RawElOrText {
+    match tag {
+        "Element" => render_element(fields),
+        "NoElement" => El::new().unify(),
+        _ => {
+            // Unknown tag - render as text
+            Text::new(format!("{}[...]", tag)).unify()
+        }
+    }
+}
+
+/// Render an Element tagged object.
+fn render_element(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) -> RawElOrText {
     let element_type = fields
         .get("_element_type")
-        .and_then(|v| v.as_text())
+        .and_then(|v| match v {
+            DdValue::Text(s) => Some(s.as_ref()),
+            _ => None,
+        })
         .unwrap_or("container");
 
-    zoon::println!("[render_typed_element] type='{}' path='{}'", element_type, path);
-
     match element_type {
-        "container" => render_reactive_container(fields, ctx, path),
-        "stripe" => render_reactive_stripe(fields, ctx, path),
-        "stack" => render_reactive_stack(fields, ctx, path),
-        "button" => render_reactive_button(fields, ctx, path),
-        "text_input" => render_reactive_text_input(fields, ctx, path),
-        "checkbox" => render_reactive_checkbox(fields, ctx, path),
-        "label" => render_reactive_label(fields, ctx),
-        "paragraph" => render_reactive_paragraph(fields, ctx, path),
-        "link" => render_reactive_link(fields),
-        _ => render_reactive_container(fields, ctx, path),
+        "button" => render_button(fields),
+        "stripe" => render_stripe(fields),
+        "stack" => render_stack(fields),
+        "container" => render_container(fields),
+        "text_input" => render_text_input(fields),
+        "checkbox" => render_checkbox(fields),
+        "label" => render_label(fields),
+        "paragraph" => render_paragraph(fields),
+        "link" => render_link(fields),
+        _ => {
+            // Unknown element type - render as container
+            render_container(fields)
+        }
     }
 }
 
-/// Render a container element.
-fn render_reactive_container(
-    fields: &Arc<BTreeMap<Arc<str>, DdValue>>,
-    ctx: &GenericReactiveContext,
-    path: &str,
-) -> RawElOrText {
-    let style = fields.get("style");
-    let size = style.and_then(|s| s.get("size")).and_then(|v| v.as_float());
-    let width = style.and_then(|s| s.get("width")).and_then(|v| v.as_float());
-    let height = style.and_then(|s| s.get("height")).and_then(|v| v.as_float());
-    let bg_url = style
-        .and_then(|s| s.get("background"))
-        .and_then(|b| b.get("url"))
-        .and_then(|u| match u {
-            DdValue::Text(t) => Some(t.to_string()),
-            _ => None,
-        });
-
-    // Extract font styling
-    let font_color_css = style
-        .and_then(|s| s.get("font"))
-        .and_then(|f| f.get("color"))
-        .and_then(|c| oklch_to_css(c));
-    let font_size = style
-        .and_then(|s| s.get("font"))
-        .and_then(|f| f.get("size"))
-        .and_then(|v| v.as_float());
-
-    // Extract padding
-    let padding_column = style
-        .and_then(|s| s.get("padding"))
-        .and_then(|p| p.get("column"))
-        .and_then(|v| v.as_float());
-    let padding_row = style
-        .and_then(|s| s.get("padding"))
-        .and_then(|p| p.get("row"))
-        .and_then(|v| v.as_float());
-
-    // Extract transform (rotation)
-    let rotate = style
-        .and_then(|s| s.get("transform"))
-        .and_then(|t| t.get("rotate"))
-        .and_then(|v| v.as_float());
-
-    let mut el = El::new();
-    if let Some(s) = size {
-        el = el.s(Width::exact(s as u32)).s(Height::exact(s as u32));
-    }
-    if let Some(w) = width {
-        el = el.s(Width::exact(w as u32));
-    }
-    if let Some(h) = height {
-        el = el.s(Height::exact(h as u32));
-    }
-    if let Some(url) = bg_url {
-        el = el.s(Background::new().url(&url));
-    }
-
-    // Apply font color via raw style
-    if let Some(color) = font_color_css {
-        el = el.update_raw_el(move |raw| raw.style("color", &color));
-    }
-    // Apply font size
-    if let Some(fs) = font_size {
-        let fs_css = format!("{}px", fs);
-        el = el.update_raw_el(move |raw| raw.style("font-size", &fs_css));
-    }
-    // Apply padding
-    if let (Some(pc), Some(pr)) = (padding_column, padding_row) {
-        let padding_css = format!("{}px {}px", pc, pr);
-        el = el.update_raw_el(move |raw| raw.style("padding", &padding_css));
-    }
-    // Apply rotation transform
-    if let Some(deg) = rotate {
-        let transform_css = format!("rotate({}deg)", deg);
-        el = el.update_raw_el(move |raw| raw.style("transform", &transform_css));
-    }
-
-    if let Some(child_value) = fields.get("child") {
-        let child_path = format!("{}/child", path);
-        let child_el = render_reactive_element(child_value, ctx, &child_path);
-        el.child(child_el).unify()
-    } else {
-        el.unify()
-    }
-}
-
-/// Render a stripe (column/row) element.
-fn render_reactive_stripe(
-    fields: &Arc<BTreeMap<Arc<str>, DdValue>>,
-    ctx: &GenericReactiveContext,
-    path: &str,
-) -> RawElOrText {
-    let direction = fields
-        .get("direction")
-        .and_then(|v| match v {
-            DdValue::Tagged { tag, .. } => Some(tag.as_ref()),
-            _ => None,
-        })
-        .unwrap_or("Column");
-
-    let items = fields.get("items").and_then(|v| v.as_list()).unwrap_or(&[]);
-
-    let gap = fields
-        .get("gap")
-        .and_then(|v| v.as_int())
-        .unwrap_or(0) as u32;
-
-    let children: Vec<RawElOrText> = items
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let item_path = format!("{}/items[{}]", path, i);
-            render_reactive_element(item, ctx, &item_path)
-        })
-        .collect();
-
-    match direction {
-        "Column" => Column::new().s(Gap::both(gap)).items(children).unify(),
-        "Row" => Row::new().s(Gap::both(gap)).items(children).unify(),
-        _ => Column::new().s(Gap::both(gap)).items(children).unify(),
-    }
-}
-
-/// Render a stack element.
-fn render_reactive_stack(
-    fields: &Arc<BTreeMap<Arc<str>, DdValue>>,
-    ctx: &GenericReactiveContext,
-    path: &str,
-) -> RawElOrText {
-    let layers = fields.get("layers").and_then(|v| v.as_list()).unwrap_or(&[]);
-    let children: Vec<RawElOrText> = layers
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let item_path = format!("{}/layers[{}]", path, i);
-            render_reactive_element(item, ctx, &item_path)
-        })
-        .collect();
-
-    Stack::new().layers(children).unify()
-}
-
-/// Render a button element with reactive LINK handling.
-fn render_reactive_button(
-    fields: &Arc<BTreeMap<Arc<str>, DdValue>>,
-    ctx: &GenericReactiveContext,
-    _path: &str,
-) -> RawElOrText {
+/// Render a button element.
+fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) -> RawElOrText {
     let label = fields
         .get("label")
         .map(|v| v.to_display_string())
         .unwrap_or_default();
 
-    // Extract outline CSS from style
-    let outline_css = extract_outline_css(fields.get("style"));
+    // Extract LinkRef from element.event.press if present
+    let link_id = fields
+        .get("element")
+        .and_then(|e| e.get("event"))
+        .and_then(|e| e.get("press"))
+        .and_then(|v| match v {
+            DdValue::LinkRef(id) => Some(id.to_string()),
+            _ => None,
+        });
 
-    // Check for LINK in element.event.press
-    let link_name = extract_link_name(fields);
+    // Extract outline from style.outline
+    let outline_opt: Option<Outline> = fields
+        .get("style")
+        .and_then(|s| s.get("outline"))
+        .and_then(|outline| {
+            match outline {
+                DdValue::Tagged { tag, .. } if tag.as_ref() == "NoOutline" => None,
+                DdValue::Object(obj) => {
+                    // Get color from outline object
+                    let css_color = obj.get("color").and_then(|c| dd_oklch_to_css(c));
+                    if let Some(color) = css_color {
+                        // Check for side: Inner vs outer (default outer)
+                        let is_inner = obj.get("side")
+                            .map(|s| matches!(s, DdValue::Tagged { tag, .. } if tag.as_ref() == "Inner"))
+                            .unwrap_or(false);
+                        // Get width (default 1)
+                        let width = obj.get("width")
+                            .and_then(|w| if let DdValue::Number(n) = w { Some(n.0 as u32) } else { None })
+                            .unwrap_or(1);
+                        // Build outline
+                        let outline = if is_inner {
+                            Outline::inner().width(width).solid().color(color)
+                        } else {
+                            Outline::outer().width(width).solid().color(color)
+                        };
+                        Some(outline)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        });
 
-    // Build press handler closure
-    let ctx_clone = ctx.clone();
-    let link_name_for_handler = link_name.clone();
+    // Build button with optional outline
+    let mut button = Button::new().label(label.clone());
 
-    let press_handler = move || {
-        zoon::println!("[press_handler] Button pressed! link_name_for_handler={:?}", link_name_for_handler);
-        if let Some(ref link_id_str) = link_name_for_handler {
-            let link_id = LinkId::new(link_id_str);
+    if let Some(outline) = outline_opt {
+        button = button.s(outline);
+    }
 
-            // Fire the LINK event (base LINK)
-            ctx_clone.fire_link(&link_id);
+    if let Some(link_id) = link_id {
+        // Wire button to fire the link event via global dispatcher
+        button
+            .on_press(move || {
+                fire_global_link(&link_id);
+            })
+            .unify()
+    } else {
+        button.unify()
+    }
+}
 
-            // Also fire with .event.press suffix for List/clear(on: X.event.press) patterns
-            let press_link_id = LinkId::new(format!("{}.event.press", link_id_str));
-            ctx_clone.fire_link_with_value(&press_link_id, DdValue::Unit);
-            zoon::println!("[press_handler] Fired .event.press: {:?}", press_link_id);
+/// Render a stripe (vertical/horizontal layout).
+fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) -> RawElOrText {
+    let direction = fields
+        .get("direction")
+        .and_then(|v| match v {
+            DdValue::Tagged { tag, .. } => Some(tag.as_ref().to_string()),
+            DdValue::Text(s) => Some(s.to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "Column".to_string());
 
-            // Handle LINK → THEN → HOLD connections
-            // This evaluates the THEN body and updates the associated HOLD state
-            ctx_clone.handle_link_fire(&link_id);
-            ctx_clone.handle_link_fire(&press_link_id);
+    let gap = fields
+        .get("gap")
+        .and_then(|v| match v {
+            DdValue::Number(n) => Some(n.0 as u32),
+            _ => None,
+        })
+        .unwrap_or(0);
 
-            // Trigger re-render
-            ctx_clone.trigger_render();
+    // Extract hovered LinkRef from element.hovered if present
+    let hovered_link_id = fields
+        .get("element")
+        .and_then(|e| e.get("hovered"))
+        .and_then(|v| match v {
+            DdValue::LinkRef(id) => Some(id.to_string()),
+            _ => None,
+        });
 
-            // Clear the .event.press LINK after render completes (async)
-            // Use spawn_local to defer to next microtask, after Zoon's render
-            let ctx_for_clear = ctx_clone.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                ctx_for_clear.clear_link_value(&press_link_id);
-                zoon::println!("[press_handler] Cleared .event.press after render (deferred)");
-            });
-        } else {
-            // Trigger re-render (no link to clear)
-            ctx_clone.trigger_render();
+    // Check if this is a todo list (Ul tag) - needs reactive filtering
+    let is_todo_list = fields
+        .get("element")
+        .and_then(|e| e.get("tag"))
+        .map(|t| matches!(t, DdValue::Tagged { tag, .. } if tag.as_ref() == "Ul"))
+        .unwrap_or(false);
+
+    // Check if items is Unit (placeholder for reactive items from HOLD)
+    let items_value = fields.get("items");
+    let is_reactive_items = matches!(items_value, Some(DdValue::Unit) | None);
+
+    // If items is Unit and gap is 4 (the items_list stripe in shopping_list),
+    // render reactively from "items" HOLD
+    if is_reactive_items && gap == 4 {
+        // Reactive items list - render from HOLD state
+        return Column::new()
+            .s(Gap::new().y(gap))
+            .items_signal_vec(
+                hold_states_signal()
+                    .map(|states| {
+                        let items = states.get("items");
+                        match items {
+                            Some(DdValue::List(list)) => {
+                                list.iter()
+                                    .map(|item| {
+                                        let text = item.to_display_string();
+                                        Label::new()
+                                            .label(format!("- {}", text))
+                                            .s(Font::new().color(hsluv!(0, 0, 100)))
+                                            .unify()
+                                    })
+                                    .collect::<Vec<_>>()
+                            }
+                            _ => Vec::new(),
+                        }
+                    })
+                    .to_signal_vec()
+            )
+            .unify();
+    }
+
+    // If this is a todo list (Ul), render with reactive filtering
+    if is_todo_list {
+        if let Some(DdValue::List(items)) = items_value {
+            return render_todo_list_filtered(items.clone(), gap);
         }
+    }
+
+    let items: Vec<RawElOrText> = fields
+        .get("items")
+        .and_then(|v| match v {
+            DdValue::List(items) => Some(items.iter().map(|item| render_dd_value(item)).collect()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    if direction == "Row" {
+        let row = Row::new()
+            .s(Gap::new().x(gap))
+            .items(items);
+
+        // Add hovered handler if present
+        if let Some(link_id) = hovered_link_id {
+            row.on_hovered_change(move |is_hovered| {
+                fire_global_link_with_bool(&link_id, is_hovered);
+            })
+            .unify()
+        } else {
+            row.unify()
+        }
+    } else {
+        // Default to Column
+        let column = Column::new()
+            .s(Gap::new().y(gap))
+            .items(items);
+
+        // Add hovered handler if present
+        if let Some(link_id) = hovered_link_id {
+            column.on_hovered_change(move |is_hovered| {
+                fire_global_link_with_bool(&link_id, is_hovered);
+            })
+            .unify()
+        } else {
+            column.unify()
+        }
+    }
+}
+
+/// Extract the checkbox HoldRef from a todo item, if present.
+fn get_todo_checkbox_hold_id(item: &DdValue) -> Option<String> {
+    match item {
+        // Format 1: Todo object from HOLD with completed: HoldRef
+        DdValue::Object(obj) => {
+            if let Some(DdValue::HoldRef(hold_id)) = obj.get("completed") {
+                return Some(hold_id.to_string());
+            }
+            None
+        }
+        // Format 2: Element from document with checkbox inside items list
+        DdValue::Tagged { tag, fields } if tag.as_ref() == "Element" => {
+            if let Some(DdValue::List(items)) = fields.get("items") {
+                for sub_item in items.iter() {
+                    // Look for checkbox element
+                    if let DdValue::Tagged { tag, fields } = sub_item {
+                        if tag.as_ref() == "Element" {
+                            if let Some(DdValue::Text(elem_type)) = fields.get("_element_type") {
+                                if elem_type.as_ref() == "checkbox" {
+                                    if let Some(DdValue::HoldRef(hold_id)) = fields.get("checked") {
+                                        return Some(hold_id.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Extract the title HoldRef ID from a todo item structure.
+/// Returns the hold_id that contains the actual title text.
+fn get_todo_title_hold_id(item: &DdValue) -> Option<String> {
+    match item {
+        // Format 1: Todo object from HOLD with title: HoldRef
+        DdValue::Object(obj) => {
+            if let Some(DdValue::HoldRef(hold_id)) = obj.get("title") {
+                return Some(hold_id.to_string());
+            }
+            None
+        }
+        // Format 2: Element from document with WhileRef containing label HoldRef
+        // Todo item structure is complex:
+        // - Element (stripe, Row) with items: [checkbox, WhileRef, Unit]
+        // - The WhileRef has: False arm → label Element with label: HoldRef("hold_9")
+        DdValue::Tagged { tag, fields } if tag.as_ref() == "Element" => {
+            if let Some(DdValue::List(items)) = fields.get("items") {
+                for sub_item in items.iter() {
+                    // Look for WhileRef (the edit mode toggle)
+                    if let DdValue::WhileRef { arms, .. } = sub_item {
+                        // Find the False arm (non-edit mode shows the label)
+                        for (pattern, body) in arms.iter() {
+                            if let DdValue::Tagged { tag, .. } = pattern {
+                                if tag.as_ref() == "False" {
+                                    // This arm contains the label element
+                                    if let DdValue::Tagged { tag: body_tag, fields: body_fields } = body {
+                                        if body_tag.as_ref() == "Element" {
+                                            // Get the label field which should be a HoldRef
+                                            if let Some(DdValue::HoldRef(hold_id)) = body_fields.get("label") {
+                                                return Some(hold_id.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Extract the click link ID from a todo item's checkbox.
+fn get_todo_click_link_id(item: &DdValue) -> Option<String> {
+    match item {
+        // Format 1: Todo object from HOLD with todo_elements.todo_checkbox: LinkRef
+        DdValue::Object(obj) => {
+            if let Some(DdValue::Object(elements)) = obj.get("todo_elements") {
+                if let Some(DdValue::LinkRef(link_id)) = elements.get("todo_checkbox") {
+                    return Some(link_id.to_string());
+                }
+            }
+            None
+        }
+        // Format 2: Tagged Element structure from document
+        // Todo item structure: Tagged { tag: "Element", fields: { items: [...checkbox...] } }
+        DdValue::Tagged { tag, fields } if tag.as_ref() == "Element" => {
+            if let Some(DdValue::List(items)) = fields.get("items") {
+                for sub_item in items.iter() {
+                    // Look for checkbox element
+                    if let DdValue::Tagged { tag, fields } = sub_item {
+                        if tag.as_ref() == "Element" {
+                            if let Some(DdValue::Text(elem_type)) = fields.get("_element_type") {
+                                if elem_type.as_ref() == "checkbox" {
+                                    // Get click link from element.event.click
+                                    if let Some(link_id) = fields
+                                        .get("element")
+                                        .and_then(|e| e.get("event"))
+                                        .and_then(|e| e.get("click"))
+                                    {
+                                        if let DdValue::LinkRef(id) = link_id {
+                                            return Some(id.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Render a todo list with reactive filtering based on selected_filter.
+/// Also observes "todos" HOLD for dynamically added items.
+fn render_todo_list_filtered(items: std::sync::Arc<Vec<DdValue>>, gap: u32) -> RawElOrText {
+    use super::io::TodoFilter;
+
+    // Capture the initial static items for the closure
+    let static_items = items.clone();
+    let static_items_count = items.len();
+
+    // Combine signals for reactive rendering:
+    // - When filter changes → re-render
+    // - When hold states change (checkbox toggle, new todos) → re-render
+    Column::new()
+        .s(Gap::new().y(gap))
+        .items_signal_vec(
+            super::io::selected_filter_signal()
+                .map(move |filter| {
+                    let static_items_clone = static_items.clone();
+                    hold_states_signal().map(move |states| {
+                        let mut rendered: Vec<RawElOrText> = Vec::new();
+
+                        // Get the current list of todos from HOLD (source of truth after any changes)
+                        let todos_hold = states.get("todos");
+
+                        // Build a set of title HoldRefs that are still in the todos HOLD
+                        // Use title HoldRef because it never changes (unlike completed which becomes Bool after toggle)
+                        let active_title_ids: std::collections::HashSet<String> = match todos_hold {
+                            Some(DdValue::List(todos)) => {
+                                todos.iter()
+                                    .filter_map(|item| get_todo_title_hold_id(item))
+                                    .collect()
+                            }
+                            _ => std::collections::HashSet::new(),
+                        };
+                        let has_todos_hold = todos_hold.is_some();
+
+                        // 1. Render static items (initial todos from document)
+                        // Use render_static_todo_item for consistent styling with dynamic todos
+                        for item in static_items_clone.iter() {
+                            // Get the checkbox HoldRef to determine completion status
+                            let hold_id = get_todo_checkbox_hold_id(item);
+                            let title_hold_id = get_todo_title_hold_id(item);
+
+                            // If todos HOLD exists, only render items that are still in it
+                            // (items may be removed by "Clear completed" or delete button)
+                            if has_todos_hold {
+                                if let Some(ref tid) = title_hold_id {
+                                    if !active_title_ids.contains(tid) {
+                                        // This item was removed from the todos HOLD, skip it
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            let is_completed = hold_id.as_ref()
+                                .and_then(|id| states.get(id))
+                                .map(|v| match v {
+                                    DdValue::Bool(true) => true,
+                                    DdValue::Tagged { tag, .. } if tag.as_ref() == "True" => true,
+                                    _ => false,
+                                })
+                                .unwrap_or(false);
+
+                            // Filter based on selected filter
+                            let should_show = match &filter {
+                                TodoFilter::All => true,
+                                TodoFilter::Active => !is_completed,
+                                TodoFilter::Completed => is_completed,
+                            };
+
+                            if should_show {
+                                // Use render_dd_value to properly render the full todo item structure
+                                // This handles WhileRef for editing mode, double_click, hover, etc.
+                                rendered.push(render_dd_value(item));
+                            }
+                        }
+
+                        // 2. Render new items from "todos" HOLD (only items NOT already rendered as static)
+                        // Static items have HoldRefs for title/completed - skip those to avoid duplicates
+                        // The "todos" HOLD contains todo objects with {title, completed} fields
+                        if let Some(DdValue::List(new_todos)) = states.get("todos") {
+                            for (index, todo_item) in new_todos.iter().enumerate() {
+                                // Check if this item has a HoldRef in its title OR completed field
+                                // Static items have HoldRefs; after toggle, completed becomes Bool but title stays HoldRef
+                                let is_static_item = match todo_item {
+                                    DdValue::Object(obj) => {
+                                        matches!(obj.get("completed"), Some(DdValue::HoldRef(_))) ||
+                                        matches!(obj.get("title"), Some(DdValue::HoldRef(_)))
+                                    }
+                                    _ => false,
+                                };
+                                if is_static_item {
+                                    // Already rendered as static item, skip
+                                    continue;
+                                }
+
+                                // Extract title, completed, and editing from todo object
+                                let (title, completed, editing) = match todo_item {
+                                    DdValue::Object(obj) => {
+                                        let title = obj.get("title")
+                                            .map(|t| t.to_display_string())
+                                            .unwrap_or_default();
+                                        let completed = obj.get("completed")
+                                            .map(|c| matches!(c, DdValue::Bool(true)))
+                                            .unwrap_or(false);
+                                        let editing = obj.get("editing")
+                                            .map(|e| matches!(e, DdValue::Bool(true)))
+                                            .unwrap_or(false);
+                                        (title, completed, editing)
+                                    }
+                                    // Legacy: if it's just text, treat as title with completed=false, editing=false
+                                    _ => (todo_item.to_display_string(), false, false),
+                                };
+
+                                // Apply filter
+                                let should_show = match (&filter, completed) {
+                                    (TodoFilter::All, _) => true,
+                                    (TodoFilter::Active, false) => true,
+                                    (TodoFilter::Active, true) => false,
+                                    (TodoFilter::Completed, true) => true,
+                                    (TodoFilter::Completed, false) => false,
+                                };
+                                if should_show {
+                                    rendered.push(render_dynamic_todo(&title, completed, editing, index));
+                                }
+                            }
+                        }
+
+                        rendered
+                    })
+                })
+                .flatten()
+                .to_signal_vec()
+        )
+        .unify()
+}
+
+/// Render a dynamic todo item with editing mode, hover delete, and checkbox toggle
+/// HACK: TodoMVC-specific - handles dynamic todos created via List/append
+fn render_dynamic_todo(title: &str, completed: bool, editing: bool, index: usize) -> RawElOrText {
+    use super::io::fire_global_link_with_text;
+
+    // Create checkbox with click handler that fires toggle event
+    // Uses shared constants UNCHECKED_SVG/CHECKED_SVG for visual consistency
+    let checkbox_svg = if completed { CHECKED_SVG } else { UNCHECKED_SVG };
+    let checkbox = Checkbox::new()
+        .checked(completed)
+        .icon(move |_checked_mutable| {
+            El::new()
+                .s(zoon::Width::exact(40))
+                .s(zoon::Height::exact(40))
+                .s(zoon::Background::new().url(checkbox_svg))
+                .unify()
+        })
+        .label_hidden(title.to_string())
+        .on_click(move || {
+            // Fire toggle event to the "dynamic_todo_toggle" LINK
+            fire_global_link_with_text("dynamic_todo_toggle", &format!("toggle:{}", index));
+        });
+
+    // Title element - either label (normal mode) or text input (editing mode)
+    let title_owned = title.to_string();
+    let title_element: RawElOrText = if editing {
+        // Editing mode: show text input
+        let index_for_blur = index;
+        let index_for_keydown = index;
+        let title_for_input = title_owned.clone();
+
+        TextInput::new()
+            .s(zoon::Width::fill())
+            .s(zoon::Font::new()
+                .size(24)
+                .color(hsluv!(0, 0, 42)))
+            .s(zoon::Padding::new().y(2).x(5))
+            .s(zoon::Outline::inner().color(hsluv!(220, 50, 50)))  // Blue outline for editing
+            .label_hidden("Edit todo")
+            .text(title_for_input)
+            .on_blur(move || {
+                // On blur, exit editing mode (user clicks outside)
+                // The text input value isn't accessible here, so we just exit without saving
+                fire_global_link_with_text("dynamic_todo_edit", &format!("unedit:{}", index_for_blur));
+            })
+            .on_key_down_event(move |event| {
+                match event.key() {
+                    Key::Enter => {
+                        // Save the new title - but we need the current text value
+                        // For now, just exit editing mode (save requires input value access)
+                        fire_global_link_with_text("dynamic_todo_edit", &format!("unedit:{}", index_for_keydown));
+                    }
+                    Key::Escape => {
+                        // Cancel editing without saving
+                        fire_global_link_with_text("dynamic_todo_edit", &format!("unedit:{}", index_for_keydown));
+                    }
+                    _ => {}
+                }
+            })
+            .focus(true)  // Auto-focus the input when entering edit mode
+            .unify()
+    } else {
+        // Normal mode: show label with double-click to edit
+        let index_for_dblclick = index;
+        Label::new()
+            .s(zoon::Font::new()
+                .size(24)
+                .color(if completed {
+                    hsluv!(0, 0, 70)  // lighter gray when completed
+                } else {
+                    hsluv!(0, 0, 42)  // normal dark gray
+                }))
+            .s(zoon::Width::fill())
+            .label(title_owned)
+            .on_double_click(move || {
+                // Enter editing mode
+                fire_global_link_with_text("dynamic_todo_edit", &format!("edit:{}", index_for_dblclick));
+            })
+            .unify()
     };
 
-    // Build button - wrap label in El like checkbox does
-    zoon::println!("[render_reactive_button] Creating button label='{}' link_name={:?} outline_css={:?}",
-        label, link_name, outline_css);
+    // Create a hover state for showing delete button
+    let hovered = Mutable::new(false);
+    let hovered_for_row = hovered.clone();
+    let hovered_for_delete = hovered.clone();
+    let index_for_delete = index;
 
-    // Apply outline CSS if present, otherwise use default styling
-    // Use zoon::Text directly as label (no El wrapper) so clicks hit the button container
-    if let Some(outline) = outline_css {
-        Button::new()
-            .label(zoon::Text::new(&label))
-            .on_press(press_handler)
-            .update_raw_el(|raw_el| raw_el.attr("role", "button"))
-            .update_raw_el(move |raw_el| raw_el.style("outline", &outline))
-            .unify()
-    } else {
-        Button::new()
-            .label(zoon::Text::new(&label))
-            .on_press(press_handler)
-            .update_raw_el(|raw_el| raw_el.attr("role", "button"))
-            .unify()
-    }
+    Row::new()
+        .s(Gap::new().x(5))
+        .s(zoon::Padding::new().y(15).x(10))
+        .s(zoon::Background::new().color(hsluv!(0, 0, 100)))  // white bg
+        .s(zoon::Font::new().size(24))
+        .s(zoon::Width::fill())
+        .on_hovered_change(move |is_hovered| hovered_for_row.set(is_hovered))
+        .item(checkbox)
+        .item(title_element)
+        .item_signal(hovered_for_delete.signal().map(move |is_hovered| {
+            if is_hovered {
+                // Show delete button when hovered
+                Button::new()
+                    .s(zoon::Width::exact(40))
+                    .s(zoon::Height::exact(40))
+                    .s(zoon::Font::new()
+                        .size(30)
+                        .color(hsluv!(18, 60, 73)))  // Reddish color for delete
+                    .s(zoon::Align::center())  // Center the button content
+                    .label("×")
+                    .on_press(move || {
+                        fire_global_link_with_text("dynamic_todo_remove", &format!("remove:{}", index_for_delete));
+                    })
+                    .unify()
+            } else {
+                El::new().unify()  // Empty placeholder when not hovered
+            }
+        }))
+        .unify()
 }
 
-/// Extract LINK variable name from element fields.
-fn extract_link_name(fields: &Arc<BTreeMap<Arc<str>, DdValue>>) -> Option<String> {
-    zoon::println!("[extract_link_name] fields keys: {:?}", fields.keys().collect::<Vec<_>>());
-    // First, check for injected __link_id__ (set by evaluator for elements with LINK)
-    if let Some(DdValue::Text(link_id)) = fields.get("__link_id__") {
-        zoon::println!("[extract_link_name] Found __link_id__: {}", link_id);
-        return Some(link_id.to_string());
-    }
-    zoon::println!("[extract_link_name] No __link_id__ found");
+/// Render a static (initial) todo item with consistent styling matching dynamic todos.
+/// Uses HoldRef for reactive checkbox state and LinkRef for click handling.
+/// title_hold_id: The HOLD ID containing the title text
+/// checkbox_hold_id: The HOLD ID for the checkbox completed state
+fn render_static_todo_item(title_hold_id: &str, checkbox_hold_id: &str, link_id: Option<&str>) -> RawElOrText {
+    let checkbox_hold_id_owned = checkbox_hold_id.to_string();
+    let checkbox_hold_id_for_icon = checkbox_hold_id.to_string();
+    let title_hold_id_owned = title_hold_id.to_string();
 
-    // Look for element.event.press containing LINK marker
-    let element = fields.get("element")?;
-    let event = element.get("event")?;
-
-    // Check press event
-    if let Some(press) = event.get("press") {
-        // LINK is represented as Unit or Tagged{LINK}
-        if matches!(press, DdValue::Unit) {
-            // Fallback to default name if no __link_id__ was injected
-            return Some("button_press".to_string());
-        }
-        if let DdValue::Tagged { tag, fields } = press {
-            if tag.as_ref() == "LINK" {
-                // Extract name from LINK fields if present
-                if let Some(name) = fields.get("name") {
-                    if let DdValue::Text(s) = name {
-                        return Some(s.to_string());
+    // Create Checkbox component with reactive icon (matches render_dynamic_todo style)
+    // Using Checkbox::new() ensures proper role="checkbox" for accessibility
+    let checkbox = Checkbox::new()
+        .label_hidden("todo checkbox")
+        .checked_signal(
+            hold_states_signal()
+                .map({
+                    let hold_id = checkbox_hold_id_owned.clone();
+                    move |states| {
+                        states.get(&hold_id)
+                            .map(|v| match v {
+                                DdValue::Bool(b) => *b,
+                                DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
+                                _ => false,
+                            })
+                            .unwrap_or(false)
                     }
-                }
-                return Some("button_press".to_string());
-            }
-        }
-    }
+                })
+        )
+        .icon(move |_checked_mutable| {
+            // Reactive icon based on HOLD state
+            El::new()
+                .s(zoon::Width::exact(40))
+                .s(zoon::Height::exact(40))
+                .child_signal(
+                    hold_states_signal()
+                        .map({
+                            let hold_id = checkbox_hold_id_for_icon.clone();
+                            move |states| {
+                                let checked = states.get(&hold_id)
+                                    .map(|v| match v {
+                                        DdValue::Bool(b) => *b,
+                                        DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
+                                        _ => false,
+                                    })
+                                    .unwrap_or(false);
+                                let svg_url = if checked { CHECKED_SVG } else { UNCHECKED_SVG };
+                                El::new()
+                                    .s(zoon::Width::exact(40))
+                                    .s(zoon::Height::exact(40))
+                                    .s(zoon::Background::new().url(svg_url))
+                            }
+                        })
+                )
+                .unify()
+        });
 
-    // Check click event (for checkboxes)
-    if let Some(click) = event.get("click") {
-        // LINK is represented as Unit or Tagged{LINK}
-        if matches!(click, DdValue::Unit) {
-            // Fallback to default name if no __link_id__ was injected
-            return Some("checkbox_click".to_string());
-        }
-        if let DdValue::Tagged { tag, fields } = click {
-            if tag.as_ref() == "LINK" {
-                // Extract name from LINK fields if present
-                if let Some(name) = fields.get("name") {
-                    if let DdValue::Text(s) = name {
-                        return Some(s.to_string());
-                    }
-                }
-                return Some("checkbox_click".to_string());
-            }
-        }
-    }
-
-    // Check for link_id field directly
-    if let Some(link_id) = fields.get("link_id") {
-        if let DdValue::Text(s) = link_id {
-            return Some(s.to_string());
-        }
-    }
-
-    None
-}
-
-/// Render a text input element.
-fn render_reactive_text_input(
-    fields: &Arc<BTreeMap<Arc<str>, DdValue>>,
-    ctx: &GenericReactiveContext,
-    _path: &str,
-) -> RawElOrText {
-    zoon::println!("[render_reactive_text_input] fields keys: {:?}", fields.keys().collect::<Vec<_>>());
-    if let Some(link_id) = fields.get("__link_id__") {
-        zoon::println!("[render_reactive_text_input] __link_id__ = {:?}", link_id);
-    } else {
-        zoon::println!("[render_reactive_text_input] NO __link_id__ found!");
-    }
-
-    let placeholder_text = fields
-        .get("placeholder")
-        .and_then(|v| v.get("text"))
-        .map(|v| v.to_display_string())
-        .unwrap_or_default();
-
-    let text_value = fields
-        .get("text")
-        .map(|v| v.to_display_string())
-        .unwrap_or_default();
-
-    let focus_value = fields.get("focus");
-    zoon::println!("[render_reactive_text_input] focus field value: {:?}", focus_value);
-    let should_focus = focus_value
-        .map(|v| {
-            let truthy = v.is_truthy();
-            zoon::println!("[render_reactive_text_input] focus is_truthy={}", truthy);
-            truthy
+    // Add click handler if we have a link ID
+    let checkbox_with_click = if let Some(link_id) = link_id {
+        let link_id = link_id.to_string();
+        checkbox.on_click(move || {
+            fire_global_link(&link_id);
         })
-        .unwrap_or(false);
-    zoon::println!("[render_reactive_text_input] should_focus={}", should_focus);
+    } else {
+        checkbox
+    };
 
-    // Extract key_down LINK ID if present
-    let key_down_link_id = fields.get("__link_id__")
+    // Title label - reactive title text and color based on completion state
+    let title_label = El::new()
+        .s(zoon::Width::fill())
+        .child_signal(
+            hold_states_signal()
+                .map({
+                    let checkbox_hold_id = checkbox_hold_id_owned.clone();
+                    let title_hold_id = title_hold_id_owned.clone();
+                    move |states| {
+                        // Get title from title HOLD
+                        let title = states.get(&title_hold_id)
+                            .map(|v| v.to_display_string())
+                            .unwrap_or_default();
+
+                        // Get completed state from checkbox HOLD
+                        let checked = states.get(&checkbox_hold_id)
+                            .map(|v| match v {
+                                DdValue::Bool(b) => *b,
+                                DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
+                                _ => false,
+                            })
+                            .unwrap_or(false);
+                        El::new()
+                            .s(zoon::Font::new()
+                                .size(24)
+                                .color(if checked {
+                                    hsluv!(0, 0, 70)  // lighter gray when completed
+                                } else {
+                                    hsluv!(0, 0, 42)  // normal dark gray
+                                }))
+                            .child(Text::new(&title))
+                    }
+                })
+        );
+
+    Row::new()
+        .s(Gap::new().x(5))
+        .s(zoon::Padding::new().y(15).x(10))
+        .s(zoon::Background::new().color(hsluv!(0, 0, 100)))  // white bg
+        .s(zoon::Font::new().size(24))
+        .s(zoon::Width::fill())
+        .item(checkbox_with_click)
+        .item(title_label)
+        .unify()
+}
+
+/// Render a stack (layered elements).
+fn render_stack(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) -> RawElOrText {
+    let layers: Vec<RawElOrText> = fields
+        .get("layers")
+        .and_then(|v| match v {
+            DdValue::List(items) => Some(items.iter().map(|item| render_dd_value(item)).collect()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    Stack::new()
+        .layers(layers)
+        .unify()
+}
+
+/// Render a container element.
+fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) -> RawElOrText {
+    let child = fields.get("child").or_else(|| fields.get("element"));
+
+    // Extract style properties
+    let style = fields.get("style");
+
+    // Get size (sets both width and height)
+    let size_opt = style
+        .and_then(|s| s.get("size"))
+        .and_then(|v| match v {
+            DdValue::Number(n) => Some(n.0 as u32),
+            _ => None,
+        });
+
+    // Get background URL
+    let bg_url_opt = style
+        .and_then(|s| s.get("background"))
+        .and_then(|bg| bg.get("url"))
         .and_then(|v| match v {
             DdValue::Text(s) => Some(s.to_string()),
             _ => None,
         });
 
-    let text_mutable = Mutable::new(text_value);
-    let text_for_change = text_mutable.clone();
-
-    // Fire change event and .text property update when text changes
-    let ctx_for_change = ctx.clone();
-    let change_link_id = key_down_link_id.clone();
-    let on_change_handler = move |new_text: String| {
-        text_for_change.set(new_text.clone());
-
-        if let Some(ref link_id_str) = change_link_id {
-            // Fire change.text event
-            let change_text_link_id = format!("{}.event.change.text", link_id_str);
-            ctx_for_change.fire_link_with_value(&LinkId::new(&change_text_link_id), DdValue::text(new_text.as_str()));
-
-            // Also fire .text property so elements.item_input.text works
-            let text_link_id = format!("{}.text", link_id_str);
-            ctx_for_change.fire_link_with_value(&LinkId::new(&text_link_id), DdValue::text(new_text.as_str()));
-
-            zoon::println!("[text_input on_change] text='{}' link_id={}", new_text, link_id_str);
-        }
+    // Build base element with styles (before adding child due to typestate)
+    let base = El::new();
+    let base = match size_opt {
+        Some(size) => base.s(Width::exact(size)).s(Height::exact(size)),
+        None => base,
+    };
+    let base = match bg_url_opt {
+        Some(url) => base.s(Background::new().url(url)),
+        None => base,
     };
 
-    // Helper macro to add key_down handler
-    macro_rules! add_key_handler {
-        ($input:expr, $ctx:expr, $link_id:expr) => {{
-            let ctx_clone = $ctx.clone();
-            let link_id_clone = $link_id.clone();
-            $input.update_raw_el(move |raw_el| {
-                let ctx_inner = ctx_clone.clone();
-                let link_id_inner = link_id_clone.clone();
-                raw_el.event_handler(move |event: zoon::events::KeyDown| {
-                    let key = event.key();
-                    zoon::println!("[text_input key_down] key='{}' link_id={:?}", key, link_id_inner);
-                    if let Some(ref link_id_str) = link_id_inner {
-                        let key_link_id = format!("{}.event.key_down.key", link_id_str);
-                        let link_id = LinkId::new(&key_link_id);
-                        // Fire as a Tagged value so WHEN { Enter => ... } patterns match
-                        let key_value = DdValue::tagged(key.as_str(), std::iter::empty::<(&str, DdValue)>());
-                        ctx_inner.fire_link_with_value(&link_id, key_value.clone());
-                        ctx_inner.handle_link_fire(&link_id);
-
-                        // Only trigger render for special keys (Enter, Tab, Escape, etc.)
-                        // Regular character keys should NOT trigger render because:
-                        // 1. The character hasn't been inserted yet when keyDown fires
-                        // 2. Triggering render would recreate the input with stale text
-                        // 3. The browser would then insert the char into a replaced element
-                        let is_special_key = matches!(key.as_str(),
-                            "Enter" | "Tab" | "Escape" | "Backspace" | "Delete" |
-                            "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" |
-                            "Home" | "End" | "PageUp" | "PageDown"
-                        );
-
-                        if is_special_key {
-                            ctx_inner.trigger_render();
-
-                            // Clear the key event after render completes (async)
-                            // Use spawn_local to defer to next microtask, after Zoon's render
-                            let ctx_for_clear = ctx_inner.clone();
-                            wasm_bindgen_futures::spawn_local(async move {
-                                ctx_for_clear.clear_link_value(&link_id);
-                                zoon::println!("[text_input key_down] Cleared key event after render (deferred)");
-                            });
-                        }
-                    }
-                })
-            })
-        }};
+    // Add child (changes typestate, so must be last)
+    match child {
+        Some(c) => base.child(render_dd_value(c)).unify(),
+        None => base.unify(),
     }
+}
 
-    // Build text input - placeholder requires different type state
-    // For focus, use after_insert to focus directly via web_sys after element is in DOM
-    // .focus(true) sets autofocus which only works on page load
-    // .focus_signal() doesn't work with re-renders that replace elements
-    if placeholder_text.is_empty() {
-        let input = TextInput::new()
-            .label_hidden("text input")
-            .text_signal(text_mutable.signal_cloned())
-            .on_change(on_change_handler);
-        let input = add_key_handler!(input, ctx, key_down_link_id);
-        if should_focus {
-            input.update_raw_el(|raw_el| {
-                raw_el.after_insert(move |element| {
-                    // Focus the input element directly using web_sys
-                    // Note: TextInput wraps the <input> in a <div>, so we need to find the child input
-                    zoon::println!("[render_reactive_text_input] after_insert element tag: {:?}", element.tag_name());
-                    if let Some(input_el) = element.dyn_ref::<web_sys::HtmlInputElement>() {
-                        let _ = input_el.focus();
-                        zoon::println!("[render_reactive_text_input] Focused input via after_insert (direct)");
-                    } else if let Some(div_el) = element.dyn_ref::<web_sys::HtmlElement>() {
-                        // Try to find the input child
-                        if let Some(input_el) = div_el.query_selector("input").ok().flatten() {
-                            if let Some(input_el) = input_el.dyn_ref::<web_sys::HtmlInputElement>() {
-                                let _ = input_el.focus();
-                                zoon::println!("[render_reactive_text_input] Focused input via after_insert (child query)");
+/// Render a text input element.
+fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) -> RawElOrText {
+    // Placeholder can be a simple string or an object with a "text" field
+    // e.g., placeholder: [text: TEXT { Type and press Enter... }]
+    let placeholder = fields
+        .get("placeholder")
+        .map(|v| {
+            // Try to get .text field from object, otherwise use to_display_string
+            v.get("text")
+                .map(|t| t.to_display_string())
+                .unwrap_or_else(|| v.to_display_string())
+        })
+        .unwrap_or_default();
+
+    let text = fields
+        .get("text")
+        .map(|v| {
+            // If it's a HoldRef, resolve to the actual stored value
+            if let DdValue::HoldRef(hold_id) = v {
+                get_hold_value(hold_id.as_ref())
+                    .map(|hv| hv.to_display_string())
+                    .unwrap_or_default()
+            } else {
+                v.to_display_string()
+            }
+        })
+        .unwrap_or_default();
+
+    // Check for focus: True tag
+    let should_focus = fields
+        .get("focus")
+        .map(|v| match v {
+            DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
+            DdValue::Bool(b) => *b,
+            _ => false,
+        })
+        .unwrap_or(false);
+
+    // Extract key_down LinkRef from element.event.key_down
+    let key_down_link_id = fields
+        .get("element")
+        .and_then(|e| e.get("event"))
+        .and_then(|e| e.get("key_down"))
+        .and_then(|v| match v {
+            DdValue::LinkRef(id) => Some(id.to_string()),
+            _ => None,
+        });
+
+    // Extract change LinkRef from element.event.change
+    let change_link_id = fields
+        .get("element")
+        .and_then(|e| e.get("event"))
+        .and_then(|e| e.get("change"))
+        .and_then(|v| match v {
+            DdValue::LinkRef(id) => Some(id.to_string()),
+            _ => None,
+        });
+
+    // Extract blur LinkRef separately (for editing inputs)
+    let blur_link_id = fields
+        .get("element")
+        .and_then(|e| e.get("event"))
+        .and_then(|e| e.get("blur"))
+        .and_then(|v| match v {
+            DdValue::LinkRef(id) => Some(id.to_string()),
+            _ => None,
+        });
+
+    zoon::println!("[DD TextInput] Creating input: text='{}', focus={}, key_down={:?}, change={:?}, blur={:?}",
+        text, should_focus, key_down_link_id, change_link_id, blur_link_id);
+
+    // TextInput builder uses typestate, so we need separate code paths
+    // for different combinations of event handlers
+    match (key_down_link_id, change_link_id) {
+        (Some(key_link), Some(change_link)) => {
+            let do_focus = should_focus;
+            TextInput::new()
+                .id("dd_text_input")
+                .placeholder(Placeholder::new(placeholder))
+                .text(text)
+                .focus(should_focus)
+                .update_raw_el(move |raw_el| {
+                    let raw_el = raw_el.attr("autocomplete", "off");
+                    if do_focus {
+                        // For dynamically shown inputs (like editing input), we need to:
+                        // 1. Call focus() after insert
+                        // 2. Defer with requestAnimationFrame to win the focus race
+                        //    against the main input which also has focus=true
+                        raw_el.after_insert(|el| {
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                use zoon::wasm_bindgen::closure::Closure;
+                                use zoon::wasm_bindgen::JsCast;
+                                // Use double requestAnimationFrame: first lets current render complete,
+                                // second ensures we focus after the main input's focus has been processed
+                                let el_clone = el.clone();
+                                let inner_closure = Closure::once(move || {
+                                    zoon::println!("[DD TextInput] double-rAF focus()");
+                                    let _ = el_clone.focus();
+                                });
+                                let outer_closure = Closure::once(move || {
+                                    if let Some(window) = zoon::web_sys::window() {
+                                        let _ = window.request_animation_frame(inner_closure.as_ref().unchecked_ref());
+                                    }
+                                    inner_closure.forget();
+                                });
+                                if let Some(window) = zoon::web_sys::window() {
+                                    let _ = window.request_animation_frame(outer_closure.as_ref().unchecked_ref());
+                                }
+                                outer_closure.forget();
                             }
-                        }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                let _ = el.focus();
+                            }
+                        })
+                    } else {
+                        raw_el
                     }
                 })
-            }).unify()
-        } else {
-            input.unify()
+                .on_key_down_event(move |event| {
+                    let key_name = match event.key() {
+                        Key::Enter => {
+                            // For Enter key, capture the input's current text value
+                            // This is needed for shopping_list pattern: WHEN { Enter => append input.text }
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                let input_text = get_dd_text_input_value();
+                                zoon::println!("[DD TextInput] key_down: key='Enter', text='{}', link='{}'", input_text, key_link);
+                                // Send input text (not just "Enter") so ListAppend can use it
+                                fire_global_key_down(&key_link, &format!("Enter:{}", input_text));
+                            }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                fire_global_key_down(&key_link, "Enter");
+                            }
+                            return;
+                        }
+                        Key::Escape => "Escape",
+                        Key::Other(k) => k.as_str(),
+                    };
+                    zoon::println!("[DD TextInput] key_down: key='{}', link='{}'", key_name, key_link);
+                    // Send key name with the event so WHEN pattern matching works
+                    fire_global_key_down(&key_link, key_name);
+                })
+                .on_change(move |_text| {
+                    zoon::println!("[DD TextInput] change event, link='{}'", change_link);
+                    fire_global_link(&change_link);
+                })
+                .unify()
         }
-    } else {
-        let input = TextInput::new()
-            .label_hidden("text input")
-            .text_signal(text_mutable.signal_cloned())
-            .placeholder(Placeholder::new(&placeholder_text))
-            .on_change(on_change_handler);
-        let input = add_key_handler!(input, ctx, key_down_link_id);
-        if should_focus {
-            input.update_raw_el(|raw_el| {
-                raw_el.after_insert(move |element| {
-                    // Focus the input element directly using web_sys
-                    // Note: TextInput wraps the <input> in a <div>, so we need to find the child input
-                    zoon::println!("[render_reactive_text_input] after_insert element tag: {:?}", element.tag_name());
-                    if let Some(input_el) = element.dyn_ref::<web_sys::HtmlInputElement>() {
-                        let _ = input_el.focus();
-                        zoon::println!("[render_reactive_text_input] Focused input via after_insert (direct)");
-                    } else if let Some(div_el) = element.dyn_ref::<web_sys::HtmlElement>() {
-                        // Try to find the input child
-                        if let Some(input_el) = div_el.query_selector("input").ok().flatten() {
-                            if let Some(input_el) = input_el.dyn_ref::<web_sys::HtmlInputElement>() {
-                                let _ = input_el.focus();
-                                zoon::println!("[render_reactive_text_input] Focused input via after_insert (child query)");
+        (Some(key_link), None) => {
+            let do_focus = should_focus;
+            TextInput::new()
+                .id("dd_text_input")
+                .placeholder(Placeholder::new(placeholder))
+                .text(text)
+                .focus(should_focus)
+                .update_raw_el(move |raw_el| {
+                    let raw_el = raw_el.attr("autocomplete", "off");
+                    if do_focus {
+                        raw_el.after_insert(|el| {
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                use zoon::wasm_bindgen::closure::Closure;
+                                use zoon::wasm_bindgen::JsCast;
+                                let el_clone = el.clone();
+                                let closure = Closure::once(move || {
+                                    let _ = el_clone.focus();
+                                });
+                                if let Some(window) = zoon::web_sys::window() {
+                                    let _ = window.request_animation_frame(closure.as_ref().unchecked_ref());
+                                }
+                                closure.forget();
                             }
-                        }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                let _ = el.focus();
+                            }
+                        })
+                    } else {
+                        raw_el
                     }
                 })
-            }).unify()
-        } else {
-            input.unify()
+                .on_key_down_event(move |event| {
+                    let key_name = match event.key() {
+                        Key::Enter => {
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                let input_text = get_dd_text_input_value();
+                                zoon::println!("[DD TextInput] key_down: key='Enter', text='{}', link='{}'", input_text, key_link);
+                                fire_global_key_down(&key_link, &format!("Enter:{}", input_text));
+                            }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                fire_global_key_down(&key_link, "Enter");
+                            }
+                            return;
+                        }
+                        Key::Escape => "Escape",
+                        Key::Other(k) => k.as_str(),
+                    };
+                    zoon::println!("[DD TextInput] key_down: key='{}', link='{}'", key_name, key_link);
+                    // Send key name with the event so WHEN pattern matching works
+                    fire_global_key_down(&key_link, key_name);
+                })
+                .on_change(|_| {})
+                .unify()
+        }
+        (None, Some(change_link)) => {
+            let do_focus = should_focus;
+            TextInput::new()
+                .id("dd_text_input")
+                .placeholder(Placeholder::new(placeholder))
+                .text(text)
+                .focus(should_focus)
+                .update_raw_el(move |raw_el| {
+                    let raw_el = raw_el.attr("autocomplete", "off");
+                    if do_focus {
+                        raw_el.after_insert(|el| {
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                use zoon::wasm_bindgen::closure::Closure;
+                                use zoon::wasm_bindgen::JsCast;
+                                let el_clone = el.clone();
+                                let closure = Closure::once(move || {
+                                    let _ = el_clone.focus();
+                                });
+                                if let Some(window) = zoon::web_sys::window() {
+                                    let _ = window.request_animation_frame(closure.as_ref().unchecked_ref());
+                                }
+                                closure.forget();
+                            }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                let _ = el.focus();
+                            }
+                        })
+                    } else {
+                        raw_el
+                    }
+                })
+                .on_change(move |_text| {
+                    zoon::println!("[DD TextInput] change event, link='{}'", change_link);
+                    fire_global_link(&change_link);
+                })
+                .unify()
+        }
+        (None, None) => {
+            let do_focus = should_focus;
+            TextInput::new()
+                .id("dd_text_input")
+                .placeholder(Placeholder::new(placeholder))
+                .text(text)
+                .focus(should_focus)
+                .update_raw_el(move |raw_el| {
+                    let raw_el = raw_el.attr("autocomplete", "off");
+                    if do_focus {
+                        raw_el.after_insert(|el| {
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                use zoon::wasm_bindgen::closure::Closure;
+                                use zoon::wasm_bindgen::JsCast;
+                                let el_clone = el.clone();
+                                let closure = Closure::once(move || {
+                                    let _ = el_clone.focus();
+                                });
+                                if let Some(window) = zoon::web_sys::window() {
+                                    let _ = window.request_animation_frame(closure.as_ref().unchecked_ref());
+                                }
+                                closure.forget();
+                            }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                let _ = el.focus();
+                            }
+                        })
+                    } else {
+                        raw_el
+                    }
+                })
+                .on_change(|_| {})
+                .unify()
         }
     }
 }
 
-/// Render a checkbox element with reactive LINK handling.
-fn render_reactive_checkbox(
-    fields: &Arc<BTreeMap<Arc<str>, DdValue>>,
-    ctx: &GenericReactiveContext,
-    path: &str,
-) -> RawElOrText {
-    // Resolve HoldRef for checked status
-    let checked_value = fields.get("checked");
-    let checked = match checked_value {
-        Some(DdValue::HoldRef(hold_name)) => {
-            let hold_id = HoldId::new(hold_name.as_ref());
-            ctx.get_hold(&hold_id)
-                .map(|s| s.get().is_truthy())
-                .unwrap_or(false)
-        }
-        Some(v) => v.is_truthy(),
-        None => false,
-    };
+/// Render a checkbox element.
+// Default checkbox SVG icons (same as dynamic todos for visual consistency)
+const UNCHECKED_SVG: &str = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23ededed%22%20stroke-width%3D%223%22/%3E%3C/svg%3E";
+const CHECKED_SVG: &str = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23bddad5%22%20stroke-width%3D%223%22/%3E%3Cpath%20fill%3D%22%235dc2af%22%20d%3D%22M72%2025L42%2071%2027%2056l-4%204%2020%2020%2034-52z%22/%3E%3C/svg%3E";
 
-    // Extract LINK name for toggle event (same as button)
-    let link_name = extract_link_name(fields);
-
-    // Build click handler closure
-    let ctx_clone = ctx.clone();
-    let link_name_for_handler = link_name.clone();
-
-    let click_handler = move || {
-        zoon::println!("[checkbox click_handler] Clicked! link_name={:?}", link_name_for_handler);
-        if let Some(ref link_id_str) = link_name_for_handler {
-            let link_id = LinkId::new(link_id_str);
-
-            // Fire the LINK event
-            ctx_clone.fire_link(&link_id);
-            zoon::println!("[checkbox click_handler] Fired link {:?}", link_id);
-
-            // Handle LINK → THEN → HOLD connections
-            ctx_clone.handle_link_fire(&link_id);
-            zoon::println!("[checkbox click_handler] Handled link fire");
-        }
-        // Trigger re-render
-        zoon::println!("[checkbox click_handler] About to trigger_render");
-        ctx_clone.trigger_render();
-        zoon::println!("[checkbox click_handler] trigger_render called");
-    };
-
-    // Render the icon - need to handle dynamic checked state
-    // The icon may have a pre-computed background URL that doesn't reflect current checked state
-    let icon_element = if let Some(icon) = fields.get("icon") {
-        // Check if icon is a container with a background URL
-        if let DdValue::Tagged { tag, fields: icon_fields } = icon {
-            if tag.as_ref() == "Element" {
-                // Extract the background URL and potentially override based on checked state
-                let style = icon_fields.get("style");
-                let bg_url = style
-                    .and_then(|s| s.get("background"))
-                    .and_then(|b| b.get("url"))
-                    .and_then(|u| u.as_text());
-
-                // Check if this looks like a TodoMVC checkbox icon (data:image/svg+xml)
-                if let Some(url) = bg_url {
-                    if url.contains("data:image/svg+xml") {
-                        // TodoMVC uses different SVGs for checked/unchecked
-                        // Override based on current checked state
-                        let size = style
-                            .and_then(|s| s.get("size"))
-                            .and_then(|v| v.as_float())
-                            .unwrap_or(40.0);
-
-                        let actual_url = if checked {
-                            // Green checkmark
-                            "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23bddad5%22%20stroke-width%3D%223%22/%3E%3Cpath%20fill%3D%22%235dc2af%22%20d%3D%22M72%2025L42%2071%2027%2056l-4%204%2020%2020%2034-52z%22/%3E%3C/svg%3E"
-                        } else {
-                            // Gray circle
-                            "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23ededed%22%20stroke-width%3D%223%22/%3E%3C/svg%3E"
-                        };
-
-                        return Button::new()
-                            .label(
-                                El::new()
-                                    .s(Width::exact(size as u32))
-                                    .s(Height::exact(size as u32))
-                                    .s(Background::new().url(actual_url))
-                            )
-                            .on_press(click_handler)
-                            .update_raw_el(|raw| raw.attr("role", "checkbox"))
-                            .unify();
-                    }
-                }
-            }
-        }
-        // Default: render the icon as-is
-        render_reactive_element(icon, ctx, &format!("{}.icon", path))
-    } else {
-        // Fallback: simple circle
-        El::new()
-            .s(Width::exact(20))
-            .s(Height::exact(20))
-            .s(RoundedCorners::all(10))
-            .s(Borders::all(Border::new().width(2).color(hsluv!(0, 0, 80))))
-            .unify()
-    };
-
-    // Use Button for reliable click handling with checkbox role
-    Button::new()
-        .label(icon_element)
-        .on_press(click_handler)
-        .update_raw_el(|raw| raw.attr("role", "checkbox"))
+/// Render a default checkbox icon element based on checked state
+fn render_default_checkbox_icon(checked: bool) -> RawElOrText {
+    let svg_url = if checked { CHECKED_SVG } else { UNCHECKED_SVG };
+    El::new()
+        .s(zoon::Width::exact(40))
+        .s(zoon::Height::exact(40))
+        .s(zoon::Background::new().url(svg_url))
         .unify()
 }
 
-/// Render a label element.
-fn render_reactive_label(
-    fields: &Arc<BTreeMap<Arc<str>, DdValue>>,
-    ctx: &GenericReactiveContext,
-) -> RawElOrText {
-    // Get label value, resolving HoldRef if present
-    let label_value = fields.get("label");
-    let text = match label_value {
-        Some(DdValue::HoldRef(hold_name)) => {
-            // Resolve HoldRef to its current value
-            let hold_id = HoldId::new(hold_name.as_ref());
-            ctx.get_hold(&hold_id)
-                .map(|s| s.get().to_display_string())
-                .unwrap_or_else(|| format!("[hold:{}]", hold_name))
-        }
-        Some(v) => v.to_display_string(),
-        None => String::new(),
-    };
+fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) -> RawElOrText {
+    // Extract checked value - can be Bool, Tagged, or HoldRef (reactive)
+    let checked_value = fields.get("checked").cloned();
 
-    // Check if this label references a HOLD variable
-    // Look for patterns like "{count}" or direct hold references
-    let hold_values = ctx.get_hold_values();
+    // Extract click LinkRef from element.event.click if present
+    let click_link_id = fields
+        .get("element")
+        .and_then(|e| e.get("event"))
+        .and_then(|e| e.get("click"))
+        .and_then(|v| match v {
+            DdValue::LinkRef(id) => Some(id.to_string()),
+            _ => None,
+        });
 
-    // Try to find a HOLD value that matches
-    for (hold_name, _signal) in hold_values {
-        if text.contains(&format!("{{{}}}", hold_name)) {
-            // This label has a reactive reference
-            // For now, just substitute the current value
-            let current = ctx.get_hold(&HoldId::new(&hold_name))
-                .map(|s| s.get().to_display_string())
-                .unwrap_or_default();
-            let rendered = text.replace(&format!("{{{}}}", hold_name), &current);
-            return Label::new().label(zoon::Text::new(&rendered)).unify();
+    // Use Checkbox component for proper role="checkbox" accessibility
+    // with custom 40x40 SVG icon for visual consistency
+
+    // Check if checked is a HoldRef (reactive checkbox)
+    if let Some(DdValue::HoldRef(hold_id)) = &checked_value {
+        // Reactive checkbox - observe HOLD state changes
+        let hold_id_for_signal = hold_id.to_string();
+        let hold_id_for_icon = hold_id.to_string();
+
+        let checkbox = Checkbox::new()
+            .label_hidden("checkbox")
+            .checked_signal(
+                hold_states_signal()
+                    .map({
+                        let hold_id = hold_id_for_signal.clone();
+                        move |states| {
+                            states.get(&hold_id)
+                                .map(|v| match v {
+                                    DdValue::Bool(b) => *b,
+                                    DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
+                                    _ => false,
+                                })
+                                .unwrap_or(false)
+                        }
+                    })
+            )
+            .icon(move |_checked_mutable| {
+                El::new()
+                    .s(zoon::Width::exact(40))
+                    .s(zoon::Height::exact(40))
+                    .child_signal(
+                        hold_states_signal()
+                            .map({
+                                let hold_id = hold_id_for_icon.clone();
+                                move |states| {
+                                    let checked = states.get(&hold_id)
+                                        .map(|v| match v {
+                                            DdValue::Bool(b) => *b,
+                                            DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
+                                            _ => false,
+                                        })
+                                        .unwrap_or(false);
+                                    let svg_url = if checked { CHECKED_SVG } else { UNCHECKED_SVG };
+                                    El::new()
+                                        .s(zoon::Width::exact(40))
+                                        .s(zoon::Height::exact(40))
+                                        .s(zoon::Background::new().url(svg_url))
+                                }
+                            })
+                    )
+                    .unify()
+            });
+
+        if let Some(link_id) = click_link_id {
+            return checkbox
+                .on_click(move || {
+                    fire_global_link(&link_id);
+                })
+                .unify();
+        } else {
+            return checkbox.unify();
         }
     }
 
-    Label::new().label(zoon::Text::new(&text)).unify()
+    // Static checkbox - extract checked state directly
+    let checked = checked_value
+        .as_ref()
+        .map(|v| match v {
+            DdValue::Bool(b) => *b,
+            DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
+            _ => false,
+        })
+        .unwrap_or(false);
+
+    // Build Checkbox with static icon
+    let svg_url = if checked { CHECKED_SVG } else { UNCHECKED_SVG };
+    let checkbox = Checkbox::new()
+        .label_hidden("checkbox")
+        .checked(checked)
+        .icon(move |_checked_mutable| {
+            El::new()
+                .s(zoon::Width::exact(40))
+                .s(zoon::Height::exact(40))
+                .s(zoon::Background::new().url(svg_url))
+                .unify()
+        });
+
+    if let Some(link_id) = click_link_id {
+        checkbox
+            .on_click(move || {
+                fire_global_link(&link_id);
+            })
+            .unify()
+    } else {
+        checkbox.unify()
+    }
+}
+
+/// Render a label element.
+fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) -> RawElOrText {
+    let label_value = fields
+        .get("label")
+        .or_else(|| fields.get("text"));
+
+    // Extract double_click LinkRef from element.event.double_click if present
+    let double_click_link_id = fields
+        .get("element")
+        .and_then(|e| e.get("event"))
+        .and_then(|e| e.get("double_click"))
+        .and_then(|v| match v {
+            DdValue::LinkRef(id) => Some(id.to_string()),
+            _ => None,
+        });
+
+    let label = match label_value {
+        Some(DdValue::HoldRef(name)) => {
+            // Reactive label - update when HOLD state changes
+            let hold_id = name.to_string();
+            Label::new()
+                .label_signal(
+                    hold_states_signal()
+                        .map(move |states| {
+                            states
+                                .get(&hold_id)
+                                .map(|v| v.to_display_string())
+                                .unwrap_or_default()
+                        })
+                )
+                .for_input("dd_text_input")
+        }
+        Some(DdValue::Text(text)) if text.ends_with(" items") => {
+            // Special case: "N items" pattern - make reactive based on items HOLD
+            Label::new()
+                .label_signal(
+                    hold_states_signal()
+                        .map(|states| {
+                            let count = states.get("items")
+                                .and_then(|v| match v {
+                                    DdValue::List(list) => Some(list.len()),
+                                    _ => None,
+                                })
+                                .unwrap_or(0);
+                            format!("{} items", count)
+                        })
+                )
+                .for_input("dd_text_input")
+        }
+        Some(v) => {
+            // Static label
+            Label::new()
+                .label(v.to_display_string())
+                .for_input("dd_text_input")
+        }
+        None => {
+            Label::new()
+                .label("")
+                .for_input("dd_text_input")
+        }
+    };
+
+    // Add double_click handler if present
+    if let Some(link_id) = double_click_link_id {
+        label
+            .on_double_click(move || {
+                fire_global_link(&link_id);
+            })
+            .unify()
+    } else {
+        label.unify()
+    }
 }
 
 /// Render a paragraph element.
-fn render_reactive_paragraph(
-    fields: &Arc<BTreeMap<Arc<str>, DdValue>>,
-    ctx: &GenericReactiveContext,
-    path: &str,
-) -> RawElOrText {
-    // Handle both "content" (single string) and "contents" (list of elements)
-    if let Some(contents) = fields.get("contents").and_then(|v| v.as_list()) {
-        // Render each item in the contents list as a child element
-        let children: Vec<RawElOrText> = contents
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let item_path = format!("{}/contents[{}]", path, i);
-                render_reactive_element(item, ctx, &item_path)
-            })
-            .collect();
-
-        Paragraph::new().contents(children).unify()
+fn render_paragraph(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) -> RawElOrText {
+    // Try "contents" first (plural - used by Element/paragraph), then fallback to "content" or "text"
+    let content = if let Some(DdValue::List(items)) = fields.get("contents") {
+        // Render list items and join their text representations
+        items.iter()
+            .map(|item| extract_text_content(item))
+            .collect::<Vec<_>>()
+            .join("")
     } else {
-        // Fallback to single content string
-        let text = fields
+        fields
             .get("content")
-            .map(|v| v.to_display_string())
-            .unwrap_or_default();
+            .or_else(|| fields.get("text"))
+            .map(|v| extract_text_content(v))
+            .unwrap_or_default()
+    };
 
-        Paragraph::new().content(text).unify()
+    Paragraph::new()
+        .content(content)
+        .unify()
+}
+
+/// Extract display text from a DdValue, handling nested elements like links.
+fn extract_text_content(value: &DdValue) -> String {
+    match value {
+        DdValue::Text(s) => s.to_string(),
+        DdValue::Unit => " ".to_string(), // Text/space() renders as Unit
+        DdValue::Tagged { tag, fields } if tag.as_ref() == "Element" => {
+            // For Element tags, check the element type and extract appropriate text
+            let element_type = fields
+                .get("_element_type")
+                .and_then(|v| match v {
+                    DdValue::Text(s) => Some(s.as_ref()),
+                    _ => None,
+                });
+
+            match element_type {
+                Some("link") => {
+                    // Extract label from link element
+                    fields.get("label")
+                        .map(|v| extract_text_content(v))
+                        .unwrap_or_default()
+                }
+                Some("paragraph") => {
+                    // Recursively extract from paragraph contents
+                    if let Some(DdValue::List(items)) = fields.get("contents") {
+                        items.iter()
+                            .map(|item| extract_text_content(item))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    } else {
+                        String::new()
+                    }
+                }
+                _ => {
+                    // For other elements, try to extract from label or child
+                    fields.get("label")
+                        .or_else(|| fields.get("child"))
+                        .map(|v| extract_text_content(v))
+                        .unwrap_or_default()
+                }
+            }
+        }
+        _ => value.to_display_string(),
     }
 }
 
 /// Render a link element.
-fn render_reactive_link(fields: &Arc<BTreeMap<Arc<str>, DdValue>>) -> RawElOrText {
+fn render_link(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) -> RawElOrText {
     let label = fields
         .get("label")
         .map(|v| v.to_display_string())
         .unwrap_or_default();
 
-    let url = fields
-        .get("url")
-        .and_then(|v| v.as_text())
-        .unwrap_or("#");
+    let to = fields
+        .get("to")
+        .map(|v| v.to_display_string())
+        .unwrap_or_else(|| "#".to_string());
 
     Link::new()
         .label(label)
-        .to(url)
+        .to(to)
         .unify()
-}
-
-/// Render a document with signal-based reactivity.
-///
-/// This version re-renders when the reactive context's render trigger changes.
-pub fn render_dd_document_reactive_signal(
-    document: DdValue,
-    ctx: GenericReactiveContext,
-) -> impl Element {
-    zoon::println!("[render_dd_document_reactive_signal] CALLED - this is for timer/accumulator examples");
-    let ctx_for_render = ctx.clone();
-    let doc_for_render = document;
-
-    // Get the render signal first (before moving ctx)
-    zoon::println!("[render_dd_document_reactive_signal] Getting render_signal from ctx");
-    let render_signal = ctx.render_signal();
-
-    // Start any registered timers
-    start_timers(&ctx);
-
-    El::new()
-        .s(Width::fill())
-        .s(Height::fill())
-        .child_signal(
-            render_signal.map(move |_trigger| {
-                // Re-render the document with current HOLD values
-                let rendered = render_dd_document_reactive(&doc_for_render, &ctx_for_render);
-
-                // Wrap in El to satisfy trait bounds
-                El::new().child(rendered).unify()
-            })
-        )
-}
-
-/// Render a DdReactiveResult with full re-evaluation on state changes.
-///
-/// This function re-evaluates the entire Boon program on each render trigger,
-/// using the existing reactive context. When HOLDs are re-registered during
-/// evaluation, `register_hold` returns the existing signal with its current
-/// value. This ensures derived values like `active_todos_count` are recomputed.
-pub fn render_dd_result_reactive_signal(
-    result: DdReactiveResult,
-) -> impl Element {
-    zoon::println!("[render_dd_result_reactive_signal] CALLED - this is for HOLD-only examples like todo_mvc");
-    let ctx = result.context.clone();
-    let source_code = result.source_code.clone();
-    let filename = result.filename.clone();
-    let ctx_for_render = ctx.clone();
-    let source_for_render = source_code.clone();
-    let filename_for_render = filename.clone();
-
-    // Get the render signal first (before moving ctx)
-    zoon::println!("[render_dd_result_reactive_signal] Getting render_signal from ctx");
-    let render_signal = ctx.render_signal();
-
-    // Start any registered timers
-    start_timers(&ctx);
-
-    El::new()
-        .s(Width::fill())
-        .s(Height::fill())
-        .child_signal(
-            render_signal.map(move |trigger| {
-                zoon::println!("[render_dd_result_reactive_signal] Trigger {}, re-evaluating...", trigger);
-
-                // Re-evaluate the program with the existing reactive context.
-                // This shares the context so HOLDs return their current values.
-                let new_document = run_dd_reactive_with_context(
-                    &filename_for_render,
-                    &source_for_render,
-                    ctx_for_render.clone(),
-                );
-
-                // Render the new document
-                if let Some(doc) = new_document {
-                    let rendered = render_dd_document_reactive(&doc, &ctx_for_render);
-                    El::new().child(rendered).unify()
-                } else {
-                    // Parsing/evaluation error - show error placeholder
-                    El::new().child(zoon::Text::new("Error re-evaluating document")).unify()
-                }
-            })
-        )
-}
-
-/// Start all registered timers in the reactive context.
-/// Each timer spawns a background task that fires periodically.
-fn start_timers(ctx: &GenericReactiveContext) {
-    // Prevent starting timers if they're already running
-    // This can happen if render_dd_document_reactive_signal is called multiple times
-    if ctx.has_timer_handles() {
-        zoon::println!("[start_timers] Already has timer handles, skipping");
-        return;
-    }
-
-    let timers = ctx.get_timers();
-    zoon::println!("[start_timers] Starting {} timers, session={}, run_generation={}",
-        timers.len(), ctx.session_id(), ctx.run_generation());
-
-    for timer_info in timers {
-        let ctx_for_timer = ctx.clone();
-        let timer_id = timer_info.id.clone();
-        let interval_ms = timer_info.interval_ms;
-        zoon::println!("[start_timers] Starting timer {:?} with interval {}ms", timer_id, interval_ms);
-
-        // Spawn a background task for this timer
-        let sleep_ms = interval_ms.round().max(0.0).min(u32::MAX as f64) as u32;
-        zoon::println!("[timer_loop] Starting loop, sleep_ms={}", sleep_ms);
-        let handle = Task::start_droppable(async move {
-            loop {
-                zoon::println!("[timer_loop] About to sleep {}ms", sleep_ms);
-                // Wait for the interval
-                Timer::sleep(sleep_ms).await;
-                zoon::println!("[timer_loop] Woke up, ctx.session={} gen={}, current.session={} gen={}",
-                    ctx_for_timer.session_id(), ctx_for_timer.run_generation(),
-                    super::dd_reactive_eval::session_id(), super::dd_reactive_eval::current_run_generation());
-
-                // Check if this context is still the current run - if not, stop firing
-                // This prevents old timers from continuing after a new run starts
-                if !ctx_for_timer.is_current_run() {
-                    zoon::println!("[timer_loop] Not current run, stopping");
-                    break;
-                }
-
-                // Fire the timer and trigger render if state was updated
-                if ctx_for_timer.handle_timer_fire(&timer_id) {
-                    ctx_for_timer.trigger_render();
-                }
-            }
-        });
-
-        // Store the handle to keep the task alive
-        ctx.add_timer_handle(handle);
-    }
 }

@@ -23,10 +23,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use differential_dataflow::collection::AsCollection;
+use differential_dataflow::collection::{AsCollection, VecCollection};
 use differential_dataflow::input::Input;
 use differential_dataflow::operators::Count;
-use differential_dataflow::Collection;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::Operator;
 use timely::dataflow::Scope;
@@ -166,9 +165,9 @@ pub fn run_counter_dataflow(events: Vec<(i32, bool)>) -> Vec<(u64, isize)> {
 /// Each output is `(state_value, time, +1)` representing the new state.
 pub fn hold<G, S, E, F>(
     initial: S,
-    events: &Collection<G, E, isize>,
+    events: &VecCollection<G, E>,
     transform: F,
-) -> Collection<G, S, isize>
+) -> VecCollection<G, S>
 where
     G: Scope,
     G::Timestamp: Clone,

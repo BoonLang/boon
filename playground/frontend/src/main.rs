@@ -20,7 +20,8 @@ use boon::platform::browser::{
 use boon::platform::browser::engine_dd::{
     dd_bridge::{render_dd_document_reactive_signal, render_dd_result_reactive_signal},
     dd_interpreter::run_dd_reactive_with_persistence,
-    dd_reactive_eval::invalidate_timers,
+    dd_reactive_eval::stop_dd_engine,
+    clear_dd_persisted_states,
 };
 
 mod code_editor;
@@ -1589,10 +1590,14 @@ impl Playground {
             )
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press(|| {
-                // Invalidate DD engine timers FIRST to prevent race condition where
-                // old timers re-save values before the new run starts
+                // Stop entire DD engine FIRST to prevent race condition where
+                // background tasks re-save values before the clear completes
                 #[cfg(feature = "engine-dd")]
-                invalidate_timers();
+                stop_dd_engine();
+
+                // Clear DD in-memory state (HOLD_STATES) and localStorage
+                #[cfg(feature = "engine-dd")]
+                clear_dd_persisted_states();
 
                 local_storage().remove(STATES_STORAGE_KEY);
                 local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
@@ -2096,6 +2101,10 @@ impl Playground {
                         local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
                         local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
                         clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
+
+                        // Clear DD in-memory HOLD states AND localStorage (counter values, todo lists, etc.)
+                        #[cfg(feature = "engine-dd")]
+                        clear_dd_persisted_states();
                     }
 
                     // Update URL to share this example

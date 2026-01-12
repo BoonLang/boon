@@ -24,6 +24,11 @@ poll_interval = 200
 # --- NAVIGATION WITH URL VERIFICATION ---
 
 [[sequence]]
+description = "BUG TEST: Verify initial Home page content is visible"
+actions = [["assert_contains", "Welcome Home"]]
+expect = "Home"
+
+[[sequence]]
 description = "Step 1a: Click About link"
 actions = [["click_text", "About"]]
 expect = "About"
@@ -31,6 +36,16 @@ expect = "About"
 [[sequence]]
 description = "Step 1b: Verify URL contains /about"
 actions = [["assert_url", "/about"]]
+expect = "About"
+
+[[sequence]]
+description = "BUG TEST: Verify About page content changed (should NOT show Welcome Home)"
+actions = [["assert_not_contains", "Welcome Home"]]
+expect = "About"
+
+[[sequence]]
+description = "BUG TEST: Verify About page content is visible"
+actions = [["assert_contains", "A multi-page Boon app"]]
 expect = "About"
 
 [[sequence]]

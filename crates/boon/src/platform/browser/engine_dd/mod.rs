@@ -1,25 +1,45 @@
 //! Differential Dataflow engine for Boon.
 //!
-//! This is an alternative engine using Timely Dataflow and Differential Dataflow
-//! for pull-based evaluation with incremental computation capabilities.
+//! This engine uses Timely Dataflow and Differential Dataflow for
+//! reactive evaluation with incremental computation capabilities.
 //!
-//! # Architecture
+//! # Architecture (Pure DD - Anti-Cheat Design)
 //!
-//! The DD engine has two layers:
+//! - `core/` - Pure DD, no Zoon dependencies, no Mutable/RefCell
+//!   - `types.rs` - DdInput/DdOutput with no sync access
+//!   - `guards.rs` - Runtime cheat detection
+//!   - `worker.rs` - Async DD worker with event loop
+//! - `io/` - Input/output channels for DD communication
+//! - `bridge/` - Zoon integration, receives streams only
+//! - `dd_value.rs` - Pure data types for DD
+//! - `dd_runtime.rs` - DD operators (hold, etc.)
+//! - `dd_evaluator.rs` - Static expression evaluation
 //!
-//! 1. **Static evaluation** (`dd_evaluator`) - Evaluates pure expressions to `DdValue`
-//! 2. **Reactive layer** (`dd_stream`, `dd_scope`) - Lightweight signals for UI reactivity
+//! ## Anti-Cheat Constraints
 //!
-//! The `dd_runtime` module provides actual Timely/DD operators for batch processing,
-//! while `dd_stream` provides browser-friendly reactivity via Zoon's Mutable/Signal.
+//! - NO `Mutable<T>` - Use DdOutput streams instead
+//! - NO `RefCell<T>` - All state in DD collections
+//! - NO `.get()` - Never read state synchronously
+//! - NO `trigger_render()` - DD outputs drive rendering automatically
+//!
+//! Run `makers verify-dd-no-cheats` to check for violations.
 
-pub mod dd_bridge;
-pub mod dd_evaluator;
-pub mod dd_interpreter;
-pub mod dd_link;
-pub mod dd_reactive;
-pub mod dd_reactive_eval;
-pub mod dd_runtime;
-pub mod dd_scope;
-pub mod dd_stream;
-pub mod dd_value;
+// Pure DD modules (anti-cheat compliant)
+pub mod core;
+pub mod io;
+pub mod bridge;
+
+// Core modules (no cheats)
+pub mod dd_value;      // Pure data types
+pub mod dd_runtime;    // DD operators (hold, etc.)
+pub mod dd_evaluator;  // Static expression evaluation
+
+// Stub modules for frontend compatibility (to be replaced in Phase 4)
+pub mod dd_bridge;       // Stub: render DD output to Zoon elements
+pub mod dd_interpreter;  // Stub: parse Boon and run DD dataflow
+pub mod dd_reactive_eval; // Stub: timer invalidation
+
+// Re-export commonly used types
+pub use core::{DdEvent, DdEventValue, DdInput, DdOutput, DdWorker, DdWorkerHandle, HoldId, LinkId};
+pub use dd_value::DdValue;
+pub use io::{clear_dd_persisted_states, clear_hold_states_memory};

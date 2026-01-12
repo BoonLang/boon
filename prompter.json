@@ -4,7 +4,7 @@
   "command": [
     "cl"
   ],
-  "supervisor_prompt": "Make DD engine fully working according to the plan or as needed and remove all stubs or workarounds that were used to make it work by cheating.",
+  "supervisor_prompt": "Make DD engine fully working without cheating.",
   "completion_condition": "+completed+",
   "completion_command": "makers verify-playground-dd",
   "protected_patterns": [

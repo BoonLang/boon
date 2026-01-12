@@ -257,6 +257,13 @@ impl Action {
                             .context("assert_button_count requires expected count")?;
                         Ok(ParsedAction::AssertButtonCount { expected: expected_count as u32 })
                     }
+                    "assert_checkbox_count" => {
+                        let expected_count = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_checkbox_count requires expected count")?;
+                        Ok(ParsedAction::AssertCheckboxCount { expected: expected_count as u32 })
+                    }
                     "assert_not_contains" => {
                         let text = arr
                             .get(1)
@@ -279,6 +286,13 @@ impl Action {
                             .context("assert_checkbox_unchecked requires checkbox index")?;
                         Ok(ParsedAction::AssertCheckboxUnchecked { index: index as u32 })
                     }
+                    "assert_checkbox_checked" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_checkbox_checked requires checkbox index")?;
+                        Ok(ParsedAction::AssertCheckboxChecked { index: index as u32 })
+                    }
                     "assert_button_has_outline" => {
                         let text = arr
                             .get(1)
@@ -288,6 +302,21 @@ impl Action {
                         Ok(ParsedAction::AssertButtonHasOutline { text })
                     }
                     "assert_toggle_all_darker" => Ok(ParsedAction::AssertToggleAllDarker),
+                    "assert_input_empty" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_input_empty requires input index")?;
+                        Ok(ParsedAction::AssertInputEmpty { index: index as u32 })
+                    }
+                    "assert_contains" => {
+                        let text = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .context("assert_contains requires text that should be present")?
+                            .to_string();
+                        Ok(ParsedAction::AssertContains { text })
+                    }
                     _ => anyhow::bail!("Unknown action type: {}", cmd),
                 }
             }
@@ -316,11 +345,15 @@ pub enum ParsedAction {
     AssertUrl { pattern: String },  // Assert current URL contains pattern
     AssertInputTypeable { index: u32 },  // Assert input is actually typeable (not disabled/readonly/hidden)
     AssertButtonCount { expected: u32 },  // Assert number of visible buttons in preview
+    AssertCheckboxCount { expected: u32 },  // Assert number of visible checkboxes in preview
     AssertNotContains { text: String },  // Assert preview does NOT contain text
     AssertNotFocused { input_index: u32 },  // Assert input does NOT have focus
     AssertCheckboxUnchecked { index: u32 },  // Assert checkbox is NOT checked
+    AssertCheckboxChecked { index: u32 },  // Assert checkbox IS checked
     AssertButtonHasOutline { text: String },  // Assert button has visible outline
     AssertToggleAllDarker,  // Assert toggle all icon is dark (all todos completed)
+    AssertInputEmpty { index: u32 },  // Assert input value is empty
+    AssertContains { text: String },  // Assert preview contains text
 }
 
 #[derive(Debug, Clone, Deserialize)]

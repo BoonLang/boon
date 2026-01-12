@@ -8,6 +8,59 @@ use std::sync::Arc;
 
 use ordered_float::OrderedFloat;
 
+/// Type of computation for reactive computed values.
+///
+/// These represent "recipes" for computing values that depend on HOLD state.
+/// The bridge evaluates these reactively when the source HOLD changes.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ComputedType {
+    /// Count items in list where field == value
+    /// Used for: `todos |> List/retain(item, if: item.completed) |> List/count()`
+    ListCountWhere {
+        field: Arc<str>,
+        value: Box<DdValue>,
+    },
+    /// Total count of list items
+    /// Used for: `todos |> List/count()`
+    ListCount,
+    /// Subtract two computed values
+    /// Used for: `todos_count - completed_todos_count`
+    Subtract {
+        left: Box<DdValue>,
+        right: Box<DdValue>,
+    },
+    /// Check if all items in list satisfy condition
+    /// Used for: `todos |> List/all(item => item.completed)`
+    ListAllWhere {
+        field: Arc<str>,
+        value: Box<DdValue>,
+    },
+    /// Check if computed value > 0
+    /// Used for: `completed_todos_count > 0`
+    GreaterThanZero {
+        operand: Box<DdValue>,
+    },
+    /// Equality comparison of two values
+    /// Used for: `active_todos_count == todos_count`
+    Equal {
+        left: Box<DdValue>,
+        right: Box<DdValue>,
+    },
+    /// Count items in a list where items have HoldRef fields
+    /// Used for: `todos |> List/retain(item, if: item.completed) |> List/count()`
+    /// where each todo.completed is a HoldRef
+    ReactiveListCountWhere {
+        /// The list items (containing HoldRef fields)
+        items: Arc<Vec<DdValue>>,
+        /// The field to filter on
+        field: Arc<str>,
+        /// The value to match
+        value: Box<DdValue>,
+        /// The HoldRef IDs to observe (one per item)
+        hold_ids: Arc<Vec<Arc<str>>>,
+    },
+}
+
 /// A simple value type for DD dataflows.
 ///
 /// These values are pure data - no actors, no channels, no async.
@@ -33,6 +86,62 @@ pub enum DdValue {
     },
     /// Reference to a HOLD state - resolved at render time
     HoldRef(Arc<str>),
+    /// Reference to a LINK event source - used for reactive event wiring
+    /// The string is the path to the LINK (e.g., "increment_button.event.press")
+    LinkRef(Arc<str>),
+    /// Reference to a Timer event source - used for timer-triggered reactivity
+    /// Contains (timer_id, interval_ms)
+    TimerRef { id: Arc<str>, interval_ms: u64 },
+    /// Reactive WHILE/WHEN expression - evaluates arms based on HoldRef value
+    /// Used when pattern matching against a reactive HoldRef input
+    WhileRef {
+        /// The HoldRef that provides the input value
+        hold_id: Arc<str>,
+        /// Optional computation to apply before matching (for ComputedRef inputs)
+        /// If Some, the hold value is first passed through this computation,
+        /// and the boolean result is matched against True/False patterns.
+        computation: Option<ComputedType>,
+        /// Pre-evaluated arms: (pattern_value, body_result)
+        /// Each arm is (tag/value to match, evaluated body result)
+        arms: Arc<Vec<(DdValue, DdValue)>>,
+        /// Default arm result (for wildcard pattern)
+        default: Option<Arc<DdValue>>,
+    },
+    /// Computed value that re-evaluates when dependencies change.
+    /// Used for reactive expressions like `completed_todos_count` that need
+    /// to update when a HOLD (like `todos`) changes.
+    ComputedRef {
+        /// The type of computation to perform
+        computation: ComputedType,
+        /// The HOLD ID this depends on (the primary data source)
+        source_hold: Arc<str>,
+    },
+    /// Intermediate value for filtered list operations on HoldRef.
+    /// Created when List/retain is applied to a HoldRef.
+    /// Used to build ComputedRef when List/count() is called on this.
+    FilteredListRef {
+        /// The source HOLD ID containing the list
+        source_hold: Arc<str>,
+        /// The field to filter on (e.g., "completed")
+        filter_field: Arc<str>,
+        /// The value to match (e.g., Bool(true))
+        filter_value: Box<DdValue>,
+    },
+    /// Reactive filtered list where items have HoldRef fields.
+    /// Created when List/retain is applied to a concrete list
+    /// where the filter condition references a field containing HoldRefs.
+    /// Example: todos |> List/retain(item, if: item.completed)
+    /// where each todo.completed is a HoldRef.
+    ReactiveFilteredList {
+        /// The concrete list items (containing HoldRef fields)
+        items: Arc<Vec<DdValue>>,
+        /// The field to filter on (e.g., "completed")
+        filter_field: Arc<str>,
+        /// The value to match (e.g., Bool(true))
+        filter_value: Box<DdValue>,
+        /// The HoldRef IDs that this list depends on (one per item)
+        hold_ids: Arc<Vec<Arc<str>>>,
+    },
 }
 
 impl DdValue {
@@ -54,6 +163,16 @@ impl DdValue {
     /// Create a text value.
     pub fn text(s: impl Into<Arc<str>>) -> Self {
         Self::Text(s.into())
+    }
+
+    /// Create a LINK reference with the given path/id.
+    pub fn link_ref(path: impl Into<Arc<str>>) -> Self {
+        Self::LinkRef(path.into())
+    }
+
+    /// Create a Timer reference with the given id and interval.
+    pub fn timer_ref(id: impl Into<Arc<str>>, interval_ms: u64) -> Self {
+        Self::TimerRef { id: id.into(), interval_ms }
     }
 
     /// Create an object from key-value pairs.
@@ -85,6 +204,15 @@ impl DdValue {
         }
     }
 
+    /// Create a todo object with title and completed fields.
+    /// Used for dynamically added todos in todo_mvc.
+    pub fn todo_object(title: &str, completed: bool) -> Self {
+        Self::object([
+            ("title", Self::text(title)),
+            ("completed", Self::Bool(completed)),
+        ])
+    }
+
     /// Get a field from an object or tagged object.
     pub fn get(&self, key: &str) -> Option<&DdValue> {
         match self {
@@ -95,6 +223,10 @@ impl DdValue {
     }
 
     /// Check if this is a truthy value.
+    ///
+    /// For HoldRef values, looks up the actual stored value from HOLD_STATES.
+    /// This is important for correct evaluation of patterns like:
+    ///   `List/retain(item, if: item.completed)` where completed is a HoldRef.
     pub fn is_truthy(&self) -> bool {
         match self {
             Self::Unit => false,
@@ -105,8 +237,33 @@ impl DdValue {
             Self::List(items) => !items.is_empty(),
             // False tag is falsy, True and all other tags are truthy
             Self::Tagged { tag, .. } => tag.as_ref() != "False",
-            // HoldRef is truthy (the actual value is resolved at render time)
-            Self::HoldRef(_) => true,
+            // HoldRef - look up actual value from HOLD_STATES
+            Self::HoldRef(hold_id) => {
+                // Use the io module's get_hold_value to look up the actual value
+                super::io::get_hold_value(hold_id)
+                    .map(|v| v.is_truthy())
+                    .unwrap_or(false)
+            }
+            // LinkRef is truthy (represents an event source)
+            Self::LinkRef(_) => true,
+            // TimerRef is truthy (represents a timer event source)
+            Self::TimerRef { .. } => true,
+            // WhileRef is truthy (represents a reactive expression)
+            Self::WhileRef { .. } => true,
+            // ComputedRef - evaluate computation with current HOLD state
+            Self::ComputedRef { computation, source_hold } => {
+                super::io::get_hold_value(source_hold)
+                    .map(|source_value| {
+                        evaluate_computed(computation, &source_value).is_truthy()
+                    })
+                    .unwrap_or(false)
+            }
+            // FilteredListRef - intermediate value, truthy if source exists
+            Self::FilteredListRef { source_hold, .. } => {
+                super::io::get_hold_value(source_hold).is_some()
+            }
+            // ReactiveFilteredList - truthy if it has items
+            Self::ReactiveFilteredList { items, .. } => !items.is_empty(),
         }
     }
 
@@ -128,6 +285,18 @@ impl DdValue {
             Self::List(items) => format!("[list of {}]", items.len()),
             Self::Tagged { tag, .. } => format!("[{tag}]"),
             Self::HoldRef(name) => format!("[hold:{}]", name),
+            Self::LinkRef(path) => format!("[link:{}]", path),
+            Self::TimerRef { id, interval_ms } => format!("[timer:{}@{}ms]", id, interval_ms),
+            Self::WhileRef { hold_id, arms, .. } => format!("[while:{}#{}]", hold_id, arms.len()),
+            Self::ComputedRef { computation, source_hold } => {
+                format!("[computed:{:?}@{}]", computation, source_hold)
+            }
+            Self::FilteredListRef { source_hold, filter_field, .. } => {
+                format!("[filtered:{}@{}]", filter_field, source_hold)
+            }
+            Self::ReactiveFilteredList { items, filter_field, .. } => {
+                format!("[reactive-filtered:{}#{}]", filter_field, items.len())
+            }
         }
     }
 
@@ -161,6 +330,146 @@ impl DdValue {
             Self::List(items) => Some(items),
             _ => None,
         }
+    }
+
+    /// Create a computed reference value.
+    pub fn computed_ref(computation: ComputedType, source_hold: impl Into<Arc<str>>) -> Self {
+        Self::ComputedRef {
+            computation,
+            source_hold: source_hold.into(),
+        }
+    }
+}
+
+/// Evaluate a computed expression with a given source value.
+///
+/// This is called both from `is_truthy()` for synchronous evaluation
+/// and from the bridge for reactive rendering.
+pub fn evaluate_computed(computation: &ComputedType, source_value: &DdValue) -> DdValue {
+    match computation {
+        ComputedType::ListCount => {
+            match source_value {
+                DdValue::List(items) => DdValue::int(items.len() as i64),
+                _ => DdValue::int(0),
+            }
+        }
+        ComputedType::ListCountWhere { field, value } => {
+            match source_value {
+                DdValue::List(items) => {
+                    let count = items.iter()
+                        .filter(|item| {
+                            if let DdValue::Object(obj) = item {
+                                obj.get(field.as_ref()) == Some(value.as_ref())
+                            } else {
+                                false
+                            }
+                        })
+                        .count();
+                    DdValue::int(count as i64)
+                }
+                _ => DdValue::int(0),
+            }
+        }
+        ComputedType::ListAllWhere { field, value } => {
+            match source_value {
+                DdValue::List(items) => {
+                    if items.is_empty() {
+                        DdValue::Bool(false)
+                    } else {
+                        let all_match = items.iter().all(|item| {
+                            if let DdValue::Object(obj) = item {
+                                obj.get(field.as_ref()) == Some(value.as_ref())
+                            } else {
+                                false
+                            }
+                        });
+                        DdValue::Bool(all_match)
+                    }
+                }
+                _ => DdValue::Bool(false),
+            }
+        }
+        ComputedType::Subtract { left, right } => {
+            // Resolve left and right values
+            let left_val = resolve_computed_operand(left, source_value);
+            let right_val = resolve_computed_operand(right, source_value);
+
+            match (left_val.as_int(), right_val.as_int()) {
+                (Some(l), Some(r)) => DdValue::int(l - r),
+                _ => DdValue::int(0),
+            }
+        }
+        ComputedType::GreaterThanZero { operand } => {
+            let val = resolve_computed_operand(operand, source_value);
+            match val.as_int() {
+                Some(n) => DdValue::Bool(n > 0),
+                None => DdValue::Bool(false),
+            }
+        }
+        ComputedType::Equal { left, right } => {
+            let left_val = resolve_computed_operand(left, source_value);
+            let right_val = resolve_computed_operand(right, source_value);
+            DdValue::Bool(left_val == right_val)
+        }
+        ComputedType::ReactiveListCountWhere { items: static_items, field: _, value, hold_ids: _ } => {
+            // Count items where the "completed" field matches the expected value
+            // IMPORTANT: Use current "todos" HOLD as source of truth (not static items)
+            // This handles Clear completed removing items dynamically
+
+            let current_items = super::io::get_hold_value("todos")
+                .and_then(|v| match v {
+                    DdValue::List(list) => Some(list),
+                    _ => None,
+                })
+                .unwrap_or_else(|| static_items.clone());
+
+            let count = current_items.iter()
+                .filter(|item| {
+                    // Get the completed field value
+                    let completed_value = match item {
+                        DdValue::Object(obj) => {
+                            match obj.get("completed") {
+                                // Direct Bool value (dynamic todos)
+                                Some(DdValue::Bool(b)) => Some(DdValue::Bool(*b)),
+                                // HoldRef - look up current value
+                                Some(DdValue::HoldRef(hold_id)) => {
+                                    super::io::get_hold_value(hold_id)
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+
+                    // Compare with expected value
+                    match (completed_value.as_ref(), value.as_ref()) {
+                        (Some(DdValue::Bool(b)), DdValue::Bool(expected)) => *b == *expected,
+                        (Some(DdValue::Tagged { tag, .. }), DdValue::Tagged { tag: expected_tag, .. }) => {
+                            tag == expected_tag
+                        }
+                        (Some(current), expected) => current == expected,
+                        _ => false,
+                    }
+                })
+                .count();
+            DdValue::int(count as i64)
+        }
+    }
+}
+
+/// Resolve a computed operand - if it's a nested ComputedRef, evaluate it.
+fn resolve_computed_operand(value: &DdValue, source_value: &DdValue) -> DdValue {
+    match value {
+        DdValue::ComputedRef { computation, source_hold: _ } => {
+            // For nested computations, use the same source value
+            // (they all depend on the same HOLD)
+            evaluate_computed(computation, source_value)
+        }
+        DdValue::HoldRef(hold_id) => {
+            // Look up from global state
+            super::io::get_hold_value(hold_id).unwrap_or(DdValue::Unit)
+        }
+        _ => value.clone(),
     }
 }
 
