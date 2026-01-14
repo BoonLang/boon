@@ -10,33 +10,7 @@ use super::dd_interpreter::{DdContext, DdResult};
 use super::dd_value::DdValue;
 use zoon::*;
 
-use super::io::{fire_global_link, fire_global_link_with_bool, fire_global_blur, fire_global_key_down, hold_states_signal, get_hold_value, toggle_hold_bool, get_list_var_name, get_checkbox_toggle_holds};
-
-/// Generic helper to check if a list item is completed.
-/// Uses checkbox toggle HOLD detection (no hardcoded field names).
-fn is_item_completed_in_states(item: &DdValue, states: &std::collections::HashMap<String, DdValue>) -> bool {
-    let toggle_holds = get_checkbox_toggle_holds();
-    if let DdValue::Object(obj) = item {
-        for (_, value) in obj.iter() {
-            match value {
-                DdValue::HoldRef(hold_id) => {
-                    // Check if this is a checkbox toggle hold or dynamic hold
-                    if toggle_holds.contains(&hold_id.to_string()) || hold_id.starts_with("dynamic_") {
-                        // Look up the value in states
-                        return match states.get(hold_id.as_ref()) {
-                            Some(DdValue::Bool(true)) => true,
-                            Some(DdValue::Tagged { tag, .. }) if tag.as_ref() == "True" => true,
-                            _ => false,
-                        };
-                    }
-                }
-                DdValue::Bool(b) => return *b,
-                _ => {}
-            }
-        }
-    }
-    false
-}
+use super::io::{fire_global_link, fire_global_link_with_bool, fire_global_blur, fire_global_key_down, hold_states_signal, get_hold_value, toggle_hold_bool};
 
 /// Helper function to get the variant name of a DdValue for debug logging.
 fn dd_value_variant_name(value: &DdValue) -> &'static str {
@@ -59,6 +33,15 @@ fn dd_value_variant_name(value: &DdValue) -> &'static str {
         DdValue::ComputedRef { .. } => "ComputedRef",
         DdValue::FilteredListRef { .. } => "FilteredListRef",
         DdValue::ReactiveFilteredList { .. } => "ReactiveFilteredList",
+        DdValue::ReactiveText { .. } => "ReactiveText",
+        DdValue::Placeholder => "Placeholder",
+        DdValue::PlaceholderField { .. } => "PlaceholderField",
+        DdValue::PlaceholderWhileRef { .. } => "PlaceholderWhileRef",
+        DdValue::NegatedPlaceholderField { .. } => "NegatedPlaceholderField",
+        DdValue::MappedListRef { .. } => "MappedListRef",
+        DdValue::FilteredMappedListRef { .. } => "FilteredMappedListRef",
+        DdValue::FilteredListRefWithPredicate { .. } => "FilteredListRefWithPredicate",
+        DdValue::FilteredMappedListWithPredicate { .. } => "FilteredMappedListWithPredicate",
     }
 }
 
@@ -126,6 +109,27 @@ fn evaluate_while_ref_now(hold_id: &str, computation: &Option<super::dd_value::C
         }
     }
     None
+}
+
+/// Evaluate a DdValue for filter comparison, resolving HoldRefs and WhileRefs.
+/// Used by FilteredMappedListRef to compare field values with filter values.
+/// Recursively evaluates until we get a concrete value (Bool, Tagged, etc.).
+fn evaluate_dd_value_for_filter(value: &DdValue, states: &std::collections::HashMap<String, DdValue>) -> DdValue {
+    match value {
+        DdValue::HoldRef(hold_id) => {
+            let resolved = states.get(hold_id.as_ref()).cloned().unwrap_or(DdValue::Unit);
+            // Recursively evaluate in case the hold value is itself a HoldRef or WhileRef
+            evaluate_dd_value_for_filter(&resolved, states)
+        }
+        DdValue::WhileRef { hold_id, computation, arms, default } => {
+            let result = evaluate_while_ref_now(hold_id, computation, arms)
+                .or_else(|| default.as_ref().map(|d| (**d).clone()))
+                .unwrap_or(DdValue::Unit);
+            // Recursively evaluate in case the WhileRef body is a HoldRef
+            evaluate_dd_value_for_filter(&result, states)
+        }
+        other => other.clone(),
+    }
 }
 
 fn dd_oklch_to_css(value: &DdValue) -> Option<String> {
@@ -257,40 +261,7 @@ fn render_dd_value(value: &DdValue) -> RawElOrText {
         }
 
         DdValue::Text(s) => {
-            let text_str = s.to_string();
-            // Check if this is an "N items left" pattern that should be reactive
-            if text_str.ends_with(" items left") || text_str.ends_with(" item left") {
-                // Make this reactive based on list HOLD which is the authoritative source
-                let list_name = get_list_var_name();
-                return El::new()
-                    .child_signal(
-                        hold_states_signal()
-                            .map(move |states| {
-                                if !states.contains_key(&list_name) {
-                                    // No list HOLD, fall back to static text
-                                    return Text::new(text_str.clone());
-                                }
-
-                                // Count active (not completed) items from list HOLD
-                                // Uses generic checkbox toggle detection (no hardcoded field names)
-                                let total_active = match states.get(&list_name) {
-                                    Some(DdValue::List(items)) => {
-                                        items.iter().filter(|item| {
-                                            // Not completed = active
-                                            !is_item_completed_in_states(item, &states)
-                                        }).count()
-                                    }
-                                    _ => 0,
-                                };
-
-                                // Format the text
-                                let item_text = if total_active == 1 { "item" } else { "items" };
-                                Text::new(format!("{} {} left", total_active, item_text))
-                            })
-                    )
-                    .unify();
-            }
-            Text::new(text_str).unify()
+            Text::new(s.to_string()).unify()
         }
 
         DdValue::List(items) => {
@@ -309,6 +280,23 @@ fn render_dd_value(value: &DdValue) -> RawElOrText {
                 .collect::<Vec<_>>()
                 .join(", ");
             Text::new(format!("[{}]", debug)).unify()
+        }
+
+        DdValue::ReactiveText { parts } => {
+            // Reactive TEXT with interpolated values - evaluated at render time
+            let parts = parts.clone();
+            El::new()
+                .child_signal(
+                    hold_states_signal()
+                        .map(move |_states| {
+                            // Evaluate all parts with current HOLD state
+                            let result: String = parts.iter()
+                                .map(|part| part.to_display_string())
+                                .collect();
+                            Text::new(result)
+                        })
+                )
+                .unify()
         }
 
         DdValue::Tagged { tag, fields } => {
@@ -481,15 +469,21 @@ fn render_dd_value(value: &DdValue) -> RawElOrText {
                                         (DdValue::Text(curr), DdValue::Text(pat)) => curr == pat,
                                         // Tag comparison (e.g., Home, About)
                                         (DdValue::Tagged { tag: curr_tag, .. }, DdValue::Tagged { tag: pat_tag, .. }) => curr_tag == pat_tag,
-                                        // Text to tag comparison for route matching
-                                        // e.g., current="/" pattern=Tagged{Home} - need to map routes to tags
+                                        // Text to tag comparison - compare the text with tag name (case-insensitive)
+                                        // For route matching, "/" maps to root tag, "/foo" maps to "Foo" tag
                                         (DdValue::Text(text), DdValue::Tagged { tag, .. }) => {
-                                            // Map route paths to tags
-                                            match (text.as_ref(), tag.as_ref()) {
-                                                ("/", "Home") | ("", "Home") => true,
-                                                ("/about", "About") => true,
-                                                ("/contact", "Contact") => true,
-                                                _ => false,
+                                            let text_ref = text.as_ref();
+                                            let tag_ref = tag.as_ref();
+                                            // Root path "/" or "" matches tag if tag is the root tag name
+                                            if text_ref == "/" || text_ref.is_empty() {
+                                                // Check if tag matches common root names
+                                                tag_ref.eq_ignore_ascii_case("home") ||
+                                                tag_ref.eq_ignore_ascii_case("root") ||
+                                                tag_ref.eq_ignore_ascii_case("all")
+                                            } else {
+                                                // "/foo" should match "Foo" tag (strip leading /, compare case-insensitive)
+                                                let route_name = text_ref.trim_start_matches('/');
+                                                route_name.eq_ignore_ascii_case(tag_ref)
                                             }
                                         }
                                         _ => current == pattern,
@@ -503,23 +497,16 @@ fn render_dd_value(value: &DdValue) -> RawElOrText {
 
                             // No match - use default if available
                             if let Some(ref def) = default {
-                                // For numeric computations (like Subtract for "items left"),
-                                // use the computed value to render reactive text
-                                if let Some(DdValue::Number(n)) = current_value {
-                                    if let Some(ref comp) = computation {
-                                        use super::dd_value::ComputedType;
-                                        // Check if this is a list-related count computation
-                                        let is_list_count = matches!(comp,
-                                            ComputedType::Subtract { .. } |
-                                            ComputedType::ListCountHold { .. } |
-                                            ComputedType::ListCountWhereHold { .. }
-                                        );
-                                        if is_list_count {
-                                            let count = n.0 as i64;
-                                            let item_text = if count == 1 { "item" } else { "items" };
-                                            return Text::new(format!("{} {} left", count, item_text)).unify();
-                                        }
-                                    }
+                                // If we have a computed numeric value and the default is text,
+                                // render the number followed by the default text (generic approach)
+                                if let (Some(DdValue::Number(n)), DdValue::Text(text)) = (&current_value, def.as_ref()) {
+                                    // Render: "N" + default_text (e.g., "2" + " items left" = "2 items left")
+                                    let text_str = text.to_string();
+                                    // Clean up any placeholder markers in the text
+                                    let clean_text = text_str
+                                        .replace("[while:", "")
+                                        .replace("]", "");
+                                    return Text::new(format!("{}{}", n.0 as i64, clean_text)).unify();
                                 }
                                 return render_dd_value(def.as_ref());
                             }
@@ -568,6 +555,131 @@ fn render_dd_value(value: &DdValue) -> RawElOrText {
             // ReactiveFilteredList is an intermediate value - shouldn't normally be rendered directly
             // If it is rendered, show debug info
             Text::new(format!("[reactive-filtered:{}#{}]", filter_field, items.len())).unify()
+        }
+
+        DdValue::FilteredListRefWithPredicate { source_hold, .. } => {
+            // FilteredListRefWithPredicate is an intermediate value - shouldn't normally be rendered directly
+            // If it is rendered, show debug info
+            Text::new(format!("[filtered-list-predicate:{}]", source_hold)).unify()
+        }
+
+        DdValue::Placeholder => {
+            // Placeholder should never be rendered directly - it's a template marker
+            Text::new("[placeholder]").unify()
+        }
+
+        DdValue::PlaceholderField { path } => {
+            // PlaceholderField should never be rendered directly - it's a deferred field access marker
+            Text::new(format!("[placeholder.{}]", path.join("."))).unify()
+        }
+
+        DdValue::PlaceholderWhileRef { field_path, .. } => {
+            // PlaceholderWhileRef should never be rendered directly - it's a deferred WHILE marker
+            Text::new(format!("[placeholder-while.{}]", field_path.join("."))).unify()
+        }
+
+        DdValue::NegatedPlaceholderField { path } => {
+            // NegatedPlaceholderField should never be rendered directly - it's a deferred negation marker
+            Text::new(format!("[not-placeholder.{}]", path.join("."))).unify()
+        }
+
+        DdValue::MappedListRef { source_hold, element_template } => {
+            // MappedListRef should be handled in render_stripe; if rendered directly, show reactive column
+            zoon::println!("[DD render_dd_value] MappedListRef: source_hold={}", source_hold);
+            let source_hold = source_hold.clone();
+            let element_template = element_template.clone();
+            El::new()
+                .child_signal(
+                    hold_states_signal()
+                        .map(move |states| {
+                            let items = states.get(source_hold.as_ref());
+                            match items {
+                                Some(DdValue::List(list_items)) => {
+                                    zoon::println!("[DD MappedListRef direct] rendering {} items", list_items.len());
+                                    let children: Vec<RawElOrText> = list_items.iter().map(|item| {
+                                        let concrete_element = element_template.substitute_placeholder(item);
+                                        render_dd_value(&concrete_element)
+                                    }).collect();
+                                    Column::new().items(children).unify_option()
+                                }
+                                _ => None,
+                            }
+                        })
+                )
+                .unify()
+        }
+
+        DdValue::FilteredMappedListRef { source_hold, filter_field, filter_value, element_template } => {
+            // FilteredMappedListRef: render filtered then mapped list from HOLD
+            zoon::println!("[DD render_dd_value] FilteredMappedListRef: source_hold={}, filter={}", source_hold, filter_field);
+            let source_hold = source_hold.clone();
+            let filter_field = filter_field.clone();
+            let filter_value = filter_value.clone();
+            let element_template = element_template.clone();
+            El::new()
+                .child_signal(
+                    hold_states_signal()
+                        .map(move |states| {
+                            let items = states.get(source_hold.as_ref());
+                            match items {
+                                Some(DdValue::List(list_items)) => {
+                                    // Filter items by field value
+                                    let filtered: Vec<&DdValue> = list_items.iter().filter(|item| {
+                                        if let DdValue::Object(obj) = item {
+                                            if let Some(field_val) = obj.get(filter_field.as_ref()) {
+                                                // Evaluate the field value (might be a HoldRef or WhileRef)
+                                                let evaluated = evaluate_dd_value_for_filter(field_val, &states);
+                                                let filter_eval = evaluate_dd_value_for_filter(&filter_value, &states);
+                                                return evaluated == filter_eval;
+                                            }
+                                        }
+                                        false
+                                    }).collect();
+                                    zoon::println!("[DD FilteredMappedListRef direct] filtered {} -> {} items",
+                                        list_items.len(), filtered.len());
+                                    let children: Vec<RawElOrText> = filtered.iter().map(|item| {
+                                        let concrete_element = element_template.substitute_placeholder(item);
+                                        render_dd_value(&concrete_element)
+                                    }).collect();
+                                    Column::new().items(children).unify_option()
+                                }
+                                _ => None,
+                            }
+                        })
+                )
+                .unify()
+        }
+
+        DdValue::FilteredMappedListWithPredicate { source_hold, predicate_template, element_template } => {
+            // FilteredMappedListWithPredicate: render list with generic predicate filtering
+            // The predicate_template contains Placeholder markers that get substituted with each item
+            let source_hold = source_hold.clone();
+            let predicate_template = predicate_template.clone();
+            let element_template = element_template.clone();
+            El::new()
+                .child_signal(
+                    hold_states_signal()
+                        .map(move |states| {
+                            let items = states.get(source_hold.as_ref());
+                            match items {
+                                Some(DdValue::List(list_items)) => {
+                                    // Filter items by evaluating predicate for each
+                                    let filtered: Vec<&DdValue> = list_items.iter().filter(|item| {
+                                        let resolved_predicate = predicate_template.substitute_placeholder(item);
+                                        let evaluated = evaluate_dd_value_for_filter(&resolved_predicate, &states);
+                                        evaluated.is_truthy()
+                                    }).collect();
+                                    let children: Vec<RawElOrText> = filtered.iter().map(|item| {
+                                        let concrete_element = element_template.substitute_placeholder(item);
+                                        render_dd_value(&concrete_element)
+                                    }).collect();
+                                    Column::new().items(children).unify_option()
+                                }
+                                _ => None,
+                            }
+                        })
+                )
+                .unify()
         }
     }
 }
@@ -633,14 +745,20 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) ->
         .unwrap_or_default();
 
     // Extract LinkRef from element.event.press if present
-    let link_id = fields
-        .get("element")
-        .and_then(|e| e.get("event"))
-        .and_then(|e| e.get("press"))
+    let element_value = fields.get("element");
+    let event_value = element_value.and_then(|e| e.get("event"));
+    let press_value = event_value.and_then(|e| e.get("press"));
+    zoon::println!("[DD render_button] label='{}' element={:?} event={:?} press={:?}",
+        label,
+        element_value.map(|v| format!("{:?}", v)).unwrap_or_else(|| "None".to_string()),
+        event_value.map(|v| format!("{:?}", v)).unwrap_or_else(|| "None".to_string()),
+        press_value.map(|v| format!("{:?}", v)).unwrap_or_else(|| "None".to_string()));
+    let link_id = press_value
         .and_then(|v| match v {
             DdValue::LinkRef(id) => Some(id.to_string()),
             _ => None,
         });
+    zoon::println!("[DD render_button] Extracted link_id={:?}", link_id);
 
     // Extract outline from style.outline
     // Note: outline may be a WhileRef for reactive styling based on selection state
@@ -759,49 +877,147 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) ->
     let element_tag = fields
         .get("element")
         .and_then(|e| e.get("tag"));
-    let is_filterable_list = element_tag
-        .map(|t| matches!(t, DdValue::Tagged { tag, .. } if tag.as_ref() == "Ul"))
-        .unwrap_or(false);
-
-    // Check if items is Unit (placeholder for reactive items from HOLD)
     let items_value = fields.get("items");
-    let is_reactive_items = matches!(items_value, Some(DdValue::Unit) | None);
 
-    // If items is Unit and gap is 4 (the items_list stripe in shopping_list),
-    // render reactively from "items" HOLD
-    if is_reactive_items && gap == 4 {
-        // Reactive items list - render from HOLD state
-        return Column::new()
-            .s(Gap::new().y(gap))
-            .items_signal_vec(
+    // Debug: what type is items_value?
+    if let Some(iv) = items_value {
+        zoon::println!("[DD render_stripe DEBUG] items_value variant={}", dd_value_variant_name(iv));
+    }
+
+    // MappedListRef: Reactive list rendering from HOLD with template substitution
+    if let Some(DdValue::MappedListRef { source_hold, element_template }) = items_value {
+        zoon::println!("[DD render_stripe] MappedListRef: source_hold={}", source_hold);
+        let source_hold = source_hold.clone();
+        let element_template = element_template.clone();
+        return El::new()
+            .child_signal(
                 hold_states_signal()
-                    .map(|states| {
-                        let items = states.get("items");
+                    .map(move |states| {
+                        let items = states.get(source_hold.as_ref());
                         match items {
-                            Some(DdValue::List(list)) => {
-                                list.iter()
-                                    .map(|item| {
-                                        let text = item.to_display_string();
-                                        Label::new()
-                                            .label(format!("- {}", text))
-                                            .s(Font::new().color(hsluv!(0, 0, 100)))
-                                            .unify()
-                                    })
-                                    .collect::<Vec<_>>()
+                            Some(DdValue::List(list_items)) => {
+                                zoon::println!("[DD MappedListRef] rendering {} items from HOLD", list_items.len());
+                                let children: Vec<RawElOrText> = list_items.iter().map(|item| {
+                                    // Substitute the Placeholder with the actual item value
+                                    let concrete_element = element_template.substitute_placeholder(item);
+                                    render_dd_value(&concrete_element)
+                                }).collect();
+                                Some(Column::new().s(Gap::new().y(gap)).items(children).unify())
                             }
-                            _ => Vec::new(),
+                            _ => {
+                                zoon::println!("[DD MappedListRef] no items or wrong type in HOLD");
+                                None
+                            }
                         }
                     })
-                    .to_signal_vec()
             )
             .unify();
     }
 
-    // If this is a list (Ul), render with reactive filtering
-    if is_filterable_list {
-        if let Some(DdValue::List(items)) = items_value {
-            return render_filtered_list(items.clone(), gap);
-        }
+    // FilteredMappedListRef: Reactive filtered + mapped list rendering from HOLD
+    if let Some(DdValue::FilteredMappedListRef { source_hold, filter_field, filter_value, element_template }) = items_value {
+        zoon::println!("[DD render_stripe] FilteredMappedListRef: source_hold={}, filter={}", source_hold, filter_field);
+        let source_hold = source_hold.clone();
+        let filter_field = filter_field.clone();
+        let filter_value = filter_value.clone();
+        let element_template = element_template.clone();
+        return El::new()
+            .child_signal(
+                hold_states_signal()
+                    .map(move |states| {
+                        let items = states.get(source_hold.as_ref());
+                        match items {
+                            Some(DdValue::List(list_items)) => {
+                                // Filter items by field value
+                                let filtered: Vec<&DdValue> = list_items.iter().filter(|item| {
+                                    if let DdValue::Object(obj) = item {
+                                        if let Some(field_val) = obj.get(filter_field.as_ref()) {
+                                            // Evaluate the field value (might be a HoldRef)
+                                            let evaluated = evaluate_dd_value_for_filter(field_val, &states);
+                                            let filter_eval = evaluate_dd_value_for_filter(&filter_value, &states);
+                                            return evaluated == filter_eval;
+                                        }
+                                    }
+                                    false
+                                }).collect();
+                                zoon::println!("[DD FilteredMappedListRef] filtered {} -> {} items from HOLD",
+                                    list_items.len(), filtered.len());
+                                let children: Vec<RawElOrText> = filtered.iter().map(|item| {
+                                    let concrete_element = element_template.substitute_placeholder(item);
+                                    render_dd_value(&concrete_element)
+                                }).collect();
+                                Some(Column::new().s(Gap::new().y(gap)).items(children).unify())
+                            }
+                            _ => {
+                                zoon::println!("[DD FilteredMappedListRef] no items or wrong type in HOLD");
+                                None
+                            }
+                        }
+                    })
+            )
+            .unify();
+    }
+
+    // FilteredMappedListWithPredicate: Generic predicate filtering for stripe rendering
+    if let Some(DdValue::FilteredMappedListWithPredicate { source_hold, predicate_template, element_template }) = items_value {
+        zoon::println!("[DD render_stripe] FilteredMappedListWithPredicate: source_hold={}", source_hold);
+        let source_hold = source_hold.clone();
+        let predicate_template = predicate_template.clone();
+        let element_template = element_template.clone();
+        return El::new()
+            .child_signal(
+                hold_states_signal()
+                    .map(move |states| {
+                        let items = states.get(source_hold.as_ref());
+                        // Get pre-instantiated elements from list_elements (these have unique hover IDs)
+                        let list_elements = states.get("list_elements");
+                        let elements_vec: Option<&std::sync::Arc<Vec<DdValue>>> = match list_elements {
+                            Some(DdValue::List(elems)) => Some(elems),
+                            _ => None,
+                        };
+                        zoon::println!("[DD FilteredMappedListWithPredicate] source_hold={}, items={:?}, list_elements={}",
+                            source_hold, items.map(|v| dd_value_variant_name(v)),
+                            elements_vec.map(|e| e.len()).unwrap_or(0));
+                        match items {
+                            Some(DdValue::List(list_items)) => {
+                                zoon::println!("[DD FilteredMappedListWithPredicate] list has {} items", list_items.len());
+                                // Filter items and their corresponding elements together
+                                // Items and elements are parallel arrays (same order)
+                                let filtered_with_idx: Vec<(usize, &DdValue)> = list_items.iter()
+                                    .enumerate()
+                                    .filter(|(_, item)| {
+                                        let resolved_predicate = predicate_template.substitute_placeholder(item);
+                                        let evaluated = evaluate_dd_value_for_filter(&resolved_predicate, &states);
+                                        zoon::println!("[DD FilteredMappedListWithPredicate] predicate evaluated to: {:?} (truthy={})", evaluated, evaluated.is_truthy());
+                                        evaluated.is_truthy()
+                                    })
+                                    .collect();
+                                zoon::println!("[DD FilteredMappedListWithPredicate] filtered to {} items", filtered_with_idx.len());
+
+                                // Render using list_elements if available (with unique IDs), else fall back to template
+                                let children: Vec<RawElOrText> = filtered_with_idx.iter().map(|(idx, item)| {
+                                    // Try to get pre-instantiated element from list_elements (has unique hover IDs)
+                                    if let Some(elems) = elements_vec {
+                                        if let Some(element) = elems.get(*idx) {
+                                            zoon::println!("[DD FilteredMappedListWithPredicate] Using pre-instantiated element at idx {}", idx);
+                                            return render_dd_value(element);
+                                        }
+                                    }
+                                    // Fall back to template (shared IDs) - shouldn't happen for instantiated items
+                                    zoon::println!("[DD FilteredMappedListWithPredicate] Fallback to template for idx {}", idx);
+                                    let concrete_element = element_template.substitute_placeholder(item);
+                                    render_dd_value(&concrete_element)
+                                }).collect();
+                                Some(Column::new().s(Gap::new().y(gap)).items(children).unify())
+                            }
+                            _ => {
+                                zoon::println!("[DD FilteredMappedListWithPredicate] no list found or wrong type");
+                                None
+                            }
+                        }
+                    })
+            )
+            .unify();
     }
 
     let items: Vec<RawElOrText> = fields
@@ -952,250 +1168,6 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) ->
     }
 }
 
-/// Extract the checkbox/completed HoldRef from a list item, if present.
-/// Uses generic detection: finds boolean HoldRef that's in checkbox_toggle_holds or is dynamic.
-/// No hardcoded field names - works with any object structure.
-fn get_item_checkbox_hold_id(item: &DdValue) -> Option<String> {
-    let toggle_holds = get_checkbox_toggle_holds();
-    match item {
-        // Format 1: Object with any boolean HoldRef that's a checkbox toggle
-        DdValue::Object(obj) => {
-            for (_, value) in obj.iter() {
-                if let DdValue::HoldRef(hold_id) = value {
-                    // Check if this is a known checkbox toggle or dynamic hold
-                    if toggle_holds.contains(&hold_id.to_string()) || hold_id.starts_with("dynamic_") {
-                        // Verify it's a boolean hold
-                        if let Some(current) = get_hold_value(hold_id) {
-                            if matches!(current, DdValue::Bool(_)) {
-                                return Some(hold_id.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            None
-        }
-        // Format 2: Element with checkbox inside items list
-        DdValue::Tagged { tag, fields } if tag.as_ref() == "Element" => {
-            if let Some(DdValue::List(items)) = fields.get("items") {
-                for sub_item in items.iter() {
-                    // Look for checkbox element (generic - uses _element_type tag)
-                    if let DdValue::Tagged { tag, fields } = sub_item {
-                        if tag.as_ref() == "Element" {
-                            if let Some(DdValue::Text(elem_type)) = fields.get("_element_type") {
-                                if elem_type.as_ref() == "checkbox" {
-                                    if let Some(DdValue::HoldRef(hold_id)) = fields.get("checked") {
-                                        return Some(hold_id.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-/// Extract the title/label HoldRef ID from a list item structure.
-/// Uses generic detection: finds text HoldRef (no hardcoded field names).
-fn get_item_title_hold_id(item: &DdValue) -> Option<String> {
-    match item {
-        // Format 1: Object with any text HoldRef
-        DdValue::Object(obj) => {
-            for (_, value) in obj.iter() {
-                if let DdValue::HoldRef(hold_id) = value {
-                    // Check if this hold contains text
-                    if let Some(current) = get_hold_value(hold_id) {
-                        if matches!(current, DdValue::Text(_)) {
-                            return Some(hold_id.to_string());
-                        }
-                    }
-                }
-            }
-            None
-        }
-        // Format 2: Element with WhileRef containing label HoldRef
-        // Item structure: Element (Row) with items: [checkbox, WhileRef, ...]
-        // The WhileRef has: False arm → label Element with label: HoldRef
-        DdValue::Tagged { tag, fields } if tag.as_ref() == "Element" => {
-            if let Some(DdValue::List(items)) = fields.get("items") {
-                for sub_item in items.iter() {
-                    // Look for WhileRef (the edit mode toggle)
-                    if let DdValue::WhileRef { arms, .. } = sub_item {
-                        // Find the False arm (non-edit mode shows the label)
-                        for (pattern, body) in arms.iter() {
-                            if let DdValue::Tagged { tag, .. } = pattern {
-                                if tag.as_ref() == "False" {
-                                    // This arm contains the label element
-                                    if let DdValue::Tagged { tag: body_tag, fields: body_fields } = body {
-                                        if body_tag.as_ref() == "Element" {
-                                            // Get the label field which should be a HoldRef
-                                            if let Some(DdValue::HoldRef(hold_id)) = body_fields.get("label") {
-                                                return Some(hold_id.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-/// Render a list with reactive filtering based on selected_filter.
-/// Also observes list HOLD for dynamically added items.
-fn render_filtered_list(items: std::sync::Arc<Vec<DdValue>>, gap: u32) -> RawElOrText {
-    use super::io::ListFilter;
-
-    zoon::println!("[DD render_filtered_list] CALLED with {} items", items.len());
-    for (idx, item) in items.iter().enumerate() {
-        zoon::println!("[DD render_filtered_list] item[{}] variant={}", idx, dd_value_variant_name(item));
-    }
-
-    // Capture the initial static items for the closure
-    let static_items = items.clone();
-    let static_items_count = items.len();
-    let list_name = get_list_var_name();
-    let list_name_inner = list_name.clone();
-
-    // ARCHITECTURE FIX: Render items ONCE, don't re-render on every state change
-    // Each item handles its own reactivity via signals (checked_signal, etc.)
-    // Re-render on: filter changes OR list changes (add/remove)
-    // Use El wrapper because Column doesn't have child_signal
-    //
-    // Use map_ref! to combine filter signal with hold_states, then dedupe on
-    // (filter, list_len, elems_len) tuple - this ensures we only re-render when
-    // filter changes OR items are added/removed, NOT on every checkbox toggle.
-    use zoon::map_ref;
-
-    El::new()
-        .child_signal(
-            map_ref! {
-                let filter = super::io::selected_filter_signal(),
-                let states = super::io::hold_states_signal() => {
-                    // Derive trigger values from states
-                    let list_len = match states.get(&list_name) {
-                        Some(DdValue::List(items)) => items.len(),
-                        _ => 0,
-                    };
-                    let elems_len = match states.get("list_elements") {
-                        Some(DdValue::List(elements)) => elements.len(),
-                        _ => 0,
-                    };
-                    (filter.clone(), list_len, elems_len)
-                }
-            }
-            .dedupe_cloned()  // Only re-emit when (filter, len, len) tuple changes
-            .map(move |(filter, _list_len, _elems_len)| {
-                let static_items_clone = static_items.clone();
-                // Get current state snapshot for rendering
-                let states = super::io::get_all_hold_states();
-                    // Return the element directly, not a signal
-                        let mut rendered: Vec<RawElOrText> = Vec::new();
-
-                        // Get the current list of items from HOLD (source of truth after any changes)
-                        let list_hold = states.get(&list_name_inner);
-
-                        // Build a set of title HoldRefs that are still in the list HOLD
-                        // Use title HoldRef because it never changes (unlike completed which becomes Bool after toggle)
-                        let active_title_ids: std::collections::HashSet<String> = match list_hold {
-                            Some(DdValue::List(items)) => {
-                                items.iter()
-                                    .filter_map(|item| get_item_title_hold_id(item))
-                                    .collect()
-                            }
-                            _ => std::collections::HashSet::new(),
-                        };
-                        let has_list_hold = list_hold.is_some();
-
-                        // 1. Render static items (initial items from document)
-                        for (idx, item) in static_items_clone.iter().enumerate() {
-                            // Get the checkbox HoldRef to determine completion status
-                            let hold_id = get_item_checkbox_hold_id(item);
-                            let title_hold_id = get_item_title_hold_id(item);
-
-                            // If list HOLD exists, only render items that are still in it
-                            // (items may be removed by "Clear completed" or delete button)
-                            if has_list_hold {
-                                if let Some(ref tid) = title_hold_id {
-                                    if !active_title_ids.contains(tid) {
-                                        // This item was removed from the list HOLD, skip it
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            let is_completed = hold_id.as_ref()
-                                .and_then(|id| states.get(id))
-                                .map(|v| match v {
-                                    DdValue::Bool(true) => true,
-                                    DdValue::Tagged { tag, .. } if tag.as_ref() == "True" => true,
-                                    _ => false,
-                                })
-                                .unwrap_or(false);
-
-                            // Filter based on selected filter
-                            let should_show = match &filter {
-                                ListFilter::All => true,
-                                ListFilter::Active => !is_completed,
-                                ListFilter::Completed => is_completed,
-                            };
-
-                            if should_show {
-                                // Use render_dd_value to properly render the full list item structure
-                                // This handles WhileRef for editing mode, double_click, hover, etc.
-                                zoon::println!("[DD render_filtered_list] rendering static item[{}] variant={}", idx, dd_value_variant_name(item));
-                                rendered.push(render_dd_value(item));
-                            }
-                        }
-
-                        // 2. Render dynamic items from "list_elements" HOLD
-                        // These are Element AST cloned from the template with fresh HoldRef IDs
-                        // Get completion status directly from the element's checkbox HoldRef
-                        if let Some(DdValue::List(elements)) = states.get("list_elements") {
-                            for (index, element) in elements.iter().enumerate() {
-                                // Get completion status directly from element's checkbox HoldRef
-                                // This is more reliable than indexing into list data
-                                let completed = get_item_checkbox_hold_id(element)
-                                    .and_then(|hold_id| states.get(&hold_id))
-                                    .map(|v| match v {
-                                        DdValue::Bool(true) => true,
-                                        DdValue::Tagged { tag, .. } if tag.as_ref() == "True" => true,
-                                        _ => false,
-                                    })
-                                    .unwrap_or(false);
-
-                                // Apply filter
-                                let should_show = match (&filter, completed) {
-                                    (ListFilter::All, _) => true,
-                                    (ListFilter::Active, false) => true,
-                                    (ListFilter::Active, true) => false,
-                                    (ListFilter::Completed, true) => true,
-                                    (ListFilter::Completed, false) => false,
-                                };
-                                if should_show {
-                                    // Use render_dd_value for unified rendering - no more list-specific code!
-                                    rendered.push(render_dd_value(element));
-                                }
-                            }
-                        }
-
-                    // Wrap items in a Column for child_signal (needs single element)
-                    Column::new()
-                        .s(Gap::new().y(gap))
-                        .items(rendered)
-                })
-        )
-        .unify()
-}
 
 /// Render a stack (layered elements).
 fn render_stack(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) -> RawElOrText {
@@ -2084,19 +2056,17 @@ fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) -> 
                 )
                 .for_input("dd_text_input")
         }
-        Some(DdValue::Text(text)) if text.ends_with(" items") => {
-            // Special case: "N items" pattern - make reactive based on items HOLD
+        Some(DdValue::ReactiveText { parts }) => {
+            // Reactive TEXT with interpolated values - evaluated at render time
+            let parts = parts.clone();
             Label::new()
                 .label_signal(
                     hold_states_signal()
-                        .map(|states| {
-                            let count = states.get("items")
-                                .and_then(|v| match v {
-                                    DdValue::List(list) => Some(list.len()),
-                                    _ => None,
-                                })
-                                .unwrap_or(0);
-                            format!("{} items", count)
+                        .map(move |_states| {
+                            // Evaluate all parts with current HOLD state
+                            parts.iter()
+                                .map(|part| part.to_display_string())
+                                .collect::<String>()
                         })
                 )
                 .for_input("dd_text_input")

@@ -38,7 +38,7 @@ pub use types::{
 };
 pub use worker::{
     DataflowConfig, DdWorker, DdWorkerHandle, DocumentUpdate, EventFilter, HoldConfig,
-    StateTransform, reconstruct_persisted_item,
+    StateTransform, reconstruct_persisted_item, instantiate_fresh_item,
     // Generic template system exports
     FieldPath, ItemIdentitySpec, FieldInitializer, LinkActionSpec, LinkActionConfig,
     ListItemTemplate, InstantiatedItem, FieldUpdate,

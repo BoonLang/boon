@@ -13,12 +13,12 @@ poll_interval = 200
 
 [[sequence]]
 description = "Click increment button"
-actions = [["click", "[data-boon-panel='preview'] [role='button']"]]
+actions = [["click_button", 0]]
 expect = "1+"
 
 [[sequence]]
 description = "Click again"
-actions = [["click", "[data-boon-panel='preview'] [role='button']"]]
+actions = [["click_button", 0]]
 expect = "2+"
 
 # --- PERSISTENCE TEST ---

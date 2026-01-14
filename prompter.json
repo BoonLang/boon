@@ -4,7 +4,7 @@
   "command": [
     "cl"
   ],
-  "supervisor_prompt": "Make DD engine fully working without cheating and without business logic in bridge or anywhere else",
+  "supervisor_prompt": "Make DD engine fully working without cheating, if you are in the middle of a work - continue, make sure your plan to get rid of all business code from DD engine is completed and the unnecesary code is removed and everything is properly tested.",
   "completion_condition": "+completed+",
   "completion_command": "makers verify-playground-dd",
   "protected_patterns": [

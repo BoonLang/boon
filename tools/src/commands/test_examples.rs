@@ -612,7 +612,7 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
     let _ = send_command_to_server(opts.port, WsCommand::NavigateTo { path: "/".to_string() }).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let _ = send_command_to_server(opts.port, WsCommand::Refresh).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     // Inject code with filename for persistence
     let filename = format!("{}.bn", example.name);

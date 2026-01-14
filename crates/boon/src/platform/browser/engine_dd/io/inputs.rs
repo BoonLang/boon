@@ -10,6 +10,8 @@ use super::super::core::{DdEvent, DdEventValue, DdInput, LinkId, TimerId};
 /// Action to perform when a dynamic link fires.
 #[derive(Clone, Debug)]
 pub enum DynamicLinkAction {
+    /// Toggle a boolean hold (for checkbox clicks)
+    BoolToggle(String),
     /// Set a hold to true (for entering edit mode via double-click)
     SetTrue(String),
     /// Set a hold to false (for exiting edit mode via Escape)
@@ -23,6 +25,14 @@ pub enum DynamicLinkAction {
     /// Remove a list item by link_id (for delete buttons on dynamically added items)
     /// The link_id identifies which item to remove by matching its remove button's LinkRef
     RemoveListItem { link_id: String },
+    /// Toggle ALL items' completed field based on computed all_completed value.
+    /// Used for "toggle all" checkbox that sets all items to completed or not completed.
+    ListToggleAllCompleted {
+        /// The list HOLD ID (e.g., "hold_0" for todos)
+        list_hold_id: String,
+        /// The field to toggle on each item (e.g., "completed")
+        completed_field: String,
+    },
 }
 
 // Global event dispatcher for browser environment (single-threaded)
@@ -153,7 +163,7 @@ fn check_dynamic_link_action(link_id: &str) -> bool {
                     // until the focus race settles (use timeout instead of relying on focus event)
                     let hold_id_for_timeout = hold_id.clone();
                     EDITING_HOLDS_GRACE_PERIOD.with(|cell| {
-                        cell.borrow_mut().insert(hold_id.clone());
+                        cell.borrow_mut().insert(hold_id.clone()); // ALLOWED: IO layer
                     });
                     // NOTE: Grace period is cleared ONLY by key events (Enter/Escape) in check_dynamic_key_action.
                     // The focus race between main input and editing input continues indefinitely,
@@ -165,6 +175,10 @@ fn check_dynamic_link_action(link_id: &str) -> bool {
                 DynamicLinkAction::SetFalse(hold_id) => {
                     zoon::println!("[DD DynamicLink] {} -> SetFalse({})", link_id, hold_id);
                     super::outputs::update_hold_state(&hold_id, super::super::dd_value::DdValue::Bool(false));
+                }
+                DynamicLinkAction::BoolToggle(hold_id) => {
+                    zoon::println!("[DD DynamicLink] {} -> BoolToggle({})", link_id, hold_id);
+                    super::outputs::toggle_hold_bool(&hold_id);
                 }
                 DynamicLinkAction::SetFalseOnKeys { .. } => {
                     // SetFalseOnKeys is handled by check_dynamic_key_action, not here
@@ -192,6 +206,11 @@ fn check_dynamic_link_action(link_id: &str) -> bool {
                             zoon::println!("[DD Dispatcher] Fired dynamic_list_remove with remove:{}", remove_link_id);
                         }
                     });
+                }
+                DynamicLinkAction::ListToggleAllCompleted { list_hold_id, completed_field } => {
+                    // Toggle ALL items' completed field
+                    zoon::println!("[DD DynamicLink] {} -> ListToggleAllCompleted(list={}, field={})", link_id, list_hold_id, completed_field);
+                    super::outputs::toggle_all_list_items_completed(&list_hold_id, &completed_field);
                 }
             }
             true
@@ -331,7 +350,7 @@ pub fn fire_global_blur(link_id: &str) {
             if let DynamicLinkAction::EditingHandler { editing_hold, .. } = action {
                 // Check if this editing_hold is in grace period (just enabled, input hasn't been focused yet)
                 let in_grace_period = EDITING_HOLDS_GRACE_PERIOD.with(|grace| {
-                    grace.borrow().contains(&editing_hold)
+                    grace.borrow().contains(&editing_hold) // ALLOWED: IO layer
                 });
                 if in_grace_period {
                     // Ignore spurious blur during WhileRef arm switch
@@ -352,7 +371,7 @@ pub fn fire_global_blur(link_id: &str) {
 /// Clear the grace period for an editing hold (call when input receives focus)
 pub fn clear_editing_grace_period(editing_hold: &str) {
     EDITING_HOLDS_GRACE_PERIOD.with(|cell| {
-        cell.borrow_mut().remove(editing_hold);
+        cell.borrow_mut().remove(editing_hold); // ALLOWED: IO layer
     });
     zoon::println!("[DD Focus] Cleared grace period for {}", editing_hold);
 }
@@ -361,9 +380,9 @@ pub fn clear_editing_grace_period(editing_hold: &str) {
 /// This looks up the EditingHandler for the given blur_link_id and clears its grace period.
 pub fn clear_editing_grace_period_for_link(blur_link_id: &str) {
     DYNAMIC_LINK_ACTIONS.with(|cell| {
-        if let Some(DynamicLinkAction::EditingHandler { editing_hold, .. }) = cell.borrow().get(blur_link_id).cloned() {
+        if let Some(DynamicLinkAction::EditingHandler { editing_hold, .. }) = cell.borrow().get(blur_link_id).cloned() { // ALLOWED: IO layer
             EDITING_HOLDS_GRACE_PERIOD.with(|grace| {
-                grace.borrow_mut().remove(&editing_hold);
+                grace.borrow_mut().remove(&editing_hold); // ALLOWED: IO layer
             });
             zoon::println!("[DD Focus] Cleared grace period for {} (via link {})", editing_hold, blur_link_id);
         }
@@ -395,9 +414,9 @@ pub fn fire_global_key_down(link_id: &str, key: &str) {
 fn check_dynamic_key_action(link_id: &str, key: &str) -> bool {
     zoon::println!("[DD check_dynamic_key_action] link_id='{}', key='{}'", link_id, key);
     DYNAMIC_LINK_ACTIONS.with(|cell| {
-        let actions = cell.borrow();
+        let actions = cell.borrow(); // ALLOWED: IO layer
         zoon::println!("[DD check_dynamic_key_action] DYNAMIC_LINK_ACTIONS has {} entries", actions.len());
-        if let Some(action) = actions.get(link_id).cloned() { // ALLOWED: IO layer
+        if let Some(action) = actions.get(link_id).cloned() {
             zoon::println!("[DD check_dynamic_key_action] Found action for {}: {:?}", link_id, action);
             match action {
                 DynamicLinkAction::SetFalseOnKeys { hold_id, keys } => {
@@ -413,7 +432,7 @@ fn check_dynamic_key_action(link_id: &str, key: &str) -> bool {
                         // Exit edit mode without saving
                         // Clear grace period first (user is explicitly exiting)
                         EDITING_HOLDS_GRACE_PERIOD.with(|cell| {
-                            cell.borrow_mut().remove(&editing_hold);
+                            cell.borrow_mut().remove(&editing_hold); // ALLOWED: IO layer
                         });
                         zoon::println!("[DD DynamicLink] {} key='Escape' -> exit edit (no save)", link_id);
                         super::outputs::update_hold_state(&editing_hold, super::super::dd_value::DdValue::Bool(false));
@@ -422,7 +441,7 @@ fn check_dynamic_key_action(link_id: &str, key: &str) -> bool {
                         // Save title and exit edit mode
                         // Clear grace period first (user is explicitly saving)
                         EDITING_HOLDS_GRACE_PERIOD.with(|cell| {
-                            cell.borrow_mut().remove(&editing_hold);
+                            cell.borrow_mut().remove(&editing_hold); // ALLOWED: IO layer
                         });
                         zoon::println!("[DD DynamicLink] {} key='Enter' -> save '{}' to {}, exit edit", link_id, text, title_hold);
                         super::outputs::update_hold_state(&title_hold, super::super::dd_value::DdValue::text(text));

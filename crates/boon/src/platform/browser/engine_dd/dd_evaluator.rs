@@ -407,7 +407,28 @@ impl BoonDdRuntime {
         for var in &obj.variables {
             let name_str = var.node.name.as_str();
             let name = Arc::from(name_str);
-            let value = scoped_runtime.eval_expression(&var.node.value.node);
+
+            // Check if this field contains reactive list operations (List/append, List/clear)
+            // If so, evaluate the initial list, store in HOLD, and return HoldRef
+            let value = if self.contains_reactive_list_ops(&var.node.value.node) {
+                zoon::println!("[DD_EVAL] Field '{}' has reactive list ops - creating HoldRef", name_str);
+
+                // Extract and evaluate the initial list expression (before List/append, List/clear, List/remove)
+                if let Some(initial_expr) = self.extract_initial_list_expr(&var.node.value.node) {
+                    let initial_value = scoped_runtime.eval_expression(initial_expr);
+                    zoon::println!("[DD_EVAL] Field '{}' initial list value: {:?}", name_str, initial_value);
+
+                    // Store the initial value in the HOLD
+                    super::io::update_hold_state_no_persist(name_str, initial_value);
+                }
+
+                // Parse List/remove event paths from the pipe chain (since eval_pipe is bypassed)
+                scoped_runtime.parse_list_remove_bindings(&var.node.value.node);
+
+                DdValue::HoldRef(Arc::from(name_str))
+            } else {
+                scoped_runtime.eval_expression(&var.node.value.node)
+            };
 
             // Add to both the result map and the scoped runtime
             // so later variables can reference earlier ones
@@ -417,20 +438,168 @@ impl BoonDdRuntime {
         DdValue::Object(Arc::new(map))
     }
 
+    /// Check if an expression contains reactive list operations (List/append, List/clear).
+    /// Used to detect fields that should become reactive HOLDs.
+    fn contains_reactive_list_ops(&self, expr: &Expression) -> bool {
+        match expr {
+            Expression::Pipe { from, to } => {
+                // Check if piping to List/append or List/clear
+                if let Expression::FunctionCall { path, .. } = &to.node {
+                    let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                    if path_strs == ["List", "append"] || path_strs == ["List", "clear"] {
+                        return true;
+                    }
+                }
+                // Recursively check both sides of pipe
+                self.contains_reactive_list_ops(&from.node) || self.contains_reactive_list_ops(&to.node)
+            }
+            Expression::FunctionCall { path, .. } => {
+                let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                path_strs == ["List", "append"] || path_strs == ["List", "clear"]
+            }
+            _ => false,
+        }
+    }
+
+    /// Extract the initial list expression from a reactive list pipe chain.
+    /// For `LIST { ... } |> List/append(...) |> List/remove(...)`, returns the `LIST { ... }` part.
+    fn extract_initial_list_expr<'a>(&self, expr: &'a Expression) -> Option<&'a Expression> {
+        match expr {
+            Expression::Pipe { from, to } => {
+                // Check if the `to` part is a reactive list operation
+                if let Expression::FunctionCall { path, .. } = &to.node {
+                    let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                    if path_strs == ["List", "append"] || path_strs == ["List", "clear"] || path_strs == ["List", "remove"] {
+                        // Recursively check if `from` also has reactive ops, or return it
+                        if self.contains_reactive_list_ops(&from.node) {
+                            return self.extract_initial_list_expr(&from.node);
+                        } else {
+                            // This is the initial list expression
+                            return Some(&from.node);
+                        }
+                    }
+                }
+                // Not a reactive list op at this level, check deeper
+                self.extract_initial_list_expr(&from.node)
+                    .or_else(|| self.extract_initial_list_expr(&to.node))
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse List/remove bindings from a pipe chain expression.
+    /// This is called when reactive list ops are detected but eval_pipe is bypassed.
+    /// Walks the expression tree to find all List/remove calls and extracts their `on:` event paths.
+    fn parse_list_remove_bindings(&self, expr: &Expression) {
+        match expr {
+            Expression::Pipe { from, to } => {
+                // First check the `to` part for List/remove
+                if let Expression::FunctionCall { path, arguments } = &to.node {
+                    let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                    if path_strs == ["List", "remove"] {
+                        // Get the binding name (first argument without value, e.g., "item")
+                        let binding_name = arguments
+                            .iter()
+                            .find(|arg| arg.node.value.is_none())
+                            .map(|arg| arg.node.name.as_str());
+
+                        // Get the "on:" event expression (unevaluated)
+                        let on_expr = arguments
+                            .iter()
+                            .find(|arg| arg.node.name.as_str() == "on")
+                            .and_then(|arg| arg.node.value.as_ref());
+
+                        if let (Some(binding), Some(event_expr)) = (binding_name, on_expr) {
+                            // Try to extract per-item removal path (item.X.Y.event.press → ["X", "Y"])
+                            if let Some(path) = self.extract_linkref_path_from_event(binding, &event_expr.node) {
+                                zoon::println!("[DD_EVAL] List/remove (reactive field) parsed on: binding={}, path={:?}", binding, path);
+                                super::io::set_remove_event_path(path);
+                            } else {
+                                // Try to extract bulk removal path (elements.X.event.press → global event)
+                                if let Some(global_path) = self.extract_global_event_path(&event_expr.node) {
+                                    zoon::println!("[DD_EVAL] List/remove (reactive field) parsed BULK on: path={:?}", global_path);
+                                    super::io::set_bulk_remove_event_path(global_path);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Recursively check both sides of pipe
+                self.parse_list_remove_bindings(&from.node);
+                self.parse_list_remove_bindings(&to.node);
+            }
+            Expression::FunctionCall { path, arguments } => {
+                // Direct function call (not in pipe context)
+                let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                if path_strs == ["List", "remove"] {
+                    let binding_name = arguments
+                        .iter()
+                        .find(|arg| arg.node.value.is_none())
+                        .map(|arg| arg.node.name.as_str());
+                    let on_expr = arguments
+                        .iter()
+                        .find(|arg| arg.node.name.as_str() == "on")
+                        .and_then(|arg| arg.node.value.as_ref());
+
+                    if let (Some(binding), Some(event_expr)) = (binding_name, on_expr) {
+                        if let Some(path) = self.extract_linkref_path_from_event(binding, &event_expr.node) {
+                            zoon::println!("[DD_EVAL] List/remove (direct) parsed on: binding={}, path={:?}", binding, path);
+                            super::io::set_remove_event_path(path);
+                        } else if let Some(global_path) = self.extract_global_event_path(&event_expr.node) {
+                            zoon::println!("[DD_EVAL] List/remove (direct) parsed BULK on: path={:?}", global_path);
+                            super::io::set_bulk_remove_event_path(global_path);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Evaluate a text literal with interpolation.
+    /// If any interpolated value is reactive (ComputedRef, WhileRef, HoldRef),
+    /// create a ReactiveText that the bridge evaluates at render time.
     fn eval_text_literal(&mut self, parts: &[TextPart]) -> DdValue {
-        let mut result = String::new();
+        // First pass: collect values and check for reactive parts
+        let mut collected_parts: Vec<DdValue> = Vec::new();
+        let mut has_reactive = false;
+
         for part in parts {
             match part {
-                TextPart::Text(s) => result.push_str(s.as_str()),
+                TextPart::Text(s) => {
+                    collected_parts.push(DdValue::text(s.as_str()));
+                }
                 TextPart::Interpolation { var, .. } => {
                     if let Some(value) = self.variables.get(var.as_str()) {
-                        result.push_str(&value.to_display_string());
+                        // Check if the value is reactive or a placeholder
+                        let is_reactive = matches!(
+                            value,
+                            DdValue::ComputedRef { .. } |
+                            DdValue::WhileRef { .. } |
+                            DdValue::HoldRef(_) |
+                            DdValue::Placeholder
+                        );
+                        if is_reactive {
+                            has_reactive = true;
+                        }
+                        collected_parts.push(value.clone());
                     }
                 }
             }
         }
-        DdValue::text(result)
+
+        // If no reactive parts, use the simple string approach
+        if !has_reactive {
+            let result: String = collected_parts.iter()
+                .map(|v| v.to_display_string())
+                .collect();
+            return DdValue::text(result);
+        }
+
+        // Has reactive parts - create ReactiveText for bridge to evaluate at render time
+        DdValue::ReactiveText {
+            parts: Arc::new(collected_parts),
+        }
     }
 
     /// Evaluate a function call.
@@ -805,6 +974,12 @@ impl BoonDdRuntime {
                         // Initial items come from the LIST literal.
                         from.clone()
                     }
+                    (Some("List"), "clear") => {
+                        // from |> List/clear(on: ...) - pass through for static eval
+                        // The clear operation depends on events (e.g., button press)
+                        // so we don't clear items during static evaluation.
+                        from.clone()
+                    }
                     (Some("List"), "remove") => {
                         // from |> List/remove(item, on: ...) - parse the on: argument to extract the LinkRef path
                         // E.g., List/remove(item, on: item.todo_elements.remove_todo_button.event.press)
@@ -823,10 +998,17 @@ impl BoonDdRuntime {
                             .and_then(|arg| arg.node.value.as_ref());
 
                         if let (Some(binding), Some(event_expr)) = (binding_name, on_expr) {
-                            // Extract the path from item.X.Y.event.press → ["X", "Y"]
+                            // Try to extract per-item removal path (item.X.Y.event.press → ["X", "Y"])
                             if let Some(path) = self.extract_linkref_path_from_event(binding, &event_expr.node) {
                                 zoon::println!("[DD_EVAL] List/remove parsed on: binding={}, path={:?}", binding, path);
                                 super::io::set_remove_event_path(path);
+                            } else {
+                                // Try to extract bulk removal path (elements.X.event.press → global event)
+                                // This handles patterns like: elements.remove_completed_button.event.press |> THEN {...}
+                                if let Some(global_path) = self.extract_global_event_path(&event_expr.node) {
+                                    zoon::println!("[DD_EVAL] List/remove parsed BULK on: path={:?}", global_path);
+                                    super::io::set_bulk_remove_event_path(global_path);
+                                }
                             }
                         }
 
@@ -860,6 +1042,25 @@ impl BoonDdRuntime {
                                         filter_value: Box::new(filter_value),
                                     };
                                 }
+                                // Complex predicate: create predicate template with Placeholder
+                                // Evaluate the predicate with item = Placeholder to create a template
+                                let mut template_runtime = BoonDdRuntime {
+                                    variables: self.variables.clone(),
+                                    functions: self.functions.clone(),
+                                    passed_context: self.passed_context.clone(),
+                                    link_counter: 0,
+                                    hold_counter: 0,
+                                    context_path: Vec::new(),
+                                    last_list_source: None,
+                                };
+                                template_runtime.variables.insert(binding.to_string(), DdValue::Placeholder);
+                                let predicate_template = template_runtime.eval_expression(&pred_expr.node);
+                                zoon::println!("[DD_EVAL] FilteredListRefWithPredicate: source_hold={}, predicate_template={:?}",
+                                    hold_id, predicate_template);
+                                return DdValue::FilteredListRefWithPredicate {
+                                    source_hold: hold_id.clone(),
+                                    predicate_template: Box::new(predicate_template),
+                                };
                             }
                             // Fallback: return HoldRef unchanged
                             return from.clone();
@@ -942,31 +1143,103 @@ impl BoonDdRuntime {
                             .find(|arg| arg.node.name.as_str() == "new")
                             .and_then(|arg| arg.node.value.as_ref());
 
-                        if let (Some(binding), Some(new_expr), DdValue::List(items)) =
-                            (binding_name, transform_expr, from)
-                        {
-                            let mapped: Vec<DdValue> = items
-                                .iter()
-                                .map(|item| {
-                                    // Create scoped runtime with the item bound
-                                    let mut scoped = BoonDdRuntime {
-                                        variables: self.variables.clone(),
-                                        functions: self.functions.clone(),
-                                        passed_context: self.passed_context.clone(),
-                                        link_counter: 0,
-                                        hold_counter: 0,
-                                        context_path: Vec::new(),
-                                        last_list_source: None,
-                                    };
-                                    scoped.variables.insert(binding.to_string(), (*item).clone());
+                        match (binding_name, transform_expr, from) {
+                            // HoldRef |> List/map(item, new: ...) -> MappedListRef
+                            // Defers evaluation to render time
+                            (Some(binding), Some(new_expr), DdValue::HoldRef(hold_id)) => {
+                                // Evaluate the transform with Placeholder as the item
+                                // This creates a template that can be substituted at render time
+                                let mut scoped = BoonDdRuntime {
+                                    variables: self.variables.clone(),
+                                    functions: self.functions.clone(),
+                                    passed_context: self.passed_context.clone(),
+                                    link_counter: 0,
+                                    hold_counter: 0,
+                                    context_path: Vec::new(),
+                                    last_list_source: None,
+                                };
+                                scoped.variables.insert(binding.to_string(), DdValue::Placeholder);
 
-                                    // Evaluate the transform expression
-                                    scoped.eval_expression(&new_expr.node)
-                                })
-                                .collect();
-                            DdValue::list(mapped)
-                        } else {
-                            from.clone()
+                                let element_template = scoped.eval_expression(&new_expr.node);
+                                zoon::println!("[DD_EVAL] List/map on HoldRef: source={}, template={:?}", hold_id, element_template);
+
+                                DdValue::mapped_list_ref(hold_id.as_ref(), element_template)
+                            }
+                            // FilteredListRef |> List/map(item, new: ...) -> FilteredMappedListRef
+                            // Defers both filtering and mapping to render time
+                            (Some(binding), Some(new_expr), DdValue::FilteredListRef { source_hold, filter_field, filter_value }) => {
+                                // Evaluate the transform with Placeholder as the item
+                                let mut scoped = BoonDdRuntime {
+                                    variables: self.variables.clone(),
+                                    functions: self.functions.clone(),
+                                    passed_context: self.passed_context.clone(),
+                                    link_counter: 0,
+                                    hold_counter: 0,
+                                    context_path: Vec::new(),
+                                    last_list_source: None,
+                                };
+                                scoped.variables.insert(binding.to_string(), DdValue::Placeholder);
+
+                                let element_template = scoped.eval_expression(&new_expr.node);
+                                zoon::println!("[DD_EVAL] List/map on FilteredListRef: source={}, filter={}, template={:?}",
+                                    source_hold, filter_field, element_template);
+
+                                DdValue::FilteredMappedListRef {
+                                    source_hold: source_hold.clone(),
+                                    filter_field: filter_field.clone(),
+                                    filter_value: filter_value.clone(),
+                                    element_template: Arc::new(element_template),
+                                }
+                            }
+                            // FilteredListRefWithPredicate |> List/map(item, new: ...) -> FilteredMappedListWithPredicate
+                            // For complex predicates (like WHILE expressions), preserves the predicate template
+                            (Some(binding), Some(new_expr), DdValue::FilteredListRefWithPredicate { source_hold, predicate_template }) => {
+                                // Evaluate the transform with Placeholder as the item
+                                let mut scoped = BoonDdRuntime {
+                                    variables: self.variables.clone(),
+                                    functions: self.functions.clone(),
+                                    passed_context: self.passed_context.clone(),
+                                    link_counter: 0,
+                                    hold_counter: 0,
+                                    context_path: Vec::new(),
+                                    last_list_source: None,
+                                };
+                                scoped.variables.insert(binding.to_string(), DdValue::Placeholder);
+
+                                let element_template = scoped.eval_expression(&new_expr.node);
+                                zoon::println!("[DD_EVAL] List/map on FilteredListRefWithPredicate: source={}, template={:?}",
+                                    source_hold, element_template);
+
+                                DdValue::FilteredMappedListWithPredicate {
+                                    source_hold: source_hold.clone(),
+                                    predicate_template: predicate_template.clone(),
+                                    element_template: Arc::new(element_template),
+                                }
+                            }
+                            // List |> List/map(item, new: ...) -> concrete list
+                            (Some(binding), Some(new_expr), DdValue::List(items)) => {
+                                let mapped: Vec<DdValue> = items
+                                    .iter()
+                                    .map(|item| {
+                                        // Create scoped runtime with the item bound
+                                        let mut scoped = BoonDdRuntime {
+                                            variables: self.variables.clone(),
+                                            functions: self.functions.clone(),
+                                            passed_context: self.passed_context.clone(),
+                                            link_counter: 0,
+                                            hold_counter: 0,
+                                            context_path: Vec::new(),
+                                            last_list_source: None,
+                                        };
+                                        scoped.variables.insert(binding.to_string(), (*item).clone());
+
+                                        // Evaluate the transform expression
+                                        scoped.eval_expression(&new_expr.node)
+                                    })
+                                    .collect();
+                                DdValue::list(mapped)
+                            }
+                            _ => from.clone(),
                         }
                     }
                     (Some("List"), "count") => {
@@ -1048,6 +1321,16 @@ impl BoonDdRuntime {
                                     DdValue::Bool(items.is_empty())
                                 }
                             }
+                            // HoldRef |> List/is_empty() -> reactive ComputedRef
+                            DdValue::HoldRef(hold_id) => {
+                                zoon::println!("[DD_EVAL] List/is_empty() on HoldRef: hold_id={}", hold_id);
+                                DdValue::ComputedRef {
+                                    computation: ComputedType::ListIsEmptyHold {
+                                        source_hold: hold_id.clone(),
+                                    },
+                                    source_hold: hold_id.clone(),
+                                }
+                            }
                             _ => DdValue::Bool(true),
                         }
                     }
@@ -1082,6 +1365,10 @@ impl BoonDdRuntime {
                     }
                     (Some("Bool"), "not") => {
                         // from |> Bool/not()
+                        // Handle PlaceholderField specially - create a negation template
+                        if let DdValue::PlaceholderField { path } = from {
+                            return DdValue::NegatedPlaceholderField { path: path.clone() };
+                        }
                         let from_bool = match from {
                             DdValue::Bool(b) => *b,
                             DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
@@ -1140,7 +1427,24 @@ impl BoonDdRuntime {
             Expression::FieldAccess { path } => {
                 let mut current = from.clone();
                 for field in path {
-                    current = current.get(field.as_str()).cloned().unwrap_or(DdValue::Unit);
+                    // Handle Placeholder specially - create PlaceholderField
+                    // This preserves the field access path for later substitution
+                    current = match &current {
+                        DdValue::Placeholder => {
+                            DdValue::PlaceholderField {
+                                path: Arc::new(vec![Arc::from(field.as_ref())]),
+                            }
+                        }
+                        DdValue::PlaceholderField { path: existing_path } => {
+                            // Extend the existing path (clone the inner Vec, not the Arc)
+                            let mut new_path: Vec<Arc<str>> = existing_path.as_ref().clone();
+                            new_path.push(Arc::from(field.as_ref()));
+                            DdValue::PlaceholderField {
+                                path: Arc::new(new_path),
+                            }
+                        }
+                        _ => current.get(field.as_str()).cloned().unwrap_or(DdValue::Unit),
+                    };
                 }
                 current
             }
@@ -1160,8 +1464,14 @@ impl BoonDdRuntime {
                     let result = self.replace_link_ref_in_value(from, target_id);
                     zoon::println!("[DD_EVAL] LinkSetter: replaced LinkRef with {}", target_id);
                     result
+                } else if let DdValue::PlaceholderField { path } = &target_link {
+                    // Template evaluation: replace LinkRef with PlaceholderField
+                    // During cloning, this will be resolved to the real LinkRef from the data item
+                    let result = self.replace_link_ref_with_placeholder(from, path);
+                    zoon::println!("[DD_EVAL] LinkSetter: replaced LinkRef with PlaceholderField {:?}", path);
+                    result
                 } else {
-                    // If alias doesn't resolve to a LinkRef, just pass through unchanged
+                    // If alias doesn't resolve to a LinkRef or PlaceholderField, just pass through unchanged
                     zoon::println!("[DD_EVAL] LinkSetter: alias did not resolve to LinkRef, passing through unchanged");
                     from.clone()
                 }
@@ -1216,9 +1526,41 @@ impl BoonDdRuntime {
                 let is_boolean_hold = matches!(initial, DdValue::Bool(_)) ||
                     matches!(initial, DdValue::Tagged { tag, .. } if tag.as_ref() == "True" || tag.as_ref() == "False");
                 if is_boolean_hold {
+                    zoon::println!("[DD_EVAL] is_boolean_hold=true for {}, extracting bindings", hold_id);
                     let bindings = self.extract_editing_bindings(body);
                     if !bindings.edit_trigger_path.is_empty() {
                         super::io::set_editing_event_bindings(bindings);
+                    }
+
+                    // Also extract toggle event bindings (click |> THEN { state |> Bool/not() })
+                    let toggle_bindings = self.extract_toggle_bindings(body, state_name);
+                    for (event_path, event_type) in toggle_bindings {
+                        super::io::add_toggle_event_binding(super::io::ToggleEventBinding {
+                            hold_id: hold_id.clone(),
+                            event_path,
+                            event_type,
+                        });
+                    }
+                }
+
+                // For boolean HOLDs, also extract global toggle bindings
+                // Pattern: store.elements.toggle_all.event.click |> THEN { store.all_completed |> Bool/not() }
+                // This is in the completed HOLD inside each todo item, not in a list HOLD
+                if is_boolean_hold {
+                    let global_toggle_bindings = self.extract_global_toggle_bindings(body);
+                    if !global_toggle_bindings.is_empty() {
+                        zoon::println!("[DD_EVAL] Extracted {} global toggle bindings from boolean HOLD {}", global_toggle_bindings.len(), hold_id);
+                        for (event_path, event_type, value_path) in global_toggle_bindings {
+                            zoon::println!("[DD_EVAL] Adding global toggle binding: event_path={:?}, value_path={:?}", event_path, value_path);
+                            // For boolean HOLDs, the list_hold_id is the HOLD ID of this completed field
+                            // The action will toggle this specific HOLD based on store.all_completed
+                            super::io::add_global_toggle_binding(super::io::GlobalToggleEventBinding {
+                                list_hold_id: hold_id.clone(),  // This is the completed HOLD, not a list
+                                event_path,
+                                event_type,
+                                value_path,
+                            });
+                        }
                     }
                 }
 
@@ -1373,6 +1715,44 @@ impl BoonDdRuntime {
             Expression::Pipe { from, .. } => {
                 // The from side might be the event path
                 self.extract_linkref_path_from_event(binding, &from.node)
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract a global event path (not starting with binding).
+    /// Handles patterns like `elements.remove_completed_button.event.press`
+    /// Returns the full path up to "event": ["elements", "remove_completed_button"]
+    fn extract_global_event_path(&self, event_expr: &Expression) -> Option<Vec<String>> {
+        match event_expr {
+            Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
+                // Find "event" in the path
+                if let Some(event_idx) = parts.iter().position(|p| p.as_ref() == "event") {
+                    if event_idx > 0 {
+                        let path: Vec<String> = parts[..event_idx]
+                            .iter()
+                            .map(|p| p.to_string())
+                            .collect();
+                        return Some(path);
+                    }
+                }
+                None
+            }
+            Expression::FieldAccess { path } => {
+                if let Some(event_idx) = path.iter().position(|p| p.as_ref() == "event") {
+                    if event_idx > 0 {
+                        let result: Vec<String> = path[..event_idx]
+                            .iter()
+                            .map(|p| p.to_string())
+                            .collect();
+                        return Some(result);
+                    }
+                }
+                None
+            }
+            Expression::Pipe { from, .. } => {
+                // The from side might be the event path
+                self.extract_global_event_path(&from.node)
             }
             _ => None,
         }
@@ -1550,6 +1930,148 @@ impl BoonDdRuntime {
             }
             _ => None,
         }
+    }
+
+    /// Check if expression is a Bool/not() toggle pattern like `state |> Bool/not()`.
+    /// Returns true if the expression is a boolean toggle on the HOLD state.
+    fn is_bool_toggle_pattern(&self, expr: &Expression, state_name: &str) -> bool {
+        match expr {
+            Expression::Pipe { from, to } => {
+                // Check: state |> Bool/not()
+                if let Expression::FunctionCall { path, .. } = &to.node {
+                    let fn_path: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                    if fn_path == vec!["Bool", "not"] {
+                        // Check if from is the state variable (can be Variable or Alias)
+                        match &from.node {
+                            Expression::Variable(v) => {
+                                return v.name.as_ref() == state_name;
+                            }
+                            Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
+                                // Single-part alias like just "state"
+                                if parts.len() == 1 && parts[0].as_ref() == state_name {
+                                    return true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if expression is a global toggle pattern like `store.all_completed |> Bool/not()`.
+    /// Returns Some(path) where path is the alias parts (e.g., ["store", "all_completed"]).
+    fn is_global_toggle_pattern(&self, expr: &Expression) -> Option<Vec<String>> {
+        match expr {
+            Expression::Pipe { from, to } => {
+                // Check: X |> Bool/not() where X is an alias (not state)
+                if let Expression::FunctionCall { path, .. } = &to.node {
+                    let fn_path: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                    if fn_path == vec!["Bool", "not"] {
+                        // Check if from is an alias (like store.all_completed)
+                        match &from.node {
+                            Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
+                                // Multi-part alias like store.all_completed
+                                if parts.len() > 1 && parts[0].as_ref() == "store" {
+                                    return Some(parts.iter().map(|p| p.to_string()).collect());
+                                }
+                            }
+                            Expression::Alias(Alias::WithPassed { extra_parts, .. }) => {
+                                // PASSED.store.X - also a global reference
+                                if !extra_parts.is_empty() && extra_parts[0].as_ref() == "store" {
+                                    return Some(extra_parts.iter().map(|p| p.to_string()).collect());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract global toggle bindings from HOLD body.
+    /// Looks for patterns like: `store.elements.X.event.click |> THEN { store.Y |> Bool/not() }`
+    /// Returns list of (event_path, event_type, value_path) for global toggles.
+    fn extract_global_toggle_bindings(&self, body: &Expression) -> Vec<(Vec<String>, String, Vec<String>)> {
+        zoon::println!("[DD_EVAL] extract_global_toggle_bindings CALLED");
+        let mut toggles = Vec::new();
+
+        // Helper to extract inputs from LATEST
+        let inputs = match body {
+            Expression::Latest { inputs, .. } => {
+                inputs.iter().map(|s| &s.node).collect::<Vec<_>>()
+            }
+            _ => vec![body]
+        };
+
+        for input in inputs.iter() {
+            // Look for patterns like: store.elements.X.event.click |> THEN { store.Y |> Bool/not() }
+            if let Expression::Pipe { from, to } = input {
+                if let Expression::Then { body: then_body } = &to.node {
+                    // Check if THEN body is a global toggle (store.X |> Bool/not())
+                    if let Some(value_path) = self.is_global_toggle_pattern(&then_body.node) {
+                        zoon::println!("[DD_EVAL] extract_global_toggle_bindings: found global toggle with value_path {:?}", value_path);
+                        // Extract the event path from the from side
+                        if let Some((path, event_type)) = self.extract_event_path(&from.node) {
+                            zoon::println!("[DD_EVAL] extract_global_toggle_bindings: extracted event path {:?}, type {}", path, event_type);
+                            toggles.push((path, event_type, value_path));
+                        }
+                    }
+                }
+            }
+        }
+
+        toggles
+    }
+
+    /// Extract checkbox toggle bindings from HOLD body.
+    /// Looks for patterns like: `path.event.click |> THEN { state |> Bool/not() }`
+    /// Returns list of (event_path, event_type) for toggles.
+    fn extract_toggle_bindings(&self, body: &Expression, state_name: &str) -> Vec<(Vec<String>, String)> {
+        zoon::println!("[DD_EVAL] extract_toggle_bindings CALLED with state_name={}", state_name);
+        let mut toggles = Vec::new();
+
+        // Helper to extract inputs from LATEST
+        let inputs = match body {
+            Expression::Latest { inputs, .. } => {
+                zoon::println!("[DD_EVAL] extract_toggle_bindings: found LATEST with {} inputs", inputs.len());
+                inputs.iter().map(|s| &s.node).collect::<Vec<_>>()
+            }
+            _ => {
+                zoon::println!("[DD_EVAL] extract_toggle_bindings: body is not LATEST, treating as single input");
+                vec![body]
+            }
+        };
+
+        for (i, input) in inputs.iter().enumerate() {
+            // Look for patterns like: path.event.click |> THEN { state |> Bool/not() }
+            if let Expression::Pipe { from, to } = input {
+                if let Expression::Then { body: then_body } = &to.node {
+                    zoon::println!("[DD_EVAL] extract_toggle_bindings: input {} is Pipe->THEN, checking for Bool/not pattern with state_name={}", i, state_name);
+                    // Check if THEN body is Bool/not() toggle
+                    if self.is_bool_toggle_pattern(&then_body.node, state_name) {
+                        zoon::println!("[DD_EVAL] extract_toggle_bindings: input {} IS Bool/not toggle!", i);
+                        // Extract the event path from the from side
+                        if let Some((path, event_type)) = self.extract_event_path(&from.node) {
+                            zoon::println!("[DD_EVAL] extract_toggle_bindings: extracted path {:?}, event_type {}", path, event_type);
+                            toggles.push((path, event_type));
+                        } else {
+                            zoon::println!("[DD_EVAL] extract_toggle_bindings: failed to extract event path");
+                        }
+                    } else {
+                        zoon::println!("[DD_EVAL] extract_toggle_bindings: input {} is NOT Bool/not toggle", i);
+                    }
+                }
+            }
+        }
+
+        toggles
     }
 
     /// Check if expression contains a LINK trigger (reactive event source).
@@ -1912,6 +2434,52 @@ impl BoonDdRuntime {
             return DdValue::WhileRef {
                 hold_id: hold_id.clone(),
                 computation: None,  // No computation for direct HoldRef
+                arms: Arc::new(evaluated_arms),
+                default: default_value,
+            };
+        }
+
+        // If input is a PlaceholderField, create a PlaceholderWhileRef for deferred resolution
+        // This handles: todo.editing |> WHILE { True => ..., False => ... } in templates
+        if let DdValue::PlaceholderField { path } = value {
+            // Pre-evaluate all arms for later substitution
+            let mut evaluated_arms = Vec::new();
+            let mut default_value = None;
+
+            for arm in arms {
+                let pattern_value = self.pattern_to_value(&arm.pattern);
+
+                if matches!(arm.pattern, Pattern::WildCard) {
+                    let mut match_runtime = BoonDdRuntime {
+                        variables: self.variables.clone(),
+                        functions: self.functions.clone(),
+                        passed_context: self.passed_context.clone(),
+                        link_counter: 0,
+                        hold_counter: 0,
+                        context_path: Vec::new(),
+                        last_list_source: None,
+                    };
+                    let body_result = match_runtime.eval_expression(&arm.body.node);
+                    default_value = Some(Arc::new(body_result));
+                } else if let Some(pv) = pattern_value {
+                    let mut match_runtime = BoonDdRuntime {
+                        variables: self.variables.clone(),
+                        functions: self.functions.clone(),
+                        passed_context: self.passed_context.clone(),
+                        link_counter: 0,
+                        hold_counter: 0,
+                        context_path: Vec::new(),
+                        last_list_source: None,
+                    };
+                    let body_result = match_runtime.eval_expression(&arm.body.node);
+                    evaluated_arms.push((pv, body_result));
+                }
+            }
+
+            zoon::println!("[DD_EVAL] Created PlaceholderWhileRef for path {:?} with {} arms", path, evaluated_arms.len());
+
+            return DdValue::PlaceholderWhileRef {
+                field_path: path.clone(),
                 arms: Arc::new(evaluated_arms),
                 default: default_value,
             };
@@ -2542,7 +3110,23 @@ impl BoonDdRuntime {
 
                 // Rest are field accesses
                 for field in parts.iter().skip(1) {
-                    current = current.get(field.as_str()).cloned().unwrap_or(DdValue::Unit);
+                    // Handle Placeholder specially - create PlaceholderField for deferred access
+                    current = match &current {
+                        DdValue::Placeholder => {
+                            DdValue::PlaceholderField {
+                                path: Arc::new(vec![Arc::from(field.as_ref())]),
+                            }
+                        }
+                        DdValue::PlaceholderField { path: existing_path } => {
+                            // Extend the existing path
+                            let mut new_path: Vec<Arc<str>> = existing_path.as_ref().clone();
+                            new_path.push(Arc::from(field.as_ref()));
+                            DdValue::PlaceholderField {
+                                path: Arc::new(new_path),
+                            }
+                        }
+                        _ => current.get(field.as_str()).cloned().unwrap_or(DdValue::Unit),
+                    };
                     // Update list_source_name if this field is a List
                     if matches!(current, DdValue::List(_)) {
                         list_source_name = Some(field.to_string());
@@ -2562,33 +3146,44 @@ impl BoonDdRuntime {
                 // PASSED value - access the passed_context and navigate through fields
                 let mut current = self.passed_context.clone().unwrap_or(DdValue::Unit);
 
-                // Debug: log PASSED access path
-                let path_str = extra_parts.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(".");
-                if path_str.contains("active_todos") {
-                    zoon::println!("[DD_EVAL] PASSED.{} access starting", path_str);
-                    if let DdValue::Object(obj) = &current {
-                        zoon::println!("[DD_EVAL] PASSED context keys: {:?}", obj.keys().cloned().collect::<Vec<_>>());
-                    }
-                }
-
                 // Track list source for PASSED context too
                 let mut list_source_name: Option<String> = None;
 
                 // Navigate through extra_parts (field accesses after PASSED)
                 for field in extra_parts {
-                    current = current.get(field.as_str()).cloned().unwrap_or(DdValue::Unit);
-                    if path_str.contains("active_todos") {
-                        zoon::println!("[DD_EVAL] PASSED.{}: after field '{}' = {:?}", path_str, field, current);
-                    }
+                    // Handle Placeholder specially - create PlaceholderField for deferred access
+                    current = match &current {
+                        DdValue::Placeholder => {
+                            DdValue::PlaceholderField {
+                                path: Arc::new(vec![Arc::from(field.as_ref())]),
+                            }
+                        }
+                        DdValue::PlaceholderField { path: existing_path } => {
+                            // Extend the existing path
+                            let mut new_path: Vec<Arc<str>> = existing_path.as_ref().clone();
+                            new_path.push(Arc::from(field.as_ref()));
+                            DdValue::PlaceholderField {
+                                path: Arc::new(new_path),
+                            }
+                        }
+                        _ => current.get(field.as_str()).cloned().unwrap_or(DdValue::Unit),
+                    };
                     if matches!(current, DdValue::List(_)) {
                         list_source_name = Some(field.to_string());
                     }
                 }
 
-                // If the result is a List, track its source name
-                if matches!(current, DdValue::List(_)) {
-                    if let Some(name) = list_source_name {
-                        self.last_list_source = Some(name);
+                // If the result is a List, check if there's a reactive HOLD for this field.
+                // The interpreter creates HOLDs for reactive list operations (List/append, List/clear).
+                // If such a HOLD exists, return HoldRef so List/map creates MappedListRef.
+                if matches!(current, DdValue::List(_) | DdValue::Unit) {
+                    if let Some(ref name) = list_source_name {
+                        // Check if a HOLD with this name exists
+                        if super::io::get_hold_value(name).is_some() {
+                            zoon::println!("[DD_EVAL] PASSED.{} is reactive list - returning HoldRef", name);
+                            return DdValue::HoldRef(Arc::from(name.as_str()));
+                        }
+                        self.last_list_source = Some(name.clone());
                     }
                 }
 
@@ -2635,6 +3230,53 @@ impl BoonDdRuntime {
                 let new_items: Vec<DdValue> = items
                     .iter()
                     .map(|item| self.replace_link_ref_in_value(item, target_id))
+                    .collect();
+                DdValue::List(Arc::new(new_items))
+            }
+
+            // Other values pass through unchanged
+            _ => value.clone(),
+        }
+    }
+
+    /// Replace any LinkRef in a value with a PlaceholderField.
+    ///
+    /// This is used by `|> LINK { alias }` during template evaluation when the alias
+    /// resolves to a PlaceholderField (deferred field access). The PlaceholderField
+    /// will be resolved to a real LinkRef during template cloning/substitution.
+    fn replace_link_ref_with_placeholder(&self, value: &DdValue, path: &[Arc<str>]) -> DdValue {
+        use std::collections::BTreeMap;
+
+        match value {
+            // Replace any LinkRef with the PlaceholderField
+            DdValue::LinkRef(_) => DdValue::PlaceholderField { path: Arc::new(path.to_vec()) },
+
+            // Recursively process objects
+            DdValue::Object(fields) => {
+                let new_fields: BTreeMap<Arc<str>, DdValue> = fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.replace_link_ref_with_placeholder(v, path)))
+                    .collect();
+                DdValue::Object(Arc::new(new_fields))
+            }
+
+            // Recursively process tagged values
+            DdValue::Tagged { tag, fields } => {
+                let new_fields: BTreeMap<Arc<str>, DdValue> = fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.replace_link_ref_with_placeholder(v, path)))
+                    .collect();
+                DdValue::Tagged {
+                    tag: tag.clone(),
+                    fields: Arc::new(new_fields),
+                }
+            }
+
+            // Recursively process lists
+            DdValue::List(items) => {
+                let new_items: Vec<DdValue> = items
+                    .iter()
+                    .map(|item| self.replace_link_ref_with_placeholder(item, path))
                     .collect();
                 DdValue::List(Arc::new(new_items))
             }

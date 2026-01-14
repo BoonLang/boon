@@ -153,6 +153,16 @@ pub enum DdValue {
         /// The value to match (e.g., Bool(true))
         filter_value: Box<DdValue>,
     },
+    /// Intermediate filtered list reference with predicate template.
+    /// Created when List/retain has a complex predicate (not simple field=value).
+    /// The predicate_template contains Placeholder markers for item values.
+    FilteredListRefWithPredicate {
+        /// The source HOLD ID containing the list
+        source_hold: Arc<str>,
+        /// The predicate template - contains Placeholder markers for item fields.
+        /// At render time, for each item, substitute_placeholder is called.
+        predicate_template: Box<DdValue>,
+    },
     /// Reactive filtered list where items have HoldRef fields.
     /// Created when List/retain is applied to a concrete list
     /// where the filter condition references a field containing HoldRefs.
@@ -169,6 +179,81 @@ pub enum DdValue {
         hold_ids: Arc<Vec<Arc<str>>>,
         /// The source HOLD containing this list (for live counting)
         source_hold: Arc<str>,
+    },
+    /// Reactive TEXT interpolation - evaluated at render time.
+    /// Created when TEXT contains reactive parts (ComputedRef, WhileRef, HoldRef).
+    /// Each part is either a literal Text or a reactive value.
+    /// Example: TEXT { {count} items left } with reactive count
+    ReactiveText {
+        /// Parts of the text - can be Text (literal) or reactive values
+        parts: Arc<Vec<DdValue>>,
+    },
+    /// Placeholder for template substitution.
+    /// Used in MappedListRef to mark where list item values should be inserted.
+    /// At render time, the bridge substitutes actual item values for placeholders.
+    Placeholder,
+    /// Deferred field access on a Placeholder.
+    /// Created when evaluating `item.field` where `item` is a Placeholder.
+    /// At render time, the path is resolved against the actual item value.
+    /// Example: `item.completed` → `PlaceholderField { path: ["completed"] }`
+    PlaceholderField {
+        /// Field access path from the placeholder (e.g., ["todo_elements", "remove_button"])
+        path: Arc<Vec<Arc<str>>>,
+    },
+    /// Mapped list reference - reactive List/map over a HoldRef.
+    /// Created when: `hold_ref |> List/map(item, new: element_expr)`
+    /// The element_template is evaluated once with `item` bound to Placeholder,
+    /// then at render time, the Placeholder is substituted with each actual item.
+    MappedListRef {
+        /// The source HOLD ID containing the list
+        source_hold: Arc<str>,
+        /// Template element with Placeholder where the item value goes
+        element_template: Arc<DdValue>,
+    },
+    /// Filtered and mapped list reference - reactive List/retain then List/map over a HoldRef.
+    /// Created when: `hold_ref |> List/retain(item, if: ...) |> List/map(item, new: element_expr)`
+    FilteredMappedListRef {
+        /// The source HOLD ID containing the list
+        source_hold: Arc<str>,
+        /// The field to filter on (e.g., "completed")
+        filter_field: Arc<str>,
+        /// The value to match (e.g., Bool(true) or a WhileRef for dynamic filtering)
+        filter_value: Box<DdValue>,
+        /// Template element with Placeholder where the item value goes
+        element_template: Arc<DdValue>,
+    },
+    /// Filtered and mapped list with a predicate template - generic filtering.
+    /// Created when: `list |> List/retain(item, if: complex_predicate) |> List/map(item, new: element_expr)`
+    /// The predicate_template contains Placeholder markers that get substituted with each item.
+    /// This allows complex predicates like `selected_filter |> WHILE { All => True, Active => item.completed |> Bool/not() }`
+    FilteredMappedListWithPredicate {
+        /// The source HOLD ID containing the list (or empty if from concrete list)
+        source_hold: Arc<str>,
+        /// The predicate template - contains Placeholder markers for item fields.
+        /// At render time, for each item, substitute_placeholder is called and the result
+        /// is evaluated for truthiness.
+        predicate_template: Box<DdValue>,
+        /// Template element with Placeholder where the item value goes
+        element_template: Arc<DdValue>,
+    },
+    /// Deferred WHILE pattern match on a PlaceholderField.
+    /// Created when: `todo.editing |> WHILE { True => ..., False => ... }` during template evaluation.
+    /// At render time (during substitute_placeholder), the field path is resolved against the
+    /// actual item value, and this becomes a proper WhileRef.
+    PlaceholderWhileRef {
+        /// Field access path from the placeholder (e.g., ["editing"])
+        field_path: Arc<Vec<Arc<str>>>,
+        /// Pre-evaluated arms: (pattern_value, body_result)
+        arms: Arc<Vec<(DdValue, DdValue)>>,
+        /// Default arm result (for wildcard pattern)
+        default: Option<Arc<DdValue>>,
+    },
+    /// Negated placeholder field - for `item.field |> Bool/not()` in templates.
+    /// Created when Bool/not() is applied to a PlaceholderField.
+    /// At render time, the field is resolved and the boolean result is negated.
+    NegatedPlaceholderField {
+        /// Field access path from the placeholder (e.g., ["completed"])
+        path: Arc<Vec<Arc<str>>>,
     },
 }
 
@@ -283,6 +368,32 @@ impl DdValue {
             }
             // ReactiveFilteredList - truthy if it has items
             Self::ReactiveFilteredList { items, .. } => !items.is_empty(),
+            // ReactiveText - truthy if it has parts
+            Self::ReactiveText { parts } => !parts.is_empty(),
+            // Placeholder - always truthy (represents a value slot)
+            Self::Placeholder => true,
+            // PlaceholderField - always truthy (represents deferred field access)
+            Self::PlaceholderField { .. } => true,
+            // PlaceholderWhileRef - always truthy (deferred WHILE on placeholder)
+            Self::PlaceholderWhileRef { .. } => true,
+            // NegatedPlaceholderField - always truthy (deferred negated field access)
+            Self::NegatedPlaceholderField { .. } => true,
+            // MappedListRef - truthy if source HOLD exists
+            Self::MappedListRef { source_hold, .. } => {
+                super::io::get_hold_value(source_hold).is_some()
+            }
+            // FilteredMappedListRef - truthy if source HOLD exists
+            Self::FilteredMappedListRef { source_hold, .. } => {
+                super::io::get_hold_value(source_hold).is_some()
+            }
+            // FilteredListRefWithPredicate - truthy if source HOLD exists
+            Self::FilteredListRefWithPredicate { source_hold, .. } => {
+                super::io::get_hold_value(source_hold).is_some()
+            }
+            // FilteredMappedListWithPredicate - truthy if source HOLD exists
+            Self::FilteredMappedListWithPredicate { source_hold, .. } => {
+                source_hold.is_empty() || super::io::get_hold_value(source_hold).is_some()
+            }
         }
     }
 
@@ -306,7 +417,31 @@ impl DdValue {
             Self::HoldRef(name) => format!("[hold:{}]", name),
             Self::LinkRef(path) => format!("[link:{}]", path),
             Self::TimerRef { id, interval_ms } => format!("[timer:{}@{}ms]", id, interval_ms),
-            Self::WhileRef { hold_id, arms, .. } => format!("[while:{}#{}]", hold_id, arms.len()),
+            Self::WhileRef { hold_id, computation, arms, default } => {
+                // Try to evaluate the WhileRef with current HOLD state
+                if let Some(hold_value) = super::io::get_hold_value(hold_id) {
+                    // If there's a computation, evaluate it first
+                    let match_value = if let Some(comp) = computation {
+                        evaluate_computed(comp, &hold_value)
+                    } else {
+                        hold_value
+                    };
+
+                    // Try to match against arms
+                    for (pattern, body) in arms.iter() {
+                        if &match_value == pattern {
+                            return body.to_display_string();
+                        }
+                    }
+
+                    // No match - use default
+                    if let Some(def) = default {
+                        return def.to_display_string();
+                    }
+                }
+                // HOLD not available or no match - return empty
+                String::new()
+            }
             Self::ComputedRef { computation, source_hold } => {
                 // Try to evaluate the computation with current HOLD state
                 if let Some(source_value) = super::io::get_hold_value(source_hold) {
@@ -321,6 +456,34 @@ impl DdValue {
             }
             Self::ReactiveFilteredList { items, filter_field, .. } => {
                 format!("[reactive-filtered:{}#{}]", filter_field, items.len())
+            }
+            Self::ReactiveText { parts } => {
+                // Evaluate all parts with current HOLD state and concatenate
+                parts.iter()
+                    .map(|part| part.to_display_string())
+                    .collect()
+            }
+            Self::Placeholder => "[placeholder]".to_string(),
+            Self::PlaceholderField { path } => {
+                format!("[placeholder.{}]", path.join("."))
+            }
+            Self::PlaceholderWhileRef { field_path, .. } => {
+                format!("[placeholder-while.{}]", field_path.join("."))
+            }
+            Self::NegatedPlaceholderField { path } => {
+                format!("[not-placeholder.{}]", path.join("."))
+            }
+            Self::MappedListRef { source_hold, .. } => {
+                format!("[mapped-list:{}]", source_hold)
+            }
+            Self::FilteredMappedListRef { source_hold, filter_field, .. } => {
+                format!("[filtered-mapped-list:{}@{}]", filter_field, source_hold)
+            }
+            Self::FilteredListRefWithPredicate { source_hold, .. } => {
+                format!("[filtered-list-predicate:{}]", source_hold)
+            }
+            Self::FilteredMappedListWithPredicate { source_hold, .. } => {
+                format!("[filtered-mapped-list-predicate:{}]", source_hold)
             }
         }
     }
@@ -362,6 +525,146 @@ impl DdValue {
         Self::ComputedRef {
             computation,
             source_hold: source_hold.into(),
+        }
+    }
+
+    /// Create a mapped list reference.
+    pub fn mapped_list_ref(source_hold: impl Into<Arc<str>>, element_template: DdValue) -> Self {
+        Self::MappedListRef {
+            source_hold: source_hold.into(),
+            element_template: Arc::new(element_template),
+        }
+    }
+
+    /// Substitute all Placeholder occurrences with the given value.
+    /// Used by MappedListRef to create concrete elements from templates.
+    pub fn substitute_placeholder(&self, value: &DdValue) -> DdValue {
+        match self {
+            Self::Placeholder => value.clone(),
+            // PlaceholderField - resolve the path against the substituted value
+            Self::PlaceholderField { path } => {
+                let mut current = value.clone();
+                for field in path.iter() {
+                    current = current.get(field.as_ref()).cloned().unwrap_or(DdValue::Unit);
+                }
+                current
+            }
+            // PlaceholderWhileRef - resolve field path and create WhileRef
+            Self::PlaceholderWhileRef { field_path, arms, default } => {
+                // Resolve the field path against the actual item value
+                let mut resolved = value.clone();
+                for field in field_path.iter() {
+                    resolved = resolved.get(field.as_ref()).cloned().unwrap_or(DdValue::Unit);
+                }
+
+                // Substitute placeholders in the arms too
+                let new_arms: Vec<(DdValue, DdValue)> = arms
+                    .iter()
+                    .map(|(pattern, body)| {
+                        (pattern.substitute_placeholder(value), body.substitute_placeholder(value))
+                    })
+                    .collect();
+
+                let new_default = default.as_ref().map(|d| Arc::new(d.substitute_placeholder(value)));
+
+                // If resolved to HoldRef, create a proper WhileRef
+                if let DdValue::HoldRef(hold_id) = resolved {
+                    Self::WhileRef {
+                        hold_id,
+                        computation: None,
+                        arms: Arc::new(new_arms),
+                        default: new_default,
+                    }
+                } else {
+                    // For non-HoldRef values, try to match synchronously
+                    for (pattern, body) in new_arms.iter() {
+                        if &resolved == pattern {
+                            return body.clone();
+                        }
+                    }
+                    // No match - use default or Unit
+                    new_default.map(|d| (*d).clone()).unwrap_or(DdValue::Unit)
+                }
+            }
+            // NegatedPlaceholderField - resolve field path and negate the result
+            Self::NegatedPlaceholderField { path } => {
+                // Resolve the field path against the actual item value
+                let mut resolved = value.clone();
+                for field in path.iter() {
+                    resolved = resolved.get(field.as_ref()).cloned().unwrap_or(DdValue::Unit);
+                }
+                // If resolved to a HoldRef, we need to keep it reactive
+                // but since negation is a simple operation, we can check for Bool values
+                match resolved {
+                    DdValue::Bool(b) => DdValue::Bool(!b),
+                    DdValue::Tagged { ref tag, .. } => {
+                        // True -> False, False -> True
+                        if tag.as_ref() == "True" {
+                            DdValue::Bool(false)
+                        } else if tag.as_ref() == "False" {
+                            DdValue::Bool(true)
+                        } else {
+                            DdValue::Bool(!resolved.is_truthy())
+                        }
+                    }
+                    DdValue::HoldRef(hold_id) => {
+                        // For HoldRef, look up and negate
+                        let hold_value = super::io::get_hold_value(&hold_id)
+                            .unwrap_or(DdValue::Bool(false));
+                        DdValue::Bool(!hold_value.is_truthy())
+                    }
+                    _ => DdValue::Bool(!resolved.is_truthy()),
+                }
+            }
+            Self::Object(fields) => {
+                let new_fields: BTreeMap<Arc<str>, DdValue> = fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.substitute_placeholder(value)))
+                    .collect();
+                Self::Object(Arc::new(new_fields))
+            }
+            Self::List(items) => {
+                let new_items: Vec<DdValue> = items
+                    .iter()
+                    .map(|item| item.substitute_placeholder(value))
+                    .collect();
+                Self::List(Arc::new(new_items))
+            }
+            Self::Tagged { tag, fields } => {
+                let new_fields: BTreeMap<Arc<str>, DdValue> = fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.substitute_placeholder(value)))
+                    .collect();
+                Self::Tagged {
+                    tag: tag.clone(),
+                    fields: Arc::new(new_fields),
+                }
+            }
+            Self::ReactiveText { parts } => {
+                let new_parts: Vec<DdValue> = parts
+                    .iter()
+                    .map(|part| part.substitute_placeholder(value))
+                    .collect();
+                Self::ReactiveText { parts: Arc::new(new_parts) }
+            }
+            // WhileRef - substitute placeholders in arm bodies
+            Self::WhileRef { hold_id, computation, arms, default } => {
+                let new_arms: Vec<(DdValue, DdValue)> = arms
+                    .iter()
+                    .map(|(pattern, body)| {
+                        (pattern.clone(), body.substitute_placeholder(value))
+                    })
+                    .collect();
+                let new_default = default.as_ref().map(|d| Arc::new(d.substitute_placeholder(value)));
+                Self::WhileRef {
+                    hold_id: hold_id.clone(),
+                    computation: computation.clone(),
+                    arms: Arc::new(new_arms),
+                    default: new_default,
+                }
+            }
+            // For all other types, no substitution needed
+            _ => self.clone(),
         }
     }
 }

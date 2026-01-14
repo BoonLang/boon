@@ -38,8 +38,7 @@ pub fn clear_hold_states_memory() {
     CHECKBOX_TOGGLE_HOLDS.with(|holds| {
         holds.lock_mut().clear();
     });
-    // Also reset filter and route state to prevent cross-example contamination
-    clear_selected_filter();
+    // Also reset route state to prevent cross-example contamination
     clear_current_route();
 }
 
@@ -55,23 +54,7 @@ thread_local! {
     static CHECKBOX_TOGGLE_HOLDS: Mutable<Vec<String>> = Mutable::new(Vec::new()); // ALLOWED: view state
 }
 
-// Current selected filter (All, Active, Completed)
-// Updated by router navigation
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ListFilter {
-    All,
-    Active,
-    Completed,
-}
-
-impl Default for ListFilter {
-    fn default() -> Self {
-        Self::All
-    }
-}
-
 thread_local! {
-    static SELECTED_FILTER: Mutable<ListFilter> = Mutable::new(ListFilter::All); // ALLOWED: view state
     static CURRENT_ROUTE: Mutable<String> = Mutable::new("/".to_string()); // ALLOWED: route state
     // Detected list variable name from Boon code (e.g., "items", "list_data", or any List variable)
     // Set by interpreter during initialization, used by bridge for HOLD lookups
@@ -83,42 +66,46 @@ thread_local! {
     // Stores the path ["X", "Y"] from item to the LinkRef that triggers removal
     // This is PARSED FROM CODE, not guessed from field names
     static REMOVE_EVENT_PATH: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new()); // ALLOWED: config state
+    // Bulk remove event path: parsed from List/remove(item, on: elements.X.event.press |> THEN {...})
+    // Stores the full path ["elements", "X"] to the global LinkRef that triggers bulk removal
+    // This replaces label-based pattern matching for "Clear completed" button
+    static BULK_REMOVE_EVENT_PATH: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new()); // ALLOWED: config state
 }
 
 /// Set the detected list variable name.
 /// Called by interpreter after detecting the list variable from the Boon code.
 pub fn set_list_var_name(name: String) {
-    LIST_VAR_NAME.with(|n| *n.borrow_mut() = name);
+    LIST_VAR_NAME.with(|n| *n.borrow_mut() = name); // ALLOWED: IO layer
 }
 
 /// Get the detected list variable name.
 /// Used by bridge when looking up the list HOLD.
 pub fn get_list_var_name() -> String {
-    LIST_VAR_NAME.with(|n| n.borrow().clone())
+    LIST_VAR_NAME.with(|n| n.borrow().clone()) // ALLOWED: IO layer
 }
 
 /// Clear the list variable name (reset to default).
 /// Called when clearing state between examples.
 pub fn clear_list_var_name() {
-    LIST_VAR_NAME.with(|n| *n.borrow_mut() = "list_data".to_string());
+    LIST_VAR_NAME.with(|n| *n.borrow_mut() = "list_data".to_string()); // ALLOWED: IO layer
 }
 
 /// Set the detected elements field name.
 /// Called by interpreter after detecting the elements field from list item objects.
 pub fn set_elements_field_name(name: String) {
-    ELEMENTS_FIELD_NAME.with(|n| *n.borrow_mut() = name);
+    ELEMENTS_FIELD_NAME.with(|n| *n.borrow_mut() = name); // ALLOWED: IO layer
 }
 
 /// Get the detected elements field name.
 /// Used when looking up LinkRefs in list item objects.
 pub fn get_elements_field_name() -> String {
-    ELEMENTS_FIELD_NAME.with(|n| n.borrow().clone())
+    ELEMENTS_FIELD_NAME.with(|n| n.borrow().clone()) // ALLOWED: IO layer
 }
 
 /// Clear the elements field name (reset to default).
 /// Called when clearing state between examples.
 pub fn clear_elements_field_name() {
-    ELEMENTS_FIELD_NAME.with(|n| *n.borrow_mut() = "item_elements".to_string());
+    ELEMENTS_FIELD_NAME.with(|n| *n.borrow_mut() = "item_elements".to_string()); // ALLOWED: IO layer
 }
 
 /// Set the remove event path.
@@ -126,19 +113,39 @@ pub fn clear_elements_field_name() {
 /// This is the path from item to the LinkRef that triggers removal.
 pub fn set_remove_event_path(path: Vec<String>) {
     zoon::println!("[DD Config] Setting remove event path: {:?}", path);
-    REMOVE_EVENT_PATH.with(|p| *p.borrow_mut() = path);
+    REMOVE_EVENT_PATH.with(|p| *p.borrow_mut() = path); // ALLOWED: IO layer
 }
 
 /// Get the remove event path.
 /// Used when cloning templates to wire the correct LinkRef to removal.
 pub fn get_remove_event_path() -> Vec<String> {
-    REMOVE_EVENT_PATH.with(|p| p.borrow().clone())
+    REMOVE_EVENT_PATH.with(|p| p.borrow().clone()) // ALLOWED: IO layer
 }
 
 /// Clear the remove event path.
 /// Called when clearing state between examples.
 pub fn clear_remove_event_path() {
-    REMOVE_EVENT_PATH.with(|p| p.borrow_mut().clear());
+    REMOVE_EVENT_PATH.with(|p| p.borrow_mut().clear()); // ALLOWED: IO layer
+}
+
+/// Set the bulk remove event path.
+/// Parsed from List/remove(item, on: elements.X.event.press |> THEN {...}) → ["elements", "X"]
+/// This is the path to the global LinkRef that triggers bulk removal (e.g., "Clear completed" button).
+pub fn set_bulk_remove_event_path(path: Vec<String>) {
+    zoon::println!("[DD Config] Setting bulk remove event path: {:?}", path);
+    BULK_REMOVE_EVENT_PATH.with(|p| *p.borrow_mut() = path); // ALLOWED: IO layer
+}
+
+/// Get the bulk remove event path.
+/// Used by interpreter to wire the correct LinkRef to bulk removal.
+pub fn get_bulk_remove_event_path() -> Vec<String> {
+    BULK_REMOVE_EVENT_PATH.with(|p| p.borrow().clone()) // ALLOWED: IO layer
+}
+
+/// Clear the bulk remove event path.
+/// Called when clearing state between examples.
+pub fn clear_bulk_remove_event_path() {
+    BULK_REMOVE_EVENT_PATH.with(|p| p.borrow_mut().clear()); // ALLOWED: IO layer
 }
 
 /// Editing event bindings parsed from HOLD body.
@@ -163,31 +170,94 @@ thread_local! {
 /// `todo_elements.todo_title_element.event.double_click |> THEN { True }`
 pub fn set_editing_event_bindings(bindings: EditingEventBindings) {
     zoon::println!("[DD Config] Setting editing bindings: {:?}", bindings);
-    EDITING_EVENT_BINDINGS.with(|b| *b.borrow_mut() = bindings);
+    EDITING_EVENT_BINDINGS.with(|b| *b.borrow_mut() = bindings); // ALLOWED: IO layer
 }
 
 /// Get the editing event bindings.
 pub fn get_editing_event_bindings() -> EditingEventBindings {
-    EDITING_EVENT_BINDINGS.with(|b| b.borrow().clone())
+    EDITING_EVENT_BINDINGS.with(|b| b.borrow().clone()) // ALLOWED: IO layer
 }
 
 /// Clear the editing event bindings.
 pub fn clear_editing_event_bindings() {
-    EDITING_EVENT_BINDINGS.with(|b| *b.borrow_mut() = EditingEventBindings::default());
+    EDITING_EVENT_BINDINGS.with(|b| *b.borrow_mut() = EditingEventBindings::default()); // ALLOWED: IO layer
 }
 
-/// Set the selected filter based on route.
-/// Called by router navigation.
+/// Toggle event binding parsed from HOLD body.
+/// Contains the path to a LinkRef whose click event toggles a boolean HOLD.
+#[derive(Clone, Debug)]
+pub struct ToggleEventBinding {
+    /// The HOLD ID that this toggle affects
+    pub hold_id: String,
+    /// Path to LinkRef whose click triggers toggle (e.g., ["todo_elements", "todo_checkbox"])
+    pub event_path: Vec<String>,
+    /// Event type (usually "click")
+    pub event_type: String,
+}
+
+thread_local! {
+    // Toggle event bindings parsed from HOLD bodies
+    static TOGGLE_EVENT_BINDINGS: std::cell::RefCell<Vec<ToggleEventBinding>> = std::cell::RefCell::new(Vec::new()); // ALLOWED: config state
+}
+
+/// Add a toggle event binding.
+/// Parsed from HOLD body expressions like:
+/// `todo_elements.todo_checkbox.event.click |> THEN { state |> Bool/not() }`
+pub fn add_toggle_event_binding(binding: ToggleEventBinding) {
+    zoon::println!("[DD Config] Adding toggle binding: {:?}", binding);
+    TOGGLE_EVENT_BINDINGS.with(|b| b.borrow_mut().push(binding)); // ALLOWED: IO layer
+}
+
+/// Get all toggle event bindings.
+pub fn get_toggle_event_bindings() -> Vec<ToggleEventBinding> {
+    TOGGLE_EVENT_BINDINGS.with(|b| b.borrow().clone()) // ALLOWED: IO layer
+}
+
+/// Clear all toggle event bindings.
+pub fn clear_toggle_event_bindings() {
+    TOGGLE_EVENT_BINDINGS.with(|b| b.borrow_mut().clear()); // ALLOWED: IO layer
+}
+
+/// Global toggle event binding for "toggle all" patterns.
+/// Contains the path to a LinkRef whose click toggles ALL items in a list.
+/// Pattern: `store.elements.toggle_all.event.click |> THEN { store.all_completed |> Bool/not() }`
+#[derive(Clone, Debug)]
+pub struct GlobalToggleEventBinding {
+    /// The HOLD ID that this toggle affects (the list HOLD like "todos")
+    pub list_hold_id: String,
+    /// Path to LinkRef whose click triggers toggle (e.g., ["store", "elements", "toggle_all_checkbox"])
+    pub event_path: Vec<String>,
+    /// Event type (usually "click")
+    pub event_type: String,
+    /// Path to the global computed value (e.g., ["store", "all_completed"])
+    pub value_path: Vec<String>,
+}
+
+thread_local! {
+    // Global toggle event bindings parsed from HOLD bodies
+    static GLOBAL_TOGGLE_BINDINGS: std::cell::RefCell<Vec<GlobalToggleEventBinding>> = std::cell::RefCell::new(Vec::new()); // ALLOWED: config state
+}
+
+/// Add a global toggle event binding.
+pub fn add_global_toggle_binding(binding: GlobalToggleEventBinding) {
+    zoon::println!("[DD Config] Adding global toggle binding: {:?}", binding);
+    GLOBAL_TOGGLE_BINDINGS.with(|b| b.borrow_mut().push(binding)); // ALLOWED: IO layer
+}
+
+/// Get all global toggle event bindings.
+pub fn get_global_toggle_bindings() -> Vec<GlobalToggleEventBinding> {
+    GLOBAL_TOGGLE_BINDINGS.with(|b| b.borrow().clone()) // ALLOWED: IO layer
+}
+
+/// Clear all global toggle event bindings.
+pub fn clear_global_toggle_bindings() {
+    GLOBAL_TOGGLE_BINDINGS.with(|b| b.borrow_mut().clear()); // ALLOWED: IO layer
+}
+
+/// Set the current route.
+/// Called by router navigation. Updates the "current_route" HOLD for reactive filtering.
 pub fn set_filter_from_route(route: &str) {
-    let filter = match route {
-        "/" => ListFilter::All,
-        "/active" => ListFilter::Active,
-        "/completed" => ListFilter::Completed,
-        _ => ListFilter::All,
-    };
-    zoon::println!("[DD Filter] Setting filter to {:?} from route {}", filter, route);
-    SELECTED_FILTER.with(|f| f.set(filter));
-    // Also update current route for reactive Router/route()
+    zoon::println!("[DD Route] Setting route to {}", route);
     CURRENT_ROUTE.with(|r| r.set(route.to_string()));
     // Update HOLD_STATES so Router/route() HoldRef is reactive
     update_hold_state_no_persist("current_route", super::super::dd_value::DdValue::text(route));
@@ -206,14 +276,6 @@ pub fn init_current_route() {
         use zoon::*;
         let path = window().location().pathname().unwrap_or_else(|_| "/".to_string());
         CURRENT_ROUTE.with(|r| r.set(path.clone()));
-        // Also set the filter based on initial route
-        let filter = match path.as_str() {
-            "/" => ListFilter::All,
-            "/active" => ListFilter::Active,
-            "/completed" => ListFilter::Completed,
-            _ => ListFilter::All,
-        };
-        SELECTED_FILTER.with(|f| f.set(filter));
     }
 }
 
@@ -222,15 +284,6 @@ pub fn clear_current_route() {
     CURRENT_ROUTE.with(|r| r.set("/".to_string()));
 }
 
-/// Get a signal for the selected filter.
-pub fn selected_filter_signal() -> impl zoon::Signal<Item = ListFilter> {
-    SELECTED_FILTER.with(|f| f.signal_cloned())
-}
-
-/// Clear the selected filter (reset to All).
-pub fn clear_selected_filter() {
-    SELECTED_FILTER.with(|f| f.set(ListFilter::All));
-}
 
 /// Register checkbox toggle hold IDs for reactive count computation.
 /// Called by interpreter when detecting the checkbox toggle pattern.
@@ -313,20 +366,129 @@ pub fn clear_hold_state(hold_id: &str) {
 /// Toggle a boolean HOLD value (for checkbox interactions).
 /// Reads the current value, inverts it, and updates both memory and persistent storage.
 pub fn toggle_hold_bool(hold_id: &str) {
+    zoon::println!("[DD toggle_hold_bool] CALLED with hold_id={}", hold_id);
     HOLD_STATES.with(|states| {
         let mut lock = states.lock_mut();
         let current = lock.get(hold_id).cloned();
+        zoon::println!("[DD toggle_hold_bool] Current value for {}: {:?}", hold_id, current);
         let new_value = match current {
             Some(DdValue::Bool(b)) => DdValue::Bool(!b),
             Some(DdValue::Tagged { tag, .. }) if tag.as_ref() == "True" => DdValue::Bool(false),
             Some(DdValue::Tagged { tag, .. }) if tag.as_ref() == "False" => DdValue::Bool(true),
             _ => DdValue::Bool(true), // Default to true if no current value
         };
+        zoon::println!("[DD toggle_hold_bool] New value for {}: {:?}", hold_id, new_value);
         lock.insert(hold_id.to_string(), new_value.clone());
         // Persist the new value
         drop(lock);
         persist_hold_value(hold_id, &new_value);
     });
+}
+
+/// Toggle ALL items' completed field in a list HOLD.
+/// Used for "toggle all" checkbox that sets all items to completed or not completed.
+/// The new value is: NOT(all_completed), i.e., if all are completed -> make all not completed.
+pub fn toggle_all_list_items_completed(list_hold_id: &str, completed_field: &str) {
+    use std::sync::Arc;
+
+    // Phase 1: Collect data and compute new state (with lock held)
+    let (items, all_completed, hold_ids_to_update) = HOLD_STATES.with(|states| {
+        let lock = states.lock_mut();
+        let current_list = lock.get(list_hold_id).cloned();
+
+        let items = match current_list {
+            Some(DdValue::List(items)) => items,
+            _ => {
+                zoon::println!("[DD ToggleAll] No list found at {}", list_hold_id);
+                return (None, false, Vec::new());
+            }
+        };
+
+        if items.is_empty() {
+            zoon::println!("[DD ToggleAll] List is empty, nothing to toggle");
+            return (None, false, Vec::new());
+        }
+
+        // First collect all hold IDs and their completion states
+        // (Don't use .all() because it short-circuits and won't collect all hold IDs!)
+        let mut hold_ids: Vec<String> = Vec::new();
+        let mut completed_states: Vec<bool> = Vec::new();
+
+        for item in items.iter() {
+            if let DdValue::Object(fields) = item {
+                match fields.get(completed_field) {
+                    Some(DdValue::Bool(b)) => {
+                        completed_states.push(*b);
+                    }
+                    Some(DdValue::HoldRef(hold_id)) => {
+                        hold_ids.push(hold_id.to_string());
+                        // Look up the HoldRef value
+                        let is_completed = lock.get(hold_id.as_ref())
+                            .map(|v| matches!(v, DdValue::Bool(true)))
+                            .unwrap_or(false);
+                        completed_states.push(is_completed);
+                    }
+                    _ => {
+                        completed_states.push(false);
+                    }
+                }
+            } else {
+                completed_states.push(false);
+            }
+        }
+
+        // Now check if all items are completed
+        let all_completed = !completed_states.is_empty() && completed_states.iter().all(|&c| c);
+
+        (Some(items), all_completed, hold_ids)
+    });
+
+    // Early return if no items
+    let items = match items {
+        Some(items) => items,
+        None => return,
+    };
+
+    // New value is the opposite of all_completed
+    let new_completed = !all_completed;
+    zoon::println!("[DD ToggleAll] all_completed={}, setting all to {}", all_completed, new_completed);
+
+    // Phase 2: Update all HOLDs (with lock held)
+    HOLD_STATES.with(|states| {
+        let mut lock = states.lock_mut();
+
+        // Update all referenced HOLDs
+        for hold_id in &hold_ids_to_update {
+            lock.insert(hold_id.clone(), DdValue::Bool(new_completed));
+        }
+
+        // Build new items list (fields don't change, only HoldRef values)
+        let new_items: Vec<DdValue> = items.iter().map(|item| {
+            if let DdValue::Object(fields) = item {
+                // If completed is a direct Bool field (not HoldRef), update it
+                if fields.get(completed_field).map(|v| matches!(v, DdValue::Bool(_))).unwrap_or(false) {
+                    let mut new_fields = (**fields).clone();
+                    new_fields.insert(Arc::from(completed_field), DdValue::Bool(new_completed));
+                    DdValue::Object(Arc::new(new_fields))
+                } else {
+                    // HoldRef - no need to clone, the reference stays the same
+                    item.clone()
+                }
+            } else {
+                item.clone()
+            }
+        }).collect();
+
+        // Update the list in HOLD_STATES
+        lock.insert(list_hold_id.to_string(), DdValue::List(Arc::new(new_items)));
+    });
+
+    // Phase 3: Persist all updated HOLDs (without lock)
+    for hold_id in &hold_ids_to_update {
+        persist_hold_value(hold_id, &DdValue::Bool(new_completed));
+    }
+
+    zoon::println!("[DD ToggleAll] Updated {} items in {}", items.len(), list_hold_id);
 }
 
 /// Load persisted HOLD value from localStorage.
@@ -412,7 +574,7 @@ fn dd_value_to_json(value: &DdValue) -> Option<zoon::serde_json::Value> {
             })
         }
         // Don't persist complex types - they need code evaluation
-        DdValue::Tagged { .. } | DdValue::LinkRef(_) | DdValue::TimerRef { .. } | DdValue::WhileRef { .. } | DdValue::ComputedRef { .. } | DdValue::FilteredListRef { .. } | DdValue::ReactiveFilteredList { .. } => None,
+        DdValue::Tagged { .. } | DdValue::LinkRef(_) | DdValue::TimerRef { .. } | DdValue::WhileRef { .. } | DdValue::ComputedRef { .. } | DdValue::FilteredListRef { .. } | DdValue::FilteredListRefWithPredicate { .. } | DdValue::ReactiveFilteredList { .. } | DdValue::ReactiveText { .. } | DdValue::Placeholder | DdValue::PlaceholderField { .. } | DdValue::PlaceholderWhileRef { .. } | DdValue::NegatedPlaceholderField { .. } | DdValue::MappedListRef { .. } | DdValue::FilteredMappedListRef { .. } | DdValue::FilteredMappedListWithPredicate { .. } => None,
     }
 }
 
