@@ -23,7 +23,7 @@ use chumsky::Parser as _;
 use super::dd_evaluator::{BoonDdRuntime, reset_hold_counter};
 use super::dd_value::DdValue;
 use super::core::{DdWorker, DataflowConfig, HoldConfig, HoldId, LinkId, EventFilter, StateTransform, reconstruct_persisted_item};
-use super::io::{EventInjector, set_global_dispatcher, clear_global_dispatcher, set_task_handle, clear_task_handle, set_output_listener_handle, clear_output_listener_handle, set_timer_handle, clear_timer_handle, clear_router_mappings, clear_dynamic_link_actions, update_hold_state, update_hold_state_no_persist, load_persisted_hold_value, set_checkbox_toggle_holds, clear_hold_states_memory};
+use super::io::{EventInjector, set_global_dispatcher, clear_global_dispatcher, set_task_handle, clear_task_handle, set_output_listener_handle, clear_output_listener_handle, set_timer_handle, clear_timer_handle, clear_router_mappings, clear_dynamic_link_actions, update_hold_state, update_hold_state_no_persist, load_persisted_hold_value, set_checkbox_toggle_holds, clear_hold_states_memory, set_list_var_name, clear_remove_event_path, get_editing_event_bindings, clear_editing_event_bindings};
 #[cfg(target_arch = "wasm32")]
 use super::dd_bridge::clear_dd_text_input_value;
 use zoon::{Task, StreamExt};
@@ -87,6 +87,24 @@ impl DdContext {
 }
 
 /// Run Boon code with DD reactive evaluation and persistence.
+/// Check if a DdValue contains HoldRefs (indicating it uses item data).
+/// Used to distinguish element templates that use item data (like todo_item)
+/// from container elements that don't (like main_panel).
+fn has_dynamic_holds(value: &DdValue) -> bool {
+    match value {
+        DdValue::HoldRef(_) => true,
+        DdValue::List(items) => items.iter().any(has_dynamic_holds),
+        DdValue::Object(fields) => fields.values().any(has_dynamic_holds),
+        DdValue::Tagged { fields, .. } => fields.values().any(has_dynamic_holds),
+        DdValue::WhileRef { arms, default, .. } => {
+            // Check arms and default for HoldRefs
+            arms.iter().any(|(_, body)| has_dynamic_holds(body)) ||
+            default.as_ref().map_or(false, |d| has_dynamic_holds(d.as_ref()))
+        }
+        _ => false,
+    }
+}
+
 ///
 /// # Arguments
 ///
@@ -112,6 +130,8 @@ pub fn run_dd_reactive_with_persistence(
     clear_global_dispatcher();
     clear_router_mappings();
     clear_dynamic_link_actions();  // Clear dynamic link→hold mappings
+    clear_remove_event_path();  // Clear parsed remove event path
+    clear_editing_event_bindings();  // Clear parsed editing event bindings
     clear_hold_states_memory();  // Prevent state contamination between examples
     #[cfg(target_arch = "wasm32")]
     clear_dd_text_input_value();  // Clear text input state
@@ -192,18 +212,20 @@ pub fn run_dd_reactive_with_persistence(
     // Get the document output
     let document = runtime.get_document().cloned();
 
-    // Get the initial todos list from static evaluation (for todo_mvc)
-    // In todo_mvc.bn, todos is inside store: [todos: LIST {...}]
-    let static_todos = runtime.get_variable("store")
-        .and_then(|store| store.get("todos"))
-        .cloned()
-        .or_else(|| runtime.get_variable("todos").cloned());
+    // Get the initial list from static evaluation
+    // Detect the list variable dynamically by looking for variables containing List values
+    // Common patterns: store.items, store.list_data, items, list_data, or any variable containing a List
+    let (static_list, list_var_name) = detect_list_variable(&runtime);
+    zoon::println!("[DD Interpreter] Detected list variable: {:?}", list_var_name);
+    // Store the detected name globally so bridge can use it for HOLD lookups
+    let list_hold_name = list_var_name.clone().unwrap_or_else(|| "list_data".to_string());
+    set_list_var_name(list_hold_name.clone());
     // Get the initial items list from static evaluation (for shopping_list)
     let static_items = runtime.get_variable("items").cloned();
 
     zoon::println!("[DD Interpreter] Evaluation complete, has document: {}",
         document.is_some());
-    zoon::println!("[DD Interpreter] static_todos = {:?}", static_todos);
+    zoon::println!("[DD Interpreter] static_list = {:?}", static_list);
     zoon::println!("[DD Interpreter] static_items = {:?}", static_items);
 
     // Step 7: Set up DdWorker for reactive updates
@@ -224,7 +246,7 @@ pub fn run_dd_reactive_with_persistence(
         zoon::println!("[DD Interpreter] Timer config: {} @ {}ms, initial {:?}", hold_id, interval_ms, initial_value);
         DataflowConfig::timer_counter(hold_id, initial_value, interval_ms)
     } else if !checkbox_toggles.is_empty() {
-        // Checkbox toggle pattern (todo_mvc): checkbox.click |> THEN { state |> Bool/not() }
+        // Checkbox toggle pattern (list_example): checkbox.click |> THEN { state |> Bool/not() }
         // Each checkbox has its own HOLD for the completed state
         zoon::println!("[DD Interpreter] Checkbox toggle config: {} toggles", checkbox_toggles.len());
         let mut config = DataflowConfig::new();
@@ -233,11 +255,10 @@ pub fn run_dd_reactive_with_persistence(
             // Initialize HOLD_STATES for reactive rendering
             update_hold_state_no_persist(&toggle.hold_id, DdValue::Bool(toggle.initial));
             checkbox_hold_ids.push(toggle.hold_id.clone());
-            // Build triggered_by list: own checkbox click + toggle_all click (if present)
-            let mut triggers = vec![LinkId::new(&toggle.link_id)];
-            if let Some(ref toggle_all_id) = toggle_all_link {
-                triggers.push(LinkId::new(toggle_all_id));
-            }
+            // Only trigger on own checkbox click - toggle_all is handled by ListToggleAllCompleted
+            // (Adding toggle_all here would cause double-toggling since both BoolToggle and
+            // ListToggleAllCompleted would fire on the same event)
+            let triggers = vec![LinkId::new(&toggle.link_id)];
             // Add BoolToggle HOLD config
             config.holds.push(HoldConfig {
                 id: HoldId::new(&toggle.hold_id),
@@ -252,7 +273,7 @@ pub fn run_dd_reactive_with_persistence(
         // Register checkbox hold IDs for reactive "N items left" count
         set_checkbox_toggle_holds(checkbox_hold_ids);
 
-        // Add editing toggle HOLDs (for double-click to edit in todo_mvc)
+        // Add editing toggle HOLDs (for double-click to edit in list_example)
         for toggle in &editing_toggles {
             // Initialize editing HOLD to false (not editing initially)
             update_hold_state_no_persist(&toggle.hold_id, DdValue::Bool(false));
@@ -303,102 +324,309 @@ pub fn run_dd_reactive_with_persistence(
             zoon::println!("[DD Interpreter] Added editing toggle config for hold {}", toggle.hold_id);
         }
 
-        // Also check for text input key_down pattern (todo_mvc has BOTH checkboxes AND add-todo input)
+        // Also check for text input key_down pattern (list_example has BOTH checkboxes AND add-item input)
         if let Some(ref link_id) = key_down_link {
             // Use persisted value, or fall back to static evaluation, or empty list
-            let initial_list = load_persisted_hold_value("todos")
-                .unwrap_or_else(|| static_todos.clone().unwrap_or_else(|| DdValue::List(std::sync::Arc::new(Vec::new()))));
-            zoon::println!("[DD Interpreter] todos initial_list: {:?}", initial_list);
+            let initial_list = load_persisted_hold_value(&list_hold_name)
+                .unwrap_or_else(|| static_list.clone().unwrap_or_else(|| DdValue::List(std::sync::Arc::new(Vec::new()))));
+            zoon::println!("[DD Interpreter] list initial_list: {:?}", initial_list);
             // Initialize HOLD_STATES for reactive rendering
-            update_hold_state_no_persist("todos", initial_list.clone());
+            update_hold_state_no_persist(&list_hold_name, initial_list.clone());
             // Initialize text_input_text HOLD for reactive text clearing
             update_hold_state_no_persist("text_input_text", DdValue::text(""));
-            zoon::println!("[DD Interpreter] Also adding list-append for todos: link={}", link_id);
+            zoon::println!("[DD Interpreter] Also adding list-append for list: link={}", link_id);
 
-            // Register dynamic link actions for initial todos
-            // This allows the same mechanisms to work for both initial and dynamic todos
-            // NOTE: Use static_todos (not initial_list) because persisted data doesn't include LinkRefs
-            if let Some(DdValue::List(items)) = &static_todos {
+            // Register dynamic link actions for initial items
+            // This allows the same mechanisms to work for both initial and dynamic items
+            // NOTE: Use static_list (not initial_list) because persisted data doesn't include LinkRefs
+            if let Some(DdValue::List(items)) = &static_list {
                 use super::io::{add_dynamic_link_action, DynamicLinkAction};
                 for item in items.iter() {
                     if let DdValue::Object(obj) = item {
-                        // DEBUG: Log the todo object structure
-                        zoon::println!("[DD Interpreter] Initial todo object fields: {:?}", obj.keys().collect::<Vec<_>>());
-                        zoon::println!("[DD Interpreter] Initial todo editing={:?}, title={:?}",
-                            obj.get("editing"), obj.get("title"));
+                        // DEBUG: Log the item object structure
+                        zoon::println!("[DD Interpreter] Initial item object fields: {:?}", obj.keys().collect::<Vec<_>>());
 
-                        // Get the editing and title HoldRefs from the todo object
-                        let editing_hold = match obj.get("editing") {
-                            Some(DdValue::HoldRef(id)) => Some(id.to_string()),
-                            _ => None,
-                        };
-                        let title_hold = match obj.get("title") {
-                            Some(DdValue::HoldRef(id)) => Some(id.to_string()),
-                            _ => None,
-                        };
-                        zoon::println!("[DD Interpreter] Extracted editing_hold={:?}, title_hold={:?}", editing_hold, title_hold);
+                        // Discover HoldRef fields dynamically by type
+                        // Find boolean HoldRef (editing state) and text HoldRef (title data)
+                        let mut editing_hold: Option<String> = None;
+                        let mut title_hold: Option<String> = None;
+                        for (hold_field, hold_value) in obj.iter() {
+                            if let DdValue::HoldRef(hold_id) = hold_value {
+                                // Check the initial value to determine type
+                                if let Some(initial) = super::io::get_hold_value(hold_id) {
+                                    match initial {
+                                        DdValue::Bool(_) | DdValue::Tagged { .. } => {
+                                            // Boolean or Tagged (True/False) - this is the editing state
+                                            zoon::println!("[DD Interpreter] Initial item: detected boolean HoldRef: {} = {}", hold_field, hold_id);
+                                            editing_hold = Some(hold_id.to_string());
+                                        }
+                                        DdValue::Text(_) => {
+                                            // Text - this is the title
+                                            zoon::println!("[DD Interpreter] Initial item: detected text HoldRef: {} = {}", hold_field, hold_id);
+                                            title_hold = Some(hold_id.to_string());
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        zoon::println!("[DD Interpreter] Discovered editing_hold={:?}, title_hold={:?}", editing_hold, title_hold);
 
-                        if let Some(DdValue::Object(todo_elements)) = obj.get("todo_elements") {
-                            // Register RemoveListItem for delete button
-                            if let Some(DdValue::LinkRef(remove_link_id)) = todo_elements.get("remove_todo_button") {
-                                zoon::println!("[DD Interpreter] Registering RemoveListItem for initial todo: {}", remove_link_id);
-                                add_dynamic_link_action(remove_link_id.to_string(), DynamicLinkAction::RemoveListItem { link_id: remove_link_id.to_string() });
+                        // Find the elements field dynamically (Object containing LinkRefs)
+                        let elements_field = obj.iter()
+                            .find(|(_, v)| matches!(v, DdValue::Object(inner) if inner.values().any(|iv| matches!(iv, DdValue::LinkRef(_)))))
+                            .map(|(k, v)| (k.clone(), v.clone()));
+
+                        if let Some((elements_name, DdValue::Object(item_elements))) = elements_field {
+                            zoon::println!("[DD Interpreter] Found elements field '{}' with {} LinkRefs", elements_name, item_elements.len());
+
+                            // Register actions using PARSED PATH from List/remove(item, on: ...)
+                            // Get the remove event path that was parsed from the Boon code
+                            let remove_path = super::io::get_remove_event_path();
+                            zoon::println!("[DD Interpreter] Using parsed remove path: {:?}", remove_path);
+
+                            // Register remove action using parsed path (no pattern matching!)
+                            if remove_path.len() >= 2 {
+                                // Path is like ["todo_elements", "remove_todo_button"]
+                                // First element is the field we're currently in (elements_name)
+                                // Check if it matches and navigate to the LinkRef
+                                if remove_path[0] == elements_name.as_ref() {
+                                    if let Some(DdValue::LinkRef(link_id)) = item_elements.get(remove_path[1].as_str()) {
+                                        zoon::println!("[DD Interpreter] Initial item: {} -> RemoveListItem (via parsed path)", link_id);
+                                        add_dynamic_link_action(link_id.to_string(), DynamicLinkAction::RemoveListItem { link_id: link_id.to_string() });
+                                    }
+                                }
                             }
 
-                            // Register SetTrue for todo_title_element (double-click to enter edit mode)
-                            if let (Some(DdValue::LinkRef(title_link_id)), Some(edit_hold)) = (todo_elements.get("todo_title_element"), editing_hold.as_ref()) {
-                                zoon::println!("[DD Interpreter] Registering SetTrue for initial todo title: {} -> {}", title_link_id, edit_hold);
-                                add_dynamic_link_action(title_link_id.to_string(), DynamicLinkAction::SetTrue(edit_hold.clone()));
+                            // Register editing actions using PARSED PATHS from HOLD body (no pattern matching!)
+                            let editing_bindings = get_editing_event_bindings();
+                            zoon::println!("[DD Interpreter] Using parsed editing bindings: edit_trigger={:?}, exit_key={:?}, exit_blur={:?}",
+                                editing_bindings.edit_trigger_path, editing_bindings.exit_key_path, editing_bindings.exit_blur_path);
+
+                            // Double-click element (edit_trigger_path) -> SetTrue(editing_hold)
+                            if editing_bindings.edit_trigger_path.len() >= 2 && editing_bindings.edit_trigger_path[0] == elements_name.as_ref() {
+                                if let Some(DdValue::LinkRef(link_id)) = item_elements.get(editing_bindings.edit_trigger_path[1].as_str()) {
+                                    if let Some(ref edit_hold) = editing_hold {
+                                        zoon::println!("[DD Interpreter] Initial item: {} -> SetTrue({}) (via parsed path)", link_id, edit_hold);
+                                        add_dynamic_link_action(link_id.to_string(), DynamicLinkAction::SetTrue(edit_hold.clone()));
+                                    }
+                                }
                             }
 
-                            // Register EditingHandler for editing_todo_title_element (Enter/Escape to save/cancel)
-                            if let (Some(DdValue::LinkRef(edit_link_id)), Some(edit_hold), Some(t_hold)) =
-                                (todo_elements.get("editing_todo_title_element"), editing_hold.as_ref(), title_hold.as_ref()) {
-                                zoon::println!("[DD Interpreter] Registering EditingHandler for initial todo: {} -> edit={}, title={}", edit_link_id, edit_hold, t_hold);
-                                add_dynamic_link_action(edit_link_id.to_string(), DynamicLinkAction::EditingHandler {
-                                    editing_hold: edit_hold.clone(),
-                                    title_hold: t_hold.clone(),
-                                });
+                            // Key/Blur element (exit_key_path) -> EditingHandler
+                            if editing_bindings.exit_key_path.len() >= 2 && editing_bindings.exit_key_path[0] == elements_name.as_ref() {
+                                if let Some(DdValue::LinkRef(link_id)) = item_elements.get(editing_bindings.exit_key_path[1].as_str()) {
+                                    if let (Some(edit_hold), Some(t_hold)) = (&editing_hold, &title_hold) {
+                                        zoon::println!("[DD Interpreter] Initial item: {} -> EditingHandler(edit={}, title={}) (via parsed path)", link_id, edit_hold, t_hold);
+                                        add_dynamic_link_action(link_id.to_string(), DynamicLinkAction::EditingHandler {
+                                            editing_hold: edit_hold.clone(),
+                                            title_hold: t_hold.clone(),
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
 
-            // Try to create both templates:
-            // 1. data_template: new_todo("__TEMPLATE__") - the data object
-            // 2. element_template: todo_item(data_template) - the Element AST for rendering
-            let data_template = runtime.call_function("new_todo", &[("title", DdValue::text("__TEMPLATE__"))]);
+            // Try to create both templates by detecting available functions based on OUTPUT:
+            // 1. data_template: A function that returns an Object with HoldRef fields
+            // 2. element_template: A function that returns a Tagged Element
+            // This makes the engine truly generic - no assumptions about naming conventions
+            let func_names: Vec<String> = runtime.get_function_names().into_iter().cloned().collect();
+
+            // Find data template function by testing each function's output
+            let mut data_template: Option<DdValue> = None;
+            let mut data_func_name: Option<String> = None;
+            for name in &func_names {
+                // Get actual parameter names from the function definition
+                // Clone the first param to release the borrow before calling call_function
+                let first_param = runtime.get_function_parameters(name)
+                    .and_then(|params| params.first().cloned());
+                // Only try functions that take a parameter (data templates take an item parameter)
+                if let Some(first_param) = first_param {
+                        // Try calling with the actual parameter name
+                        if let Some(result) = runtime.call_function(name, &[(first_param.as_str(), DdValue::text("__TEMPLATE__"))]) {
+                            // Check if result is an Object with HoldRef fields (indicates a list item template)
+                            if let DdValue::Object(fields) = &result {
+                                let has_hold_refs = fields.values().any(|v| matches!(v, DdValue::HoldRef(_)));
+                                if has_hold_refs {
+                                    zoon::println!("[DD Interpreter] Found data template function: {} -> {:?}", name, result);
+                                    // Detect the elements field name (Object field containing LinkRefs)
+                                    // and register actions for template's LinkRefs
+                                    for (field_name, field_value) in fields.iter() {
+                                        if let DdValue::Object(inner_fields) = field_value {
+                                            let has_link_refs = inner_fields.values().any(|v| matches!(v, DdValue::LinkRef(_)));
+                                            if has_link_refs {
+                                                zoon::println!("[DD Interpreter] Detected elements field name: {}", field_name);
+                                                super::io::set_elements_field_name(field_name.to_string());
+
+                                                // Discover HoldRef fields dynamically by type
+                                                // Find boolean HoldRef (editing state) and text HoldRef (title data)
+                                                let mut editing_hold: Option<String> = None;
+                                                let mut title_hold: Option<String> = None;
+                                                for (hold_field, hold_value) in fields.iter() {
+                                                    if let DdValue::HoldRef(hold_id) = hold_value {
+                                                        // Check the initial value to determine type
+                                                        if let Some(initial) = super::io::get_hold_value(hold_id) {
+                                                            match initial {
+                                                                DdValue::Bool(_) | DdValue::Tagged { .. } => {
+                                                                    // Boolean or Tagged (True/False) - this is the editing state
+                                                                    zoon::println!("[DD Interpreter] Detected boolean HoldRef: {} = {}", hold_field, hold_id);
+                                                                    editing_hold = Some(hold_id.to_string());
+                                                                }
+                                                                DdValue::Text(_) => {
+                                                                    // Text - this is the title
+                                                                    zoon::println!("[DD Interpreter] Detected text HoldRef: {} = {}", hold_field, hold_id);
+                                                                    title_hold = Some(hold_id.to_string());
+                                                                }
+                                                                _ => {}
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                use super::io::{add_dynamic_link_action, DynamicLinkAction};
+
+                                                // Use PARSED PATH from List/remove for remove action (no pattern matching!)
+                                                let remove_path = super::io::get_remove_event_path();
+                                                zoon::println!("[DD Interpreter] Template using parsed remove path: {:?}", remove_path);
+
+                                                // Register remove action using parsed path
+                                                if remove_path.len() >= 2 && remove_path[0] == field_name.as_ref() {
+                                                    if let Some(DdValue::LinkRef(link_id)) = inner_fields.get(remove_path[1].as_str()) {
+                                                        zoon::println!("[DD Interpreter] Template action: {} -> RemoveListItem (via parsed path)", link_id);
+                                                        add_dynamic_link_action(link_id.to_string(), DynamicLinkAction::RemoveListItem { link_id: link_id.to_string() });
+                                                    }
+                                                }
+
+                                                // Register editing actions using PARSED PATHS from HOLD body (no pattern matching!)
+                                                let editing_bindings = get_editing_event_bindings();
+
+                                                // Double-click element (edit_trigger_path) -> SetTrue(editing_hold)
+                                                if editing_bindings.edit_trigger_path.len() >= 2 && editing_bindings.edit_trigger_path[0] == field_name.as_ref() {
+                                                    if let Some(DdValue::LinkRef(link_id)) = inner_fields.get(editing_bindings.edit_trigger_path[1].as_str()) {
+                                                        if let Some(ref edit_hold) = editing_hold {
+                                                            zoon::println!("[DD Interpreter] Template action: {} -> SetTrue({}) (via parsed path)", link_id, edit_hold);
+                                                            add_dynamic_link_action(link_id.to_string(), DynamicLinkAction::SetTrue(edit_hold.clone()));
+                                                        }
+                                                    }
+                                                }
+
+                                                // Key/Blur element (exit_key_path) -> EditingHandler
+                                                if editing_bindings.exit_key_path.len() >= 2 && editing_bindings.exit_key_path[0] == field_name.as_ref() {
+                                                    if let Some(DdValue::LinkRef(link_id)) = inner_fields.get(editing_bindings.exit_key_path[1].as_str()) {
+                                                        if let (Some(edit_hold), Some(t_hold)) = (&editing_hold, &title_hold) {
+                                                            zoon::println!("[DD Interpreter] Template action: {} -> EditingHandler(edit={}, title={}) (via parsed path)", link_id, edit_hold, t_hold);
+                                                            add_dynamic_link_action(link_id.to_string(), DynamicLinkAction::EditingHandler {
+                                                                editing_hold: edit_hold.clone(),
+                                                                title_hold: t_hold.clone(),
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    data_template = Some(result);
+                                    data_func_name = Some(name.clone());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+            }
 
             let element_template = if let Some(ref data) = data_template {
                 zoon::println!("[DD Interpreter] Created data template: {:?}", data);
-                // Create element template by calling todo_item with the data template
-                runtime.call_function("todo_item", &[("todo", data.clone())])
+                zoon::println!("[DD Interpreter] Available functions: {:?}", func_names);
+                // Find element template function by testing each function's output
+                // The element template should be a function that:
+                // 1. Takes a data item as parameter
+                // 2. Returns a Tagged Element
+                // We prefer functions with "item" in the name (more specific to list items)
+                let mut elem_result: Option<DdValue> = None;
+                let mut elem_func_name: Option<String> = None;
+
+                // Sort function names to prioritize those with "item" in the name
+                let mut sorted_func_names = func_names.clone();
+                sorted_func_names.sort_by(|a, b| {
+                    let a_has_item = a.to_lowercase().contains("item");
+                    let b_has_item = b.to_lowercase().contains("item");
+                    match (a_has_item, b_has_item) {
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        _ => a.cmp(b),
+                    }
+                });
+                zoon::println!("[DD Interpreter] Sorted functions (item-priority): {:?}", sorted_func_names);
+
+                for name in &sorted_func_names {
+                    // Skip the data template function
+                    if data_func_name.as_ref() == Some(name) { continue; }
+                    // Get the actual parameter names from the function definition
+                    // Clone the first param to release the borrow before calling call_function
+                    let first_param = runtime.get_function_parameters(name)
+                        .and_then(|params| params.first().cloned());
+                    zoon::println!("[DD Interpreter] Function '{}' has first_param: {:?}", name, first_param);
+                    // Use the first parameter name if available, otherwise skip
+                    if let Some(first_param) = first_param {
+                        if let Some(result) = runtime.call_function(name, &[(first_param.as_str(), data.clone())]) {
+                            // Check if result is a Tagged Element
+                            if let DdValue::Tagged { tag, .. } = &result {
+                                if tag.as_ref() == "Element" {
+                                    zoon::println!("[DD Interpreter] Found element template candidate: {} with param '{}' -> Tagged(Element)", name, first_param);
+                                    // Check if this function actually uses the parameter by looking for HoldRefs
+                                    // Functions that take data typically reference it (e.g., todo.completed)
+                                    // Functions without params (like main_panel) won't have item-specific HoldRefs
+                                    let has_item_refs = has_dynamic_holds(&result);
+                                    if has_item_refs {
+                                        zoon::println!("[DD Interpreter] Selected element template: {} (has dynamic item refs)", name);
+                                        elem_result = Some(result);
+                                        elem_func_name = Some(name.clone());
+                                        break;
+                                    } else if elem_result.is_none() {
+                                        // Keep as fallback if no better match found
+                                        elem_result = Some(result);
+                                        elem_func_name = Some(name.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if elem_func_name.is_some() && has_dynamic_holds(elem_result.as_ref().unwrap()) { break; }
+                }
+                if let Some(ref name) = elem_func_name {
+                    zoon::println!("[DD Interpreter] Final element template function: {}", name);
+                }
+                elem_result
             } else {
                 None
             };
 
             if let Some(ref elem) = element_template {
                 zoon::println!("[DD Interpreter] Created element template: {:?}", elem);
-                // Initialize todos_elements HOLD for dynamic item rendering
-                update_hold_state_no_persist("todos_elements", DdValue::List(std::sync::Arc::new(Vec::new())));
+                // Initialize list_elements HOLD for dynamic item rendering
+                update_hold_state_no_persist("list_elements", DdValue::List(std::sync::Arc::new(Vec::new())));
             }
 
             // Reconstruct persisted items that lost their HoldRef structure
-            // Persisted items have empty todo_elements: {}, while fresh items have HoldRefs
+            // Persisted items have empty elements Object, while fresh items have LinkRefs
             let initial_list = if let (Some(data_tmpl), DdValue::List(items)) = (&data_template, &initial_list) {
                 let mut reconstructed_items = Vec::new();
                 let mut reconstructed_elements = Vec::new();
                 let mut any_reconstructed = false;
 
                 for item in items.iter() {
-                    // Check if this item needs reconstruction (empty todo_elements)
+                    // Check if this item needs reconstruction (empty elements field)
+                    // Find the elements field dynamically (Object containing LinkRefs in template)
                     let needs_reconstruction = if let DdValue::Object(obj) = item {
-                        match obj.get("todo_elements") {
-                            Some(DdValue::Object(todo_elems)) => todo_elems.is_empty(),
-                            None => true,
-                            _ => false,
-                        }
+                        // Check if any Object field is empty (elements were stripped during persistence)
+                        obj.values().any(|v| {
+                            matches!(v, DdValue::Object(inner) if inner.is_empty())
+                        })
                     } else {
                         false
                     };
@@ -417,7 +645,7 @@ pub fn run_dd_reactive_with_persistence(
                             reconstructed_items.push(item.clone());
                         }
                     } else {
-                        // Item already has proper structure (from static_todos)
+                        // Item already has proper structure (from static_list)
                         reconstructed_items.push(item.clone());
                     }
                 }
@@ -425,9 +653,9 @@ pub fn run_dd_reactive_with_persistence(
                 if any_reconstructed {
                     zoon::println!("[DD Interpreter] Reconstructed {} items, {} elements",
                         reconstructed_items.len(), reconstructed_elements.len());
-                    // Update todos_elements HOLD with reconstructed elements
+                    // Update list_elements HOLD with reconstructed elements
                     if !reconstructed_elements.is_empty() {
-                        update_hold_state_no_persist("todos_elements", DdValue::List(std::sync::Arc::new(reconstructed_elements)));
+                        update_hold_state_no_persist("list_elements", DdValue::List(std::sync::Arc::new(reconstructed_elements)));
                     }
                     DdValue::List(std::sync::Arc::new(reconstructed_items))
                 } else {
@@ -438,24 +666,41 @@ pub fn run_dd_reactive_with_persistence(
             };
 
             // Update HOLD_STATES with reconstructed list
-            update_hold_state_no_persist("todos", initial_list.clone());
+            update_hold_state_no_persist(&list_hold_name, initial_list.clone());
 
             // Add list-append HOLDs manually (can't use add_list_append_on_enter which returns new Self)
-            let transform = if let Some(data_tmpl) = data_template {
+            let transform = if let Some(ref data_tmpl) = data_template {
+                // Discover the text HoldRef field name from the template
+                let text_hold_field = if let DdValue::Object(fields) = &data_tmpl {
+                    fields.iter()
+                        .find(|(_, v)| {
+                            if let DdValue::HoldRef(hold_id) = v {
+                                if let Some(initial) = super::io::get_hold_value(hold_id) {
+                                    return matches!(initial, DdValue::Text(_));
+                                }
+                            }
+                            false
+                        })
+                        .map(|(k, _)| k.to_string())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                zoon::println!("[DD Interpreter] Discovered text hold field: {:?}", text_hold_field);
                 // Use template-based append for proper Element AST items
                 StateTransform::ListAppendWithTemplate {
-                    data_template: data_tmpl,
+                    data_template: data_tmpl.clone(),
                     element_template,
-                    title_hold_field: "title".to_string(),
+                    title_hold_field: text_hold_field,
                 }
             } else {
                 // Fall back to simple object append
-                zoon::println!("[DD Interpreter] WARNING: new_todo function not found, using legacy ListAppend");
+                zoon::println!("[DD Interpreter] WARNING: new_list_item function not found, using legacy ListAppend");
                 StateTransform::ListAppend
             };
 
             config.holds.push(HoldConfig {
-                id: HoldId::new("todos"),
+                id: HoldId::new(&list_hold_name),
                 initial: initial_list.clone(),
                 triggered_by: vec![LinkId::new(link_id)],
                 timer_interval_ms: 0,
@@ -472,56 +717,27 @@ pub fn run_dd_reactive_with_persistence(
                 transform: StateTransform::ClearText,
                 persist: false,
             });
-            // Add toggle HOLD for dynamic todo checkboxes
-            // Uses a dedicated link "dynamic_todo_toggle" with events like "toggle:0"
+            // REMOVED: ToggleListItemCompleted - checkboxes use toggle_hold_bool() directly
+            // REMOVED: SetListItemEditing - editing uses DynamicLinkAction::SetTrue directly
+            // REMOVED: UpdateListItemTitle - saving uses DynamicLinkAction::EditingHandler directly
+
+            // Remove HOLD for dynamic list item deletion (uses stable LinkRef identity)
+            // Event format: "remove:LINK_ID" where LINK_ID is the remove button's LinkRef
             config.holds.push(HoldConfig {
-                id: HoldId::new("todos"),
+                id: HoldId::new(&list_hold_name),
                 initial: initial_list.clone(),
-                triggered_by: vec![LinkId::new("dynamic_todo_toggle")],
-                timer_interval_ms: 0,
-                filter: EventFilter::TextStartsWith("toggle:".to_string()),
-                transform: StateTransform::ToggleListItemCompleted,
-                persist: true,
-            });
-            // HACK: TodoMVC-specific - Add editing HOLD for dynamic todo double-click
-            // Uses events like "edit:0" (enter edit mode) or "unedit:0" (exit edit mode)
-            config.holds.push(HoldConfig {
-                id: HoldId::new("todos"),
-                initial: initial_list.clone(),
-                triggered_by: vec![LinkId::new("dynamic_todo_edit")],
-                timer_interval_ms: 0,
-                filter: EventFilter::Any,
-                transform: StateTransform::SetListItemEditing,
-                persist: true,
-            });
-            // HACK: TodoMVC-specific - Add save HOLD for dynamic todo title updates
-            // Uses events like "save:0:new title"
-            config.holds.push(HoldConfig {
-                id: HoldId::new("todos"),
-                initial: initial_list.clone(),
-                triggered_by: vec![LinkId::new("dynamic_todo_save")],
-                timer_interval_ms: 0,
-                filter: EventFilter::TextStartsWith("save:".to_string()),
-                transform: StateTransform::UpdateListItemTitle,
-                persist: true,
-            });
-            // HACK: TodoMVC-specific - Add remove HOLD for dynamic todo deletion
-            // Uses events like "remove:0"
-            config.holds.push(HoldConfig {
-                id: HoldId::new("todos"),
-                initial: initial_list.clone(),
-                triggered_by: vec![LinkId::new("dynamic_todo_remove")],
+                triggered_by: vec![LinkId::new("dynamic_list_remove")],
                 timer_interval_ms: 0,
                 filter: EventFilter::TextStartsWith("remove:".to_string()),
                 transform: StateTransform::RemoveListItem,
                 persist: true,
             });
             // Add Toggle All HOLD if toggle_all_checkbox is present
-            // Triggers ListToggleAllCompleted on the todos list
+            // Triggers ListToggleAllCompleted on the list
             if let Some(ref toggle_all_id) = toggle_all_link {
-                zoon::println!("[DD Interpreter] Adding toggle-all for todos: toggle_all_link={}", toggle_all_id);
+                zoon::println!("[DD Interpreter] Adding toggle-all for list: toggle_all_link={}", toggle_all_id);
                 config.holds.push(HoldConfig {
-                    id: HoldId::new("todos"),
+                    id: HoldId::new(&list_hold_name),
                     initial: initial_list.clone(),
                     triggered_by: vec![LinkId::new(toggle_all_id)],
                     timer_interval_ms: 0,
@@ -531,11 +747,11 @@ pub fn run_dd_reactive_with_persistence(
                 });
             }
             // Add Clear Completed HOLD if remove_completed_button is present
-            // Triggers ListRemoveCompleted on the todos list
+            // Triggers ListRemoveCompleted on the list
             if let Some(ref clear_completed_id) = clear_completed_link {
-                zoon::println!("[DD Interpreter] Adding clear-completed for todos: button_link={}", clear_completed_id);
+                zoon::println!("[DD Interpreter] Adding clear-completed for list: button_link={}", clear_completed_id);
                 config.holds.push(HoldConfig {
-                    id: HoldId::new("todos"),
+                    id: HoldId::new(&list_hold_name),
                     initial: initial_list,
                     triggered_by: vec![LinkId::new(clear_completed_id)],
                     timer_interval_ms: 0,
@@ -640,6 +856,44 @@ pub fn run_dd_reactive_with_persistence(
     })
 }
 
+/// Detect the list variable from the runtime by searching for List values.
+///
+/// Returns (list_value, variable_name) if found.
+/// Checks common patterns in order: store.*, then top-level variables.
+fn detect_list_variable(runtime: &BoonDdRuntime) -> (Option<DdValue>, Option<String>) {
+    // First check if there's a "store" object with list fields
+    if let Some(store) = runtime.get_variable("store") {
+        if let DdValue::Object(fields) = store {
+            // Look for any field that contains a List value
+            for (field_name, value) in fields.iter() {
+                if matches!(value, DdValue::List(_)) {
+                    return (Some(value.clone()), Some(field_name.to_string()));
+                }
+            }
+        }
+    }
+
+    // Then check top-level variables for List values
+    // Check common names first, then any variable with a List
+    let common_names = ["items", "list", "data"];
+    for name in common_names {
+        if let Some(value) = runtime.get_variable(name) {
+            if matches!(value, DdValue::List(_)) {
+                return (Some(value.clone()), Some(name.to_string()));
+            }
+        }
+    }
+
+    // If no common name found, search all variables for any List
+    for (name, value) in runtime.get_all_variables() {
+        if matches!(value, DdValue::List(_)) {
+            return (Some(value.clone()), Some(name.clone()));
+        }
+    }
+
+    (None, None)
+}
+
 /// Extract timer info from a document if it contains a TimerRef.
 ///
 /// Recursively searches the document for TimerRef values and returns
@@ -658,7 +912,7 @@ fn extract_text_input_key_down(document: &Option<DdValue>) -> Option<String> {
 }
 
 /// Information about a checkbox toggle pattern.
-/// Used for todo_mvc style patterns where checkbox clicks toggle boolean HOLDs.
+/// Used for list_example style patterns where checkbox clicks toggle boolean HOLDs.
 struct CheckboxToggle {
     link_id: String,
     hold_id: String,
@@ -667,8 +921,8 @@ struct CheckboxToggle {
 
 /// Extract checkbox toggle patterns from the document.
 ///
-/// Looks for todo-like objects with:
-///   - todo_elements.todo_checkbox → LinkRef (click event trigger)
+/// Looks for list item objects with:
+///   - item_elements.item_checkbox → LinkRef (click event trigger)
 ///   - completed → HoldRef (boolean state)
 fn extract_checkbox_toggles(document: &Option<DdValue>) -> Vec<CheckboxToggle> {
     let doc = match document.as_ref() {
@@ -751,7 +1005,7 @@ fn extract_checkbox_toggles_from_value(value: &DdValue, toggles: &mut Vec<Checkb
 }
 
 /// Information about an editing toggle pattern.
-/// Used for todo_mvc style patterns where double-click enters editing mode.
+/// Used for list_example style patterns where double-click enters editing mode.
 struct EditingToggle {
     /// The HOLD ID that controls editing state (e.g., "hold_10")
     hold_id: String,
@@ -875,7 +1129,7 @@ fn extract_editing_toggles_from_value(value: &DdValue, toggles: &mut Vec<Editing
 
 /// Extract the toggle_all checkbox click link_id.
 ///
-/// Looks for a checkbox whose `checked` field is NOT a HoldRef (individual todo checkboxes have HoldRef).
+/// Looks for a checkbox whose `checked` field is NOT a HoldRef (individual item checkboxes have HoldRef).
 /// The toggle_all checkbox has `checked: all_completed` which is a computed Bool, not a HoldRef.
 fn extract_toggle_all_link(document: &Option<DdValue>) -> Option<String> {
     let doc = document.as_ref()?;
@@ -1022,7 +1276,7 @@ fn extract_button_press_link(document: &Option<DdValue>) -> Option<String> {
     extract_button_press_from_value(doc, None)
 }
 
-/// Extract "Clear completed" button specifically for todo_mvc.
+/// Extract "Clear completed" button specifically for list_example.
 /// Looks for a button with label "Clear completed".
 fn extract_clear_completed_button_link(document: &Option<DdValue>) -> Option<String> {
     let doc = document.as_ref()?;

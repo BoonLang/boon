@@ -36,4 +36,11 @@ pub use guards::{
 pub use types::{
     channel, DdEvent, DdEventValue, DdInput, DdOutput, HoldId, LinkId, TimerId,
 };
-pub use worker::{DataflowConfig, DdWorker, DdWorkerHandle, DocumentUpdate, EventFilter, HoldConfig, StateTransform, reconstruct_persisted_item};
+pub use worker::{
+    DataflowConfig, DdWorker, DdWorkerHandle, DocumentUpdate, EventFilter, HoldConfig,
+    StateTransform, reconstruct_persisted_item,
+    // Generic template system exports
+    FieldPath, ItemIdentitySpec, FieldInitializer, LinkActionSpec, LinkActionConfig,
+    ListItemTemplate, InstantiatedItem, FieldUpdate,
+    instantiate_template, get_at_path, get_link_ref_at_path, get_hold_ref_at_path, update_field_at_path,
+};

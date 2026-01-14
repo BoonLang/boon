@@ -15,40 +15,40 @@ use ordered_float::OrderedFloat;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ComputedType {
     /// Count items in list where field == value
-    /// Used for: `todos |> List/retain(item, if: item.completed) |> List/count()`
+    /// Used for: `items |> List/retain(item, if: item.completed) |> List/count()`
     ListCountWhere {
         field: Arc<str>,
         value: Box<DdValue>,
     },
     /// Total count of list items
-    /// Used for: `todos |> List/count()`
+    /// Used for: `items |> List/count()`
     ListCount,
     /// Subtract two computed values
-    /// Used for: `todos_count - completed_todos_count`
+    /// Used for: `list_count - completed_items_count`
     Subtract {
         left: Box<DdValue>,
         right: Box<DdValue>,
     },
     /// Check if all items in list satisfy condition
-    /// Used for: `todos |> List/all(item => item.completed)`
+    /// Used for: `items |> List/all(item => item.completed)`
     ListAllWhere {
         field: Arc<str>,
         value: Box<DdValue>,
     },
     /// Check if computed value > 0
-    /// Used for: `completed_todos_count > 0`
+    /// Used for: `completed_items_count > 0`
     GreaterThanZero {
         operand: Box<DdValue>,
     },
     /// Equality comparison of two values
-    /// Used for: `active_todos_count == todos_count`
+    /// Used for: `active_items_count == list_count`
     Equal {
         left: Box<DdValue>,
         right: Box<DdValue>,
     },
     /// Count items in a list where items have HoldRef fields
-    /// Used for: `todos |> List/retain(item, if: item.completed) |> List/count()`
-    /// where each todo.completed is a HoldRef
+    /// Used for: `items |> List/retain(item, if: item.completed) |> List/count()`
+    /// where each item.completed is a HoldRef
     /// DEPRECATED: Use ListCountWhereHold instead (reads live HOLD data)
     ReactiveListCountWhere {
         /// The list items (containing HoldRef fields)
@@ -73,14 +73,14 @@ pub enum ComputedType {
     },
     /// Total count of items in a list HOLD.
     /// Reads LIVE data from source_hold on each evaluation.
-    /// Used for: `todos |> List/count()` where todos came from a HOLD variable.
+    /// Used for: `items |> List/count()` where items came from a HOLD variable.
     ListCountHold {
         /// Which HOLD contains the list
         source_hold: Arc<str>,
     },
     /// Check if a list HOLD is empty.
     /// Reads LIVE data from source_hold on each evaluation.
-    /// Used for: `todos |> List/is_empty()` where todos came from a HOLD variable.
+    /// Used for: `items |> List/is_empty()` where items came from a HOLD variable.
     ListIsEmptyHold {
         /// Which HOLD contains the list
         source_hold: Arc<str>,
@@ -134,8 +134,8 @@ pub enum DdValue {
         default: Option<Arc<DdValue>>,
     },
     /// Computed value that re-evaluates when dependencies change.
-    /// Used for reactive expressions like `completed_todos_count` that need
-    /// to update when a HOLD (like `todos`) changes.
+    /// Used for reactive expressions like `completed_items_count` that need
+    /// to update when a HOLD (like `items`) changes.
     ComputedRef {
         /// The type of computation to perform
         computation: ComputedType,
@@ -156,8 +156,8 @@ pub enum DdValue {
     /// Reactive filtered list where items have HoldRef fields.
     /// Created when List/retain is applied to a concrete list
     /// where the filter condition references a field containing HoldRefs.
-    /// Example: todos |> List/retain(item, if: item.completed)
-    /// where each todo.completed is a HoldRef.
+    /// Example: items |> List/retain(item, if: item.completed)
+    /// where each item.completed is a HoldRef.
     ReactiveFilteredList {
         /// The concrete list items (containing HoldRef fields)
         items: Arc<Vec<DdValue>>,
@@ -230,15 +230,6 @@ impl DdValue {
             tag: tag.into(),
             fields: Arc::new(map),
         }
-    }
-
-    /// Create a todo object with title and completed fields.
-    /// Used for dynamically added todos in todo_mvc.
-    pub fn todo_object(title: &str, completed: bool) -> Self {
-        Self::object([
-            ("title", Self::text(title)),
-            ("completed", Self::Bool(completed)),
-        ])
     }
 
     /// Get a field from an object or tagged object.
@@ -317,7 +308,13 @@ impl DdValue {
             Self::TimerRef { id, interval_ms } => format!("[timer:{}@{}ms]", id, interval_ms),
             Self::WhileRef { hold_id, arms, .. } => format!("[while:{}#{}]", hold_id, arms.len()),
             Self::ComputedRef { computation, source_hold } => {
-                format!("[computed:{:?}@{}]", computation, source_hold)
+                // Try to evaluate the computation with current HOLD state
+                if let Some(source_value) = super::io::get_hold_value(source_hold) {
+                    evaluate_computed(computation, &source_value).to_display_string()
+                } else {
+                    // HOLD not available - return empty (bridge will handle reactively)
+                    String::new()
+                }
             }
             Self::FilteredListRef { source_hold, filter_field, .. } => {
                 format!("[filtered:{}@{}]", filter_field, source_hold)
@@ -457,12 +454,14 @@ pub fn evaluate_computed(computation: &ComputedType, source_value: &DdValue) -> 
             let right_val = resolve_computed_operand(right, source_value);
             DdValue::Bool(left_val == right_val)
         }
-        ComputedType::ReactiveListCountWhere { items: static_items, field: _, value, hold_ids: _ } => {
-            // Count items where the "completed" field matches the expected value
-            // IMPORTANT: Use current "todos" HOLD as source of truth (not static items)
+        ComputedType::ReactiveListCountWhere { items: static_items, field, value, hold_ids: _ } => {
+            // Count items where the specified field matches the expected value
+            // Uses the `field` parameter (no hardcoded field names)
+            // IMPORTANT: Use current list HOLD as source of truth (not static items)
             // This handles Clear completed removing items dynamically
 
-            let current_items = super::io::get_hold_value("todos")
+            let list_name = super::io::get_list_var_name();
+            let current_items = super::io::get_hold_value(&list_name)
                 .and_then(|v| match v {
                     DdValue::List(list) => Some(list),
                     _ => None,
@@ -471,16 +470,17 @@ pub fn evaluate_computed(computation: &ComputedType, source_value: &DdValue) -> 
 
             let count = current_items.iter()
                 .filter(|item| {
-                    // Get the completed field value
-                    let completed_value = match item {
+                    // Get the field value using the generic field parameter
+                    let field_value = match item {
                         DdValue::Object(obj) => {
-                            match obj.get("completed") {
-                                // Direct Bool value (dynamic todos)
+                            // Use the field parameter instead of hardcoding "completed"
+                            match obj.get(field.as_ref()) {
+                                // Direct Bool value (dynamic items)
                                 Some(DdValue::Bool(b)) => Some(DdValue::Bool(*b)),
                                 // HoldRef - look up current value
                                 Some(DdValue::HoldRef(hold_id)) => {
                                     let val = super::io::get_hold_value(hold_id);
-                                    zoon::println!("[DD ReactiveListCountWhere] hold_id={}, value={:?}", hold_id, val);
+                                    zoon::println!("[DD ReactiveListCountWhere] field={}, hold_id={}, value={:?}", field, hold_id, val);
                                     val
                                 }
                                 _ => None,
@@ -490,7 +490,7 @@ pub fn evaluate_computed(computation: &ComputedType, source_value: &DdValue) -> 
                     };
 
                     // Compare with expected value
-                    let result = match (completed_value.as_ref(), value.as_ref()) {
+                    let result = match (field_value.as_ref(), value.as_ref()) {
                         (Some(DdValue::Bool(b)), DdValue::Bool(expected)) => *b == *expected,
                         (Some(DdValue::Tagged { tag, .. }), DdValue::Tagged { tag: expected_tag, .. }) => {
                             tag == expected_tag
@@ -498,7 +498,7 @@ pub fn evaluate_computed(computation: &ComputedType, source_value: &DdValue) -> 
                         (Some(current), expected) => current == expected,
                         _ => false,
                     };
-                    zoon::println!("[DD ReactiveListCountWhere] completed_value={:?}, expected={:?}, match={}", completed_value, value, result);
+                    zoon::println!("[DD ReactiveListCountWhere] field_value={:?}, expected={:?}, match={}", field_value, value, result);
                     result
                 })
                 .count();

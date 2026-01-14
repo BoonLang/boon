@@ -101,6 +101,18 @@ impl BoonDdRuntime {
         &self.variables
     }
 
+    /// Get all defined function names.
+    /// Used by interpreter to detect available template functions.
+    pub fn get_function_names(&self) -> Vec<&String> {
+        self.functions.keys().collect()
+    }
+
+    /// Get the parameter names for a function.
+    /// Used by interpreter to detect correct parameter names for element templates.
+    pub fn get_function_parameters(&self, name: &str) -> Option<&[String]> {
+        self.functions.get(name).map(|def| def.parameters.as_slice())
+    }
+
     /// Get the document output (the root rendering output).
     pub fn get_document(&self) -> Option<&DdValue> {
         self.get_variable("document")
@@ -121,7 +133,7 @@ impl BoonDdRuntime {
     }
 
     /// Call a function with arguments and return the result.
-    /// Used for evaluating item templates like `new_todo("placeholder")`.
+    /// Used for evaluating item templates like `new_list_item("placeholder")`.
     pub fn call_function(&mut self, name: &str, args: &[(&str, DdValue)]) -> Option<DdValue> {
         let func_def = self.functions.get(name)?.clone();
 
@@ -794,8 +806,31 @@ impl BoonDdRuntime {
                         from.clone()
                     }
                     (Some("List"), "remove") => {
-                        // from |> List/remove(item, on: ...) - pass through for static eval
-                        // (removal depends on events which don't fire in static eval)
+                        // from |> List/remove(item, on: ...) - parse the on: argument to extract the LinkRef path
+                        // E.g., List/remove(item, on: item.todo_elements.remove_todo_button.event.press)
+                        // We need to extract ["todo_elements", "remove_todo_button"] as the path
+
+                        // Get the binding name (first argument without value, e.g., "item")
+                        let binding_name = arguments
+                            .iter()
+                            .find(|arg| arg.node.value.is_none())
+                            .map(|arg| arg.node.name.as_str());
+
+                        // Get the "on:" event expression (unevaluated)
+                        let on_expr = arguments
+                            .iter()
+                            .find(|arg| arg.node.name.as_str() == "on")
+                            .and_then(|arg| arg.node.value.as_ref());
+
+                        if let (Some(binding), Some(event_expr)) = (binding_name, on_expr) {
+                            // Extract the path from item.X.Y.event.press → ["X", "Y"]
+                            if let Some(path) = self.extract_linkref_path_from_event(binding, &event_expr.node) {
+                                zoon::println!("[DD_EVAL] List/remove parsed on: binding={}, path={:?}", binding, path);
+                                super::io::set_remove_event_path(path);
+                            }
+                        }
+
+                        // Pass through for static eval (removal depends on events)
                         from.clone()
                     }
                     (Some("List"), "retain") => {
@@ -1172,6 +1207,21 @@ impl BoonDdRuntime {
                 // Store initial value in HOLD_STATES for reactive rendering
                 init_hold_state(&hold_id, initial.clone());
 
+                // For boolean HOLDs, extract editing event bindings from the body
+                // This parses expressions like:
+                //   todo_elements.todo_title_element.event.double_click |> THEN { True }
+                //   todo_elements.editing_todo_title_element.event.key_down.key |> WHEN { Enter => False }
+                //   todo_elements.editing_todo_title_element.event.blur |> THEN { False }
+                // Note: In Boon, True/False are tags (Tagged { tag: "False" }), not native bools
+                let is_boolean_hold = matches!(initial, DdValue::Bool(_)) ||
+                    matches!(initial, DdValue::Tagged { tag, .. } if tag.as_ref() == "True" || tag.as_ref() == "False");
+                if is_boolean_hold {
+                    let bindings = self.extract_editing_bindings(body);
+                    if !bindings.edit_trigger_path.is_empty() {
+                        super::io::set_editing_event_bindings(bindings);
+                    }
+                }
+
                 zoon::println!("[DD_EVAL] LINK-triggered HOLD detected: {} with initial {:?}", hold_id, initial);
 
                 // Return HoldRef - bridge will render reactively
@@ -1276,6 +1326,58 @@ impl BoonDdRuntime {
         }
     }
 
+    /// Extract the path to a LinkRef from an event expression.
+    /// Handles patterns like `item.todo_elements.remove_todo_button.event.press`
+    /// Returns the path between binding and "event": ["todo_elements", "remove_todo_button"]
+    fn extract_linkref_path_from_event(
+        &self,
+        binding: &str,
+        event_expr: &Expression,
+    ) -> Option<Vec<String>> {
+        // The expression is typically an Alias like: item.todo_elements.remove_todo_button.event.press
+        // We need to extract the path between the binding and "event"
+        match event_expr {
+            Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
+                // Find "event" in the path
+                if let Some(event_idx) = parts.iter().position(|p| p.as_ref() == "event") {
+                    // Check that it starts with the binding
+                    if parts.first().map(|p| p.as_ref()) == Some(binding) {
+                        // Extract path between binding (index 0) and "event" (event_idx)
+                        // E.g., ["item", "todo_elements", "remove_todo_button", "event", "press"]
+                        //         0       1                2                     3       4
+                        // We want [1..3] = ["todo_elements", "remove_todo_button"]
+                        if event_idx > 1 {
+                            let path: Vec<String> = parts[1..event_idx]
+                                .iter()
+                                .map(|p| p.to_string())
+                                .collect();
+                            return Some(path);
+                        }
+                    }
+                }
+                None
+            }
+            Expression::FieldAccess { path } => {
+                // Similar logic for FieldAccess
+                if let Some(event_idx) = path.iter().position(|p| p.as_ref() == "event") {
+                    if path.first().map(|p| p.as_ref()) == Some(binding) && event_idx > 1 {
+                        let result: Vec<String> = path[1..event_idx]
+                            .iter()
+                            .map(|p| p.to_string())
+                            .collect();
+                        return Some(result);
+                    }
+                }
+                None
+            }
+            Expression::Pipe { from, .. } => {
+                // The from side might be the event path
+                self.extract_linkref_path_from_event(binding, &from.node)
+            }
+            _ => None,
+        }
+    }
+
     /// Extract field filter pattern from predicate expression.
     /// Handles patterns like `item.completed` where `item` is the binding name.
     /// Returns (field_name, filter_value) if pattern matches.
@@ -1319,6 +1421,132 @@ impl BoonDdRuntime {
                     }
                 }
                 None
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract editing event bindings from a HOLD body.
+    /// Parses expressions like:
+    /// ```boon
+    /// LATEST {
+    ///     todo_elements.todo_title_element.event.double_click |> THEN { True }
+    ///     todo_elements.editing_todo_title_element.event.key_down.key |> WHEN { Enter => False }
+    ///     todo_elements.editing_todo_title_element.event.blur |> THEN { False }
+    /// }
+    /// ```
+    /// Returns EditingEventBindings with paths extracted from the event expressions.
+    fn extract_editing_bindings(&self, body: &Expression) -> super::io::EditingEventBindings {
+        let mut bindings = super::io::EditingEventBindings::default();
+
+        // Helper to extract inputs from LATEST
+        let inputs = match body {
+            Expression::Latest { inputs, .. } => inputs.iter().map(|s| &s.node).collect::<Vec<_>>(),
+            _ => vec![body], // Single expression, not wrapped in LATEST
+        };
+
+        for input in &inputs {
+            // Look for patterns like: path.event.X |> THEN/WHEN { value }
+            if let Some((event_path, event_type, result_value)) = self.extract_event_binding(input) {
+                match (event_type.as_str(), result_value) {
+                    // double_click |> THEN { True } → edit trigger
+                    ("double_click", Some(true)) => {
+                        bindings.edit_trigger_path = event_path;
+                    }
+                    // key_down |> WHEN { Enter => False, Escape => False } → exit on key
+                    ("key_down", Some(false)) => {
+                        bindings.exit_key_path = event_path;
+                    }
+                    // blur |> THEN { False } → exit on blur
+                    ("blur", Some(false)) => {
+                        bindings.exit_blur_path = event_path;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        bindings
+    }
+
+    /// Extract event binding from an expression like `path.event.X |> THEN/WHEN { value }`.
+    /// Returns (path_to_linkref, event_type, result_bool_value).
+    fn extract_event_binding(&self, expr: &Expression) -> Option<(Vec<String>, String, Option<bool>)> {
+        match expr {
+            Expression::Pipe { from, to } => {
+                // Check if piping to THEN { True/False }
+                if let Expression::Then { body } = &to.node {
+                    if let Some((path, event_type)) = self.extract_event_path(&from.node) {
+                        let result_value = self.extract_bool_literal(&body.node);
+                        return Some((path, event_type, result_value));
+                    }
+                }
+                // Check if piping to WHEN { Enter => False, ... }
+                if let Expression::When { arms } = &to.node {
+                    if let Some((path, event_type)) = self.extract_event_path(&from.node) {
+                        // Check if arms produce False for Enter/Escape
+                        let has_false_on_keys = arms.iter().any(|arm| {
+                            // Tags in WHEN arms are Literal::Tag, not TaggedObject
+                            if let Pattern::Literal(Literal::Tag(name)) = &arm.pattern {
+                                (name.as_ref() == "Enter" || name.as_ref() == "Escape") && self.extract_bool_literal(&arm.body.node) == Some(false)
+                            } else {
+                                false
+                            }
+                        });
+                        if has_false_on_keys {
+                            return Some((path, event_type, Some(false)));
+                        }
+                    }
+                }
+                // Recurse into nested pipes
+                self.extract_event_binding(&from.node)
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract the path and event type from an expression like `todo_elements.todo_title_element.event.double_click`.
+    /// Returns (["todo_elements", "todo_title_element"], "double_click").
+    fn extract_event_path(&self, expr: &Expression) -> Option<(Vec<String>, String)> {
+        match expr {
+            Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
+                // Find "event" in the path, extract path before it and event type after
+                if let Some(event_idx) = parts.iter().position(|p| p.as_ref() == "event") {
+                    if event_idx > 0 && event_idx + 1 < parts.len() {
+                        let path: Vec<String> = parts[..event_idx].iter().map(|p| p.to_string()).collect();
+                        let event_type = parts[event_idx + 1].to_string();
+                        return Some((path, event_type));
+                    }
+                }
+                None
+            }
+            Expression::FieldAccess { path } => {
+                if let Some(event_idx) = path.iter().position(|p| p.as_ref() == "event") {
+                    if event_idx > 0 && event_idx + 1 < path.len() {
+                        let result: Vec<String> = path[..event_idx].iter().map(|p| p.to_string()).collect();
+                        let event_type = path[event_idx + 1].to_string();
+                        return Some((result, event_type));
+                    }
+                }
+                None
+            }
+            Expression::Pipe { from, .. } => {
+                // Recurse into the from side (event path might be piped)
+                self.extract_event_path(&from.node)
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract a boolean literal from an expression.
+    fn extract_bool_literal(&self, expr: &Expression) -> Option<bool> {
+        match expr {
+            Expression::Literal(Literal::Tag(s)) => {
+                match s.as_str() {
+                    "True" => Some(true),
+                    "False" => Some(false),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -1647,6 +1875,22 @@ impl BoonDdRuntime {
                     };
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     default_value = Some(Arc::new(body_result));
+                } else if let Pattern::Alias { name } = &arm.pattern {
+                    // Alias pattern - treat as catch-all but bind the HoldRef to the alias name
+                    let mut match_runtime = BoonDdRuntime {
+                        variables: self.variables.clone(),
+                        functions: self.functions.clone(),
+                        passed_context: self.passed_context.clone(),
+                        link_counter: 0,
+                        hold_counter: 0,
+                        context_path: Vec::new(),
+                        last_list_source: None,
+                    };
+                    // Bind the alias name to the HoldRef value
+                    match_runtime.variables.insert(name.to_string(), value.clone());
+                    zoon::println!("[DD_EVAL] HoldRef WHEN: binding '{}' to HoldRef for body evaluation", name);
+                    let body_result = match_runtime.eval_expression(&arm.body.node);
+                    default_value = Some(Arc::new(body_result));
                 } else if let Some(pv) = pattern_value {
                     // Evaluate the body for this pattern
                     let mut match_runtime = BoonDdRuntime {
@@ -1674,7 +1918,7 @@ impl BoonDdRuntime {
         }
 
         // If input is a ComputedRef (boolean computation), create a WhileRef with the computation
-        // This handles: completed_todos_count > 0 |> WHILE { True => button, False => NoElement }
+        // This handles: completed_list_count > 0 |> WHILE { True => button, False => NoElement }
         if let DdValue::ComputedRef { computation, source_hold } = value {
             // Pre-evaluate all arms for the bridge to render reactively
             let mut evaluated_arms = Vec::new();
@@ -1683,6 +1927,8 @@ impl BoonDdRuntime {
             for arm in arms {
                 let pattern_value = self.pattern_to_value(&arm.pattern);
 
+                // Alias patterns (like `count => body`) are catch-all patterns that bind the value
+                // They should be treated like wildcards, but with the value bound to the alias name
                 if matches!(arm.pattern, Pattern::WildCard) {
                     let mut match_runtime = BoonDdRuntime {
                         variables: self.variables.clone(),
@@ -1693,6 +1939,23 @@ impl BoonDdRuntime {
                         context_path: Vec::new(),
                         last_list_source: None,
                     };
+                    let body_result = match_runtime.eval_expression(&arm.body.node);
+                    default_value = Some(Arc::new(body_result));
+                } else if let Pattern::Alias { name } = &arm.pattern {
+                    // Alias pattern - treat as catch-all but bind the ComputedRef to the alias name
+                    // This enables patterns like: count |> WHEN { n => TEXT { {n} items } }
+                    let mut match_runtime = BoonDdRuntime {
+                        variables: self.variables.clone(),
+                        functions: self.functions.clone(),
+                        passed_context: self.passed_context.clone(),
+                        link_counter: 0,
+                        hold_counter: 0,
+                        context_path: Vec::new(),
+                        last_list_source: None,
+                    };
+                    // Bind the alias name to the ComputedRef value
+                    match_runtime.variables.insert(name.to_string(), value.clone());
+                    zoon::println!("[DD_EVAL] ComputedRef WHEN: binding '{}' to ComputedRef for body evaluation", name);
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     default_value = Some(Arc::new(body_result));
                 } else if let Some(pv) = pattern_value {
@@ -1758,14 +2021,6 @@ impl BoonDdRuntime {
                         context_path: Vec::new(),
                         last_list_source: None,
                     };
-                    // Debug: log the 'todo' variable if present to trace LinkRef binding
-                    if let Some(todo_val) = match_runtime.variables.get("todo") {
-                        if let Some(todo_elements) = todo_val.get("todo_elements") {
-                            if let Some(remove_btn) = todo_elements.get("remove_todo_button") {
-                                zoon::println!("[DD_EVAL] WhileRef arm eval: todo.todo_elements.remove_todo_button = {:?}", remove_btn);
-                            }
-                        }
-                    }
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     evaluated_arms.push((pv, body_result));
                 }
@@ -2120,7 +2375,7 @@ impl BoonDdRuntime {
                         }
                     }
                     // ComputedRef == ComputedRef => ComputedRef::Equal
-                    // Used for: all_completed: completed_todos_count == todos_count
+                    // Used for: all_completed: completed_list_count == list_count
                     (DdValue::ComputedRef { source_hold, .. }, DdValue::ComputedRef { .. }) => {
                         DdValue::computed_ref(
                             ComputedType::Equal {
@@ -2131,8 +2386,8 @@ impl BoonDdRuntime {
                         )
                     }
                     // ComputedRef == non-ComputedRef (e.g., Int) => ComputedRef::Equal
-                    // Used for: all_completed: todos_count == completed_todos_count
-                    // where todos_count is Int and completed_todos_count is ComputedRef
+                    // Used for: all_completed: list_count == completed_list_count
+                    // where list_count is Int and completed_list_count is ComputedRef
                     (DdValue::ComputedRef { source_hold, .. }, _) => {
                         #[cfg(debug_assertions)]
                         zoon::println!("[DD_EVAL] Reactive equality: ComputedRef({}) == {:?}", source_hold, b);
@@ -2177,7 +2432,7 @@ impl BoonDdRuntime {
                 let b = self.eval_expression(&operand_b.node);
                 match (&a, &b) {
                     // ComputedRef > 0 => ComputedRef::GreaterThanZero
-                    // Used for: show_clear_completed: completed_todos_count > 0
+                    // Used for: show_clear_completed: completed_list_count > 0
                     (DdValue::ComputedRef { source_hold, .. }, DdValue::Number(n)) if n.0 == 0.0 => {
                         DdValue::computed_ref(
                             ComputedType::GreaterThanZero {
@@ -2217,11 +2472,13 @@ impl BoonDdRuntime {
             ArithmeticOperator::Subtract { operand_a, operand_b } => {
                 let a = self.eval_expression(&operand_a.node);
                 let b = self.eval_expression(&operand_b.node);
+                zoon::println!("[DD_EVAL] Subtract: a={:?}, b={:?}", a, b);
                 match (&a, &b) {
                     (DdValue::Number(x), DdValue::Number(y)) => DdValue::float(x.0 - y.0),
                     // ComputedRef - ComputedRef => ComputedRef::Subtract
-                    // Used for: active_todos_count: todos_count - completed_todos_count
+                    // Used for: active_list_count: list_count - completed_list_count
                     (DdValue::ComputedRef { source_hold, .. }, DdValue::ComputedRef { .. }) => {
+                        zoon::println!("[DD_EVAL] Creating ComputedRef(Subtract) with source_hold={}", source_hold);
                         DdValue::computed_ref(
                             ComputedType::Subtract {
                                 left: Box::new(a.clone()),
@@ -2230,7 +2487,10 @@ impl BoonDdRuntime {
                             source_hold.clone(),
                         )
                     }
-                    _ => DdValue::Unit,
+                    _ => {
+                        zoon::println!("[DD_EVAL] Subtract: returning Unit (no match)");
+                        DdValue::Unit
+                    }
                 }
             }
             ArithmeticOperator::Multiply { operand_a, operand_b } => {
@@ -2302,12 +2562,24 @@ impl BoonDdRuntime {
                 // PASSED value - access the passed_context and navigate through fields
                 let mut current = self.passed_context.clone().unwrap_or(DdValue::Unit);
 
+                // Debug: log PASSED access path
+                let path_str = extra_parts.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(".");
+                if path_str.contains("active_todos") {
+                    zoon::println!("[DD_EVAL] PASSED.{} access starting", path_str);
+                    if let DdValue::Object(obj) = &current {
+                        zoon::println!("[DD_EVAL] PASSED context keys: {:?}", obj.keys().cloned().collect::<Vec<_>>());
+                    }
+                }
+
                 // Track list source for PASSED context too
                 let mut list_source_name: Option<String> = None;
 
                 // Navigate through extra_parts (field accesses after PASSED)
                 for field in extra_parts {
                     current = current.get(field.as_str()).cloned().unwrap_or(DdValue::Unit);
+                    if path_str.contains("active_todos") {
+                        zoon::println!("[DD_EVAL] PASSED.{}: after field '{}' = {:?}", path_str, field, current);
+                    }
                     if matches!(current, DdValue::List(_)) {
                         list_source_name = Some(field.to_string());
                     }

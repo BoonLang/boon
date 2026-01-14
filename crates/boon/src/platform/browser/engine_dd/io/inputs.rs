@@ -20,8 +20,8 @@ pub enum DynamicLinkAction {
     EditingHandler { editing_hold: String, title_hold: String },
     /// Update hold state to match hover state (true/false)
     HoverState(String),
-    /// Remove a list item by link_id (for delete button on dynamically added todos)
-    /// The link_id identifies which item to remove by matching its remove_todo_button LinkRef
+    /// Remove a list item by link_id (for delete buttons on dynamically added items)
+    /// The link_id identifies which item to remove by matching its remove button's LinkRef
     RemoveListItem { link_id: String },
 }
 
@@ -133,6 +133,14 @@ pub fn clear_dynamic_link_actions() {
     });
 }
 
+/// Get the action registered for a link ID.
+/// Used when cloning templates to replicate actions for new LinkRefs.
+pub fn get_dynamic_link_action(link_id: &str) -> Option<DynamicLinkAction> {
+    DYNAMIC_LINK_ACTIONS.with(|cell| {
+        cell.borrow().get(link_id).cloned() // ALLOWED: IO layer
+    })
+}
+
 /// Check if a link has a dynamic action and execute it.
 /// Returns true if the action was handled.
 fn check_dynamic_link_action(link_id: &str) -> bool {
@@ -180,8 +188,8 @@ fn check_dynamic_link_action(link_id: &str) -> bool {
                     // Fire via global dispatcher with link_id format (not index, since indices shift)
                     GLOBAL_DISPATCHER.with(|disp_cell| {
                         if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
-                            injector.fire_link_text(LinkId::new("dynamic_todo_remove"), format!("remove:{}", remove_link_id));
-                            zoon::println!("[DD Dispatcher] Fired dynamic_todo_remove with remove:{}", remove_link_id);
+                            injector.fire_link_text(LinkId::new("dynamic_list_remove"), format!("remove:{}", remove_link_id));
+                            zoon::println!("[DD Dispatcher] Fired dynamic_list_remove with remove:{}", remove_link_id);
                         }
                     });
                 }
@@ -198,7 +206,7 @@ fn check_dynamic_link_action(link_id: &str) -> bool {
 fn check_router_mapping(link_id: &str) -> bool {
     ROUTER_MAPPINGS.with(|cell| {
         if let Some(route) = cell.borrow().get(link_id) { // ALLOWED: IO layer
-            // Update filter state based on route (for reactive todo list filtering)
+            // Update filter state based on route (for reactive list filtering)
             super::outputs::set_filter_from_route(route);
 
             #[cfg(target_arch = "wasm32")]
@@ -225,7 +233,7 @@ fn check_router_mapping(link_id: &str) -> bool {
 /// Used by the bridge when button events occur.
 pub fn fire_global_link(link_id: &str) {
     zoon::println!("[DD fire_global_link] CALLED with link_id={}", link_id);
-    // Check if this link has a dynamic action (for dynamic todo editing)
+    // Check if this link has a dynamic action (for dynamic list item editing)
     if check_dynamic_link_action(link_id) {
         // Action executed directly, no need to fire DD event
         return;
@@ -263,7 +271,7 @@ pub fn fire_global_link_with_text(link_id: &str, text: &str) {
 /// Fire a link event with a boolean value.
 /// Used by the bridge when hover state changes.
 pub fn fire_global_link_with_bool(link_id: &str, value: bool) {
-    // Check if this link has a HoverState action (for dynamic todo hover)
+    // Check if this link has a HoverState action (for dynamic list item hover)
     let handled = DYNAMIC_LINK_ACTIONS.with(|cell| {
         if let Some(action) = cell.borrow().get(link_id).cloned() { // ALLOWED: IO layer
             if let DynamicLinkAction::HoverState(hold_id) = action {

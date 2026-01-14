@@ -10,7 +10,33 @@ use super::dd_interpreter::{DdContext, DdResult};
 use super::dd_value::DdValue;
 use zoon::*;
 
-use super::io::{fire_global_link, fire_global_link_with_bool, fire_global_blur, fire_global_key_down, hold_states_signal, get_hold_value, toggle_hold_bool};
+use super::io::{fire_global_link, fire_global_link_with_bool, fire_global_blur, fire_global_key_down, hold_states_signal, get_hold_value, toggle_hold_bool, get_list_var_name, get_checkbox_toggle_holds};
+
+/// Generic helper to check if a list item is completed.
+/// Uses checkbox toggle HOLD detection (no hardcoded field names).
+fn is_item_completed_in_states(item: &DdValue, states: &std::collections::HashMap<String, DdValue>) -> bool {
+    let toggle_holds = get_checkbox_toggle_holds();
+    if let DdValue::Object(obj) = item {
+        for (_, value) in obj.iter() {
+            match value {
+                DdValue::HoldRef(hold_id) => {
+                    // Check if this is a checkbox toggle hold or dynamic hold
+                    if toggle_holds.contains(&hold_id.to_string()) || hold_id.starts_with("dynamic_") {
+                        // Look up the value in states
+                        return match states.get(hold_id.as_ref()) {
+                            Some(DdValue::Bool(true)) => true,
+                            Some(DdValue::Tagged { tag, .. }) if tag.as_ref() == "True" => true,
+                            _ => false,
+                        };
+                    }
+                }
+                DdValue::Bool(b) => return *b,
+                _ => {}
+            }
+        }
+    }
+    false
+}
 
 /// Helper function to get the variant name of a DdValue for debug logging.
 fn dd_value_variant_name(value: &DdValue) -> &'static str {
@@ -66,18 +92,7 @@ pub fn clear_dd_text_input_value() {
     }
 }
 
-/// Get the value of a dynamic todo edit input by index.
-/// Used when Enter is pressed to capture the edited title.
-#[cfg(target_arch = "wasm32")]
-fn get_dynamic_todo_edit_value(index: usize) -> Option<String> {
-    use zoon::*;
-    let input_id = format!("dynamic_todo_edit_input_{}", index);
-    document()
-        .get_element_by_id(&input_id)
-        .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
-        .map(|input| input.value().trim().to_string())
-        .filter(|s| !s.is_empty())
-}
+// REMOVED: get_dynamic_item_edit_value - dead code (render_dynamic_item was removed)
 
 /// Convert a DdValue Oklch color to CSS color string.
 /// Returns None if the color should be invisible (alpha=0 or broken WhileRef).
@@ -242,39 +257,27 @@ fn render_dd_value(value: &DdValue) -> RawElOrText {
         }
 
         DdValue::Text(s) => {
-            // Check if this is an "N items left" pattern that should be reactive
             let text_str = s.to_string();
+            // Check if this is an "N items left" pattern that should be reactive
             if text_str.ends_with(" items left") || text_str.ends_with(" item left") {
-                // Make this reactive based on "todos" HOLD which is the authoritative source
+                // Make this reactive based on list HOLD which is the authoritative source
+                let list_name = get_list_var_name();
                 return El::new()
                     .child_signal(
                         hold_states_signal()
                             .map(move |states| {
-                                if !states.contains_key("todos") {
-                                    // No todos HOLD, fall back to static text
+                                if !states.contains_key(&list_name) {
+                                    // No list HOLD, fall back to static text
                                     return Text::new(text_str.clone());
                                 }
 
-                                // Count active (not completed) items from "todos" HOLD
-                                // The todos list is authoritative - after Clear completed, it only contains remaining items
-                                let total_active = match states.get("todos") {
-                                    Some(DdValue::List(todos)) => {
-                                        todos.iter().filter(|todo| {
-                                            // Check completed field - could be HoldRef or Bool
-                                            match todo.get("completed") {
-                                                // Completed via direct Bool
-                                                Some(DdValue::Bool(true)) => false,
-                                                // Completed via HoldRef - look up the HOLD value
-                                                Some(DdValue::HoldRef(hold_id)) => {
-                                                    match states.get(hold_id.as_ref()) {
-                                                        Some(DdValue::Bool(true)) => false,
-                                                        Some(DdValue::Tagged { tag, .. }) if tag.as_ref() == "True" => false,
-                                                        _ => true,  // not completed
-                                                    }
-                                                }
-                                                // No completed field or other - assume active
-                                                _ => true,
-                                            }
+                                // Count active (not completed) items from list HOLD
+                                // Uses generic checkbox toggle detection (no hardcoded field names)
+                                let total_active = match states.get(&list_name) {
+                                    Some(DdValue::List(items)) => {
+                                        items.iter().filter(|item| {
+                                            // Not completed = active
+                                            !is_item_completed_in_states(item, &states)
                                         }).count()
                                     }
                                     _ => 0,
@@ -500,6 +503,24 @@ fn render_dd_value(value: &DdValue) -> RawElOrText {
 
                             // No match - use default if available
                             if let Some(ref def) = default {
+                                // For numeric computations (like Subtract for "items left"),
+                                // use the computed value to render reactive text
+                                if let Some(DdValue::Number(n)) = current_value {
+                                    if let Some(ref comp) = computation {
+                                        use super::dd_value::ComputedType;
+                                        // Check if this is a list-related count computation
+                                        let is_list_count = matches!(comp,
+                                            ComputedType::Subtract { .. } |
+                                            ComputedType::ListCountHold { .. } |
+                                            ComputedType::ListCountWhereHold { .. }
+                                        );
+                                        if is_list_count {
+                                            let count = n.0 as i64;
+                                            let item_text = if count == 1 { "item" } else { "items" };
+                                            return Text::new(format!("{} {} left", count, item_text)).unify();
+                                        }
+                                    }
+                                }
                                 return render_dd_value(def.as_ref());
                             }
 
@@ -734,11 +755,11 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) ->
             _ => None,
         });
 
-    // Check if this is a todo list (Ul tag) - needs reactive filtering
+    // Check if this is a list (Ul tag) - needs reactive filtering
     let element_tag = fields
         .get("element")
         .and_then(|e| e.get("tag"));
-    let is_todo_list = element_tag
+    let is_filterable_list = element_tag
         .map(|t| matches!(t, DdValue::Tagged { tag, .. } if tag.as_ref() == "Ul"))
         .unwrap_or(false);
 
@@ -776,10 +797,10 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) ->
             .unify();
     }
 
-    // If this is a todo list (Ul), render with reactive filtering
-    if is_todo_list {
+    // If this is a list (Ul), render with reactive filtering
+    if is_filterable_list {
         if let Some(DdValue::List(items)) = items_value {
-            return render_todo_list_filtered(items.clone(), gap);
+            return render_filtered_list(items.clone(), gap);
         }
     }
 
@@ -931,21 +952,34 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) ->
     }
 }
 
-/// Extract the checkbox HoldRef from a todo item, if present.
-fn get_todo_checkbox_hold_id(item: &DdValue) -> Option<String> {
+/// Extract the checkbox/completed HoldRef from a list item, if present.
+/// Uses generic detection: finds boolean HoldRef that's in checkbox_toggle_holds or is dynamic.
+/// No hardcoded field names - works with any object structure.
+fn get_item_checkbox_hold_id(item: &DdValue) -> Option<String> {
+    let toggle_holds = get_checkbox_toggle_holds();
     match item {
-        // Format 1: Todo object from HOLD with completed: HoldRef
+        // Format 1: Object with any boolean HoldRef that's a checkbox toggle
         DdValue::Object(obj) => {
-            if let Some(DdValue::HoldRef(hold_id)) = obj.get("completed") {
-                return Some(hold_id.to_string());
+            for (_, value) in obj.iter() {
+                if let DdValue::HoldRef(hold_id) = value {
+                    // Check if this is a known checkbox toggle or dynamic hold
+                    if toggle_holds.contains(&hold_id.to_string()) || hold_id.starts_with("dynamic_") {
+                        // Verify it's a boolean hold
+                        if let Some(current) = get_hold_value(hold_id) {
+                            if matches!(current, DdValue::Bool(_)) {
+                                return Some(hold_id.to_string());
+                            }
+                        }
+                    }
+                }
             }
             None
         }
-        // Format 2: Element from document with checkbox inside items list
+        // Format 2: Element with checkbox inside items list
         DdValue::Tagged { tag, fields } if tag.as_ref() == "Element" => {
             if let Some(DdValue::List(items)) = fields.get("items") {
                 for sub_item in items.iter() {
-                    // Look for checkbox element
+                    // Look for checkbox element (generic - uses _element_type tag)
                     if let DdValue::Tagged { tag, fields } = sub_item {
                         if tag.as_ref() == "Element" {
                             if let Some(DdValue::Text(elem_type)) = fields.get("_element_type") {
@@ -965,21 +999,27 @@ fn get_todo_checkbox_hold_id(item: &DdValue) -> Option<String> {
     }
 }
 
-/// Extract the title HoldRef ID from a todo item structure.
-/// Returns the hold_id that contains the actual title text.
-fn get_todo_title_hold_id(item: &DdValue) -> Option<String> {
+/// Extract the title/label HoldRef ID from a list item structure.
+/// Uses generic detection: finds text HoldRef (no hardcoded field names).
+fn get_item_title_hold_id(item: &DdValue) -> Option<String> {
     match item {
-        // Format 1: Todo object from HOLD with title: HoldRef
+        // Format 1: Object with any text HoldRef
         DdValue::Object(obj) => {
-            if let Some(DdValue::HoldRef(hold_id)) = obj.get("title") {
-                return Some(hold_id.to_string());
+            for (_, value) in obj.iter() {
+                if let DdValue::HoldRef(hold_id) = value {
+                    // Check if this hold contains text
+                    if let Some(current) = get_hold_value(hold_id) {
+                        if matches!(current, DdValue::Text(_)) {
+                            return Some(hold_id.to_string());
+                        }
+                    }
+                }
             }
             None
         }
-        // Format 2: Element from document with WhileRef containing label HoldRef
-        // Todo item structure is complex:
-        // - Element (stripe, Row) with items: [checkbox, WhileRef, Unit]
-        // - The WhileRef has: False arm → label Element with label: HoldRef("hold_9")
+        // Format 2: Element with WhileRef containing label HoldRef
+        // Item structure: Element (Row) with items: [checkbox, WhileRef, ...]
+        // The WhileRef has: False arm → label Element with label: HoldRef
         DdValue::Tagged { tag, fields } if tag.as_ref() == "Element" => {
             if let Some(DdValue::List(items)) = fields.get("items") {
                 for sub_item in items.iter() {
@@ -1010,72 +1050,30 @@ fn get_todo_title_hold_id(item: &DdValue) -> Option<String> {
     }
 }
 
-/// Extract the click link ID from a todo item's checkbox.
-fn get_todo_click_link_id(item: &DdValue) -> Option<String> {
-    match item {
-        // Format 1: Todo object from HOLD with todo_elements.todo_checkbox: LinkRef
-        DdValue::Object(obj) => {
-            if let Some(DdValue::Object(elements)) = obj.get("todo_elements") {
-                if let Some(DdValue::LinkRef(link_id)) = elements.get("todo_checkbox") {
-                    return Some(link_id.to_string());
-                }
-            }
-            None
-        }
-        // Format 2: Tagged Element structure from document
-        // Todo item structure: Tagged { tag: "Element", fields: { items: [...checkbox...] } }
-        DdValue::Tagged { tag, fields } if tag.as_ref() == "Element" => {
-            if let Some(DdValue::List(items)) = fields.get("items") {
-                for sub_item in items.iter() {
-                    // Look for checkbox element
-                    if let DdValue::Tagged { tag, fields } = sub_item {
-                        if tag.as_ref() == "Element" {
-                            if let Some(DdValue::Text(elem_type)) = fields.get("_element_type") {
-                                if elem_type.as_ref() == "checkbox" {
-                                    // Get click link from element.event.click
-                                    if let Some(link_id) = fields
-                                        .get("element")
-                                        .and_then(|e| e.get("event"))
-                                        .and_then(|e| e.get("click"))
-                                    {
-                                        if let DdValue::LinkRef(id) = link_id {
-                                            return Some(id.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
+/// Render a list with reactive filtering based on selected_filter.
+/// Also observes list HOLD for dynamically added items.
+fn render_filtered_list(items: std::sync::Arc<Vec<DdValue>>, gap: u32) -> RawElOrText {
+    use super::io::ListFilter;
 
-/// Render a todo list with reactive filtering based on selected_filter.
-/// Also observes "todos" HOLD for dynamically added items.
-fn render_todo_list_filtered(items: std::sync::Arc<Vec<DdValue>>, gap: u32) -> RawElOrText {
-    use super::io::TodoFilter;
-
-    zoon::println!("[DD render_todo_list_filtered] CALLED with {} items", items.len());
+    zoon::println!("[DD render_filtered_list] CALLED with {} items", items.len());
     for (idx, item) in items.iter().enumerate() {
-        zoon::println!("[DD render_todo_list_filtered] item[{}] variant={}", idx, dd_value_variant_name(item));
+        zoon::println!("[DD render_filtered_list] item[{}] variant={}", idx, dd_value_variant_name(item));
     }
 
     // Capture the initial static items for the closure
     let static_items = items.clone();
     let static_items_count = items.len();
+    let list_name = get_list_var_name();
+    let list_name_inner = list_name.clone();
 
     // ARCHITECTURE FIX: Render items ONCE, don't re-render on every state change
     // Each item handles its own reactivity via signals (checked_signal, etc.)
-    // Re-render on: filter changes OR todos list changes (add/remove)
+    // Re-render on: filter changes OR list changes (add/remove)
     // Use El wrapper because Column doesn't have child_signal
     //
     // Use map_ref! to combine filter signal with hold_states, then dedupe on
-    // (filter, todos_len, elems_len) tuple - this ensures we only re-render when
-    // filter changes OR todos are added/removed, NOT on every checkbox toggle.
+    // (filter, list_len, elems_len) tuple - this ensures we only re-render when
+    // filter changes OR items are added/removed, NOT on every checkbox toggle.
     use zoon::map_ref;
 
     El::new()
@@ -1084,52 +1082,52 @@ fn render_todo_list_filtered(items: std::sync::Arc<Vec<DdValue>>, gap: u32) -> R
                 let filter = super::io::selected_filter_signal(),
                 let states = super::io::hold_states_signal() => {
                     // Derive trigger values from states
-                    let todos_len = match states.get("todos") {
-                        Some(DdValue::List(todos)) => todos.len(),
+                    let list_len = match states.get(&list_name) {
+                        Some(DdValue::List(items)) => items.len(),
                         _ => 0,
                     };
-                    let elems_len = match states.get("todos_elements") {
+                    let elems_len = match states.get("list_elements") {
                         Some(DdValue::List(elements)) => elements.len(),
                         _ => 0,
                     };
-                    (filter.clone(), todos_len, elems_len)
+                    (filter.clone(), list_len, elems_len)
                 }
             }
             .dedupe_cloned()  // Only re-emit when (filter, len, len) tuple changes
-            .map(move |(filter, _todos_len, _elems_len)| {
+            .map(move |(filter, _list_len, _elems_len)| {
                 let static_items_clone = static_items.clone();
                 // Get current state snapshot for rendering
                 let states = super::io::get_all_hold_states();
                     // Return the element directly, not a signal
                         let mut rendered: Vec<RawElOrText> = Vec::new();
 
-                        // Get the current list of todos from HOLD (source of truth after any changes)
-                        let todos_hold = states.get("todos");
+                        // Get the current list of items from HOLD (source of truth after any changes)
+                        let list_hold = states.get(&list_name_inner);
 
-                        // Build a set of title HoldRefs that are still in the todos HOLD
+                        // Build a set of title HoldRefs that are still in the list HOLD
                         // Use title HoldRef because it never changes (unlike completed which becomes Bool after toggle)
-                        let active_title_ids: std::collections::HashSet<String> = match todos_hold {
-                            Some(DdValue::List(todos)) => {
-                                todos.iter()
-                                    .filter_map(|item| get_todo_title_hold_id(item))
+                        let active_title_ids: std::collections::HashSet<String> = match list_hold {
+                            Some(DdValue::List(items)) => {
+                                items.iter()
+                                    .filter_map(|item| get_item_title_hold_id(item))
                                     .collect()
                             }
                             _ => std::collections::HashSet::new(),
                         };
-                        let has_todos_hold = todos_hold.is_some();
+                        let has_list_hold = list_hold.is_some();
 
-                        // 1. Render static items (initial todos from document)
+                        // 1. Render static items (initial items from document)
                         for (idx, item) in static_items_clone.iter().enumerate() {
                             // Get the checkbox HoldRef to determine completion status
-                            let hold_id = get_todo_checkbox_hold_id(item);
-                            let title_hold_id = get_todo_title_hold_id(item);
+                            let hold_id = get_item_checkbox_hold_id(item);
+                            let title_hold_id = get_item_title_hold_id(item);
 
-                            // If todos HOLD exists, only render items that are still in it
+                            // If list HOLD exists, only render items that are still in it
                             // (items may be removed by "Clear completed" or delete button)
-                            if has_todos_hold {
+                            if has_list_hold {
                                 if let Some(ref tid) = title_hold_id {
                                     if !active_title_ids.contains(tid) {
-                                        // This item was removed from the todos HOLD, skip it
+                                        // This item was removed from the list HOLD, skip it
                                         continue;
                                     }
                                 }
@@ -1146,27 +1144,27 @@ fn render_todo_list_filtered(items: std::sync::Arc<Vec<DdValue>>, gap: u32) -> R
 
                             // Filter based on selected filter
                             let should_show = match &filter {
-                                TodoFilter::All => true,
-                                TodoFilter::Active => !is_completed,
-                                TodoFilter::Completed => is_completed,
+                                ListFilter::All => true,
+                                ListFilter::Active => !is_completed,
+                                ListFilter::Completed => is_completed,
                             };
 
                             if should_show {
-                                // Use render_dd_value to properly render the full todo item structure
+                                // Use render_dd_value to properly render the full list item structure
                                 // This handles WhileRef for editing mode, double_click, hover, etc.
-                                zoon::println!("[DD render_todo_list] rendering static item[{}] variant={}", idx, dd_value_variant_name(item));
+                                zoon::println!("[DD render_filtered_list] rendering static item[{}] variant={}", idx, dd_value_variant_name(item));
                                 rendered.push(render_dd_value(item));
                             }
                         }
 
-                        // 2. Render dynamic items from "todos_elements" HOLD
+                        // 2. Render dynamic items from "list_elements" HOLD
                         // These are Element AST cloned from the template with fresh HoldRef IDs
                         // Get completion status directly from the element's checkbox HoldRef
-                        if let Some(DdValue::List(elements)) = states.get("todos_elements") {
+                        if let Some(DdValue::List(elements)) = states.get("list_elements") {
                             for (index, element) in elements.iter().enumerate() {
                                 // Get completion status directly from element's checkbox HoldRef
-                                // This is more reliable than indexing into todos data
-                                let completed = get_todo_checkbox_hold_id(element)
+                                // This is more reliable than indexing into list data
+                                let completed = get_item_checkbox_hold_id(element)
                                     .and_then(|hold_id| states.get(&hold_id))
                                     .map(|v| match v {
                                         DdValue::Bool(true) => true,
@@ -1177,14 +1175,14 @@ fn render_todo_list_filtered(items: std::sync::Arc<Vec<DdValue>>, gap: u32) -> R
 
                                 // Apply filter
                                 let should_show = match (&filter, completed) {
-                                    (TodoFilter::All, _) => true,
-                                    (TodoFilter::Active, false) => true,
-                                    (TodoFilter::Active, true) => false,
-                                    (TodoFilter::Completed, true) => true,
-                                    (TodoFilter::Completed, false) => false,
+                                    (ListFilter::All, _) => true,
+                                    (ListFilter::Active, false) => true,
+                                    (ListFilter::Active, true) => false,
+                                    (ListFilter::Completed, true) => true,
+                                    (ListFilter::Completed, false) => false,
                                 };
                                 if should_show {
-                                    // Use render_dd_value for unified rendering - no more TodoMVC-specific code!
+                                    // Use render_dd_value for unified rendering - no more list-specific code!
                                     rendered.push(render_dd_value(element));
                                 }
                             }
@@ -1196,355 +1194,6 @@ fn render_todo_list_filtered(items: std::sync::Arc<Vec<DdValue>>, gap: u32) -> R
                         .items(rendered)
                 })
         )
-        .unify()
-}
-
-/// Render a dynamic todo item with editing mode, hover delete, and checkbox toggle
-///
-/// ARCHITECTURAL NOTE: This function exists because ListAppend creates simple data objects
-/// instead of full Element AST structures. The proper fix would be to make ListAppend
-/// evaluate new_todo() and create HoldRefs, enabling render_dd_value for ALL todos.
-/// Until then, this function must produce IDENTICAL output to what render_dd_value
-/// produces for initial todos (same styles as Boon's todo_item function).
-fn render_dynamic_todo(title: &str, completed: bool, editing: bool, index: usize) -> RawElOrText {
-    use super::io::fire_global_link_with_text;
-
-    // Styles from Boon's todo_item():
-    // style: [width: Fill, background: Oklch[lightness: 1], font: [size: 24], padding: [row: 15, column: 10]]
-    // Checkbox uses size: 40 with SVG background
-
-    let checkbox_svg = if completed { CHECKED_SVG } else { UNCHECKED_SVG };
-    let checkbox = Checkbox::new()
-        .checked(completed)
-        .icon(move |_checked_mutable| {
-            // CRITICAL: Use pointer_events_none() so clicks pass through to checkbox parent
-            El::new()
-                .s(zoon::Width::exact(40))
-                .s(zoon::Height::exact(40))
-                .s(zoon::Background::new().url(checkbox_svg))
-                .update_raw_el(|raw_el| raw_el.style("pointer-events", "none"))  // Let clicks pass through
-                .unify()
-        })
-        .label_hidden(title.to_string())
-        .on_click(move || {
-            fire_global_link_with_text("dynamic_todo_toggle", &format!("toggle:{}", index));
-        });
-
-    // Title element - either label (normal mode) or text input (editing mode)
-    let title_owned = title.to_string();
-    let title_element: RawElOrText = if editing {
-        // Editing mode: show text input
-        // CRITICAL: Track editing text in a HOLD so it persists across re-renders
-        // (hover events cause re-renders which would otherwise destroy the input)
-        let editing_text_hold = format!("editing_text_{}", index);
-        let editing_text_hold_for_change = editing_text_hold.clone();
-        let editing_text_hold_for_blur = editing_text_hold.clone();
-        let editing_text_hold_for_keydown = editing_text_hold.clone();
-
-        // Initialize editing text hold with current title if not already set
-        let current_text = super::io::get_hold_value(&editing_text_hold)
-            .and_then(|v| if let super::dd_value::DdValue::Text(t) = v { Some(t.to_string()) } else { None })
-            .unwrap_or_else(|| {
-                // First time entering edit mode for this index - initialize with current title
-                let t = title_owned.clone();
-                super::io::update_hold_state_no_persist(&editing_text_hold, super::dd_value::DdValue::text(t.clone()));
-                t
-            });
-
-        let index_for_blur = index;
-        let index_for_keydown = index;
-        let input_id = format!("dynamic_todo_edit_input_{}", index);
-
-        // Guard: only process blur if the input was ever focused
-        // This prevents spurious blur events when the input is first created
-        let was_focused = std::rc::Rc::new(std::cell::Cell::new(false));
-        let was_focused_for_blur = was_focused.clone();
-
-        TextInput::new()
-            .id(&input_id)
-            .s(zoon::Width::fill())
-            .s(zoon::Font::new()
-                .size(24)
-                .color(hsluv!(0, 0, 42)))  // Oklch lightness 0.42 from Boon todo_item
-            .s(zoon::Padding::new().y(2).x(5))
-            .s(zoon::Outline::inner().color(hsluv!(220, 50, 50)))  // Blue outline for editing
-            .label_hidden("Edit todo")
-            .text(current_text)  // Use tracked editing text (persists across re-renders)
-            .on_focus(move || {
-                // Mark that the input was focused - blur events after this are legitimate
-                was_focused.set(true);
-            })
-            .on_change(move |text| {
-                // Track every keystroke in the editing text HOLD
-                // This ensures typed text persists even if the parent re-renders
-                super::io::update_hold_state_no_persist(&editing_text_hold_for_change, super::dd_value::DdValue::text(text.clone()));
-            })
-            .on_blur(move || {
-                // Only process blur if the input was ever focused
-                // This guards against spurious blur events when the input is first created
-                if !was_focused_for_blur.get() {
-                    return;
-                }
-                // On blur, save from the tracked editing text HOLD
-                let new_title = super::io::get_hold_value(&editing_text_hold_for_blur)
-                    .and_then(|v| if let super::dd_value::DdValue::Text(t) = v {
-                        let s = t.to_string().trim().to_string();
-                        if s.is_empty() { None } else { Some(s) }
-                    } else { None });
-
-                // Clear the editing text hold (we're done editing)
-                super::io::clear_hold_state(&editing_text_hold_for_blur);
-
-                if let Some(title) = new_title {
-                    fire_global_link_with_text("dynamic_todo_save", &format!("save:{}:{}", index_for_blur, title));
-                } else {
-                    // Empty title - just exit without saving (reverts to original)
-                    fire_global_link_with_text("dynamic_todo_edit", &format!("unedit:{}", index_for_blur));
-                }
-            })
-            .on_key_down_event(move |event| {
-                match event.key() {
-                    Key::Enter => {
-                        // Save from the tracked editing text HOLD
-                        let new_title = super::io::get_hold_value(&editing_text_hold_for_keydown)
-                            .and_then(|v| if let super::dd_value::DdValue::Text(t) = v {
-                                let s = t.to_string().trim().to_string();
-                                if s.is_empty() { None } else { Some(s) }
-                            } else { None });
-
-                        // Clear the editing text hold (we're done editing)
-                        super::io::clear_hold_state(&editing_text_hold_for_keydown);
-
-                        if let Some(title) = new_title {
-                            fire_global_link_with_text("dynamic_todo_save", &format!("save:{}:{}", index_for_keydown, title));
-                        } else {
-                            // Empty title - just exit without saving
-                            fire_global_link_with_text("dynamic_todo_edit", &format!("unedit:{}", index_for_keydown));
-                        }
-                    }
-                    Key::Escape => {
-                        // Clear the editing text hold (we're canceling)
-                        super::io::clear_hold_state(&editing_text_hold_for_keydown);
-                        // Cancel editing without saving
-                        fire_global_link_with_text("dynamic_todo_edit", &format!("unedit:{}", index_for_keydown));
-                    }
-                    _ => {}
-                }
-            })
-            .focus(true)  // Auto-focus the input when entering edit mode
-            .update_raw_el(|raw_el| {
-                // For dynamically shown inputs (like editing input), we need to:
-                // 1. Call focus() after insert
-                // 2. Defer with requestAnimationFrame to ensure focus happens after DOM insertion
-                raw_el.after_insert(|el| {
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        use zoon::wasm_bindgen::closure::Closure;
-                        use zoon::wasm_bindgen::JsCast;
-                        // Use double requestAnimationFrame: first lets current render complete,
-                        // second ensures we focus after any other focus operations
-                        let el_clone = el.clone();
-                        let inner_closure = Closure::once(move || {
-                            let _ = el_clone.focus();
-                        });
-                        let outer_closure = Closure::once(move || {
-                            if let Some(window) = zoon::web_sys::window() {
-                                let _ = window.request_animation_frame(inner_closure.as_ref().unchecked_ref());
-                            }
-                            inner_closure.forget();
-                        });
-                        if let Some(window) = zoon::web_sys::window() {
-                            let _ = window.request_animation_frame(outer_closure.as_ref().unchecked_ref());
-                        }
-                        outer_closure.forget();
-                    }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        let _ = el.focus();
-                    }
-                })
-            })
-            .unify()
-    } else {
-        // Normal mode: show label with double-click to edit
-        // Font: size 24, color Oklch[lightness: 0.42] (from Boon todo_item)
-        let index_for_dblclick = index;
-        Label::new()
-            .s(zoon::Font::new()
-                .size(24)
-                .color(if completed {
-                    hsluv!(0, 0, 70)  // lighter gray when completed
-                } else {
-                    hsluv!(0, 0, 42)  // Oklch lightness 0.42 from todo_item
-                }))
-            .s(zoon::Width::fill())
-            .label(title_owned)
-            .on_double_click(move || {
-                // Enter editing mode
-                fire_global_link_with_text("dynamic_todo_edit", &format!("edit:{}", index_for_dblclick));
-            })
-            .unify()
-    };
-
-    // Create a hover state for showing delete button
-    let hovered = Mutable::new(false);
-    let hovered_for_row = hovered.clone();
-    let hovered_for_delete = hovered.clone();
-    let index_for_delete = index;
-
-    // Styles from Boon's todo_item():
-    // gap: 5, width: Fill, background: Oklch[lightness: 1] (white), font: size 24, padding: row 15, column 10
-    Row::new()
-        .s(Gap::new().x(5))
-        .s(zoon::Padding::new().y(15).x(10))
-        .s(zoon::Background::new().color(hsluv!(0, 0, 100)))  // Oklch lightness 1 = white
-        .s(zoon::Font::new().size(24))
-        .s(zoon::Width::fill())
-        .on_hovered_change(move |is_hovered| hovered_for_row.set(is_hovered))
-        .item(checkbox)
-        .item(title_element)
-        .item_signal(hovered_for_delete.signal().map(move |is_hovered| {
-            if is_hovered {
-                // Show delete button when hovered
-                Button::new()
-                    .s(zoon::Width::exact(40))
-                    .s(zoon::Height::exact(40))
-                    .s(zoon::Font::new()
-                        .size(30)
-                        .color(hsluv!(18, 60, 73)))  // Reddish color for delete
-                    .s(zoon::Align::center())  // Center the button content
-                    .label("×")
-                    .on_press(move || {
-                        fire_global_link_with_text("dynamic_todo_remove", &format!("remove:{}", index_for_delete));
-                    })
-                    .unify()
-            } else {
-                El::new().unify()  // Empty placeholder when not hovered
-            }
-        }))
-        .unify()
-}
-
-/// Render a static (initial) todo item with consistent styling matching dynamic todos.
-/// Uses HoldRef for reactive checkbox state and LinkRef for click handling.
-/// title_hold_id: The HOLD ID containing the title text
-/// checkbox_hold_id: The HOLD ID for the checkbox completed state
-fn render_static_todo_item(title_hold_id: &str, checkbox_hold_id: &str, link_id: Option<&str>) -> RawElOrText {
-    let checkbox_hold_id_owned = checkbox_hold_id.to_string();
-    let checkbox_hold_id_for_icon = checkbox_hold_id.to_string();
-    let title_hold_id_owned = title_hold_id.to_string();
-
-    // Create Checkbox component with reactive icon (matches render_dynamic_todo style)
-    // Using Checkbox::new() ensures proper role="checkbox" for accessibility
-    let checkbox = Checkbox::new()
-        .label_hidden("todo checkbox")
-        .checked_signal(
-            hold_states_signal()
-                .map({
-                    let hold_id = checkbox_hold_id_owned.clone();
-                    move |states| {
-                        states.get(&hold_id)
-                            .map(|v| match v {
-                                DdValue::Bool(b) => *b,
-                                DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
-                                _ => false,
-                            })
-                            .unwrap_or(false)
-                    }
-                })
-        )
-        .icon(move |_checked_mutable| {
-            // Reactive icon based on HOLD state
-            // CRITICAL: Use pointer_events_none() so clicks pass through to checkbox parent
-            El::new()
-                .s(zoon::Width::exact(40))
-                .s(zoon::Height::exact(40))
-                .update_raw_el(|raw_el| raw_el.style("pointer-events", "none"))  // Let clicks pass through
-                .child_signal(
-                    hold_states_signal()
-                        .map({
-                            let hold_id = checkbox_hold_id_for_icon.clone();
-                            move |states| {
-                                let checked = states.get(&hold_id)
-                                    .map(|v| match v {
-                                        DdValue::Bool(b) => *b,
-                                        DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
-                                        _ => false,
-                                    })
-                                    .unwrap_or(false);
-                                let svg_url = if checked { CHECKED_SVG } else { UNCHECKED_SVG };
-                                El::new()
-                                    .s(zoon::Width::exact(40))
-                                    .s(zoon::Height::exact(40))
-                                    .s(zoon::Background::new().url(svg_url))
-                                    .update_raw_el(|raw_el| raw_el.style("pointer-events", "none"))  // Let clicks pass through
-                            }
-                        })
-                )
-                .unify()
-        });
-
-    // Add click handler - always toggle HOLD, optionally fire link
-    let checkbox_hold_for_click = checkbox_hold_id_owned.clone();
-    let checkbox_with_click = if let Some(link_id) = link_id {
-        let link_id = link_id.to_string();
-        checkbox.on_click(move || {
-            // CRITICAL: Toggle the HOLD state first, then fire the link
-            // Without toggle_hold_bool, HOLD_STATES doesn't update and
-            // reactive computations (like completed_todos_count) stay stale
-            toggle_hold_bool(&checkbox_hold_for_click);
-            fire_global_link(&link_id);
-        })
-    } else {
-        // No link, just toggle the HOLD directly
-        checkbox.on_click(move || {
-            toggle_hold_bool(&checkbox_hold_for_click);
-        })
-    };
-
-    // Title label - reactive title text and color based on completion state
-    let title_label = El::new()
-        .s(zoon::Width::fill())
-        .child_signal(
-            hold_states_signal()
-                .map({
-                    let checkbox_hold_id = checkbox_hold_id_owned.clone();
-                    let title_hold_id = title_hold_id_owned.clone();
-                    move |states| {
-                        // Get title from title HOLD
-                        let title = states.get(&title_hold_id)
-                            .map(|v| v.to_display_string())
-                            .unwrap_or_default();
-
-                        // Get completed state from checkbox HOLD
-                        let checked = states.get(&checkbox_hold_id)
-                            .map(|v| match v {
-                                DdValue::Bool(b) => *b,
-                                DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
-                                _ => false,
-                            })
-                            .unwrap_or(false);
-                        El::new()
-                            .s(zoon::Font::new()
-                                .size(24)
-                                .color(if checked {
-                                    hsluv!(0, 0, 70)  // lighter gray when completed
-                                } else {
-                                    hsluv!(0, 0, 42)  // normal dark gray
-                                }))
-                            .child(Text::new(&title))
-                    }
-                })
-        );
-
-    Row::new()
-        .s(Gap::new().x(5))
-        .s(zoon::Padding::new().y(15).x(10))
-        .s(zoon::Background::new().color(hsluv!(0, 0, 100)))  // white bg
-        .s(zoon::Font::new().size(24))
-        .s(zoon::Width::fill())
-        .item(checkbox_with_click)
-        .item(title_label)
         .unify()
 }
 
@@ -2128,7 +1777,7 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>
 }
 
 /// Render a checkbox element.
-// Default checkbox SVG icons (same as dynamic todos for visual consistency)
+// Default checkbox SVG icons (same as dynamic items for visual consistency)
 const UNCHECKED_SVG: &str = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23ededed%22%20stroke-width%3D%223%22/%3E%3C/svg%3E";
 const CHECKED_SVG: &str = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23bddad5%22%20stroke-width%3D%223%22/%3E%3Cpath%20fill%3D%22%235dc2af%22%20d%3D%22M72%2025L42%2071%2027%2056l-4%204%2020%2020%2034-52z%22/%3E%3C/svg%3E";
 
@@ -2245,7 +1894,7 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) 
         }
     }
 
-    // Check for ComputedRef (e.g., toggle all checkbox where checked = todos_count == completed_todos_count)
+    // Check for ComputedRef (e.g., toggle all checkbox where checked = items_count == completed_items_count)
     if let Some(DdValue::ComputedRef { computation, source_hold }) = &checked_value {
         zoon::println!("[DD render_checkbox] ComputedRef checkbox with source_hold={}", source_hold);
 

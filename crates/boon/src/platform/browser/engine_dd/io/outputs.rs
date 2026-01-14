@@ -58,31 +58,132 @@ thread_local! {
 // Current selected filter (All, Active, Completed)
 // Updated by router navigation
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TodoFilter {
+pub enum ListFilter {
     All,
     Active,
     Completed,
 }
 
-impl Default for TodoFilter {
+impl Default for ListFilter {
     fn default() -> Self {
         Self::All
     }
 }
 
 thread_local! {
-    static SELECTED_FILTER: Mutable<TodoFilter> = Mutable::new(TodoFilter::All); // ALLOWED: view state
+    static SELECTED_FILTER: Mutable<ListFilter> = Mutable::new(ListFilter::All); // ALLOWED: view state
     static CURRENT_ROUTE: Mutable<String> = Mutable::new("/".to_string()); // ALLOWED: route state
+    // Detected list variable name from Boon code (e.g., "items", "list_data", or any List variable)
+    // Set by interpreter during initialization, used by bridge for HOLD lookups
+    static LIST_VAR_NAME: std::cell::RefCell<String> = std::cell::RefCell::new("list_data".to_string()); // ALLOWED: config state
+    // Detected elements field name from list item objects (e.g., "todo_elements", "item_elements")
+    // This is the Object field containing LinkRefs for item UI interactions
+    static ELEMENTS_FIELD_NAME: std::cell::RefCell<String> = std::cell::RefCell::new("item_elements".to_string()); // ALLOWED: config state
+    // Remove event path: parsed from List/remove(item, on: item.X.Y.event.press)
+    // Stores the path ["X", "Y"] from item to the LinkRef that triggers removal
+    // This is PARSED FROM CODE, not guessed from field names
+    static REMOVE_EVENT_PATH: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new()); // ALLOWED: config state
+}
+
+/// Set the detected list variable name.
+/// Called by interpreter after detecting the list variable from the Boon code.
+pub fn set_list_var_name(name: String) {
+    LIST_VAR_NAME.with(|n| *n.borrow_mut() = name);
+}
+
+/// Get the detected list variable name.
+/// Used by bridge when looking up the list HOLD.
+pub fn get_list_var_name() -> String {
+    LIST_VAR_NAME.with(|n| n.borrow().clone())
+}
+
+/// Clear the list variable name (reset to default).
+/// Called when clearing state between examples.
+pub fn clear_list_var_name() {
+    LIST_VAR_NAME.with(|n| *n.borrow_mut() = "list_data".to_string());
+}
+
+/// Set the detected elements field name.
+/// Called by interpreter after detecting the elements field from list item objects.
+pub fn set_elements_field_name(name: String) {
+    ELEMENTS_FIELD_NAME.with(|n| *n.borrow_mut() = name);
+}
+
+/// Get the detected elements field name.
+/// Used when looking up LinkRefs in list item objects.
+pub fn get_elements_field_name() -> String {
+    ELEMENTS_FIELD_NAME.with(|n| n.borrow().clone())
+}
+
+/// Clear the elements field name (reset to default).
+/// Called when clearing state between examples.
+pub fn clear_elements_field_name() {
+    ELEMENTS_FIELD_NAME.with(|n| *n.borrow_mut() = "item_elements".to_string());
+}
+
+/// Set the remove event path.
+/// Parsed from List/remove(item, on: item.X.Y.event.press) → ["X", "Y"]
+/// This is the path from item to the LinkRef that triggers removal.
+pub fn set_remove_event_path(path: Vec<String>) {
+    zoon::println!("[DD Config] Setting remove event path: {:?}", path);
+    REMOVE_EVENT_PATH.with(|p| *p.borrow_mut() = path);
+}
+
+/// Get the remove event path.
+/// Used when cloning templates to wire the correct LinkRef to removal.
+pub fn get_remove_event_path() -> Vec<String> {
+    REMOVE_EVENT_PATH.with(|p| p.borrow().clone())
+}
+
+/// Clear the remove event path.
+/// Called when clearing state between examples.
+pub fn clear_remove_event_path() {
+    REMOVE_EVENT_PATH.with(|p| p.borrow_mut().clear());
+}
+
+/// Editing event bindings parsed from HOLD body.
+/// Contains paths to LinkRefs that control editing state.
+#[derive(Clone, Debug, Default)]
+pub struct EditingEventBindings {
+    /// Path to LinkRef whose double_click triggers edit mode (e.g., ["todo_elements", "todo_title_element"])
+    pub edit_trigger_path: Vec<String>,
+    /// Path to LinkRef whose key_down exits edit mode on Enter/Escape (e.g., ["todo_elements", "editing_todo_title_element"])
+    pub exit_key_path: Vec<String>,
+    /// Path to LinkRef whose blur exits edit mode (e.g., ["todo_elements", "editing_todo_title_element"])
+    pub exit_blur_path: Vec<String>,
+}
+
+thread_local! {
+    // Editing event bindings parsed from HOLD body
+    static EDITING_EVENT_BINDINGS: std::cell::RefCell<EditingEventBindings> = std::cell::RefCell::new(EditingEventBindings::default()); // ALLOWED: config state
+}
+
+/// Set the editing event bindings.
+/// Parsed from HOLD body expressions like:
+/// `todo_elements.todo_title_element.event.double_click |> THEN { True }`
+pub fn set_editing_event_bindings(bindings: EditingEventBindings) {
+    zoon::println!("[DD Config] Setting editing bindings: {:?}", bindings);
+    EDITING_EVENT_BINDINGS.with(|b| *b.borrow_mut() = bindings);
+}
+
+/// Get the editing event bindings.
+pub fn get_editing_event_bindings() -> EditingEventBindings {
+    EDITING_EVENT_BINDINGS.with(|b| b.borrow().clone())
+}
+
+/// Clear the editing event bindings.
+pub fn clear_editing_event_bindings() {
+    EDITING_EVENT_BINDINGS.with(|b| *b.borrow_mut() = EditingEventBindings::default());
 }
 
 /// Set the selected filter based on route.
 /// Called by router navigation.
 pub fn set_filter_from_route(route: &str) {
     let filter = match route {
-        "/" => TodoFilter::All,
-        "/active" => TodoFilter::Active,
-        "/completed" => TodoFilter::Completed,
-        _ => TodoFilter::All,
+        "/" => ListFilter::All,
+        "/active" => ListFilter::Active,
+        "/completed" => ListFilter::Completed,
+        _ => ListFilter::All,
     };
     zoon::println!("[DD Filter] Setting filter to {:?} from route {}", filter, route);
     SELECTED_FILTER.with(|f| f.set(filter));
@@ -107,10 +208,10 @@ pub fn init_current_route() {
         CURRENT_ROUTE.with(|r| r.set(path.clone()));
         // Also set the filter based on initial route
         let filter = match path.as_str() {
-            "/" => TodoFilter::All,
-            "/active" => TodoFilter::Active,
-            "/completed" => TodoFilter::Completed,
-            _ => TodoFilter::All,
+            "/" => ListFilter::All,
+            "/active" => ListFilter::Active,
+            "/completed" => ListFilter::Completed,
+            _ => ListFilter::All,
         };
         SELECTED_FILTER.with(|f| f.set(filter));
     }
@@ -122,13 +223,13 @@ pub fn clear_current_route() {
 }
 
 /// Get a signal for the selected filter.
-pub fn selected_filter_signal() -> impl zoon::Signal<Item = TodoFilter> {
+pub fn selected_filter_signal() -> impl zoon::Signal<Item = ListFilter> {
     SELECTED_FILTER.with(|f| f.signal_cloned())
 }
 
 /// Clear the selected filter (reset to All).
 pub fn clear_selected_filter() {
-    SELECTED_FILTER.with(|f| f.set(TodoFilter::All));
+    SELECTED_FILTER.with(|f| f.set(ListFilter::All));
 }
 
 /// Register checkbox toggle hold IDs for reactive count computation.
@@ -287,7 +388,7 @@ fn dd_value_to_json(value: &DdValue) -> Option<zoon::serde_json::Value> {
             Some(json!(arr))
         }
         DdValue::Object(fields) => {
-            // Persist Objects (like todo items) by recursively converting fields
+            // Persist Objects (like list items) by recursively converting fields
             let mut obj = zoon::serde_json::Map::new();
             for (key, val) in fields.iter() {
                 if let Some(json_val) = dd_value_to_json(val) {
@@ -329,7 +430,7 @@ fn json_to_dd_value(json: &zoon::serde_json::Value) -> Option<DdValue> {
             Some(DdValue::List(items.into()))
         }
         JsonValue::Object(obj) => {
-            // Restore Objects (like todo items)
+            // Restore Objects (like list items)
             let mut fields = BTreeMap::new();
             for (key, val) in obj.iter() {
                 if let Some(dd_val) = json_to_dd_value(val) {
