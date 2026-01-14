@@ -739,6 +739,13 @@ fn extract_checkbox_toggles_from_value(value: &DdValue, toggles: &mut Vec<Checkb
                 extract_checkbox_toggles_from_value(v, toggles);
             }
         }
+        DdValue::WhileRef { arms, .. } => {
+            // Recurse into WhileRef arm bodies to find checkboxes
+            // (checkboxes may be inside conditionally rendered content)
+            for (_pattern, body) in arms.iter() {
+                extract_checkbox_toggles_from_value(body, toggles);
+            }
+        }
         _ => {}
     }
 }
@@ -932,6 +939,15 @@ fn extract_toggle_all_from_value(value: &DdValue) -> Option<String> {
             }
             None
         }
+        DdValue::WhileRef { arms, .. } => {
+            // Recurse into WhileRef arm bodies
+            for (_pattern, body) in arms.iter() {
+                if let Some(id) = extract_toggle_all_from_value(body) {
+                    return Some(id);
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -980,6 +996,15 @@ fn extract_key_down_from_value(value: &DdValue) -> Option<String> {
         DdValue::Tagged { fields, .. } => {
             for (_, v) in fields.iter() {
                 if let Some(id) = extract_key_down_from_value(v) {
+                    return Some(id);
+                }
+            }
+            None
+        }
+        DdValue::WhileRef { arms, .. } => {
+            // Recurse into WhileRef arm bodies
+            for (_pattern, body) in arms.iter() {
+                if let Some(id) = extract_key_down_from_value(body) {
                     return Some(id);
                 }
             }

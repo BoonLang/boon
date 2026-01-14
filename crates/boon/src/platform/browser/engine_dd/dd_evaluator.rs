@@ -47,6 +47,8 @@ pub struct BoonDdRuntime {
     hold_counter: u32,
     /// Current context path for LINK naming (e.g., "increment_button.event.press")
     context_path: Vec<String>,
+    /// Last accessed variable name that contained a List (for source_hold tracking)
+    last_list_source: Option<String>,
 }
 
 impl BoonDdRuntime {
@@ -59,6 +61,7 @@ impl BoonDdRuntime {
             link_counter: 0,
             hold_counter: 0,
             context_path: Vec::new(),
+            last_list_source: None,
         }
     }
 
@@ -130,7 +133,8 @@ impl BoonDdRuntime {
             link_counter: 0,
             hold_counter: 0,
             context_path: Vec::new(),
-        };
+                last_list_source: None,
+            };
 
         // Bind arguments to parameters
         for (param, arg_name) in func_def.parameters.iter().zip(args.iter()) {
@@ -283,6 +287,7 @@ impl BoonDdRuntime {
                     link_counter: 0,
                     hold_counter: 0,
                     context_path: Vec::new(),
+                    last_list_source: None,
                 };
                 for var in variables {
                     let name = var.node.name.as_str().to_string();
@@ -383,7 +388,8 @@ impl BoonDdRuntime {
             link_counter: 0,
             hold_counter: 0,
             context_path: Vec::new(),
-        };
+                last_list_source: None,
+            };
 
         let mut map = BTreeMap::new();
         for var in &obj.variables {
@@ -547,6 +553,7 @@ impl BoonDdRuntime {
                 link_counter: 0,
                 hold_counter: 0,
                 context_path: Vec::new(),
+                last_list_source: None,
             };
 
             // Bind arguments to parameters
@@ -599,6 +606,7 @@ impl BoonDdRuntime {
                 link_counter: 0,
                 hold_counter: 0,
                 context_path: Vec::new(),
+                last_list_source: None,
             };
 
             // First parameter gets the piped value
@@ -845,11 +853,15 @@ impl BoonDdRuntime {
 
                                 // If all items have HoldRef fields, create reactive filtered list
                                 if hold_ids.len() == items.len() && !hold_ids.is_empty() {
+                                    // Get the source name tracked during alias evaluation
+                                    let source_hold = self.get_list_source();
+                                    zoon::println!("[DD_EVAL] ReactiveFilteredList: source_hold={}, {} items", source_hold, items.len());
                                     return DdValue::ReactiveFilteredList {
                                         items: items.clone(),
                                         filter_field: Arc::from(field_name),
                                         filter_value: Box::new(filter_value),
                                         hold_ids: Arc::new(hold_ids),
+                                        source_hold,
                                     };
                                 }
                             }
@@ -866,6 +878,7 @@ impl BoonDdRuntime {
                                         link_counter: 0,
                                         hold_counter: 0,
                                         context_path: Vec::new(),
+                                        last_list_source: None,
                                     };
                                     scoped.variables.insert(binding.to_string(), (*item).clone());
 
@@ -908,6 +921,7 @@ impl BoonDdRuntime {
                                         link_counter: 0,
                                         hold_counter: 0,
                                         context_path: Vec::new(),
+                                        last_list_source: None,
                                     };
                                     scoped.variables.insert(binding.to_string(), (*item).clone());
 
@@ -923,7 +937,23 @@ impl BoonDdRuntime {
                     (Some("List"), "count") => {
                         // from |> List/count() - count items
                         match from {
-                            DdValue::List(items) => DdValue::int(items.len() as i64),
+                            DdValue::List(items) => {
+                                // Check if this list came from a HOLD variable
+                                let source_hold = self.get_list_source();
+                                if !source_hold.is_empty() {
+                                    // Return reactive count that reads LIVE from HOLD
+                                    zoon::println!("[DD_EVAL] List/count() on List from HOLD: source_hold={}", source_hold);
+                                    DdValue::ComputedRef {
+                                        computation: ComputedType::ListCountHold {
+                                            source_hold: source_hold.clone(),
+                                        },
+                                        source_hold,
+                                    }
+                                } else {
+                                    // Static count for lists not from HOLD
+                                    DdValue::int(items.len() as i64)
+                                }
+                            }
                             // HoldRef |> List/count() -> ComputedRef::ListCount
                             DdValue::HoldRef(hold_id) => DdValue::computed_ref(
                                 ComputedType::ListCount,
@@ -941,24 +971,23 @@ impl BoonDdRuntime {
                                 },
                                 source_hold.clone(),
                             ),
-                            // ReactiveFilteredList |> List/count() -> ComputedRef::ReactiveListCountWhere
+                            // ReactiveFilteredList |> List/count() -> ComputedRef::ListCountWhereHold
+                            // Uses the new ListCountWhereHold that reads LIVE data from source_hold,
+                            // enabling proper counting for both static and dynamic items.
                             DdValue::ReactiveFilteredList {
-                                items,
                                 filter_field,
                                 filter_value,
-                                hold_ids,
+                                source_hold,
+                                ..  // items and hold_ids are only used by the old ReactiveListCountWhere
                             } => {
-                                // Use first hold_id as source (for bridge reactivity)
-                                // The actual counting is done by ReactiveListCountWhere which uses all hold_ids
-                                let source = hold_ids.first().cloned().unwrap_or_else(|| Arc::from(""));
+                                zoon::println!("[DD_EVAL] List/count() on ReactiveFilteredList: source_hold={}", source_hold);
                                 DdValue::ComputedRef {
-                                    computation: ComputedType::ReactiveListCountWhere {
-                                        items: items.clone(),
+                                    computation: ComputedType::ListCountWhereHold {
+                                        source_hold: source_hold.clone(),
                                         field: filter_field.clone(),
                                         value: filter_value.clone(),
-                                        hold_ids: hold_ids.clone(),
                                     },
-                                    source_hold: source,
+                                    source_hold: source_hold.clone(),  // Watch the source HOLD for changes
                                 }
                             }
                             _ => DdValue::int(0),
@@ -966,10 +995,25 @@ impl BoonDdRuntime {
                     }
                     (Some("List"), "is_empty") => {
                         // from |> List/is_empty()
-                        if let DdValue::List(items) = from {
-                            DdValue::Bool(items.is_empty())
-                        } else {
-                            DdValue::Bool(true)
+                        match from {
+                            DdValue::List(items) => {
+                                // Check if this list came from a HOLD variable
+                                let source_hold = self.get_list_source();
+                                if !source_hold.is_empty() {
+                                    // Return reactive is_empty that reads LIVE from HOLD
+                                    zoon::println!("[DD_EVAL] List/is_empty() on List from HOLD: source_hold={}", source_hold);
+                                    DdValue::ComputedRef {
+                                        computation: ComputedType::ListIsEmptyHold {
+                                            source_hold: source_hold.clone(),
+                                        },
+                                        source_hold,
+                                    }
+                                } else {
+                                    // Static is_empty for lists not from HOLD
+                                    DdValue::Bool(items.is_empty())
+                                }
+                            }
+                            _ => DdValue::Bool(true),
                         }
                     }
                     // Bool operations
@@ -1158,6 +1202,7 @@ impl BoonDdRuntime {
                 link_counter: 0,
                 hold_counter: 0,
                 context_path: Vec::new(),
+                last_list_source: None,
             };
             iter_runtime.variables.insert(state_name.to_string(), current_state.clone());
 
@@ -1218,6 +1263,16 @@ impl BoonDdRuntime {
             }
             Expression::Then { body } => Some(&body.node),
             _ => None,
+        }
+    }
+
+    /// Get the source name for a list, tracked during evaluation.
+    /// This returns the variable/field name that the list was accessed from.
+    /// Used to set source_hold for ReactiveFilteredList.
+    fn get_list_source(&self) -> Arc<str> {
+        match &self.last_list_source {
+            Some(name) => Arc::from(name.as_str()),
+            None => Arc::from(""),
         }
     }
 
@@ -1588,6 +1643,7 @@ impl BoonDdRuntime {
                         link_counter: 0,
                         hold_counter: 0,
                         context_path: Vec::new(),
+                        last_list_source: None,
                     };
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     default_value = Some(Arc::new(body_result));
@@ -1600,6 +1656,7 @@ impl BoonDdRuntime {
                         link_counter: 0,
                         hold_counter: 0,
                         context_path: Vec::new(),
+                        last_list_source: None,
                     };
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     evaluated_arms.push((pv, body_result));
@@ -1634,6 +1691,7 @@ impl BoonDdRuntime {
                         link_counter: 0,
                         hold_counter: 0,
                         context_path: Vec::new(),
+                        last_list_source: None,
                     };
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     default_value = Some(Arc::new(body_result));
@@ -1645,6 +1703,7 @@ impl BoonDdRuntime {
                         link_counter: 0,
                         hold_counter: 0,
                         context_path: Vec::new(),
+                        last_list_source: None,
                     };
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     evaluated_arms.push((pv, body_result));
@@ -1685,6 +1744,7 @@ impl BoonDdRuntime {
                         link_counter: 0,
                         hold_counter: 0,
                         context_path: Vec::new(),
+                        last_list_source: None,
                     };
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     default_value = Some(Arc::new(body_result));
@@ -1696,6 +1756,7 @@ impl BoonDdRuntime {
                         link_counter: 0,
                         hold_counter: 0,
                         context_path: Vec::new(),
+                        last_list_source: None,
                     };
                     // Debug: log the 'todo' variable if present to trace LinkRef binding
                     if let Some(todo_val) = match_runtime.variables.get("todo") {
@@ -1796,6 +1857,7 @@ impl BoonDdRuntime {
                                 link_counter: 0,
                                 hold_counter: 0,
                                 context_path: Vec::new(),
+                                last_list_source: None,
                             };
                             let body_result = match_runtime.eval_expression(&arm.body.node);
                             evaluated_arms.push((input_pattern.clone(), body_result));
@@ -1817,6 +1879,7 @@ impl BoonDdRuntime {
                             link_counter: 0,
                             hold_counter: 0,
                             context_path: Vec::new(),
+                            last_list_source: None,
                         };
                         let body_result = match_runtime.eval_expression(&arm.body.node);
                         default_value = Some(Arc::new(body_result));
@@ -1837,6 +1900,7 @@ impl BoonDdRuntime {
                                 link_counter: 0,
                                 hold_counter: 0,
                                 context_path: Vec::new(),
+                                last_list_source: None,
                             };
                             let body_result = match_runtime.eval_expression(&arm.body.node);
                             default_value = Some(Arc::new(body_result));
@@ -1857,6 +1921,7 @@ impl BoonDdRuntime {
                             link_counter: 0,
                             hold_counter: 0,
                             context_path: Vec::new(),
+                            last_list_source: None,
                         };
                         let body_result = match_runtime.eval_expression(&arm.body.node);
                         default_value = Some(Arc::new(body_result));
@@ -1886,6 +1951,7 @@ impl BoonDdRuntime {
                     link_counter: 0,
                     hold_counter: 0,
                     context_path: Vec::new(),
+                    last_list_source: None,
                 };
                 for (name, bound_value) in bindings {
                     match_runtime.variables.insert(name, bound_value);
@@ -2064,6 +2130,31 @@ impl BoonDdRuntime {
                             source_hold.clone(),
                         )
                     }
+                    // ComputedRef == non-ComputedRef (e.g., Int) => ComputedRef::Equal
+                    // Used for: all_completed: todos_count == completed_todos_count
+                    // where todos_count is Int and completed_todos_count is ComputedRef
+                    (DdValue::ComputedRef { source_hold, .. }, _) => {
+                        #[cfg(debug_assertions)]
+                        zoon::println!("[DD_EVAL] Reactive equality: ComputedRef({}) == {:?}", source_hold, b);
+                        DdValue::computed_ref(
+                            ComputedType::Equal {
+                                left: Box::new(a.clone()),
+                                right: Box::new(b.clone()),
+                            },
+                            source_hold.clone(),
+                        )
+                    }
+                    (_, DdValue::ComputedRef { source_hold, .. }) => {
+                        #[cfg(debug_assertions)]
+                        zoon::println!("[DD_EVAL] Reactive equality: {:?} == ComputedRef({})", a, source_hold);
+                        DdValue::computed_ref(
+                            ComputedType::Equal {
+                                left: Box::new(a.clone()),
+                                right: Box::new(b.clone()),
+                            },
+                            source_hold.clone(),
+                        )
+                    }
                     _ => {
                         #[cfg(debug_assertions)]
                         zoon::println!("[DD_EVAL] Comparing {:?} == {:?} => {:?}", a, b, a == b);
@@ -2183,9 +2274,26 @@ impl BoonDdRuntime {
                     .cloned()
                     .unwrap_or(DdValue::Unit);
 
+                // Track the last field name that contained a list (for source_hold tracking)
+                let mut list_source_name: Option<String> = None;
+                if matches!(current, DdValue::List(_)) {
+                    list_source_name = Some(parts[0].to_string());
+                }
+
                 // Rest are field accesses
                 for field in parts.iter().skip(1) {
                     current = current.get(field.as_str()).cloned().unwrap_or(DdValue::Unit);
+                    // Update list_source_name if this field is a List
+                    if matches!(current, DdValue::List(_)) {
+                        list_source_name = Some(field.to_string());
+                    }
+                }
+
+                // If the result is a List, track its source name
+                if matches!(current, DdValue::List(_)) {
+                    if let Some(name) = list_source_name {
+                        self.last_list_source = Some(name);
+                    }
                 }
 
                 current
@@ -2194,9 +2302,22 @@ impl BoonDdRuntime {
                 // PASSED value - access the passed_context and navigate through fields
                 let mut current = self.passed_context.clone().unwrap_or(DdValue::Unit);
 
+                // Track list source for PASSED context too
+                let mut list_source_name: Option<String> = None;
+
                 // Navigate through extra_parts (field accesses after PASSED)
                 for field in extra_parts {
                     current = current.get(field.as_str()).cloned().unwrap_or(DdValue::Unit);
+                    if matches!(current, DdValue::List(_)) {
+                        list_source_name = Some(field.to_string());
+                    }
+                }
+
+                // If the result is a List, track its source name
+                if matches!(current, DdValue::List(_)) {
+                    if let Some(name) = list_source_name {
+                        self.last_list_source = Some(name);
+                    }
                 }
 
                 current

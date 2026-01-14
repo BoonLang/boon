@@ -81,12 +81,55 @@ fn get_dynamic_todo_edit_value(index: usize) -> Option<String> {
 
 /// Convert a DdValue Oklch color to CSS color string.
 /// Returns None if the color should be invisible (alpha=0 or broken WhileRef).
+/// Evaluate a WhileRef with computation to get the current value.
+/// Returns the matching arm's body value or None if no match.
+fn evaluate_while_ref_now(hold_id: &str, computation: &Option<super::dd_value::ComputedType>, arms: &[(DdValue, DdValue)]) -> Option<DdValue> {
+    use super::dd_value::evaluate_computed;
+
+    // Get the source value from hold states
+    let source_value = get_hold_value(hold_id).unwrap_or(DdValue::Unit);
+
+    // If there's a computation, evaluate it to get the actual value to match
+    let value_to_match = if let Some(comp) = computation {
+        evaluate_computed(comp, &source_value)
+    } else {
+        source_value
+    };
+
+    // Match against arms
+    for (pattern, body) in arms.iter() {
+        let matches = match (&value_to_match, pattern) {
+            (DdValue::Bool(b), DdValue::Tagged { tag, .. }) => {
+                (*b && tag.as_ref() == "True") || (!*b && tag.as_ref() == "False")
+            }
+            (DdValue::Text(curr), DdValue::Text(pat)) => curr == pat,
+            (DdValue::Tagged { tag: curr_tag, .. }, DdValue::Tagged { tag: pat_tag, .. }) => curr_tag == pat_tag,
+            _ => &value_to_match == pattern,
+        };
+        if matches {
+            return Some(body.clone());
+        }
+    }
+    None
+}
+
 fn dd_oklch_to_css(value: &DdValue) -> Option<String> {
     match value {
         DdValue::Tagged { tag, fields } if tag.as_ref() == "Oklch" => {
-            let lightness = fields.get("lightness")
-                .and_then(|v| if let DdValue::Number(n) = v { Some(n.0) } else { None })
-                .unwrap_or(0.5);
+            // Handle lightness - can be Number or WhileRef (reactive)
+            let lightness = match fields.get("lightness") {
+                Some(DdValue::Number(n)) => n.0,
+                Some(DdValue::WhileRef { hold_id, computation, arms, .. }) => {
+                    // Evaluate WhileRef to get current lightness value
+                    let result = evaluate_while_ref_now(hold_id, computation, arms);
+                    zoon::println!("[DD dd_oklch_to_css] WhileRef lightness: hold_id={}, computation={:?}, result={:?}", hold_id, computation.is_some(), result);
+                    match result {
+                        Some(DdValue::Number(n)) => n.0,
+                        _ => 0.5, // default
+                    }
+                }
+                _ => 0.5, // default
+            };
             let chroma = fields.get("chroma")
                 .and_then(|v| if let DdValue::Number(n) = v { Some(n.0) } else { None })
                 .unwrap_or(0.0);
@@ -347,16 +390,62 @@ fn render_dd_value(value: &DdValue) -> RawElOrText {
                 format!("pattern={:?}, body_press={:?}", pattern, find_press_link(body))
             });
 
-            // Create reactive element that updates when THIS hold value changes
+            // Create reactive element that updates when relevant hold values change
             // Use map + dedupe to avoid re-rendering on unrelated hold changes (like hover)
+            //
+            // For ListCountHold/ListCountWhereHold: we need to watch ALL holds, not just the source_hold.
+            // This is because the count depends on the list items in the HOLD (which can be dynamically added).
+            // For ListCountWhereHold specifically, the count also depends on HoldRef values inside items (e.g., checkbox states).
+            fn contains_list_count_hold(comp: &super::dd_value::ComputedType) -> bool {
+                use super::dd_value::ComputedType;
+                match comp {
+                    // List computations that need to watch all holds
+                    ComputedType::ListCountWhereHold { .. } => true,
+                    ComputedType::ListCountHold { .. } => true,
+                    ComputedType::ListIsEmptyHold { .. } => true,
+                    ComputedType::GreaterThanZero { operand } => {
+                        if let DdValue::ComputedRef { computation: inner_comp, .. } = operand.as_ref() {
+                            contains_list_count_hold(inner_comp)
+                        } else {
+                            false
+                        }
+                    }
+                    ComputedType::Equal { left, right } => {
+                        // Check if either operand contains ListCountHold/ListCountWhereHold
+                        let left_has = if let DdValue::ComputedRef { computation: inner_comp, .. } = left.as_ref() {
+                            contains_list_count_hold(inner_comp)
+                        } else {
+                            false
+                        };
+                        let right_has = if let DdValue::ComputedRef { computation: inner_comp, .. } = right.as_ref() {
+                            contains_list_count_hold(inner_comp)
+                        } else {
+                            false
+                        };
+                        left_has || right_has
+                    }
+                    _ => false,
+                }
+            }
+            let needs_watch_all_holds = computation.as_ref().map_or(false, contains_list_count_hold);
             let hold_id_for_extract = hold_id.clone();
             let hold_id_for_log = hold_id.clone();
             El::new()
                 .child_signal(
                     hold_states_signal()
-                        .map(move |states| states.get(&hold_id_for_extract).cloned())
-                        .dedupe_cloned()  // Only emit when THIS hold's value changes
-                        .map(move |source_value| {
+                        .map(move |states| {
+                            let main_value = states.get(&hold_id_for_extract).cloned();
+                            if needs_watch_all_holds {
+                                // For ListCountHold/ListCountWhereHold: include all states so any hold change triggers re-evaluation
+                                // This is necessary because the count depends on HOLD contents (dynamic list additions/removals)
+                                (main_value, Some(states))
+                            } else {
+                                // For other computations: only watch the main hold
+                                (main_value, None)
+                            }
+                        })
+                        .dedupe_cloned()  // Emit when watched hold values change
+                        .map(move |(source_value, _watched_source)| {
                             zoon::println!("[DD WhileRef RENDER] hold_id={}, value={:?}", hold_id_for_log, source_value);
                             let source_value = source_value.as_ref();
 
@@ -454,7 +543,7 @@ fn render_dd_value(value: &DdValue) -> RawElOrText {
             Text::new(format!("[filtered:{}@{}]", filter_field, source_hold)).unify()
         }
 
-        DdValue::ReactiveFilteredList { items, filter_field, filter_value: _, hold_ids: _ } => {
+        DdValue::ReactiveFilteredList { items, filter_field, filter_value: _, hold_ids: _, source_hold: _ } => {
             // ReactiveFilteredList is an intermediate value - shouldn't normally be rendered directly
             // If it is rendered, show debug info
             Text::new(format!("[reactive-filtered:{}#{}]", filter_field, items.len())).unify()
@@ -981,15 +1070,36 @@ fn render_todo_list_filtered(items: std::sync::Arc<Vec<DdValue>>, gap: u32) -> R
 
     // ARCHITECTURE FIX: Render items ONCE, don't re-render on every state change
     // Each item handles its own reactivity via signals (checked_signal, etc.)
-    // Only filter changes trigger re-renders, NOT hold state changes
+    // Re-render on: filter changes OR todos list changes (add/remove)
     // Use El wrapper because Column doesn't have child_signal
+    //
+    // Use map_ref! to combine filter signal with hold_states, then dedupe on
+    // (filter, todos_len, elems_len) tuple - this ensures we only re-render when
+    // filter changes OR todos are added/removed, NOT on every checkbox toggle.
+    use zoon::map_ref;
+
     El::new()
         .child_signal(
-            super::io::selected_filter_signal()
-                .map(move |filter| {
-                    let static_items_clone = static_items.clone();
-                    // Get current state ONCE, don't subscribe to changes
-                    let states = super::io::get_all_hold_states();
+            map_ref! {
+                let filter = super::io::selected_filter_signal(),
+                let states = super::io::hold_states_signal() => {
+                    // Derive trigger values from states
+                    let todos_len = match states.get("todos") {
+                        Some(DdValue::List(todos)) => todos.len(),
+                        _ => 0,
+                    };
+                    let elems_len = match states.get("todos_elements") {
+                        Some(DdValue::List(elements)) => elements.len(),
+                        _ => 0,
+                    };
+                    (filter.clone(), todos_len, elems_len)
+                }
+            }
+            .dedupe_cloned()  // Only re-emit when (filter, len, len) tuple changes
+            .map(move |(filter, _todos_len, _elems_len)| {
+                let static_items_clone = static_items.clone();
+                // Get current state snapshot for rendering
+                let states = super::io::get_all_hold_states();
                     // Return the element directly, not a signal
                         let mut rendered: Vec<RawElOrText> = Vec::new();
 
@@ -1051,27 +1161,17 @@ fn render_todo_list_filtered(items: std::sync::Arc<Vec<DdValue>>, gap: u32) -> R
 
                         // 2. Render dynamic items from "todos_elements" HOLD
                         // These are Element AST cloned from the template with fresh HoldRef IDs
-                        // Filter by checking corresponding data in "todos" HOLD
-                        let todos_data = states.get("todos");
+                        // Get completion status directly from the element's checkbox HoldRef
                         if let Some(DdValue::List(elements)) = states.get("todos_elements") {
                             for (index, element) in elements.iter().enumerate() {
-                                // Get completion status from corresponding data item
-                                // Data items are in "todos" at indices after static_items_count
-                                let data_index = static_items_count + index;
-                                let completed = todos_data
-                                    .and_then(|t| if let DdValue::List(list) = t { list.get(data_index) } else { None })
-                                    .and_then(|item| if let DdValue::Object(obj) = item { obj.get("completed") } else { None })
-                                    .map(|c| {
-                                        // Check HoldRef for actual value, or direct Bool
-                                        match c {
-                                            DdValue::Bool(b) => *b,
-                                            DdValue::HoldRef(hold_id) => {
-                                                states.get(hold_id.as_ref())
-                                                    .map(|v| matches!(v, DdValue::Bool(true)))
-                                                    .unwrap_or(false)
-                                            }
-                                            _ => false,
-                                        }
+                                // Get completion status directly from element's checkbox HoldRef
+                                // This is more reliable than indexing into todos data
+                                let completed = get_todo_checkbox_hold_id(element)
+                                    .and_then(|hold_id| states.get(&hold_id))
+                                    .map(|v| match v {
+                                        DdValue::Bool(true) => true,
+                                        DdValue::Tagged { tag, .. } if tag.as_ref() == "True" => true,
+                                        _ => false,
                                     })
                                     .unwrap_or(false);
 
@@ -1384,14 +1484,22 @@ fn render_static_todo_item(title_hold_id: &str, checkbox_hold_id: &str, link_id:
                 .unify()
         });
 
-    // Add click handler if we have a link ID
+    // Add click handler - always toggle HOLD, optionally fire link
+    let checkbox_hold_for_click = checkbox_hold_id_owned.clone();
     let checkbox_with_click = if let Some(link_id) = link_id {
         let link_id = link_id.to_string();
         checkbox.on_click(move || {
+            // CRITICAL: Toggle the HOLD state first, then fire the link
+            // Without toggle_hold_bool, HOLD_STATES doesn't update and
+            // reactive computations (like completed_todos_count) stay stale
+            toggle_hold_bool(&checkbox_hold_for_click);
             fire_global_link(&link_id);
         })
     } else {
-        checkbox
+        // No link, just toggle the HOLD directly
+        checkbox.on_click(move || {
+            toggle_hold_bool(&checkbox_hold_for_click);
+        })
     };
 
     // Title label - reactive title text and color based on completion state
@@ -1479,6 +1587,38 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>)
             _ => None,
         });
 
+    // Get font color value for checking if it's reactive
+    let font_color_value = style
+        .and_then(|s| s.get("font"))
+        .and_then(|f| f.get("color"))
+        .cloned();
+
+    // Debug: log what font_color_value we got
+    if font_color_value.is_some() {
+        zoon::println!("[DD render_container] font_color_value: {:?}", font_color_value);
+    }
+
+    // Check if font color contains a WhileRef (needs reactive rendering)
+    let is_reactive_font_color = font_color_value.as_ref().map_or(false, |c| {
+        if let DdValue::Tagged { fields, .. } = c {
+            // Check if any field (like lightness) is a WhileRef with computation
+            let has_reactive = fields.values().any(|v| matches!(v, DdValue::WhileRef { computation: Some(_), .. }));
+            zoon::println!("[DD render_container] is_reactive_font_color: {}", has_reactive);
+            has_reactive
+        } else {
+            false
+        }
+    });
+
+    // Get font size
+    let font_size = style
+        .and_then(|s| s.get("font"))
+        .and_then(|f| f.get("size"))
+        .and_then(|v| match v {
+            DdValue::Number(n) => Some(n.0 as u32),
+            _ => None,
+        });
+
     // Build base element with styles (before adding child due to typestate)
     let base = El::new();
     let base = match size_opt {
@@ -1488,6 +1628,154 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>)
     let base = match bg_url_opt {
         Some(url) => base.s(Background::new().url(url)),
         None => base,
+    };
+
+    // Apply font styling - reactive if color contains WhileRef with computation
+    let base = if is_reactive_font_color {
+        // Reactive font color - need to watch holds
+        let font_color_value = font_color_value.clone();
+        base.s(Font::new().size(font_size.unwrap_or(14)).color_signal(
+            hold_states_signal()
+                .map(move |_states| {
+                    // Re-evaluate color on any hold change
+                    font_color_value.as_ref()
+                        .and_then(|c| dd_oklch_to_css(c))
+                        .unwrap_or_else(|| "inherit".to_string())
+                })
+                .dedupe_cloned()
+        ))
+    } else {
+        // Static font styling
+        let font_color_css = font_color_value.as_ref().and_then(|c| dd_oklch_to_css(c));
+        if font_size.is_some() || font_color_css.is_some() {
+            let mut font = Font::new();
+            if let Some(size) = font_size {
+                font = font.size(size);
+            }
+            if let Some(color) = font_color_css {
+                font = font.color(color);
+            }
+            base.s(font)
+        } else {
+            base
+        }
+    };
+
+    // Apply padding
+    let base = {
+        let padding_value = style.and_then(|s| s.get("padding"));
+
+        // Check if padding is a single number (applies to all sides)
+        let padding_all = padding_value.and_then(|p| match p {
+            DdValue::Number(n) => Some(n.0 as u32),
+            _ => None,
+        });
+
+        if let Some(all) = padding_all {
+            // Single value applies to all sides
+            base.s(Padding::all(all))
+        } else {
+            // Padding is an Object with specific values (row, column, left, right, top, bottom)
+            let padding_obj = padding_value;
+
+            // Get padding values (row = horizontal/x, column = vertical/y)
+            let padding_row = padding_obj
+                .and_then(|p| p.get("row"))
+                .and_then(|v| match v {
+                    DdValue::Number(n) => Some(n.0 as u32),
+                    _ => None,
+                });
+            let padding_column = padding_obj
+                .and_then(|p| p.get("column"))
+                .and_then(|v| match v {
+                    DdValue::Number(n) => Some(n.0 as u32),
+                    _ => None,
+                });
+            let padding_left = padding_obj
+                .and_then(|p| p.get("left"))
+                .and_then(|v| match v {
+                    DdValue::Number(n) => Some(n.0 as u32),
+                    _ => None,
+                });
+            let padding_right = padding_obj
+                .and_then(|p| p.get("right"))
+                .and_then(|v| match v {
+                    DdValue::Number(n) => Some(n.0 as u32),
+                    _ => None,
+                });
+            let padding_top = padding_obj
+                .and_then(|p| p.get("top"))
+                .and_then(|v| match v {
+                    DdValue::Number(n) => Some(n.0 as u32),
+                    _ => None,
+                });
+            let padding_bottom = padding_obj
+                .and_then(|p| p.get("bottom"))
+                .and_then(|v| match v {
+                    DdValue::Number(n) => Some(n.0 as u32),
+                    _ => None,
+                });
+
+            if padding_row.is_some() || padding_column.is_some() || padding_left.is_some()
+                || padding_right.is_some() || padding_top.is_some() || padding_bottom.is_some() {
+                let mut padding = Padding::new();
+                if let Some(x) = padding_row {
+                    padding = padding.x(x);
+                }
+                if let Some(y) = padding_column {
+                    padding = padding.y(y);
+                }
+                if let Some(left) = padding_left {
+                    padding = padding.left(left);
+                }
+                if let Some(right) = padding_right {
+                    padding = padding.right(right);
+                }
+                if let Some(top) = padding_top {
+                    padding = padding.top(top);
+                }
+                if let Some(bottom) = padding_bottom {
+                    padding = padding.bottom(bottom);
+                }
+                base.s(padding)
+            } else {
+                base
+            }
+        }
+    };
+
+    // Apply height
+    let base = {
+        let height_opt = style
+            .and_then(|s| s.get("height"))
+            .and_then(|v| match v {
+                DdValue::Number(n) => Some(n.0 as u32),
+                _ => None,
+            });
+
+        if let Some(height) = height_opt {
+            base.s(Height::exact(height))
+        } else {
+            base
+        }
+    };
+
+    // Apply transform (rotation)
+    let base = {
+        let rotate_opt = style
+            .and_then(|s| s.get("transform"))
+            .and_then(|t| t.get("rotate"))
+            .and_then(|v| match v {
+                DdValue::Number(n) => Some(n.0 as i32),
+                _ => None,
+            });
+
+        if let Some(rotate) = rotate_opt {
+            zoon::println!("[DD render_container] Applying transform rotate: {} degrees", rotate);
+            base.s(Transform::new().rotate(rotate))
+        } else {
+            base
+        }
     };
 
     // Add child (changes typestate, so must be last)
@@ -1957,6 +2245,95 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) 
         }
     }
 
+    // Check for ComputedRef (e.g., toggle all checkbox where checked = todos_count == completed_todos_count)
+    if let Some(DdValue::ComputedRef { computation, source_hold }) = &checked_value {
+        zoon::println!("[DD render_checkbox] ComputedRef checkbox with source_hold={}", source_hold);
+
+        // Check if there's a custom icon - toggle all uses a "❯" character with reactive color
+        let custom_icon = fields.get("icon").cloned();
+
+        let computation = computation.clone();
+        let source_hold = source_hold.clone();
+
+        let checkbox = if let Some(icon_value) = custom_icon {
+            zoon::println!("[DD render_checkbox] Using custom icon for ComputedRef checkbox");
+            // Use custom icon with reactive rendering
+            Checkbox::new()
+                .label_hidden("checkbox")
+                .checked_signal(
+                    hold_states_signal()
+                        .map({
+                            let computation = computation.clone();
+                            move |_states| {
+                                // Evaluate the computation to get current checked state
+                                use super::dd_value::evaluate_computed;
+                                let result = evaluate_computed(&computation, &DdValue::Unit);
+                                match result {
+                                    DdValue::Bool(b) => b,
+                                    _ => false,
+                                }
+                            }
+                        })
+                )
+                .icon(move |_checked_mutable| {
+                    // Render the custom icon value - it should be a container element
+                    render_dd_value(&icon_value)
+                })
+        } else {
+            // Use default SVG icon
+            Checkbox::new()
+                .label_hidden("checkbox")
+                .checked_signal(
+                    hold_states_signal()
+                        .map({
+                            let computation = computation.clone();
+                            move |_states| {
+                                use super::dd_value::evaluate_computed;
+                                let result = evaluate_computed(&computation, &DdValue::Unit);
+                                match result {
+                                    DdValue::Bool(b) => b,
+                                    _ => false,
+                                }
+                            }
+                        })
+                )
+                .icon({
+                    let computation = computation.clone();
+                    move |_checked_mutable| {
+                        El::new()
+                            .s(zoon::Width::exact(40))
+                            .s(zoon::Height::exact(40))
+                            .update_raw_el(|raw_el| raw_el.style("pointer-events", "none"))
+                            .s(zoon::Background::new().url_signal(
+                                hold_states_signal()
+                                    .map({
+                                        let computation = computation.clone();
+                                        move |_states| {
+                                            use super::dd_value::evaluate_computed;
+                                            let result = evaluate_computed(&computation, &DdValue::Unit);
+                                            let checked = match result {
+                                                DdValue::Bool(b) => b,
+                                                _ => false,
+                                            };
+                                            if checked { CHECKED_SVG } else { UNCHECKED_SVG }
+                                        }
+                                    })
+                            ))
+                    }
+                })
+        };
+
+        if let Some(link_id) = click_link_id {
+            return checkbox
+                .on_click(move || {
+                    fire_global_link(&link_id);
+                })
+                .unify();
+        } else {
+            return checkbox.unify();
+        }
+    }
+
     // Static checkbox - extract checked state directly
     let checked = checked_value
         .as_ref()
@@ -1967,20 +2344,32 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) 
         })
         .unwrap_or(false);
 
-    // Build Checkbox with static icon
-    let svg_url = if checked { CHECKED_SVG } else { UNCHECKED_SVG };
-    let checkbox = Checkbox::new()
-        .label_hidden("checkbox")
-        .checked(checked)
-        .icon(move |_checked_mutable| {
-            // CRITICAL: Use pointer_events_none() so clicks pass through to checkbox parent
-            El::new()
-                .s(zoon::Width::exact(40))
-                .s(zoon::Height::exact(40))
-                .s(zoon::Background::new().url(svg_url))
-                .update_raw_el(|raw_el| raw_el.style("pointer-events", "none"))  // Let clicks pass through
-                .unify()
-        });
+    // Check for custom icon (static case)
+    let custom_icon = fields.get("icon").cloned();
+
+    // Build Checkbox with either custom or default icon
+    let checkbox = if let Some(icon_value) = custom_icon {
+        Checkbox::new()
+            .label_hidden("checkbox")
+            .checked(checked)
+            .icon(move |_checked_mutable| {
+                render_dd_value(&icon_value)
+            })
+    } else {
+        let svg_url = if checked { CHECKED_SVG } else { UNCHECKED_SVG };
+        Checkbox::new()
+            .label_hidden("checkbox")
+            .checked(checked)
+            .icon(move |_checked_mutable| {
+                // CRITICAL: Use pointer_events_none() so clicks pass through to checkbox parent
+                El::new()
+                    .s(zoon::Width::exact(40))
+                    .s(zoon::Height::exact(40))
+                    .s(zoon::Background::new().url(svg_url))
+                    .update_raw_el(|raw_el| raw_el.style("pointer-events", "none"))  // Let clicks pass through
+                    .unify()
+            })
+    };
 
     if let Some(link_id) = click_link_id {
         checkbox

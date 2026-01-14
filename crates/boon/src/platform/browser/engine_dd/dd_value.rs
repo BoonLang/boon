@@ -49,6 +49,7 @@ pub enum ComputedType {
     /// Count items in a list where items have HoldRef fields
     /// Used for: `todos |> List/retain(item, if: item.completed) |> List/count()`
     /// where each todo.completed is a HoldRef
+    /// DEPRECATED: Use ListCountWhereHold instead (reads live HOLD data)
     ReactiveListCountWhere {
         /// The list items (containing HoldRef fields)
         items: Arc<Vec<DdValue>>,
@@ -58,6 +59,31 @@ pub enum ComputedType {
         value: Box<DdValue>,
         /// The HoldRef IDs to observe (one per item)
         hold_ids: Arc<Vec<Arc<str>>>,
+    },
+    /// Count items in a list HOLD where field matches value.
+    /// Reads LIVE data from source_hold on each evaluation.
+    /// This handles both static and dynamic items correctly.
+    ListCountWhereHold {
+        /// Which HOLD contains the list (e.g., from variable context)
+        source_hold: Arc<str>,
+        /// The field to filter on (e.g., "completed")
+        field: Arc<str>,
+        /// The value to match (e.g., Bool(true))
+        value: Box<DdValue>,
+    },
+    /// Total count of items in a list HOLD.
+    /// Reads LIVE data from source_hold on each evaluation.
+    /// Used for: `todos |> List/count()` where todos came from a HOLD variable.
+    ListCountHold {
+        /// Which HOLD contains the list
+        source_hold: Arc<str>,
+    },
+    /// Check if a list HOLD is empty.
+    /// Reads LIVE data from source_hold on each evaluation.
+    /// Used for: `todos |> List/is_empty()` where todos came from a HOLD variable.
+    ListIsEmptyHold {
+        /// Which HOLD contains the list
+        source_hold: Arc<str>,
     },
 }
 
@@ -141,6 +167,8 @@ pub enum DdValue {
         filter_value: Box<DdValue>,
         /// The HoldRef IDs that this list depends on (one per item)
         hold_ids: Arc<Vec<Arc<str>>>,
+        /// The source HOLD containing this list (for live counting)
+        source_hold: Arc<str>,
     },
 }
 
@@ -359,7 +387,16 @@ pub fn evaluate_computed(computation: &ComputedType, source_value: &DdValue) -> 
                     let count = items.iter()
                         .filter(|item| {
                             if let DdValue::Object(obj) = item {
-                                obj.get(field.as_ref()) == Some(value.as_ref())
+                                // Resolve HoldRef before comparing (items may have completed: HoldRef("hold_11"))
+                                match obj.get(field.as_ref()) {
+                                    Some(DdValue::HoldRef(hold_id)) => {
+                                        let hold_value = super::io::get_hold_value(hold_id)
+                                            .unwrap_or(DdValue::Unit);
+                                        &hold_value == value.as_ref()
+                                    }
+                                    Some(field_value) => field_value == value.as_ref(),
+                                    None => false,
+                                }
                             } else {
                                 false
                             }
@@ -378,7 +415,16 @@ pub fn evaluate_computed(computation: &ComputedType, source_value: &DdValue) -> 
                     } else {
                         let all_match = items.iter().all(|item| {
                             if let DdValue::Object(obj) = item {
-                                obj.get(field.as_ref()) == Some(value.as_ref())
+                                // Resolve HoldRef before comparing
+                                match obj.get(field.as_ref()) {
+                                    Some(DdValue::HoldRef(hold_id)) => {
+                                        let hold_value = super::io::get_hold_value(hold_id)
+                                            .unwrap_or(DdValue::Unit);
+                                        &hold_value == value.as_ref()
+                                    }
+                                    Some(field_value) => field_value == value.as_ref(),
+                                    None => false,
+                                }
                             } else {
                                 false
                             }
@@ -433,7 +479,9 @@ pub fn evaluate_computed(computation: &ComputedType, source_value: &DdValue) -> 
                                 Some(DdValue::Bool(b)) => Some(DdValue::Bool(*b)),
                                 // HoldRef - look up current value
                                 Some(DdValue::HoldRef(hold_id)) => {
-                                    super::io::get_hold_value(hold_id)
+                                    let val = super::io::get_hold_value(hold_id);
+                                    zoon::println!("[DD ReactiveListCountWhere] hold_id={}, value={:?}", hold_id, val);
+                                    val
                                 }
                                 _ => None,
                             }
@@ -442,17 +490,76 @@ pub fn evaluate_computed(computation: &ComputedType, source_value: &DdValue) -> 
                     };
 
                     // Compare with expected value
-                    match (completed_value.as_ref(), value.as_ref()) {
+                    let result = match (completed_value.as_ref(), value.as_ref()) {
                         (Some(DdValue::Bool(b)), DdValue::Bool(expected)) => *b == *expected,
                         (Some(DdValue::Tagged { tag, .. }), DdValue::Tagged { tag: expected_tag, .. }) => {
                             tag == expected_tag
                         }
                         (Some(current), expected) => current == expected,
                         _ => false,
+                    };
+                    zoon::println!("[DD ReactiveListCountWhere] completed_value={:?}, expected={:?}, match={}", completed_value, value, result);
+                    result
+                })
+                .count();
+            zoon::println!("[DD ReactiveListCountWhere] total count={}", count);
+            DdValue::int(count as i64)
+        }
+        ComputedType::ListCountWhereHold { source_hold, field, value } => {
+            // Get LIVE items from source HOLD (includes dynamic items!)
+            let items = super::io::get_hold_value(source_hold.as_ref())
+                .and_then(|v| match v {
+                    DdValue::List(list) => Some(list),
+                    _ => None,
+                })
+                .unwrap_or_default();
+
+            // Count items where field matches value
+            let count = items.iter()
+                .filter(|item| {
+                    if let DdValue::Object(obj) = item {
+                        match obj.get(field.as_ref()) {
+                            // Resolve HoldRef to get current value
+                            Some(DdValue::HoldRef(hold_id)) => {
+                                let hold_value = super::io::get_hold_value(hold_id)
+                                    .unwrap_or(DdValue::Unit);
+                                &hold_value == value.as_ref()
+                            }
+                            // Direct value comparison
+                            Some(field_value) => field_value == value.as_ref(),
+                            None => false,
+                        }
+                    } else {
+                        false
                     }
                 })
                 .count();
+            zoon::println!("[DD ListCountWhereHold] source={}, count={}", source_hold, count);
             DdValue::int(count as i64)
+        }
+        ComputedType::ListCountHold { source_hold } => {
+            // Get LIVE items from source HOLD (includes dynamic items!)
+            let items = super::io::get_hold_value(source_hold.as_ref())
+                .and_then(|v| match v {
+                    DdValue::List(list) => Some(list),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let count = items.len();
+            zoon::println!("[DD ListCountHold] source={}, count={}", source_hold, count);
+            DdValue::int(count as i64)
+        }
+        ComputedType::ListIsEmptyHold { source_hold } => {
+            // Get LIVE items from source HOLD (includes dynamic items!)
+            let items = super::io::get_hold_value(source_hold.as_ref())
+                .and_then(|v| match v {
+                    DdValue::List(list) => Some(list),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let is_empty = items.is_empty();
+            zoon::println!("[DD ListIsEmptyHold] source={}, is_empty={}", source_hold, is_empty);
+            DdValue::Bool(is_empty)
         }
     }
 }
