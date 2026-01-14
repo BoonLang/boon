@@ -765,7 +765,7 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
                 }
             }
             Response::Error { message } => Err(format!("Click checkbox failed: {}", message)),
-            _ => Ok(format!("Clicked checkbox {}", index)),
+            other => Err(format!("Click checkbox failed: unexpected response type: {:?}", other)),
         };
     }
 
@@ -789,7 +789,7 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
                 }
             }
             Response::Error { message } => Err(format!("Click button failed: {}", message)),
-            _ => Ok(format!("Clicked button {}", index)),
+            other => Err(format!("Click button failed: unexpected response type: {:?}", other)),
         };
     }
 
@@ -813,7 +813,7 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
                 }
             }
             Response::Error { message } => Err(format!("Focus input failed: {}", message)),
-            _ => Ok(format!("Focused input {}", index)),
+            other => Err(format!("Focus input failed: unexpected response type: {:?}", other)),
         };
     }
 
@@ -832,7 +832,7 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
         return match response {
             Response::Success { .. } => Ok(format!("Typed: {}", text)),
             Response::Error { message } => Err(format!("Type text failed: {}", message)),
-            _ => Ok(format!("Typed: {}", text)),
+            other => Err(format!("Type text failed: unexpected response type: {:?}", other)),
         };
     }
 
@@ -851,7 +851,7 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
         return match response {
             Response::Success { .. } => Ok(format!("Pressed: {}", key)),
             Response::Error { message } => Err(format!("Press key failed: {}", message)),
-            _ => Ok(format!("Pressed: {}", key)),
+            other => Err(format!("Press key failed: unexpected response type: {:?}", other)),
         };
     }
 
@@ -1433,7 +1433,7 @@ async fn dblclick_element_by_text(text: &str, exact: bool, ws_port: u16) -> Resu
                         text, click_x, click_y
                     )),
                     Response::Error { message } => Err(format!("Double-click failed: {}", message)),
-                    _ => Ok(format!("Double-clicked '{}' at ({}, {})", text, click_x, click_y)),
+                    other => Err(format!("Double-click failed: unexpected response type: {:?}", other)),
                 }
             } else {
                 Err(format!("No element found containing text '{}'", text))
@@ -1471,7 +1471,7 @@ async fn hover_element_by_text(text: &str, exact: bool, ws_port: u16) -> Result<
                         text, hover_x, hover_y
                     )),
                     Response::Error { message } => Err(format!("Hover failed: {}", message)),
-                    _ => Ok(format!("Hovered over '{}' at ({}, {})", text, hover_x, hover_y)),
+                    other => Err(format!("Hover failed: unexpected response type: {:?}", other)),
                 }
             } else {
                 Err(format!("No element found containing text '{}'", text))

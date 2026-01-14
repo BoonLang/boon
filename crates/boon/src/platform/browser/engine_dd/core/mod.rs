@@ -36,4 +36,4 @@ pub use guards::{
 pub use types::{
     channel, DdEvent, DdEventValue, DdInput, DdOutput, HoldId, LinkId, TimerId,
 };
-pub use worker::{DataflowConfig, DdWorker, DdWorkerHandle, DocumentUpdate, EventFilter, HoldConfig, StateTransform};
+pub use worker::{DataflowConfig, DdWorker, DdWorkerHandle, DocumentUpdate, EventFilter, HoldConfig, StateTransform, reconstruct_persisted_item};

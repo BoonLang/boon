@@ -317,6 +317,13 @@ impl Action {
                             .to_string();
                         Ok(ParsedAction::AssertContains { text })
                     }
+                    "assert_checkbox_clickable" => {
+                        let index = arr
+                            .get(1)
+                            .and_then(|v| v.as_u64())
+                            .context("assert_checkbox_clickable requires checkbox index")?;
+                        Ok(ParsedAction::AssertCheckboxClickable { index: index as u32 })
+                    }
                     _ => anyhow::bail!("Unknown action type: {}", cmd),
                 }
             }
@@ -354,6 +361,7 @@ pub enum ParsedAction {
     AssertToggleAllDarker,  // Assert toggle all icon is dark (all todos completed)
     AssertInputEmpty { index: u32 },  // Assert input value is empty
     AssertContains { text: String },  // Assert preview contains text
+    AssertCheckboxClickable { index: u32 },  // Assert checkbox is clickable by real user (not obscured)
 }
 
 #[derive(Debug, Clone, Deserialize)]

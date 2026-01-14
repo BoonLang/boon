@@ -2392,6 +2392,97 @@ async function handleCommand(id, command) {
           return { type: 'error', message: 'Assert toggle all darker failed: ' + e.message };
         }
 
+      case 'assertCheckboxClickable':
+        // Verify that a checkbox is ACTUALLY clickable by real user (not obscured by other elements)
+        // This uses elementFromPoint() to check what element would receive a real click
+        try {
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { found: false, error: 'Preview panel not found' };
+
+              const checkboxIndex = ${command.index};
+
+              // Find checkboxes using same method as clickCheckbox
+              const roleCheckboxes = Array.from(preview.querySelectorAll('[role="checkbox"]'));
+              const idCheckboxes = Array.from(preview.querySelectorAll('[id^="cb-"]'));
+
+              // Merge and dedupe
+              const seen = new Set();
+              const allCheckboxes = [];
+              roleCheckboxes.forEach(el => { seen.add(el); allCheckboxes.push(el); });
+              idCheckboxes.forEach(el => { if (!seen.has(el)) { seen.add(el); allCheckboxes.push(el); } });
+
+              // Sort by vertical position for consistent ordering
+              allCheckboxes.sort((a, b) => {
+                const rectA = a.getBoundingClientRect();
+                const rectB = b.getBoundingClientRect();
+                return rectA.top - rectB.top;
+              });
+
+              if (checkboxIndex >= allCheckboxes.length) {
+                return {
+                  found: false,
+                  clickable: false,
+                  error: 'Checkbox index ' + checkboxIndex + ' not found (only ' + allCheckboxes.length + ' checkboxes exist)'
+                };
+              }
+
+              const checkbox = allCheckboxes[checkboxIndex];
+              const rect = checkbox.getBoundingClientRect();
+
+              // Calculate center point
+              const centerX = rect.left + rect.width / 2;
+              const centerY = rect.top + rect.height / 2;
+
+              // Use elementFromPoint to check what element would receive a REAL user click
+              const topElement = document.elementFromPoint(centerX, centerY);
+
+              if (!topElement) {
+                return {
+                  found: true,
+                  clickable: false,
+                  error: 'No element at checkbox center (' + centerX.toFixed(1) + ', ' + centerY.toFixed(1) + ')'
+                };
+              }
+
+              // Element is clickable if it IS the checkbox OR is a descendant of the checkbox
+              const isClickable = checkbox.contains(topElement) || topElement === checkbox;
+
+              if (!isClickable) {
+                return {
+                  found: true,
+                  clickable: false,
+                  error: 'Checkbox ' + checkboxIndex + ' is OBSCURED. At center (' +
+                         centerX.toFixed(1) + ', ' + centerY.toFixed(1) +
+                         '), click would hit <' + topElement.tagName.toLowerCase() +
+                         (topElement.id ? ' id="' + topElement.id + '"' : '') +
+                         (topElement.className ? ' class="' + topElement.className + '"' : '') +
+                         '> instead of the checkbox'
+                };
+              }
+
+              return {
+                found: true,
+                clickable: true,
+                centerX: centerX,
+                centerY: centerY,
+                actualElement: topElement.tagName.toLowerCase()
+              };
+            })()
+          `);
+
+          if (!result.found) {
+            return { type: 'error', message: result.error || 'Checkbox not found' };
+          }
+          if (!result.clickable) {
+            return { type: 'error', message: result.error || 'Checkbox not clickable' };
+          }
+          return { type: 'success', data: { centerX: result.centerX, centerY: result.centerY, actualElement: result.actualElement } };
+        } catch (e) {
+          return { type: 'error', message: 'Assert checkbox clickable failed: ' + e.message };
+        }
+
       case 'screenshotPreview':
         // Take screenshot of preview pane at specified dimensions (v3)
         // Uses PreviewOnly panel layout mode for clean screenshots

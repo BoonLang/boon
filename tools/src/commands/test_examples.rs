@@ -1421,6 +1421,17 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 _ => anyhow::bail!("Unexpected response for GetPreviewText"),
             }
         }
+        ParsedAction::AssertCheckboxClickable { index } => {
+            // Verify that a checkbox is ACTUALLY clickable by real user (not obscured)
+            let response = send_command_to_server(port, WsCommand::AssertCheckboxClickable { index: *index }).await?;
+            match response {
+                WsResponse::Success { .. } => {}
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert checkbox clickable failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for AssertCheckboxClickable"),
+            }
+        }
     }
     Ok(())
 }

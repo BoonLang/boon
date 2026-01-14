@@ -13,8 +13,9 @@
 # 5. Toggle complete (check/uncheck)
 # 6. Toggle all
 # 7. Check different todo
-# 8. Edit todo (double-click)
-# 9. Escape cancel edit
+# 8. Edit todo (double-click) + Escape cancel
+# 8b. Edit mode persistence (BUG #5: edit mode should NOT flash)
+# 9. Title save test (BUG #6: edited title MUST be saved on Enter)
 # 10. Delete todo
 # 11. Clear completed (BUG #4: must remove correct todos)
 # 12. Persistence checks
@@ -380,13 +381,65 @@ description = "Verify Buy milk still shows after canceling edit"
 expect = "Buy milk"
 
 # ============================================
-# SECTION 10: DELETE TODO (HOVER)
-# Tests hover delete button on dynamic todos (via index-based events)
+# SECTION 8b: EDIT MODE PERSISTENCE BUG TEST
+# BUG: Double-click on dynamic todo should enter AND STAY in edit mode
+# The bug causes edit mode to flash (briefly appear then immediately revert)
 # ============================================
 
 [[sequence]]
-description = "Hover over 'Buy milk' to show delete button"
-actions = [["hover_text", "Buy milk"]]
+description = "BUG TEST: Double-click Buy milk to re-enter edit mode"
+actions = [["dblclick_text", "Buy milk"]]
+expect = "1 item left"
+
+[[sequence]]
+description = "BUG TEST: Edit input (index 1) should have focus - edit mode persists"
+actions = [["assert_focused", 1]]
+expect = "1 item left"
+
+[[sequence]]
+description = "BUG TEST: Edit input should be typeable - edit mode is real"
+actions = [["assert_input_typeable", 1]]
+expect = "1 item left"
+
+[[sequence]]
+description = "Press Escape to exit edit mode for next test"
+actions = [["key", "Escape"]]
+expect = "1 item left"
+
+# ============================================
+# SECTION 9: TITLE SAVE TEST
+# BUG: Edited title must be saved when Enter is pressed
+# The bug causes Enter to exit edit mode WITHOUT saving the new title
+# ============================================
+
+[[sequence]]
+description = "Double-click Buy milk to enter edit mode for save test"
+actions = [["dblclick_text", "Buy milk"]]
+expect = "1 item left"
+
+[[sequence]]
+description = "BUG TEST: Type ' EDITED' to append to title"
+actions = [["type", " EDITED"]]
+expect = "1 item left"
+
+[[sequence]]
+description = "BUG TEST: Press Enter to save the edited title"
+actions = [["key", "Enter"]]
+expect = "1 item left"
+
+[[sequence]]
+description = "BUG TEST: Verify the title was saved with appended text"
+expect = "Buy milk EDITED"
+
+# ============================================
+# SECTION 10: DELETE TODO (HOVER)
+# Tests hover delete button on dynamic todos (via index-based events)
+# Note: Title is now "Buy milk EDITED" after Section 9 title save test
+# ============================================
+
+[[sequence]]
+description = "Hover over 'Buy milk EDITED' to show delete button"
+actions = [["hover_text", "Buy milk EDITED"]]
 expect = "1 item left"
 
 [[sequence]]
@@ -395,7 +448,7 @@ actions = [["assert_contains", "×"]]
 expect = "1 item left"
 
 [[sequence]]
-description = "Click delete button to remove 'Buy milk'"
+description = "Click delete button to remove 'Buy milk EDITED'"
 actions = [["click_text", "×"]]
 expect = "0 items left"
 

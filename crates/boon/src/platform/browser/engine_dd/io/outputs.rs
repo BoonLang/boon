@@ -183,8 +183,12 @@ pub fn get_unchecked_checkbox_count() -> usize {
 /// Update a HOLD state value and persist to storage.
 /// Called by the output listener when DD produces new output.
 pub fn update_hold_state(hold_id: &str, value: DdValue) {
+    zoon::println!("[DD HOLD] update_hold_state('{}', {:?})", hold_id, value);
     HOLD_STATES.with(|states| {
-        states.lock_mut().insert(hold_id.to_string(), value.clone());
+        let mut lock = states.lock_mut();
+        let old_value = lock.get(hold_id).cloned();
+        lock.insert(hold_id.to_string(), value.clone());
+        zoon::println!("[DD HOLD] {} changed: {:?} -> {:?}", hold_id, old_value, value);
     });
     // Persist to localStorage
     persist_hold_value(hold_id, &value);
@@ -195,6 +199,32 @@ pub fn update_hold_state(hold_id: &str, value: DdValue) {
 pub fn update_hold_state_no_persist(hold_id: &str, value: DdValue) {
     HOLD_STATES.with(|states| {
         states.lock_mut().insert(hold_id.to_string(), value);
+    });
+}
+
+/// Remove a HOLD state (used to clean up temporary editing text holds).
+pub fn clear_hold_state(hold_id: &str) {
+    HOLD_STATES.with(|states| {
+        states.lock_mut().remove(hold_id);
+    });
+}
+
+/// Toggle a boolean HOLD value (for checkbox interactions).
+/// Reads the current value, inverts it, and updates both memory and persistent storage.
+pub fn toggle_hold_bool(hold_id: &str) {
+    HOLD_STATES.with(|states| {
+        let mut lock = states.lock_mut();
+        let current = lock.get(hold_id).cloned();
+        let new_value = match current {
+            Some(DdValue::Bool(b)) => DdValue::Bool(!b),
+            Some(DdValue::Tagged { tag, .. }) if tag.as_ref() == "True" => DdValue::Bool(false),
+            Some(DdValue::Tagged { tag, .. }) if tag.as_ref() == "False" => DdValue::Bool(true),
+            _ => DdValue::Bool(true), // Default to true if no current value
+        };
+        lock.insert(hold_id.to_string(), new_value.clone());
+        // Persist the new value
+        drop(lock);
+        persist_hold_value(hold_id, &new_value);
     });
 }
 
@@ -266,8 +296,22 @@ fn dd_value_to_json(value: &DdValue) -> Option<zoon::serde_json::Value> {
             }
             Some(zoon::serde_json::Value::Object(obj))
         }
+        // Dereference HoldRefs to persist their actual values
+        DdValue::HoldRef(hold_id) => {
+            // Look up the actual value in HOLD_STATES and persist that
+            HOLD_STATES.with(|cell| {
+                let states = cell.lock_ref(); // ALLOWED: IO layer
+                if let Some(value) = states.get(hold_id.as_ref()) {
+                    zoon::println!("[DD Persist] HoldRef {} -> {:?}", hold_id, value);
+                    dd_value_to_json(value)
+                } else {
+                    zoon::println!("[DD Persist] HoldRef {} NOT FOUND in HOLD_STATES", hold_id);
+                    None
+                }
+            })
+        }
         // Don't persist complex types - they need code evaluation
-        DdValue::Tagged { .. } | DdValue::HoldRef(_) | DdValue::LinkRef(_) | DdValue::TimerRef { .. } | DdValue::WhileRef { .. } | DdValue::ComputedRef { .. } | DdValue::FilteredListRef { .. } | DdValue::ReactiveFilteredList { .. } => None,
+        DdValue::Tagged { .. } | DdValue::LinkRef(_) | DdValue::TimerRef { .. } | DdValue::WhileRef { .. } | DdValue::ComputedRef { .. } | DdValue::FilteredListRef { .. } | DdValue::ReactiveFilteredList { .. } => None,
     }
 }
 
@@ -308,6 +352,14 @@ pub fn hold_states_signal() -> MutableSignalCloned<HashMap<String, DdValue>> {
 pub fn get_hold_value(hold_id: &str) -> Option<DdValue> {
     HOLD_STATES.with(|states| {
         states.lock_ref().get(hold_id).cloned()
+    })
+}
+
+/// Get a snapshot of all current HOLD states.
+/// This reads the current state without subscribing to changes.
+pub fn get_all_hold_states() -> HashMap<String, DdValue> {
+    HOLD_STATES.with(|states| {
+        states.lock_ref().clone()
     })
 }
 

@@ -158,6 +158,10 @@ pub enum Command {
     /// Assert the toggle all checkbox icon is dark (all todos completed)
     AssertToggleAllDarker,
 
+    /// Assert a checkbox is actually clickable by real user (not obscured by other elements)
+    /// Uses elementFromPoint() to verify what element would receive a real click
+    AssertCheckboxClickable { index: u32 },
+
     /// Navigate to a specific route/path (uses history.pushState + popstate event)
     NavigateTo { path: String },
 

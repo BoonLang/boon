@@ -117,6 +117,30 @@ impl BoonDdRuntime {
         }
     }
 
+    /// Call a function with arguments and return the result.
+    /// Used for evaluating item templates like `new_todo("placeholder")`.
+    pub fn call_function(&mut self, name: &str, args: &[(&str, DdValue)]) -> Option<DdValue> {
+        let func_def = self.functions.get(name)?.clone();
+
+        // Create a new runtime with the function arguments as variables
+        let mut func_runtime = BoonDdRuntime {
+            variables: self.variables.clone(),
+            functions: self.functions.clone(),
+            passed_context: self.passed_context.clone(),
+            link_counter: 0,
+            hold_counter: 0,
+            context_path: Vec::new(),
+        };
+
+        // Bind arguments to parameters
+        for (param, arg_name) in func_def.parameters.iter().zip(args.iter()) {
+            func_runtime.variables.insert(param.clone(), arg_name.1.clone());
+        }
+
+        // Evaluate the function body
+        Some(func_runtime.eval_expression(&func_def.body.node))
+    }
+
     /// Evaluate expressions and store results.
     ///
     /// Does two passes to handle forward references (variables that reference
@@ -397,17 +421,7 @@ impl BoonDdRuntime {
         path: &[crate::parser::StrSlice],
         arguments: &[Spanned<crate::parser::static_expression::Argument>],
     ) -> DdValue {
-        // Build argument map
-        let args: HashMap<&str, DdValue> = arguments
-            .iter()
-            .filter_map(|arg| {
-                let name = arg.node.name.as_str();
-                let value = arg.node.value.as_ref().map(|v| self.eval_expression(&v.node))?;
-                Some((name, value))
-            })
-            .collect();
-
-        // Convert path to namespace/name
+        // Convert path to namespace/name first (needed to detect Element functions)
         let full_path: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
         let (namespace, name) = if full_path.len() >= 2 {
             (Some(full_path[0]), full_path[1])
@@ -416,6 +430,23 @@ impl BoonDdRuntime {
         } else {
             return DdValue::Unit;
         };
+
+        // For Element functions, use scoped evaluation where `element` argument
+        // is made available as a variable when evaluating other arguments like `items`.
+        // This enables patterns like: Element/stripe(element: [hovered: LINK], items: LIST { element.hovered |> WHILE {...} })
+        if namespace == Some("Element") {
+            return self.eval_element_function_with_scoped_args(name, arguments);
+        }
+
+        // Build argument map (standard evaluation for non-Element functions)
+        let args: HashMap<&str, DdValue> = arguments
+            .iter()
+            .filter_map(|arg| {
+                let name = arg.node.name.as_str();
+                let value = arg.node.value.as_ref().map(|v| self.eval_expression(&v.node))?;
+                Some((name, value))
+            })
+            .collect();
 
         match (namespace, name) {
             // Document/new(root: value)
@@ -432,8 +463,8 @@ impl BoonDdRuntime {
             // Stream/pulses - returns unit in static context
             (Some("Stream"), "pulses") => DdValue::Unit,
 
-            // Element functions
-            (Some("Element"), func) => self.eval_element_function(func, &args),
+            // Element functions (handled above with scoped args)
+            (Some("Element"), _) => unreachable!(),
 
             // List functions
             (Some("List"), func) => self.eval_list_function(func, &args),
@@ -452,6 +483,49 @@ impl BoonDdRuntime {
             // Unknown
             _ => DdValue::Unit,
         }
+    }
+
+    /// Evaluate Element function with scoped argument evaluation.
+    /// The `element` argument is evaluated first and bound as a variable
+    /// so other arguments (like `items`) can reference `element.hovered` etc.
+    fn eval_element_function_with_scoped_args(
+        &mut self,
+        func_name: &str,
+        arguments: &[Spanned<crate::parser::static_expression::Argument>],
+    ) -> DdValue {
+        // Find and evaluate `element` argument first (if present)
+        let element_arg = arguments.iter().find(|arg| arg.node.name.as_str() == "element");
+        let element_value = element_arg
+            .and_then(|arg| arg.node.value.as_ref())
+            .map(|v| self.eval_expression(&v.node))
+            .unwrap_or(DdValue::Unit);
+
+        // Bind `element` as a variable in scope for evaluating remaining arguments
+        let old_element = self.variables.insert("element".to_string(), element_value.clone());
+
+        // Build argument map with scoped evaluation
+        let args: HashMap<&str, DdValue> = arguments
+            .iter()
+            .filter_map(|arg| {
+                let name = arg.node.name.as_str();
+                if name == "element" {
+                    // Already evaluated, use cached value
+                    Some((name, element_value.clone()))
+                } else {
+                    let value = arg.node.value.as_ref().map(|v| self.eval_expression(&v.node))?;
+                    Some((name, value))
+                }
+            })
+            .collect();
+
+        // Restore previous `element` variable (if any)
+        if let Some(old) = old_element {
+            self.variables.insert("element".to_string(), old);
+        } else {
+            self.variables.remove("element");
+        }
+
+        self.eval_element_function(func_name, &args)
     }
 
     /// Evaluate a user-defined function call.
@@ -548,11 +622,14 @@ impl BoonDdRuntime {
 
     /// Evaluate an Element function.
     fn eval_element_function(&mut self, name: &str, args: &HashMap<&str, DdValue>) -> DdValue {
+        zoon::println!("[DD_EVAL] Element/{}() called with args: {:?}", name, args.keys().collect::<Vec<_>>());
         let mut fields: Vec<(&str, DdValue)> = vec![("_element_type", DdValue::text(name))];
         for (k, v) in args {
             fields.push((k, v.clone()));
         }
-        DdValue::tagged("Element", fields.into_iter())
+        let result = DdValue::tagged("Element", fields.into_iter());
+        zoon::println!("[DD_EVAL] Element/{}() -> Tagged(Element)", name);
+        result
     }
 
     /// Evaluate a List function.
@@ -997,12 +1074,16 @@ impl BoonDdRuntime {
             Expression::LinkSetter { alias } => {
                 // Get the target LinkRef from the alias
                 let target_link = self.eval_alias(&alias.node);
+                zoon::println!("[DD_EVAL] LinkSetter: alias={:?} -> target_link={:?}", alias.node, target_link);
 
                 // Replace any LinkRef in the element with the target
                 if let DdValue::LinkRef(target_id) = &target_link {
-                    self.replace_link_ref_in_value(from, target_id)
+                    let result = self.replace_link_ref_in_value(from, target_id);
+                    zoon::println!("[DD_EVAL] LinkSetter: replaced LinkRef with {}", target_id);
+                    result
                 } else {
                     // If alias doesn't resolve to a LinkRef, just pass through unchanged
+                    zoon::println!("[DD_EVAL] LinkSetter: alias did not resolve to LinkRef, passing through unchanged");
                     from.clone()
                 }
             }
@@ -1484,6 +1565,9 @@ impl BoonDdRuntime {
 
     /// Evaluate pattern matching for WHEN/WHILE.
     fn eval_pattern_match(&mut self, value: &DdValue, arms: &[Arm]) -> DdValue {
+        // Debug: log what value type is being pattern matched
+        zoon::println!("[DD_EVAL] eval_pattern_match input: {:?}", value);
+
         // If input is a HoldRef, return a WhileRef for reactive rendering
         if let DdValue::HoldRef(hold_id) = value {
             // Pre-evaluate all arms for the bridge to render reactively
@@ -1572,6 +1656,106 @@ impl BoonDdRuntime {
             return DdValue::WhileRef {
                 hold_id: source_hold.clone(),
                 computation: Some(computation.clone()),  // Store the computation for bridge to evaluate
+                arms: Arc::new(evaluated_arms),
+                default: default_value,
+            };
+        }
+
+        // If input is a LinkRef (e.g., element.hovered), create a synthetic hold for boolean state
+        // This handles: element.hovered |> WHILE { True => delete_button, False => NoElement }
+        if let DdValue::LinkRef(link_id) = value {
+            // Create a synthetic hold for this link's boolean state
+            let hold_id = format!("hover_{}", link_id);
+
+            // Initialize the hold state to False (not hovered initially)
+            init_hold_state(&hold_id, DdValue::Bool(false));
+
+            // Pre-evaluate all arms for the bridge to render reactively
+            let mut evaluated_arms = Vec::new();
+            let mut default_value = None;
+
+            for arm in arms {
+                let pattern_value = self.pattern_to_value(&arm.pattern);
+
+                if matches!(arm.pattern, Pattern::WildCard) {
+                    let mut match_runtime = BoonDdRuntime {
+                        variables: self.variables.clone(),
+                        functions: self.functions.clone(),
+                        passed_context: self.passed_context.clone(),
+                        link_counter: 0,
+                        hold_counter: 0,
+                        context_path: Vec::new(),
+                    };
+                    let body_result = match_runtime.eval_expression(&arm.body.node);
+                    default_value = Some(Arc::new(body_result));
+                } else if let Some(pv) = pattern_value {
+                    let mut match_runtime = BoonDdRuntime {
+                        variables: self.variables.clone(),
+                        functions: self.functions.clone(),
+                        passed_context: self.passed_context.clone(),
+                        link_counter: 0,
+                        hold_counter: 0,
+                        context_path: Vec::new(),
+                    };
+                    // Debug: log the 'todo' variable if present to trace LinkRef binding
+                    if let Some(todo_val) = match_runtime.variables.get("todo") {
+                        if let Some(todo_elements) = todo_val.get("todo_elements") {
+                            if let Some(remove_btn) = todo_elements.get("remove_todo_button") {
+                                zoon::println!("[DD_EVAL] WhileRef arm eval: todo.todo_elements.remove_todo_button = {:?}", remove_btn);
+                            }
+                        }
+                    }
+                    let body_result = match_runtime.eval_expression(&arm.body.node);
+                    evaluated_arms.push((pv, body_result));
+                }
+            }
+
+            // Log what the True arm contains (specifically look for button press LinkRef)
+            for (pattern, body) in &evaluated_arms {
+                if matches!(pattern, DdValue::Tagged { tag, .. } if tag.as_ref() == "True") {
+                    // Check if body contains a button with a press LinkRef
+                    fn find_press_link(v: &DdValue) -> Option<String> {
+                        match v {
+                            DdValue::Tagged { tag, fields } if tag.as_ref() == "Element" => {
+                                if let Some(element) = fields.get("element") {
+                                    if let Some(event) = element.get("event") {
+                                        if let Some(DdValue::LinkRef(id)) = event.get("press") {
+                                            return Some(id.to_string());
+                                        }
+                                    }
+                                }
+                                // Recurse into items
+                                if let Some(DdValue::List(items)) = fields.get("items") {
+                                    for item in items.iter() {
+                                        if let Some(link) = find_press_link(item) {
+                                            return Some(link);
+                                        }
+                                    }
+                                }
+                                None
+                            }
+                            DdValue::Object(obj) => {
+                                if let Some(event) = obj.get("event") {
+                                    if let Some(DdValue::LinkRef(id)) = event.get("press") {
+                                        return Some(id.to_string());
+                                    }
+                                }
+                                None
+                            }
+                            _ => None,
+                        }
+                    }
+                    if let Some(press_link) = find_press_link(body) {
+                        zoon::println!("[DD_EVAL] WhileRef {} True arm button press: {}", hold_id, press_link);
+                    }
+                }
+            }
+
+            zoon::println!("[DD_EVAL] Created WhileRef for LinkRef {} (hover hold: {}) with {} arms", link_id, hold_id, evaluated_arms.len());
+
+            return DdValue::WhileRef {
+                hold_id: Arc::from(hold_id),
+                computation: None,  // No computation - just read hold state directly
                 arms: Arc::new(evaluated_arms),
                 default: default_value,
             };

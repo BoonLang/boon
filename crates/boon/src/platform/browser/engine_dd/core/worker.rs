@@ -34,6 +34,332 @@ use zoon::{Task, Timer};
 
 use super::types::{DdEvent, DdEventValue, DdInput, DdOutput, HoldId, LinkId};
 use crate::platform::browser::engine_dd::dd_value::DdValue;
+use crate::platform::browser::engine_dd::io::{update_hold_state, update_hold_state_no_persist};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Global counter for generating unique HOLD IDs for dynamic items
+static DYNAMIC_HOLD_COUNTER: AtomicU32 = AtomicU32::new(1000);
+
+/// Global counter for generating unique LINK IDs for dynamic items
+static DYNAMIC_LINK_COUNTER: AtomicU32 = AtomicU32::new(1000);
+
+/// Extract field-to-hold-id mappings from a template.
+/// Returns a map like {"title" -> "hold_18", "completed" -> "hold_20", ...}
+fn extract_field_to_hold_map(template: &DdValue) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    if let DdValue::Object(fields) = template {
+        for (field_name, value) in fields.iter() {
+            if let DdValue::HoldRef(hold_id) = value {
+                result.insert(field_name.to_string(), hold_id.to_string());
+            }
+        }
+    }
+    result
+}
+
+/// Clone a template DdValue with fresh HoldRef/LinkRef IDs.
+/// Returns the cloned value and a mapping of old HoldRef IDs to new IDs.
+fn clone_template_with_fresh_ids(
+    template: &DdValue,
+    hold_id_map: &mut HashMap<String, String>,
+    link_id_map: &mut HashMap<String, String>,
+) -> DdValue {
+    match template {
+        DdValue::HoldRef(old_id) => {
+            // Generate or reuse fresh ID for this HoldRef
+            let new_id = hold_id_map
+                .entry(old_id.to_string())
+                .or_insert_with(|| {
+                    let counter = DYNAMIC_HOLD_COUNTER.fetch_add(1, Ordering::SeqCst);
+                    format!("dynamic_hold_{}", counter)
+                })
+                .clone();
+            DdValue::HoldRef(Arc::from(new_id.as_str()))
+        }
+        DdValue::LinkRef(old_id) => {
+            // Generate or reuse fresh ID for this LinkRef
+            let new_id = link_id_map
+                .entry(old_id.to_string())
+                .or_insert_with(|| {
+                    let counter = DYNAMIC_LINK_COUNTER.fetch_add(1, Ordering::SeqCst);
+                    format!("dynamic_link_{}", counter)
+                })
+                .clone();
+            DdValue::LinkRef(Arc::from(new_id.as_str()))
+        }
+        DdValue::Object(fields) => {
+            let new_fields: BTreeMap<Arc<str>, DdValue> = fields
+                .iter()
+                .map(|(k, v)| (k.clone(), clone_template_with_fresh_ids(v, hold_id_map, link_id_map)))
+                .collect();
+            DdValue::Object(Arc::new(new_fields))
+        }
+        DdValue::List(items) => {
+            let new_items: Vec<DdValue> = items
+                .iter()
+                .map(|v| clone_template_with_fresh_ids(v, hold_id_map, link_id_map))
+                .collect();
+            DdValue::List(Arc::new(new_items))
+        }
+        DdValue::Tagged { tag, fields } => {
+            let new_fields: BTreeMap<Arc<str>, DdValue> = fields
+                .iter()
+                .map(|(k, v)| (k.clone(), clone_template_with_fresh_ids(v, hold_id_map, link_id_map)))
+                .collect();
+            DdValue::Tagged { tag: tag.clone(), fields: Arc::new(new_fields) }
+        }
+        DdValue::WhileRef { hold_id, computation, arms, default } => {
+            // Remap the hold_id using the existing mapping
+            let new_hold_id = hold_id_map
+                .entry(hold_id.to_string())
+                .or_insert_with(|| {
+                    let counter = DYNAMIC_HOLD_COUNTER.fetch_add(1, Ordering::SeqCst);
+                    format!("dynamic_hold_{}", counter)
+                })
+                .clone();
+
+            // Recurse into arm patterns and bodies
+            let new_arms: Vec<(DdValue, DdValue)> = arms
+                .iter()
+                .map(|(pattern, body)| {
+                    (
+                        clone_template_with_fresh_ids(pattern, hold_id_map, link_id_map),
+                        clone_template_with_fresh_ids(body, hold_id_map, link_id_map),
+                    )
+                })
+                .collect();
+
+            // Recurse into default if present
+            let new_default = default.as_ref().map(|d| {
+                Arc::new(clone_template_with_fresh_ids(d.as_ref(), hold_id_map, link_id_map))
+            });
+
+            DdValue::WhileRef {
+                hold_id: Arc::from(new_hold_id.as_str()),
+                computation: computation.clone(), // Computation doesn't contain HoldRefs to remap
+                arms: Arc::new(new_arms),
+                default: new_default,
+            }
+        }
+        // Primitive types are cloned as-is
+        _ => template.clone(),
+    }
+}
+
+/// Find the hold_id of a WhileRef that controls hover-based visibility.
+/// Looks for a WhileRef in items that has True/False arms (for showing/hiding the delete button).
+fn find_hover_while_hold_id(items: Option<&DdValue>) -> Option<String> {
+    if let Some(DdValue::List(item_list)) = items {
+        for item in item_list.iter() {
+            // Check if this item is a WhileRef with True/False arms
+            if let DdValue::WhileRef { hold_id, arms, .. } = item {
+                // Check if this WhileRef has True and False arms (hover-based visibility pattern)
+                let has_true_arm = arms.iter().any(|(pattern, _)| {
+                    matches!(pattern, DdValue::Tagged { tag, .. } if tag.as_ref() == "True")
+                });
+                let has_false_arm = arms.iter().any(|(pattern, body)| {
+                    matches!(pattern, DdValue::Tagged { tag, .. } if tag.as_ref() == "False") &&
+                    matches!(body, DdValue::Tagged { tag, .. } if tag.as_ref() == "NoElement")
+                });
+                if has_true_arm && has_false_arm {
+                    return Some(hold_id.to_string());
+                }
+            }
+            // Also check nested in Tagged elements' items
+            if let DdValue::Tagged { fields, .. } = item {
+                if let Some(nested_items) = fields.get("items") {
+                    if let Some(hold_id) = find_hover_while_hold_id(Some(nested_items)) {
+                        return Some(hold_id);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Find the checkbox's `checked` HoldRef ID within an Element AST.
+/// Used by ListRemoveCompleted to determine if an element should be removed.
+fn find_checkbox_hold_id(element: &DdValue) -> Option<String> {
+    // Element structure: Tagged { tag: "Element", fields: { items: List([checkbox, ...]) } }
+    if let DdValue::Tagged { tag, fields } = element {
+        if tag.as_ref() == "Element" {
+            // Look for items list
+            if let Some(DdValue::List(items)) = fields.get("items") {
+                for item in items.iter() {
+                    // Check if this item is a checkbox element
+                    if let DdValue::Tagged { tag: item_tag, fields: item_fields } = item {
+                        if item_tag.as_ref() == "Element" {
+                            if let Some(DdValue::Text(elem_type)) = item_fields.get("_element_type") {
+                                if elem_type.as_ref() == "checkbox" {
+                                    // Found checkbox - extract checked HoldRef
+                                    if let Some(DdValue::HoldRef(hold_id)) = item_fields.get("checked") {
+                                        zoon::println!("[DD Worker] find_checkbox_hold_id: found checkbox with checked={}", hold_id);
+                                        return Some(hold_id.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            zoon::println!("[DD Worker] find_checkbox_hold_id: no checkbox found in element type {:?}", fields.get("_element_type"));
+        }
+    }
+    None
+}
+
+/// Reconstruct a persisted todo item using templates.
+///
+/// When todos are persisted to localStorage, they lose their HoldRef/LinkRef structure.
+/// This function reconstructs the full structure by:
+/// 1. Cloning templates with fresh IDs
+/// 2. Initializing HOLDs with persisted values (title, completed, editing)
+/// 3. Registering dynamic link actions (edit, remove, hover)
+/// 4. Returning the reconstructed (data_item, element) pair
+///
+/// This enables persisted todos to render correctly after page reload.
+pub fn reconstruct_persisted_item(
+    persisted_item: &DdValue,
+    data_template: &DdValue,
+    element_template: Option<&DdValue>,
+) -> Option<(DdValue, Option<DdValue>)> {
+    // Extract persisted values
+    let (title, completed, editing) = if let DdValue::Object(obj) = persisted_item {
+        let title = obj.get("title").and_then(|v| match v {
+            DdValue::Text(t) => Some(t.to_string()),
+            _ => None,
+        })?;
+        let completed = obj.get("completed").and_then(|v| match v {
+            DdValue::Bool(b) => Some(*b),
+            _ => None,
+        }).unwrap_or(false);
+        let editing = obj.get("editing").and_then(|v| match v {
+            DdValue::Bool(b) => Some(*b),
+            _ => None,
+        }).unwrap_or(false);
+        (title, completed, editing)
+    } else {
+        return None;
+    };
+
+    zoon::println!("[DD Reconstruct] Persisted item: title='{}', completed={}, editing={}", title, completed, editing);
+
+    // Extract field-to-hold mapping from data template
+    let field_to_hold = extract_field_to_hold_map(data_template);
+
+    // Clone data template with fresh HoldRef/LinkRef IDs
+    let mut hold_id_map: HashMap<String, String> = HashMap::new();
+    let mut link_id_map: HashMap<String, String> = HashMap::new();
+    let new_data_item = clone_template_with_fresh_ids(data_template, &mut hold_id_map, &mut link_id_map);
+
+    // Create reverse mapping: old_hold_id -> field_name
+    let hold_to_field: HashMap<String, String> = field_to_hold
+        .iter()
+        .map(|(field, hold)| (hold.clone(), field.clone()))
+        .collect();
+
+    // Register new HOLDs with PERSISTED values (not defaults!)
+    for (old_id, new_id) in &hold_id_map {
+        let field_name = hold_to_field.get(old_id).map(|s| s.as_str());
+        let initial_value = match field_name {
+            Some("title") => DdValue::text(title.clone()),
+            Some("completed") => DdValue::Bool(completed),
+            Some("editing") => DdValue::Bool(editing),
+            _ => DdValue::Unit,
+        };
+        zoon::println!("[DD Reconstruct] Registering HOLD: {} -> {} = {:?} (field: {:?})",
+            old_id, new_id, initial_value, field_name);
+        update_hold_state_no_persist(new_id, initial_value);
+    }
+
+    zoon::println!("[DD Reconstruct] Created item with {} HOLDs, {} LINKs",
+        hold_id_map.len(), link_id_map.len());
+
+    // Register dynamic link actions for editing mode
+    if let Some(editing_old_id) = field_to_hold.get("editing") {
+        if let Some(editing_new_id) = hold_id_map.get(editing_old_id) {
+            if let DdValue::Object(obj) = data_template {
+                if let Some(DdValue::Object(todo_elements)) = obj.get("todo_elements") {
+                    // Register double-click on todo_title_element → SetTrue(editing hold)
+                    if let Some(DdValue::LinkRef(old_link_id)) = todo_elements.get("todo_title_element") {
+                        if let Some(new_link_id) = link_id_map.get(old_link_id.as_ref()) {
+                            zoon::println!("[DD Reconstruct] Registering SetTrue: {} -> {}", new_link_id, editing_new_id);
+                            use super::super::io::{add_dynamic_link_action, DynamicLinkAction};
+                            add_dynamic_link_action(new_link_id.clone(), DynamicLinkAction::SetTrue(editing_new_id.clone()));
+                        }
+                    }
+
+                    // Register editing handler for editing_todo_title_element
+                    if let Some(DdValue::LinkRef(old_edit_link_id)) = todo_elements.get("editing_todo_title_element") {
+                        if let Some(new_edit_link_id) = link_id_map.get(old_edit_link_id.as_ref()) {
+                            if let Some(title_old_id) = field_to_hold.get("title") {
+                                if let Some(title_new_id) = hold_id_map.get(title_old_id) {
+                                    zoon::println!("[DD Reconstruct] Registering EditingHandler: {} -> edit={}, title={}", new_edit_link_id, editing_new_id, title_new_id);
+                                    use super::super::io::{add_dynamic_link_action, DynamicLinkAction};
+                                    add_dynamic_link_action(new_edit_link_id.clone(), DynamicLinkAction::EditingHandler {
+                                        editing_hold: editing_new_id.clone(),
+                                        title_hold: title_new_id.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // Register RemoveListItem action for remove_todo_button
+                    if let Some(DdValue::LinkRef(old_remove_link_id)) = todo_elements.get("remove_todo_button") {
+                        if let Some(new_remove_link_id) = link_id_map.get(old_remove_link_id.as_ref()) {
+                            zoon::println!("[DD Reconstruct] Registering RemoveListItem: {} -> link_id={}", new_remove_link_id, new_remove_link_id);
+                            use super::super::io::{add_dynamic_link_action, DynamicLinkAction};
+                            add_dynamic_link_action(new_remove_link_id.clone(), DynamicLinkAction::RemoveListItem { link_id: new_remove_link_id.clone() });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Clone element template if provided
+    let new_element = element_template.map(|elem_tmpl| {
+        // Find the hover link in the element template BEFORE cloning
+        let hover_link_old_id = if let DdValue::Tagged { fields, .. } = elem_tmpl {
+            fields.get("element")
+                .and_then(|e| e.get("hovered"))
+                .and_then(|h| match h {
+                    DdValue::LinkRef(id) => Some(id.to_string()),
+                    _ => None,
+                })
+        } else {
+            None
+        };
+
+        // Find the WhileRef for hover
+        let hover_hold_old_id = if let DdValue::Tagged { fields, .. } = elem_tmpl {
+            find_hover_while_hold_id(fields.get("items"))
+        } else {
+            None
+        };
+
+        // Clone element template - reuses the same ID mapping
+        let cloned_element = clone_template_with_fresh_ids(elem_tmpl, &mut hold_id_map, &mut link_id_map);
+
+        // Register HoverState action if we found both the hover link and hold
+        if let (Some(old_link), Some(old_hold)) = (hover_link_old_id, hover_hold_old_id) {
+            if let (Some(new_link), Some(new_hold)) = (link_id_map.get(&old_link), hold_id_map.get(&old_hold)) {
+                zoon::println!("[DD Reconstruct] Registering HoverState: {} -> {}", new_link, new_hold);
+                use super::super::io::{add_dynamic_link_action, DynamicLinkAction};
+                add_dynamic_link_action(new_link.clone(), DynamicLinkAction::HoverState(new_hold.clone()));
+                // Initialize hover hold to false
+                update_hold_state_no_persist(new_hold, DdValue::Bool(false));
+            }
+        }
+
+        cloned_element
+    });
+
+    Some((new_data_item, new_element))
+}
 
 /// Handle to a running DD worker.
 ///
@@ -106,7 +432,21 @@ pub enum StateTransform {
     /// Set boolean to false (for exiting editing mode on Enter/Escape/blur)
     SetFalse,
     /// Append event text to list (creates todo objects with title/completed)
+    /// DEPRECATED: Use ListAppendWithTemplate for proper Element AST items
     ListAppend,
+    /// Append item using template DdValues with fresh HoldRef/LinkRef IDs.
+    /// The templates are pre-evaluated structures (e.g., from new_todo() and todo_item()).
+    /// At append time, both templates are cloned with the SAME ID mapping, so the element
+    /// references the cloned data's HOLDs correctly.
+    /// Fields:
+    /// - data_template: The data object template (stored in "todos" HOLD)
+    /// - element_template: The Element AST template (stored in "todos_elements" HOLD)
+    /// - title_hold_field: Path to the title HoldRef field (e.g., "title")
+    ListAppendWithTemplate {
+        data_template: DdValue,
+        element_template: Option<DdValue>,
+        title_hold_field: String,
+    },
     /// List with both append and clear - handles "Enter:text" for append, Unit from clear_link for clear
     /// The String parameter is the clear button's link_id - only Unit events from this link will clear.
     ListAppendWithClear(String),
@@ -579,7 +919,7 @@ impl DdWorker {
                             StateTransform::ListAppend => {
                                 // Append event text to list as a proper todo object
                                 // Event format is "Enter:text" - extract the text after ":"
-                                // HACK: TodoMVC-specific - creates todo object with editing field
+                                // DEPRECATED: Use ListAppendWithTemplate for proper Element AST items
                                 match (state, event) {
                                     (DdValue::List(items), (_, DdEventValue::Text(text))) => {
                                         // Extract text after "Enter:" prefix
@@ -600,6 +940,195 @@ impl DdWorker {
                                             ("editing", DdValue::Bool(false)),
                                         ]);
                                         new_items.push(todo);
+                                        DdValue::List(Arc::new(new_items))
+                                    }
+                                    _ => state.clone(),
+                                }
+                            }
+                            StateTransform::ListAppendWithTemplate { data_template, element_template, title_hold_field } => {
+                                // Append item using template cloning with fresh IDs
+                                // Both data and element templates use the SAME ID mapping,
+                                // so the cloned element references the cloned data's HOLDs
+                                match (state, event) {
+                                    (DdValue::List(items), (_, DdEventValue::Text(text))) => {
+                                        // Extract text after "Enter:" prefix
+                                        let item_text = if let Some(stripped) = text.strip_prefix("Enter:") {
+                                            stripped.trim()
+                                        } else {
+                                            text.trim()
+                                        };
+                                        // Only append non-empty text
+                                        if item_text.is_empty() {
+                                            return state.clone();
+                                        }
+
+                                        // Extract field-to-hold mapping from data template
+                                        // e.g., {"title" -> "hold_18", "completed" -> "hold_20", "editing" -> "hold_19"}
+                                        let field_to_hold = extract_field_to_hold_map(data_template);
+
+                                        // Clone data template with fresh HoldRef/LinkRef IDs
+                                        let mut hold_id_map: HashMap<String, String> = HashMap::new();
+                                        let mut link_id_map: HashMap<String, String> = HashMap::new();
+                                        let new_data_item = clone_template_with_fresh_ids(data_template, &mut hold_id_map, &mut link_id_map);
+
+                                        // Create reverse mapping: old_hold_id -> field_name
+                                        let hold_to_field: HashMap<String, String> = field_to_hold
+                                            .iter()
+                                            .map(|(field, hold)| (hold.clone(), field.clone()))
+                                            .collect();
+
+                                        // Register new HOLDs with initial values
+                                        // Use field_name to determine what value to set
+                                        for (old_id, new_id) in &hold_id_map {
+                                            let field_name = hold_to_field.get(old_id).map(|s| s.as_str());
+                                            let initial_value = match field_name {
+                                                Some(name) if name == title_hold_field || name == "title" => {
+                                                    // This is the title HOLD - set to input text
+                                                    DdValue::text(item_text)
+                                                }
+                                                Some("completed") => {
+                                                    // Completed defaults to false
+                                                    DdValue::Bool(false)
+                                                }
+                                                Some("editing") => {
+                                                    // Editing defaults to false
+                                                    DdValue::Bool(false)
+                                                }
+                                                _ => {
+                                                    // Unknown HOLD - default to Unit
+                                                    DdValue::Unit
+                                                }
+                                            };
+                                            zoon::println!("[DD Worker] Registering HOLD: {} -> {} = {:?} (field: {:?})",
+                                                old_id, new_id, initial_value, field_name);
+                                            update_hold_state_no_persist(new_id, initial_value);
+                                        }
+
+                                        zoon::println!("[DD Worker] ListAppendWithTemplate: Created item with {} HOLDs, {} LINKs",
+                                            hold_id_map.len(), link_id_map.len());
+
+                                        // Register dynamic link actions for editing mode
+                                        // Find editing hold ID and todo_title_element link ID, then wire them
+                                        zoon::println!("[DD Worker] Checking dynamic link registration: field_to_hold={:?}", field_to_hold);
+                                        if let Some(editing_old_id) = field_to_hold.get("editing") {
+                                            zoon::println!("[DD Worker] Found editing hold: {}", editing_old_id);
+                                            if let Some(editing_new_id) = hold_id_map.get(editing_old_id) {
+                                                zoon::println!("[DD Worker] Mapped to new editing hold: {}", editing_new_id);
+                                                // Find todo_title_element link from data template's todo_elements
+                                                if let DdValue::Object(obj) = data_template {
+                                                    zoon::println!("[DD Worker] data_template is Object with keys: {:?}", obj.keys().collect::<Vec<_>>());
+                                                    if let Some(DdValue::Object(todo_elements)) = obj.get("todo_elements") {
+                                                        zoon::println!("[DD Worker] Found todo_elements with keys: {:?}", todo_elements.keys().collect::<Vec<_>>());
+                                                        // Register double-click on todo_title_element → SetTrue(editing hold)
+                                                        if let Some(DdValue::LinkRef(old_link_id)) = todo_elements.get("todo_title_element") {
+                                                            zoon::println!("[DD Worker] Found todo_title_element link: {}", old_link_id);
+                                                            if let Some(new_link_id) = link_id_map.get(old_link_id.as_ref()) {
+                                                                zoon::println!("[DD Worker] Registering dynamic link: {} -> SetTrue({})", new_link_id, editing_new_id);
+                                                                use super::super::io::{add_dynamic_link_action, DynamicLinkAction};
+                                                                add_dynamic_link_action(new_link_id.clone(), DynamicLinkAction::SetTrue(editing_new_id.clone()));
+                                                            } else {
+                                                                zoon::println!("[DD Worker] ERROR: Could not find new link ID for {}", old_link_id);
+                                                            }
+                                                        } else {
+                                                            zoon::println!("[DD Worker] ERROR: todo_title_element not found or not LinkRef");
+                                                        }
+
+                                                        // Register editing handler for editing_todo_title_element
+                                                        // Handles: Enter → save title + exit, Escape → exit (no save), blur → exit (no save)
+                                                        zoon::println!("[DD Worker] CHECKPOINT: About to check editing_todo_title_element");
+                                                        if let Some(DdValue::LinkRef(old_edit_link_id)) = todo_elements.get("editing_todo_title_element") {
+                                                            zoon::println!("[DD Worker] Found editing_todo_title_element link: {}", old_edit_link_id);
+                                                            if let Some(new_edit_link_id) = link_id_map.get(old_edit_link_id.as_ref()) {
+                                                                // Also need the title HOLD ID for saving
+                                                                if let Some(title_old_id) = field_to_hold.get("title") {
+                                                                    if let Some(title_new_id) = hold_id_map.get(title_old_id) {
+                                                                        zoon::println!("[DD Worker] Registering EditingHandler: {} -> edit={}, title={}", new_edit_link_id, editing_new_id, title_new_id);
+                                                                        use super::super::io::{add_dynamic_link_action, DynamicLinkAction};
+                                                                        add_dynamic_link_action(new_edit_link_id.clone(), DynamicLinkAction::EditingHandler {
+                                                                            editing_hold: editing_new_id.clone(),
+                                                                            title_hold: title_new_id.clone(),
+                                                                        });
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+
+                                                        // Register RemoveListItem action for remove_todo_button
+                                                        // Handles: click → remove this todo from the list
+                                                        if let Some(DdValue::LinkRef(old_remove_link_id)) = todo_elements.get("remove_todo_button") {
+                                                            zoon::println!("[DD Worker] Found remove_todo_button link: {}", old_remove_link_id);
+                                                            if let Some(new_remove_link_id) = link_id_map.get(old_remove_link_id.as_ref()) {
+                                                                // Use link_id instead of index (indices shift when items are removed)
+                                                                zoon::println!("[DD Worker] Registering RemoveListItem: {} -> link_id={}", new_remove_link_id, new_remove_link_id);
+                                                                use super::super::io::{add_dynamic_link_action, DynamicLinkAction};
+                                                                add_dynamic_link_action(new_remove_link_id.clone(), DynamicLinkAction::RemoveListItem { link_id: new_remove_link_id.clone() });
+                                                            }
+                                                        }
+                                                    } else {
+                                                        zoon::println!("[DD Worker] ERROR: todo_elements not found or not Object");
+                                                    }
+                                                } else {
+                                                    zoon::println!("[DD Worker] ERROR: data_template is not Object: {:?}", data_template);
+                                                }
+                                            } else {
+                                                zoon::println!("[DD Worker] ERROR: Could not map editing hold {} to new ID", editing_old_id);
+                                            }
+                                        } else {
+                                            zoon::println!("[DD Worker] No editing field in field_to_hold");
+                                        }
+
+                                        // If element template exists, clone it with SAME ID mapping
+                                        // and add to "todos_elements" HOLD for unified rendering
+                                        if let Some(elem_tmpl) = element_template {
+                                            // Find the hover link in the element template BEFORE cloning
+                                            // Element template is Tagged "Element" with fields including element.hovered
+                                            let hover_link_old_id = if let DdValue::Tagged { fields, .. } = elem_tmpl {
+                                                fields.get("element")
+                                                    .and_then(|e| e.get("hovered"))
+                                                    .and_then(|h| match h {
+                                                        DdValue::LinkRef(id) => Some(id.to_string()),
+                                                        _ => None,
+                                                    })
+                                            } else {
+                                                None
+                                            };
+
+                                            // Find the WhileRef for hover in the element template's items
+                                            // This is the WhileRef that has arms for True (delete button) and False (NoElement)
+                                            let hover_hold_old_id = if let DdValue::Tagged { fields, .. } = elem_tmpl {
+                                                find_hover_while_hold_id(fields.get("items"))
+                                            } else {
+                                                None
+                                            };
+
+                                            // Clone element template - reuses the same ID mapping
+                                            let new_element = clone_template_with_fresh_ids(elem_tmpl, &mut hold_id_map, &mut link_id_map);
+
+                                            // Register HoverState action if we found both the hover link and hold
+                                            if let (Some(old_link), Some(old_hold)) = (hover_link_old_id, hover_hold_old_id) {
+                                                if let (Some(new_link), Some(new_hold)) = (link_id_map.get(&old_link), hold_id_map.get(&old_hold)) {
+                                                    zoon::println!("[DD Worker] Registering HoverState: {} -> {}", new_link, new_hold);
+                                                    use super::super::io::{add_dynamic_link_action, DynamicLinkAction};
+                                                    add_dynamic_link_action(new_link.clone(), DynamicLinkAction::HoverState(new_hold.clone()));
+                                                    // Initialize hover hold to false
+                                                    update_hold_state_no_persist(new_hold, DdValue::Bool(false));
+                                                }
+                                            }
+
+                                            // Get current todos_elements list and append
+                                            let current_elements = super::super::io::get_hold_value("todos_elements")
+                                                .unwrap_or_else(|| DdValue::List(Arc::new(Vec::new())));
+                                            if let DdValue::List(elems) = current_elements {
+                                                let mut new_elems: Vec<DdValue> = elems.to_vec();
+                                                new_elems.push(new_element);
+                                                let new_count = new_elems.len();
+                                                update_hold_state_no_persist("todos_elements", DdValue::List(Arc::new(new_elems)));
+                                                zoon::println!("[DD Worker] Added element to todos_elements, now {} elements", new_count);
+                                            }
+                                        }
+
+                                        let mut new_items: Vec<DdValue> = items.to_vec();
+                                        new_items.push(new_data_item);
                                         DdValue::List(Arc::new(new_items))
                                     }
                                     _ => state.clone(),
@@ -698,26 +1227,51 @@ impl DdWorker {
                                         if items.is_empty() {
                                             return state.clone();
                                         }
+                                        // Helper to check if an item's completed value is true
+                                        // Must resolve HoldRefs to get actual boolean values
+                                        // NOTE: Always read from global HOLD_STATES since update_hold_state writes there
+                                        let is_item_completed = |obj: &std::collections::BTreeMap<Arc<str>, DdValue>| -> bool {
+                                            match obj.get("completed") {
+                                                Some(DdValue::Bool(true)) => true,
+                                                Some(DdValue::HoldRef(hold_id)) => {
+                                                    // All HoldRefs are read from global HOLD_STATES
+                                                    // (update_hold_state writes there, not to worker's states_map)
+                                                    super::super::io::get_hold_value(hold_id.as_ref())
+                                                        .map(|v| matches!(v, DdValue::Bool(true)))
+                                                        .unwrap_or(false)
+                                                }
+                                                _ => false,
+                                            }
+                                        };
                                         // Check if all items are completed
                                         let all_completed = items.iter().all(|item| {
                                             match item {
-                                                DdValue::Object(obj) => {
-                                                    obj.get("completed")
-                                                        .map(|c| matches!(c, DdValue::Bool(true)))
-                                                        .unwrap_or(false)
-                                                }
+                                                DdValue::Object(obj) => is_item_completed(obj),
                                                 // Text items are considered uncompleted
                                                 _ => false,
                                             }
                                         });
                                         // Toggle: if all completed, set all to uncompleted; otherwise set all to completed
                                         let new_completed = !all_completed;
+                                        zoon::println!("[DD Transform] ListToggleAllCompleted: all_completed={}, setting to {}", all_completed, new_completed);
                                         let new_items: Vec<DdValue> = items.iter().map(|item| {
                                             match item {
                                                 DdValue::Object(obj) => {
-                                                    let mut new_obj = (**obj).clone();
-                                                    new_obj.insert(Arc::from("completed"), DdValue::Bool(new_completed));
-                                                    DdValue::Object(Arc::new(new_obj))
+                                                    match obj.get("completed") {
+                                                        Some(DdValue::HoldRef(hold_id)) => {
+                                                            // For HoldRef: update the underlying hold, keep the ref
+                                                            zoon::println!("[DD Transform] Updating hold {} to {}", hold_id, new_completed);
+                                                            update_hold_state(hold_id.as_ref(), DdValue::Bool(new_completed));
+                                                            // Keep the object unchanged (HoldRef stays intact)
+                                                            item.clone()
+                                                        }
+                                                        _ => {
+                                                            // For Bool or missing: set directly
+                                                            let mut new_obj = (**obj).clone();
+                                                            new_obj.insert(Arc::from("completed"), DdValue::Bool(new_completed));
+                                                            DdValue::Object(Arc::new(new_obj))
+                                                        }
+                                                    }
                                                 }
                                                 // Convert text to object with completed state
                                                 DdValue::Text(title) => {
@@ -736,37 +1290,73 @@ impl DdWorker {
                                 // Remove all items where completed=true
                                 // Need to resolve HoldRefs to get actual boolean values
                                 let states_map = transform_states.lock().unwrap();
-                                zoon::println!("[DD Transform] ListRemoveCompleted: states_map keys = {:?}", states_map.keys().collect::<Vec<_>>());
                                 match state {
                                     DdValue::List(items) => {
-                                        let filtered: Vec<DdValue> = items.iter()
-                                            .filter(|item| {
-                                                match item {
-                                                    DdValue::Object(obj) => {
-                                                        // Get the completed field
-                                                        let completed_value = obj.get("completed");
-                                                        // Resolve HoldRef if needed
-                                                        let is_completed = match completed_value {
-                                                            Some(DdValue::Bool(true)) => true,
-                                                            Some(DdValue::HoldRef(hold_id)) => {
-                                                                // Look up the actual value
-                                                                let resolved = states_map.get(hold_id.as_ref());
-                                                                zoon::println!("[DD Transform] Resolving {} -> {:?}", hold_id, resolved);
-                                                                resolved.map(|v| matches!(v, DdValue::Bool(true))).unwrap_or(false)
+                                        // Helper to check if an item is completed
+                                        // NOTE: Dynamic holds (from toggle_hold_bool) are in global HOLD_STATES
+                                        let is_item_completed = |item: &DdValue| -> bool {
+                                            match item {
+                                                DdValue::Object(obj) => {
+                                                    match obj.get("completed") {
+                                                        Some(DdValue::Bool(true)) => true,
+                                                        Some(DdValue::HoldRef(hold_id)) => {
+                                                            // Dynamic holds are updated in global HOLD_STATES
+                                                            if hold_id.starts_with("dynamic_") {
+                                                                super::super::io::get_hold_value(hold_id.as_ref())
+                                                                    .map(|v| matches!(v, DdValue::Bool(true)))
+                                                                    .unwrap_or(false)
+                                                            } else {
+                                                                states_map.get(hold_id.as_ref())
+                                                                    .map(|v| matches!(v, DdValue::Bool(true)))
+                                                                    .unwrap_or(false)
                                                             }
-                                                            _ => false,
-                                                        };
-                                                        zoon::println!("[DD Transform] Item completed={:?}, is_completed={}, keeping={}", completed_value, is_completed, !is_completed);
-                                                        // Keep items that are NOT completed
-                                                        !is_completed
+                                                        }
+                                                        _ => false,
                                                     }
-                                                    // Keep non-object items
-                                                    _ => true,
                                                 }
-                                            })
+                                                _ => false,
+                                            }
+                                        };
+
+                                        // Filter the "todos" data list
+                                        let filtered: Vec<DdValue> = items.iter()
+                                            .filter(|item| !is_item_completed(item))
                                             .cloned()
                                             .collect();
-                                        zoon::println!("[DD Transform] Filtered {} -> {} items", items.len(), filtered.len());
+                                        zoon::println!("[DD Transform] ListRemoveCompleted: Filtered {} -> {} items", items.len(), filtered.len());
+
+                                        // Also filter "todos_elements" to remove corresponding elements
+                                        // Each element has a checkbox with checked: HoldRef pointing to a completed hold
+                                        // NOTE: Use global HOLD_STATES for dynamic holds since worker states_map may be stale
+                                        if let Some(DdValue::List(elements)) = super::super::io::get_hold_value("todos_elements") {
+                                            let filtered_elements: Vec<DdValue> = elements.iter()
+                                                .filter(|element| {
+                                                    // Find the checkbox's checked HoldRef
+                                                    let completed_hold_id = find_checkbox_hold_id(element);
+                                                    if let Some(hold_id) = completed_hold_id {
+                                                        // For dynamic holds (toggle_hold_bool updates global HOLD_STATES),
+                                                        // read from global state, not worker's stale states_map
+                                                        let is_completed = if hold_id.starts_with("dynamic_") {
+                                                            super::super::io::get_hold_value(&hold_id)
+                                                                .map(|v| matches!(v, DdValue::Bool(true)))
+                                                                .unwrap_or(false)
+                                                        } else {
+                                                            states_map.get(&hold_id)
+                                                                .map(|v| matches!(v, DdValue::Bool(true)))
+                                                                .unwrap_or(false)
+                                                        };
+                                                        zoon::println!("[DD Transform] Element hold {} is_completed={}, keeping={}", hold_id, is_completed, !is_completed);
+                                                        !is_completed
+                                                    } else {
+                                                        true // Keep elements we can't determine
+                                                    }
+                                                })
+                                                .cloned()
+                                                .collect();
+                                            zoon::println!("[DD Transform] ListRemoveCompleted: Filtered elements {} -> {}", elements.len(), filtered_elements.len());
+                                            update_hold_state_no_persist("todos_elements", DdValue::List(Arc::new(filtered_elements)));
+                                        }
+
                                         DdValue::List(Arc::new(filtered))
                                     }
                                     _ => state.clone(),
@@ -842,18 +1432,94 @@ impl DdWorker {
                                 }
                             }
                             StateTransform::RemoveListItem => {
-                                // Remove a specific list item by index
-                                // Event format: "remove:N" where N is index
+                                // Remove a specific list item by link_id (matches remove_todo_button LinkRef)
+                                // Event format: "remove:LINK_ID" where LINK_ID identifies the item to remove
                                 // HACK: TodoMVC-specific - used for delete button on hover
+                                zoon::println!("[DD Transform] RemoveListItem: Received event {:?}, state has {} items",
+                                    event, if let DdValue::List(items) = state { items.len() } else { 0 });
                                 match (state, event) {
                                     (DdValue::List(items), (_, DdEventValue::Text(text))) => {
-                                        if let Some(index_str) = text.strip_prefix("remove:") {
-                                            if let Ok(index) = index_str.parse::<usize>() {
-                                                if index < items.len() {
-                                                    let mut new_items: Vec<DdValue> = items.to_vec();
-                                                    new_items.remove(index);
-                                                    return DdValue::List(Arc::new(new_items));
+                                        zoon::println!("[DD Transform] RemoveListItem: Processing text event: {}", text);
+                                        if let Some(link_id_str) = text.strip_prefix("remove:") {
+                                            // Find the item whose remove_todo_button matches this link_id
+                                            let index_to_remove = items.iter().position(|item| {
+                                                if let DdValue::Object(obj) = item {
+                                                    if let Some(DdValue::Object(todo_elements)) = obj.get("todo_elements") {
+                                                        if let Some(DdValue::LinkRef(remove_link)) = todo_elements.get("remove_todo_button") {
+                                                            return remove_link.as_ref() == link_id_str;
+                                                        }
+                                                    }
                                                 }
+                                                false
+                                            });
+
+                                            if let Some(index) = index_to_remove {
+                                                zoon::println!("[DD Transform] RemoveListItem: Found item with link_id {} at index {}", link_id_str, index);
+                                                let mut new_items: Vec<DdValue> = items.to_vec();
+                                                new_items.remove(index);
+
+                                                // Also remove from "todos_elements" - find by matching hover link or checkbox link
+                                                // The element has a checkbox whose element.event.click LinkRef matches the todo's todo_checkbox
+                                                // NOTE: todos_elements only contains dynamic todos, not initial ones
+                                                if let Some(DdValue::List(elements)) = super::super::io::get_hold_value("todos_elements") {
+                                                    // For dynamic todos, the link_id starts with "dynamic_link_"
+                                                    // Find the element whose hover WhileRef matches our link_id pattern
+                                                    let element_index = elements.iter().position(|element| {
+                                                        // Check if this element's hover link matches
+                                                        if let DdValue::Tagged { fields, .. } = element {
+                                                            if let Some(DdValue::LinkRef(hover_link)) = fields.get("element").and_then(|e| e.get("hovered")) {
+                                                                // The hover link ID pattern: e.g., "dynamic_link_1004" for a todo with remove button "dynamic_link_1001"
+                                                                // They share the same base, so check if our link_id starts with "dynamic_link_"
+                                                                // and extract the base number
+                                                                if link_id_str.starts_with("dynamic_link_") {
+                                                                    // Extract base number from remove button link
+                                                                    if let Some(base) = link_id_str.strip_prefix("dynamic_link_") {
+                                                                        if let Ok(remove_num) = base.parse::<u32>() {
+                                                                            // The hover link is usually remove_num + 3 (based on ID allocation pattern)
+                                                                            // But safer to check the element's items for our specific link_id
+                                                                            if let Some(DdValue::List(elem_items)) = fields.get("items") {
+                                                                                for item in elem_items.iter() {
+                                                                                    // Look for the delete button WhileRef
+                                                                                    if let DdValue::WhileRef { arms, .. } = item {
+                                                                                        for (_, body) in arms.iter() {
+                                                                                            if let DdValue::Tagged { fields: btn_fields, tag } = body {
+                                                                                                if tag.as_ref() == "Element" {
+                                                                                                    if let Some(DdValue::Object(btn_elem)) = btn_fields.get("element") {
+                                                                                                        if let Some(DdValue::Object(event)) = btn_elem.get("event") {
+                                                                                                            if let Some(DdValue::LinkRef(press_link)) = event.get("press") {
+                                                                                                                if press_link.as_ref() == link_id_str {
+                                                                                                                    return true;
+                                                                                                                }
+                                                                                                            }
+                                                                                                        }
+                                                                                                    }
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        false
+                                                    });
+
+                                                    if let Some(elem_idx) = element_index {
+                                                        let mut new_elements: Vec<DdValue> = elements.to_vec();
+                                                        new_elements.remove(elem_idx);
+                                                        zoon::println!("[DD Transform] RemoveListItem: Also removed element at index {}, now {} elements", elem_idx, new_elements.len());
+                                                        update_hold_state_no_persist("todos_elements", DdValue::List(Arc::new(new_elements)));
+                                                    } else {
+                                                        zoon::println!("[DD Transform] RemoveListItem: No matching element found in todos_elements for link_id {}", link_id_str);
+                                                    }
+                                                }
+
+                                                return DdValue::List(Arc::new(new_items));
+                                            } else {
+                                                zoon::println!("[DD Transform] RemoveListItem: No item found with link_id {}", link_id_str);
                                             }
                                         }
                                         state.clone()
