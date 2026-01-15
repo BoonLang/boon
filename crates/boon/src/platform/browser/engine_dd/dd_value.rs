@@ -46,20 +46,8 @@ pub enum ComputedType {
         left: Box<DdValue>,
         right: Box<DdValue>,
     },
-    /// Count items in a list where items have HoldRef fields
-    /// Used for: `items |> List/retain(item, if: item.completed) |> List/count()`
-    /// where each item.completed is a HoldRef
-    /// DEPRECATED: Use ListCountWhereHold instead (reads live HOLD data)
-    ReactiveListCountWhere {
-        /// The list items (containing HoldRef fields)
-        items: Arc<Vec<DdValue>>,
-        /// The field to filter on
-        field: Arc<str>,
-        /// The value to match
-        value: Box<DdValue>,
-        /// The HoldRef IDs to observe (one per item)
-        hold_ids: Arc<Vec<Arc<str>>>,
-    },
+    // DELETED: ReactiveListCountWhere - was dead code (never constructed)
+    // Use ListCountWhereHold instead which reads live HOLD data
     /// Count items in a list HOLD where field matches value.
     /// Reads LIVE data from source_hold on each evaluation.
     /// This handles both static and dynamic items correctly.
@@ -255,6 +243,20 @@ pub enum DdValue {
         /// Field access path from the placeholder (e.g., ["completed"])
         path: Arc<Vec<Arc<str>>>,
     },
+    /// Merged stream reference - LATEST { input1, input2, ... }
+    /// Created when LATEST combines multiple reactive inputs.
+    /// Downstream operators like Math/sum() recognize this and configure DataflowConfig.
+    ///
+    /// Example: `LATEST { 0, button.press |> THEN { 1 } } |> Math/sum()`
+    /// Creates LatestRef with initial=0, events=[LinkRef("link_1")]
+    LatestRef {
+        /// Initial/default value (first non-event input, or Unit)
+        initial: Box<DdValue>,
+        /// Event sources (LinkRefs or TimerRefs that trigger updates)
+        events: Arc<Vec<DdValue>>,
+        /// Event values (what each event emits when triggered)
+        event_values: Arc<Vec<DdValue>>,
+    },
 }
 
 impl DdValue {
@@ -394,6 +396,10 @@ impl DdValue {
             Self::FilteredMappedListWithPredicate { source_hold, .. } => {
                 source_hold.is_empty() || super::io::get_hold_value(source_hold).is_some()
             }
+            // LatestRef - truthy if initial or any events exist
+            Self::LatestRef { initial, events, .. } => {
+                initial.is_truthy() || !events.is_empty()
+            }
         }
     }
 
@@ -414,7 +420,12 @@ impl DdValue {
             Self::Object(_) => "[object]".to_string(),
             Self::List(items) => format!("[list of {}]", items.len()),
             Self::Tagged { tag, .. } => format!("[{tag}]"),
-            Self::HoldRef(name) => format!("[hold:{}]", name),
+            Self::HoldRef(name) => {
+                // Resolve HoldRef to actual HOLD value for display
+                super::io::get_hold_value(name)
+                    .map(|v| v.to_display_string())
+                    .unwrap_or_else(|| String::new())
+            }
             Self::LinkRef(path) => format!("[link:{}]", path),
             Self::TimerRef { id, interval_ms } => format!("[timer:{}@{}ms]", id, interval_ms),
             Self::WhileRef { hold_id, computation, arms, default } => {
@@ -484,6 +495,10 @@ impl DdValue {
             }
             Self::FilteredMappedListWithPredicate { source_hold, .. } => {
                 format!("[filtered-mapped-list-predicate:{}]", source_hold)
+            }
+            Self::LatestRef { initial, .. } => {
+                // In text context, LATEST displays its initial/current value
+                initial.to_display_string()
             }
         }
     }
@@ -757,57 +772,7 @@ pub fn evaluate_computed(computation: &ComputedType, source_value: &DdValue) -> 
             let right_val = resolve_computed_operand(right, source_value);
             DdValue::Bool(left_val == right_val)
         }
-        ComputedType::ReactiveListCountWhere { items: static_items, field, value, hold_ids: _ } => {
-            // Count items where the specified field matches the expected value
-            // Uses the `field` parameter (no hardcoded field names)
-            // IMPORTANT: Use current list HOLD as source of truth (not static items)
-            // This handles Clear completed removing items dynamically
-
-            let list_name = super::io::get_list_var_name();
-            let current_items = super::io::get_hold_value(&list_name)
-                .and_then(|v| match v {
-                    DdValue::List(list) => Some(list),
-                    _ => None,
-                })
-                .unwrap_or_else(|| static_items.clone());
-
-            let count = current_items.iter()
-                .filter(|item| {
-                    // Get the field value using the generic field parameter
-                    let field_value = match item {
-                        DdValue::Object(obj) => {
-                            // Use the field parameter instead of hardcoding "completed"
-                            match obj.get(field.as_ref()) {
-                                // Direct Bool value (dynamic items)
-                                Some(DdValue::Bool(b)) => Some(DdValue::Bool(*b)),
-                                // HoldRef - look up current value
-                                Some(DdValue::HoldRef(hold_id)) => {
-                                    let val = super::io::get_hold_value(hold_id);
-                                    zoon::println!("[DD ReactiveListCountWhere] field={}, hold_id={}, value={:?}", field, hold_id, val);
-                                    val
-                                }
-                                _ => None,
-                            }
-                        }
-                        _ => None,
-                    };
-
-                    // Compare with expected value
-                    let result = match (field_value.as_ref(), value.as_ref()) {
-                        (Some(DdValue::Bool(b)), DdValue::Bool(expected)) => *b == *expected,
-                        (Some(DdValue::Tagged { tag, .. }), DdValue::Tagged { tag: expected_tag, .. }) => {
-                            tag == expected_tag
-                        }
-                        (Some(current), expected) => current == expected,
-                        _ => false,
-                    };
-                    zoon::println!("[DD ReactiveListCountWhere] field_value={:?}, expected={:?}, match={}", field_value, value, result);
-                    result
-                })
-                .count();
-            zoon::println!("[DD ReactiveListCountWhere] total count={}", count);
-            DdValue::int(count as i64)
-        }
+        // DELETED: ComputedType::ReactiveListCountWhere match arm - was dead code (never constructed)
         ComputedType::ListCountWhereHold { source_hold, field, value } => {
             // Get LIVE items from source HOLD (includes dynamic items!)
             let items = super::io::get_hold_value(source_hold.as_ref())

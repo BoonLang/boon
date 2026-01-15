@@ -42,6 +42,7 @@ fn dd_value_variant_name(value: &DdValue) -> &'static str {
         DdValue::FilteredMappedListRef { .. } => "FilteredMappedListRef",
         DdValue::FilteredListRefWithPredicate { .. } => "FilteredListRefWithPredicate",
         DdValue::FilteredMappedListWithPredicate { .. } => "FilteredMappedListWithPredicate",
+        DdValue::LatestRef { .. } => "LatestRef",
     }
 }
 
@@ -680,6 +681,13 @@ fn render_dd_value(value: &DdValue) -> RawElOrText {
                         })
                 )
                 .unify()
+        }
+
+        DdValue::LatestRef { initial, .. } => {
+            // LatestRef should have been processed by Math/sum() or Router/go_to()
+            // If we reach here, just render the initial value
+            zoon::println!("[DD render_dd_value] LatestRef reached render - using initial value");
+            render_dd_value(initial)
         }
     }
 }
@@ -1753,15 +1761,7 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>
 const UNCHECKED_SVG: &str = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23ededed%22%20stroke-width%3D%223%22/%3E%3C/svg%3E";
 const CHECKED_SVG: &str = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23bddad5%22%20stroke-width%3D%223%22/%3E%3Cpath%20fill%3D%22%235dc2af%22%20d%3D%22M72%2025L42%2071%2027%2056l-4%204%2020%2020%2034-52z%22/%3E%3C/svg%3E";
 
-/// Render a default checkbox icon element based on checked state
-fn render_default_checkbox_icon(checked: bool) -> RawElOrText {
-    let svg_url = if checked { CHECKED_SVG } else { UNCHECKED_SVG };
-    El::new()
-        .s(zoon::Width::exact(40))
-        .s(zoon::Height::exact(40))
-        .s(zoon::Background::new().url(svg_url))
-        .unify()
-}
+// DEAD CODE DELETED: render_default_checkbox_icon() - was never called
 
 fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, DdValue>>) -> RawElOrText {
     zoon::println!("[DD render_checkbox] CALLED with fields={:?}", fields.keys().collect::<Vec<_>>());

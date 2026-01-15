@@ -55,6 +55,13 @@ thread_local! {
     static CHECKBOX_TOGGLE_HOLDS: Mutable<Vec<String>> = Mutable::new(Vec::new()); // ALLOWED: view state
 }
 
+// Global set of text-clear HOLD IDs (derived from link IDs, not hardcoded)
+// When these HOLDs are updated, the corresponding text input DOM element is cleared
+// Task 7.1: Replaces hardcoded "text_input_text" with dynamic link-derived names
+thread_local! {
+    static TEXT_CLEAR_HOLDS: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(std::collections::HashSet::new()); // ALLOWED: config state
+}
+
 thread_local! {
     static CURRENT_ROUTE: Mutable<String> = Mutable::new("/".to_string()); // ALLOWED: route state
     // Detected list variable name from Boon code (e.g., "items", "list_data", or any List variable)
@@ -85,11 +92,7 @@ pub fn get_list_var_name() -> String {
     LIST_VAR_NAME.with(|n| n.borrow().clone()) // ALLOWED: IO layer
 }
 
-/// Clear the list variable name (reset to default).
-/// Called when clearing state between examples.
-pub fn clear_list_var_name() {
-    LIST_VAR_NAME.with(|n| *n.borrow_mut() = "list_data".to_string()); // ALLOWED: IO layer
-}
+// DEAD CODE DELETED: clear_list_var_name() - never called
 
 /// Set the detected elements field name.
 /// Called by interpreter after detecting the elements field from list item objects.
@@ -97,17 +100,8 @@ pub fn set_elements_field_name(name: String) {
     ELEMENTS_FIELD_NAME.with(|n| *n.borrow_mut() = name); // ALLOWED: IO layer
 }
 
-/// Get the detected elements field name.
-/// Used when looking up LinkRefs in list item objects.
-pub fn get_elements_field_name() -> String {
-    ELEMENTS_FIELD_NAME.with(|n| n.borrow().clone()) // ALLOWED: IO layer
-}
-
-/// Clear the elements field name (reset to default).
-/// Called when clearing state between examples.
-pub fn clear_elements_field_name() {
-    ELEMENTS_FIELD_NAME.with(|n| *n.borrow_mut() = "item_elements".to_string()); // ALLOWED: IO layer
-}
+// DEAD CODE DELETED: get_elements_field_name() - never called
+// DEAD CODE DELETED: clear_elements_field_name() - never called
 
 /// Set the remove event path.
 /// Parsed from List/remove(item, on: item.X.Y.event.press) → ["X", "Y"]
@@ -153,12 +147,20 @@ pub fn clear_bulk_remove_event_path() {
 /// Contains paths to LinkRefs that control editing state.
 #[derive(Clone, Debug, Default)]
 pub struct EditingEventBindings {
+    /// The HOLD ID that these bindings control (e.g., "hold_5")
+    pub hold_id: Option<String>,
     /// Path to LinkRef whose double_click triggers edit mode (e.g., ["todo_elements", "todo_title_element"])
     pub edit_trigger_path: Vec<String>,
+    /// Actual LinkRef ID for edit trigger (resolved during evaluation)
+    pub edit_trigger_link_id: Option<String>,
     /// Path to LinkRef whose key_down exits edit mode on Enter/Escape (e.g., ["todo_elements", "editing_todo_title_element"])
     pub exit_key_path: Vec<String>,
+    /// Actual LinkRef ID for exit key (resolved during evaluation)
+    pub exit_key_link_id: Option<String>,
     /// Path to LinkRef whose blur exits edit mode (e.g., ["todo_elements", "editing_todo_title_element"])
     pub exit_blur_path: Vec<String>,
+    /// Actual LinkRef ID for exit blur (resolved during evaluation)
+    pub exit_blur_link_id: Option<String>,
 }
 
 thread_local! {
@@ -194,6 +196,9 @@ pub struct ToggleEventBinding {
     pub event_path: Vec<String>,
     /// Event type (usually "click")
     pub event_type: String,
+    /// Actual LinkRef ID if available (resolved during evaluation)
+    /// When present, this takes precedence over event_path resolution
+    pub link_id: Option<String>,
 }
 
 thread_local! {
@@ -255,6 +260,78 @@ pub fn clear_global_toggle_bindings() {
     GLOBAL_TOGGLE_BINDINGS.with(|b| b.borrow_mut().clear()); // ALLOWED: IO layer
 }
 
+// Text input key_down LinkRef extracted from Element/text_input during evaluation
+thread_local! {
+    static TEXT_INPUT_KEY_DOWN_LINK: std::cell::Cell<Option<String>> = std::cell::Cell::new(None); // ALLOWED: config state
+}
+
+/// Set the text_input key_down LinkRef ID.
+/// Called by eval_element_function when Element/text_input has a key_down event.
+/// Task 4.3: Eliminates extract_text_input_key_down() document scanning.
+pub fn set_text_input_key_down_link(link_id: String) {
+    zoon::println!("[DD Config] Setting text_input key_down link: {}", link_id);
+    TEXT_INPUT_KEY_DOWN_LINK.with(|l| l.set(Some(link_id))); // ALLOWED: IO layer
+}
+
+/// Get the text_input key_down LinkRef ID.
+/// Returns the LinkRef ID from Element/text_input's key_down event, if set.
+pub fn get_text_input_key_down_link() -> Option<String> {
+    TEXT_INPUT_KEY_DOWN_LINK.with(|l| l.take()) // ALLOWED: IO layer
+}
+
+/// Clear the text_input key_down LinkRef.
+pub fn clear_text_input_key_down_link() {
+    TEXT_INPUT_KEY_DOWN_LINK.with(|l| l.set(None)); // ALLOWED: IO layer
+}
+
+// List/clear LinkRef extracted from List/clear(on: ...) during evaluation
+thread_local! {
+    static LIST_CLEAR_LINK: std::cell::Cell<Option<String>> = std::cell::Cell::new(None); // ALLOWED: config state
+}
+
+/// Set the List/clear event LinkRef ID.
+/// Called by evaluator when List/clear(on: ...) evaluates the on: argument to a LinkRef.
+/// Task 6.3: Eliminates extract_button_press_link() document scanning.
+pub fn set_list_clear_link(link_id: String) {
+    zoon::println!("[DD Config] Setting List/clear link: {}", link_id);
+    LIST_CLEAR_LINK.with(|l| l.set(Some(link_id))); // ALLOWED: IO layer
+}
+
+/// Get the List/clear event LinkRef ID.
+/// Returns the LinkRef ID from List/clear's on: argument, if set.
+pub fn get_list_clear_link() -> Option<String> {
+    LIST_CLEAR_LINK.with(|l| l.take()) // ALLOWED: IO layer
+}
+
+/// Clear the List/clear event LinkRef.
+pub fn clear_list_clear_link() {
+    LIST_CLEAR_LINK.with(|l| l.set(None)); // ALLOWED: IO layer
+}
+
+// Flag for template-based lists (FilteredMappedListWithPredicate/FilteredMappedListRef)
+thread_local! {
+    static HAS_TEMPLATE_LIST: std::cell::Cell<bool> = std::cell::Cell::new(false); // ALLOWED: config state
+}
+
+/// Set the has_template_list flag.
+/// Called by evaluator when creating FilteredMappedListWithPredicate or FilteredMappedListRef.
+/// Task 6.3: Eliminates has_filtered_mapped_list() document scanning.
+pub fn set_has_template_list(value: bool) {
+    zoon::println!("[DD Config] Setting has_template_list: {}", value);
+    HAS_TEMPLATE_LIST.with(|l| l.set(value)); // ALLOWED: IO layer
+}
+
+/// Get the has_template_list flag.
+/// Returns true if the document contains template-based lists.
+pub fn get_has_template_list() -> bool {
+    HAS_TEMPLATE_LIST.with(|l| l.get()) // ALLOWED: IO layer
+}
+
+/// Clear the has_template_list flag.
+pub fn clear_has_template_list() {
+    HAS_TEMPLATE_LIST.with(|l| l.set(false)); // ALLOWED: IO layer
+}
+
 /// Set the current route.
 /// Called by router navigation. Updates the "current_route" HOLD for reactive filtering.
 pub fn set_filter_from_route(route: &str) {
@@ -314,25 +391,27 @@ pub fn get_checkbox_toggle_holds() -> Vec<String> {
     CHECKBOX_TOGGLE_HOLDS.with(|holds| holds.lock_ref().clone())
 }
 
-/// Compute the count of unchecked (false) checkbox toggles.
-/// Used for reactive "N items left" rendering.
-pub fn get_unchecked_checkbox_count() -> usize {
-    CHECKBOX_TOGGLE_HOLDS.with(|holds| {
-        let hold_ids = holds.lock_ref();
-        HOLD_STATES.with(|states| {
-            let states = states.lock_ref();
-            hold_ids.iter()
-                .filter(|hold_id| {
-                    // Count as "active" if NOT completed (false/False)
-                    match states.get(*hold_id) {
-                        Some(DdValue::Bool(true)) => false,  // completed
-                        Some(DdValue::Tagged { tag, .. }) if tag.as_ref() == "True" => false,  // completed
-                        _ => true,  // not completed (false, False, or missing)
-                    }
-                })
-                .count()
-        })
-    })
+// DEAD CODE DELETED: get_unchecked_checkbox_count() - never called
+
+/// Register a text-clear HOLD ID (derived from link ID).
+/// When this HOLD is updated, the text input DOM will be cleared.
+/// Task 7.1: Replaces hardcoded "text_input_text" with dynamic names.
+pub fn add_text_clear_hold(hold_id: String) {
+    TEXT_CLEAR_HOLDS.with(|holds| {
+        holds.borrow_mut().insert(hold_id);
+    });
+}
+
+/// Check if a HOLD ID is a text-clear HOLD.
+/// Used by output listener to know when to clear text input DOM.
+pub fn is_text_clear_hold(hold_id: &str) -> bool {
+    TEXT_CLEAR_HOLDS.with(|holds| holds.borrow().contains(hold_id))
+}
+
+/// Clear text-clear hold registry.
+/// Called when clearing state or starting a new run.
+pub fn clear_text_clear_holds() {
+    TEXT_CLEAR_HOLDS.with(|holds| holds.borrow_mut().clear());
 }
 
 /// Update a HOLD state value and persist to storage.
@@ -575,7 +654,7 @@ fn dd_value_to_json(value: &DdValue) -> Option<zoon::serde_json::Value> {
             })
         }
         // Don't persist complex types - they need code evaluation
-        DdValue::Tagged { .. } | DdValue::LinkRef(_) | DdValue::TimerRef { .. } | DdValue::WhileRef { .. } | DdValue::ComputedRef { .. } | DdValue::FilteredListRef { .. } | DdValue::FilteredListRefWithPredicate { .. } | DdValue::ReactiveFilteredList { .. } | DdValue::ReactiveText { .. } | DdValue::Placeholder | DdValue::PlaceholderField { .. } | DdValue::PlaceholderWhileRef { .. } | DdValue::NegatedPlaceholderField { .. } | DdValue::MappedListRef { .. } | DdValue::FilteredMappedListRef { .. } | DdValue::FilteredMappedListWithPredicate { .. } => None,
+        DdValue::Tagged { .. } | DdValue::LinkRef(_) | DdValue::TimerRef { .. } | DdValue::WhileRef { .. } | DdValue::ComputedRef { .. } | DdValue::FilteredListRef { .. } | DdValue::FilteredListRefWithPredicate { .. } | DdValue::ReactiveFilteredList { .. } | DdValue::ReactiveText { .. } | DdValue::Placeholder | DdValue::PlaceholderField { .. } | DdValue::PlaceholderWhileRef { .. } | DdValue::NegatedPlaceholderField { .. } | DdValue::MappedListRef { .. } | DdValue::FilteredMappedListRef { .. } | DdValue::FilteredMappedListWithPredicate { .. } | DdValue::LatestRef { .. } => None,
     }
 }
 

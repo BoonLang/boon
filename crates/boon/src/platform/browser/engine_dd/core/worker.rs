@@ -89,7 +89,7 @@ fn find_checkbox_toggle_in_item(obj: &BTreeMap<Arc<str>, DdValue>) -> Option<(St
 
 /// Get the checkbox toggle value for an item (true = completed).
 /// Works with both HoldRef and direct Bool values.
-/// Also checks for a "completed" field directly (for template-based items).
+/// Task 7.2: Generic - checks ANY boolean HoldRef field, not just "completed".
 fn is_item_completed_generic(item: &DdValue) -> bool {
     match item {
         DdValue::Object(obj) => {
@@ -98,17 +98,26 @@ fn is_item_completed_generic(item: &DdValue) -> bool {
                 return is_completed;
             }
 
-            // For template-based items: check for a "completed" field that's a HoldRef
-            // This handles todo_mvc items where completed: HoldRef("hold_X")
-            if let Some(DdValue::HoldRef(hold_id)) = obj.get("completed") {
-                let is_completed = super::super::io::get_hold_value(hold_id.as_ref())
-                    .map(|v| match v {
-                        DdValue::Bool(b) => b,
-                        DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
-                        _ => false,
-                    })
-                    .unwrap_or(false);
-                return is_completed;
+            // Task 7.2: Generic approach - find ANY boolean HoldRef field
+            // Excludes "editing" fields which are UI state, not completion state
+            for (field_name, field_value) in obj.iter() {
+                // Skip editing-related fields (UI state, not completion state)
+                if field_name.contains("edit") {
+                    continue;
+                }
+                if let DdValue::HoldRef(hold_id) = field_value {
+                    if let Some(hold_value) = super::super::io::get_hold_value(hold_id.as_ref()) {
+                        match hold_value {
+                            DdValue::Bool(b) => return b,
+                            DdValue::Tagged { tag, .. } => {
+                                if tag.as_ref() == "True" || tag.as_ref() == "False" {
+                                    return tag.as_ref() == "True";
+                                }
+                            }
+                            _ => continue,
+                        }
+                    }
+                }
             }
 
             false
@@ -662,16 +671,22 @@ pub fn reconstruct_persisted_item(
         // Find which field this HOLD corresponds to
         let field_name = hold_to_field.get(old_id);
         // Get the persisted value for this field (if any)
-        // If not found, use Bool(false) for boolean fields (editing, completed)
-        // since Unit doesn't match True/False patterns in WhileRef
+        // Task 7.2: Use original HOLD's type to determine default, not hardcoded field names
         let initial_value = field_name
             .and_then(|name| persisted_fields.get(name.as_str()))
             .cloned()
             .unwrap_or_else(|| {
-                // Boolean fields should default to false, not Unit
-                match field_name.map(|s| s.as_str()) {
-                    Some("editing") | Some("completed") => DdValue::Bool(false),
-                    _ => DdValue::Unit
+                // Task 7.2: Check original HOLD's value to determine type, not field name
+                if let Some(template_value) = get_hold_value(old_id) {
+                    match template_value {
+                        DdValue::Bool(_) => DdValue::Bool(false),
+                        DdValue::Tagged { tag, .. } if tag.as_ref() == "True" || tag.as_ref() == "False" => {
+                            DdValue::Bool(false)
+                        }
+                        _ => DdValue::Unit
+                    }
+                } else {
+                    DdValue::Unit
                 }
             });
         zoon::println!("[DD Reconstruct] Registering HOLD: {} -> {} = {:?} (field: {:?})",
@@ -1218,6 +1233,9 @@ pub enum EventFilter {
 /// Type of state transformation to apply.
 #[derive(Clone, Debug)]
 pub enum StateTransform {
+    /// Identity transform - pass through the event value as-is
+    /// Used when the transform type cannot be determined during evaluation
+    Identity,
     /// Increment numeric value by 1
     Increment,
     /// Toggle boolean value
@@ -1412,12 +1430,14 @@ impl DataflowConfig {
     ///
     /// Used for shopping_list style patterns: key_down |> WHEN { Enter => append }
     /// Events are "Enter:text" format - text after colon is appended.
-    /// Also adds a text_input_text HOLD that clears when items are added.
+    /// Also adds a text-clear HOLD that clears when items are added.
+    /// Task 7.1: text_clear_hold_id is now passed from interpreter (derived from link ID).
     pub fn add_list_append_on_enter(
         mut self,
         id: impl Into<String>,
         initial: DdValue,
         key_link_id: &str,
+        text_clear_hold_id: &str,
     ) -> Self {
         // HOLD for the list items
         self.holds.push(HoldConfig {
@@ -1431,7 +1451,7 @@ impl DataflowConfig {
         });
         // HOLD for text input clearing - same trigger, clears to empty on successful append
         self.holds.push(HoldConfig {
-            id: HoldId::new("text_input_text"),
+            id: HoldId::new(text_clear_hold_id),
             initial: DdValue::text(""),
             triggered_by: vec![LinkId::new(key_link_id)],
             timer_interval_ms: 0,
@@ -1448,13 +1468,15 @@ impl DataflowConfig {
     /// Events:
     /// - "Enter:text" format from key_link_id → append text to list
     /// - Unit event from clear_link_id → clear list to empty
-    /// Also adds a text_input_text HOLD that clears when items are added.
+    /// Also adds a text-clear HOLD that clears when items are added.
+    /// Task 7.1: text_clear_hold_id is now passed from interpreter (derived from link ID).
     pub fn add_list_append_with_clear(
         mut self,
         id: impl Into<String>,
         initial: DdValue,
         key_link_id: &str,
         clear_link_id: &str,
+        text_clear_hold_id: &str,
     ) -> Self {
         let id_str = id.into();
         // HOLD for the list items - triggered by both Enter key AND clear button
@@ -1469,7 +1491,7 @@ impl DataflowConfig {
         });
         // HOLD for text input clearing - only on Enter key (not clear button)
         self.holds.push(HoldConfig {
-            id: HoldId::new("text_input_text"),
+            id: HoldId::new(text_clear_hold_id),
             initial: DdValue::text(""),
             triggered_by: vec![LinkId::new(key_link_id)],
             timer_interval_ms: 0,
@@ -1812,7 +1834,7 @@ impl DdWorker {
                                             .collect();
 
                                         // Register new HOLDs with initial values
-                                        // Generic: text field uses input, others use template defaults
+                                        // Task 7.2: Generic - text field uses input, others use template defaults
                                         for (old_id, new_id) in &hold_id_map {
                                             let field_name = hold_to_field.get(old_id).map(|s| s.as_str());
                                             let initial_value = if field_name == Some(title_hold_field.as_str()) {
@@ -1820,16 +1842,23 @@ impl DdWorker {
                                                 DdValue::text(item_text)
                                             } else {
                                                 // Use template's default value for this HOLD
-                                                // Look up the original HOLD's initial value
-                                                // If not found, use Bool(false) for boolean fields (editing, completed)
-                                                // since Unit doesn't match True/False patterns in WhileRef
+                                                // Task 7.2: Check template HOLD value type, not hardcoded field names
                                                 get_hold_value(old_id).unwrap_or_else(|| {
-                                                    // Boolean fields should default to false, not Unit
-                                                    // This covers "editing" and "completed" style fields
-                                                    match field_name {
-                                                        Some("editing") | Some("completed") => DdValue::Bool(false),
-                                                        _ => DdValue::Unit
+                                                    // If template HOLD not found, check data_template for the value type
+                                                    // by looking at what type of value this field has in the template
+                                                    if let DdValue::Object(template_fields) = data_template {
+                                                        if let Some(field_name) = field_name {
+                                                            if let Some(template_field_value) = template_fields.get(&std::sync::Arc::from(field_name)) {
+                                                                // If it's a HoldRef, the type is unknown here
+                                                                // Default boolean fields to false (common pattern)
+                                                                if matches!(template_field_value, DdValue::HoldRef(_)) {
+                                                                    // Unknown type - try Unit first
+                                                                    return DdValue::Unit;
+                                                                }
+                                                            }
+                                                        }
                                                     }
+                                                    DdValue::Unit
                                                 })
                                             };
                                             if LOG_DD_DEBUG { zoon::println!("[DD Worker] Registering HOLD: {} -> {} = {:?} (field: {:?})", old_id, new_id, initial_value, field_name); }
@@ -2335,6 +2364,12 @@ impl DdWorker {
                                     }
                                     _ => state.clone(),
                                 }
+                            }
+
+                            StateTransform::Identity => {
+                                // Identity transform - pass through unchanged
+                                // This is a placeholder for transforms that couldn't be determined
+                                state.clone()
                             }
                         }
                     });

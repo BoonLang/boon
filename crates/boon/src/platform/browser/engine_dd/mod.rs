@@ -31,17 +31,15 @@ pub const LOG_DD_DEBUG: bool = false;
 // Pure DD modules (anti-cheat compliant)
 pub mod core;
 pub mod io;
-pub mod bridge;
 
 // Core modules (no cheats)
 pub mod dd_value;      // Pure data types
 pub mod dd_runtime;    // DD operators (hold, etc.)
 pub mod dd_evaluator;  // Static expression evaluation
 
-// Stub modules for frontend compatibility (to be replaced in Phase 4)
-pub mod dd_bridge;       // Stub: render DD output to Zoon elements
-pub mod dd_interpreter;  // Stub: parse Boon and run DD dataflow
-pub mod dd_reactive_eval; // Stub: timer invalidation
+// Rendering and interpretation modules
+pub mod dd_bridge;       // Render DD values to Zoon elements
+pub mod dd_interpreter;  // Parse Boon code and run DD dataflow
 
 // Re-export commonly used types
 pub use core::{DdEvent, DdEventValue, DdInput, DdOutput, DdWorker, DdWorkerHandle, HoldId, LinkId};

@@ -20,7 +20,6 @@ use boon::platform::browser::{
 use boon::platform::browser::engine_dd::{
     dd_bridge::{render_dd_document_reactive_signal, render_dd_result_reactive_signal},
     dd_interpreter::run_dd_reactive_with_persistence,
-    dd_reactive_eval::stop_dd_engine,
     clear_dd_persisted_states,
 };
 
@@ -1590,12 +1589,8 @@ impl Playground {
             )
             .on_hovered_change(move |is_hovered| hovered.set(is_hovered))
             .on_press(|| {
-                // Stop entire DD engine FIRST to prevent race condition where
-                // background tasks re-save values before the clear completes
-                #[cfg(feature = "engine-dd")]
-                stop_dd_engine();
-
                 // Clear DD in-memory state (HOLD_STATES) and localStorage
+                // Note: Previous stop_dd_engine() call was removed as it was a no-op stub
                 #[cfg(feature = "engine-dd")]
                 clear_dd_persisted_states();
 
