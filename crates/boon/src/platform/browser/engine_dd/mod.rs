@@ -24,6 +24,10 @@
 //!
 //! Run `makers verify-dd-no-cheats` to check for violations.
 
+/// Master debug logging flag for the DD engine.
+/// When enabled, prints detailed information about DD operations.
+pub const LOG_DD_DEBUG: bool = false;
+
 // Pure DD modules (anti-cheat compliant)
 pub mod core;
 pub mod io;

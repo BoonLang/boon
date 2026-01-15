@@ -35,6 +35,7 @@ use zoon::{Task, Timer};
 use super::types::{DdEvent, DdEventValue, DdInput, DdOutput, HoldId, LinkId};
 use crate::platform::browser::engine_dd::dd_value::DdValue;
 use crate::platform::browser::engine_dd::io::{update_hold_state_no_persist, get_hold_value};
+use crate::platform::browser::engine_dd::LOG_DD_DEBUG;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -370,7 +371,7 @@ fn clone_template_with_fresh_ids_impl(
                     // If the link_id is already a dynamic link (from data_context which was already cloned),
                     // use it directly - don't remap again!
                     if link_id.starts_with(DYNAMIC_LINK_PREFIX) {
-                        zoon::println!("[DD Clone] PlaceholderField {:?} resolved to already-remapped LinkRef({})", path, link_id);
+                        if LOG_DD_DEBUG { zoon::println!("[DD Clone] PlaceholderField {:?} resolved to already-remapped LinkRef({})", path, link_id); }
                         return current;
                     }
                     // Otherwise, remap the original link_id to a new dynamic link
@@ -381,7 +382,7 @@ fn clone_template_with_fresh_ids_impl(
                             format!("{}{}", DYNAMIC_LINK_PREFIX, counter)
                         })
                         .clone();
-                    zoon::println!("[DD Clone] PlaceholderField {:?} resolved to LinkRef({}) -> {}", path, link_id, new_link_id);
+                    if LOG_DD_DEBUG { zoon::println!("[DD Clone] PlaceholderField {:?} resolved to LinkRef({}) -> {}", path, link_id, new_link_id); }
                     return DdValue::LinkRef(Arc::from(new_link_id.as_str()));
                 }
                 // If we resolved to a HoldRef, check if it needs remapping
@@ -389,7 +390,7 @@ fn clone_template_with_fresh_ids_impl(
                     // If the hold_id is already a dynamic hold (from data_context which was already cloned),
                     // use it directly - don't remap again!
                     if hold_id.starts_with(DYNAMIC_HOLD_PREFIX) {
-                        zoon::println!("[DD Clone] PlaceholderField {:?} resolved to already-remapped HoldRef({})", path, hold_id);
+                        if LOG_DD_DEBUG { zoon::println!("[DD Clone] PlaceholderField {:?} resolved to already-remapped HoldRef({})", path, hold_id); }
                         return current;
                     }
                     // Otherwise, remap the original hold_id to a new dynamic hold
@@ -400,12 +401,12 @@ fn clone_template_with_fresh_ids_impl(
                             format!("{}{}", DYNAMIC_HOLD_PREFIX, counter)
                         })
                         .clone();
-                    zoon::println!("[DD Clone] PlaceholderField {:?} resolved to HoldRef({}) -> {}", path, hold_id, new_hold_id);
+                    if LOG_DD_DEBUG { zoon::println!("[DD Clone] PlaceholderField {:?} resolved to HoldRef({}) -> {}", path, hold_id, new_hold_id); }
                     return DdValue::HoldRef(Arc::from(new_hold_id.as_str()));
                 }
             }
             // If we can't resolve, keep the PlaceholderField (shouldn't happen in normal use)
-            zoon::println!("[DD Clone] PlaceholderField {:?} could not be resolved, keeping as-is", path);
+            if LOG_DD_DEBUG { zoon::println!("[DD Clone] PlaceholderField {:?} could not be resolved, keeping as-is", path); }
             template.clone()
         }
         DdValue::HoldRef(old_id) => {
@@ -508,8 +509,7 @@ fn clone_template_with_fresh_ids_impl(
                     // If the hold_id is already a dynamic hold (from data_context which was already cloned),
                     // use it directly - don't remap again!
                     let final_hold_id = if hold_id.starts_with(DYNAMIC_HOLD_PREFIX) {
-                        zoon::println!("[DD Clone] PlaceholderWhileRef {:?} resolved to already-remapped HoldRef({})",
-                            field_path, hold_id);
+                        if LOG_DD_DEBUG { zoon::println!("[DD Clone] PlaceholderWhileRef {:?} resolved to already-remapped HoldRef({})", field_path, hold_id); }
                         hold_id.to_string()
                     } else {
                         let new_hold_id = hold_id_map
@@ -519,8 +519,7 @@ fn clone_template_with_fresh_ids_impl(
                                 format!("{}{}", DYNAMIC_HOLD_PREFIX, counter)
                             })
                             .clone();
-                        zoon::println!("[DD Clone] PlaceholderWhileRef {:?} resolved to HoldRef({}) -> {}",
-                            field_path, hold_id, new_hold_id);
+                        if LOG_DD_DEBUG { zoon::println!("[DD Clone] PlaceholderWhileRef {:?} resolved to HoldRef({}) -> {}", field_path, hold_id, new_hold_id); }
                         new_hold_id
                     };
 
@@ -549,7 +548,7 @@ fn clone_template_with_fresh_ids_impl(
                 }
             }
             // If we can't resolve, keep as-is (shouldn't happen in normal use)
-            zoon::println!("[DD Clone] PlaceholderWhileRef {:?} could not be resolved, keeping as-is", field_path);
+            if LOG_DD_DEBUG { zoon::println!("[DD Clone] PlaceholderWhileRef {:?} could not be resolved, keeping as-is", field_path); }
             template.clone()
         }
         // Primitive types are cloned as-is
@@ -605,7 +604,7 @@ fn find_checkbox_hold_id(element: &DdValue) -> Option<String> {
                                 if elem_type.as_ref() == "checkbox" {
                                     // Found checkbox - extract checked HoldRef
                                     if let Some(DdValue::HoldRef(hold_id)) = item_fields.get("checked") {
-                                        zoon::println!("[DD Worker] find_checkbox_hold_id: found checkbox with checked={}", hold_id);
+                                        if LOG_DD_DEBUG { zoon::println!("[DD Worker] find_checkbox_hold_id: found checkbox with checked={}", hold_id); }
                                         return Some(hold_id.to_string());
                                     }
                                 }
@@ -614,7 +613,7 @@ fn find_checkbox_hold_id(element: &DdValue) -> Option<String> {
                     }
                 }
             }
-            zoon::println!("[DD Worker] find_checkbox_hold_id: no checkbox found in element type {:?}", fields.get("_element_type"));
+            if LOG_DD_DEBUG { zoon::println!("[DD Worker] find_checkbox_hold_id: no checkbox found in element type {:?}", fields.get("_element_type")); }
         }
     }
     None
@@ -833,8 +832,7 @@ pub fn instantiate_fresh_item(
                     // Get current value of this hold and initialize the new hold with it
                     if let Some(new_hold_id) = hold_id_map.get(old_hold_id.as_ref()) {
                         if let Some(current_value) = super::super::io::get_hold_value(old_hold_id) {
-                            zoon::println!("[DD Worker] instantiate_fresh_item: field {} hold {} -> {}, value={:?}",
-                                field_name, old_hold_id, new_hold_id, current_value);
+                            if LOG_DD_DEBUG { zoon::println!("[DD Worker] instantiate_fresh_item: field {} hold {} -> {}, value={:?}", field_name, old_hold_id, new_hold_id, current_value); }
                             update_hold_state_no_persist(new_hold_id, current_value);
                         }
                     }
@@ -893,8 +891,7 @@ pub fn instantiate_fresh_item(
                                         }
                                     };
                                     if let Some(new_action) = remapped_action {
-                                        zoon::println!("[DD Worker] instantiate_fresh_item: Replicating action {} -> {} {:?}",
-                                            old_link_id, new_link_id, new_action);
+                                        if LOG_DD_DEBUG { zoon::println!("[DD Worker] instantiate_fresh_item: Replicating action {} -> {} {:?}", old_link_id, new_link_id, new_action); }
                                         super::super::io::add_dynamic_link_action(new_link_id.clone(), new_action);
                                     }
                                 }
@@ -939,7 +936,7 @@ pub fn instantiate_fresh_item(
                 .clone();
             let new_hover_hold = format!("hover_{}", new_link_id);
             hold_id_map.insert(old_hold.clone(), new_hover_hold.clone());
-            zoon::println!("[DD Worker] instantiate_fresh_item: Pre-mapped hover hold: {} -> {}", old_hold, new_hover_hold);
+            if LOG_DD_DEBUG { zoon::println!("[DD Worker] instantiate_fresh_item: Pre-mapped hover hold: {} -> {}", old_hold, new_hover_hold); }
         }
 
         // Clone element template with same ID mappings
@@ -948,7 +945,7 @@ pub fn instantiate_fresh_item(
         // Register HoverState action
         if let (Some(old_link), Some(old_hold)) = (hover_link_old_id, hover_hold_old_id) {
             if let (Some(new_link), Some(new_hold)) = (link_id_map.get(&old_link), hold_id_map.get(&old_hold)) {
-                zoon::println!("[DD Worker] instantiate_fresh_item: Registering HoverState: {} -> {}", new_link, new_hold);
+                if LOG_DD_DEBUG { zoon::println!("[DD Worker] instantiate_fresh_item: Registering HoverState: {} -> {}", new_link, new_hold); }
                 super::super::io::add_dynamic_link_action(new_link.clone(), super::super::io::DynamicLinkAction::HoverState(new_hold.clone()));
                 update_hold_state_no_persist(new_hold, DdValue::Bool(false));
             }
@@ -1698,7 +1695,7 @@ impl DdWorker {
                     if hold_config.timer_interval_ms > 0 {
                         let timer_id = format!("__timer_{}", hold_config.timer_interval_ms);
                         trigger_ids.push(timer_id);
-                        zoon::println!("[DD Worker] HOLD {} listening for timer events", hold_id);
+                        if LOG_DD_DEBUG { zoon::println!("[DD Worker] HOLD {} listening for timer events", hold_id); }
                     }
 
                     // Clone filter for the closure
@@ -1835,13 +1832,11 @@ impl DdWorker {
                                                     }
                                                 })
                                             };
-                                            zoon::println!("[DD Worker] Registering HOLD: {} -> {} = {:?} (field: {:?})",
-                                                old_id, new_id, initial_value, field_name);
+                                            if LOG_DD_DEBUG { zoon::println!("[DD Worker] Registering HOLD: {} -> {} = {:?} (field: {:?})", old_id, new_id, initial_value, field_name); }
                                             update_hold_state_no_persist(new_id, initial_value);
                                         }
 
-                                        zoon::println!("[DD Worker] ListAppendWithTemplate: Created item with {} HOLDs, {} LINKs",
-                                            hold_id_map.len(), link_id_map.len());
+                                        if LOG_DD_DEBUG { zoon::println!("[DD Worker] ListAppendWithTemplate: Created item with {} HOLDs, {} LINKs", hold_id_map.len(), link_id_map.len()); }
 
                                         // Replicate dynamic link actions from template to cloned item
                                         // For each LinkRef in the template, look up its action and register with remapped IDs
@@ -1897,7 +1892,7 @@ impl DdWorker {
                                                     }
                                                 };
                                                 if let Some(new_action) = remapped_action {
-                                                    zoon::println!("[DD Worker] Replicating action {} -> {} {:?}", old_link_id, new_link_id, new_action);
+                                                    if LOG_DD_DEBUG { zoon::println!("[DD Worker] Replicating action {} -> {} {:?}", old_link_id, new_link_id, new_action); }
                                                     add_dynamic_link_action(new_link_id.clone(), new_action);
                                                 }
                                             }
@@ -1942,7 +1937,7 @@ impl DdWorker {
                                                 // Then create the hover hold mapping: hover_link_22 → hover_dynamic_link_1000
                                                 let new_hover_hold = format!("hover_{}", new_link_id);
                                                 hold_id_map.insert(old_hold.clone(), new_hover_hold.clone());
-                                                zoon::println!("[DD Worker] Pre-mapped hover hold: {} -> {}", old_hold, new_hover_hold);
+                                                if LOG_DD_DEBUG { zoon::println!("[DD Worker] Pre-mapped hover hold: {} -> {}", old_hold, new_hover_hold); }
                                             }
 
                                             // Clone element template - reuses the same ID mapping
@@ -1952,7 +1947,7 @@ impl DdWorker {
                                             // Register HoverState action if we found both the hover link and hold
                                             if let (Some(old_link), Some(old_hold)) = (hover_link_old_id, hover_hold_old_id) {
                                                 if let (Some(new_link), Some(new_hold)) = (link_id_map.get(&old_link), hold_id_map.get(&old_hold)) {
-                                                    zoon::println!("[DD Worker] Registering HoverState: {} -> {}", new_link, new_hold);
+                                                    if LOG_DD_DEBUG { zoon::println!("[DD Worker] Registering HoverState: {} -> {}", new_link, new_hold); }
                                                     use super::super::io::{add_dynamic_link_action, DynamicLinkAction};
                                                     add_dynamic_link_action(new_link.clone(), DynamicLinkAction::HoverState(new_hold.clone()));
                                                     // Initialize hover hold to false
@@ -1968,7 +1963,7 @@ impl DdWorker {
                                                 new_elems.push(new_element);
                                                 let new_count = new_elems.len();
                                                 update_hold_state_no_persist("list_elements", DdValue::List(Arc::new(new_elems)));
-                                                zoon::println!("[DD Worker] Added element to list_elements, now {} elements", new_count);
+                                                if LOG_DD_DEBUG { zoon::println!("[DD Worker] Added element to list_elements, now {} elements", new_count); }
                                             }
                                         }
 
@@ -2415,7 +2410,7 @@ impl DdWorker {
                         // This allows timer-triggered HOLDs to work with the same logic
                         let timer_link_id = format!("__timer_{}", id.name());
                         link_input.insert((timer_link_id, DdEventValue::Unit));
-                        zoon::println!("[DD Worker] Timer {} tick {}", id.name(), tick);
+                        if LOG_DD_DEBUG { zoon::println!("[DD Worker] Timer {} tick {}", id.name(), tick); }
                     }
                     DdEvent::External { name: _, value: _ } => {
                         // TODO: External events

@@ -2042,9 +2042,9 @@ pub fn function_router_route(
 
     // Send initial route
     let initial_path = get_current_pathname();
-    zoon::println!("[ROUTER] Initial route: '{}'", initial_path);
+    if LOG_DEBUG { zoon::println!("[ROUTER] Initial route: '{}'", initial_path); }
     if let Err(e) = route_sender.try_send(initial_path) {
-        zoon::println!("[ROUTER] Failed to send initial route: {e}");
+        if LOG_DEBUG { zoon::println!("[ROUTER] Failed to send initial route: {e}"); }
     }
 
     // Set up popstate listener for browser back/forward navigation
@@ -2053,7 +2053,7 @@ pub fn function_router_route(
         move || {
             let path = get_current_pathname();
             if let Err(e) = route_sender.clone().try_send(path) {
-                zoon::println!("[ROUTER] Failed to send popstate route: {e}");
+                if LOG_DEBUG { zoon::println!("[ROUTER] Failed to send popstate route: {e}"); }
             }
         }
     });
@@ -2072,7 +2072,7 @@ pub fn function_router_route(
 
     // Convert route strings to Text values
     route_receiver.map(move |path| {
-        zoon::println!("[ROUTER] Emitting route: '{}'", path);
+        if LOG_DEBUG { zoon::println!("[ROUTER] Emitting route: '{}'", path); }
         // Prevent drop: captured by `move` closure, lives as long as stream combinator
         let _popstate_closure = &popstate_closure;
         Text::new_value(
@@ -2105,7 +2105,7 @@ pub fn function_router_go_to(
             Value::Text(text, _) => text.text().to_string(),
             _ => "/".to_string(),
         };
-        zoon::println!("[ROUTER] go_to called with route: '{}'", route);
+        if LOG_DEBUG { zoon::println!("[ROUTER] go_to called with route: '{}'", route); }
 
         // Navigate using browser history API
         if route.starts_with('/') {
@@ -2117,7 +2117,7 @@ pub fn function_router_go_to(
             ROUTE_SENDER.with(|cell| {
                 if let Some(sender) = cell.borrow_mut().as_mut() {
                     if let Err(e) = sender.try_send(route) {
-                        zoon::println!("[ROUTER] Failed to send go_to route: {e}");
+                        if LOG_DEBUG { zoon::println!("[ROUTER] Failed to send go_to route: {e}"); }
                     }
                 }
             });

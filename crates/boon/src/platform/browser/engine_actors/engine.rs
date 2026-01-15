@@ -133,7 +133,7 @@ pub fn add_to_removed_set(removed_set_key: &str, call_id: &str) {
         removed.push(call_id.to_string());
         if let Err(e) = local_storage().insert(removed_set_key, &removed) {
             zoon::eprintln!("[DEBUG] Failed to save removed set: {:#}", e);
-        } else {
+        } else if LOG_DEBUG {
             zoon::println!("[DEBUG] Added {} to removed set {}, now {} items",
                 call_id, removed_set_key, removed.len());
         }
@@ -337,6 +337,17 @@ impl<T> NamedChannel<T> {
 /// - ValueActor dropped while subscriptions are still active
 /// - Extra owned data not properly keeping actors alive
 const LOG_DROPS_AND_LOOP_ENDS: bool = false;
+
+/// Master debug logging flag for the engine.
+/// When enabled, prints detailed information about:
+/// - LINK_ACTOR: Link actor creation and events
+/// - VAR_REF: Variable reference resolution
+/// - FORWARDING/FWD2: Stream forwarding operations
+/// - DEBUG: General debug information
+/// - LAZY_ACTOR: Lazy actor lifecycle
+/// - BACKPRESSURE: Backpressure system
+/// - VFS: Virtual filesystem operations
+pub const LOG_DEBUG: bool = false;
 
 // --- TypedStream ---
 
@@ -2190,12 +2201,14 @@ impl Variable {
         // We'll capture the actor's address after Arc creation for correlation
         let desc_for_closure = variable_description_for_log.clone();
         let logged_receiver = link_value_receiver.map(move |value| {
-            let value_desc = match &value {
-                Value::Tag(tag, _) => format!("Tag({})", tag.tag()),
-                Value::Object(_, _) => "Object".to_string(),
-                _ => "Other".to_string(),
-            };
-            zoon::println!("[LINK_ACTOR] Received from channel: {} for {}", value_desc, desc_for_closure);
+            if LOG_DEBUG {
+                let value_desc = match &value {
+                    Value::Tag(tag, _) => format!("Tag({})", tag.tag()),
+                    Value::Object(_, _) => "Object".to_string(),
+                    _ => "Other".to_string(),
+                };
+                zoon::println!("[LINK_ACTOR] Received from channel: {} for {}", value_desc, desc_for_closure);
+            }
             value
         });
 
@@ -2204,9 +2217,11 @@ impl Variable {
         let value_actor = Arc::new(value_actor);
 
         // Log the actor's unique ID (pointer address) for correlation with forwarding loops
-        let actor_addr = Arc::as_ptr(&value_actor) as usize;
-        zoon::println!("[LINK_ACTOR] Created link_value_actor addr={:x} pid={} scope={:?} for {}",
-            actor_addr, persistence_id, scope, variable_description_for_log);
+        if LOG_DEBUG {
+            let actor_addr = Arc::as_ptr(&value_actor) as usize;
+            zoon::println!("[LINK_ACTOR] Created link_value_actor addr={:x} pid={} scope={:?} for {}",
+                actor_addr, persistence_id, scope, variable_description_for_log);
+        }
 
         Arc::new(Self {
             construct_info: construct_info.complete(ConstructType::LinkVariable),
@@ -2376,8 +2391,10 @@ impl VariableOrArgumentReference {
         let num_parts = parts_vec.len();
 
         // Log subscription_time for debugging
-        if let Some(sub_time) = subscription_time {
-            zoon::println!("[VAR_REF] Creating path subscription with subscription_time={}", sub_time);
+        if LOG_DEBUG {
+            if let Some(sub_time) = subscription_time {
+                zoon::println!("[VAR_REF] Creating path subscription with subscription_time={}", sub_time);
+            }
         }
 
         for (idx, alias_part) in parts_vec.into_iter().enumerate() {
@@ -2400,13 +2417,15 @@ impl VariableOrArgumentReference {
                 move |value| {
                 let alias_part = alias_part.clone();
                 let alias_part_log = alias_part_for_log.clone();
-                let value_type = match &value {
-                    Value::Object(_, _) => "Object",
-                    Value::TaggedObject(tagged, _) => tagged.tag(),
-                    Value::Tag(tag, _) => tag.tag(),
-                    _ => "Other",
-                };
-                zoon::println!("[VAR_REF] step {} outer received {} for field '{}'", step_idx, value_type, alias_part_log);
+                if LOG_DEBUG {
+                    let value_type = match &value {
+                        Value::Object(_, _) => "Object",
+                        Value::TaggedObject(tagged, _) => tagged.tag(),
+                        Value::Tag(tag, _) => tag.tag(),
+                        _ => "Other",
+                    };
+                    zoon::println!("[VAR_REF] step {} outer received {} for field '{}'", step_idx, value_type, alias_part_log);
+                }
                 match value {
                     Value::Object(object, _) => {
                         let variable = object.expect_variable(&alias_part);
@@ -2448,26 +2467,30 @@ impl VariableOrArgumentReference {
                                                     if let Some(time) = sub_time {
                                                         if value.happened_before(time) {
                                                             // Skip stale value, keep polling
-                                                            let value_type = match &value {
-                                                                Value::Object(_, _) => "Object",
-                                                                Value::TaggedObject(tagged, _) => tagged.tag(),
-                                                                Value::Tag(tag, _) => tag.tag(),
-                                                                _ => "Other",
-                                                            };
-                                                            zoon::println!("[ALIAS_PATH] FILTERED stale {} (value.lamport={:?} < sub_time={})",
-                                                                value_type, value.lamport_time(), time);
+                                                            if LOG_DEBUG {
+                                                                let value_type = match &value {
+                                                                    Value::Object(_, _) => "Object",
+                                                                    Value::TaggedObject(tagged, _) => tagged.tag(),
+                                                                    Value::Tag(tag, _) => tag.tag(),
+                                                                    _ => "Other",
+                                                                };
+                                                                zoon::println!("[ALIAS_PATH] FILTERED stale {} (value.lamport={:?} < sub_time={})",
+                                                                    value_type, value.lamport_time(), time);
+                                                            }
                                                             continue;
                                                         }
                                                     }
                                                     // Fresh value - emit it
-                                                    let emit_value_type = match &value {
-                                                        Value::Object(_, _) => "Object",
-                                                        Value::TaggedObject(tagged, _) => tagged.tag(),
-                                                        Value::Tag(tag, _) => tag.tag(),
-                                                        _ => "Other",
-                                                    };
-                                                    zoon::println!("[VAR_REF] Emitting {} (lamport={:?}, sub_time={:?})",
-                                                        emit_value_type, value.lamport_time(), sub_time);
+                                                    if LOG_DEBUG {
+                                                        let emit_value_type = match &value {
+                                                            Value::Object(_, _) => "Object",
+                                                            Value::TaggedObject(tagged, _) => tagged.tag(),
+                                                            Value::Tag(tag, _) => tag.tag(),
+                                                            _ => "Other",
+                                                        };
+                                                        zoon::println!("[VAR_REF] Emitting {} (lamport={:?}, sub_time={:?})",
+                                                            emit_value_type, value.lamport_time(), sub_time);
+                                                    }
                                                     return Some((value, (Some(subscription), None, object, variable, sub_time)));
                                                 }
                                                 None => {
@@ -4326,35 +4349,37 @@ impl ValueActor {
         // Capture source actor address for correlation logging
         let source_addr = Arc::as_ptr(&source_actor) as usize;
         ActorLoop::new(async move {
-            zoon::println!("[FWD2] connect_forwarding loop STARTED, source_actor addr={:x}", source_addr);
+            if LOG_DEBUG { zoon::println!("[FWD2] connect_forwarding loop STARTED, source_actor addr={:x}", source_addr); }
             // Send initial value first (awaiting if needed)
             if let Some(value) = initial_value_future.await {
-                zoon::println!("[FORWARDING] Sending initial value (source={:x})", source_addr);
+                if LOG_DEBUG { zoon::println!("[FORWARDING] Sending initial value (source={:x})", source_addr); }
                 if let Err(e) = forwarding_sender.send(value).await {
-                    zoon::println!("[FORWARDING] Initial forwarding FAILED: {e} - EXITING! (source={:x})", source_addr);
+                    if LOG_DEBUG { zoon::println!("[FORWARDING] Initial forwarding FAILED: {e} - EXITING! (source={:x})", source_addr); }
                     return;
                 }
-                zoon::println!("[FORWARDING] Initial value sent OK (source={:x})", source_addr);
+                if LOG_DEBUG { zoon::println!("[FORWARDING] Initial value sent OK (source={:x})", source_addr); }
             } else {
-                zoon::println!("[FORWARDING] No initial value (source={:x})", source_addr);
+                if LOG_DEBUG { zoon::println!("[FORWARDING] No initial value (source={:x})", source_addr); }
             }
 
-            zoon::println!("[FORWARDING] Subscribing to source_actor addr={:x}...", source_addr);
+            if LOG_DEBUG { zoon::println!("[FORWARDING] Subscribing to source_actor addr={:x}...", source_addr); }
             let mut subscription = source_actor.stream();
-            zoon::println!("[FORWARDING] Subscribed to addr={:x}, entering forwarding loop", source_addr);
+            if LOG_DEBUG { zoon::println!("[FORWARDING] Subscribed to addr={:x}, entering forwarding loop", source_addr); }
             while let Some(value) = subscription.next().await {
-                let value_desc = match &value {
-                    Value::Tag(tag, _) => format!("Tag({})", tag.tag()),
-                    Value::Object(_, _) => "Object".to_string(),
-                    _ => "Other".to_string(),
-                };
-                zoon::println!("[FORWARDING] Received value from source addr={:x}: {}", source_addr, value_desc);
+                if LOG_DEBUG {
+                    let value_desc = match &value {
+                        Value::Tag(tag, _) => format!("Tag({})", tag.tag()),
+                        Value::Object(_, _) => "Object".to_string(),
+                        _ => "Other".to_string(),
+                    };
+                    zoon::println!("[FORWARDING] Received value from source addr={:x}: {}", source_addr, value_desc);
+                }
                 if forwarding_sender.send(value).await.is_err() {
-                    zoon::println!("[FORWARDING] Forwarding FAILED (source={:x}) - breaking loop", source_addr);
+                    if LOG_DEBUG { zoon::println!("[FORWARDING] Forwarding FAILED (source={:x}) - breaking loop", source_addr); }
                     break;
                 }
             }
-            zoon::println!("[FORWARDING] Forwarding loop ENDED (source={:x})", source_addr);
+            if LOG_DEBUG { zoon::println!("[FORWARDING] Forwarding loop ENDED (source={:x})", source_addr); }
         })
     }
 
@@ -6392,7 +6417,7 @@ impl List {
                                                 true
                                             } else if obj.len() > 1 {
                                                 // Complex object - skip restoration
-                                                zoon::println!("[DEBUG] Skipping JSON restoration: complex object with {} fields", obj.len());
+                                                if LOG_DEBUG { zoon::println!("[DEBUG] Skipping JSON restoration: complex object with {} fields", obj.len()); }
                                                 false
                                             } else {
                                                 true
@@ -6426,7 +6451,7 @@ impl List {
                                         PersistState::Restored { pid, change_stream, current_items: items, ctx, actor_ctx, cid },
                                     ));
                                 }
-                            } else if loaded_items.is_some() {
+                            } else if loaded_items.is_some() && LOG_DEBUG {
                                 zoon::println!("[DEBUG] Skipping JSON restoration for list with complex objects - use recorded-call restoration instead");
                             }
 
@@ -8085,8 +8110,10 @@ impl ListBindingFunction {
                                 ListChange::Replace { items: new_items } => {
                                     // Filter out items we've already removed (by PersistenceId)
                                     // and rebuild tracking for remaining items
-                                    zoon::println!("[DEBUG] List/remove Replace: {} items incoming, persisted_removed={:?}",
-                                        new_items.len(), persisted_removed);
+                                    if LOG_DEBUG {
+                                        zoon::println!("[DEBUG] List/remove Replace: {} items incoming, persisted_removed={:?}",
+                                            new_items.len(), persisted_removed);
+                                    }
                                     items.clear();
                                     let mut filtered_items = Vec::new();
 
@@ -8094,24 +8121,24 @@ impl ListBindingFunction {
                                         let persistence_id = item.persistence_id();
                                         if removed_pids.contains(&persistence_id) {
                                             // This item was removed by this List/remove, skip it
-                                            zoon::println!("[DEBUG] List/remove Replace: filtering by removed_pids");
+                                            if LOG_DEBUG { zoon::println!("[DEBUG] List/remove Replace: filtering by removed_pids"); }
                                             continue;
                                         }
 
                                         // Check persisted removals (for restoration after reload)
                                         if let Some(origin) = item.list_item_origin() {
-                                            zoon::println!("[DEBUG] List/remove Replace: item has origin call_id={}", origin.call_id);
+                                            if LOG_DEBUG { zoon::println!("[DEBUG] List/remove Replace: item has origin call_id={}", origin.call_id); }
                                             if persisted_removed.contains(&origin.call_id) {
                                                 // This item was previously removed, skip it
-                                                zoon::println!("[DEBUG] List/remove Replace: FILTERING out call_id={}", origin.call_id);
+                                                if LOG_DEBUG { zoon::println!("[DEBUG] List/remove Replace: FILTERING out call_id={}", origin.call_id); }
                                                 continue;
                                             }
                                         } else {
                                             // Check for persistence_id-based removal (LIST literal items)
                                             let id_str = format!("pid:{}", persistence_id);
-                                            zoon::println!("[DEBUG] List/remove Replace: item has NO origin, checking pid={}", id_str);
+                                            if LOG_DEBUG { zoon::println!("[DEBUG] List/remove Replace: item has NO origin, checking pid={}", id_str); }
                                             if persisted_removed.contains(&id_str) {
-                                                zoon::println!("[DEBUG] List/remove Replace: FILTERING out pid={}", id_str);
+                                                if LOG_DEBUG { zoon::println!("[DEBUG] List/remove Replace: FILTERING out pid={}", id_str); }
                                                 continue;
                                             }
                                         }
@@ -8153,24 +8180,26 @@ impl ListBindingFunction {
                                     let persistence_id = item.persistence_id();
                                     // If this item was previously removed, don't add it back
                                     if removed_pids.contains(&persistence_id) {
-                                        zoon::println!("[DEBUG] List/remove Push: filtering by removed_pids");
+                                        if LOG_DEBUG { zoon::println!("[DEBUG] List/remove Push: filtering by removed_pids"); }
                                         return future::ready(Some(None));
                                     }
 
                                     // Check persisted removals (for restoration after reload)
                                     if let Some(origin) = item.list_item_origin() {
-                                        zoon::println!("[DEBUG] List/remove Push: item has origin call_id={}, persisted_removed={:?}",
-                                            origin.call_id, persisted_removed);
+                                        if LOG_DEBUG {
+                                            zoon::println!("[DEBUG] List/remove Push: item has origin call_id={}, persisted_removed={:?}",
+                                                origin.call_id, persisted_removed);
+                                        }
                                         if persisted_removed.contains(&origin.call_id) {
-                                            zoon::println!("[DEBUG] List/remove Push: FILTERING out call_id={}", origin.call_id);
+                                            if LOG_DEBUG { zoon::println!("[DEBUG] List/remove Push: FILTERING out call_id={}", origin.call_id); }
                                             return future::ready(Some(None));
                                         }
                                     } else {
                                         // Check for persistence_id-based removal (LIST literal items)
                                         let id_str = format!("pid:{}", persistence_id);
-                                        zoon::println!("[DEBUG] List/remove Push: item has NO origin, checking pid={}", id_str);
+                                        if LOG_DEBUG { zoon::println!("[DEBUG] List/remove Push: item has NO origin, checking pid={}", id_str); }
                                         if persisted_removed.contains(&id_str) {
-                                            zoon::println!("[DEBUG] List/remove Push: FILTERING out pid={}", id_str);
+                                            if LOG_DEBUG { zoon::println!("[DEBUG] List/remove Push: FILTERING out pid={}", id_str); }
                                             return future::ready(Some(None));
                                         }
                                     }
@@ -8231,18 +8260,20 @@ impl ListBindingFunction {
                                 let (_, item, _, _) = &items[pos];
 
                                 // Debug logging
-                                zoon::println!("[DEBUG] RemoveItem: item has origin: {}, removed_set_key: {:?}",
-                                    item.list_item_origin().is_some(), removed_set_key);
+                                if LOG_DEBUG {
+                                    zoon::println!("[DEBUG] RemoveItem: item has origin: {}, removed_set_key: {:?}",
+                                        item.list_item_origin().is_some(), removed_set_key);
+                                }
 
                                 // Persist removal to this branch's removed set
                                 if let Some(key) = removed_set_key.as_ref() {
                                     if let Some(origin) = item.list_item_origin() {
-                                        zoon::println!("[DEBUG] Adding to removed set: key={}, call_id={}", key, origin.call_id);
+                                        if LOG_DEBUG { zoon::println!("[DEBUG] Adding to removed set: key={}, call_id={}", key, origin.call_id); }
                                         add_to_removed_set(key, &origin.call_id);
                                     } else {
                                         // Fallback: use persistence_id for items without origin (LIST literal items)
                                         let id_str = format!("pid:{}", persistence_id);
-                                        zoon::println!("[DEBUG] Adding to removed set (no origin): key={}, id={}", key, id_str);
+                                        if LOG_DEBUG { zoon::println!("[DEBUG] Adding to removed set (no origin): key={}, id={}", key, id_str); }
                                         add_to_removed_set(key, &id_str);
                                     }
                                 }

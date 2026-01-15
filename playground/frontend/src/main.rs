@@ -1917,7 +1917,6 @@ impl Playground {
     }
 
     fn example_runner(&self, run_command: RunCommand) -> impl Element + use<> {
-        println!("Command to run example received!");
 
         // Get all files and current file info
         let files = self.files.lock_ref();
@@ -2075,6 +2074,7 @@ impl Playground {
                 let run_command = self.run_command.clone();
                 let custom_examples = self.custom_examples.clone();
                 let selected_custom_example = self.selected_custom_example.clone();
+                let engine_type = self.engine_type.clone();
                 move || {
                     // Check if we're re-selecting the same example
                     let is_same_example = *current_file.lock_ref() == example_data.filename;
@@ -2103,8 +2103,11 @@ impl Playground {
                         clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
 
                         // Clear DD in-memory HOLD states AND localStorage (counter values, todo lists, etc.)
+                        // Only clear when DD engine is actually selected (not just compiled in)
                         #[cfg(feature = "engine-dd")]
-                        clear_dd_persisted_states();
+                        if engine_type.get() == EngineType::DifferentialDataflow {
+                            clear_dd_persisted_states();
+                        }
                     }
 
                     // Update URL to share this example

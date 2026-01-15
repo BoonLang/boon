@@ -1442,13 +1442,13 @@ fn schedule_expression(
                         .collect();
 
                     // DEBUG: Log LATEST args with persistence
-                    if !latest_args_with_persistence.is_empty() {
+                    if LOG_DEBUG && !latest_args_with_persistence.is_empty() {
                         zoon::println!("[DEBUG] FunctionCall has {} LATEST args with persistence", latest_args_with_persistence.len());
                     }
 
                     // Push persistence wrappers for LATEST args
                     for (arg_slot, persistence_id, value_changed) in latest_args_with_persistence {
-                        zoon::println!("[DEBUG] Pushing WrapWithPersistence for LATEST slot {:?} with id {}", arg_slot, persistence_id);
+                        if LOG_DEBUG { zoon::println!("[DEBUG] Pushing WrapWithPersistence for LATEST slot {:?} with id {}", arg_slot, persistence_id); }
                         state.push(WorkItem::WrapWithPersistence {
                             source_slot: arg_slot,
                             persistence_id,
@@ -2578,9 +2578,9 @@ fn process_work_item(
         WorkItem::WrapWithPersistence { source_slot, persistence_id, ctx, result_slot, value_changed } => {
             // Wrap an evaluated function argument with persistence.
             // This enables persistence for LATEST and other constructs used as function arguments.
-            zoon::println!("[DEBUG] Processing WrapWithPersistence for slot {:?} with id {}", source_slot, persistence_id);
+            if LOG_DEBUG { zoon::println!("[DEBUG] Processing WrapWithPersistence for slot {:?} with id {}", source_slot, persistence_id); }
             if let Some(source_actor) = state.get(source_slot) {
-                zoon::println!("[DEBUG] Found source actor, wrapping with persistence");
+                if LOG_DEBUG { zoon::println!("[DEBUG] Found source actor, wrapping with persistence"); }
                 let persistence_stream = create_variable_persistence_stream(
                     source_actor.clone(),
                     ctx.construct_context.construct_storage.clone(),
@@ -3008,13 +3008,13 @@ fn build_when_actor(
                 Value::List(_, _) => "List".to_string(),
                 _ => "Other".to_string(),
             };
-            zoon::println!("[WHEN] Received value: {}", value_desc);
+            if LOG_DEBUG { zoon::println!("[WHEN] Received value: {}", value_desc); }
 
             // Try to match against each arm
             for arm in &arms_clone {
                 // Use async pattern matching to properly extract bindings from Objects
                 if let Some(bindings) = match_pattern(&arm.pattern, &value).await {
-                    zoon::println!("[WHEN] Pattern MATCHED: {:?}", arm.pattern);
+                    if LOG_DEBUG { zoon::println!("[WHEN] Pattern MATCHED: {:?}", arm.pattern); }
                     let value_actor = ValueActor::new_arc(
                         ConstructInfo::new(
                             "WHEN input value".to_string(),
@@ -4355,8 +4355,10 @@ fn build_list_append_with_recording(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
 ) -> Result<Option<Arc<ValueActor>>, String> {
-    zoon::println!("[DEBUG] build_list_append_with_recording called");
-    zoon::println!("[DEBUG] persistence: {:?}, persistence_id: {}", persistence.is_some(), persistence_id);
+    if LOG_DEBUG {
+        zoon::println!("[DEBUG] build_list_append_with_recording called");
+        zoon::println!("[DEBUG] persistence: {:?}, persistence_id: {}", persistence.is_some(), persistence_id);
+    }
 
     // For List/append(item: expr):
     // - First arg "item:" has the expression to evaluate
@@ -4384,7 +4386,7 @@ fn build_list_append_with_recording(
     // Storage key must be defined first to pass to with_persisting_child_scope
     let storage_key = format!("list_calls:{}", scope_id);
     let (child_ctx, call_receiver) = ctx.actor_context.with_persisting_child_scope(&scope_id, storage_key.clone());
-    zoon::println!("[DEBUG] Created persisting scope: {}, call_recorder is Some: {}", scope_id, child_ctx.call_recorder.is_some());
+    if LOG_DEBUG { zoon::println!("[DEBUG] Created persisting scope: {}, call_recorder is Some: {}", scope_id, child_ctx.call_recorder.is_some()); }
 
     // Create new evaluation context with the persisting scope
     let item_eval_ctx = EvaluationContext {
@@ -4426,9 +4428,9 @@ fn build_list_append_with_recording(
     // Each call creates an item by evaluating the function with stored inputs
     let mut restored_items: Vec<Arc<ValueActor>> = Vec::new();
     if !stored_calls.is_empty() {
-        zoon::println!("[DEBUG] Restoring {} items from stored calls", stored_calls.len());
+        if LOG_DEBUG { zoon::println!("[DEBUG] Restoring {} items from stored calls", stored_calls.len()); }
         for (index, recorded_call) in stored_calls.iter().enumerate() {
-            zoon::println!("[DEBUG] Restoring item {}: {:?}", index, recorded_call);
+            if LOG_DEBUG { zoon::println!("[DEBUG] Restoring item {}: {:?}", index, recorded_call); }
 
             // 1. Convert CapturedValue back to a Value actor
             let Some(input_value) = recorded_call.inputs.restore_with_context(
@@ -4465,7 +4467,7 @@ fn build_list_append_with_recording(
             // For `title_to_add |> new_todo()`, the piped value becomes the first argument (title)
             let mut parameters = ctx.actor_context.parameters.clone();
             if let Some(first_param) = func_def.parameters.first() {
-                zoon::println!("[DEBUG] Binding restored input to parameter '{}' for function '{}'", first_param, function_path);
+                if LOG_DEBUG { zoon::println!("[DEBUG] Binding restored input to parameter '{}' for function '{}'", first_param, function_path); }
                 parameters.insert(first_param.clone(), input_actor.clone());
             } else {
                 zoon::eprintln!("[DEBUG] Function '{}' has no parameters to bind input to", function_path);
@@ -4486,7 +4488,7 @@ fn build_list_append_with_recording(
             // 5. Evaluate function body
             match evaluate_expression(func_def.body.clone(), body_ctx) {
                 Ok(Some(item_actor)) => {
-                    zoon::println!("[DEBUG] Restored item {} successfully", index);
+                    if LOG_DEBUG { zoon::println!("[DEBUG] Restored item {} successfully", index); }
                     // Wrap the item with origin for removal tracking
                     let origin = ListItemOrigin {
                         source_storage_key: storage_key.clone(),
@@ -4506,7 +4508,7 @@ fn build_list_append_with_recording(
                     restored_items.push(wrapped_item);
                 }
                 Ok(None) => {
-                    zoon::println!("[DEBUG] Restored item {} was SKIP", index);
+                    if LOG_DEBUG { zoon::println!("[DEBUG] Restored item {} was SKIP", index); }
                 }
                 Err(e) => {
                     zoon::eprintln!("[DEBUG] Failed to restore item {}: {}", index, e);
@@ -4515,7 +4517,7 @@ fn build_list_append_with_recording(
         }
     }
     let storage_handle = spawn_recorded_calls_storage_actor(storage_key.clone(), call_receiver);
-    zoon::println!("[DEBUG] Spawned storage actor for key: {}", storage_key);
+    if LOG_DEBUG { zoon::println!("[DEBUG] Spawned storage actor for key: {}", storage_key); }
 
     // Build a custom change stream that includes restored items
     // This replicates function_list_append logic but injects restored items after the first Replace
@@ -4572,7 +4574,7 @@ fn build_list_append_with_recording(
 
     let restored_changes = stream::iter(
         restored_items.into_iter().map(|item| {
-            zoon::println!("[DEBUG] Emitting restored item to change stream");
+            if LOG_DEBUG { zoon::println!("[DEBUG] Emitting restored item to change stream"); }
             TaggedChange::FromRestored(ListChange::Push { item })
         })
     );
@@ -4751,7 +4753,7 @@ fn call_function(
                 // Record the call if we're in a persisting scope
                 if let Some(call_recorder) = &ctx_for_closure.actor_context.call_recorder {
                     let captured_input = CapturedValue::capture(&piped_value);
-                    zoon::println!("[DEBUG] Recording call: {:?} with id: {} and input: {:?}", path_for_recording, invocation_id, captured_input);
+                    if LOG_DEBUG { zoon::println!("[DEBUG] Recording call: {:?} with id: {} and input: {:?}", path_for_recording, invocation_id, captured_input); }
                     let recorded_call = RecordedCall {
                         id: invocation_id.clone(),
                         path: path_for_recording.clone(),
@@ -5961,22 +5963,22 @@ fn spawn_recorded_calls_storage_actor(
                 Vec::new()
             }
         };
-        zoon::println!("[DEBUG] Storage actor loaded {} existing calls for {}", recorded_calls.len(), storage_key);
+        if LOG_DEBUG { zoon::println!("[DEBUG] Storage actor loaded {} existing calls for {}", recorded_calls.len(), storage_key); }
 
         // Process incoming recorded calls
         while let Some(call) = call_receiver.next().await {
-            zoon::println!("[DEBUG] Storage actor received call: {:?}", call);
+            if LOG_DEBUG { zoon::println!("[DEBUG] Storage actor received call: {:?}", call); }
             recorded_calls.push(call);
 
             // Save to localStorage after each call
             if let Err(error) = local_storage().insert(&storage_key, &recorded_calls) {
                 zoon::eprintln!("[DEBUG] Failed to save recorded calls for {}: {:#}", storage_key, error);
-            } else {
+            } else if LOG_DEBUG {
                 zoon::println!("[DEBUG] Storage actor saved {} calls to {}", recorded_calls.len(), storage_key);
             }
         }
 
-        zoon::println!("[DEBUG] Storage actor for {} shutting down", storage_key);
+        if LOG_DEBUG { zoon::println!("[DEBUG] Storage actor for {} shutting down", storage_key); }
     })
 }
 

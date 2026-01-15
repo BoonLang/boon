@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use super::super::core::DdOutput;
 use super::super::dd_value::DdValue;
+use super::super::LOG_DD_DEBUG;
 use zoon::futures_util::stream::Stream;
 use zoon::Mutable;
 use zoon::signal::MutableSignalCloned;
@@ -26,7 +27,7 @@ pub fn clear_dd_persisted_states() {
     HOLD_STATES.with(|states| {
         states.lock_mut().clear();
     });
-    zoon::println!("[DD Persist] Cleared all DD states");
+    if LOG_DD_DEBUG { zoon::println!("[DD Persist] Cleared all DD states"); }
 }
 
 /// Clear in-memory HOLD_STATES only (not localStorage).
@@ -509,11 +510,11 @@ pub fn load_persisted_hold_value(hold_id: &str) -> Option<DdValue> {
 pub fn init_hold_state(hold_id: &str, initial: DdValue) -> DdValue {
     // Try to load persisted value first
     if let Some(persisted) = load_persisted_hold_value(hold_id) {
-        zoon::println!("[DD Persist] Restored {} = {:?}", hold_id, persisted);
+        if LOG_DD_DEBUG { zoon::println!("[DD Persist] Restored {} = {:?}", hold_id, persisted); }
         update_hold_state_no_persist(hold_id, persisted.clone());
         persisted
     } else {
-        zoon::println!("[DD Persist] Using initial {} = {:?}", hold_id, initial);
+        if LOG_DD_DEBUG { zoon::println!("[DD Persist] Using initial {} = {:?}", hold_id, initial); }
         update_hold_state_no_persist(hold_id, initial.clone());
         initial
     }
@@ -565,10 +566,10 @@ fn dd_value_to_json(value: &DdValue) -> Option<zoon::serde_json::Value> {
             HOLD_STATES.with(|cell| {
                 let states = cell.lock_ref(); // ALLOWED: IO layer
                 if let Some(value) = states.get(hold_id.as_ref()) {
-                    zoon::println!("[DD Persist] HoldRef {} -> {:?}", hold_id, value);
+                    if LOG_DD_DEBUG { zoon::println!("[DD Persist] HoldRef {} -> {:?}", hold_id, value); }
                     dd_value_to_json(value)
                 } else {
-                    zoon::println!("[DD Persist] HoldRef {} NOT FOUND in HOLD_STATES", hold_id);
+                    if LOG_DD_DEBUG { zoon::println!("[DD Persist] HoldRef {} NOT FOUND in HOLD_STATES", hold_id); }
                     None
                 }
             })
