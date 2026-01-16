@@ -388,14 +388,34 @@ async function cdpTypeTextCharByChar(tabId, text) {
   await attachDebugger(tabId);
 
   for (const char of text) {
-    const code = char.toUpperCase().charCodeAt(0);
-    const keyCode = code >= 65 && code <= 90 ? code : char.charCodeAt(0);
+    // Get the correct key code for the character
+    let keyCode;
+    let codeStr;
+
+    const upperCode = char.toUpperCase().charCodeAt(0);
+    if (upperCode >= 65 && upperCode <= 90) {
+      // Letters A-Z
+      keyCode = upperCode;
+      codeStr = `Key${char.toUpperCase()}`;
+    } else if (char === ' ') {
+      // Space key
+      keyCode = 32;
+      codeStr = 'Space';
+    } else if (char >= '0' && char <= '9') {
+      // Digits 0-9
+      keyCode = char.charCodeAt(0);
+      codeStr = `Digit${char}`;
+    } else {
+      // Other characters (punctuation, etc.)
+      keyCode = char.charCodeAt(0);
+      codeStr = ''; // Many punctuation keys have complex codes, but char event handles them
+    }
 
     // keyDown - don't include text, just key info
     await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
       type: 'keyDown',
       key: char,
-      code: `Key${char.toUpperCase()}`,
+      code: codeStr,
       windowsVirtualKeyCode: keyCode,
       nativeVirtualKeyCode: keyCode
     });
@@ -410,7 +430,7 @@ async function cdpTypeTextCharByChar(tabId, text) {
     await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
       type: 'keyUp',
       key: char,
-      code: `Key${char.toUpperCase()}`,
+      code: codeStr,
       windowsVirtualKeyCode: keyCode,
       nativeVirtualKeyCode: keyCode
     });
@@ -1787,12 +1807,14 @@ async function handleCommand(id, command) {
         // After typing, dispatch input/change events to trigger Zoon callbacks
         try {
           await cdpTypeText(tab.id, command.text);
-          // CDP Input.insertText doesn't reliably trigger DOM events
-          // Dispatch input and change events on the focused element
+          // CDP Input.insertText inserts at cursor but may not reliably update DOM's .value
+          // We dispatch events so Zoon's on_change fires with the actual DOM value
+          // CRITICAL: Do NOT overwrite el.value - it would replace existing text instead of appending!
           const dispatchScript = `
             (function() {
               const el = document.activeElement;
               if (el && el.tagName === 'INPUT') {
+                console.log('[boon-tools] typeText: el.value after CDP insertText:', el.value);
                 el.dispatchEvent(new Event('input', { bubbles: true }));
                 el.dispatchEvent(new Event('change', { bubbles: true }));
               }

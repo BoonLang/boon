@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use differential_dataflow::collection::{AsCollection, VecCollection};
 use differential_dataflow::input::Input;
+use differential_dataflow::lattice::Lattice;
 use differential_dataflow::operators::Count;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::Operator;
@@ -265,6 +266,193 @@ pub fn run_hold_counter_dataflow(num_clicks: usize) -> Vec<(u64, i64)> {
         .expect("outputs still borrowed")
         .into_inner()
         .unwrap()
+}
+
+// ============================================================================
+// LIST OPERATORS - O(delta) operations on DD collections
+// ============================================================================
+// These operators provide incremental computation over collections.
+// Using DD 0.18's VecCollection<G, D> API which is Collection<G, Vec<(D, Time, Diff)>>.
+
+use differential_dataflow::operators::Threshold;
+
+/// Filter a collection by predicate - O(delta).
+///
+/// Only elements where `predicate(element)` returns true are retained.
+/// DD incrementally processes only changed elements, not the entire collection.
+///
+/// Boon equivalent:
+/// ```boon
+/// list |> List/retain({ item => condition })
+/// ```
+pub fn list_filter<G, D, F>(
+    collection: &VecCollection<G, D>,
+    predicate: F,
+) -> VecCollection<G, D>
+where
+    G: Scope,
+    G::Timestamp: Clone,
+    D: timely::Data,
+    F: Fn(&D) -> bool + 'static,
+{
+    // DD's filter operation processes only deltas
+    collection.filter(move |item| predicate(item))
+}
+
+/// Map over a collection - O(delta).
+///
+/// Transforms each element using the provided function.
+/// DD incrementally processes only changed elements.
+///
+/// Boon equivalent:
+/// ```boon
+/// list |> List/map({ item => transform(item) })
+/// ```
+pub fn list_map<G, D, D2, F>(
+    collection: &VecCollection<G, D>,
+    transform: F,
+) -> VecCollection<G, D2>
+where
+    G: Scope,
+    G::Timestamp: Clone,
+    D: timely::Data,
+    D2: timely::Data,
+    F: Fn(D) -> D2 + 'static,
+{
+    // DD's map operation processes only deltas
+    collection.map(move |item| transform(item))
+}
+
+/// Count elements in a collection - O(1) per change.
+///
+/// Returns a collection containing the current count.
+/// Each change to the input produces an incremental count update.
+///
+/// Boon equivalent:
+/// ```boon
+/// list |> List/count()
+/// ```
+pub fn list_count<G, D>(
+    collection: &VecCollection<G, D>,
+) -> VecCollection<G, isize>
+where
+    G: Scope,
+    G::Timestamp: Clone + Ord + Lattice,
+    D: timely::Data,
+{
+    // Map all elements to unit key, then count
+    // This gives us the total count across all elements
+    collection
+        .map(|_| ())
+        .count()
+        .map(|((), count)| count)
+}
+
+/// Count elements matching a predicate - O(delta).
+///
+/// Returns a collection containing the count of matching elements.
+/// Only processes changed elements, not the entire collection.
+///
+/// Boon equivalent:
+/// ```boon
+/// list |> List/retain(predicate) |> List/count()
+/// ```
+pub fn list_count_where<G, D, F>(
+    collection: &VecCollection<G, D>,
+    predicate: F,
+) -> VecCollection<G, isize>
+where
+    G: Scope,
+    G::Timestamp: Clone + Ord + Lattice,
+    D: timely::Data,
+    F: Fn(&D) -> bool + 'static,
+{
+    // Filter then count - DD optimizes this incrementally
+    list_count(&list_filter(collection, predicate))
+}
+
+/// Check if a collection is empty - O(1) per change.
+///
+/// Returns a collection containing a boolean indicating emptiness.
+///
+/// Boon equivalent:
+/// ```boon
+/// list |> List/count() |> { count => count == 0 }
+/// ```
+pub fn list_is_empty<G, D>(
+    collection: &VecCollection<G, D>,
+) -> VecCollection<G, bool>
+where
+    G: Scope,
+    G::Timestamp: Clone + Ord + Lattice,
+    D: timely::Data,
+{
+    list_count(collection).map(|count| count == 0)
+}
+
+/// Flat-map over a collection - O(delta).
+///
+/// Each input element can produce zero or more output elements.
+/// DD incrementally processes only changed elements.
+///
+/// Boon equivalent:
+/// ```boon
+/// list |> List/flat_map({ item => items })
+/// ```
+pub fn list_flat_map<G, D, D2, I, F>(
+    collection: &VecCollection<G, D>,
+    transform: F,
+) -> VecCollection<G, D2>
+where
+    G: Scope,
+    G::Timestamp: Clone,
+    D: timely::Data,
+    D2: timely::Data,
+    I: IntoIterator<Item = D2>,
+    F: Fn(D) -> I + 'static,
+{
+    collection.flat_map(move |item| transform(item))
+}
+
+/// Concatenate two collections - O(1).
+///
+/// Returns a collection containing all elements from both inputs.
+/// This is the DD equivalent of Boon's LATEST for collections.
+///
+/// Boon equivalent:
+/// ```boon
+/// LATEST { list1, list2 }
+/// ```
+pub fn list_concat<G, D>(
+    collection1: &VecCollection<G, D>,
+    collection2: &VecCollection<G, D>,
+) -> VecCollection<G, D>
+where
+    G: Scope,
+    G::Timestamp: Clone,
+    D: timely::Data,
+{
+    collection1.concat(collection2)
+}
+
+/// Distinct elements in a collection - O(delta).
+///
+/// Removes duplicate elements, keeping only one of each.
+/// DD incrementally maintains the distinct set.
+///
+/// Boon equivalent:
+/// ```boon
+/// list |> List/distinct()
+/// ```
+pub fn list_distinct<G, D>(
+    collection: &VecCollection<G, D>,
+) -> VecCollection<G, D>
+where
+    G: Scope,
+    G::Timestamp: Clone + Ord + Lattice,
+    D: timely::Data + differential_dataflow::ExchangeData + std::hash::Hash,
+{
+    collection.distinct()
 }
 
 /// Run a more complex HOLD example: accumulating a sum.

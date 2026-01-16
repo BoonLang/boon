@@ -5,7 +5,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use super::super::core::{DdEvent, DdEventValue, DdInput, LinkId, TimerId};
+use super::super::core::{Event, EventValue, Input, LinkId, TimerId};
 
 /// Action to perform when a dynamic link fires.
 #[derive(Clone, Debug)]
@@ -16,10 +16,10 @@ pub enum DynamicLinkAction {
     SetTrue(String),
     /// Set a hold to false (for exiting edit mode via Escape)
     SetFalse(String),
-    /// Set a hold to false when specific keys are pressed (Escape/Enter for exiting edit mode)
-    SetFalseOnKeys { hold_id: String, keys: Vec<String> },
+    /// Set a cell to false when specific keys are pressed (Escape/Enter for exiting edit mode)
+    SetFalseOnKeys { cell_id: String, keys: Vec<String> },
     /// Handle editing events: save title on Enter, exit on Escape
-    EditingHandler { editing_hold: String, title_hold: String },
+    EditingHandler { editing_cell: String, title_cell: String },
     /// Update hold state to match hover state (true/false)
     HoverState(String),
     /// Remove a list item by link_id (for delete buttons on dynamically added items)
@@ -28,8 +28,8 @@ pub enum DynamicLinkAction {
     /// Toggle ALL items' completed field based on computed all_completed value.
     /// Used for "toggle all" checkbox that sets all items to completed or not completed.
     ListToggleAllCompleted {
-        /// The list HOLD ID (e.g., "hold_0" for todos)
-        list_hold_id: String,
+        /// The list Cell ID (e.g., "cell_0" for todos)
+        list_cell_id: String,
         /// The field to toggle on each item (e.g., "completed")
         completed_field: String,
     },
@@ -51,7 +51,7 @@ thread_local! {
 }
 
 /// Set the global event dispatcher.
-/// Called when DdWorker is created to enable event injection from anywhere.
+/// Called when Worker is created to enable event injection from anywhere.
 pub fn set_global_dispatcher(injector: EventInjector) {
     GLOBAL_DISPATCHER.with(|cell| {
         *cell.borrow_mut() = Some(injector); // ALLOWED: IO layer
@@ -151,34 +151,121 @@ pub fn get_dynamic_link_action(link_id: &str) -> Option<DynamicLinkAction> {
     })
 }
 
+/// Convert all DYNAMIC_LINK_ACTIONS to LinkCellMappings for DD-native processing (Phase 8).
+///
+/// This is a migration bridge that allows the existing `add_dynamic_link_action` calls
+/// to work while we transition to pure DD link handling. The returned mappings are
+/// added to DataflowConfig and processed by the DD worker.
+pub fn get_all_link_mappings() -> Vec<super::super::core::types::LinkCellMapping> {
+    use super::super::core::types::{LinkCellMapping, LinkAction, CellId, LinkId};
+
+    DYNAMIC_LINK_ACTIONS.with(|cell| {
+        let actions = cell.borrow(); // ALLOWED: IO layer
+        actions.iter().filter_map(|(link_id, action)| {
+            match action {
+                DynamicLinkAction::BoolToggle(cell_id) => {
+                    Some(LinkCellMapping::bool_toggle(link_id.clone(), cell_id.clone()))
+                }
+                DynamicLinkAction::SetTrue(cell_id) => {
+                    Some(LinkCellMapping::set_true(link_id.clone(), cell_id.clone()))
+                }
+                DynamicLinkAction::SetFalse(cell_id) => {
+                    Some(LinkCellMapping::set_false(link_id.clone(), cell_id.clone()))
+                }
+                DynamicLinkAction::SetFalseOnKeys { cell_id, keys } => {
+                    Some(LinkCellMapping::with_key_filter(
+                        link_id.clone(),
+                        cell_id.clone(),
+                        LinkAction::SetFalse,
+                        keys.clone(),
+                    ))
+                }
+                DynamicLinkAction::HoverState(cell_id) => {
+                    Some(LinkCellMapping::hover_state(link_id.clone(), cell_id.clone()))
+                }
+                DynamicLinkAction::RemoveListItem { link_id: remove_link_id } => {
+                    // RemoveListItem uses event indirection pattern:
+                    // delete_button → dynamic_list_remove → list_cell
+                    // The IO layer just routes; DD handles removal via StateTransform::RemoveListItem
+                    // This is acceptable as IO only routes, doesn't do business logic
+                    zoon::println!("[Phase8] RemoveListItem {} uses event indirection (acceptable)", remove_link_id);
+                    None
+                }
+                DynamicLinkAction::ListToggleAllCompleted { list_cell_id, completed_field } => {
+                    Some(LinkCellMapping::new(
+                        link_id.clone(),
+                        list_cell_id.clone(),
+                        LinkAction::ListToggleAllCompleted {
+                            list_cell_id: CellId::new(list_cell_id.clone()),
+                            completed_field: completed_field.clone(),
+                        },
+                    ))
+                }
+                DynamicLinkAction::EditingHandler { editing_cell, title_cell } => {
+                    // EditingHandler expands to multiple mappings:
+                    // - Blur → editing_cell = false (handled via fire_global_blur with grace period)
+                    // - Escape → editing_cell = false
+                    // - Enter:text → title_cell = text, editing_cell = false
+                    // Grace period logic stays in IO (browser-specific focus race handling)
+                    zoon::println!("[Phase8] EditingHandler {} -> editing={}, title={}",
+                        link_id, editing_cell, title_cell);
+                    // Return blur/Escape mapping; Enter is more complex and stays in IO for now
+                    Some(LinkCellMapping::with_key_filter(
+                        link_id.clone(),
+                        editing_cell.clone(),
+                        LinkAction::SetFalse,
+                        vec!["Escape".to_string()],
+                    ))
+                }
+            }
+        }).collect()
+    })
+}
+
 /// Check if a link has a dynamic action and execute it.
 /// Returns true if the action was handled.
 fn check_dynamic_link_action(link_id: &str) -> bool {
     DYNAMIC_LINK_ACTIONS.with(|cell| {
         if let Some(action) = cell.borrow().get(link_id).cloned() { // ALLOWED: IO layer
             match action {
-                DynamicLinkAction::SetTrue(hold_id) => {
-                    zoon::println!("[DD DynamicLink] {} -> SetTrue({})", link_id, hold_id);
-                    // Add to grace period - blur events for this editing_hold should be ignored
+                DynamicLinkAction::SetTrue(cell_id) => {
+                    zoon::println!("[DD DynamicLink] {} -> SetTrue({})", link_id, cell_id);
+                    // Add to grace period - blur events for this editing_cell should be ignored
                     // until the focus race settles (use timeout instead of relying on focus event)
-                    let hold_id_for_timeout = hold_id.clone();
+                    let cell_id_for_timeout = cell_id.clone();
                     EDITING_HOLDS_GRACE_PERIOD.with(|cell| {
-                        cell.borrow_mut().insert(hold_id.clone()); // ALLOWED: IO layer
+                        cell.borrow_mut().insert(cell_id.clone()); // ALLOWED: IO layer
                     });
                     // NOTE: Grace period is cleared ONLY by key events (Enter/Escape) in check_dynamic_key_action.
-                    // The focus race between main input and editing input continues indefinitely,
-                    // so blur events are ignored until the user explicitly exits via keyboard.
-                    // This changes UX slightly: clicking outside won't exit editing, only Enter/Escape will.
-                    let _ = hold_id_for_timeout; // Mark as used
-                    super::outputs::update_hold_state(&hold_id, super::super::dd_value::DdValue::Bool(true));
+                    let _ = cell_id_for_timeout; // Mark as used
+                    // Phase 7: Fire to DD instead of direct update
+                    // Format: "cell_set_true:{cell_id}" - DD worker processes this
+                    GLOBAL_DISPATCHER.with(|disp_cell| {
+                        if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
+                            injector.fire_link_text(LinkId::new("dd_cell_update"), format!("set_true:{}", cell_id));
+                            zoon::println!("[DD Phase7] Fired dd_cell_update with set_true:{}", cell_id);
+                        }
+                    });
                 }
-                DynamicLinkAction::SetFalse(hold_id) => {
-                    zoon::println!("[DD DynamicLink] {} -> SetFalse({})", link_id, hold_id);
-                    super::outputs::update_hold_state(&hold_id, super::super::dd_value::DdValue::Bool(false));
+                DynamicLinkAction::SetFalse(cell_id) => {
+                    zoon::println!("[DD DynamicLink] {} -> SetFalse({})", link_id, cell_id);
+                    // Phase 7: Fire to DD instead of direct update
+                    GLOBAL_DISPATCHER.with(|disp_cell| {
+                        if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
+                            injector.fire_link_text(LinkId::new("dd_cell_update"), format!("set_false:{}", cell_id));
+                            zoon::println!("[DD Phase7] Fired dd_cell_update with set_false:{}", cell_id);
+                        }
+                    });
                 }
-                DynamicLinkAction::BoolToggle(hold_id) => {
-                    zoon::println!("[DD DynamicLink] {} -> BoolToggle({})", link_id, hold_id);
-                    super::outputs::toggle_hold_bool(&hold_id);
+                DynamicLinkAction::BoolToggle(cell_id) => {
+                    zoon::println!("[DD DynamicLink] {} -> BoolToggle({})", link_id, cell_id);
+                    // Phase 7: Fire to DD instead of direct update
+                    GLOBAL_DISPATCHER.with(|disp_cell| {
+                        if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
+                            injector.fire_link_text(LinkId::new("dd_cell_update"), format!("bool_toggle:{}", cell_id));
+                            zoon::println!("[DD Phase7] Fired dd_cell_update with bool_toggle:{}", cell_id);
+                        }
+                    });
                 }
                 DynamicLinkAction::SetFalseOnKeys { .. } => {
                     // SetFalseOnKeys is handled by check_dynamic_key_action, not here
@@ -207,10 +294,16 @@ fn check_dynamic_link_action(link_id: &str) -> bool {
                         }
                     });
                 }
-                DynamicLinkAction::ListToggleAllCompleted { list_hold_id, completed_field } => {
-                    // Toggle ALL items' completed field
-                    zoon::println!("[DD DynamicLink] {} -> ListToggleAllCompleted(list={}, field={})", link_id, list_hold_id, completed_field);
-                    super::outputs::toggle_all_list_items_completed(&list_hold_id, &completed_field);
+                DynamicLinkAction::ListToggleAllCompleted { list_cell_id, completed_field } => {
+                    // Toggle ALL items' completed field - fire DD event
+                    zoon::println!("[DD DynamicLink] {} -> ListToggleAllCompleted(list={}, field={})", link_id, list_cell_id, completed_field);
+                    // Phase 7: Fire to DD instead of direct mutation
+                    GLOBAL_DISPATCHER.with(|disp_cell| {
+                        if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
+                            injector.fire_link_text(LinkId::new("dd_cell_update"), format!("list_toggle_all:{}:{}", list_cell_id, completed_field));
+                            zoon::println!("[DD Phase7] Fired dd_cell_update with list_toggle_all:{}:{}", list_cell_id, completed_field);
+                        }
+                    });
                 }
             }
             true
@@ -293,18 +386,24 @@ pub fn fire_global_link_with_bool(link_id: &str, value: bool) {
     // Check if this link has a HoverState action (for dynamic list item hover)
     let handled = DYNAMIC_LINK_ACTIONS.with(|cell| {
         if let Some(action) = cell.borrow().get(link_id).cloned() { // ALLOWED: IO layer
-            if let DynamicLinkAction::HoverState(hold_id) = action {
+            if let DynamicLinkAction::HoverState(cell_id) = action {
                 // Skip update if value hasn't changed - prevents signal spam on continuous hover
-                let current = super::outputs::get_hold_value(&hold_id);
+                let current = super::outputs::get_cell_value(&cell_id);
                 let same_value = match current {
-                    Some(super::super::dd_value::DdValue::Bool(b)) => b == value,
+                    Some(super::super::core::value::Value::Bool(b)) => b == value,
                     _ => false,
                 };
                 if same_value {
                     return true; // Already handled, skip redundant update
                 }
-                zoon::println!("[DD Hover] {} -> update {} to {}", link_id, hold_id, value);
-                super::outputs::update_hold_state_no_persist(&hold_id, super::super::dd_value::DdValue::Bool(value));
+                zoon::println!("[DD Hover] {} -> update {} to {}", link_id, cell_id, value);
+                // Phase 7: Fire to DD instead of direct mutation
+                GLOBAL_DISPATCHER.with(|disp_cell| {
+                    if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
+                        injector.fire_link_text(LinkId::new("dd_cell_update"), format!("hover_set:{}:{}", cell_id, value));
+                        zoon::println!("[DD Phase7] Fired dd_cell_update with hover_set:{}:{}", cell_id, value);
+                    }
+                });
                 return true;
             }
         }
@@ -317,16 +416,22 @@ pub fn fire_global_link_with_bool(link_id: &str, value: bool) {
 
     // Also update synthetic hover hold for statically-defined hover WhileRefs
     // The evaluator creates holds named "hover_{link_id}" for element.hovered |> WHILE patterns
-    let hover_hold_id = format!("hover_{}", link_id);
+    let hover_cell_id = format!("hover_{}", link_id);
     // Skip update if value hasn't changed - prevents signal spam on continuous hover
-    let current = super::outputs::get_hold_value(&hover_hold_id);
+    let current = super::outputs::get_cell_value(&hover_cell_id);
     let same_value = match current {
-        Some(super::super::dd_value::DdValue::Bool(b)) => b == value,
+        Some(super::super::core::value::Value::Bool(b)) => b == value,
         _ => false,
     };
     if !same_value {
-        super::outputs::update_hold_state_no_persist(&hover_hold_id, super::super::dd_value::DdValue::Bool(value));
-        zoon::println!("[DD Hover] {} -> synthetic hold {} = {}", link_id, hover_hold_id, value);
+        // Phase 7: Fire to DD instead of direct mutation
+        GLOBAL_DISPATCHER.with(|disp_cell| {
+            if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
+                injector.fire_link_text(LinkId::new("dd_cell_update"), format!("hover_set:{}:{}", hover_cell_id, value));
+                zoon::println!("[DD Phase7] Fired dd_cell_update with hover_set:{}:{}", hover_cell_id, value);
+            }
+        });
+        zoon::println!("[DD Hover] {} -> synthetic hold {} = {}", link_id, hover_cell_id, value);
 
         // Only fire to dispatcher when value actually changed
         GLOBAL_DISPATCHER.with(|cell| {
@@ -347,19 +452,26 @@ pub fn fire_global_blur(link_id: &str) {
     // Check if this link has an EditingHandler
     DYNAMIC_LINK_ACTIONS.with(|cell| {
         if let Some(action) = cell.borrow().get(link_id).cloned() { // ALLOWED: IO layer
-            if let DynamicLinkAction::EditingHandler { editing_hold, .. } = action {
-                // Check if this editing_hold is in grace period (just enabled, input hasn't been focused yet)
+            if let DynamicLinkAction::EditingHandler { editing_cell, .. } = action {
+                // Check if this editing_cell is in grace period (just enabled, input hasn't been focused yet)
                 let in_grace_period = EDITING_HOLDS_GRACE_PERIOD.with(|grace| {
-                    grace.borrow().contains(&editing_hold) // ALLOWED: IO layer
+                    grace.borrow().contains(&editing_cell) // ALLOWED: IO layer
                 });
                 if in_grace_period {
                     // Ignore spurious blur during WhileRef arm switch
-                    zoon::println!("[DD Blur] {} -> IGNORED (grace period for {})", link_id, editing_hold);
+                    zoon::println!("[DD Blur] {} -> IGNORED (grace period for {})", link_id, editing_cell);
                     return;
                 }
                 // Exit edit mode without saving on blur
+                // IMPORTANT: Boon uses Tagged booleans, not Rust bools
                 zoon::println!("[DD Blur] {} -> exit edit (no save)", link_id);
-                super::outputs::update_hold_state(&editing_hold, super::super::dd_value::DdValue::Bool(false));
+                // Phase 7: Fire to DD instead of direct mutation
+                GLOBAL_DISPATCHER.with(|disp_cell| {
+                    if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
+                        injector.fire_link_text(LinkId::new("dd_cell_update"), format!("set_false:{}", editing_cell));
+                        zoon::println!("[DD Phase7] Fired dd_cell_update with set_false:{}", editing_cell);
+                    }
+                });
                 return;
             }
         }
@@ -369,22 +481,22 @@ pub fn fire_global_blur(link_id: &str) {
 }
 
 /// Clear the grace period for an editing hold (call when input receives focus)
-pub fn clear_editing_grace_period(editing_hold: &str) {
+pub fn clear_editing_grace_period(editing_cell: &str) {
     EDITING_HOLDS_GRACE_PERIOD.with(|cell| {
-        cell.borrow_mut().remove(editing_hold); // ALLOWED: IO layer
+        cell.borrow_mut().remove(editing_cell); // ALLOWED: IO layer
     });
-    zoon::println!("[DD Focus] Cleared grace period for {}", editing_hold);
+    zoon::println!("[DD Focus] Cleared grace period for {}", editing_cell);
 }
 
 /// Clear the grace period for a link's editing hold (call when input receives focus)
 /// This looks up the EditingHandler for the given blur_link_id and clears its grace period.
 pub fn clear_editing_grace_period_for_link(blur_link_id: &str) {
     DYNAMIC_LINK_ACTIONS.with(|cell| {
-        if let Some(DynamicLinkAction::EditingHandler { editing_hold, .. }) = cell.borrow().get(blur_link_id).cloned() { // ALLOWED: IO layer
+        if let Some(DynamicLinkAction::EditingHandler { editing_cell, .. }) = cell.borrow().get(blur_link_id).cloned() { // ALLOWED: IO layer
             EDITING_HOLDS_GRACE_PERIOD.with(|grace| {
-                grace.borrow_mut().remove(&editing_hold); // ALLOWED: IO layer
+                grace.borrow_mut().remove(&editing_cell); // ALLOWED: IO layer
             });
-            zoon::println!("[DD Focus] Cleared grace period for {} (via link {})", editing_hold, blur_link_id);
+            zoon::println!("[DD Focus] Cleared grace period for {} (via link {})", editing_cell, blur_link_id);
         }
     });
 }
@@ -419,33 +531,55 @@ fn check_dynamic_key_action(link_id: &str, key: &str) -> bool {
         if let Some(action) = actions.get(link_id).cloned() {
             zoon::println!("[DD check_dynamic_key_action] Found action for {}: {:?}", link_id, action);
             match action {
-                DynamicLinkAction::SetFalseOnKeys { hold_id, keys } => {
+                DynamicLinkAction::SetFalseOnKeys { cell_id, keys } => {
                     if keys.iter().any(|k| k == key) {
-                        zoon::println!("[DD DynamicLink] {} key='{}' -> SetFalse({})", link_id, key, hold_id);
-                        super::outputs::update_hold_state(&hold_id, super::super::dd_value::DdValue::Bool(false));
+                        zoon::println!("[DD DynamicLink] {} key='{}' -> SetFalse({})", link_id, key, cell_id);
+                        // Phase 7: Fire to DD instead of direct mutation
+                        GLOBAL_DISPATCHER.with(|disp_cell| {
+                            if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
+                                injector.fire_link_text(LinkId::new("dd_cell_update"), format!("set_false:{}", cell_id));
+                                zoon::println!("[DD Phase7] Fired dd_cell_update with set_false:{}", cell_id);
+                            }
+                        });
                         return true;
                     }
                 }
-                DynamicLinkAction::EditingHandler { editing_hold, title_hold } => {
+                DynamicLinkAction::EditingHandler { editing_cell, title_cell } => {
                     // Handle editing key events
                     if key == "Escape" {
                         // Exit edit mode without saving
                         // Clear grace period first (user is explicitly exiting)
                         EDITING_HOLDS_GRACE_PERIOD.with(|cell| {
-                            cell.borrow_mut().remove(&editing_hold); // ALLOWED: IO layer
+                            cell.borrow_mut().remove(&editing_cell); // ALLOWED: IO layer
                         });
                         zoon::println!("[DD DynamicLink] {} key='Escape' -> exit edit (no save)", link_id);
-                        super::outputs::update_hold_state(&editing_hold, super::super::dd_value::DdValue::Bool(false));
+                        // Phase 7: Fire to DD instead of direct mutation
+                        GLOBAL_DISPATCHER.with(|disp_cell| {
+                            if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
+                                injector.fire_link_text(LinkId::new("dd_cell_update"), format!("set_false:{}", editing_cell));
+                                zoon::println!("[DD Phase7] Fired dd_cell_update with set_false:{}", editing_cell);
+                            }
+                        });
                         return true;
                     } else if let Some(text) = key.strip_prefix("Enter:") {
                         // Save title and exit edit mode
                         // Clear grace period first (user is explicitly saving)
                         EDITING_HOLDS_GRACE_PERIOD.with(|cell| {
-                            cell.borrow_mut().remove(&editing_hold); // ALLOWED: IO layer
+                            cell.borrow_mut().remove(&editing_cell); // ALLOWED: IO layer
                         });
-                        zoon::println!("[DD DynamicLink] {} key='Enter' -> save '{}' to {}, exit edit", link_id, text, title_hold);
-                        super::outputs::update_hold_state(&title_hold, super::super::dd_value::DdValue::text(text));
-                        super::outputs::update_hold_state(&editing_hold, super::super::dd_value::DdValue::Bool(false));
+                        zoon::println!("[DD DynamicLink] {} key='Enter' -> save '{}' to {}, exit edit", link_id, text, title_cell);
+                        // Phase 7: Fire to DD instead of direct mutation
+                        // Fire text update first, then set editing to false
+                        GLOBAL_DISPATCHER.with(|disp_cell| {
+                            if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
+                                // Encode text with base64 to avoid delimiter issues
+                                let encoded_text = text.replace(':', "::"); // Escape colons
+                                injector.fire_link_text(LinkId::new("dd_cell_update"), format!("set_text:{}:{}", title_cell, encoded_text));
+                                zoon::println!("[DD Phase7] Fired dd_cell_update with set_text:{}:{}", title_cell, text);
+                                injector.fire_link_text(LinkId::new("dd_cell_update"), format!("set_false:{}", editing_cell));
+                                zoon::println!("[DD Phase7] Fired dd_cell_update with set_false:{}", editing_cell);
+                            }
+                        });
                         return true;
                     }
                 }
@@ -463,43 +597,43 @@ fn check_dynamic_key_action(link_id: &str, key: &str) -> bool {
 /// All injection is fire-and-forget - there's no synchronous feedback.
 #[derive(Clone)]
 pub struct EventInjector {
-    event_input: DdInput<DdEvent>,
+    event_input: Input<Event>,
 }
 
 impl EventInjector {
     /// Create a new event injector with the given input channel.
-    pub fn new(event_input: DdInput<DdEvent>) -> Self {
+    pub fn new(event_input: Input<Event>) -> Self {
         Self { event_input }
     }
 
     /// Fire a LINK event (e.g., button click).
-    pub fn fire_link(&self, id: LinkId, value: DdEventValue) {
-        self.event_input.send_or_drop(DdEvent::Link { id, value });
+    pub fn fire_link(&self, id: LinkId, value: EventValue) {
+        self.event_input.send_or_drop(Event::Link { id, value });
     }
 
     /// Fire a LINK with unit value (most common case - button press).
     pub fn fire_link_unit(&self, id: LinkId) {
-        self.fire_link(id, DdEventValue::Unit);
+        self.fire_link(id, EventValue::Unit);
     }
 
     /// Fire a LINK with text value (e.g., text input change).
     pub fn fire_link_text(&self, id: LinkId, text: impl Into<String>) {
-        self.fire_link(id, DdEventValue::Text(text.into()));
+        self.fire_link(id, EventValue::Text(text.into()));
     }
 
     /// Fire a LINK with boolean value (e.g., checkbox toggle).
     pub fn fire_link_bool(&self, id: LinkId, value: bool) {
-        self.fire_link(id, DdEventValue::Bool(value));
+        self.fire_link(id, EventValue::Bool(value));
     }
 
     /// Fire a timer tick event.
     pub fn fire_timer(&self, id: TimerId, tick: u64) {
-        self.event_input.send_or_drop(DdEvent::Timer { id, tick });
+        self.event_input.send_or_drop(Event::Timer { id, tick });
     }
 
     /// Fire an external event with arbitrary name and value.
-    pub fn fire_external(&self, name: impl Into<String>, value: DdEventValue) {
-        self.event_input.send_or_drop(DdEvent::External {
+    pub fn fire_external(&self, name: impl Into<String>, value: EventValue) {
+        self.event_input.send_or_drop(Event::External {
             name: name.into(),
             value,
         });

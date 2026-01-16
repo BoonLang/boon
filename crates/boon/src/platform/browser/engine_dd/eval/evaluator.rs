@@ -8,19 +8,19 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use super::dd_value::{DdValue, ComputedType};
-use super::io::{init_hold_state, add_router_mapping};
-use super::core::{DataflowConfig, HoldConfig, HoldId, LinkId, EventFilter, StateTransform};
+use super::super::core::value::Value;
+use super::super::io::{add_router_mapping, init_cell};
+use super::super::core::{DataflowConfig, CellConfig, CellId, LinkId, EventFilter, StateTransform, BoolTag, ElementTag};
 
 // Global counter for generating unique HOLD IDs across all runtime instances
-static GLOBAL_HOLD_COUNTER: AtomicU32 = AtomicU32::new(0);
+static GLOBAL_CELL_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 // Global counter for generating unique LINK IDs across all runtime instances
 static GLOBAL_LINK_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Reset the global counters (call at start of each evaluation)
-pub fn reset_hold_counter() {
-    GLOBAL_HOLD_COUNTER.store(0, Ordering::SeqCst);
+pub fn reset_cell_counter() {
+    GLOBAL_CELL_COUNTER.store(0, Ordering::SeqCst);
     GLOBAL_LINK_COUNTER.store(0, Ordering::SeqCst);
 }
 use crate::parser::static_expression::{
@@ -37,15 +37,15 @@ struct FunctionDef {
 /// The DD-based Boon runtime.
 pub struct BoonDdRuntime {
     /// Variable values
-    variables: HashMap<String, DdValue>,
+    variables: HashMap<String, Value>,
     /// Function definitions
     functions: HashMap<String, FunctionDef>,
     /// PASSED context for function calls
-    passed_context: Option<DdValue>,
+    passed_context: Option<Value>,
     /// Counter for generating unique LINK IDs
     link_counter: u32,
     /// Counter for generating unique HOLD IDs
-    hold_counter: u32,
+    cell_counter: u32,
     /// Current context path for LINK naming (e.g., "increment_button.event.press")
     context_path: Vec<String>,
     /// Last accessed variable name that contained a List (for source_hold tracking)
@@ -62,7 +62,7 @@ impl BoonDdRuntime {
             functions: HashMap::new(),
             passed_context: None,
             link_counter: 0,
-            hold_counter: 0,
+            cell_counter: 0,
             context_path: Vec::new(),
             last_list_source: None,
             dataflow_config: DataflowConfig::new(),
@@ -80,12 +80,12 @@ impl BoonDdRuntime {
         &self.dataflow_config
     }
 
-    /// Add a HoldConfig entry during evaluation.
+    /// Add a CellConfig entry during evaluation.
     /// This is called from eval_hold when a HOLD is encountered.
-    fn add_hold_config(&mut self, config: HoldConfig) {
-        zoon::println!("[DD_EVAL] Adding HoldConfig: id={}, transform={:?}, triggers={:?}",
+    fn add_cell_config(&mut self, config: CellConfig) {
+        zoon::println!("[DD_EVAL] Adding CellConfig: id={}, transform={:?}, triggers={:?}",
             config.id.name(), config.transform, config.triggered_by.iter().map(|l| l.name()).collect::<Vec<_>>());
-        self.dataflow_config.holds.push(config);
+        self.dataflow_config.cells.push(config);
     }
 
     /// Determine the StateTransform from HOLD body pattern.
@@ -95,7 +95,7 @@ impl BoonDdRuntime {
     /// - `state + 1` → Increment
     /// - `True` or `False` tag → SetTrue/SetFalse
     /// - Default → Identity (no transform, just propagate event)
-    fn determine_transform(&self, body: &Expression, state_name: &str, initial: &DdValue) -> StateTransform {
+    fn determine_transform(&self, body: &Expression, state_name: &str, initial: &Value) -> StateTransform {
         // Look for patterns in THEN body
         match body {
             Expression::Pipe { from, to } => {
@@ -128,7 +128,7 @@ impl BoonDdRuntime {
     }
 
     /// Helper to determine transform from a single LATEST input.
-    fn determine_transform_from_input(&self, input: &Expression, state_name: &str, initial: &DdValue) -> Option<StateTransform> {
+    fn determine_transform_from_input(&self, input: &Expression, state_name: &str, initial: &Value) -> Option<StateTransform> {
         match input {
             Expression::Pipe { from: _, to } => {
                 if let Expression::Then { body: then_body } = &to.node {
@@ -144,7 +144,7 @@ impl BoonDdRuntime {
     }
 
     /// Determine transform from the body of a THEN expression.
-    fn determine_transform_from_then_body(&self, body: &Expression, state_name: &str, initial: &DdValue) -> StateTransform {
+    fn determine_transform_from_then_body(&self, body: &Expression, state_name: &str, initial: &Value) -> StateTransform {
         match body {
             // Pattern: state |> Bool/not() → BoolToggle
             Expression::Pipe { from, to } => {
@@ -172,15 +172,14 @@ impl BoonDdRuntime {
             }
             // Pattern: True or False tag → SetTrue/SetFalse
             Expression::Literal(Literal::Tag(name)) => {
-                if name.as_ref() == "True" {
-                    return StateTransform::SetTrue;
-                } else if name.as_ref() == "False" {
-                    return StateTransform::SetFalse;
+                match BoolTag::from_tag(name.as_ref()) {
+                    Some(BoolTag::True) => StateTransform::SetTrue,
+                    Some(BoolTag::False) => StateTransform::SetFalse,
+                    None => StateTransform::Identity,
                 }
-                StateTransform::Identity
             }
             // Check if initial is boolean - might be an implicit toggle
-            _ if matches!(initial, DdValue::Bool(_)) => {
+            _ if matches!(initial, Value::Bool(_)) => {
                 StateTransform::BoolToggle
             }
             _ => StateTransform::Identity,
@@ -188,8 +187,8 @@ impl BoonDdRuntime {
     }
 
     /// Generate a unique HOLD ID using global counter.
-    fn generate_hold_id(&mut self) -> String {
-        let id = GLOBAL_HOLD_COUNTER.fetch_add(1, Ordering::SeqCst);
+    fn generate_cell_id(&mut self) -> String {
+        let id = GLOBAL_CELL_COUNTER.fetch_add(1, Ordering::SeqCst);
         format!("hold_{}", id)
     }
 
@@ -214,12 +213,12 @@ impl BoonDdRuntime {
     }
 
     /// Get the current value of a variable.
-    pub fn get_variable(&self, name: &str) -> Option<&DdValue> {
+    pub fn get_variable(&self, name: &str) -> Option<&Value> {
         self.variables.get(name)
     }
 
     /// Get all variables.
-    pub fn get_all_variables(&self) -> &HashMap<String, DdValue> {
+    pub fn get_all_variables(&self) -> &HashMap<String, Value> {
         &self.variables
     }
 
@@ -236,19 +235,19 @@ impl BoonDdRuntime {
     }
 
     /// Get the document output (the root rendering output).
-    pub fn get_document(&self) -> Option<&DdValue> {
+    pub fn get_document(&self) -> Option<&Value> {
         self.get_variable("document")
     }
 
     /// Inject a variable value before evaluation.
     /// This allows external state (from ReactiveContext) to override
     /// AST-defined variables.
-    pub fn inject_variable(&mut self, name: impl Into<String>, value: DdValue) {
+    pub fn inject_variable(&mut self, name: impl Into<String>, value: Value) {
         self.variables.insert(name.into(), value);
     }
 
     /// Inject multiple variables at once.
-    pub fn inject_variables(&mut self, vars: impl IntoIterator<Item = (String, DdValue)>) {
+    pub fn inject_variables(&mut self, vars: impl IntoIterator<Item = (String, Value)>) {
         for (name, value) in vars {
             self.variables.insert(name, value);
         }
@@ -256,7 +255,7 @@ impl BoonDdRuntime {
 
     /// Call a function with arguments and return the result.
     /// Used for evaluating item templates like `new_list_item("placeholder")`.
-    pub fn call_function(&mut self, name: &str, args: &[(&str, DdValue)]) -> Option<DdValue> {
+    pub fn call_function(&mut self, name: &str, args: &[(&str, Value)]) -> Option<Value> {
         let func_def = self.functions.get(name)?.clone();
 
         // Create a new runtime with the function arguments as variables
@@ -265,7 +264,7 @@ impl BoonDdRuntime {
             functions: self.functions.clone(),
             passed_context: self.passed_context.clone(),
             link_counter: 0,
-            hold_counter: 0,
+            cell_counter: 0,
             context_path: Vec::new(),
             last_list_source: None,
             dataflow_config: DataflowConfig::new(),
@@ -334,7 +333,7 @@ impl BoonDdRuntime {
     }
 
     /// Evaluate a single expression.
-    fn eval_expression(&mut self, expr: &Expression) -> DdValue {
+    fn eval_expression(&mut self, expr: &Expression) -> Value {
         match expr {
             // Literals
             Expression::Literal(lit) => self.eval_literal(lit),
@@ -347,11 +346,11 @@ impl BoonDdRuntime {
 
             // List literal: LIST { a, b, c }
             Expression::List { items } => {
-                let values: Vec<DdValue> = items
+                let values: Vec<Value> = items
                     .iter()
                     .map(|spanned| self.eval_expression(&spanned.node))
                     .collect();
-                DdValue::list(values)
+                Value::list(values)
             }
 
             // Text literal: TEXT { ... }
@@ -372,17 +371,17 @@ impl BoonDdRuntime {
                 if self.is_timer_sum_pattern(&from.node, &to.node) {
                     // Extract timer info from the pattern
                     if let Some((_timer_id, interval_ms)) = self.extract_timer_info(&from.node) {
-                        let hold_id = "timer_counter";
-                        // NOTE: Do NOT call init_hold_state here!
+                        let cell_id = "timer_counter";
+                        // NOTE: Do NOT call init_cell here!
                         // The test expects empty output until the first timer fires.
                         // The interpreter will handle initialization via DataflowConfig.
 
-                        zoon::println!("[DD_EVAL] Timer+sum pattern detected: {} @ {}ms", hold_id, interval_ms);
+                        zoon::println!("[DD_EVAL] Timer+sum pattern detected: {} @ {}ms", cell_id, interval_ms);
 
-                        // Task 6.3: Build HoldConfig during evaluation (eliminates interpreter fallback)
-                        self.add_hold_config(HoldConfig {
-                            id: HoldId::new(hold_id),
-                            initial: DdValue::int(0), // Timer counters start at 0
+                        // Task 6.3: Build CellConfig during evaluation (eliminates interpreter fallback)
+                        self.add_cell_config(CellConfig {
+                            id: CellId::new(cell_id),
+                            initial: Value::int(0), // Timer counters start at 0
                             triggered_by: Vec::new(), // Timer-triggered, no external triggers
                             timer_interval_ms: interval_ms,
                             filter: EventFilter::Any,
@@ -391,8 +390,8 @@ impl BoonDdRuntime {
                         });
 
                         // Return TimerRef so interpreter can set up the timer
-                        return DdValue::TimerRef {
-                            id: Arc::from(hold_id),
+                        return Value::TimerRef {
+                            id: Arc::from(cell_id),
                             interval_ms
                         };
                     }
@@ -412,7 +411,7 @@ impl BoonDdRuntime {
                     functions: self.functions.clone(),
                     passed_context: self.passed_context.clone(),
                     link_counter: 0,
-                    hold_counter: 0,
+                    cell_counter: 0,
                     context_path: Vec::new(),
                     last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
@@ -437,36 +436,36 @@ impl BoonDdRuntime {
             }
 
             // HOLD - for static eval, return unit (needs pipe context)
-            Expression::Hold { .. } => DdValue::Unit,
+            Expression::Hold { .. } => Value::Unit,
 
             // THEN - for static eval, return unit (needs event)
-            Expression::Then { .. } => DdValue::Unit,
+            Expression::Then { .. } => Value::Unit,
 
             // WHEN/WHILE - try to match patterns for static values
             Expression::When { arms } | Expression::While { arms } => {
                 // For static eval, need piped value - return Unit (handled in eval_pipe)
-                DdValue::Unit
+                Value::Unit
             }
 
             // LINK - create a LinkRef with a unique ID for reactive wiring
             Expression::Link => {
                 let link_id = self.generate_link_id();
-                DdValue::link_ref(link_id)
+                Value::link_ref(link_id)
             }
 
             // Skip
-            Expression::Skip => DdValue::Unit,
+            Expression::Skip => Value::Unit,
 
             // Tagged object
             Expression::TaggedObject { tag, object } => {
                 let fields = self.eval_object(object);
-                if let DdValue::Object(map) = fields {
-                    DdValue::Tagged {
+                if let Value::Object(map) = fields {
+                    Value::Tagged {
                         tag: Arc::from(tag.as_str()),
                         fields: map,
                     }
                 } else {
-                    DdValue::Unit
+                    Value::Unit
                 }
             }
 
@@ -476,20 +475,20 @@ impl BoonDdRuntime {
             // Field access: .field.path
             Expression::FieldAccess { path } => {
                 // This should only appear in pipe context
-                DdValue::Unit
+                Value::Unit
             }
 
             // Fallback for unhandled expressions
-            _ => DdValue::Unit,
+            _ => Value::Unit,
         }
     }
 
     /// Evaluate a literal.
-    fn eval_literal(&mut self, lit: &Literal) -> DdValue {
+    fn eval_literal(&mut self, lit: &Literal) -> Value {
         match lit {
-            Literal::Number(n) => DdValue::float(*n),
-            Literal::Text(s) => DdValue::text(s.as_str()),
-            Literal::Tag(s) => DdValue::Tagged {
+            Literal::Number(n) => Value::float(*n),
+            Literal::Text(s) => Value::text(s.as_str()),
+            Literal::Tag(s) => Value::Tagged {
                 tag: Arc::from(s.as_str()),
                 fields: Arc::new(BTreeMap::new()),
             },
@@ -501,14 +500,14 @@ impl BoonDdRuntime {
     /// Uses a scoped runtime so variables defined earlier in the object
     /// can be referenced by variables defined later (forward references
     /// within the same object).
-    fn eval_object(&mut self, obj: &Object) -> DdValue {
+    fn eval_object(&mut self, obj: &Object) -> Value {
         // Create a scoped runtime with access to current variables
         let mut scoped_runtime = BoonDdRuntime {
             variables: self.variables.clone(),
             functions: self.functions.clone(),
             passed_context: self.passed_context.clone(),
             link_counter: 0,
-            hold_counter: 0,
+            cell_counter: 0,
             context_path: Vec::new(),
                 last_list_source: None,
             dataflow_config: DataflowConfig::new(),
@@ -520,9 +519,9 @@ impl BoonDdRuntime {
             let name = Arc::from(name_str);
 
             // Check if this field contains reactive list operations (List/append, List/clear)
-            // If so, evaluate the initial list, store in HOLD, and return HoldRef
+            // If so, evaluate the initial list, store in HOLD, and return CellRef
             let value = if self.contains_reactive_list_ops(&var.node.value.node) {
-                zoon::println!("[DD_EVAL] Field '{}' has reactive list ops - creating HoldRef", name_str);
+                zoon::println!("[DD_EVAL] Field '{}' has reactive list ops - creating CellRef", name_str);
 
                 // Extract and evaluate the initial list expression (before List/append, List/clear, List/remove)
                 if let Some(initial_expr) = self.extract_initial_list_expr(&var.node.value.node) {
@@ -530,13 +529,13 @@ impl BoonDdRuntime {
                     zoon::println!("[DD_EVAL] Field '{}' initial list value: {:?}", name_str, initial_value);
 
                     // Store the initial value in the HOLD
-                    super::io::update_hold_state_no_persist(name_str, initial_value);
+                    init_cell(name_str, initial_value);
                 }
 
                 // Parse List/remove event paths from the pipe chain (since eval_pipe is bypassed)
                 scoped_runtime.parse_list_remove_bindings(&var.node.value.node);
 
-                DdValue::HoldRef(Arc::from(name_str))
+                Value::CellRef(CellId::new(name_str))
             } else {
                 scoped_runtime.eval_expression(&var.node.value.node)
             };
@@ -546,7 +545,7 @@ impl BoonDdRuntime {
             map.insert(name, value.clone());
             scoped_runtime.variables.insert(name_str.to_string(), value);
         }
-        DdValue::Object(Arc::new(map))
+        Value::Object(Arc::new(map))
     }
 
     /// Check if an expression contains reactive list operations (List/append, List/clear).
@@ -624,12 +623,12 @@ impl BoonDdRuntime {
                             // Try to extract per-item removal path (item.X.Y.event.press → ["X", "Y"])
                             if let Some(path) = self.extract_linkref_path_from_event(binding, &event_expr.node) {
                                 zoon::println!("[DD_EVAL] List/remove (reactive field) parsed on: binding={}, path={:?}", binding, path);
-                                super::io::set_remove_event_path(path);
+                                super::super::io::set_remove_event_path(path);
                             } else {
                                 // Try to extract bulk removal path (elements.X.event.press → global event)
                                 if let Some(global_path) = self.extract_global_event_path(&event_expr.node) {
                                     zoon::println!("[DD_EVAL] List/remove (reactive field) parsed BULK on: path={:?}", global_path);
-                                    super::io::set_bulk_remove_event_path(global_path);
+                                    super::super::io::set_bulk_remove_event_path(global_path);
                                 }
                             }
                         }
@@ -655,10 +654,10 @@ impl BoonDdRuntime {
                     if let (Some(binding), Some(event_expr)) = (binding_name, on_expr) {
                         if let Some(path) = self.extract_linkref_path_from_event(binding, &event_expr.node) {
                             zoon::println!("[DD_EVAL] List/remove (direct) parsed on: binding={}, path={:?}", binding, path);
-                            super::io::set_remove_event_path(path);
+                            super::super::io::set_remove_event_path(path);
                         } else if let Some(global_path) = self.extract_global_event_path(&event_expr.node) {
                             zoon::println!("[DD_EVAL] List/remove (direct) parsed BULK on: path={:?}", global_path);
-                            super::io::set_bulk_remove_event_path(global_path);
+                            super::super::io::set_bulk_remove_event_path(global_path);
                         }
                     }
                 }
@@ -668,27 +667,27 @@ impl BoonDdRuntime {
     }
 
     /// Evaluate a text literal with interpolation.
-    /// If any interpolated value is reactive (ComputedRef, WhileRef, HoldRef),
+    /// If any interpolated value is reactive (ComputedRef, WhileRef, CellRef),
     /// create a ReactiveText that the bridge evaluates at render time.
-    fn eval_text_literal(&mut self, parts: &[TextPart]) -> DdValue {
+    fn eval_text_literal(&mut self, parts: &[TextPart]) -> Value {
         // First pass: collect values and check for reactive parts
-        let mut collected_parts: Vec<DdValue> = Vec::new();
+        let mut collected_parts: Vec<Value> = Vec::new();
         let mut has_reactive = false;
 
         for part in parts {
             match part {
                 TextPart::Text(s) => {
-                    collected_parts.push(DdValue::text(s.as_str()));
+                    collected_parts.push(Value::text(s.as_str()));
                 }
                 TextPart::Interpolation { var, .. } => {
                     if let Some(value) = self.variables.get(var.as_str()) {
                         // Check if the value is reactive or a placeholder
                         let is_reactive = matches!(
                             value,
-                            DdValue::ComputedRef { .. } |
-                            DdValue::WhileRef { .. } |
-                            DdValue::HoldRef(_) |
-                            DdValue::Placeholder
+                            Value::ComputedRef { .. } |
+                            Value::WhileRef { .. } |
+                            Value::CellRef(_) |
+                            Value::Placeholder
                         );
                         if is_reactive {
                             has_reactive = true;
@@ -704,11 +703,11 @@ impl BoonDdRuntime {
             let result: String = collected_parts.iter()
                 .map(|v| v.to_display_string())
                 .collect();
-            return DdValue::text(result);
+            return Value::text(result);
         }
 
         // Has reactive parts - create ReactiveText for bridge to evaluate at render time
-        DdValue::ReactiveText {
+        Value::ReactiveText {
             parts: Arc::new(collected_parts),
         }
     }
@@ -718,7 +717,7 @@ impl BoonDdRuntime {
         &mut self,
         path: &[crate::parser::StrSlice],
         arguments: &[Spanned<crate::parser::static_expression::Argument>],
-    ) -> DdValue {
+    ) -> Value {
         // Convert path to namespace/name first (needed to detect Element functions)
         let full_path: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
         let (namespace, name) = if full_path.len() >= 2 {
@@ -726,7 +725,7 @@ impl BoonDdRuntime {
         } else if full_path.len() == 1 {
             (None, full_path[0])
         } else {
-            return DdValue::Unit;
+            return Value::Unit;
         };
 
         // For Element functions, use scoped evaluation where `element` argument
@@ -737,7 +736,7 @@ impl BoonDdRuntime {
         }
 
         // Build argument map (standard evaluation for non-Element functions)
-        let args: HashMap<&str, DdValue> = arguments
+        let args: HashMap<&str, Value> = arguments
             .iter()
             .filter_map(|arg| {
                 let name = arg.node.name.as_str();
@@ -749,17 +748,17 @@ impl BoonDdRuntime {
         match (namespace, name) {
             // Document/new(root: value)
             (Some("Document"), "new") => {
-                args.get("root").cloned().unwrap_or(DdValue::Unit)
+                args.get("root").cloned().unwrap_or(Value::Unit)
             }
 
             // Math/sum() - returns 0 for static
-            (Some("Math"), "sum") => DdValue::int(0),
+            (Some("Math"), "sum") => Value::int(0),
 
             // Timer/interval - returns unit in static context
-            (Some("Timer"), "interval") => DdValue::Unit,
+            (Some("Timer"), "interval") => Value::Unit,
 
             // Stream/pulses - returns unit in static context
-            (Some("Stream"), "pulses") => DdValue::Unit,
+            (Some("Stream"), "pulses") => Value::Unit,
 
             // Element functions (handled above with scoped args)
             (Some("Element"), _) => unreachable!(),
@@ -779,7 +778,7 @@ impl BoonDdRuntime {
             }
 
             // Unknown
-            _ => DdValue::Unit,
+            _ => Value::Unit,
         }
     }
 
@@ -790,19 +789,19 @@ impl BoonDdRuntime {
         &mut self,
         func_name: &str,
         arguments: &[Spanned<crate::parser::static_expression::Argument>],
-    ) -> DdValue {
+    ) -> Value {
         // Find and evaluate `element` argument first (if present)
         let element_arg = arguments.iter().find(|arg| arg.node.name.as_str() == "element");
         let element_value = element_arg
             .and_then(|arg| arg.node.value.as_ref())
             .map(|v| self.eval_expression(&v.node))
-            .unwrap_or(DdValue::Unit);
+            .unwrap_or(Value::Unit);
 
         // Bind `element` as a variable in scope for evaluating remaining arguments
         let old_element = self.variables.insert("element".to_string(), element_value.clone());
 
         // Build argument map with scoped evaluation
-        let args: HashMap<&str, DdValue> = arguments
+        let args: HashMap<&str, Value> = arguments
             .iter()
             .filter_map(|arg| {
                 let name = arg.node.name.as_str();
@@ -827,7 +826,7 @@ impl BoonDdRuntime {
     }
 
     /// Evaluate a user-defined function call.
-    fn eval_user_function(&mut self, name: &str, args: &HashMap<&str, DdValue>) -> DdValue {
+    fn eval_user_function(&mut self, name: &str, args: &HashMap<&str, Value>) -> Value {
         if let Some(func_def) = self.functions.get(name) {
             #[cfg(debug_assertions)]
             if name == "filter_button" {
@@ -843,7 +842,7 @@ impl BoonDdRuntime {
                 functions: self.functions.clone(),
                 passed_context,
                 link_counter: 0,
-                hold_counter: 0,
+                cell_counter: 0,
                 context_path: Vec::new(),
                 last_list_source: None,
             dataflow_config: DataflowConfig::new(),
@@ -875,7 +874,7 @@ impl BoonDdRuntime {
             // Evaluate the function body
             func_runtime.eval_expression(&func_def.body.node)
         } else {
-            DdValue::Unit
+            Value::Unit
         }
     }
 
@@ -884,9 +883,9 @@ impl BoonDdRuntime {
     fn eval_user_function_with_piped(
         &self,
         name: &str,
-        piped: &DdValue,
-        args: &HashMap<&str, DdValue>,
-    ) -> DdValue {
+        piped: &Value,
+        args: &HashMap<&str, Value>,
+    ) -> Value {
         if let Some(func_def) = self.functions.get(name) {
             // Check for PASS: argument to set passed_context
             let passed_context = args.get("PASS").cloned().or_else(|| self.passed_context.clone());
@@ -897,7 +896,7 @@ impl BoonDdRuntime {
                 functions: self.functions.clone(),
                 passed_context,
                 link_counter: 0,
-                hold_counter: 0,
+                cell_counter: 0,
                 context_path: Vec::new(),
                 last_list_source: None,
             dataflow_config: DataflowConfig::new(),
@@ -918,14 +917,14 @@ impl BoonDdRuntime {
             // Evaluate the function body
             func_runtime.eval_expression(&func_def.body.node)
         } else {
-            DdValue::Unit
+            Value::Unit
         }
     }
 
     /// Evaluate an Element function.
-    fn eval_element_function(&mut self, name: &str, args: &HashMap<&str, DdValue>) -> DdValue {
+    fn eval_element_function(&mut self, name: &str, args: &HashMap<&str, Value>) -> Value {
         zoon::println!("[DD_EVAL] Element/{}() called with args: {:?}", name, args.keys().collect::<Vec<_>>());
-        let mut fields: Vec<(&str, DdValue)> = vec![("_element_type", DdValue::text(name))];
+        let mut fields: Vec<(&str, Value)> = vec![("_element_type", Value::text(name))];
         for (k, v) in args {
             fields.push((k, v.clone()));
         }
@@ -933,95 +932,95 @@ impl BoonDdRuntime {
         // NOTE: text_input key_down detection moved to LinkSetter (see eval_pipe)
         // LinkSetter detects with the FINAL link ID after replacement, not the temporary one
 
-        let result = DdValue::tagged("Element", fields.into_iter());
+        let result = Value::tagged("Element", fields.into_iter());
         zoon::println!("[DD_EVAL] Element/{}() -> Tagged(Element)", name);
         result
     }
 
     /// Evaluate a List function.
-    fn eval_list_function(&mut self, name: &str, args: &HashMap<&str, DdValue>) -> DdValue {
+    fn eval_list_function(&mut self, name: &str, args: &HashMap<&str, Value>) -> Value {
         match name {
             "count" => {
-                if let Some(DdValue::List(items)) = args.values().next() {
-                    DdValue::int(items.len() as i64)
+                if let Some(Value::List(items)) = args.values().next() {
+                    Value::int(items.len() as i64)
                 } else {
-                    DdValue::int(0)
+                    Value::int(0)
                 }
             }
             "is_empty" => {
-                if let Some(DdValue::List(items)) = args.values().next() {
-                    DdValue::Bool(items.is_empty())
+                if let Some(Value::List(items)) = args.values().next() {
+                    Value::Bool(items.is_empty())
                 } else {
-                    DdValue::Bool(true)
+                    Value::Bool(true)
                 }
             }
-            _ => DdValue::Unit,
+            _ => Value::Unit,
         }
     }
 
     /// Evaluate a Router function.
-    fn eval_router_function(&mut self, name: &str, _args: &HashMap<&str, DdValue>) -> DdValue {
+    fn eval_router_function(&mut self, name: &str, _args: &HashMap<&str, Value>) -> Value {
         match name {
-            // Router/route() - returns a HoldRef to the current route
-            // The actual route value is stored in HOLD_STATES["current_route"]
+            // Router/route() - returns a CellRef to the current route
+            // The actual route value is stored in CELL_STATES["current_route"]
             // and updated by navigation events via set_filter_from_route()
             "route" => {
                 // Initialize the current_route HOLD with the browser's current path
                 #[cfg(target_arch = "wasm32")]
                 {
-                    super::io::init_current_route();
-                    let path = super::io::get_current_route();
-                    // Store in HOLD_STATES so bridge can render it reactively
-                    super::io::update_hold_state_no_persist("current_route", DdValue::text(path));
+                    super::super::io::init_current_route();
+                    let path = super::super::io::get_current_route();
+                    // Store in CELL_STATES so bridge can render it reactively
+                    init_cell("current_route", Value::text(path));
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    super::io::update_hold_state_no_persist("current_route", DdValue::text("/"));
+                    init_cell("current_route", Value::text("/"));
                 }
-                // Return HoldRef so WHEN can observe route changes reactively
-                DdValue::HoldRef(std::sync::Arc::from("current_route"))
+                // Return CellRef so WHEN can observe route changes reactively
+                Value::CellRef(CellId::new("current_route"))
             }
             // Router/go_to(route) - navigation (no-op in static context)
-            "go_to" => DdValue::Unit,
-            _ => DdValue::Unit,
+            "go_to" => Value::Unit,
+            _ => Value::Unit,
         }
     }
 
     /// Evaluate a Text function.
-    fn eval_text_function(&mut self, name: &str, args: &HashMap<&str, DdValue>) -> DdValue {
+    fn eval_text_function(&mut self, name: &str, args: &HashMap<&str, Value>) -> Value {
         match name {
             // Text/trim() - trim whitespace
             "trim" => {
-                if let Some(DdValue::Text(s)) = args.values().next() {
-                    DdValue::text(s.trim())
+                if let Some(Value::Text(s)) = args.values().next() {
+                    Value::text(s.trim())
                 } else {
-                    DdValue::text("")
+                    Value::text("")
                 }
             }
             // Text/is_not_empty() -> Bool
             "is_not_empty" => {
-                if let Some(DdValue::Text(s)) = args.values().next() {
-                    DdValue::Bool(!s.is_empty())
+                if let Some(Value::Text(s)) = args.values().next() {
+                    Value::Bool(!s.is_empty())
                 } else {
-                    DdValue::Bool(false)
+                    Value::Bool(false)
                 }
             }
             // Text/is_empty() -> Bool
             "is_empty" => {
-                if let Some(DdValue::Text(s)) = args.values().next() {
-                    DdValue::Bool(s.is_empty())
+                if let Some(Value::Text(s)) = args.values().next() {
+                    Value::Bool(s.is_empty())
                 } else {
-                    DdValue::Bool(true)
+                    Value::Bool(true)
                 }
             }
             // Text/empty() -> ""
-            "empty" => DdValue::text(""),
-            _ => DdValue::Unit,
+            "empty" => Value::text(""),
+            _ => Value::Unit,
         }
     }
 
     /// Evaluate a pipe expression.
-    fn eval_pipe(&mut self, from: &DdValue, to: &Expression) -> DdValue {
+    fn eval_pipe(&mut self, from: &Value, to: &Expression) -> Value {
         match to {
             // Pipe to function call
             Expression::FunctionCall { path, arguments } => {
@@ -1031,11 +1030,11 @@ impl BoonDdRuntime {
                 } else if full_path.len() == 1 {
                     (None, full_path[0])
                 } else {
-                    return DdValue::Unit;
+                    return Value::Unit;
                 };
 
                 // Build args
-                let args: HashMap<&str, DdValue> = arguments
+                let args: HashMap<&str, Value> = arguments
                     .iter()
                     .filter_map(|arg| {
                         let name = arg.node.name.as_str();
@@ -1050,30 +1049,30 @@ impl BoonDdRuntime {
                         if !args.contains_key("root") {
                             return from.clone();
                         }
-                        args.get("root").cloned().unwrap_or(DdValue::Unit)
+                        args.get("root").cloned().unwrap_or(Value::Unit)
                     }
                     (Some("Math"), "sum") => {
-                        // LatestRef |> Math/sum() - create a reactive HoldRef for accumulation
-                        if let DdValue::LatestRef { initial, events, event_values: _ } = from {
+                        // LatestRef |> Math/sum() - create a reactive CellRef for accumulation
+                        if let Value::LatestRef { initial, events, event_values: _ } = from {
                             // Generate unique HOLD ID for this accumulator
-                            let hold_id = self.generate_hold_id();
-                            init_hold_state(&hold_id, *initial.clone());
+                            let cell_id = self.generate_cell_id();
+                            init_cell(&cell_id, *initial.clone());
 
                             zoon::println!("[DD_EVAL] LatestRef |> Math/sum(): {} with initial {:?}, {} events",
-                                hold_id, initial, events.len());
+                                cell_id, initial, events.len());
 
-                            // Return HoldRef - bridge will render reactively
+                            // Return CellRef - bridge will render reactively
                             // The interpreter will configure DataflowConfig based on the events
-                            return DdValue::HoldRef(Arc::from(hold_id.as_str()));
+                            return Value::CellRef(CellId::new(cell_id));
                         }
                         // TimerRef |> Math/sum() - also creates a reactive accumulator
-                        if let DdValue::TimerRef { interval_ms, .. } = from {
-                            let hold_id = "timer_counter";
-                            // NOTE: Do NOT call init_hold_state here!
+                        if let Value::TimerRef { interval_ms, .. } = from {
+                            let cell_id = "timer_counter";
+                            // NOTE: Do NOT call init_cell here!
                             // The test expects empty output until the first timer fires.
-                            zoon::println!("[DD_EVAL] TimerRef |> Math/sum(): {} @ {}ms", hold_id, interval_ms);
-                            return DdValue::TimerRef {
-                                id: Arc::from(hold_id),
+                            zoon::println!("[DD_EVAL] TimerRef |> Math/sum(): {} @ {}ms", cell_id, interval_ms);
+                            return Value::TimerRef {
+                                id: Arc::from(cell_id),
                                 interval_ms: *interval_ms,
                             };
                         }
@@ -1082,37 +1081,37 @@ impl BoonDdRuntime {
                     }
                     (Some("Router"), "go_to") => {
                         // LatestRef |> Router/go_to() - set up router mappings from events
-                        if let DdValue::LatestRef { events, event_values, .. } = from {
+                        if let Value::LatestRef { events, event_values, .. } = from {
                             // Pair each event (LinkRef) with its value (route text)
                             for (event, route_value) in events.iter().zip(event_values.iter()) {
-                                if let (DdValue::LinkRef(link_id), DdValue::Text(route)) = (event, route_value) {
+                                if let (Value::LinkRef(link_id), Value::Text(route)) = (event, route_value) {
                                     add_router_mapping(link_id.as_ref(), route.as_ref());
                                 }
                             }
                             zoon::println!("[DD_EVAL] LatestRef |> Router/go_to(): configured {} route mappings", events.len());
                         }
                         // Return Unit - router actions happen on link fire
-                        DdValue::Unit
+                        Value::Unit
                     }
                     (Some("Timer"), "interval") => {
                         // Duration |> Timer/interval() - returns TimerRef
                         // Extract interval from Duration[seconds: n] or Duration[millis: n]
                         let interval_ms = match from {
-                            DdValue::Tagged { tag, fields } if tag.as_ref() == "Duration" => {
-                                if let Some(DdValue::Number(secs)) = fields.get("seconds") {
+                            Value::Tagged { tag, fields } if tag.as_ref() == "Duration" => {
+                                if let Some(Value::Number(secs)) = fields.get("seconds") {
                                     (secs.0 * 1000.0) as u64
-                                } else if let Some(DdValue::Number(ms)) = fields.get("millis") {
+                                } else if let Some(Value::Number(ms)) = fields.get("millis") {
                                     ms.0 as u64
                                 } else {
                                     1000 // Default 1 second
                                 }
                             }
-                            DdValue::Number(ms) => ms.0 as u64,
+                            Value::Number(ms) => ms.0 as u64,
                             _ => 1000, // Default 1 second
                         };
                         let timer_id = format!("timer_{}", interval_ms);
                         zoon::println!("[DD_EVAL] Timer/interval: {}ms -> {}", interval_ms, timer_id);
-                        DdValue::timer_ref(timer_id, interval_ms)
+                        Value::timer_ref(timer_id, interval_ms)
                     }
                     (Some("Stream"), "skip") => {
                         // from |> Stream/skip(count: n) - in static eval, just return from
@@ -1164,13 +1163,13 @@ impl BoonDdRuntime {
                             // Try to extract per-item removal path (item.X.Y.event.press → ["X", "Y"])
                             if let Some(path) = self.extract_linkref_path_from_event(binding, &event_expr.node) {
                                 zoon::println!("[DD_EVAL] List/remove parsed on: binding={}, path={:?}", binding, path);
-                                super::io::set_remove_event_path(path);
+                                super::super::io::set_remove_event_path(path);
                             } else {
                                 // Try to extract bulk removal path (elements.X.event.press → global event)
                                 // This handles patterns like: elements.remove_completed_button.event.press |> THEN {...}
                                 if let Some(global_path) = self.extract_global_event_path(&event_expr.node) {
                                     zoon::println!("[DD_EVAL] List/remove parsed BULK on: path={:?}", global_path);
-                                    super::io::set_bulk_remove_event_path(global_path);
+                                    super::super::io::set_bulk_remove_event_path(global_path);
                                 }
                             }
                         }
@@ -1192,15 +1191,15 @@ impl BoonDdRuntime {
                             .find(|arg| arg.node.name.as_str() == "if")
                             .and_then(|arg| arg.node.value.as_ref());
 
-                        // Handle HoldRef input - create FilteredListRef for reactive evaluation
-                        if let DdValue::HoldRef(hold_id) = from {
+                        // Handle CellRef input - create FilteredListRef for reactive evaluation
+                        if let Value::CellRef(cell_id) = from {
                             if let (Some(binding), Some(pred_expr)) = (binding_name, predicate_expr) {
                                 // Try to extract field access pattern: `item.field`
                                 if let Some((field_name, filter_value)) =
                                     self.extract_field_filter(binding, &pred_expr.node)
                                 {
-                                    return DdValue::FilteredListRef {
-                                        source_hold: hold_id.clone(),
+                                    return Value::FilteredListRef {
+                                        source_hold: cell_id.clone(),
                                         filter_field: Arc::from(field_name),
                                         filter_value: Box::new(filter_value),
                                     };
@@ -1212,62 +1211,62 @@ impl BoonDdRuntime {
                                     functions: self.functions.clone(),
                                     passed_context: self.passed_context.clone(),
                                     link_counter: 0,
-                                    hold_counter: 0,
+                                    cell_counter: 0,
                                     context_path: Vec::new(),
                                     last_list_source: None,
                                 dataflow_config: DataflowConfig::new(),
                                 };
-                                template_runtime.variables.insert(binding.to_string(), DdValue::Placeholder);
+                                template_runtime.variables.insert(binding.to_string(), Value::Placeholder);
                                 let predicate_template = template_runtime.eval_expression(&pred_expr.node);
                                 zoon::println!("[DD_EVAL] FilteredListRefWithPredicate: source_hold={}, predicate_template={:?}",
-                                    hold_id, predicate_template);
-                                return DdValue::FilteredListRefWithPredicate {
-                                    source_hold: hold_id.clone(),
+                                    cell_id, predicate_template);
+                                return Value::FilteredListRefWithPredicate {
+                                    source_hold: cell_id.clone(),
                                     predicate_template: Box::new(predicate_template),
                                 };
                             }
-                            // Fallback: return HoldRef unchanged
+                            // Fallback: return CellRef unchanged
                             return from.clone();
                         }
 
-                        // Handle concrete List input - check if filter references HoldRef fields
-                        if let (Some(binding), Some(pred_expr), DdValue::List(items)) =
+                        // Handle concrete List input - check if filter references CellRef fields
+                        if let (Some(binding), Some(pred_expr), Value::List(items)) =
                             (binding_name, predicate_expr, from)
                         {
                             // Try to extract field access pattern: `item.field`
                             if let Some((field_name, filter_value)) =
                                 self.extract_field_filter(binding, &pred_expr.node)
                             {
-                                // Check if the field contains HoldRefs in any item
-                                let hold_ids: Vec<Arc<str>> = items
+                                // Check if the field contains CellRefs in any item
+                                let cell_ids: Vec<CellId> = items
                                     .iter()
                                     .filter_map(|item| {
-                                        if let DdValue::Object(obj) = item {
-                                            if let Some(DdValue::HoldRef(hold_id)) = obj.get(field_name.as_str()) {
-                                                return Some(hold_id.clone());
+                                        if let Value::Object(obj) = item {
+                                            if let Some(Value::CellRef(cell_id)) = obj.get(field_name.as_str()) {
+                                                return Some(cell_id.clone());
                                             }
                                         }
                                         None
                                     })
                                     .collect();
 
-                                // If all items have HoldRef fields, create reactive filtered list
-                                if hold_ids.len() == items.len() && !hold_ids.is_empty() {
+                                // If all items have CellRef fields, create reactive filtered list
+                                if cell_ids.len() == items.len() && !cell_ids.is_empty() {
                                     // Get the source name tracked during alias evaluation
                                     let source_hold = self.get_list_source();
                                     zoon::println!("[DD_EVAL] ReactiveFilteredList: source_hold={}, {} items", source_hold, items.len());
-                                    return DdValue::ReactiveFilteredList {
+                                    return Value::ReactiveFilteredList {
                                         items: items.clone(),
                                         filter_field: Arc::from(field_name),
                                         filter_value: Box::new(filter_value),
-                                        hold_ids: Arc::new(hold_ids),
+                                        cell_ids: Arc::new(cell_ids),
                                         source_hold,
                                     };
                                 }
                             }
 
                             // Fallback: filter immediately (for non-reactive cases)
-                            let filtered: Vec<DdValue> = items
+                            let filtered: Vec<Value> = items
                                 .iter()
                                 .filter(|item| {
                                     // Create scoped runtime with the item bound
@@ -1276,7 +1275,7 @@ impl BoonDdRuntime {
                                         functions: self.functions.clone(),
                                         passed_context: self.passed_context.clone(),
                                         link_counter: 0,
-                                        hold_counter: 0,
+                                        cell_counter: 0,
                                         context_path: Vec::new(),
                                         last_list_source: None,
                                     dataflow_config: DataflowConfig::new(),
@@ -1289,7 +1288,7 @@ impl BoonDdRuntime {
                                 })
                                 .cloned()
                                 .collect();
-                            DdValue::list(filtered)
+                            Value::list(filtered)
                         } else {
                             from.clone()
                         }
@@ -1309,9 +1308,9 @@ impl BoonDdRuntime {
                             .and_then(|arg| arg.node.value.as_ref());
 
                         match (binding_name, transform_expr, from) {
-                            // HoldRef |> List/map(item, new: ...) -> MappedListRef
+                            // CellRef |> List/map(item, new: ...) -> MappedListRef
                             // Defers evaluation to render time
-                            (Some(binding), Some(new_expr), DdValue::HoldRef(hold_id)) => {
+                            (Some(binding), Some(new_expr), Value::CellRef(cell_id)) => {
                                 // Evaluate the transform with Placeholder as the item
                                 // This creates a template that can be substituted at render time
                                 let mut scoped = BoonDdRuntime {
@@ -1319,42 +1318,42 @@ impl BoonDdRuntime {
                                     functions: self.functions.clone(),
                                     passed_context: self.passed_context.clone(),
                                     link_counter: 0,
-                                    hold_counter: 0,
+                                    cell_counter: 0,
                                     context_path: Vec::new(),
                                     last_list_source: None,
                                 dataflow_config: DataflowConfig::new(),
                                 };
-                                scoped.variables.insert(binding.to_string(), DdValue::Placeholder);
+                                scoped.variables.insert(binding.to_string(), Value::Placeholder);
 
                                 let element_template = scoped.eval_expression(&new_expr.node);
-                                zoon::println!("[DD_EVAL] List/map on HoldRef: source={}, template={:?}", hold_id, element_template);
+                                zoon::println!("[DD_EVAL] List/map on CellRef: source={}, template={:?}", cell_id, element_template);
 
-                                DdValue::mapped_list_ref(hold_id.as_ref(), element_template)
+                                Value::mapped_list_ref(cell_id.clone(), element_template)
                             }
                             // FilteredListRef |> List/map(item, new: ...) -> FilteredMappedListRef
                             // Defers both filtering and mapping to render time
-                            (Some(binding), Some(new_expr), DdValue::FilteredListRef { source_hold, filter_field, filter_value }) => {
+                            (Some(binding), Some(new_expr), Value::FilteredListRef { source_hold, filter_field, filter_value }) => {
                                 // Evaluate the transform with Placeholder as the item
                                 let mut scoped = BoonDdRuntime {
                                     variables: self.variables.clone(),
                                     functions: self.functions.clone(),
                                     passed_context: self.passed_context.clone(),
                                     link_counter: 0,
-                                    hold_counter: 0,
+                                    cell_counter: 0,
                                     context_path: Vec::new(),
                                     last_list_source: None,
                                 dataflow_config: DataflowConfig::new(),
                                 };
-                                scoped.variables.insert(binding.to_string(), DdValue::Placeholder);
+                                scoped.variables.insert(binding.to_string(), Value::Placeholder);
 
                                 let element_template = scoped.eval_expression(&new_expr.node);
                                 zoon::println!("[DD_EVAL] List/map on FilteredListRef: source={}, filter={}, template={:?}",
                                     source_hold, filter_field, element_template);
 
                                 // Task 6.3: Set template list flag - eliminates has_filtered_mapped_list() document scanning
-                                super::io::set_has_template_list(true);
+                                super::super::io::set_has_template_list(true);
 
-                                DdValue::FilteredMappedListRef {
+                                Value::FilteredMappedListRef {
                                     source_hold: source_hold.clone(),
                                     filter_field: filter_field.clone(),
                                     filter_value: filter_value.clone(),
@@ -1363,36 +1362,36 @@ impl BoonDdRuntime {
                             }
                             // FilteredListRefWithPredicate |> List/map(item, new: ...) -> FilteredMappedListWithPredicate
                             // For complex predicates (like WHILE expressions), preserves the predicate template
-                            (Some(binding), Some(new_expr), DdValue::FilteredListRefWithPredicate { source_hold, predicate_template }) => {
+                            (Some(binding), Some(new_expr), Value::FilteredListRefWithPredicate { source_hold, predicate_template }) => {
                                 // Evaluate the transform with Placeholder as the item
                                 let mut scoped = BoonDdRuntime {
                                     variables: self.variables.clone(),
                                     functions: self.functions.clone(),
                                     passed_context: self.passed_context.clone(),
                                     link_counter: 0,
-                                    hold_counter: 0,
+                                    cell_counter: 0,
                                     context_path: Vec::new(),
                                     last_list_source: None,
                                 dataflow_config: DataflowConfig::new(),
                                 };
-                                scoped.variables.insert(binding.to_string(), DdValue::Placeholder);
+                                scoped.variables.insert(binding.to_string(), Value::Placeholder);
 
                                 let element_template = scoped.eval_expression(&new_expr.node);
                                 zoon::println!("[DD_EVAL] List/map on FilteredListRefWithPredicate: source={}, template={:?}",
                                     source_hold, element_template);
 
                                 // Task 6.3: Set template list flag - eliminates has_filtered_mapped_list() document scanning
-                                super::io::set_has_template_list(true);
+                                super::super::io::set_has_template_list(true);
 
-                                DdValue::FilteredMappedListWithPredicate {
+                                Value::FilteredMappedListWithPredicate {
                                     source_hold: source_hold.clone(),
                                     predicate_template: predicate_template.clone(),
                                     element_template: Arc::new(element_template),
                                 }
                             }
                             // List |> List/map(item, new: ...) -> concrete list
-                            (Some(binding), Some(new_expr), DdValue::List(items)) => {
-                                let mapped: Vec<DdValue> = items
+                            (Some(binding), Some(new_expr), Value::List(items)) => {
+                                let mapped: Vec<Value> = items
                                     .iter()
                                     .map(|item| {
                                         // Create scoped runtime with the item bound
@@ -1401,7 +1400,7 @@ impl BoonDdRuntime {
                                             functions: self.functions.clone(),
                                             passed_context: self.passed_context.clone(),
                                             link_counter: 0,
-                                            hold_counter: 0,
+                                            cell_counter: 0,
                                             context_path: Vec::new(),
                                             last_list_source: None,
                                         dataflow_config: DataflowConfig::new(),
@@ -1412,7 +1411,7 @@ impl BoonDdRuntime {
                                         scoped.eval_expression(&new_expr.node)
                                     })
                                     .collect();
-                                DdValue::list(mapped)
+                                Value::list(mapped)
                             }
                             _ => from.clone(),
                         }
@@ -1420,13 +1419,13 @@ impl BoonDdRuntime {
                     (Some("List"), "count") => {
                         // from |> List/count() - count items
                         match from {
-                            DdValue::List(items) => {
+                            Value::List(items) => {
                                 // Check if this list came from a HOLD variable
                                 let source_hold = self.get_list_source();
-                                if !source_hold.is_empty() {
+                                if !source_hold.name().is_empty() {
                                     // Return reactive count that reads LIVE from HOLD
                                     zoon::println!("[DD_EVAL] List/count() on List from HOLD: source_hold={}", source_hold);
-                                    DdValue::ComputedRef {
+                                    Value::ComputedRef {
                                         computation: ComputedType::ListCountHold {
                                             source_hold: source_hold.clone(),
                                         },
@@ -1434,20 +1433,20 @@ impl BoonDdRuntime {
                                     }
                                 } else {
                                     // Static count for lists not from HOLD
-                                    DdValue::int(items.len() as i64)
+                                    Value::int(items.len() as i64)
                                 }
                             }
-                            // HoldRef |> List/count() -> ComputedRef::ListCount
-                            DdValue::HoldRef(hold_id) => DdValue::computed_ref(
+                            // CellRef |> List/count() -> ComputedRef::ListCount
+                            Value::CellRef(cell_id) => Value::computed_ref(
                                 ComputedType::ListCount,
-                                hold_id.clone(),
+                                cell_id.clone(),
                             ),
                             // FilteredListRef |> List/count() -> ComputedRef::ListCountWhere
-                            DdValue::FilteredListRef {
+                            Value::FilteredListRef {
                                 source_hold,
                                 filter_field,
                                 filter_value,
-                            } => DdValue::computed_ref(
+                            } => Value::computed_ref(
                                 ComputedType::ListCountWhere {
                                     field: filter_field.clone(),
                                     value: filter_value.clone(),
@@ -1457,14 +1456,14 @@ impl BoonDdRuntime {
                             // ReactiveFilteredList |> List/count() -> ComputedRef::ListCountWhereHold
                             // Uses the new ListCountWhereHold that reads LIVE data from source_hold,
                             // enabling proper counting for both static and dynamic items.
-                            DdValue::ReactiveFilteredList {
+                            Value::ReactiveFilteredList {
                                 filter_field,
                                 filter_value,
                                 source_hold,
-                                ..  // items and hold_ids are unused (legacy fields)
+                                ..  // items and cell_ids are unused (legacy fields)
                             } => {
                                 zoon::println!("[DD_EVAL] List/count() on ReactiveFilteredList: source_hold={}", source_hold);
-                                DdValue::ComputedRef {
+                                Value::ComputedRef {
                                     computation: ComputedType::ListCountWhereHold {
                                         source_hold: source_hold.clone(),
                                         field: filter_field.clone(),
@@ -1473,19 +1472,19 @@ impl BoonDdRuntime {
                                     source_hold: source_hold.clone(),  // Watch the source HOLD for changes
                                 }
                             }
-                            _ => DdValue::int(0),
+                            _ => Value::int(0),
                         }
                     }
                     (Some("List"), "is_empty") => {
                         // from |> List/is_empty()
                         match from {
-                            DdValue::List(items) => {
+                            Value::List(items) => {
                                 // Check if this list came from a HOLD variable
                                 let source_hold = self.get_list_source();
-                                if !source_hold.is_empty() {
+                                if !source_hold.name().is_empty() {
                                     // Return reactive is_empty that reads LIVE from HOLD
                                     zoon::println!("[DD_EVAL] List/is_empty() on List from HOLD: source_hold={}", source_hold);
-                                    DdValue::ComputedRef {
+                                    Value::ComputedRef {
                                         computation: ComputedType::ListIsEmptyHold {
                                             source_hold: source_hold.clone(),
                                         },
@@ -1493,87 +1492,87 @@ impl BoonDdRuntime {
                                     }
                                 } else {
                                     // Static is_empty for lists not from HOLD
-                                    DdValue::Bool(items.is_empty())
+                                    Value::Bool(items.is_empty())
                                 }
                             }
-                            // HoldRef |> List/is_empty() -> reactive ComputedRef
-                            DdValue::HoldRef(hold_id) => {
-                                zoon::println!("[DD_EVAL] List/is_empty() on HoldRef: hold_id={}", hold_id);
-                                DdValue::ComputedRef {
+                            // CellRef |> List/is_empty() -> reactive ComputedRef
+                            Value::CellRef(cell_id) => {
+                                zoon::println!("[DD_EVAL] List/is_empty() on CellRef: cell_id={}", cell_id);
+                                Value::ComputedRef {
                                     computation: ComputedType::ListIsEmptyHold {
-                                        source_hold: hold_id.clone(),
+                                        source_hold: cell_id.clone(),
                                     },
-                                    source_hold: hold_id.clone(),
+                                    source_hold: cell_id.clone(),
                                 }
                             }
-                            _ => DdValue::Bool(true),
+                            _ => Value::Bool(true),
                         }
                     }
                     // Bool operations
                     (Some("Bool"), "or") => {
                         // from |> Bool/or(that: other_bool)
                         let from_bool = match from {
-                            DdValue::Bool(b) => *b,
-                            DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
+                            Value::Bool(b) => *b,
+                            Value::Tagged { tag, .. } => BoolTag::is_true(tag.as_ref()),
                             _ => from.is_truthy(),
                         };
                         let that_bool = args.get("that").map(|v| match v {
-                            DdValue::Bool(b) => *b,
-                            DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
+                            Value::Bool(b) => *b,
+                            Value::Tagged { tag, .. } => BoolTag::is_true(tag.as_ref()),
                             _ => v.is_truthy(),
                         }).unwrap_or(false);
-                        DdValue::Bool(from_bool || that_bool)
+                        Value::Bool(from_bool || that_bool)
                     }
                     (Some("Bool"), "and") => {
                         // from |> Bool/and(that: other_bool)
                         let from_bool = match from {
-                            DdValue::Bool(b) => *b,
-                            DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
+                            Value::Bool(b) => *b,
+                            Value::Tagged { tag, .. } => BoolTag::is_true(tag.as_ref()),
                             _ => from.is_truthy(),
                         };
                         let that_bool = args.get("that").map(|v| match v {
-                            DdValue::Bool(b) => *b,
-                            DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
+                            Value::Bool(b) => *b,
+                            Value::Tagged { tag, .. } => BoolTag::is_true(tag.as_ref()),
                             _ => v.is_truthy(),
                         }).unwrap_or(true);
-                        DdValue::Bool(from_bool && that_bool)
+                        Value::Bool(from_bool && that_bool)
                     }
                     (Some("Bool"), "not") => {
                         // from |> Bool/not()
                         // Handle PlaceholderField specially - create a negation template
-                        if let DdValue::PlaceholderField { path } = from {
-                            return DdValue::NegatedPlaceholderField { path: path.clone() };
+                        if let Value::PlaceholderField { path } = from {
+                            return Value::NegatedPlaceholderField { path: path.clone() };
                         }
                         let from_bool = match from {
-                            DdValue::Bool(b) => *b,
-                            DdValue::Tagged { tag, .. } => tag.as_ref() == "True",
+                            Value::Bool(b) => *b,
+                            Value::Tagged { tag, .. } => BoolTag::is_true(tag.as_ref()),
                             _ => from.is_truthy(),
                         };
-                        DdValue::Bool(!from_bool)
+                        Value::Bool(!from_bool)
                     }
                     // Text functions (piped)
                     (Some("Text"), "trim") => {
                         // from |> Text/trim()
-                        if let DdValue::Text(s) = from {
-                            DdValue::text(s.trim())
+                        if let Value::Text(s) = from {
+                            Value::text(s.trim())
                         } else {
                             from.clone()
                         }
                     }
                     (Some("Text"), "is_not_empty") => {
                         // from |> Text/is_not_empty()
-                        if let DdValue::Text(s) = from {
-                            DdValue::Bool(!s.is_empty())
+                        if let Value::Text(s) = from {
+                            Value::Bool(!s.is_empty())
                         } else {
-                            DdValue::Bool(false)
+                            Value::Bool(false)
                         }
                     }
                     (Some("Text"), "is_empty") => {
                         // from |> Text/is_empty()
-                        if let DdValue::Text(s) = from {
-                            DdValue::Bool(s.is_empty())
+                        if let Value::Text(s) = from {
+                            Value::Bool(s.is_empty())
                         } else {
-                            DdValue::Bool(true)
+                            Value::Bool(true)
                         }
                     }
                     // User-defined function: pass piped value as first argument
@@ -1590,7 +1589,7 @@ impl BoonDdRuntime {
             }
 
             // Pipe to THEN - return unit (needs event trigger)
-            Expression::Then { .. } => DdValue::Unit,
+            Expression::Then { .. } => Value::Unit,
 
             // Pipe to WHEN - pattern match and return body
             Expression::When { arms } => self.eval_pattern_match(from, arms),
@@ -1605,23 +1604,23 @@ impl BoonDdRuntime {
                     // Handle Placeholder specially - create PlaceholderField
                     // This preserves the field access path for later substitution
                     current = match &current {
-                        DdValue::Placeholder => {
-                            DdValue::PlaceholderField {
+                        Value::Placeholder => {
+                            Value::PlaceholderField {
                                 path: Arc::new(vec![Arc::from(field.as_ref())]),
                             }
                         }
-                        DdValue::PlaceholderField { path: existing_path } => {
+                        Value::PlaceholderField { path: existing_path } => {
                             // Extend the existing path (clone the inner Vec, not the Arc)
                             let mut new_path: Vec<Arc<str>> = existing_path.as_ref().clone();
                             new_path.push(Arc::from(field.as_ref()));
-                            DdValue::PlaceholderField {
+                            Value::PlaceholderField {
                                 path: Arc::new(new_path),
                             }
                         }
                         // Handle LinkRef.event - create synthetic event object with all event types
-                        DdValue::LinkRef(link_id) if field.as_str() == "event" => {
-                            let link_ref = DdValue::LinkRef(link_id.clone());
-                            DdValue::object([
+                        Value::LinkRef(link_id) if field.as_str() == "event" => {
+                            let link_ref = Value::LinkRef(link_id.clone());
+                            Value::object([
                                 ("press", link_ref.clone()),
                                 ("click", link_ref.clone()),
                                 ("blur", link_ref.clone()),
@@ -1630,7 +1629,7 @@ impl BoonDdRuntime {
                                 ("change", link_ref.clone()),
                             ])
                         }
-                        _ => current.get(field.as_str()).cloned().unwrap_or(DdValue::Unit),
+                        _ => current.get(field.as_str()).cloned().unwrap_or(Value::Unit),
                     };
                 }
                 current
@@ -1647,11 +1646,11 @@ impl BoonDdRuntime {
                 zoon::println!("[DD_EVAL] LinkSetter: alias={:?} -> target_link={:?}", alias.node, target_link);
 
                 // Replace any LinkRef in the element with the target
-                let result = if let DdValue::LinkRef(target_id) = &target_link {
+                let result = if let Value::LinkRef(target_id) = &target_link {
                     let result = self.replace_link_ref_in_value(from, target_id);
                     zoon::println!("[DD_EVAL] LinkSetter: replaced LinkRef with {}", target_id);
                     result
-                } else if let DdValue::PlaceholderField { path } = &target_link {
+                } else if let Value::PlaceholderField { path } = &target_link {
                     // Template evaluation: replace LinkRef with PlaceholderField
                     // During cloning, this will be resolved to the real LinkRef from the data item
                     let result = self.replace_link_ref_with_placeholder(from, path);
@@ -1665,25 +1664,25 @@ impl BoonDdRuntime {
 
                 // Task 6.3: Detect element events AFTER LinkSetter (not during Element evaluation)
                 // This ensures we capture the final link ID, not the temporary one
-                if let DdValue::Tagged { tag, fields } = &result {
-                    if tag.as_ref() == "Element" {
-                        if let Some(DdValue::Text(t)) = fields.get("_element_type") {
+                if let Value::Tagged { tag, fields } = &result {
+                    if ElementTag::is_element(tag.as_ref()) {
+                        if let Some(Value::Text(t)) = fields.get("_element_type") {
                             let element_type = t.as_ref();
                             if let Some(element) = fields.get("element") {
                                 if let Some(event) = element.get("event") {
                                     // Detect text_input key_down
                                     if element_type == "text_input" {
-                                        if let Some(DdValue::LinkRef(link_id)) = event.get("key_down") {
+                                        if let Some(Value::LinkRef(link_id)) = event.get("key_down") {
                                             zoon::println!("[DD_EVAL] LinkSetter: text_input key_down detected with FINAL link: {}", link_id);
-                                            super::io::set_text_input_key_down_link(link_id.to_string());
+                                            super::super::io::set_text_input_key_down_link(link_id.to_string());
                                         }
                                     }
                                     // Task 6.3: Detect button press for List/clear pattern
                                     // This eliminates extract_button_press_link() document scanning
                                     if element_type == "button" {
-                                        if let Some(DdValue::LinkRef(link_id)) = event.get("press") {
+                                        if let Some(Value::LinkRef(link_id)) = event.get("press") {
                                             zoon::println!("[DD_EVAL] LinkSetter: button press detected with FINAL link: {}", link_id);
-                                            super::io::set_list_clear_link(link_id.to_string());
+                                            super::super::io::set_list_clear_link(link_id.to_string());
                                         }
                                     }
                                 }
@@ -1707,7 +1706,7 @@ impl BoonDdRuntime {
     ///   [prev: 0, curr: 1] |> HOLD state {
     ///     n-1 |> Stream/pulses() |> THEN { [prev: state.curr, curr: state.prev + state.curr] }
     ///   }
-    fn eval_hold(&mut self, initial: &DdValue, state_name: &str, body: &Expression) -> DdValue {
+    fn eval_hold(&mut self, initial: &Value, state_name: &str, body: &Expression) -> Value {
         // Try to extract pulse count from body: `count |> Stream/pulses() |> ...`
         let pulse_count = self.extract_pulse_count(body);
 
@@ -1715,13 +1714,13 @@ impl BoonDdRuntime {
             // Check if body contains a timer trigger (variable that evaluates to TimerRef)
             // e.g., `tick |> THEN { state + 1 }` where tick = Duration |> Timer/interval()
             if let Some(interval_ms) = self.extract_timer_trigger_from_body(body) {
-                let hold_id = "timer_counter";
-                // NOTE: Do NOT call init_hold_state here - test expects empty until first tick
-                zoon::println!("[DD_EVAL] Timer-triggered HOLD detected: {} @ {}ms", hold_id, interval_ms);
+                let cell_id = "timer_counter";
+                // NOTE: Do NOT call init_cell here - test expects empty until first tick
+                zoon::println!("[DD_EVAL] Timer-triggered HOLD detected: {} @ {}ms", cell_id, interval_ms);
 
-                // Task 4.4: Build HoldConfig during evaluation (not in interpreter)
-                self.add_hold_config(HoldConfig {
-                    id: HoldId::new(hold_id),
+                // Task 4.4: Build CellConfig during evaluation (not in interpreter)
+                self.add_cell_config(CellConfig {
+                    id: CellId::new(cell_id),
                     initial: initial.clone(),
                     triggered_by: Vec::new(), // Timer-triggered, no external triggers
                     timer_interval_ms: interval_ms,
@@ -1731,8 +1730,8 @@ impl BoonDdRuntime {
                 });
 
                 // Return TimerRef so interpreter sets up timer-triggered HOLD
-                return DdValue::TimerRef {
-                    id: Arc::from(hold_id),
+                return Value::TimerRef {
+                    id: Arc::from(cell_id),
                     interval_ms,
                 };
             }
@@ -1741,10 +1740,10 @@ impl BoonDdRuntime {
             // e.g., `button.event.press |> THEN { state + 1 }`
             if self.contains_link_trigger(body) {
                 // Generate unique HOLD ID for this HOLD instance
-                let hold_id = self.generate_hold_id();
+                let cell_id = self.generate_cell_id();
 
-                // Store initial value in HOLD_STATES for reactive rendering
-                init_hold_state(&hold_id, initial.clone());
+                // Store initial value in CELL_STATES for reactive rendering
+                init_cell(&cell_id, initial.clone());
 
                 // For boolean HOLDs, extract editing event bindings from the body
                 // This parses expressions like:
@@ -1752,23 +1751,35 @@ impl BoonDdRuntime {
                 //   todo_elements.editing_todo_title_element.event.key_down.key |> WHEN { Enter => False }
                 //   todo_elements.editing_todo_title_element.event.blur |> THEN { False }
                 // Note: In Boon, True/False are tags (Tagged { tag: "False" }), not native bools
-                let is_boolean_hold = matches!(initial, DdValue::Bool(_)) ||
-                    matches!(initial, DdValue::Tagged { tag, .. } if tag.as_ref() == "True" || tag.as_ref() == "False");
+                let is_boolean_hold = matches!(initial, Value::Bool(_)) ||
+                    matches!(initial, Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()));
                 if is_boolean_hold {
-                    zoon::println!("[DD_EVAL] is_boolean_hold=true for {}, extracting bindings", hold_id);
+                    zoon::println!("[DD_EVAL] is_boolean_hold=true for {}, extracting bindings", cell_id);
                     // Task 4.3: Use new method that evaluates to get actual LinkRef IDs
                     let mut bindings = self.extract_editing_bindings_with_link_ids(body);
-                    bindings.hold_id = Some(hold_id.clone()); // Associate with this HOLD
+                    bindings.cell_id = Some(cell_id.clone()); // Associate with this HOLD
+
+                    // Register SetFalseOnKeys for EACH boolean HOLD (not globally)
+                    // This ensures all items get their key_down handlers registered
+                    if let Some(ref exit_key_link_id) = bindings.exit_key_link_id {
+                        use super::super::io::{add_dynamic_link_action, DynamicLinkAction};
+                        zoon::println!("[DD_EVAL] Registering SetFalseOnKeys: {} -> {}", exit_key_link_id, cell_id);
+                        add_dynamic_link_action(exit_key_link_id.clone(), DynamicLinkAction::SetFalseOnKeys {
+                            cell_id: cell_id.clone(),
+                            keys: vec!["Enter".to_string(), "Escape".to_string()],
+                        });
+                    }
+
                     if !bindings.edit_trigger_path.is_empty() || bindings.edit_trigger_link_id.is_some() {
-                        super::io::set_editing_event_bindings(bindings);
+                        super::super::io::set_editing_event_bindings(bindings);
                     }
 
                     // Also extract toggle event bindings (click |> THEN { state |> Bool/not() })
                     // Task 4.3: Use new method that evaluates to get actual LinkRef IDs
                     let toggle_bindings = self.extract_toggle_bindings_with_link_ids(body, state_name);
                     for (event_path, event_type, link_id) in toggle_bindings {
-                        super::io::add_toggle_event_binding(super::io::ToggleEventBinding {
-                            hold_id: hold_id.clone(),
+                        super::super::io::add_toggle_event_binding(super::super::io::ToggleEventBinding {
+                            cell_id: cell_id.clone(),
                             event_path,
                             event_type,
                             link_id, // Now populated with actual LinkRef ID
@@ -1782,13 +1793,13 @@ impl BoonDdRuntime {
                 if is_boolean_hold {
                     let global_toggle_bindings = self.extract_global_toggle_bindings(body);
                     if !global_toggle_bindings.is_empty() {
-                        zoon::println!("[DD_EVAL] Extracted {} global toggle bindings from boolean HOLD {}", global_toggle_bindings.len(), hold_id);
+                        zoon::println!("[DD_EVAL] Extracted {} global toggle bindings from boolean HOLD {}", global_toggle_bindings.len(), cell_id);
                         for (event_path, event_type, value_path) in global_toggle_bindings {
                             zoon::println!("[DD_EVAL] Adding global toggle binding: event_path={:?}, value_path={:?}", event_path, value_path);
-                            // For boolean HOLDs, the list_hold_id is the HOLD ID of this completed field
+                            // For boolean HOLDs, the list_cell_id is the HOLD ID of this completed field
                             // The action will toggle this specific HOLD based on store.all_completed
-                            super::io::add_global_toggle_binding(super::io::GlobalToggleEventBinding {
-                                list_hold_id: hold_id.clone(),  // This is the completed HOLD, not a list
+                            super::super::io::add_global_toggle_binding(super::super::io::GlobalToggleEventBinding {
+                                list_cell_id: cell_id.clone(),  // This is the completed HOLD, not a list
                                 event_path,
                                 event_type,
                                 value_path,
@@ -1797,9 +1808,9 @@ impl BoonDdRuntime {
                     }
                 }
 
-                zoon::println!("[DD_EVAL] LINK-triggered HOLD detected: {} with initial {:?}", hold_id, initial);
+                zoon::println!("[DD_EVAL] LINK-triggered HOLD detected: {} with initial {:?}", cell_id, initial);
 
-                // Task 4.4: Build HoldConfig during evaluation
+                // Task 4.4: Build CellConfig during evaluation
                 // Determine the transform from the body pattern
                 let transform = self.determine_transform(body, state_name, initial);
                 zoon::println!("[DD_EVAL] Determined transform: {:?}", transform);
@@ -1808,21 +1819,39 @@ impl BoonDdRuntime {
                 let triggered_by = self.extract_link_trigger_id(body)
                     .map(|id| vec![LinkId::new(&id)])
                     .unwrap_or_default();
-                zoon::println!("[DD_EVAL] HoldConfig triggered_by: {:?}", triggered_by);
+                zoon::println!("[DD_EVAL] CellConfig triggered_by: {:?}", triggered_by);
 
-                // Add HoldConfig with dynamically extracted triggers
-                self.add_hold_config(HoldConfig {
-                    id: HoldId::new(&hold_id),
+                // Add CellConfig with dynamically extracted triggers
+                let triggered_by_clone = triggered_by.clone();
+                let transform_clone = transform.clone();
+                self.add_cell_config(CellConfig {
+                    id: CellId::new(&cell_id),
                     initial: initial.clone(),
                     triggered_by,
                     timer_interval_ms: 0,
                     filter: EventFilter::Any,
                     transform,
-                    persist: !is_boolean_hold || matches!(initial, DdValue::Bool(_)), // Don't persist editing state
+                    persist: !is_boolean_hold || matches!(initial, Value::Bool(_)), // Don't persist editing state
                 });
 
-                // Return HoldRef - bridge will render reactively
-                return DdValue::HoldRef(Arc::from(hold_id.as_str()));
+                // Also register DynamicLinkAction for SetTrue/SetFalse transforms
+                // This enables replication when list items are cloned
+                use super::super::core::worker::StateTransform;
+                use super::super::io::{add_dynamic_link_action, DynamicLinkAction};
+                for link_id in &triggered_by_clone {
+                    match transform_clone {
+                        StateTransform::SetTrue => {
+                            add_dynamic_link_action(link_id.name().to_string(), DynamicLinkAction::SetTrue(cell_id.clone()));
+                        }
+                        StateTransform::SetFalse => {
+                            add_dynamic_link_action(link_id.name().to_string(), DynamicLinkAction::SetFalse(cell_id.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Return CellRef - bridge will render reactively
+                return Value::CellRef(CellId::new(cell_id));
             }
 
             // No Stream/pulses and no LINK trigger, just return initial value
@@ -1847,7 +1876,7 @@ impl BoonDdRuntime {
                 functions: self.functions.clone(),
                 passed_context: self.passed_context.clone(),
                 link_counter: 0,
-                hold_counter: 0,
+                cell_counter: 0,
                 context_path: Vec::new(),
                 last_list_source: None,
                 dataflow_config: DataflowConfig::new(), // Iteration doesn't accumulate config
@@ -1858,7 +1887,7 @@ impl BoonDdRuntime {
             let next_state = iter_runtime.eval_expression(then_body);
 
             // Skip Unit results (like SKIP in WHEN patterns)
-            if next_state != DdValue::Unit {
+            if next_state != Value::Unit {
                 current_state = next_state;
             }
         }
@@ -1873,7 +1902,7 @@ impl BoonDdRuntime {
             Expression::Pipe { from, to } => {
                 // Check if `to` is Stream/pulses: `count |> Stream/pulses()`
                 if self.is_stream_pulses(&to.node) {
-                    if let DdValue::Number(n) = self.eval_expression(&from.node) {
+                    if let Value::Number(n) = self.eval_expression(&from.node) {
                         return (n.0 as i64).max(0);
                     }
                 }
@@ -1917,10 +1946,10 @@ impl BoonDdRuntime {
     /// Get the source name for a list, tracked during evaluation.
     /// This returns the variable/field name that the list was accessed from.
     /// Used to set source_hold for ReactiveFilteredList.
-    fn get_list_source(&self) -> Arc<str> {
+    fn get_list_source(&self) -> CellId {
         match &self.last_list_source {
-            Some(name) => Arc::from(name.as_str()),
-            None => Arc::from(""),
+            Some(name) => CellId::new(name.as_str()),
+            None => CellId::new(""),
         }
     }
 
@@ -2021,20 +2050,31 @@ impl BoonDdRuntime {
         &mut self,
         binding: &str,
         predicate: &Expression,
-    ) -> Option<(String, DdValue)> {
+    ) -> Option<(String, Value)> {
+        // Boon uses Tagged booleans (Tagged { tag: "True" }) not Rust bools (Bool(true))
+        // This must match how initial values and toggle results are stored
+        let tagged_true = Value::Tagged {
+            tag: Arc::from("True"),
+            fields: Arc::new(BTreeMap::new()),
+        };
+        let tagged_false = Value::Tagged {
+            tag: Arc::from("False"),
+            fields: Arc::new(BTreeMap::new()),
+        };
+
         match predicate {
             // Pattern: `item.field` - field access is the entire predicate
             // Path is [item, field], meaning: filter where field == true
             Expression::FieldAccess { path } => {
                 if path.len() == 2 && path[0].as_ref() == binding {
-                    return Some((path[1].to_string(), DdValue::Bool(true)));
+                    return Some((path[1].to_string(), tagged_true));
                 }
                 None
             }
             // Pattern: `item.field` as Alias (parser produces this for variable.field)
             Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
                 if parts.len() == 2 && parts[0].as_ref() == binding {
-                    return Some((parts[1].to_string(), DdValue::Bool(true)));
+                    return Some((parts[1].to_string(), tagged_true));
                 }
                 None
             }
@@ -2045,13 +2085,13 @@ impl BoonDdRuntime {
                         // Check for FieldAccess
                         if let Expression::FieldAccess { path } = &from.node {
                             if path.len() == 2 && path[0].as_ref() == binding {
-                                return Some((path[1].to_string(), DdValue::Bool(false)));
+                                return Some((path[1].to_string(), tagged_false.clone()));
                             }
                         }
                         // Check for Alias
                         if let Expression::Alias(Alias::WithoutPassed { parts, .. }) = &from.node {
                             if parts.len() == 2 && parts[0].as_ref() == binding {
-                                return Some((parts[1].to_string(), DdValue::Bool(false)));
+                                return Some((parts[1].to_string(), tagged_false));
                             }
                         }
                     }
@@ -2072,8 +2112,8 @@ impl BoonDdRuntime {
     /// }
     /// ```
     /// Returns EditingEventBindings with paths extracted from the event expressions.
-    fn extract_editing_bindings(&self, body: &Expression) -> super::io::EditingEventBindings {
-        let mut bindings = super::io::EditingEventBindings::default();
+    fn extract_editing_bindings(&self, body: &Expression) -> super::super::io::EditingEventBindings {
+        let mut bindings = super::super::io::EditingEventBindings::default();
 
         // Helper to extract inputs from LATEST
         let inputs = match body {
@@ -2109,8 +2149,8 @@ impl BoonDdRuntime {
     ///
     /// This method EVALUATES the `from` expression in editing patterns to get actual LinkRef IDs.
     /// Used for Task 4.3: eliminate interpreter's extract_editing_toggles dependency.
-    fn extract_editing_bindings_with_link_ids(&mut self, body: &Expression) -> super::io::EditingEventBindings {
-        let mut bindings = super::io::EditingEventBindings::default();
+    fn extract_editing_bindings_with_link_ids(&mut self, body: &Expression) -> super::super::io::EditingEventBindings {
+        let mut bindings = super::super::io::EditingEventBindings::default();
 
         // Helper to extract inputs from LATEST
         let inputs = match body {
@@ -2147,9 +2187,25 @@ impl BoonDdRuntime {
                 };
 
                 // CRITICAL: Evaluate the `from` expression to get actual LinkRef ID
+                // Note: For key_down, the pattern is `path.event.key_down.key |> WHEN {...}`
+                // We need to evaluate `path.event.key_down` (the LinkRef), not `path.event.key_down.key`
                 let from_value = self.eval_expression(&from.node);
-                let link_id = if let DdValue::LinkRef(id) = from_value {
+                let link_id = if let Value::LinkRef(id) = &from_value {
                     Some(id.to_string())
+                } else if let Some((path, _)) = &path_info {
+                    // If direct evaluation didn't return a LinkRef (e.g., key_down.key case),
+                    // the path already points to the element containing the LINK.
+                    // The `.event.key_down` part is syntactic sugar - the LinkRef is at the path itself.
+                    // Resolve just the path to get the LinkRef.
+                    if let Some(val) = self.resolve_field_path(path) {
+                        if let Value::LinkRef(id) = val {
+                            Some(id.to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -2264,6 +2320,24 @@ impl BoonDdRuntime {
             }
             _ => None,
         }
+    }
+
+    /// Resolve a field path like ["todo_elements", "editing_todo_title_element", "event", "key_down"]
+    /// to its Value by traversing the current scope.
+    fn resolve_field_path(&self, path: &[String]) -> Option<Value> {
+        if path.is_empty() {
+            return None;
+        }
+        // Start by looking up the first part in variables
+        let first = &path[0];
+        let mut current = self.variables.get(first.as_str())?.clone();
+
+        // Traverse the remaining path
+        for part in &path[1..] {
+            current = current.get(part.as_str())?.clone();
+        }
+
+        Some(current)
     }
 
     /// Check if expression is a Bool/not() toggle pattern like `state |> Bool/not()`.
@@ -2436,7 +2510,7 @@ impl BoonDdRuntime {
 
                         // CRITICAL: Evaluate the `from` expression to get actual LinkRef ID
                         let from_value = self.eval_expression(&from.node);
-                        let link_id = if let DdValue::LinkRef(id) = from_value {
+                        let link_id = if let Value::LinkRef(id) = from_value {
                             zoon::println!("[DD_EVAL] extract_toggle_bindings_with_link_ids: evaluated to LinkRef({})", id);
                             Some(id.to_string())
                         } else {
@@ -2464,7 +2538,7 @@ impl BoonDdRuntime {
     ///
     /// Detection strategy: Look for the `X |> THEN { ... }` pattern which is
     /// the canonical event-driven reactive pattern in Boon. If the HOLD body
-    /// pipes something to THEN, it's event-driven and should return HoldRef.
+    /// pipes something to THEN, it's event-driven and should return CellRef.
     fn contains_link_trigger(&self, expr: &Expression) -> bool {
         match expr {
             Expression::Pipe { from: _, to } => {
@@ -2491,7 +2565,7 @@ impl BoonDdRuntime {
     }
 
     /// Extract the LinkRef ID from a LINK trigger expression.
-    /// Used to populate `triggered_by` in HoldConfig for non-boolean HOLDs.
+    /// Used to populate `triggered_by` in CellConfig for non-boolean HOLDs.
     /// Pattern: `link_expr |> THEN { ... }` → extracts LinkRef ID from link_expr
     ///
     /// Task 7.1: This enables dynamic trigger IDs instead of hardcoded fallbacks.
@@ -2501,7 +2575,7 @@ impl BoonDdRuntime {
                 // Pattern: X |> THEN { ... } - evaluate X to get LinkRef
                 if matches!(to.node, Expression::Then { .. }) {
                     let from_value = self.eval_expression(&from.node);
-                    if let DdValue::LinkRef(id) = from_value {
+                    if let Value::LinkRef(id) = from_value {
                         zoon::println!("[DD_EVAL] extract_link_trigger_id: found LinkRef({})", id);
                         return Some(id.to_string());
                     }
@@ -2563,16 +2637,16 @@ impl BoonDdRuntime {
                         // Evaluate the Duration
                         let duration = self.eval_expression(&from.node);
                         let interval_ms = match &duration {
-                            DdValue::Tagged { tag, fields } if tag.as_ref() == "Duration" => {
-                                if let Some(DdValue::Number(secs)) = fields.get("seconds") {
+                            Value::Tagged { tag, fields } if tag.as_ref() == "Duration" => {
+                                if let Some(Value::Number(secs)) = fields.get("seconds") {
                                     (secs.0 * 1000.0) as u64
-                                } else if let Some(DdValue::Number(ms)) = fields.get("millis") {
+                                } else if let Some(Value::Number(ms)) = fields.get("millis") {
                                     ms.0 as u64
                                 } else {
                                     1000
                                 }
                             }
-                            DdValue::Number(ms) => ms.0 as u64,
+                            Value::Number(ms) => ms.0 as u64,
                             _ => 1000,
                         };
                         let timer_id = format!("timer_{}", interval_ms);
@@ -2637,7 +2711,7 @@ impl BoonDdRuntime {
                 if matches!(to.node, Expression::Then { .. }) {
                     // Evaluate the FROM side to see if it's a TimerRef
                     let from_val = self.eval_expression(&from.node);
-                    if let DdValue::TimerRef { interval_ms, .. } = from_val {
+                    if let Value::TimerRef { interval_ms, .. } = from_val {
                         return Some(interval_ms);
                     }
                 }
@@ -2677,7 +2751,7 @@ impl BoonDdRuntime {
                         // Extract the route from the body (e.g., TEXT { /about })
                         let route = self.eval_expression(&body.node);
 
-                        if let (Some(link_id), DdValue::Text(route_text)) = (link_ref, route) {
+                        if let (Some(link_id), Value::Text(route_text)) = (link_ref, route) {
                             add_router_mapping(&link_id, route_text.as_ref());
                         }
                     }
@@ -2712,11 +2786,11 @@ impl BoonDdRuntime {
                 // Evaluate the link path to get the LinkRef
                 let mut current = self.variables.get(link_path[0])?.clone();
                 for field in link_path.iter().skip(1) {
-                    current = current.get(field).cloned().unwrap_or(DdValue::Unit);
+                    current = current.get(field).cloned().unwrap_or(Value::Unit);
                 }
 
                 // Extract the link ID from the LinkRef
-                if let DdValue::LinkRef(id) = current {
+                if let Value::LinkRef(id) = current {
                     Some(id.to_string())
                 } else {
                     None
@@ -2733,8 +2807,8 @@ impl BoonDdRuntime {
     /// - Event-driven inputs (X |> THEN { Y }) are reactive triggers
     /// - Returns LatestRef if any inputs are event-driven
     /// - Returns first non-Unit value if all inputs are static
-    fn eval_latest(&mut self, inputs: &[Spanned<Expression>]) -> DdValue {
-        let mut initial_value = DdValue::Unit;
+    fn eval_latest(&mut self, inputs: &[Spanned<Expression>]) -> Value {
+        let mut initial_value = Value::Unit;
         let mut events = Vec::new();
         let mut event_values = Vec::new();
         let mut has_events = false;
@@ -2751,7 +2825,7 @@ impl BoonDdRuntime {
             } else {
                 // Static input - evaluate and use as initial if we haven't found one yet
                 let val = self.eval_expression(&input.node);
-                if initial_value == DdValue::Unit && val != DdValue::Unit {
+                if initial_value == Value::Unit && val != Value::Unit {
                     initial_value = val;
                 }
             }
@@ -2760,7 +2834,7 @@ impl BoonDdRuntime {
         if has_events {
             // Return LatestRef for downstream operators like Math/sum() to process
             zoon::println!("[DD_EVAL] LATEST with events: initial={:?}, events={:?}", initial_value, events.len());
-            DdValue::LatestRef {
+            Value::LatestRef {
                 initial: Box::new(initial_value),
                 events: Arc::new(events),
                 event_values: Arc::new(event_values),
@@ -2773,7 +2847,7 @@ impl BoonDdRuntime {
 
     /// Extract event source (LinkRef/TimerRef) and emitted value from a THEN pattern.
     /// For `link |> THEN { value }`, returns (LinkRef, evaluated_value).
-    fn extract_event_and_value(&mut self, expr: &Expression) -> Option<(DdValue, DdValue)> {
+    fn extract_event_and_value(&mut self, expr: &Expression) -> Option<(Value, Value)> {
         match expr {
             Expression::Pipe { from, to } => {
                 if let Expression::Then { body } = &to.node {
@@ -2783,7 +2857,7 @@ impl BoonDdRuntime {
                     let value = self.eval_expression(&body.node);
 
                     match &source {
-                        DdValue::LinkRef(_) | DdValue::TimerRef { .. } => {
+                        Value::LinkRef(_) | Value::TimerRef { .. } => {
                             return Some((source, value));
                         }
                         _ => {
@@ -2805,22 +2879,22 @@ impl BoonDdRuntime {
     /// Try to extract a LinkRef from a nested object structure.
     /// For paths like `button.event.press`, the evaluated result might be
     /// an Object containing a LinkRef.
-    fn try_extract_link_ref(&self, value: &DdValue) -> Option<DdValue> {
+    fn try_extract_link_ref(&self, value: &Value) -> Option<Value> {
         match value {
-            DdValue::LinkRef(_) => Some(value.clone()),
-            DdValue::Object(fields) => {
+            Value::LinkRef(_) => Some(value.clone()),
+            Value::Object(fields) => {
                 // Check common event field names
                 for key in ["press", "click", "change", "key_down", "blur", "double_click"] {
                     if let Some(v) = fields.get(key) {
-                        if let DdValue::LinkRef(_) = v {
+                        if let Value::LinkRef(_) = v {
                             return Some(v.clone());
                         }
                     }
                 }
                 // Check nested event object
-                if let Some(DdValue::Object(event_fields)) = fields.get("event") {
+                if let Some(Value::Object(event_fields)) = fields.get("event") {
                     for (_, v) in event_fields.iter() {
-                        if let DdValue::LinkRef(_) = v {
+                        if let Value::LinkRef(_) = v {
                             return Some(v.clone());
                         }
                     }
@@ -2832,12 +2906,17 @@ impl BoonDdRuntime {
     }
 
     /// Evaluate pattern matching for WHEN/WHILE.
-    fn eval_pattern_match(&mut self, value: &DdValue, arms: &[Arm]) -> DdValue {
+    fn eval_pattern_match(&mut self, value: &Value, arms: &[Arm]) -> Value {
         // Debug: log what value type is being pattern matched
         zoon::println!("[DD_EVAL] eval_pattern_match input: {:?}", value);
 
-        // If input is a HoldRef, return a WhileRef for reactive rendering
-        if let DdValue::HoldRef(hold_id) = value {
+        // If input is a CellRef, return a WhileRef for reactive rendering
+        if let Value::CellRef(cell_id) = value {
+            // Enter WHILE pre-eval context to skip text_input key_down detection
+            // This prevents editing text_inputs inside WHILE branches from overwriting
+            // the main document's text_input link
+            super::super::io::enter_while_preeval();
+
             // Pre-evaluate all arms for the bridge to render reactively
             let mut evaluated_arms = Vec::new();
             let mut default_value = None;
@@ -2854,7 +2933,7 @@ impl BoonDdRuntime {
                         functions: self.functions.clone(),
                         passed_context: self.passed_context.clone(),
                         link_counter: 0,
-                        hold_counter: 0,
+                        cell_counter: 0,
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
@@ -2862,20 +2941,20 @@ impl BoonDdRuntime {
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     default_value = Some(Arc::new(body_result));
                 } else if let Pattern::Alias { name } = &arm.pattern {
-                    // Alias pattern - treat as catch-all but bind the HoldRef to the alias name
+                    // Alias pattern - treat as catch-all but bind the CellRef to the alias name
                     let mut match_runtime = BoonDdRuntime {
                         variables: self.variables.clone(),
                         functions: self.functions.clone(),
                         passed_context: self.passed_context.clone(),
                         link_counter: 0,
-                        hold_counter: 0,
+                        cell_counter: 0,
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
                     };
-                    // Bind the alias name to the HoldRef value
+                    // Bind the alias name to the CellRef value
                     match_runtime.variables.insert(name.to_string(), value.clone());
-                    zoon::println!("[DD_EVAL] HoldRef WHEN: binding '{}' to HoldRef for body evaluation", name);
+                    zoon::println!("[DD_EVAL] CellRef WHEN: binding '{}' to CellRef for body evaluation", name);
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     default_value = Some(Arc::new(body_result));
                 } else if let Some(pv) = pattern_value {
@@ -2885,7 +2964,7 @@ impl BoonDdRuntime {
                         functions: self.functions.clone(),
                         passed_context: self.passed_context.clone(),
                         link_counter: 0,
-                        hold_counter: 0,
+                        cell_counter: 0,
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
@@ -2895,11 +2974,14 @@ impl BoonDdRuntime {
                 }
             }
 
-            zoon::println!("[DD_EVAL] Created WhileRef for hold {} with {} arms", hold_id, evaluated_arms.len());
+            zoon::println!("[DD_EVAL] Created WhileRef for hold {} with {} arms", cell_id, evaluated_arms.len());
 
-            return DdValue::WhileRef {
-                hold_id: hold_id.clone(),
-                computation: None,  // No computation for direct HoldRef
+            // Exit WHILE pre-eval context
+            super::super::io::exit_while_preeval();
+
+            return Value::WhileRef {
+                cell_id: cell_id.clone(),
+                computation: None,  // No computation for direct CellRef
                 arms: Arc::new(evaluated_arms),
                 default: default_value,
             };
@@ -2907,7 +2989,12 @@ impl BoonDdRuntime {
 
         // If input is a PlaceholderField, create a PlaceholderWhileRef for deferred resolution
         // This handles: todo.editing |> WHILE { True => ..., False => ... } in templates
-        if let DdValue::PlaceholderField { path } = value {
+        if let Value::PlaceholderField { path } = value {
+            // Enter WHILE pre-eval context to skip text_input key_down detection
+            // This prevents editing text_inputs inside WHILE branches from overwriting
+            // the main document's text_input link
+            super::super::io::enter_while_preeval();
+
             // Pre-evaluate all arms for later substitution
             let mut evaluated_arms = Vec::new();
             let mut default_value = None;
@@ -2921,7 +3008,7 @@ impl BoonDdRuntime {
                         functions: self.functions.clone(),
                         passed_context: self.passed_context.clone(),
                         link_counter: 0,
-                        hold_counter: 0,
+                        cell_counter: 0,
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
@@ -2934,7 +3021,7 @@ impl BoonDdRuntime {
                         functions: self.functions.clone(),
                         passed_context: self.passed_context.clone(),
                         link_counter: 0,
-                        hold_counter: 0,
+                        cell_counter: 0,
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
@@ -2946,7 +3033,10 @@ impl BoonDdRuntime {
 
             zoon::println!("[DD_EVAL] Created PlaceholderWhileRef for path {:?} with {} arms", path, evaluated_arms.len());
 
-            return DdValue::PlaceholderWhileRef {
+            // Exit WHILE pre-eval context
+            super::super::io::exit_while_preeval();
+
+            return Value::PlaceholderWhileRef {
                 field_path: path.clone(),
                 arms: Arc::new(evaluated_arms),
                 default: default_value,
@@ -2955,7 +3045,12 @@ impl BoonDdRuntime {
 
         // If input is a ComputedRef (boolean computation), create a WhileRef with the computation
         // This handles: completed_list_count > 0 |> WHILE { True => button, False => NoElement }
-        if let DdValue::ComputedRef { computation, source_hold } = value {
+        if let Value::ComputedRef { computation, source_hold } = value {
+            // Enter WHILE pre-eval context to skip text_input key_down detection
+            // This prevents editing text_inputs inside WHILE branches from overwriting
+            // the main document's text_input link
+            super::super::io::enter_while_preeval();
+
             // Pre-evaluate all arms for the bridge to render reactively
             let mut evaluated_arms = Vec::new();
             let mut default_value = None;
@@ -2971,7 +3066,7 @@ impl BoonDdRuntime {
                         functions: self.functions.clone(),
                         passed_context: self.passed_context.clone(),
                         link_counter: 0,
-                        hold_counter: 0,
+                        cell_counter: 0,
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
@@ -2986,7 +3081,7 @@ impl BoonDdRuntime {
                         functions: self.functions.clone(),
                         passed_context: self.passed_context.clone(),
                         link_counter: 0,
-                        hold_counter: 0,
+                        cell_counter: 0,
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
@@ -3002,7 +3097,7 @@ impl BoonDdRuntime {
                         functions: self.functions.clone(),
                         passed_context: self.passed_context.clone(),
                         link_counter: 0,
-                        hold_counter: 0,
+                        cell_counter: 0,
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
@@ -3014,8 +3109,11 @@ impl BoonDdRuntime {
 
             zoon::println!("[DD_EVAL] Created WhileRef for ComputedRef (source: {}) with {} arms", source_hold, evaluated_arms.len());
 
-            return DdValue::WhileRef {
-                hold_id: source_hold.clone(),
+            // Exit WHILE pre-eval context
+            super::super::io::exit_while_preeval();
+
+            return Value::WhileRef {
+                cell_id: source_hold.clone(),
                 computation: Some(computation.clone()),  // Store the computation for bridge to evaluate
                 arms: Arc::new(evaluated_arms),
                 default: default_value,
@@ -3024,12 +3122,12 @@ impl BoonDdRuntime {
 
         // If input is a LinkRef (e.g., element.hovered), create a synthetic hold for boolean state
         // This handles: element.hovered |> WHILE { True => delete_button, False => NoElement }
-        if let DdValue::LinkRef(link_id) = value {
+        if let Value::LinkRef(link_id) = value {
             // Create a synthetic hold for this link's boolean state
-            let hold_id = format!("hover_{}", link_id);
+            let cell_id = format!("hover_{}", link_id);
 
             // Initialize the hold state to False (not hovered initially)
-            init_hold_state(&hold_id, DdValue::Bool(false));
+            init_cell(&cell_id, Value::Bool(false));
 
             // Pre-evaluate all arms for the bridge to render reactively
             let mut evaluated_arms = Vec::new();
@@ -3044,7 +3142,7 @@ impl BoonDdRuntime {
                         functions: self.functions.clone(),
                         passed_context: self.passed_context.clone(),
                         link_counter: 0,
-                        hold_counter: 0,
+                        cell_counter: 0,
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
@@ -3057,7 +3155,7 @@ impl BoonDdRuntime {
                         functions: self.functions.clone(),
                         passed_context: self.passed_context.clone(),
                         link_counter: 0,
-                        hold_counter: 0,
+                        cell_counter: 0,
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
@@ -3069,20 +3167,20 @@ impl BoonDdRuntime {
 
             // Log what the True arm contains (specifically look for button press LinkRef)
             for (pattern, body) in &evaluated_arms {
-                if matches!(pattern, DdValue::Tagged { tag, .. } if tag.as_ref() == "True") {
+                if matches!(pattern, Value::Tagged { tag, .. } if BoolTag::is_true(tag.as_ref())) {
                     // Check if body contains a button with a press LinkRef
-                    fn find_press_link(v: &DdValue) -> Option<String> {
+                    fn find_press_link(v: &Value) -> Option<String> {
                         match v {
-                            DdValue::Tagged { tag, fields } if tag.as_ref() == "Element" => {
+                            Value::Tagged { tag, fields } if ElementTag::is_element(tag.as_ref()) => {
                                 if let Some(element) = fields.get("element") {
                                     if let Some(event) = element.get("event") {
-                                        if let Some(DdValue::LinkRef(id)) = event.get("press") {
+                                        if let Some(Value::LinkRef(id)) = event.get("press") {
                                             return Some(id.to_string());
                                         }
                                     }
                                 }
                                 // Recurse into items
-                                if let Some(DdValue::List(items)) = fields.get("items") {
+                                if let Some(Value::List(items)) = fields.get("items") {
                                     for item in items.iter() {
                                         if let Some(link) = find_press_link(item) {
                                             return Some(link);
@@ -3091,9 +3189,9 @@ impl BoonDdRuntime {
                                 }
                                 None
                             }
-                            DdValue::Object(obj) => {
+                            Value::Object(obj) => {
                                 if let Some(event) = obj.get("event") {
-                                    if let Some(DdValue::LinkRef(id)) = event.get("press") {
+                                    if let Some(Value::LinkRef(id)) = event.get("press") {
                                         return Some(id.to_string());
                                     }
                                 }
@@ -3103,15 +3201,15 @@ impl BoonDdRuntime {
                         }
                     }
                     if let Some(press_link) = find_press_link(body) {
-                        zoon::println!("[DD_EVAL] WhileRef {} True arm button press: {}", hold_id, press_link);
+                        zoon::println!("[DD_EVAL] WhileRef {} True arm button press: {}", cell_id, press_link);
                     }
                 }
             }
 
-            zoon::println!("[DD_EVAL] Created WhileRef for LinkRef {} (hover hold: {}) with {} arms", link_id, hold_id, evaluated_arms.len());
+            zoon::println!("[DD_EVAL] Created WhileRef for LinkRef {} (hover hold: {}) with {} arms", link_id, cell_id, evaluated_arms.len());
 
-            return DdValue::WhileRef {
-                hold_id: Arc::from(hold_id),
+            return Value::WhileRef {
+                cell_id: CellId::new(cell_id),
                 computation: None,  // No computation - just read hold state directly
                 arms: Arc::new(evaluated_arms),
                 default: default_value,
@@ -3120,7 +3218,7 @@ impl BoonDdRuntime {
 
         // If input is a WhileRef, chain the pattern matching
         // This happens when: route |> WHEN { "/" => Home } |> WHILE { Home => page(...) }
-        if let DdValue::WhileRef { hold_id, computation: input_computation, arms: input_arms, default: input_default } = value {
+        if let Value::WhileRef { cell_id, computation: input_computation, arms: input_arms, default: input_default } = value {
             // For each arm in this WHILE, evaluate the body for each possible input value
             // This creates a composed transformation: route → page tag → page element
             let mut evaluated_arms = Vec::new();
@@ -3139,8 +3237,8 @@ impl BoonDdRuntime {
                     if let Some(pv) = &pattern_value {
                         // Check if the intermediate value matches this pattern
                         let matches = match (intermediate_value, pv) {
-                            (DdValue::Tagged { tag: a, .. }, DdValue::Tagged { tag: b, .. }) => a == b,
-                            (DdValue::Text(a), DdValue::Text(b)) => a == b,
+                            (Value::Tagged { tag: a, .. }, Value::Tagged { tag: b, .. }) => a == b,
+                            (Value::Text(a), Value::Text(b)) => a == b,
                             _ => intermediate_value == pv,
                         };
 
@@ -3151,7 +3249,7 @@ impl BoonDdRuntime {
                                 functions: self.functions.clone(),
                                 passed_context: self.passed_context.clone(),
                                 link_counter: 0,
-                                hold_counter: 0,
+                                cell_counter: 0,
                                 context_path: Vec::new(),
                                 last_list_source: None,
                             dataflow_config: DataflowConfig::new(),
@@ -3174,7 +3272,7 @@ impl BoonDdRuntime {
                             functions: self.functions.clone(),
                             passed_context: self.passed_context.clone(),
                             link_counter: 0,
-                            hold_counter: 0,
+                            cell_counter: 0,
                             context_path: Vec::new(),
                             last_list_source: None,
                         dataflow_config: DataflowConfig::new(),
@@ -3187,7 +3285,7 @@ impl BoonDdRuntime {
                     let pattern_value = self.pattern_to_value(&arm.pattern);
                     if let Some(pv) = &pattern_value {
                         let matches = match (input_def.as_ref(), pv) {
-                            (DdValue::Tagged { tag: a, .. }, DdValue::Tagged { tag: b, .. }) => a == b,
+                            (Value::Tagged { tag: a, .. }, Value::Tagged { tag: b, .. }) => a == b,
                             _ => input_def.as_ref() == pv,
                         };
                         if matches {
@@ -3196,7 +3294,7 @@ impl BoonDdRuntime {
                                 functions: self.functions.clone(),
                                 passed_context: self.passed_context.clone(),
                                 link_counter: 0,
-                                hold_counter: 0,
+                                cell_counter: 0,
                                 context_path: Vec::new(),
                                 last_list_source: None,
                             dataflow_config: DataflowConfig::new(),
@@ -3218,7 +3316,7 @@ impl BoonDdRuntime {
                             functions: self.functions.clone(),
                             passed_context: self.passed_context.clone(),
                             link_counter: 0,
-                            hold_counter: 0,
+                            cell_counter: 0,
                             context_path: Vec::new(),
                             last_list_source: None,
                         dataflow_config: DataflowConfig::new(),
@@ -3230,17 +3328,17 @@ impl BoonDdRuntime {
                 }
             }
 
-            zoon::println!("[DD_EVAL] Chained WhileRef for hold {} with {} arms", hold_id, evaluated_arms.len());
+            zoon::println!("[DD_EVAL] Chained WhileRef for cell {} with {} arms", cell_id, evaluated_arms.len());
 
-            return DdValue::WhileRef {
-                hold_id: hold_id.clone(),
+            return Value::WhileRef {
+                cell_id: cell_id.clone(),
                 computation: input_computation.clone(),  // Preserve computation from input
                 arms: Arc::new(evaluated_arms),
                 default: default_value,
             };
         }
 
-        // Static evaluation for non-HoldRef inputs
+        // Static evaluation for non-CellRef inputs
         for arm in arms {
             if let Some(bindings) = self.match_pattern(value, &arm.pattern) {
                 // Create new runtime with pattern bindings
@@ -3249,7 +3347,7 @@ impl BoonDdRuntime {
                     functions: self.functions.clone(),
                     passed_context: self.passed_context.clone(),
                     link_counter: 0,
-                    hold_counter: 0,
+                    cell_counter: 0,
                     context_path: Vec::new(),
                     last_list_source: None,
                 dataflow_config: DataflowConfig::new(),
@@ -3260,26 +3358,26 @@ impl BoonDdRuntime {
                 return match_runtime.eval_expression(&arm.body.node);
             }
         }
-        DdValue::Unit
+        Value::Unit
     }
 
-    /// Convert a pattern to a DdValue for WhileRef arms.
+    /// Convert a pattern to a Value for WhileRef arms.
     /// Used to pre-evaluate pattern values for reactive matching.
-    fn pattern_to_value(&mut self, pattern: &Pattern) -> Option<DdValue> {
+    fn pattern_to_value(&mut self, pattern: &Pattern) -> Option<Value> {
         match pattern {
             Pattern::Literal(lit) => {
                 Some(self.eval_literal(lit))
             }
             Pattern::TaggedObject { tag, .. } => {
                 // For tag patterns without fields, create a simple tag value
-                Some(DdValue::Tagged {
+                Some(Value::Tagged {
                     tag: Arc::from(tag.as_str()),
                     fields: Arc::new(BTreeMap::new()),
                 })
             }
             Pattern::Alias { name } => {
                 // Alias patterns match anything, use the name as identifier
-                Some(DdValue::text(name.as_str()))
+                Some(Value::text(name.as_str()))
             }
             Pattern::WildCard => {
                 // Wildcard handled separately as default
@@ -3292,7 +3390,7 @@ impl BoonDdRuntime {
     }
 
     /// Try to match a value against a pattern, returning bindings if successful.
-    fn match_pattern(&mut self, value: &DdValue, pattern: &Pattern) -> Option<Vec<(String, DdValue)>> {
+    fn match_pattern(&mut self, value: &Value, pattern: &Pattern) -> Option<Vec<(String, Value)>> {
         match pattern {
             Pattern::WildCard => Some(vec![]),
 
@@ -3303,12 +3401,12 @@ impl BoonDdRuntime {
 
             Pattern::Literal(lit) => {
                 // Special case: Bool values matching True/False tag literals
-                if let DdValue::Bool(b) = value {
+                if let Value::Bool(b) = value {
                     if let Literal::Tag(tag_name) = lit {
                         let tag_str = tag_name.as_str();
-                        if (tag_str == "True" && *b) || (tag_str == "False" && !*b) {
+                        if BoolTag::matches_bool(tag_str, *b) {
                             return Some(vec![]);
-                        } else if tag_str == "True" || tag_str == "False" {
+                        } else if BoolTag::is_bool_tag(tag_str) {
                             return None;
                         }
                     }
@@ -3324,21 +3422,21 @@ impl BoonDdRuntime {
 
             Pattern::TaggedObject { tag, variables } => {
                 // Special case: Bool values matching True/False tags
-                if let DdValue::Bool(b) = value {
+                if let Value::Bool(b) = value {
                     let tag_name = tag.as_str();
-                    if (tag_name == "True" && *b) || (tag_name == "False" && !*b) {
+                    if BoolTag::matches_bool(tag_name, *b) {
                         return Some(vec![]);
                     } else {
                         return None;
                     }
                 }
 
-                if let DdValue::Tagged { tag: value_tag, fields } = value {
+                if let Value::Tagged { tag: value_tag, fields } = value {
                     if tag.as_str() == value_tag.as_ref() {
                         // Match fields
                         let mut bindings = vec![];
                         for var in variables {
-                            let field_value = fields.get(var.name.as_str()).cloned().unwrap_or(DdValue::Unit);
+                            let field_value = fields.get(var.name.as_str()).cloned().unwrap_or(Value::Unit);
                             bindings.push((var.name.as_str().to_string(), field_value));
                         }
                         Some(bindings)
@@ -3351,10 +3449,10 @@ impl BoonDdRuntime {
             }
 
             Pattern::Object { variables } => {
-                if let DdValue::Object(fields) = value {
+                if let Value::Object(fields) = value {
                     let mut bindings = vec![];
                     for var in variables {
-                        let field_value = fields.get(var.name.as_str()).cloned().unwrap_or(DdValue::Unit);
+                        let field_value = fields.get(var.name.as_str()).cloned().unwrap_or(Value::Unit);
                         bindings.push((var.name.as_str().to_string(), field_value));
                     }
                     Some(bindings)
@@ -3364,7 +3462,7 @@ impl BoonDdRuntime {
             }
 
             Pattern::List { items } => {
-                if let DdValue::List(list_items) = value {
+                if let Value::List(list_items) = value {
                     if items.len() != list_items.len() {
                         return None;
                     }
@@ -3390,7 +3488,7 @@ impl BoonDdRuntime {
     }
 
     /// Evaluate a comparator.
-    fn eval_comparator(&mut self, comp: &Comparator) -> DdValue {
+    fn eval_comparator(&mut self, comp: &Comparator) -> Value {
         match comp {
             Comparator::Equal { operand_a, operand_b } => {
                 let a = self.eval_expression(&operand_a.node);
@@ -3398,23 +3496,23 @@ impl BoonDdRuntime {
                 // Handle reactive equality: WhileRef == static value
                 // Returns a WhileRef where each arm's result is compared to the static value
                 match (&a, &b) {
-                    (DdValue::WhileRef { hold_id, computation, arms, default }, other) |
-                    (other, DdValue::WhileRef { hold_id, computation, arms, default }) => {
+                    (Value::WhileRef { cell_id, computation, arms, default }, other) |
+                    (other, Value::WhileRef { cell_id, computation, arms, default }) => {
                         // Create new arms where each result is compared with other
-                        let new_arms: Vec<(DdValue, DdValue)> = arms.iter()
+                        let new_arms: Vec<(Value, Value)> = arms.iter()
                             .map(|(pattern, result)| {
                                 let eq_result = self.values_equal(result, other);
-                                (pattern.clone(), DdValue::Bool(eq_result))
+                                (pattern.clone(), Value::Bool(eq_result))
                             })
                             .collect();
                         let new_default = default.as_ref().map(|d| {
                             let eq_result = self.values_equal(d.as_ref(), other);
-                            Arc::new(DdValue::Bool(eq_result))
+                            Arc::new(Value::Bool(eq_result))
                         });
                         #[cfg(debug_assertions)]
-                        zoon::println!("[DD_EVAL] Reactive equality: WhileRef({}) == {:?} => WhileRef with {} arms", hold_id, other, new_arms.len());
-                        DdValue::WhileRef {
-                            hold_id: hold_id.clone(),
+                        zoon::println!("[DD_EVAL] Reactive equality: WhileRef({}) == {:?} => WhileRef with {} arms", cell_id, other, new_arms.len());
+                        Value::WhileRef {
+                            cell_id: cell_id.clone(),
                             computation: computation.clone(),
                             arms: Arc::new(new_arms),
                             default: new_default,
@@ -3422,8 +3520,8 @@ impl BoonDdRuntime {
                     }
                     // ComputedRef == ComputedRef => ComputedRef::Equal
                     // Used for: all_completed: completed_list_count == list_count
-                    (DdValue::ComputedRef { source_hold, .. }, DdValue::ComputedRef { .. }) => {
-                        DdValue::computed_ref(
+                    (Value::ComputedRef { source_hold, .. }, Value::ComputedRef { .. }) => {
+                        Value::computed_ref(
                             ComputedType::Equal {
                                 left: Box::new(a.clone()),
                                 right: Box::new(b.clone()),
@@ -3434,10 +3532,10 @@ impl BoonDdRuntime {
                     // ComputedRef == non-ComputedRef (e.g., Int) => ComputedRef::Equal
                     // Used for: all_completed: list_count == completed_list_count
                     // where list_count is Int and completed_list_count is ComputedRef
-                    (DdValue::ComputedRef { source_hold, .. }, _) => {
+                    (Value::ComputedRef { source_hold, .. }, _) => {
                         #[cfg(debug_assertions)]
                         zoon::println!("[DD_EVAL] Reactive equality: ComputedRef({}) == {:?}", source_hold, b);
-                        DdValue::computed_ref(
+                        Value::computed_ref(
                             ComputedType::Equal {
                                 left: Box::new(a.clone()),
                                 right: Box::new(b.clone()),
@@ -3445,10 +3543,10 @@ impl BoonDdRuntime {
                             source_hold.clone(),
                         )
                     }
-                    (_, DdValue::ComputedRef { source_hold, .. }) => {
+                    (_, Value::ComputedRef { source_hold, .. }) => {
                         #[cfg(debug_assertions)]
                         zoon::println!("[DD_EVAL] Reactive equality: {:?} == ComputedRef({})", a, source_hold);
-                        DdValue::computed_ref(
+                        Value::computed_ref(
                             ComputedType::Equal {
                                 left: Box::new(a.clone()),
                                 right: Box::new(b.clone()),
@@ -3459,19 +3557,19 @@ impl BoonDdRuntime {
                     _ => {
                         #[cfg(debug_assertions)]
                         zoon::println!("[DD_EVAL] Comparing {:?} == {:?} => {:?}", a, b, a == b);
-                        DdValue::Bool(a == b)
+                        Value::Bool(a == b)
                     }
                 }
             }
             Comparator::NotEqual { operand_a, operand_b } => {
                 let a = self.eval_expression(&operand_a.node);
                 let b = self.eval_expression(&operand_b.node);
-                DdValue::Bool(a != b)
+                Value::Bool(a != b)
             }
             Comparator::Less { operand_a, operand_b } => {
                 let a = self.eval_expression(&operand_a.node);
                 let b = self.eval_expression(&operand_b.node);
-                DdValue::Bool(a < b)
+                Value::Bool(a < b)
             }
             Comparator::Greater { operand_a, operand_b } => {
                 let a = self.eval_expression(&operand_a.node);
@@ -3479,40 +3577,40 @@ impl BoonDdRuntime {
                 match (&a, &b) {
                     // ComputedRef > 0 => ComputedRef::GreaterThanZero
                     // Used for: show_clear_completed: completed_list_count > 0
-                    (DdValue::ComputedRef { source_hold, .. }, DdValue::Number(n)) if n.0 == 0.0 => {
-                        DdValue::computed_ref(
+                    (Value::ComputedRef { source_hold, .. }, Value::Number(n)) if n.0 == 0.0 => {
+                        Value::computed_ref(
                             ComputedType::GreaterThanZero {
                                 operand: Box::new(a.clone()),
                             },
                             source_hold.clone(),
                         )
                     }
-                    _ => DdValue::Bool(a > b),
+                    _ => Value::Bool(a > b),
                 }
             }
             Comparator::LessOrEqual { operand_a, operand_b } => {
                 let a = self.eval_expression(&operand_a.node);
                 let b = self.eval_expression(&operand_b.node);
-                DdValue::Bool(a <= b)
+                Value::Bool(a <= b)
             }
             Comparator::GreaterOrEqual { operand_a, operand_b } => {
                 let a = self.eval_expression(&operand_a.node);
                 let b = self.eval_expression(&operand_b.node);
-                DdValue::Bool(a >= b)
+                Value::Bool(a >= b)
             }
         }
     }
 
     /// Evaluate an arithmetic operator.
-    fn eval_arithmetic(&mut self, op: &ArithmeticOperator) -> DdValue {
+    fn eval_arithmetic(&mut self, op: &ArithmeticOperator) -> Value {
         match op {
             ArithmeticOperator::Add { operand_a, operand_b } => {
                 let a = self.eval_expression(&operand_a.node);
                 let b = self.eval_expression(&operand_b.node);
                 match (&a, &b) {
-                    (DdValue::Number(x), DdValue::Number(y)) => DdValue::float(x.0 + y.0),
-                    (DdValue::Text(x), DdValue::Text(y)) => DdValue::text(format!("{}{}", x, y)),
-                    _ => DdValue::Unit,
+                    (Value::Number(x), Value::Number(y)) => Value::float(x.0 + y.0),
+                    (Value::Text(x), Value::Text(y)) => Value::text(format!("{}{}", x, y)),
+                    _ => Value::Unit,
                 }
             }
             ArithmeticOperator::Subtract { operand_a, operand_b } => {
@@ -3520,12 +3618,12 @@ impl BoonDdRuntime {
                 let b = self.eval_expression(&operand_b.node);
                 zoon::println!("[DD_EVAL] Subtract: a={:?}, b={:?}", a, b);
                 match (&a, &b) {
-                    (DdValue::Number(x), DdValue::Number(y)) => DdValue::float(x.0 - y.0),
+                    (Value::Number(x), Value::Number(y)) => Value::float(x.0 - y.0),
                     // ComputedRef - ComputedRef => ComputedRef::Subtract
                     // Used for: active_list_count: list_count - completed_list_count
-                    (DdValue::ComputedRef { source_hold, .. }, DdValue::ComputedRef { .. }) => {
+                    (Value::ComputedRef { source_hold, .. }, Value::ComputedRef { .. }) => {
                         zoon::println!("[DD_EVAL] Creating ComputedRef(Subtract) with source_hold={}", source_hold);
-                        DdValue::computed_ref(
+                        Value::computed_ref(
                             ComputedType::Subtract {
                                 left: Box::new(a.clone()),
                                 right: Box::new(b.clone()),
@@ -3535,7 +3633,7 @@ impl BoonDdRuntime {
                     }
                     _ => {
                         zoon::println!("[DD_EVAL] Subtract: returning Unit (no match)");
-                        DdValue::Unit
+                        Value::Unit
                     }
                 }
             }
@@ -3543,34 +3641,34 @@ impl BoonDdRuntime {
                 let a = self.eval_expression(&operand_a.node);
                 let b = self.eval_expression(&operand_b.node);
                 match (&a, &b) {
-                    (DdValue::Number(x), DdValue::Number(y)) => DdValue::float(x.0 * y.0),
-                    _ => DdValue::Unit,
+                    (Value::Number(x), Value::Number(y)) => Value::float(x.0 * y.0),
+                    _ => Value::Unit,
                 }
             }
             ArithmeticOperator::Divide { operand_a, operand_b } => {
                 let a = self.eval_expression(&operand_a.node);
                 let b = self.eval_expression(&operand_b.node);
                 match (&a, &b) {
-                    (DdValue::Number(x), DdValue::Number(y)) if y.0 != 0.0 => DdValue::float(x.0 / y.0),
-                    _ => DdValue::Unit,
+                    (Value::Number(x), Value::Number(y)) if y.0 != 0.0 => Value::float(x.0 / y.0),
+                    _ => Value::Unit,
                 }
             }
             ArithmeticOperator::Negate { operand } => {
                 let a = self.eval_expression(&operand.node);
                 match &a {
-                    DdValue::Number(x) => DdValue::float(-x.0),
-                    _ => DdValue::Unit,
+                    Value::Number(x) => Value::float(-x.0),
+                    _ => Value::Unit,
                 }
             }
         }
     }
 
     /// Evaluate an alias (variable reference with optional field path).
-    fn eval_alias(&mut self, alias: &Alias) -> DdValue {
+    fn eval_alias(&mut self, alias: &Alias) -> Value {
         match alias {
             Alias::WithoutPassed { parts, .. } => {
                 if parts.is_empty() {
-                    return DdValue::Unit;
+                    return Value::Unit;
                 }
 
                 // First part is the variable name
@@ -3578,11 +3676,11 @@ impl BoonDdRuntime {
                     .variables
                     .get(parts[0].as_str())
                     .cloned()
-                    .unwrap_or(DdValue::Unit);
+                    .unwrap_or(Value::Unit);
 
                 // Track the last field name that contained a list (for source_hold tracking)
                 let mut list_source_name: Option<String> = None;
-                if matches!(current, DdValue::List(_)) {
+                if matches!(current, Value::List(_)) {
                     list_source_name = Some(parts[0].to_string());
                 }
 
@@ -3590,23 +3688,23 @@ impl BoonDdRuntime {
                 for field in parts.iter().skip(1) {
                     // Handle Placeholder specially - create PlaceholderField for deferred access
                     current = match &current {
-                        DdValue::Placeholder => {
-                            DdValue::PlaceholderField {
+                        Value::Placeholder => {
+                            Value::PlaceholderField {
                                 path: Arc::new(vec![Arc::from(field.as_ref())]),
                             }
                         }
-                        DdValue::PlaceholderField { path: existing_path } => {
+                        Value::PlaceholderField { path: existing_path } => {
                             // Extend the existing path
                             let mut new_path: Vec<Arc<str>> = existing_path.as_ref().clone();
                             new_path.push(Arc::from(field.as_ref()));
-                            DdValue::PlaceholderField {
+                            Value::PlaceholderField {
                                 path: Arc::new(new_path),
                             }
                         }
                         // Handle LinkRef.event - create synthetic event object with all event types
-                        DdValue::LinkRef(link_id) if field.as_str() == "event" => {
-                            let link_ref = DdValue::LinkRef(link_id.clone());
-                            DdValue::object([
+                        Value::LinkRef(link_id) if field.as_str() == "event" => {
+                            let link_ref = Value::LinkRef(link_id.clone());
+                            Value::object([
                                 ("press", link_ref.clone()),
                                 ("click", link_ref.clone()),
                                 ("blur", link_ref.clone()),
@@ -3615,16 +3713,16 @@ impl BoonDdRuntime {
                                 ("change", link_ref.clone()),
                             ])
                         }
-                        _ => current.get(field.as_str()).cloned().unwrap_or(DdValue::Unit),
+                        _ => current.get(field.as_str()).cloned().unwrap_or(Value::Unit),
                     };
                     // Update list_source_name if this field is a List
-                    if matches!(current, DdValue::List(_)) {
+                    if matches!(current, Value::List(_)) {
                         list_source_name = Some(field.to_string());
                     }
                 }
 
                 // If the result is a List, track its source name
-                if matches!(current, DdValue::List(_)) {
+                if matches!(current, Value::List(_)) {
                     if let Some(name) = list_source_name {
                         self.last_list_source = Some(name);
                     }
@@ -3634,7 +3732,7 @@ impl BoonDdRuntime {
             }
             Alias::WithPassed { extra_parts } => {
                 // PASSED value - access the passed_context and navigate through fields
-                let mut current = self.passed_context.clone().unwrap_or(DdValue::Unit);
+                let mut current = self.passed_context.clone().unwrap_or(Value::Unit);
 
                 // Track list source for PASSED context too
                 let mut list_source_name: Option<String> = None;
@@ -3643,23 +3741,23 @@ impl BoonDdRuntime {
                 for field in extra_parts {
                     // Handle Placeholder specially - create PlaceholderField for deferred access
                     current = match &current {
-                        DdValue::Placeholder => {
-                            DdValue::PlaceholderField {
+                        Value::Placeholder => {
+                            Value::PlaceholderField {
                                 path: Arc::new(vec![Arc::from(field.as_ref())]),
                             }
                         }
-                        DdValue::PlaceholderField { path: existing_path } => {
+                        Value::PlaceholderField { path: existing_path } => {
                             // Extend the existing path
                             let mut new_path: Vec<Arc<str>> = existing_path.as_ref().clone();
                             new_path.push(Arc::from(field.as_ref()));
-                            DdValue::PlaceholderField {
+                            Value::PlaceholderField {
                                 path: Arc::new(new_path),
                             }
                         }
                         // Handle LinkRef.event - create synthetic event object with all event types
-                        DdValue::LinkRef(link_id) if field.as_str() == "event" => {
-                            let link_ref = DdValue::LinkRef(link_id.clone());
-                            DdValue::object([
+                        Value::LinkRef(link_id) if field.as_str() == "event" => {
+                            let link_ref = Value::LinkRef(link_id.clone());
+                            Value::object([
                                 ("press", link_ref.clone()),
                                 ("click", link_ref.clone()),
                                 ("blur", link_ref.clone()),
@@ -3668,22 +3766,22 @@ impl BoonDdRuntime {
                                 ("change", link_ref.clone()),
                             ])
                         }
-                        _ => current.get(field.as_str()).cloned().unwrap_or(DdValue::Unit),
+                        _ => current.get(field.as_str()).cloned().unwrap_or(Value::Unit),
                     };
-                    if matches!(current, DdValue::List(_)) {
+                    if matches!(current, Value::List(_)) {
                         list_source_name = Some(field.to_string());
                     }
                 }
 
                 // If the result is a List, check if there's a reactive HOLD for this field.
                 // The interpreter creates HOLDs for reactive list operations (List/append, List/clear).
-                // If such a HOLD exists, return HoldRef so List/map creates MappedListRef.
-                if matches!(current, DdValue::List(_) | DdValue::Unit) {
+                // If such a HOLD exists, return CellRef so List/map creates MappedListRef.
+                if matches!(current, Value::List(_) | Value::Unit) {
                     if let Some(ref name) = list_source_name {
                         // Check if a HOLD with this name exists
-                        if super::io::get_hold_value(name).is_some() {
-                            zoon::println!("[DD_EVAL] PASSED.{} is reactive list - returning HoldRef", name);
-                            return DdValue::HoldRef(Arc::from(name.as_str()));
+                        if super::super::io::get_cell_value(name).is_some() {
+                            zoon::println!("[DD_EVAL] PASSED.{} is reactive list - returning CellRef", name);
+                            return Value::CellRef(CellId::new(name.as_str()));
                         }
                         self.last_list_source = Some(name.clone());
                     }
@@ -3699,41 +3797,41 @@ impl BoonDdRuntime {
     /// This is used by `|> LINK { alias }` to replace the internally-generated
     /// LinkRef (from the element's `LINK` expression) with the stored LinkRef.
     /// Recursively traverses Objects, Lists, and Tagged values.
-    fn replace_link_ref_in_value(&self, value: &DdValue, target_id: &Arc<str>) -> DdValue {
+    fn replace_link_ref_in_value(&self, value: &Value, target_id: &LinkId) -> Value {
         use std::collections::BTreeMap;
 
         match value {
             // Replace any LinkRef with the target
-            DdValue::LinkRef(_) => DdValue::LinkRef(target_id.clone()),
+            Value::LinkRef(_) => Value::LinkRef(target_id.clone()),
 
             // Recursively process objects
-            DdValue::Object(fields) => {
-                let new_fields: BTreeMap<Arc<str>, DdValue> = fields
+            Value::Object(fields) => {
+                let new_fields: BTreeMap<Arc<str>, Value> = fields
                     .iter()
                     .map(|(k, v)| (k.clone(), self.replace_link_ref_in_value(v, target_id)))
                     .collect();
-                DdValue::Object(Arc::new(new_fields))
+                Value::Object(Arc::new(new_fields))
             }
 
             // Recursively process tagged values
-            DdValue::Tagged { tag, fields } => {
-                let new_fields: BTreeMap<Arc<str>, DdValue> = fields
+            Value::Tagged { tag, fields } => {
+                let new_fields: BTreeMap<Arc<str>, Value> = fields
                     .iter()
                     .map(|(k, v)| (k.clone(), self.replace_link_ref_in_value(v, target_id)))
                     .collect();
-                DdValue::Tagged {
+                Value::Tagged {
                     tag: tag.clone(),
                     fields: Arc::new(new_fields),
                 }
             }
 
             // Recursively process lists
-            DdValue::List(items) => {
-                let new_items: Vec<DdValue> = items
+            Value::List(items) => {
+                let new_items: Vec<Value> = items
                     .iter()
                     .map(|item| self.replace_link_ref_in_value(item, target_id))
                     .collect();
-                DdValue::List(Arc::new(new_items))
+                Value::List(Arc::new(new_items))
             }
 
             // Other values pass through unchanged
@@ -3746,41 +3844,41 @@ impl BoonDdRuntime {
     /// This is used by `|> LINK { alias }` during template evaluation when the alias
     /// resolves to a PlaceholderField (deferred field access). The PlaceholderField
     /// will be resolved to a real LinkRef during template cloning/substitution.
-    fn replace_link_ref_with_placeholder(&self, value: &DdValue, path: &[Arc<str>]) -> DdValue {
+    fn replace_link_ref_with_placeholder(&self, value: &Value, path: &[Arc<str>]) -> Value {
         use std::collections::BTreeMap;
 
         match value {
             // Replace any LinkRef with the PlaceholderField
-            DdValue::LinkRef(_) => DdValue::PlaceholderField { path: Arc::new(path.to_vec()) },
+            Value::LinkRef(_) => Value::PlaceholderField { path: Arc::new(path.to_vec()) },
 
             // Recursively process objects
-            DdValue::Object(fields) => {
-                let new_fields: BTreeMap<Arc<str>, DdValue> = fields
+            Value::Object(fields) => {
+                let new_fields: BTreeMap<Arc<str>, Value> = fields
                     .iter()
                     .map(|(k, v)| (k.clone(), self.replace_link_ref_with_placeholder(v, path)))
                     .collect();
-                DdValue::Object(Arc::new(new_fields))
+                Value::Object(Arc::new(new_fields))
             }
 
             // Recursively process tagged values
-            DdValue::Tagged { tag, fields } => {
-                let new_fields: BTreeMap<Arc<str>, DdValue> = fields
+            Value::Tagged { tag, fields } => {
+                let new_fields: BTreeMap<Arc<str>, Value> = fields
                     .iter()
                     .map(|(k, v)| (k.clone(), self.replace_link_ref_with_placeholder(v, path)))
                     .collect();
-                DdValue::Tagged {
+                Value::Tagged {
                     tag: tag.clone(),
                     fields: Arc::new(new_fields),
                 }
             }
 
             // Recursively process lists
-            DdValue::List(items) => {
-                let new_items: Vec<DdValue> = items
+            Value::List(items) => {
+                let new_items: Vec<Value> = items
                     .iter()
                     .map(|item| self.replace_link_ref_with_placeholder(item, path))
                     .collect();
-                DdValue::List(Arc::new(new_items))
+                Value::List(Arc::new(new_items))
             }
 
             // Other values pass through unchanged
@@ -3788,17 +3886,17 @@ impl BoonDdRuntime {
         }
     }
 
-    /// Compare two DdValues for equality.
+    /// Compare two Values for equality.
     /// Handles Tagged comparison by comparing only the tag name.
-    fn values_equal(&self, a: &DdValue, b: &DdValue) -> bool {
+    fn values_equal(&self, a: &Value, b: &Value) -> bool {
         match (a, b) {
-            (DdValue::Tagged { tag: tag_a, .. }, DdValue::Tagged { tag: tag_b, .. }) => {
+            (Value::Tagged { tag: tag_a, .. }, Value::Tagged { tag: tag_b, .. }) => {
                 tag_a.as_ref() == tag_b.as_ref()
             }
-            (DdValue::Bool(a), DdValue::Bool(b)) => a == b,
-            (DdValue::Number(a), DdValue::Number(b)) => a == b,
-            (DdValue::Text(a), DdValue::Text(b)) => a.as_ref() == b.as_ref(),
-            (DdValue::Unit, DdValue::Unit) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Number(a), Value::Number(b)) => a == b,
+            (Value::Text(a), Value::Text(b)) => a.as_ref() == b.as_ref(),
+            (Value::Unit, Value::Unit) => true,
             _ => false,
         }
     }
@@ -3811,7 +3909,7 @@ impl Default for BoonDdRuntime {
 }
 
 /// Simple function to evaluate expressions and get the document output.
-pub fn evaluate_to_document(expressions: &[Spanned<Expression>]) -> Option<DdValue> {
+pub fn evaluate_to_document(expressions: &[Spanned<Expression>]) -> Option<Value> {
     let mut runtime = BoonDdRuntime::new();
     runtime.evaluate(expressions);
     runtime.get_document().cloned()
@@ -3829,10 +3927,10 @@ mod tests {
 
     #[test]
     fn test_dd_value_operations() {
-        let val = DdValue::int(42);
+        let val = Value::int(42);
         assert_eq!(val.to_display_string(), "42");
 
-        let text = DdValue::text("hello");
+        let text = Value::text("hello");
         assert_eq!(text.to_display_string(), "hello");
     }
 }

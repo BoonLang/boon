@@ -18,8 +18,8 @@ use boon::platform::browser::{
 // DD engine imports (feature-gated)
 #[cfg(feature = "engine-dd")]
 use boon::platform::browser::engine_dd::{
-    dd_bridge::{render_dd_document_reactive_signal, render_dd_result_reactive_signal},
-    dd_interpreter::run_dd_reactive_with_persistence,
+    render_dd_document_reactive_signal, render_dd_result_reactive_signal,
+    run_dd_reactive_with_persistence,
     clear_dd_persisted_states,
 };
 

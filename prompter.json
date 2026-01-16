@@ -4,7 +4,8 @@
   "command": [
     "cl"
   ],
-  "supervisor_prompt": "Make DD engine fully working without cheating, if you are in the middle of a work - continue, make sure your plan to get rid of all business code from DD engine is completed and the unnecesary code is removed and everything is properly tested.",
+  "store_prompts": null,
+  "supervisor_prompt": "Make sure everything from plan ~/.claude/plans/optimized-purring-crescent.md is implemented. Don't guess, run subagent(s) to verify. Nothing (excluding WebWorkers) are deferred! Full migration to pure DD, including LATEST and similar constructs as mapped in the plan. Also update `makers verify-playground-dd` if it's old (conflicting with plans / new architecture) but don't try to bend it to make it pass. Again - ensure complete migration to pure DD architecture is done!",
   "completion_condition": "+completed+",
   "completion_command": "makers verify-playground-dd",
   "protected_patterns": [

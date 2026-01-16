@@ -27,7 +27,7 @@ thread_local! {
 /// # Example
 ///
 /// ```ignore
-/// fn process_dd_event(event: DdEvent) {
+/// fn process_dd_event(event: Event) {
 ///     let _guard = DdContextGuard::enter();
 ///     // Any sync operation called here will panic in debug builds
 ///     worker.inject_event(event);
@@ -111,7 +111,7 @@ pub fn assert_not_in_dd_context(operation: &str) {
             panic!(
                 "CHEAT DETECTED: '{}' called during DD computation. \
                  This operation requires synchronous state access which is forbidden. \
-                 All state observation must go through async streams (DdOutput).",
+                 All state observation must go through async streams (Output).",
                 operation
             );
         }

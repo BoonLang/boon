@@ -6,18 +6,21 @@
 //! # Architecture (Pure DD - Anti-Cheat Design)
 //!
 //! - `core/` - Pure DD, no Zoon dependencies, no Mutable/RefCell
-//!   - `types.rs` - DdInput/DdOutput with no sync access
+//!   - `types.rs` - Input/Output with no sync access
 //!   - `guards.rs` - Runtime cheat detection
 //!   - `worker.rs` - Async DD worker with event loop
+//!   - `value.rs` - Pure data types for DD (Value)
+//!   - `operators.rs` - DD operators (hold, etc.)
 //! - `io/` - Input/output channels for DD communication
-//! - `bridge/` - Zoon integration, receives streams only
-//! - `dd_value.rs` - Pure data types for DD
-//! - `dd_runtime.rs` - DD operators (hold, etc.)
-//! - `dd_evaluator.rs` - Static expression evaluation
+//! - `eval/` - Evaluation layer
+//!   - `evaluator.rs` - Expression evaluation
+//!   - `interpreter.rs` - Program interpretation
+//! - `render/` - Rendering layer
+//!   - `bridge.rs` - Value → Zoon element conversion
 //!
 //! ## Anti-Cheat Constraints
 //!
-//! - NO `Mutable<T>` - Use DdOutput streams instead
+//! - NO `Mutable<T>` - Use Output streams instead
 //! - NO `RefCell<T>` - All state in DD collections
 //! - NO `.get()` - Never read state synchronously
 //! - NO `trigger_render()` - DD outputs drive rendering automatically
@@ -26,22 +29,22 @@
 
 /// Master debug logging flag for the DD engine.
 /// When enabled, prints detailed information about DD operations.
-pub const LOG_DD_DEBUG: bool = false;
+pub const LOG_DD_DEBUG: bool = true;
 
-// Pure DD modules (anti-cheat compliant)
+// Core DD modules (anti-cheat compliant)
 pub mod core;
 pub mod io;
 
-// Core modules (no cheats)
-pub mod dd_value;      // Pure data types
-pub mod dd_runtime;    // DD operators (hold, etc.)
-pub mod dd_evaluator;  // Static expression evaluation
+// Evaluation layer
+pub mod eval;
 
-// Rendering and interpretation modules
-pub mod dd_bridge;       // Render DD values to Zoon elements
-pub mod dd_interpreter;  // Parse Boon code and run DD dataflow
+// Rendering layer
+pub mod render;
 
 // Re-export commonly used types
-pub use core::{DdEvent, DdEventValue, DdInput, DdOutput, DdWorker, DdWorkerHandle, HoldId, LinkId};
-pub use dd_value::DdValue;
-pub use io::{clear_dd_persisted_states, clear_hold_states_memory};
+pub use core::{Event, EventValue, Input, Output, Worker, WorkerHandle, CellId, LinkId};
+pub use core::value::{Value, CollectionHandle, CollectionId};
+pub use eval::interpreter::{DdContext, DdResult, run_dd_reactive_with_persistence};
+pub use eval::evaluator::BoonDdRuntime;
+pub use render::bridge::{render_dd_result_reactive_signal, render_dd_document_reactive_signal};
+pub use io::{clear_dd_persisted_states, clear_cells_memory};

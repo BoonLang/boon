@@ -1073,25 +1073,20 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 _ => false,
             };
 
-            if input_already_focused {
-                // Already in edit mode or input is focused
-                // Use character-by-character typing to simulate real keyboard behavior
-                let response = send_command_to_server(port, WsCommand::TypeTextCharByChar { text: text.clone() }).await?;
-                if let WsResponse::Error { message } = response {
-                    anyhow::bail!("Type text char-by-char failed: {}", message);
-                }
-            } else {
-                // Focus input first, then use char-by-char typing
+            if !input_already_focused {
+                // Focus input first
                 let focus_response = send_command_to_server(port, WsCommand::FocusInput { index: 0 }).await?;
                 if let WsResponse::Error { message } = focus_response {
                     anyhow::bail!("Focus input failed: {}", message);
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
+            }
 
-                let response = send_command_to_server(port, WsCommand::TypeTextCharByChar { text: text.clone() }).await?;
-                if let WsResponse::Error { message } = response {
-                    anyhow::bail!("Type text char-by-char failed: {}", message);
-                }
+            // Use TypeTextCharByChar (dispatchKeyEvent) to simulate natural typing
+            // This is necessary because Boon's input handling expects character-by-character events
+            let response = send_command_to_server(port, WsCommand::TypeTextCharByChar { text: text.clone() }).await?;
+            if let WsResponse::Error { message } = response {
+                anyhow::bail!("Type text failed: {}", message);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

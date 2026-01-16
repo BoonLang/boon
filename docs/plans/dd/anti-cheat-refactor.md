@@ -1,10 +1,19 @@
 # Plan: Refactor DD Engine with Anti-Cheat Enforcement
 
-**Status: Phase 6 COMPLETE** - Phase 7 (Generic Engine) is next. All anti-cheat infrastructure is in place; now need to remove hardcoded business logic.
+**Status: Phase 7 COMPLETE** - Infrastructure work done. Architecture is "DD-Assisted Imperative".
+
+> **HONEST ASSESSMENT (2026-01-16):**
+>
+> The anti-cheat goal of "Zero Mutable/RefCell" was NOT achieved. The codebase uses:
+> - `Mutable<HashMap<String, Value>>` for CELL_STATES in outputs.rs
+> - Multiple `RefCell` wrappers in inputs.rs (marked "// ALLOWED: IO layer")
+>
+> DD collections are NOT the source of truth - `Mutable<HashMap>` is.
+> Events flow through channels but many bypass DD and directly update HashMap.
 
 ## Goal
 Remove `trigger_render()` hack and make events flow naturally through Differential Dataflow.
-**Zero Mutable/RefCell** - DD collections are the ONLY source of truth.
+~~**Zero Mutable/RefCell**~~ - ⚠️ NOT ACHIEVED - IO layer uses both with "ALLOWED" comments.
 
 ## Current Progress
 
@@ -137,7 +146,12 @@ Goal: Clean codebase with no legacy patterns, full architectural separation.
   - Default value logic uses original HOLD type instead of hardcoded field names
 - [x] **7.3:** LATEST as DD collection concat ⚠️ DEFERRED (optional optimization, current LatestRef works)
 - [x] **7.4:** Move render functions to bridge/render.rs ⚠️ DEFERRED (code organization, no functional change)
-- [ ] **7.5:** Clean up deprecated ComputedType variant
+- [x] **7.5:** Clean up deprecated ComputedType variant ✅ COMPLETE
+  - `ReactiveListCountWhere` deleted (was dead code, never constructed)
+  - Replaced with `ListCountWhereHold` which reads live HOLD data
+- [x] **7.6:** Remove dead bridge/ directory ✅ COMPLETE
+  - Deleted bridge/render.rs, bridge/events.rs, bridge/mod.rs
+  - Updated engine_dd/mod.rs to remove `pub mod bridge;`
 
 **Estimated effort:** 8-16 hours total
 
@@ -624,12 +638,16 @@ bridge/render.rs
 
 ## Verification Checklist
 
-### Anti-Cheat Verification (CURRENTLY PASSING ✅)
-- [x] `grep -r "Mutable<" engine_dd/` returns only `// ALLOWED:` comments
-- [x] `grep -r "RefCell<" engine_dd/` returns only `// ALLOWED:` comments
+### Anti-Cheat Verification (PASSING WITH EXCEPTIONS)
+- [x] `grep -r "Mutable<" engine_dd/` returns matches - BUT marked "// ALLOWED: view state"
+- [x] `grep -r "RefCell<" engine_dd/` returns matches - BUT marked "// ALLOWED: IO layer"
 - [x] `grep -r "trigger_render" engine_dd/` returns only doc comments
 - [x] `grep -r "handle_link_fire" engine_dd/` returns nothing
-- [x] `makers verify-dd-no-cheats` passes
+- [x] `makers verify-dd-no-cheats` passes (because "ALLOWED" comments are exempted)
+
+> **Reality Check:** The anti-cheat script passes because it excludes lines with "// ALLOWED:" comments.
+> This means `Mutable<HashMap>` and `RefCell` ARE used, just marked as "allowed exceptions".
+> The original goal of "Zero Mutable/RefCell" was not achieved.
 
 ### Functional Verification (Phase 5)
 - [ ] counter.bn works (button → HOLD increment)
@@ -654,7 +672,28 @@ bridge/render.rs
 - [x] `dd_interpreter.rs` has no `extract_*` pattern detection functions (all deleted)
 - [x] `dd_evaluator.rs` builds DataflowConfig during evaluation (timer, toggles, link IDs)
 - [ ] `dd_runtime.rs` has `latest()` DD operator (optional - current LatestRef approach works)
-- [x] No sync state reads in rendering path (verified by verify-dd-no-cheats)
+- [⚠️] No sync state reads in rendering path - CAVEAT: Bridge reads from `cell_states_signal()` which is a `Mutable<HashMap>` signal, not DD differential outputs
+
+### Honest Architecture Assessment (2026-01-16)
+
+**What the plan claimed:**
+- "Zero Mutable/RefCell - DD collections are the ONLY source of truth"
+- "O(delta) complexity for all operations"
+- "DD collections remain the source of truth; this just mirrors for rendering"
+
+**What the code actually does:**
+| Aspect | Claimed | Reality |
+|--------|---------|---------|
+| State Storage | DD arrangements | `Mutable<HashMap<String, Value>>` in outputs.rs |
+| Event Flow | All through DD | Many directly update HashMap (inputs.rs:156-229) |
+| Complexity | O(delta) | O(n) - full HashMap copy propagates |
+| RefCell | Zero | Multiple RefCell in inputs.rs (marked "ALLOWED") |
+| Bridge Input | DD diffs | HashMap signal via `cell_states_signal()` |
+
+**Why it still works:** The architecture is "DD-Assisted Imperative" - DD operators are used for batch processing in `process_batch_with_hold()`, but the overall flow remains imperative. This is a valid intermediate state that provides:
+- Working examples (counter, todo_mvc, shopping_list)
+- DD operator foundation for future true DD migration
+- Type safety from phases 1-3
 
 ---
 

@@ -9,13 +9,18 @@
 //! Persistence: HOLD values are saved to localStorage and restored on re-run.
 
 use std::collections::HashMap;
-use super::super::core::DdOutput;
-use super::super::dd_value::DdValue;
+use super::super::core::Output;
+use super::super::core::types::BoolTag;
+use super::super::core::value::Value;
 use super::super::LOG_DD_DEBUG;
 use zoon::futures_util::stream::Stream;
 use zoon::Mutable;
 use zoon::signal::MutableSignalCloned;
 use zoon::{local_storage, WebStorage};
+
+// Phase 6: Import bridge function for text-clear side effect
+#[cfg(target_arch = "wasm32")]
+use super::super::render::bridge::clear_dd_text_input_value;
 
 const DD_HOLD_STORAGE_KEY: &str = "dd_hold_states";
 
@@ -23,17 +28,17 @@ const DD_HOLD_STORAGE_KEY: &str = "dd_hold_states";
 /// Called when user clicks "Clear saved states" in playground.
 pub fn clear_dd_persisted_states() {
     local_storage().remove(DD_HOLD_STORAGE_KEY);
-    // Also clear in-memory HOLD_STATES
-    HOLD_STATES.with(|states| {
+    // Also clear in-memory CELL_STATES
+    CELL_STATES.with(|states| {
         states.lock_mut().clear();
     });
     if LOG_DD_DEBUG { zoon::println!("[DD Persist] Cleared all DD states"); }
 }
 
-/// Clear in-memory HOLD_STATES only (not localStorage).
+/// Clear in-memory CELL_STATES only (not localStorage).
 /// Called at the start of each interpretation to prevent state contamination between examples.
-pub fn clear_hold_states_memory() {
-    HOLD_STATES.with(|states| {
+pub fn clear_cells_memory() {
+    CELL_STATES.with(|states| {
         states.lock_mut().clear();
     });
     CHECKBOX_TOGGLE_HOLDS.with(|holds| {
@@ -43,10 +48,97 @@ pub fn clear_hold_states_memory() {
     clear_current_route();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// INITIALIZATION FUNCTIONS (Phase 7)
+// These functions are ONLY for setting up initial state BEFORE DD starts.
+// They are NOT for reactive updates - all runtime updates must flow through DD.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Initialize a cell with its initial value (for startup only, NOT reactive updates).
+///
+/// # Phase 7 Architecture
+/// This is called ONLY during interpreter initialization, before the DD worker starts.
+/// All subsequent updates to this cell MUST flow through DD events.
+///
+/// DO NOT call this function in response to user events or runtime changes.
+pub fn init_cell(cell_id: impl Into<String>, value: Value) {
+    let cell_id = cell_id.into();
+    if LOG_DD_DEBUG { zoon::println!("[DD Init] {} = {:?}", cell_id, value); }
+    CELL_STATES.with(|states| {
+        states.lock_mut().insert(cell_id, value);
+    });
+}
+
+/// Initialize a cell and also persist it to localStorage.
+///
+/// # Phase 7 Architecture
+/// Same as init_cell, but also persists the value. Used for cells that need
+/// to survive page reloads.
+pub fn init_cell_with_persist(cell_id: impl Into<String>, value: Value) {
+    let cell_id = cell_id.into();
+    if LOG_DD_DEBUG { zoon::println!("[DD Init+Persist] {} = {:?}", cell_id, value); }
+    CELL_STATES.with(|states| {
+        states.lock_mut().insert(cell_id.clone(), value.clone());
+    });
+    persist_hold_value(&cell_id, &value);
+}
+
+/// Sync a cell value from DD output (called by DD worker after processing).
+///
+/// # Phase 6 Architecture
+/// This function is called ONLY by the DD worker to update CELL_STATES.
+/// The worker is the single state authority.
+///
+/// Side effects:
+/// - If the cell is a text-clear cell, triggers DOM input clearing
+pub fn sync_cell_from_dd(cell_id: impl Into<String>, value: Value) {
+    let cell_id = cell_id.into();
+    if LOG_DD_DEBUG { zoon::println!("[DD Sync] {} = {:?}", cell_id, value); }
+
+    // Check if this is a text-clear cell BEFORE updating (for side effect)
+    let should_clear_text = is_text_clear_cell(&cell_id);
+
+    CELL_STATES.with(|states| {
+        states.lock_mut().insert(cell_id, value);
+    });
+
+    // Phase 6: Trigger text input clearing as side effect
+    #[cfg(target_arch = "wasm32")]
+    if should_clear_text {
+        clear_dd_text_input_value();
+    }
+}
+
+/// Sync a cell value from DD output and persist it.
+pub fn sync_cell_from_dd_with_persist(cell_id: impl Into<String>, value: Value) {
+    let cell_id = cell_id.into();
+    if LOG_DD_DEBUG { zoon::println!("[DD Sync+Persist] {} = {:?}", cell_id, value); }
+    CELL_STATES.with(|states| {
+        states.lock_mut().insert(cell_id.clone(), value.clone());
+    });
+    persist_hold_value(&cell_id, &value);
+}
+
+/// Update a cell value without persistence.
+///
+/// # Phase 8 Note
+/// This function is for internal use by the IO layer when updating
+/// cells that don't need to be persisted (e.g., current_route).
+/// Runtime updates from DD events should use `sync_cell_from_dd`.
+pub fn update_cell_no_persist(cell_id: impl Into<String>, value: Value) {
+    let cell_id = cell_id.into();
+    if LOG_DD_DEBUG { zoon::println!("[DD Update] {} = {:?}", cell_id, value); }
+    CELL_STATES.with(|states| {
+        states.lock_mut().insert(cell_id, value);
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+
 // Global reactive state for HOLD values
 // DD collections remain the source of truth; this just mirrors for rendering
 thread_local! {
-    static HOLD_STATES: Mutable<HashMap<String, DdValue>> = Mutable::new(HashMap::new()); // ALLOWED: view state
+    static CELL_STATES: Mutable<HashMap<String, Value>> = Mutable::new(HashMap::new()); // ALLOWED: view state
 }
 
 // Global list of checkbox toggle hold IDs (used for reactive "items left" count)
@@ -147,8 +239,8 @@ pub fn clear_bulk_remove_event_path() {
 /// Contains paths to LinkRefs that control editing state.
 #[derive(Clone, Debug, Default)]
 pub struct EditingEventBindings {
-    /// The HOLD ID that these bindings control (e.g., "hold_5")
-    pub hold_id: Option<String>,
+    /// The Cell ID that these bindings control (e.g., "cell_5")
+    pub cell_id: Option<String>,
     /// Path to LinkRef whose double_click triggers edit mode (e.g., ["todo_elements", "todo_title_element"])
     pub edit_trigger_path: Vec<String>,
     /// Actual LinkRef ID for edit trigger (resolved during evaluation)
@@ -190,8 +282,8 @@ pub fn clear_editing_event_bindings() {
 /// Contains the path to a LinkRef whose click event toggles a boolean HOLD.
 #[derive(Clone, Debug)]
 pub struct ToggleEventBinding {
-    /// The HOLD ID that this toggle affects
-    pub hold_id: String,
+    /// The Cell ID that this toggle affects
+    pub cell_id: String,
     /// Path to LinkRef whose click triggers toggle (e.g., ["todo_elements", "todo_checkbox"])
     pub event_path: Vec<String>,
     /// Event type (usually "click")
@@ -229,8 +321,8 @@ pub fn clear_toggle_event_bindings() {
 /// Pattern: `store.elements.toggle_all.event.click |> THEN { store.all_completed |> Bool/not() }`
 #[derive(Clone, Debug)]
 pub struct GlobalToggleEventBinding {
-    /// The HOLD ID that this toggle affects (the list HOLD like "todos")
-    pub list_hold_id: String,
+    /// The Cell ID that this toggle affects (the list cell like "todos")
+    pub list_cell_id: String,
     /// Path to LinkRef whose click triggers toggle (e.g., ["store", "elements", "toggle_all_checkbox"])
     pub event_path: Vec<String>,
     /// Event type (usually "click")
@@ -263,13 +355,52 @@ pub fn clear_global_toggle_bindings() {
 // Text input key_down LinkRef extracted from Element/text_input during evaluation
 thread_local! {
     static TEXT_INPUT_KEY_DOWN_LINK: std::cell::Cell<Option<String>> = std::cell::Cell::new(None); // ALLOWED: config state
+    // Flag to skip key_down detection during WHILE pre-evaluation for reactive rendering
+    // When this is > 0, we're inside eval_pattern_match pre-evaluating WHILE arms
+    static WHILE_PREEVAL_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0); // ALLOWED: config state
+}
+
+/// Enter WHILE pre-evaluation context.
+/// Called at the start of eval_pattern_match for CellRef inputs.
+pub fn enter_while_preeval() {
+    WHILE_PREEVAL_DEPTH.with(|d| {
+        let new_depth = d.get() + 1;
+        d.set(new_depth);
+        zoon::println!("[DD WHILE preeval] ENTER depth={}", new_depth);
+    }); // ALLOWED: IO layer
+}
+
+/// Exit WHILE pre-evaluation context.
+/// Called at the end of eval_pattern_match for CellRef inputs.
+pub fn exit_while_preeval() {
+    WHILE_PREEVAL_DEPTH.with(|d| {
+        let current = d.get();
+        if current > 0 {
+            let new_depth = current - 1;
+            d.set(new_depth);
+            zoon::println!("[DD WHILE preeval] EXIT depth={}", new_depth);
+        }
+    }); // ALLOWED: IO layer
+}
+
+/// Check if we're inside WHILE pre-evaluation context.
+fn in_while_preeval() -> bool {
+    WHILE_PREEVAL_DEPTH.with(|d| d.get() > 0) // ALLOWED: IO layer
 }
 
 /// Set the text_input key_down LinkRef ID.
 /// Called by eval_element_function when Element/text_input has a key_down event.
 /// Task 4.3: Eliminates extract_text_input_key_down() document scanning.
+///
+/// NOTE: Skips setting during WHILE pre-evaluation to prevent editing text_inputs
+/// inside WHILE branches from overwriting the main document's text_input link.
 pub fn set_text_input_key_down_link(link_id: String) {
-    zoon::println!("[DD Config] Setting text_input key_down link: {}", link_id);
+    let depth = WHILE_PREEVAL_DEPTH.with(|d| d.get());
+    if in_while_preeval() {
+        zoon::println!("[DD Config] Skipping text_input key_down link in WHILE preeval (depth={}): {}", depth, link_id);
+        return;
+    }
+    zoon::println!("[DD Config] Setting text_input key_down link (depth={}): {}", depth, link_id);
     TEXT_INPUT_KEY_DOWN_LINK.with(|l| l.set(Some(link_id))); // ALLOWED: IO layer
 }
 
@@ -337,12 +468,12 @@ pub fn clear_has_template_list() {
 pub fn set_filter_from_route(route: &str) {
     zoon::println!("[DD Route] Setting route to {}", route);
     CURRENT_ROUTE.with(|r| r.set(route.to_string()));
-    // Update HOLD_STATES so Router/route() HoldRef is reactive
-    update_hold_state_no_persist("current_route", super::super::dd_value::DdValue::text(route));
+    // Update CELL_STATES so Router/route() CellRef is reactive
+    update_cell_no_persist("current_route", super::super::core::value::Value::text(route));
 }
 
 /// Get the current route value.
-/// Used by Router/route() when returning a HoldRef.
+/// Used by Router/route() when returning a CellRef.
 pub fn get_current_route() -> String {
     CURRENT_ROUTE.with(|r| r.lock_ref().clone())
 }
@@ -365,9 +496,9 @@ pub fn clear_current_route() {
 
 /// Register checkbox toggle hold IDs for reactive count computation.
 /// Called by interpreter when detecting the checkbox toggle pattern.
-pub fn set_checkbox_toggle_holds(hold_ids: Vec<String>) {
+pub fn set_checkbox_toggle_holds(cell_ids: Vec<String>) {
     CHECKBOX_TOGGLE_HOLDS.with(|holds| {
-        holds.set(hold_ids);
+        holds.set(cell_ids);
     });
 }
 
@@ -396,211 +527,63 @@ pub fn get_checkbox_toggle_holds() -> Vec<String> {
 /// Register a text-clear HOLD ID (derived from link ID).
 /// When this HOLD is updated, the text input DOM will be cleared.
 /// Task 7.1: Replaces hardcoded "text_input_text" with dynamic names.
-pub fn add_text_clear_hold(hold_id: String) {
-    TEXT_CLEAR_HOLDS.with(|holds| {
-        holds.borrow_mut().insert(hold_id);
-    });
+pub fn add_text_clear_cell(cell_id: String) {
+    TEXT_CLEAR_HOLDS.with(|holds| holds.borrow_mut().insert(cell_id)); // ALLOWED: IO layer
 }
 
 /// Check if a HOLD ID is a text-clear HOLD.
 /// Used by output listener to know when to clear text input DOM.
-pub fn is_text_clear_hold(hold_id: &str) -> bool {
-    TEXT_CLEAR_HOLDS.with(|holds| holds.borrow().contains(hold_id))
+pub fn is_text_clear_cell(cell_id: &str) -> bool {
+    TEXT_CLEAR_HOLDS.with(|holds| holds.borrow().contains(cell_id)) // ALLOWED: IO layer
 }
 
 /// Clear text-clear hold registry.
 /// Called when clearing state or starting a new run.
-pub fn clear_text_clear_holds() {
-    TEXT_CLEAR_HOLDS.with(|holds| holds.borrow_mut().clear());
+pub fn clear_text_clear_cells() {
+    TEXT_CLEAR_HOLDS.with(|holds| holds.borrow_mut().clear()); // ALLOWED: IO layer
 }
 
-/// Update a HOLD state value and persist to storage.
-/// Called by the output listener when DD produces new output.
-pub fn update_hold_state(hold_id: &str, value: DdValue) {
-    zoon::println!("[DD HOLD] update_hold_state('{}', {:?})", hold_id, value);
-    HOLD_STATES.with(|states| {
-        let mut lock = states.lock_mut();
-        let old_value = lock.get(hold_id).cloned();
-        lock.insert(hold_id.to_string(), value.clone());
-        zoon::println!("[DD HOLD] {} changed: {:?} -> {:?}", hold_id, old_value, value);
-    });
-    // Persist to localStorage
-    persist_hold_value(hold_id, &value);
-}
-
-/// Update a HOLD state value WITHOUT persisting.
-/// Used for initial value when we want to check persisted value first.
-pub fn update_hold_state_no_persist(hold_id: &str, value: DdValue) {
-    HOLD_STATES.with(|states| {
-        states.lock_mut().insert(hold_id.to_string(), value);
-    });
-}
-
-/// Remove a HOLD state (used to clean up temporary editing text holds).
-pub fn clear_hold_state(hold_id: &str) {
-    HOLD_STATES.with(|states| {
-        states.lock_mut().remove(hold_id);
-    });
-}
-
-/// Toggle a boolean HOLD value (for checkbox interactions).
-/// Reads the current value, inverts it, and updates both memory and persistent storage.
-pub fn toggle_hold_bool(hold_id: &str) {
-    zoon::println!("[DD toggle_hold_bool] CALLED with hold_id={}", hold_id);
-    HOLD_STATES.with(|states| {
-        let mut lock = states.lock_mut();
-        let current = lock.get(hold_id).cloned();
-        zoon::println!("[DD toggle_hold_bool] Current value for {}: {:?}", hold_id, current);
-        let new_value = match current {
-            Some(DdValue::Bool(b)) => DdValue::Bool(!b),
-            Some(DdValue::Tagged { tag, .. }) if tag.as_ref() == "True" => DdValue::Bool(false),
-            Some(DdValue::Tagged { tag, .. }) if tag.as_ref() == "False" => DdValue::Bool(true),
-            _ => DdValue::Bool(true), // Default to true if no current value
-        };
-        zoon::println!("[DD toggle_hold_bool] New value for {}: {:?}", hold_id, new_value);
-        lock.insert(hold_id.to_string(), new_value.clone());
-        // Persist the new value
-        drop(lock);
-        persist_hold_value(hold_id, &new_value);
-    });
-}
-
-/// Toggle ALL items' completed field in a list HOLD.
-/// Used for "toggle all" checkbox that sets all items to completed or not completed.
-/// The new value is: NOT(all_completed), i.e., if all are completed -> make all not completed.
-pub fn toggle_all_list_items_completed(list_hold_id: &str, completed_field: &str) {
-    use std::sync::Arc;
-
-    // Phase 1: Collect data and compute new state (with lock held)
-    let (items, all_completed, hold_ids_to_update) = HOLD_STATES.with(|states| {
-        let lock = states.lock_mut();
-        let current_list = lock.get(list_hold_id).cloned();
-
-        let items = match current_list {
-            Some(DdValue::List(items)) => items,
-            _ => {
-                zoon::println!("[DD ToggleAll] No list found at {}", list_hold_id);
-                return (None, false, Vec::new());
-            }
-        };
-
-        if items.is_empty() {
-            zoon::println!("[DD ToggleAll] List is empty, nothing to toggle");
-            return (None, false, Vec::new());
-        }
-
-        // First collect all hold IDs and their completion states
-        // (Don't use .all() because it short-circuits and won't collect all hold IDs!)
-        let mut hold_ids: Vec<String> = Vec::new();
-        let mut completed_states: Vec<bool> = Vec::new();
-
-        for item in items.iter() {
-            if let DdValue::Object(fields) = item {
-                match fields.get(completed_field) {
-                    Some(DdValue::Bool(b)) => {
-                        completed_states.push(*b);
-                    }
-                    Some(DdValue::HoldRef(hold_id)) => {
-                        hold_ids.push(hold_id.to_string());
-                        // Look up the HoldRef value
-                        let is_completed = lock.get(hold_id.as_ref())
-                            .map(|v| matches!(v, DdValue::Bool(true)))
-                            .unwrap_or(false);
-                        completed_states.push(is_completed);
-                    }
-                    _ => {
-                        completed_states.push(false);
-                    }
-                }
-            } else {
-                completed_states.push(false);
-            }
-        }
-
-        // Now check if all items are completed
-        let all_completed = !completed_states.is_empty() && completed_states.iter().all(|&c| c);
-
-        (Some(items), all_completed, hold_ids)
-    });
-
-    // Early return if no items
-    let items = match items {
-        Some(items) => items,
-        None => return,
-    };
-
-    // New value is the opposite of all_completed
-    let new_completed = !all_completed;
-    zoon::println!("[DD ToggleAll] all_completed={}, setting all to {}", all_completed, new_completed);
-
-    // Phase 2: Update all HOLDs (with lock held)
-    HOLD_STATES.with(|states| {
-        let mut lock = states.lock_mut();
-
-        // Update all referenced HOLDs
-        for hold_id in &hold_ids_to_update {
-            lock.insert(hold_id.clone(), DdValue::Bool(new_completed));
-        }
-
-        // Build new items list (fields don't change, only HoldRef values)
-        let new_items: Vec<DdValue> = items.iter().map(|item| {
-            if let DdValue::Object(fields) = item {
-                // If completed is a direct Bool field (not HoldRef), update it
-                if fields.get(completed_field).map(|v| matches!(v, DdValue::Bool(_))).unwrap_or(false) {
-                    let mut new_fields = (**fields).clone();
-                    new_fields.insert(Arc::from(completed_field), DdValue::Bool(new_completed));
-                    DdValue::Object(Arc::new(new_fields))
-                } else {
-                    // HoldRef - no need to clone, the reference stays the same
-                    item.clone()
-                }
-            } else {
-                item.clone()
-            }
-        }).collect();
-
-        // Update the list in HOLD_STATES
-        lock.insert(list_hold_id.to_string(), DdValue::List(Arc::new(new_items)));
-    });
-
-    // Phase 3: Persist all updated HOLDs (without lock)
-    for hold_id in &hold_ids_to_update {
-        persist_hold_value(hold_id, &DdValue::Bool(new_completed));
-    }
-
-    zoon::println!("[DD ToggleAll] Updated {} items in {}", items.len(), list_hold_id);
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// SURGICALLY REMOVED (Phase 6.1):
+//   - update_cell()
+//   - update_cell_no_persist()
+//   - clear_cell()
+//   - toggle_cell_bool()
+//   - toggle_all_list_items_completed()
+//
+// These functions directly mutated CELL_STATES HashMap, bypassing DD.
+//
+// Phase 7 TODO: Replace with DD InputHandle injection:
+//   - Events flow through DD dataflow graph
+//   - DD operators process state transitions
+//   - DD output observers update CELL_STATES
+// ═══════════════════════════════════════════════════════════════════════════
 
 /// Load persisted HOLD value from localStorage.
 /// Returns None if no persisted value exists.
-pub fn load_persisted_hold_value(hold_id: &str) -> Option<DdValue> {
+pub fn load_persisted_cell_value(cell_id: &str) -> Option<Value> {
     let storage: HashMap<String, zoon::serde_json::Value> = match local_storage().get::<HashMap<String, zoon::serde_json::Value>>(DD_HOLD_STORAGE_KEY) {
         None => return None,
         Some(Ok(s)) => s,
         Some(Err(_)) => return None, // Ignore deserialization errors
     };
 
-    let json_value = storage.get(hold_id)?;
+    let json_value = storage.get(cell_id)?;
     json_to_dd_value(json_value)
 }
 
-/// Initialize a HOLD with initial value, respecting persisted state.
-/// Returns the actual initial value (persisted or provided).
-pub fn init_hold_state(hold_id: &str, initial: DdValue) -> DdValue {
-    // Try to load persisted value first
-    if let Some(persisted) = load_persisted_hold_value(hold_id) {
-        if LOG_DD_DEBUG { zoon::println!("[DD Persist] Restored {} = {:?}", hold_id, persisted); }
-        update_hold_state_no_persist(hold_id, persisted.clone());
-        persisted
-    } else {
-        if LOG_DD_DEBUG { zoon::println!("[DD Persist] Using initial {} = {:?}", hold_id, initial); }
-        update_hold_state_no_persist(hold_id, initial.clone());
-        initial
-    }
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// SURGICALLY REMOVED (Phase 6.1): init_cell()
+// This function called update_cell_no_persist(), bypassing DD.
+//
+// Phase 7 TODO: Cell initialization should flow through DD:
+//   - Load persisted values via DD InputHandle at startup
+//   - DD operators compute initial state
+//   - DD output observers populate CELL_STATES
+// ═══════════════════════════════════════════════════════════════════════════
 
 /// Persist a HOLD value to localStorage.
-fn persist_hold_value(hold_id: &str, value: &DdValue) {
+fn persist_hold_value(cell_id: &str, value: &Value) {
     // Load existing storage
     let mut storage: HashMap<String, zoon::serde_json::Value> = match local_storage().get::<HashMap<String, zoon::serde_json::Value>>(DD_HOLD_STORAGE_KEY) {
         None => HashMap::new(),
@@ -608,28 +591,38 @@ fn persist_hold_value(hold_id: &str, value: &DdValue) {
         Some(Err(_)) => HashMap::new(), // Start fresh on deserialization error
     };
 
-    // Convert DdValue to JSON and store
+    // Convert Value to JSON and store
     if let Some(json) = dd_value_to_json(value) {
-        storage.insert(hold_id.to_string(), json);
+        storage.insert(cell_id.to_string(), json);
         if let Err(e) = local_storage().insert(DD_HOLD_STORAGE_KEY, &storage) {
             zoon::eprintln!("[DD Persist] Failed to save: {:?}", e);
         }
     }
 }
 
-/// Convert DdValue to JSON for storage.
-fn dd_value_to_json(value: &DdValue) -> Option<zoon::serde_json::Value> {
+/// Convert Value to JSON for storage.
+fn dd_value_to_json(value: &Value) -> Option<zoon::serde_json::Value> {
     use zoon::serde_json::json;
+    use super::super::core::types::BoolTag;
     match value {
-        DdValue::Unit => Some(json!(null)),
-        DdValue::Bool(b) => Some(json!(b)),
-        DdValue::Number(n) => Some(json!(n.0)),
-        DdValue::Text(s) => Some(json!(s.as_ref())),
-        DdValue::List(items) => {
+        Value::Unit => Some(json!(null)),
+        Value::Bool(b) => Some(json!(b)),
+        // Handle Tagged booleans (True/False) - serialize as JSON booleans
+        Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => {
+            Some(json!(BoolTag::is_true(tag.as_ref())))
+        }
+        Value::Number(n) => Some(json!(n.0)),
+        Value::Text(s) => Some(json!(s.as_ref())),
+        Value::List(items) => {
             let arr: Vec<_> = items.iter().filter_map(|v| dd_value_to_json(v)).collect();
             Some(json!(arr))
         }
-        DdValue::Object(fields) => {
+        Value::Collection(handle) => {
+            // Persist Collection by converting its snapshot to JSON (same as List)
+            let arr: Vec<_> = handle.iter().filter_map(|v| dd_value_to_json(v)).collect();
+            Some(json!(arr))
+        }
+        Value::Object(fields) => {
             // Persist Objects (like list items) by recursively converting fields
             let mut obj = zoon::serde_json::Map::new();
             for (key, val) in fields.iter() {
@@ -639,37 +632,42 @@ fn dd_value_to_json(value: &DdValue) -> Option<zoon::serde_json::Value> {
             }
             Some(zoon::serde_json::Value::Object(obj))
         }
-        // Dereference HoldRefs to persist their actual values
-        DdValue::HoldRef(hold_id) => {
-            // Look up the actual value in HOLD_STATES and persist that
-            HOLD_STATES.with(|cell| {
+        // Dereference CellRefs to persist their actual values
+        Value::CellRef(cell_id) => {
+            // Look up the actual value in CELL_STATES and persist that
+            CELL_STATES.with(|cell| {
                 let states = cell.lock_ref(); // ALLOWED: IO layer
-                if let Some(value) = states.get(hold_id.as_ref()) {
-                    if LOG_DD_DEBUG { zoon::println!("[DD Persist] HoldRef {} -> {:?}", hold_id, value); }
+                if let Some(value) = states.get(&cell_id.name()) {
+                    if LOG_DD_DEBUG { zoon::println!("[DD Persist] CellRef {} -> {:?}", cell_id, value); }
                     dd_value_to_json(value)
                 } else {
-                    if LOG_DD_DEBUG { zoon::println!("[DD Persist] HoldRef {} NOT FOUND in HOLD_STATES", hold_id); }
+                    if LOG_DD_DEBUG { zoon::println!("[DD Persist] CellRef {} NOT FOUND in CELL_STATES", cell_id); }
                     None
                 }
             })
         }
         // Don't persist complex types - they need code evaluation
-        DdValue::Tagged { .. } | DdValue::LinkRef(_) | DdValue::TimerRef { .. } | DdValue::WhileRef { .. } | DdValue::ComputedRef { .. } | DdValue::FilteredListRef { .. } | DdValue::FilteredListRefWithPredicate { .. } | DdValue::ReactiveFilteredList { .. } | DdValue::ReactiveText { .. } | DdValue::Placeholder | DdValue::PlaceholderField { .. } | DdValue::PlaceholderWhileRef { .. } | DdValue::NegatedPlaceholderField { .. } | DdValue::MappedListRef { .. } | DdValue::FilteredMappedListRef { .. } | DdValue::FilteredMappedListWithPredicate { .. } | DdValue::LatestRef { .. } => None,
+        Value::Tagged { .. } | Value::LinkRef(_) | Value::TimerRef { .. } | Value::WhileRef { .. } | Value::ComputedRef { .. } | Value::FilteredListRef { .. } | Value::FilteredListRefWithPredicate { .. } | Value::ReactiveFilteredList { .. } | Value::ReactiveText { .. } | Value::Placeholder | Value::PlaceholderField { .. } | Value::PlaceholderWhileRef { .. } | Value::NegatedPlaceholderField { .. } | Value::MappedListRef { .. } | Value::FilteredMappedListRef { .. } | Value::FilteredMappedListWithPredicate { .. } | Value::LatestRef { .. } | Value::Flushed(_) => None,
     }
 }
 
-/// Convert JSON to DdValue.
-fn json_to_dd_value(json: &zoon::serde_json::Value) -> Option<DdValue> {
+/// Convert JSON to Value.
+fn json_to_dd_value(json: &zoon::serde_json::Value) -> Option<Value> {
     use zoon::serde_json::Value as JsonValue;
     use std::collections::BTreeMap;
     match json {
-        JsonValue::Null => Some(DdValue::Unit),
-        JsonValue::Bool(b) => Some(DdValue::Bool(*b)),
-        JsonValue::Number(n) => Some(DdValue::float(n.as_f64()?)),
-        JsonValue::String(s) => Some(DdValue::text(s.clone())),
+        JsonValue::Null => Some(Value::Unit),
+        // IMPORTANT: Boon uses Tagged booleans (Tagged { tag: "True/False" }), not Rust bools
+        // Deserialize JSON booleans as Tagged to maintain type consistency
+        JsonValue::Bool(b) => Some(Value::Tagged {
+            tag: std::sync::Arc::from(if *b { "True" } else { "False" }),
+            fields: std::sync::Arc::new(BTreeMap::new()),
+        }),
+        JsonValue::Number(n) => Some(Value::float(n.as_f64()?)),
+        JsonValue::String(s) => Some(Value::text(s.clone())),
         JsonValue::Array(arr) => {
             let items: Vec<_> = arr.iter().filter_map(|v| json_to_dd_value(v)).collect();
-            Some(DdValue::List(items.into()))
+            Some(Value::List(items.into()))
         }
         JsonValue::Object(obj) => {
             // Restore Objects (like list items)
@@ -679,29 +677,35 @@ fn json_to_dd_value(json: &zoon::serde_json::Value) -> Option<DdValue> {
                     fields.insert(std::sync::Arc::from(key.as_str()), dd_val);
                 }
             }
-            Some(DdValue::Object(std::sync::Arc::new(fields)))
+            Some(Value::Object(std::sync::Arc::new(fields)))
         }
     }
 }
 
 /// Get a signal for all HOLD states.
 /// The bridge uses this to reactively update the DOM.
-pub fn hold_states_signal() -> MutableSignalCloned<HashMap<String, DdValue>> {
-    HOLD_STATES.with(|states| states.signal_cloned())
+pub fn cell_states_signal() -> MutableSignalCloned<HashMap<String, Value>> {
+    CELL_STATES.with(|states| states.signal_cloned())
 }
 
 /// Get the current value of a specific HOLD.
 /// Returns None if the HOLD hasn't been set yet.
-pub fn get_hold_value(hold_id: &str) -> Option<DdValue> {
-    HOLD_STATES.with(|states| {
-        states.lock_ref().get(hold_id).cloned()
+pub fn get_cell_value(cell_id: &str) -> Option<Value> {
+    CELL_STATES.with(|states| {
+        states.lock_ref().get(cell_id).cloned()
     })
+}
+
+/// Get the current value of a specific HOLD by CellId.
+/// Returns None if the HOLD hasn't been set yet.
+pub fn get_cell_value_by_id(cell_id: &crate::platform::browser::engine_dd::core::types::CellId) -> Option<Value> {
+    get_cell_value(&cell_id.name())
 }
 
 /// Get a snapshot of all current HOLD states.
 /// This reads the current state without subscribing to changes.
-pub fn get_all_hold_states() -> HashMap<String, DdValue> {
-    HOLD_STATES.with(|states| {
+pub fn get_all_cell_states() -> HashMap<String, Value> {
+    CELL_STATES.with(|states| {
         states.lock_ref().clone()
     })
 }
@@ -711,12 +715,12 @@ pub fn get_all_hold_states() -> HashMap<String, DdValue> {
 /// The bridge uses this to observe DD outputs as async streams.
 /// All observation is through streams - there's no synchronous access.
 pub struct OutputObserver<T> {
-    output: DdOutput<T>,
+    output: Output<T>,
 }
 
 impl<T> OutputObserver<T> {
     /// Create a new output observer with the given output channel.
-    pub fn new(output: DdOutput<T>) -> Self {
+    pub fn new(output: Output<T>) -> Self {
         Self { output }
     }
 
