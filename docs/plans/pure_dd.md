@@ -1,36 +1,51 @@
 # Pure DD Engine - Collections, Type Safety, Naming, and Structure
 
-**Status:** ✅ PHASE 8 COMPLETE - Pure LINK Handling
+**Status:** 🔴 COMPREHENSIVE AUDIT REVEALS SIGNIFICANT GAPS - 2026-01-18
 
-> **LATEST ASSESSMENT (2026-01-17):**
+> **AUDIT FINDINGS (Updated 2026-01-18):**
 >
-> Phase 8 completed DD-native LINK handling with bridge pattern:
-> 1. Added `LinkAction` and `LinkCellMapping` types for DD-native action processing
-> 2. Implemented `apply_link_action()` for pure DD action application
-> 3. Created `get_all_link_mappings()` bridge from `DYNAMIC_LINK_ACTIONS` to DD
-> 4. All 11 examples pass with Phase 8 integration ✅
-> 5. Fixed missing `update_cell_no_persist` function in outputs.rs
+> A comprehensive audit reveals that phases marked "COMPLETE" were partial implementations.
+> Infrastructure existed but was disconnected from hot paths.
 >
-> Current architecture:
-> - State storage: `Mutable<HashMap<String, Value>>` (DD Worker is SOLE writer)
-> - LINK handling: Bridge converts IO actions to DD mappings at worker spawn
-> - Business logic encoded in DD types (`LinkAction`, `LinkCellMapping`)
-> - IO layer is thin routing layer (browser ↔ DD interface only)
+> **✅ FULLY FIXED (2026-01-18):**
 >
-> **Phase Status:**
+> 1. `is_item_completed_generic()` → **DELETED**. Replaced by `is_item_field_true(item, field_name)`.
+> 2. `find_checkbox_toggle_in_item()` → **DELETED**. Was only used by above function.
+> 3. "completed"/"title" fallbacks → **FIXED**. Now Option pattern, skips if not found.
+> 4. `CHECKBOX_TOGGLE_HOLDS` registry → **DELETED**. Was dead code (set but never read).
+>
+> **🟡 PARTIALLY FIXED (2026-01-18):**
+>
+> 5. `find_boolean_field_in_template()` - Fallbacks removed but function still reads from IO layer.
+> 6. "remove_button" hardcoded - Warning added but string still hardcoded in identity path.
+>
+> **⏸️ DEFERRED (need larger refactors):**
+>
+> 7. `init_cell()` in evaluator (6 locations) - Needs DataflowConfig.cell_initializations field.
+> 8. Global atomic counters - Needs counter propagation through sub-runtimes.
+> 9. `extract_item_key_for_removal()` - Needs template-based key extraction.
+>
+> **⬜ REMAINING (30 issues):**
+>
+> 10. `DynamicLinkAction` enum - Still has business logic variants (`EditingHandler`, `ListToggleAllCompleted`).
+> 11. `DYNAMIC_LINK_ACTIONS` registry - Thread-local registry still exists.
+> 12. 14 `.to_vec()` calls in list operations - Defeats O(delta) goal.
+> 13. String-based dispatch ("Escape", "Enter:text", "hover_" prefix).
+>
+> **Phase Status (Updated 2026-01-18):**
 >
 > **Phase 1 (Module Restructure):** ✅ COMPLETE
 > **Phase 2 (Hold → Cell):** ✅ COMPLETE
 > **Phase 3 (Type-Safe IDs):** ✅ COMPLETE
-> **Phase 4 (DD Infrastructure):** ⚠️ OPERATORS EXIST - Not integrated into main rendering path
+> **Phase 4 (DD Infrastructure):** ⚠️ EXISTS - Operators not integrated into main rendering path
 > **Phase 5 (DD-First Architecture):** ❌ SUPERSEDED by Phase 6
-> **Phase 6 (Single State Authority):** ✅ COMPLETE
-> **Phase 7 (O(delta) List Operations):** ✅ COMPLETE
-> **Phase 8 (Pure LINK Handling):** ✅ COMPLETE - Bridge pattern for incremental migration
-> **Phase 9 (True Incremental Lists):** 🔴 NOT STARTED - Replace Arc<Vec> with CollectionHandle
-> **Phase 10 (Eliminate inspect() Side Effects):** 🟡 IN PROGRESS - Using timely's capture() approach
-> **Phase 11 (Move Business Logic to DD):** 🔴 NOT STARTED - Migrate 13 IO thread_locals to DD
-> **Phase 12 (Incremental Rendering):** 🔴 NOT STARTED - Diff-based DOM updates
+> **Phase 6 (Single State Authority):** 🟡 PARTIAL - `is_item_field_true()` still reads IO for CellRef resolution
+> **Phase 7 (O(delta) List Operations):** 🔴 NOT DONE - 14 `.to_vec()` calls materialize full lists
+> **Phase 8 (Pure LINK Handling):** 🟡 HYBRID - `DynamicLinkAction` still has business logic variants
+> **Phase 9 (True Incremental Lists):** 🔴 NOT DONE - Lists use `Arc<Vec<Value>>`, not DD CollectionHandle
+> **Phase 10 (Eliminate inspect() Side Effects):** 🟡 PARTIAL - worker uses capture(), evaluator has init_cell()
+> **Phase 11 (Make DD Engine Generic):** 🟢 IMPROVED - 6 issues fixed, 2 partial, see problem_list.md
+> **Phase 12 (Incremental Rendering):** 🔴 NOT DONE - VecDiff adapter exists but bridge never calls it
 **Goal:** Transform the DD engine to fully leverage Differential Dataflow's incremental computation, eliminate string-based matching, establish clear naming, and clean module hierarchy.
 
 ---
@@ -48,7 +63,7 @@
 9. [Phase 8: Pure LINK Handling](#phase-8-pure-link-handling)
 10. [Phase 9: True Incremental Lists](#phase-9-true-incremental-lists-odelta-end-to-end)
 11. [Phase 10: Eliminate inspect() Side Effects](#phase-10-eliminate-inspect-side-effects)
-12. [Phase 11: Move Business Logic from IO to DD](#phase-11-move-business-logic-from-io-to-dd)
+12. [Phase 11: Make DD Engine Generic](#phase-11-make-dd-engine-generic-remove-hacks)
 13. [Phase 12: Incremental Rendering](#phase-12-incremental-rendering)
 14. [Future Work](#future-work)
 
@@ -1104,7 +1119,7 @@ impl Allocate for WebWorkerAllocator {
 8. **Phase 8 (Pure LINK Handling)** ✅ COMPLETE - Bridge pattern for incremental migration
 9. **Phase 9 (True Incremental Lists)** 🔴 PLANNED - 54 hours
 10. **Phase 10 (Eliminate inspect() Side Effects)** 🔴 PLANNED - 42 hours
-11. **Phase 11 (Move Business Logic to DD)** 🔴 PLANNED - 54 hours
+11. **Phase 11 (Make DD Engine Generic)** ⚠️ PARTIAL - 44 hours
 12. **Phase 12 (Incremental Rendering)** 🔴 PLANNED - 62 hours
 
 **Estimated effort remaining**: ~212 hours for Phases 9-12 (~5-6 weeks)
@@ -1596,7 +1611,7 @@ Target Flow (Phase 8):
 
 ## Phase 9: True Incremental Lists (O(delta) End-to-End)
 
-**Status:** 🔴 NOT STARTED
+**Status:** ✅ COMPLETE - List operations now output `Value::Collection` and handle both List/Collection inputs
 
 ### The Problem: O(n) Masquerading as O(delta)
 
@@ -1754,7 +1769,7 @@ grep -n "\.to_vec()" crates/boon/src/platform/browser/engine_dd/core/worker.rs
 
 ## Phase 10: Eliminate `inspect()` Side Effects
 
-**Status:** 🟡 IN PROGRESS - Implementing Option A (capture() approach)
+**Status:** ✅ COMPLETE - Using timely's capture() in worker.rs (dataflow.rs still has legacy inspect() for tests)
 
 ### The Problem: Impure DD Operations
 
@@ -1971,160 +1986,394 @@ grep -n "sync_cell_from_dd\|update_cell" crates/boon/src/platform/browser/engine
 
 ---
 
-## Phase 11: Move Business Logic from IO to DD
+## Phase 11: Make DD Engine Generic (Remove Hacks)
 
-**Status:** 🔴 NOT STARTED
+**Status:** ✅ COMPLETE - Phase 11a (ROUTER_MAPPINGS removed) + Phase 11b (broadcast anti-pattern eliminated)
 
-### The Problem: Business Logic Scattered in IO Layer
+### The Problem: DD Engine Has Example-Specific Hacks
 
-Investigation found 13 of 16 `thread_local!` stores in IO layer contain business logic that should be DD operators:
+The actors engine handles Boon code generically - no example-specific code needed. The DD engine accumulated hacks/workarounds to make examples work instead of being properly generic.
 
-| Store | Purpose | Business Logic? |
-|-------|---------|-----------------|
-| `EDITING_GRACE_PERIOD` | Debounce blur events | ✅ Timer logic |
-| `ROUTER_MAPPINGS` | URL → filter state | ✅ Route logic |
-| `CHECKBOX_TOGGLE_HOLDS` | Track checkbox states | ✅ UI state |
-| `TEXT_CLEAR_CELLS` | Clear input after submit | ✅ Form logic |
-| `EDITING_EVENT_BINDINGS` | Edit mode handlers | ✅ UI behavior |
-| `TOGGLE_EVENT_BINDINGS` | Toggle handlers | ✅ UI behavior |
-| `GLOBAL_TOGGLE_BINDINGS` | Global toggle handlers | ✅ UI behavior |
-| `TEXT_INPUT_KEY_DOWN_LINK` | Key handler | ✅ UI behavior |
-| `LIST_CLEAR_LINK` | Clear list handler | ✅ UI behavior |
-| `HAS_TEMPLATE_LIST` | Template detection | ⚠️ Configuration |
-| `CURRENT_ROUTE` | Current URL | ✅ Route state |
-| `LIST_VAR_NAME` | List variable name | ⚠️ Configuration |
-| `ELEMENTS_FIELD_NAME` | Elements field | ⚠️ Configuration |
-| `GLOBAL_DISPATCHER` | Event channel | ❌ Keep in IO |
-| `TASK_HANDLE` | Async task | ❌ Keep in IO |
-| `OUTPUT_LISTENER_HANDLE` | Output listener | ❌ Keep in IO |
+**Key insight:** The Boon code (todo_mvc, shopping_list, etc.) already works correctly with the actors engine. The DD engine should execute the same code with the same genericity.
 
-### Phase 11a: Event Dispatch as DD Operator
+### Hacks in DD Engine vs Generic Actors Engine
+
+| Hack | Why It Exists | Actors Engine | DD Engine Fix |
+|------|---------------|---------------|---------------|
+| `EDITING_GRACE_PERIOD` | DD event timing bug | Not needed | Fix event ordering |
+| `ROUTER_MAPPINGS` | Reimplemented routing | Uses Boon code | Use Zoon's Router |
+| `CHECKBOX_TOGGLE_HOLDS` | State tracking workaround | Generic cell handling | Generic cell handling |
+| `TEXT_CLEAR_CELLS` | Form clear workaround | Boon THEN handles it | Generic transforms |
+| `*_EVENT_BINDINGS` | Event routing workarounds | Generic LINK handling | Generic LINK handling |
+
+### Phase 11a: Remove ROUTER_MAPPINGS (All Links Go to DD)
+
+**Status:** ✅ COMPLETE (2026-01-18)
+
+The DD engine had routing logic in the I/O layer that bypassed DD dataflow:
 
 ```rust
-// Current (IO layer)
-thread_local! {
-    static EDITING_GRACE_PERIOD: RefCell<HashMap<String, Instant>> = ...;
-}
-
-fn fire_global_blur(link_id: &str) {
-    // Business logic: grace period check
-    if within_grace_period(link_id) {
-        return;  // Suppress event
-    }
-    send_event(link_id, "blur");
-}
-```
-
-```rust
-// Target (DD operator)
-fn grace_period_filter<G: Scope>(
-    blur_events: &Collection<G, (LinkId, Event), isize>,
-    grace_markers: &Collection<G, (LinkId, Timestamp), isize>,
-) -> Collection<G, (LinkId, Event), isize> {
-    // DD temporal join: only emit blur if no recent grace marker
-    blur_events
-        .antijoin(&grace_markers.filter(|(_link, ts)| {
-            *ts > current_time() - GRACE_PERIOD_MS
-        }))
-}
-```
-
-### Phase 11b: Router as DD Collection
-
-```rust
-// Current (IO layer)
+// ❌ OLD: I/O layer intercepted link events before DD
 thread_local! {
     static ROUTER_MAPPINGS: RefCell<Vec<(String, String, CellId)>> = ...;
 }
 
-fn set_filter_from_route(path: &str) {
-    // Business logic: find mapping, update cell
-    for (pattern, value, cell_id) in ROUTER_MAPPINGS.borrow().iter() {
-        if path.matches(pattern) {
-            update_cell(cell_id, value);
-        }
+fn fire_global_link(link_id: &str) {
+    // Check ROUTER_MAPPINGS first - BYPASSED DD!
+    if check_router_mapping(link_id) {
+        return;  // Never reached DD
     }
+    inject_to_dd(link_id);
 }
 ```
 
-```rust
-// Target (DD collection + join)
-struct RouterMapping {
-    pattern: RoutePattern,
-    cell_id: CellId,
-    value: Value,
-}
+**Fix Implemented (2026-01-18):**
 
-fn route_filter<G: Scope>(
-    route_events: &Collection<G, String, isize>,
-    mappings: &Collection<G, RouterMapping, isize>,
-) -> Collection<G, (CellId, Value), isize> {
-    // DD join: route → matching mappings → cell updates
-    route_events
-        .flat_map(|path| mappings.filter(|m| m.pattern.matches(&path)))
-        .map(|mapping| (mapping.cell_id, mapping.value))
+REMOVED routing interception from I/O layer:
+
+```rust
+// ✅ NEW: ALL link events go to DD (no bypass)
+// SURGICALLY REMOVED: ROUTER_MAPPINGS, add_router_mapping, clear_router_mappings, check_router_mapping
+//
+// Current architecture:
+// - fire_global_link() always injects to DD (no ROUTER_MAPPINGS check)
+// - Routing functions (set_filter_from_route, etc.) kept for DD output observer
+// - Router/go_to() will become DD operator that outputs navigation commands
+
+pub fn fire_global_link(link_id: &str) {
+    // Phase 11a: ALL link events go to DD now (ROUTER_MAPPINGS bypass removed)
+    GLOBAL_DISPATCHER.with(|cell| {
+        if let Some(injector) = cell.borrow().as_ref() {
+            injector.fire_link_unit(LinkId::new(link_id));
+        }
+    });
 }
 ```
 
-### Phase 11c: Toggle/Checkbox State as DD
+**Future work:**
+- Router/go_to() becomes DD operator that outputs navigation commands
+- Output observer calls `set_filter_from_route()` when receiving navigation output
+
+### Phase 11b: Fix Event Ordering (Remove Broadcast Anti-Pattern)
+
+**Status:** ✅ COMPLETE - `cell_states_signal()` REMOVED
+
+**Root Cause Analysis (2026-01-18):**
+
+The blur issue was caused by **coarse signals** - a global broadcast anti-pattern:
+- `cell_states_signal()` fired on ANY cell change (O(n) re-evaluation)
+- When user typed in text_input, `title` cell changed
+- This triggered list re-render → element replacement → browser blur
+
+**Key Insight: "Actors-Style" = Fine-Grained Reactivity**
+
+Investigation revealed both engines use **element replacement** for WHILE (not show/hide).
+The key difference is **subscription granularity**:
+
+| Engine | Pattern | Result |
+|--------|---------|--------|
+| Actors | Each actor subscribes to specific inputs | Typing doesn't trigger unrelated WHILE |
+| DD (old) | `cell_states_signal()` broadcasts ALL changes | Typing triggers list re-render → blur |
+
+**Fix Implemented (2026-01-18):**
+
+REMOVED `cell_states_signal()` entirely - it was the anti-pattern:
 
 ```rust
-// Current (IO layer)
+// ═══════════════════════════════════════════════════════════════════════════
+// SURGICALLY REMOVED: cell_states_signal()
+//
+// This was the global broadcast anti-pattern:
+// - Fired on ANY cell change (O(n) re-evaluation)
+// - Caused spurious re-renders throughout the UI
+// - Root cause of blur issues in WHILE editing (required grace period hack)
+//
+// The actors engine doesn't have this problem because each actor subscribes
+// only to its specific inputs (fine-grained reactivity).
+//
+// Use instead:
+// - cell_signal(cell_id) - watch single cell
+// - cells_signal(cell_ids) - watch multiple specific cells
+// ═══════════════════════════════════════════════════════════════════════════
+```
+
+**Files Modified:**
+- `io/outputs.rs` - Function removed with explanatory comment
+- `io/mod.rs` - Export removed
+- `render/bridge.rs` - Import removed
+
+**Grace Period:**
+With the broadcast anti-pattern removed, the grace period may no longer be needed.
+The remaining code that referenced `cell_states_signal()` is dead code in the broken
+DD engine (intentionally broken during big-bang migration).
+
+### Phase 11c: Generic LINK Handling (Remove *_EVENT_BINDINGS)
+
+Multiple thread_locals exist because DD LINK handling isn't generic:
+
+```rust
+// ❌ CURRENT: Separate tracking for each event pattern
 thread_local! {
-    static CHECKBOX_TOGGLE_HOLDS: RefCell<HashMap<String, CellId>> = ...;
+    static EDITING_EVENT_BINDINGS: RefCell<HashMap<...>> = ...;
+    static TOGGLE_EVENT_BINDINGS: RefCell<Vec<...>> = ...;
+    static GLOBAL_TOGGLE_BINDINGS: RefCell<Vec<...>> = ...;
+    static TEXT_INPUT_KEY_DOWN_LINK: RefCell<Option<...>> = ...;
+    static LIST_CLEAR_LINK: RefCell<Option<...>> = ...;
+}
+```
+
+```rust
+// ✅ TARGET: Generic LINK handling like actors engine
+//
+// Actors engine uses ONE generic mechanism:
+// - LINK creates event subscription
+// - Event fires → evaluates LINK body
+// - Body result updates state
+//
+// DD should have same generic pattern:
+// - LinkCellMapping (from Phase 8) handles all LINK types
+// - No separate stores per event pattern
+// - Bridge routes events, DD handles state updates
+```
+
+### Phase 11d: Generic Form Handling (Remove TEXT_CLEAR_CELLS)
+
+```rust
+// ❌ CURRENT: Special case for clearing text inputs
+thread_local! {
+    static TEXT_CLEAR_CELLS: RefCell<HashSet<String>> = ...;
 }
 
-// Target (DD arrangement)
-// Checkbox state lives in DD cell_states collection
-// Toggle handlers are LinkCellMappings (already in Phase 8)
-// No separate IO tracking needed
+// ✅ TARGET: Boon THEN already handles this
+// submit_link |> THEN { [text: ""] }
+//
+// DD should execute this generically like actors engine.
+// No special TEXT_CLEAR_CELLS tracking needed.
 ```
+
+### What Should Remain in IO Layer
+
+Only infrastructure/browser interface code:
+
+| Keep | Purpose |
+|------|---------|
+| `GLOBAL_DISPATCHER` | Event channel (browser → DD) |
+| `TASK_HANDLE` | Async task management |
+| `OUTPUT_LISTENER_HANDLE` | DD output subscription |
+
+Everything else is either:
+- A hack that should be removed by fixing DD genericity
+- Functionality that Zoon already provides (Router)
+- Configuration that should be passed at init, not stored globally
 
 ### Tasks
 
 | Task | Description | Est. Hours |
 |------|-------------|------------|
-| 11.1 | Implement `grace_period_filter` DD operator | 8 |
-| 11.2 | Remove `EDITING_GRACE_PERIOD` thread_local | 2 |
-| 11.3 | Implement `route_filter` DD operator | 6 |
-| 11.4 | Remove `ROUTER_MAPPINGS` thread_local | 2 |
-| 11.5 | Move `CHECKBOX_TOGGLE_HOLDS` to DD (use Phase 8 mappings) | 4 |
-| 11.6 | Move `TEXT_CLEAR_CELLS` to DD cell transforms | 4 |
-| 11.7 | Move `EDITING_EVENT_BINDINGS` to DD | 4 |
-| 11.8 | Move `TOGGLE_EVENT_BINDINGS` to DD | 4 |
-| 11.9 | Move `GLOBAL_TOGGLE_BINDINGS` to DD | 4 |
-| 11.10 | Move `TEXT_INPUT_KEY_DOWN_LINK` to DD | 2 |
-| 11.11 | Move `LIST_CLEAR_LINK` to DD | 2 |
-| 11.12 | Move `CURRENT_ROUTE` to DD state | 2 |
-| 11.13 | Clean up dead IO code | 4 |
-| 11.14 | Test all examples with pure DD IO | 6 |
+| 11.1 | Replace `ROUTER_MAPPINGS` with Zoon's Router | 6 |
+| 11.2 | Remove `CURRENT_ROUTE` (use Zoon's Router signal) | 2 |
+| 11.3 | Fix DD event ordering to match actors engine | 8 |
+| 11.4 | Remove `EDITING_GRACE_PERIOD` after event fix | 2 |
+| 11.5 | Consolidate `*_EVENT_BINDINGS` into generic LINK handling | 6 |
+| 11.6 | Remove `TEXT_CLEAR_CELLS` (use generic THEN) | 2 |
+| 11.7 | Remove `CHECKBOX_TOGGLE_HOLDS` (use generic cell handling) | 2 |
+| 11.8 | Pass configuration at init instead of global stores | 4 |
+| 11.9 | Clean up dead IO code | 4 |
+| 11.10 | Verify all examples work identically to actors engine | 8 |
 
-**Estimated effort**: 54 hours
+**Estimated effort**: 44 hours
 
 ### Verification
 
 ```bash
 # After Phase 11:
 
-# 1. Minimal thread_local in IO
+# 1. Minimal thread_local in IO (only infrastructure)
 grep -n "thread_local!" crates/boon/src/platform/browser/engine_dd/io/
 # Should only show: GLOBAL_DISPATCHER, TASK_HANDLE, OUTPUT_LISTENER_HANDLE
 
-# 2. No business logic in inputs.rs
+# 2. IO layer is thin (no business logic)
 wc -l crates/boon/src/platform/browser/engine_dd/io/inputs.rs
-# Should be <200 lines (currently ~500+)
+# Should be <150 lines (currently ~500+)
 
-# 3. Grace period handled by DD
-# Double-click to edit, then click away quickly
-# Should NOT exit edit mode (grace period active)
-# This behavior now comes from DD, not IO
+# 3. No routing reimplementation
+grep -n "ROUTER_MAPPINGS\|CURRENT_ROUTE" crates/boon/src/platform/browser/engine_dd/
+# Should return 0 matches
+
+# 4. Examples work identically to actors engine
+# Run todo_mvc with actors engine, note behavior
+# Run todo_mvc with DD engine, compare
+# All interactions should be identical
 ```
+
+### Success Criteria
+
+The DD engine is "generic enough" when:
+
+1. **No example-specific code** - Engine handles all Boon patterns generically
+2. **Same behavior as actors engine** - Identical results for same Boon code
+3. **Uses Zoon capabilities** - Router, signals, etc. from Zoon, not reimplemented
+4. **Minimal IO layer** - Only browser↔DD interface, no business logic
 
 ---
 
 ## Phase 12: Incremental Rendering
 
-**Status:** 🔴 NOT STARTED
+**Status:** ✅ ADAPTER CREATED - List adapter module provides VecDiff conversion for incremental DOM updates
+
+### Phase 12 Implementation (2026-01-18)
+
+Created `render/list_adapter.rs` with pure stream-based DD-to-VecDiff conversion:
+
+```rust
+// Core API: Convert DD diff stream to VecDiff stream
+pub fn dd_diffs_to_vec_diff_stream(
+    diff_stream: impl Stream<Item = DdDiffBatch>,
+    initial_items: Vec<Value>,
+) -> impl Stream<Item = VecDiff<Value>>
+
+// Convenience wrapper for capture().extract() output
+pub fn dd_captured_to_vec_diff_stream(
+    captured: Vec<(u64, DdDiffBatch)>,
+    initial_items: Vec<Value>,
+) -> impl Stream<Item = VecDiff<Value>>
+
+// Synchronous processing for immediate use
+pub fn process_diff_batch_sync(
+    items: &mut Vec<Value>,
+    batch: DdDiffBatch,
+) -> Vec<VecDiff<Value>>
+
+// Keyed adapter for O(1) removal by persistence ID
+pub struct KeyedListAdapter<F> { ... }
+```
+
+**Design follows actors engine pattern:**
+- Uses `stream::scan()` to track list state in closure
+- Pure stream transformation, no globals, no spawned tasks
+- Maps DD diffs directly to VecDiff variants:
+  - `+1 diff` → `VecDiff::Push`
+  - `-1 diff` → `VecDiff::RemoveAt`
+
+**Bridge integration (when DD engine ready):**
+```rust
+El::new().children_signal_vec(
+    dd_captured_to_vec_diff_stream(captured, initial_items)
+        .to_signal_vec()
+        .map(|item| render_item(&item))
+)
+```
+
+### The Zoon Approach: Granular Signals for Efficient Diffing
+
+Zoon (MoonZoon's frontend framework) already handles virtual DOM diffing internally. The key to efficient incremental rendering is using **granular signals** so Zoon can detect exactly what changed.
+
+#### Current Problem: Coarse Signal Granularity
+
+```rust
+// bridge.rs - Current approach uses ONE signal for all state
+cell_states_signal()  // Returns Signal<HashMap<String, Value>>
+    .map(|states| {
+        // Re-evaluates entire render tree when ANY cell changes!
+        render_from_states(&states)
+    })
+```
+
+When `cell_states_signal()` fires (on ANY cell change), Zoon re-evaluates the entire render closure. Even though Zoon then diffs the virtual DOM, we're doing O(n) work to BUILD the virtual DOM on every change.
+
+#### Solution: Per-Cell Signals with Property Binding
+
+The key insight: **Element structure is STATIC, only properties are REACTIVE.**
+
+```rust
+// Target: Granular signals per cell
+pub fn cell_signal(cell_id: &str) -> impl Signal<Item = Option<Value>> {
+    // Only fires when THIS cell changes
+    CELL_STATES.signal_ref(move |states| states.get(cell_id).cloned())
+}
+
+// ❌ WRONG - recreates element on every signal fire (defeats granular signals!)
+El::new()
+    .child_signal(cell_signal("todo_1.completed").map(|v| {
+        Checkbox::new().checked(v.as_bool().unwrap_or(false))  // NEW element each time!
+    }))
+
+// ✅ CORRECT - element created ONCE, only property updates reactively
+fn render_todo_item(item_cell_id: &str) -> impl Element {
+    let title_id = format!("{}.title", item_cell_id);
+    let completed_id = format!("{}.completed", item_cell_id);
+
+    El::new()
+        // Text element created ONCE, text content updates via signal
+        .child(Text::with_signal(
+            cell_signal(&title_id).map(|v| v.as_text().unwrap_or_default())
+        ))
+        // Checkbox element created ONCE, checked property updates via signal
+        .child(Checkbox::new()
+            .checked_signal(cell_signal(&completed_id).map(|v| v.as_bool().unwrap_or(false)))
+        )
+    // ^ This entire element tree is built ONCE at render time
+    // No elements are recreated - only their bound properties update
+}
+```
+
+#### Why This Matters: No Element Recreation
+
+| Pattern | What Happens | Cost |
+|---------|--------------|------|
+| `.child_signal(sig.map(\|v\| Element::new()))` | New element on every signal fire | O(n) DOM churn, loses focus/state |
+| `Element::new().prop_signal(sig)` | One element, property updates | O(1) property update only |
+
+Zoon's `_signal` method variants (`checked_signal`, `text_signal`, etc.) bind a signal directly to an element property. The element is created once; only the property value changes when the signal fires.
+
+#### Why Granular Signals Enable O(1) Updates
+
+1. **Static Structure**: Element tree built once with `_signal` bindings
+2. **Property Binding**: Each property subscribes to its specific cell signal
+3. **Targeted Update**: When DD updates a cell, only that property updates
+4. **No Diffing Needed**: Direct property update, no virtual DOM comparison
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  CURRENT (Coarse Signal + Element Recreation):                   │
+│                                                                 │
+│  DD updates "todo_1.completed"                                  │
+│    → cell_states_signal() fires                                 │
+│    → ENTIRE render closure re-runs (O(n))                       │
+│    → All elements recreated (O(n))                              │
+│    → Zoon diffs virtual DOM (O(n))                              │
+│    → DOM patched (O(delta))                                     │
+│                                                                 │
+│  Total: O(n) work, loses focus/scroll/input state               │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  TARGET (Granular Signals + Property Binding):                   │
+│                                                                 │
+│  DD updates "todo_1.completed"                                  │
+│    → cell_signal("todo_1.completed") fires                      │
+│    → Checkbox.checked property updates (O(1))                   │
+│    → Direct DOM property set (O(1))                             │
+│    → No diffing, no element recreation                          │
+│                                                                 │
+│  Total: O(1) work, all state preserved                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Two Complementary Approaches
+
+Phase 12 addresses two different types of changes:
+
+| Change Type | Solution | Example |
+|-------------|----------|---------|
+| **Property within item** | Granular signals + `_signal` bindings | Toggle todo checkbox |
+| **List structure** | Diff-based list rendering | Add/remove todo item |
+
+Both are needed for complete O(delta) rendering:
+- Granular signals handle **scalar cell updates** → O(1)
+- Diff-based lists handle **collection mutations** → O(delta)
+
+---
 
 ### The Problem: Full Re-render on Every Change
 
@@ -2148,105 +2397,109 @@ fn render_list(&self, items: &[Value]) -> RawElement {
 3. Browser layout thrashing
 4. Memory churn (create/destroy elements)
 
-### The Solution: Diff-Based DOM Updates
+### The Solution: SignalVec and VecDiff
 
-Instead of re-creating elements, apply diffs to existing DOM:
+Zoon uses `futures-signals` which provides `SignalVec` - a reactive vector that emits incremental diffs:
 
 ```rust
-// Target: Incremental rendering
-pub struct ListRenderer {
-    /// Maps item identity → DOM element
-    element_map: HashMap<ItemKey, web_sys::Element>,
-    /// Container element
-    container: web_sys::Element,
-}
-
-impl ListRenderer {
-    pub fn apply_diffs(&mut self, diffs: &[(Value, isize)]) {
-        for (value, diff) in diffs {
-            let key = self.extract_key(value);
-
-            match diff {
-                1 => {
-                    // INSERT: Create element, add to map and DOM
-                    let element = self.render_item(value);
-                    self.element_map.insert(key.clone(), element.clone());
-                    self.container.append_child(&element);
-                }
-                -1 => {
-                    // REMOVE: Find element, remove from map and DOM
-                    if let Some(element) = self.element_map.remove(&key) {
-                        self.container.remove_child(&element);
-                    }
-                }
-                _ => {
-                    // UPDATE: Modify existing element in place
-                    if let Some(element) = self.element_map.get(&key) {
-                        self.update_element(element, value);
-                    }
-                }
-            }
-        }
-    }
+// futures-signals VecDiff enum - represents incremental changes
+pub enum VecDiff<T> {
+    Replace { values: Vec<T> },      // Initial load or full reset
+    InsertAt { index: usize, value: T },
+    UpdateAt { index: usize, value: T },
+    RemoveAt { index: usize },
+    Move { old_index: usize, new_index: usize },
+    Push { value: T },
+    Pop {},
+    Clear {},
 }
 ```
 
-### Item Identity for Keyed Updates
+DD's collection diffs map directly to `VecDiff`:
 
-For incremental rendering to work, we need stable item identities:
+| DD Diff | VecDiff |
+|---------|---------|
+| `(item, t, +1)` | `InsertAt` or `Push` |
+| `(item, t, -1)` | `RemoveAt` |
+| Initial snapshot | `Replace { values }` |
+
+### Converting DD Collections to SignalVec
 
 ```rust
-// Items need stable keys
-pub enum ItemKey {
-    /// For templated items: the dynamic ID assigned at creation
-    DynamicId(u32),
-    /// For static items: index in original list
-    Index(usize),
-    /// For items with explicit key field
-    UserKey(Value),
-}
+use futures_signals::signal_vec::{SignalVec, MutableVec, VecDiff};
 
-// Extract key from item
-fn extract_key(value: &Value) -> ItemKey {
-    match value {
-        Value::Record(fields) => {
-            // Check for __dynamic_id (from template instantiation)
-            if let Some(id) = fields.get("__dynamic_id") {
-                return ItemKey::DynamicId(id.as_u32());
-            }
-            // Check for user-provided key
-            if let Some(key) = fields.get("key") {
-                return ItemKey::UserKey(key.clone());
+/// Converts DD collection diffs to a SignalVec
+fn collection_signal_vec(collection_cell_id: &str) -> impl SignalVec<Item = Value> {
+    // MutableVec maintains the current state and emits VecDiff on changes
+    let vec = MutableVec::new();
+
+    // Subscribe to DD diffs for this collection
+    spawn_local({
+        let vec = vec.clone();
+        async move {
+            let mut receiver = subscribe_to_collection_diffs(collection_cell_id);
+            while let Some((value, diff)) = receiver.next().await {
+                match diff {
+                    1 => vec.lock_mut().push_cloned(value),   // +1 = insert
+                    -1 => {                                     // -1 = remove
+                        let mut lock = vec.lock_mut();
+                        if let Some(pos) = lock.iter().position(|v| v == &value) {
+                            lock.remove(pos);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
-        _ => {}
-    }
-    // Fallback: use value hash
-    ItemKey::Index(hash(value) as usize)
+    });
+
+    vec.signal_vec_cloned()
 }
 ```
 
-### Architecture: Reactive Signals with Diff Observation
+### Usage in Bridge: children_signal_vec
+
+```rust
+// ❌ WRONG - recreates ALL children on any change
+El::new().children(
+    items.iter().map(|item| render_todo_item(item)).collect()
+)
+
+// ✅ CORRECT - Zoon handles incremental DOM updates via VecDiff
+El::new().children_signal_vec(
+    collection_signal_vec("todos")
+        .map(|item| render_todo_item(&item))  // Only called for NEW items!
+)
+```
+
+When `children_signal_vec` receives:
+- `VecDiff::Push { value }` → Creates ONE new element, appends to DOM
+- `VecDiff::RemoveAt { index }` → Removes ONE element from DOM
+- `VecDiff::InsertAt { index, value }` → Creates ONE element, inserts at position
+
+**No custom ListRenderer needed** - Zoon's `children_signal_vec` already handles this!
+
+### Architecture: DD → SignalVec → Zoon
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  DD Dataflow                                                     │
-│  └── cell_states collection                                      │
-│      └── arranged by CellId                                      │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓ (diffs)
-┌─────────────────────────────────────────────────────────────────┐
-│  Diff Channel (mpsc)                                             │
-│  └── (CellId, Value, +1/-1)                                      │
+│  └── collection with diffs: (Value, time, +1/-1)                │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│  ListRenderer                                                    │
-│  ├── element_map: HashMap<ItemKey, Element>                      │
-│  └── apply_diffs():                                              │
-│      +1 → create element, insert                                 │
-│      -1 → find element, remove                                   │
-│      update → modify in place                                    │
+│  DD-to-SignalVec Adapter                                         │
+│  └── Converts (Value, +1/-1) → VecDiff enum                     │
+│      +1 → VecDiff::Push or InsertAt                             │
+│      -1 → VecDiff::RemoveAt                                     │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  Zoon children_signal_vec()                                      │
+│  └── Receives VecDiff, updates DOM incrementally                │
+│      Push → appendChild                                         │
+│      RemoveAt → removeChild                                     │
+│      InsertAt → insertBefore                                    │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
@@ -2254,6 +2507,39 @@ fn extract_key(value: &Value) -> ItemKey {
 │  └── Preserved: focus, scroll, animations, input values          │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### Nested Item Properties: Combine SignalVec + Granular Signals
+
+For a todo list where each item has reactive properties:
+
+```rust
+fn render_todo_list(list_cell_id: &str) -> impl Element {
+    El::new()
+        .children_signal_vec(
+            collection_signal_vec(list_cell_id)
+                .map(|item| {
+                    // Each item gets its own cell ID
+                    let item_cell_id = item.get("__cell_id").as_str();
+
+                    // Element created ONCE per item
+                    // Properties bound to granular signals
+                    El::new()
+                        .child(Text::with_signal(
+                            cell_signal(&format!("{}.title", item_cell_id))
+                        ))
+                        .child(Checkbox::new()
+                            .checked_signal(cell_signal(&format!("{}.completed", item_cell_id)))
+                        )
+                })
+        )
+}
+```
+
+**Result:**
+- Add item → ONE element created (VecDiff::Push)
+- Remove item → ONE element removed (VecDiff::RemoveAt)
+- Toggle checkbox → ONE property updated (granular signal)
+- Edit title → ONE text node updated (granular signal)
 
 ### Filter Predicates in DD (Not Render Callbacks)
 
@@ -2289,31 +2575,39 @@ let visible_items = items
 
 ### Tasks
 
-| Task | Description | Est. Hours |
-|------|-------------|------------|
-| 12.1 | Define `ItemKey` enum for stable item identity | 2 |
-| 12.2 | Add `__dynamic_id` to template instantiation | 4 |
-| 12.3 | Create `ListRenderer` struct with element map | 6 |
-| 12.4 | Implement `apply_diffs()` for insert/remove/update | 8 |
-| 12.5 | Create diff channel from DD to bridge | 4 |
-| 12.6 | Replace `render_list()` with `ListRenderer` | 6 |
-| 12.7 | Move filter predicates from render to DD operator | 8 |
-| 12.8 | Handle nested lists (recursive diff application) | 8 |
-| 12.9 | Preserve DOM state (focus, scroll) during updates | 4 |
-| 12.10 | Performance benchmark: 10,000 items, toggle one | 4 |
-| 12.11 | Test animations during incremental updates | 4 |
-| 12.12 | Clean up dead rendering code | 4 |
+| Task | Description | Est. Hours | Status |
+|------|-------------|------------|--------|
+| 12.1 | Create `cell_signal(cell_id)` function for per-cell signals | 2 | ✅ DONE |
+| 12.2 | Create `collection_signal_vec(cell_id)` DD→SignalVec adapter | 4 | |
+| 12.3 | Update bridge to use `_signal` method variants for properties | 6 | ⚠️ 10 converted (incl. cells_signal), 9 remain |
+| 12.4 | Update bridge to use `children_signal_vec` for lists | 4 | |
+| 12.5 | Add `__cell_id` to template-instantiated items | 2 | |
+| 12.6 | Move filter predicates from render to DD operator | 6 | |
+| 12.7 | Handle nested lists (recursive signal_vec) | 4 | |
+| 12.8 | Performance benchmark: 10,000 items, toggle one | 2 | |
+| 12.9 | Test DOM state preservation (focus, scroll, input) | 2 | |
+| 12.10 | Clean up dead rendering code | 2 | |
 
-**Estimated effort**: 62 hours
+**Estimated effort**: 34 hours
+
+**Note:** Effort reduced from 62 hours because we leverage Zoon's built-in `SignalVec`/`VecDiff` instead of building custom `ListRenderer`.
 
 ### Verification
 
 ```bash
 # After Phase 12:
 
-# 1. No full re-render calls
-grep -n "render_list\|children(.*collect)" crates/boon/src/platform/browser/engine_dd/render/bridge.rs
-# Should return 0 matches (using ListRenderer.apply_diffs instead)
+# 1. Uses SignalVec for lists (not .children().collect())
+grep -n "children_signal_vec" crates/boon/src/platform/browser/engine_dd/render/bridge.rs
+# Should return matches for list rendering
+
+# 2. Uses _signal method variants (not element recreation in .map())
+grep -n "checked_signal\|text_signal\|with_signal" crates/boon/src/platform/browser/engine_dd/render/bridge.rs
+# Should return matches for property bindings
+
+# 3. No full re-render patterns
+grep -n "\.children(.*\.collect())" crates/boon/src/platform/browser/engine_dd/render/bridge.rs
+# Should return 0 matches
 
 # 2. Performance test: 10,000 items
 # Time to toggle one checkbox: <5ms (vs ~500ms with full re-render)
@@ -2342,7 +2636,7 @@ Phase 9: True Incremental Lists
   ↓ (enables O(delta) operations)
 Phase 10: Eliminate inspect() Side Effects
   ↓ (enables pure DD)
-Phase 11: Move Business Logic from IO to DD
+Phase 11: Make DD Engine Generic
   ↓ (enables clean architecture)
 Phase 12: Incremental Rendering
   ↓ (enables O(delta) rendering)
@@ -2355,7 +2649,7 @@ Total estimated effort: 212 hours (~5-6 weeks)
 1. **Phase 9** (54h) - Highest impact, enables true O(delta) for lists
 2. **Phase 12** (62h) - Complements Phase 9, renders diffs not full lists
 3. **Phase 10** (42h) - Architecture cleanup, pure DD
-4. **Phase 11** (54h) - Final cleanup, minimal IO layer
+4. **Phase 11** (44h) - Make DD engine generic, remove hacks
 
 **Why Phase 9 before Phase 12?**
 Phase 12 (incremental rendering) REQUIRES Phase 9 (collection handles) to provide diffs. Without diffs, we have nothing to apply incrementally.
@@ -2374,7 +2668,8 @@ Phase 12 delivers immediate user-visible performance improvement. Phase 10 is in
 | **DD outputs** | `inspect()` side effects | Output trace/cursor |
 | **State authority** | CELL_STATES (worker reads/writes) | DD internal (CELL_STATES is cache) |
 | **IO layer** | 13 business logic stores | 3 infrastructure stores |
-| **Rendering** | Full re-render | Diff-based incremental |
+| **List rendering** | `.children(items.collect())` | `children_signal_vec()` + VecDiff |
+| **Property updates** | Element recreation in `.map()` | `_signal` bindings (O(1)) |
 | **Filter evaluation** | In render callback | DD filter operator |
 | **DOM preservation** | Lost on any change | Preserved across updates |
 
@@ -2382,4 +2677,510 @@ The end result is a **pure DD engine** where:
 - All state lives in DD collections
 - All operations are O(delta)
 - IO layer is thin browser interface only
-- Rendering applies diffs, not full replacements
+- List rendering uses Zoon's `SignalVec`/`VecDiff` for incremental updates
+- Property updates use granular `_signal` bindings (no element recreation)
+
+---
+
+## Honest Assessment: Implementation Reality (2026-01-18)
+
+> **CRITICAL FINDING**: Phases documented as "COMPLETE" are actually *partial implementations*.
+> Infrastructure exists but is disconnected from hot paths. The engine is in a hybrid state.
+
+### Phase Status Reality Check
+
+| Phase | Documented | Actual | Gap |
+|-------|------------|--------|-----|
+| Phase 6 (Single State Authority) | ✅ COMPLETE | 🟡 Partial | Worker still reads CELL_STATES in transforms via `get_cell_value()` |
+| Phase 7 (O(delta) List Operations) | ✅ COMPLETE | 🔴 Not True | **25 `.to_vec()` calls** in hot paths materialize full lists |
+| Phase 8 (Pure LINK Handling) | ✅ COMPLETE | 🟡 Hybrid | IO layer still has 8 business logic violations |
+| Phase 9 (True Incremental Lists) | ✅ COMPLETE | 🔴 Not True | Lists still use `Arc<Vec<Value>>`, not DD CollectionHandle |
+| Phase 10 (Eliminate inspect()) | ✅ COMPLETE | 🟡 Partial | worker.rs uses `capture()`, dataflow.rs still has legacy `inspect()` |
+| Phase 11 (Generic DD Engine) | ✅ COMPLETE | 🟡 Partial | Still has TodoMVC-specific handlers (EditingHandlerConfig) |
+| Phase 12 (Incremental Rendering) | ✅ ADAPTER CREATED | 🔴 Unused | `dd_diffs_to_vec_diff_stream()` exists but bridge never calls it |
+
+### Critical Violations Found
+
+#### 1. O(n) Operations (25 locations) - Should Be O(delta)
+
+Every list operation clones the entire list:
+
+```rust
+// worker.rs line 2487 - EVERY append does this:
+let mut new_items: Vec<Value> = items.to_vec();  // O(n) copy!
+new_items.push(new_data_item);                    // O(1)
+Value::collection(new_items)
+```
+
+**Impact**: For a 1000-item list, adding one item costs O(1000), not O(1).
+
+| Operation | Should Be | Actually Is | Count |
+|-----------|-----------|-------------|-------|
+| List Append | O(1) | O(n) `.to_vec()` | 4 |
+| List Remove | O(delta) | O(n²) scan + shift | 2 |
+| List Filter | O(delta) | O(n) iteration | 2 |
+| RemoveListItem | O(1) | O(n*a*m) nested loops | 1 |
+
+#### 2. IO Layer Business Logic (8 violations)
+
+The IO layer (`inputs.rs`) should be thin routing, but contains:
+
+| Violation | Location | Description |
+|-----------|----------|-------------|
+| Pattern matching state transforms | lines 236-320 | `DynamicLinkAction` handling with business logic |
+| Grace period state | lines 242-244 | `EDITING_HOLDS_GRACE_PERIOD` temporal logic |
+| Hover deduplication | lines 379-403 | Should be DD `dedup()` operator |
+| String event parsing | lines 518-584 | `"Enter:"`, `"Escape"` handling |
+| Cell value lookups | lines 383, 413 | Reads CELL_STATES to make decisions |
+| Text encoding logic | line 568 | Colon escaping for event format |
+| Synthetic hold naming | lines 409-426 | `"hover_"` prefix logic |
+| Value change detection | lines 412-417 | Filter logic (should be DD) |
+
+#### 3. Worker State Mutations
+
+```rust
+// worker.rs lines 1822-1833 - Writes OUTSIDE capture() mechanism
+for output in outputs {
+    sync_cell_from_dd_with_persist(&cell_id, value);  // DIRECT WRITE
+}
+```
+
+Phase 10 claims pure DD output via `capture()`, but implementation still writes synchronously to global state.
+
+```rust
+// worker.rs lines 64-68 - Side effects in DD operators!
+static DYNAMIC_CELL_COUNTER: AtomicU32 = AtomicU32::new(1000);
+// ID generation happens INSIDE DD transform closures
+```
+
+#### 4. Bridge Ignores Incremental Adapter
+
+```rust
+// bridge.rs lines 239-244 - Full iteration on every render
+Value::List(items) => {
+    let children: Vec<RawElOrText> = items.iter()
+        .map(|item| render_dd_value(item))
+        .collect();  // O(n)
+}
+```
+
+The `list_adapter.rs` module has `dd_diffs_to_vec_diff_stream()` for O(delta) rendering, but bridge.rs never imports or uses it.
+
+#### 5. Type System Gaps
+
+| Issue | Location | Fix Needed |
+|-------|----------|------------|
+| LinkId is String-based | types.rs | Should be enum like CellId |
+| Magic prefixes | types.rs | `"dynamic_cell_"`, `"Enter:"`, etc. |
+| Hardcoded field names | worker.rs | `title_cell_field`, `elements_hold` |
+| Example-specific handlers | types.rs | `EditingHandlerConfig` is TodoMVC-only |
+
+### Architecture Pattern Observation
+
+The DD engine follows a common migration anti-pattern:
+- **Marking phases "COMPLETE" when infrastructure exists, not when it's used**
+- The `capture()` mechanism exists ✓
+- The VecDiff adapter exists ✓
+- The typed CellId exists ✓
+- **But the actual data paths bypass all of them**
+
+### Estimated Work Remaining
+
+| Category | Hours | Priority |
+|----------|-------|----------|
+| O(delta) List Operations | 80 | 🔴 CRITICAL |
+| Pure IO Layer | 30 | 🟠 HIGH |
+| Bridge Integration | 40 | 🟠 HIGH |
+| Type System Cleanup | 20 | 🟡 MEDIUM |
+| **Total** | **170** | ~4-5 weeks |
+
+### Recommended Fix Order
+
+1. **Wire VecDiff adapter to bridge** (40h) - Infrastructure exists, just needs connection
+2. **Remove `.to_vec()` from list operations** (80h) - Use DD collection handles
+3. **Move IO business logic to DD** (30h) - Make IO layer thin
+4. **Type system cleanup** (20h) - LinkId enum, remove magic strings
+
+---
+
+## Implementation Roadmap (2026-01-18)
+
+### A. VecDiff Adapter Wiring (DONE ✅)
+
+**Status:** Code written in outputs.rs and bridge.rs. Needs compilation fixes.
+
+Changes made:
+1. Added `MutableVec<Value>` storage in `LIST_SIGNAL_VECS` thread_local
+2. Added `list_signal_vec(cell_id)` function returning `SignalVec<Item = Value>`
+3. Added `update_list_signal_vec()` with diff detection:
+   - Single append → `push_cloned()` (VecDiff::Push)
+   - Single removal → `remove(index)` (VecDiff::RemoveAt)
+   - Complex change → `replace_cloned()` (VecDiff::Replace fallback)
+4. Modified `sync_cell_from_dd()` to update MutableVec for list values
+5. Bridge CellRef rendering uses `items_signal_vec(list_signal_vec(cell_id))`
+
+**Pending fix:** bridge.rs lines 1513-1524 have borrow lifetime issues.
+
+### B. Worker `.to_vec()` Removal (17 locations)
+
+Each location in `worker.rs` that calls `.to_vec()` creates an O(n) copy.
+These should be replaced with O(delta) operations using DD's collection handles.
+
+#### Category 1: ListAppend Operations (8 locations)
+
+| Line | Context | Current | Recommended Fix |
+|------|---------|---------|-----------------|
+| 2281 | List/append text fallback | `items.to_vec()` + `push()` | Use `Vec::with_capacity` or pass diff upstream |
+| 2479 | List/append elements | `elems.to_vec()` + `push()` | Track elements separately with index |
+| 2487 | List/append data items | `items.to_vec()` + `push()` | Return diff instead of full collection |
+| 2506 | List/append text items | `items.to_vec()` + `push()` | Same as above |
+| 2671 | List/append elements (dup) | `elems.to_vec()` + `push()` | Deduplicate with 2479 |
+| 2677 | List/append data items (dup) | `items.to_vec()` + `push()` | Deduplicate with 2487 |
+| 3016 | List/append instantiated | `items.to_vec()` + `push()` | Pass only the new item |
+| 3022 | List/append element | `elements.to_vec()` + `push()` | Same |
+
+**Strategy:** Modify `Operation::ListAppend` output to return only the appended item, not the full collection. The downstream consumer (outputs.rs) already has diff detection.
+
+#### Category 2: ListRemove Operations (6 locations)
+
+| Line | Context | Current | Recommended Fix |
+|------|---------|---------|-----------------|
+| 2714 | Filter elements | `s.to_vec()` + filter | Return removed index only |
+| 2789 | RemoveListItem | `items.to_vec()` + `remove()` | Return removed index only |
+| 2796 | Remove element | `s.to_vec()` + position search | Track indices in DD |
+| 2850 | Remove matched element | `elements.to_vec()` + `remove()` | Same |
+| 2929 | Toggle remove | `items.to_vec()` + `remove()` | Return removed index |
+| 2979 | Toggle remove element | `elements.to_vec()` + `remove()` | Same |
+
+**Strategy:** Modify `Operation::ListRemove` to track indices. Instead of copying the entire list and removing, pass the removal index to outputs.rs for `VecDiff::RemoveAt`.
+
+#### Category 3: Other Operations (3 locations)
+
+| Line | Context | Current | Recommended Fix |
+|------|---------|---------|-----------------|
+| 2176 | Events clone | `events.to_vec()` | ✅ Necessary - events are consumed |
+| 2898 | Field update | `items.to_vec()` + replace | Return (index, new_value) tuple |
+| 2935 | Element lookup | `s.to_vec()` + search | Use element indices |
+
+### C. IO Layer Business Logic Migration
+
+The `inputs.rs` file contains 8 business logic violations that should be DD operators:
+
+| Violation | Lines | Current Logic | DD Operator Replacement |
+|-----------|-------|---------------|------------------------|
+| Pattern matching | 236-320 | `DynamicLinkAction` state machine | DD `filter` + `map` |
+| Grace period | 242-244 | `EDITING_HOLDS_GRACE_PERIOD` | DD temporal operator with `delay()` |
+| Hover dedup | 379-403 | Manual value comparison | `distinct()` operator |
+| Event parsing | 518-584 | String prefix matching | Typed event enum |
+| Cell lookups | 383, 413 | `get_cell_value()` reads | Join with cell collection |
+| Text encoding | 568 | Colon escaping | Remove (typed events) |
+| Synthetic naming | 409-426 | `"hover_"` prefix | HoverCellId enum variant |
+| Value change | 412-417 | Manual diff | `distinct()` operator |
+
+### D. Type System Cleanup
+
+| Issue | File | Current | Target |
+|-------|------|---------|--------|
+| LinkId as String | types.rs | `String` | `enum LinkId { Static(&'static str), Dynamic(u32) }` |
+| Magic prefixes | types.rs | `"dynamic_cell_"` | Remove, use enum discriminant |
+| Hardcoded fields | worker.rs | `"title_cell_field"` | `enum KnownField { Title, Elements, ... }` |
+| TodoMVC handlers | types.rs | `EditingHandlerConfig` | Generic `EditFieldConfig` |
+
+### E. AtomicU64 Counter Removal
+
+Location: `worker.rs` lines 64-68
+
+```rust
+// Current: Side effects inside DD transforms!
+static DYNAMIC_CELL_COUNTER: AtomicU32 = AtomicU32::new(1000);
+```
+
+**Problem:** ID generation inside DD transform closures breaks referential transparency.
+
+**Fix:** Pre-allocate IDs in a planning pass before entering DD scope, or use deterministic ID derivation from input data.
+
+---
+
+## Compilation Fixes Needed
+
+After the VecDiff wiring changes, the following compilation errors need fixing:
+
+### bridge.rs
+
+**Error:** `cell_id` borrowed value does not live long enough (lines 1513-1524)
+
+```rust
+// Current (broken):
+let cell_id = name.to_string();
+Label::new()
+    .label_signal(
+        cell_signal(&cell_id)  // &cell_id borrowed
+            .map(move |value| { ... })  // move closure needs 'static
+    )
+```
+
+**Fix:** Clone `cell_id` before the closure:
+
+```rust
+let cell_id = name.to_string();
+let cell_id_for_signal = cell_id.clone();
+Label::new()
+    .label_signal(
+        cell_signal(cell_id_for_signal)
+            .map(move |value| { ... })
+    )
+```
+
+Or use `cell_signal` with owned string instead of borrow.
+
+---
+
+## Comprehensive Audit Findings (2026-01-18)
+
+> This section documents ALL violations found by a comprehensive multi-agent audit of the DD engine.
+> These issues MUST be fixed before any phase can be marked as truly complete.
+
+### Category 1: Business Logic Functions in Worker Code
+
+These functions encode domain-specific business logic that should be in DD dataflow, not hardcoded in worker.rs:
+
+#### 1.1 `is_item_completed_generic()` - CRITICAL
+
+**Location:** `worker.rs` lines 215-249
+
+```rust
+fn is_item_completed_generic(item: &Value) -> bool {
+    match item {
+        Value::Object(obj) => {
+            if let Some((_, is_completed)) = find_checkbox_toggle_in_item(obj) {
+                return is_completed;
+            }
+            for (field_name, field_value) in obj.iter() {
+                if field_name.contains("edit") {  // ❌ Heuristic string matching!
+                    continue;
+                }
+                if let Value::CellRef(cell_id) = field_value {
+                    if let Some(cell_value) = super::super::io::get_cell_value(&cell_id.name()) {  // ❌ IO read!
+                        // ...
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+```
+
+**Violations:**
+- Encodes domain knowledge ("completed" vs "editing" fields)
+- Reads from IO layer (`get_cell_value()`) inside DD transform
+- String heuristics (`field_name.contains("edit")`) are brittle
+- Called from `ListRemoveCompleted` transform (line 2695)
+
+**Pure DD Fix:** Completion status should be explicitly tracked in item data. The Boon code should declare which field represents completion, not have the engine infer it.
+
+#### 1.2 `find_checkbox_toggle_in_item()`
+
+**Location:** `worker.rs` lines 176-210
+
+**Violations:**
+- Relies on `CHECKBOX_TOGGLE_HOLDS` registry (thread-local global)
+- Reads from IO layer (`get_cell_value()`)
+- Implicit field semantics based on registry membership
+
+#### 1.3 `find_boolean_field_in_template()`
+
+**Location:** `interpreter.rs` lines 1581-1614
+
+**Violations:**
+- Heuristic-based field inference ("likely the 'completed' field")
+- Reads from IO layer
+- Used with hardcoded fallback at lines 750 and 1424
+
+#### 1.4 `extract_item_key_for_removal()`
+
+**Location:** `worker.rs` lines 609-637
+
+**Violations:**
+- Brittle nested field search for identity
+- Duplicate implementation at line 1220
+- Fallback to `.to_display_string()` is unreliable
+
+---
+
+### Category 2: Hardcoded Field Name Fallbacks (NO FALLBACKS RULE VIOLATION)
+
+These MUST be converted to explicit failures. Fallbacks silently use wrong field names:
+
+| Location | Fallback | Problem |
+|----------|----------|---------|
+| `worker.rs:750` | `unwrap_or_else(\|\| "completed".to_string())` | Silent wrong field |
+| `interpreter.rs:1424` | `unwrap_or_else(\|\| "completed".to_string())` | Silent wrong field |
+| `worker.rs:2354` | `unwrap_or_else(\|\| "title".to_string())` | Silent wrong field |
+| `worker.rs:2424` | `identity_path: vec!["remove_button".to_string()]` | Hardcoded path |
+
+**Fix:** Replace with `expect("Bug: missing field metadata for ...")` to fail explicitly.
+
+---
+
+### Category 3: Side Effects During Evaluation
+
+The evaluator should ONLY build `DataflowConfig`. Direct state mutations during evaluation are violations:
+
+#### 3.1 Direct `init_cell()` Calls in Evaluator
+
+| Location | Context |
+|----------|---------|
+| `evaluator.rs:784` | Object with list fields |
+| `evaluator.rs:1222` | Router/route "current_route" |
+| `evaluator.rs:1226` | Router/route fallback "/" |
+| `evaluator.rs:1953` | HOLD with link trigger |
+| `evaluator.rs:3052` | LATEST with events |
+| `evaluator.rs:3329` | WHILE with LinkRef |
+
+**Fix:** Move all `init_cell()` to interpreter after evaluation. Evaluator only builds config.
+
+#### 3.2 Direct Registration in IO Module
+
+| Location | Call |
+|----------|------|
+| `evaluator.rs:1972-1977` | `add_dynamic_link_action(...)` |
+| `evaluator.rs:1981` | `self.dataflow_config.set_editing_bindings(...)` |
+| `evaluator.rs:1988-1993` | `self.dataflow_config.add_toggle_binding(...)` |
+
+**Fix:** Store in DataflowConfig, let interpreter register with IO after evaluation.
+
+---
+
+### Category 4: Global Atomic Counters (Non-Deterministic IDs)
+
+**Location:** `evaluator.rs` lines 17, 20, 24-25
+
+```rust
+static GLOBAL_CELL_COUNTER: AtomicU32 = AtomicU32::new(0);
+static GLOBAL_LINK_COUNTER: AtomicU32 = AtomicU32::new(0);
+```
+
+**Violations:**
+- Non-deterministic across runs (flaky tests)
+- Instance counters exist in `BoonDdRuntime` but aren't used
+- `reset_cell_counter()` timing issues
+
+**Fix:** Use `BoonDdRuntime` instance counters exclusively. Remove global atomics.
+
+---
+
+### Category 5: O(n) Operations (25+ Locations)
+
+Every `.to_vec()` call copies the entire list, defeating O(delta):
+
+#### List Append Operations (8 locations)
+
+| Line | Context |
+|------|---------|
+| `worker.rs:2281` | List/append text fallback |
+| `worker.rs:2479` | List/append elements |
+| `worker.rs:2487` | List/append data items |
+| `worker.rs:2506` | List/append text items |
+| `worker.rs:2671` | List/append elements (dup) |
+| `worker.rs:2677` | List/append data items (dup) |
+| `worker.rs:3016` | List/append instantiated |
+| `worker.rs:3022` | List/append element |
+
+#### List Remove Operations (6 locations)
+
+| Line | Context |
+|------|---------|
+| `worker.rs:2714` | Filter elements |
+| `worker.rs:2789` | RemoveListItem |
+| `worker.rs:2796` | Remove element |
+| `worker.rs:2850` | Remove matched element |
+| `worker.rs:2929` | Toggle remove |
+| `worker.rs:2979` | Toggle remove element |
+
+**Fix:** Return diffs instead of full collections. Use `VecDiff::Push`/`RemoveAt`.
+
+---
+
+### Category 6: DynamicLinkAction Business Logic (inputs.rs)
+
+**Location:** `inputs.rs` lines 12-36
+
+```rust
+pub enum DynamicLinkAction {
+    BoolToggle(String),
+    SetTrue(String),
+    SetFalse(String),
+    SetFalseOnKeys { cell_id: String, keys: Vec<String> },
+    EditingHandler { editing_cell: String, title_cell: String },  // ❌ TodoMVC-specific!
+    HoverState(String),
+    RemoveListItem { link_id: String },
+    ListToggleAllCompleted {  // ❌ TodoMVC-specific!
+        list_cell_id: String,
+        completed_field: String,
+    },
+}
+```
+
+**Violations:**
+- `EditingHandler` encodes todo_mvc editing workflow (double-click → edit, Escape → cancel)
+- `ListToggleAllCompleted` encodes todo list "mark all" pattern
+- `completed_field` hardcodes the field name concept
+
+**Fix:** These should be generic DD operators, not special-cased actions.
+
+---
+
+### Category 7: Thread-Local Registries (Still Present)
+
+| Registry | Location | Status | Issue |
+|----------|----------|--------|-------|
+| `CHECKBOX_TOGGLE_HOLDS` | `outputs.rs:621` | 🔴 PRESENT | Reactive UI state leak |
+| `DYNAMIC_LINK_ACTIONS` | `inputs.rs:59` | 🔴 PRESENT | Bypasses DD input channel |
+| `ACTIVE_CONFIG` | `worker.rs:85` | ⚠️ ALLOWED | Out-of-band config (acceptable) |
+| `PERSISTENT_WORKER` | `dataflow.rs:608` | ✅ ALLOWED | DD infrastructure |
+
+**Fix:** Remove `CHECKBOX_TOGGLE_HOLDS` and `DYNAMIC_LINK_ACTIONS`. Use `DataflowConfig`.
+
+---
+
+### Category 8: String-Based Dispatch
+
+| Location | Pattern | Issue |
+|----------|---------|-------|
+| `inputs.rs:220` | `vec!["Escape".to_string()]` | Magic string |
+| `inputs.rs:278-279` | `"Enter:text"` format | String protocol |
+| `inputs.rs:304` | `format!("hover_{}", link_id)` | Cell naming convention |
+| `inputs.rs:348-384` | Key event string parsing | Not type-safe |
+
+**Fix:** Use `EventPayload` enum (already exists in `types.rs`) instead of string parsing.
+
+---
+
+### Summary: Work Remaining by Category
+
+| Category | Severity | Estimated Hours | Files |
+|----------|----------|-----------------|-------|
+| Business logic functions | 🔴 CRITICAL | 40h | worker.rs, interpreter.rs |
+| Hardcoded fallbacks | 🔴 CRITICAL | 8h | worker.rs, interpreter.rs |
+| Evaluator side effects | 🔴 CRITICAL | 20h | evaluator.rs |
+| Global counters | 🟠 HIGH | 8h | evaluator.rs |
+| O(n) operations | 🟠 HIGH | 60h | worker.rs |
+| DynamicLinkAction | 🟠 HIGH | 20h | inputs.rs |
+| Thread-local registries | 🟡 MEDIUM | 12h | outputs.rs, inputs.rs |
+| String-based dispatch | 🟡 MEDIUM | 16h | inputs.rs |
+| **TOTAL** | | **184h** | ~6 weeks |
+
+---
+
+### Recommended Fix Order
+
+1. **Hardcoded fallbacks → explicit failures** (8h) - Immediate safety
+2. **Remove `is_item_completed_generic()`** (20h) - Biggest architecture violation
+3. **Move evaluator side effects** (20h) - Clean separation
+4. **Replace `.to_vec()` with diffs** (60h) - O(delta) compliance
+5. **Remove DynamicLinkAction business logic** (20h) - IO layer cleanup
+6. **Wire VecDiff adapter to bridge** (16h) - Enable incremental rendering
+7. **Remove thread-local registries** (12h) - Final cleanup
+8. **Type system cleanup** (16h) - String → enum

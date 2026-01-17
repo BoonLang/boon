@@ -1,4 +1,5 @@
 //! Output handling for DD values.
+//! Build marker: 2026-01-18-v2 (VecDiff diff detection)
 //!
 //! This module provides the OutputObserver which allows the bridge to
 //! observe DD output values as async streams.
@@ -8,14 +9,25 @@
 //!
 //! Persistence: HOLD values are saved to localStorage and restored on re-run.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use super::super::core::Output;
-use super::super::core::types::BoolTag;
 use super::super::core::value::Value;
+// Phase 7.3: Import config accessor functions
+use super::super::core::{
+    is_text_clear_cell as core_is_text_clear_cell,
+    get_remove_event_path as core_get_remove_event_path,
+    get_bulk_remove_event_path as core_get_bulk_remove_event_path,
+    get_editing_bindings as core_get_editing_bindings,
+    get_toggle_bindings as core_get_toggle_bindings,
+    get_global_toggle_bindings as core_get_global_toggle_bindings,
+    EditingBinding, ToggleBinding, GlobalToggleBinding,
+};
 use super::super::LOG_DD_DEBUG;
 use zoon::futures_util::stream::Stream;
 use zoon::Mutable;
 use zoon::signal::MutableSignalCloned;
+use zoon::futures_signals::signal_vec::{MutableVec, SignalVec};
 use zoon::{local_storage, WebStorage};
 
 // Phase 6: Import bridge function for text-clear side effect
@@ -41,9 +53,8 @@ pub fn clear_cells_memory() {
     CELL_STATES.with(|states| {
         states.lock_mut().clear();
     });
-    CHECKBOX_TOGGLE_HOLDS.with(|holds| {
-        holds.lock_mut().clear();
-    });
+    // Phase 12: Clear list signal vecs
+    clear_list_signal_vecs();
     // Also reset route state to prevent cross-example contamination
     clear_current_route();
 }
@@ -91,12 +102,73 @@ pub fn init_cell_with_persist(cell_id: impl Into<String>, value: Value) {
 ///
 /// Side effects:
 /// - If the cell is a text-clear cell, triggers DOM input clearing
+/// - If the value is a list, updates the MutableVec for incremental rendering (Phase 12)
 pub fn sync_cell_from_dd(cell_id: impl Into<String>, value: Value) {
     let cell_id = cell_id.into();
     if LOG_DD_DEBUG { zoon::println!("[DD Sync] {} = {:?}", cell_id, value); }
 
     // Check if this is a text-clear cell BEFORE updating (for side effect)
     let should_clear_text = is_text_clear_cell(&cell_id);
+
+    // Phase 2: Handle MultiCellUpdate - atomic batch of updates
+    // This eliminates side effects in transforms by returning multiple updates
+    if let Value::MultiCellUpdate(updates) = &value {
+        if LOG_DD_DEBUG { zoon::println!("[DD MultiCellUpdate] {} updates", updates.len()); }
+        for (cell_id, cell_value) in updates {
+            // Recursively apply each update (may include ListDiff variants)
+            sync_cell_from_dd(cell_id.as_ref(), (**cell_value).clone());
+        }
+        return; // All updates applied
+    }
+
+    // Phase 2.1: Handle ListDiff variants directly - O(delta) operations
+    match &value {
+        // ListPush: O(1) append to MutableVec and CELL_STATES
+        Value::ListPush { cell_id: diff_cell_id, item } => {
+            if LOG_DD_DEBUG { zoon::println!("[DD ListDiff] {} Push: {:?}", diff_cell_id, item); }
+            apply_list_push(diff_cell_id, item);
+            return; // Don't store the diff itself, it's already applied
+        }
+        // ListRemoveAt: O(n) shift but no clone
+        Value::ListRemoveAt { cell_id: diff_cell_id, index } => {
+            if LOG_DD_DEBUG { zoon::println!("[DD ListDiff] {} RemoveAt({})", diff_cell_id, index); }
+            apply_list_remove_at(diff_cell_id, *index);
+            return;
+        }
+        // ListRemoveByKey: O(1) key lookup
+        Value::ListRemoveByKey { cell_id: diff_cell_id, key } => {
+            if LOG_DD_DEBUG { zoon::println!("[DD ListDiff] {} RemoveByKey({})", diff_cell_id, key); }
+            apply_list_remove_by_key(diff_cell_id, key);
+            return;
+        }
+        // ListRemoveBatch: O(k) batch removal
+        Value::ListRemoveBatch { cell_id: diff_cell_id, keys } => {
+            if LOG_DD_DEBUG { zoon::println!("[DD ListDiff] {} RemoveBatch({} keys)", diff_cell_id, keys.len()); }
+            apply_list_remove_batch(diff_cell_id, &keys);
+            return;
+        }
+        // ListClear: O(1) clear
+        Value::ListClear { cell_id: diff_cell_id } => {
+            if LOG_DD_DEBUG { zoon::println!("[DD ListDiff] {} Clear", diff_cell_id); }
+            apply_list_clear(diff_cell_id);
+            return;
+        }
+        // ListItemUpdate: O(1) lookup + O(1) update
+        Value::ListItemUpdate { cell_id: diff_cell_id, key, field_path, new_value } => {
+            if LOG_DD_DEBUG { zoon::println!("[DD ListDiff] {} ItemUpdate({}, {:?})", diff_cell_id, key, field_path); }
+            apply_list_item_update(diff_cell_id, key, field_path, new_value);
+            return;
+        }
+        // Phase 12: Update MutableVec for list values (incremental rendering)
+        Value::List(items) => {
+            update_list_signal_vec(&cell_id, items);
+        }
+        Value::Collection(handle) => {
+            let items: Vec<Value> = handle.iter().cloned().collect();
+            update_list_signal_vec(&cell_id, &items);
+        }
+        _ => {}
+    }
 
     CELL_STATES.with(|states| {
         states.lock_mut().insert(cell_id, value);
@@ -113,6 +185,85 @@ pub fn sync_cell_from_dd(cell_id: impl Into<String>, value: Value) {
 pub fn sync_cell_from_dd_with_persist(cell_id: impl Into<String>, value: Value) {
     let cell_id = cell_id.into();
     if LOG_DD_DEBUG { zoon::println!("[DD Sync+Persist] {} = {:?}", cell_id, value); }
+
+    // Phase 2: Handle MultiCellUpdate - atomic batch of updates with persistence
+    if let Value::MultiCellUpdate(updates) = &value {
+        if LOG_DD_DEBUG { zoon::println!("[DD MultiCellUpdate+Persist] {} updates", updates.len()); }
+        for (update_cell_id, cell_value) in updates {
+            // Recursively apply each update with persistence
+            sync_cell_from_dd_with_persist(update_cell_id.as_ref(), (**cell_value).clone());
+        }
+        return; // All updates applied
+    }
+
+    // Phase 2.1: Handle ListDiff variants directly - O(delta) operations
+    match &value {
+        // ListPush: O(1) append, then persist
+        Value::ListPush { cell_id: diff_cell_id, item } => {
+            if LOG_DD_DEBUG { zoon::println!("[DD ListDiff+Persist] {} Push", diff_cell_id); }
+            apply_list_push(diff_cell_id, item);
+            // Persist the updated list
+            if let Some(updated) = get_cell_value(diff_cell_id) {
+                persist_hold_value(diff_cell_id, &updated);
+            }
+            return;
+        }
+        // ListRemoveByKey: O(1) lookup, then persist
+        Value::ListRemoveByKey { cell_id: diff_cell_id, key } => {
+            if LOG_DD_DEBUG { zoon::println!("[DD ListDiff+Persist] {} RemoveByKey({})", diff_cell_id, key); }
+            apply_list_remove_by_key(diff_cell_id, key);
+            // Persist the updated list
+            if let Some(updated) = get_cell_value(diff_cell_id) {
+                persist_hold_value(diff_cell_id, &updated);
+            }
+            return;
+        }
+        // ListRemoveBatch: O(k) batch removal, then persist
+        Value::ListRemoveBatch { cell_id: diff_cell_id, keys } => {
+            if LOG_DD_DEBUG { zoon::println!("[DD ListDiff+Persist] {} RemoveBatch({} keys)", diff_cell_id, keys.len()); }
+            apply_list_remove_batch(diff_cell_id, &keys);
+            // Persist the updated list
+            if let Some(updated) = get_cell_value(diff_cell_id) {
+                persist_hold_value(diff_cell_id, &updated);
+            }
+            return;
+        }
+        // ListClear: O(1) clear, then persist
+        Value::ListClear { cell_id: diff_cell_id } => {
+            if LOG_DD_DEBUG { zoon::println!("[DD ListDiff+Persist] {} Clear", diff_cell_id); }
+            apply_list_clear(diff_cell_id);
+            // Persist the cleared list
+            if let Some(updated) = get_cell_value(diff_cell_id) {
+                persist_hold_value(diff_cell_id, &updated);
+            }
+            return;
+        }
+        // ListRemoveAt and ListItemUpdate - apply and persist
+        Value::ListRemoveAt { cell_id: diff_cell_id, index } => {
+            apply_list_remove_at(diff_cell_id, *index);
+            if let Some(updated) = get_cell_value(diff_cell_id) {
+                persist_hold_value(diff_cell_id, &updated);
+            }
+            return;
+        }
+        Value::ListItemUpdate { cell_id: diff_cell_id, key, field_path, new_value } => {
+            apply_list_item_update(diff_cell_id, key, field_path, new_value);
+            if let Some(updated) = get_cell_value(diff_cell_id) {
+                persist_hold_value(diff_cell_id, &updated);
+            }
+            return;
+        }
+        // Phase 12: Update MutableVec for list values (incremental rendering)
+        Value::List(items) => {
+            update_list_signal_vec(&cell_id, items);
+        }
+        Value::Collection(handle) => {
+            let items: Vec<Value> = handle.iter().cloned().collect();
+            update_list_signal_vec(&cell_id, &items);
+        }
+        _ => {}
+    }
+
     CELL_STATES.with(|states| {
         states.lock_mut().insert(cell_id.clone(), value.clone());
     });
@@ -128,9 +279,302 @@ pub fn sync_cell_from_dd_with_persist(cell_id: impl Into<String>, value: Value) 
 pub fn update_cell_no_persist(cell_id: impl Into<String>, value: Value) {
     let cell_id = cell_id.into();
     if LOG_DD_DEBUG { zoon::println!("[DD Update] {} = {:?}", cell_id, value); }
+
+    // Phase 2.1: Handle ListDiff variants directly
+    match &value {
+        Value::ListPush { cell_id: diff_cell_id, item } => {
+            apply_list_push(diff_cell_id, item);
+            return;
+        }
+        Value::ListRemoveByKey { cell_id: diff_cell_id, key } => {
+            apply_list_remove_by_key(diff_cell_id, key);
+            return;
+        }
+        Value::ListClear { cell_id: diff_cell_id } => {
+            apply_list_clear(diff_cell_id);
+            return;
+        }
+        _ => {}
+    }
+
     CELL_STATES.with(|states| {
         states.lock_mut().insert(cell_id, value);
     });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 2.1: ListDiff Application Functions
+// These apply O(delta) operations directly to MutableVec and CELL_STATES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Apply ListPush diff - O(1) append
+fn apply_list_push(cell_id: &str, item: &Value) {
+    // Update MutableVec for incremental rendering
+    LIST_SIGNAL_VECS.with(|vecs| {
+        let mut vecs = vecs.borrow_mut(); // ALLOWED: IO layer
+        if let Some(mvec) = vecs.get_mut(cell_id) {
+            mvec.lock_mut().push_cloned(item.clone());
+        } else {
+            // First item - create new MutableVec
+            let mvec = MutableVec::new_with_values(vec![item.clone()]);
+            vecs.insert(cell_id.to_string(), mvec);
+        }
+    });
+
+    // Update CELL_STATES by appending to the stored list
+    CELL_STATES.with(|states| {
+        let mut lock = states.lock_mut();
+        if let Some(current) = lock.get(cell_id) {
+            if let Some(items) = current.as_list_items() {
+                let mut new_items: Vec<Value> = items.to_vec();
+                new_items.push(item.clone());
+                lock.insert(cell_id.to_string(), Value::collection(new_items));
+            }
+        } else {
+            // No existing value - create new collection
+            lock.insert(cell_id.to_string(), Value::collection(vec![item.clone()]));
+        }
+    });
+}
+
+/// Apply ListRemoveAt diff - O(n) shift but no clone needed
+fn apply_list_remove_at(cell_id: &str, index: usize) {
+    // Update MutableVec
+    LIST_SIGNAL_VECS.with(|vecs| {
+        let vecs = vecs.borrow(); // ALLOWED: IO layer
+        if let Some(mvec) = vecs.get(cell_id) {
+            let mut lock = mvec.lock_mut();
+            if index < lock.len() {
+                lock.remove(index);
+            }
+        }
+    });
+
+    // Update CELL_STATES
+    CELL_STATES.with(|states| {
+        let mut lock = states.lock_mut();
+        if let Some(current) = lock.get(cell_id).cloned() {
+            if let Some(items) = current.as_list_items() {
+                if index < items.len() {
+                    let mut new_items: Vec<Value> = items.to_vec();
+                    new_items.remove(index);
+                    lock.insert(cell_id.to_string(), Value::collection(new_items));
+                }
+            }
+        }
+    });
+}
+
+/// Apply ListRemoveByKey diff - O(1) key lookup
+fn apply_list_remove_by_key(cell_id: &str, key: &str) {
+    // Find index by key first
+    let index = CELL_STATES.with(|states| {
+        let lock = states.lock_ref();
+        if let Some(current) = lock.get(cell_id) {
+            if let Some(items) = current.as_list_items() {
+                return items.iter().position(|item| extract_item_key(item) == key);
+            }
+        }
+        None
+    });
+
+    if let Some(idx) = index {
+        // Update MutableVec
+        LIST_SIGNAL_VECS.with(|vecs| {
+            let vecs = vecs.borrow(); // ALLOWED: IO layer
+            if let Some(mvec) = vecs.get(cell_id) {
+                let mut lock = mvec.lock_mut();
+                if idx < lock.len() {
+                    lock.remove(idx);
+                }
+            }
+        });
+
+        // Update CELL_STATES
+        CELL_STATES.with(|states| {
+            let mut lock = states.lock_mut();
+            if let Some(current) = lock.get(cell_id).cloned() {
+                if let Some(items) = current.as_list_items() {
+                    let mut new_items: Vec<Value> = items.to_vec();
+                    if idx < new_items.len() {
+                        new_items.remove(idx);
+                    }
+                    lock.insert(cell_id.to_string(), Value::collection(new_items));
+                }
+            }
+        });
+
+        if LOG_DD_DEBUG { zoon::println!("[DD ListDiff] {} RemoveByKey({}) at index {}", cell_id, key, idx); }
+    } else {
+        if LOG_DD_DEBUG { zoon::println!("[DD ListDiff] {} RemoveByKey({}) - key not found", cell_id, key); }
+    }
+}
+
+/// Apply ListRemoveBatch diff - O(k) batch removal where k = keys.len()
+/// Removes all items whose keys are in the provided set.
+/// This is more efficient than multiple individual RemoveByKey operations
+/// because it processes all removals in a single pass.
+fn apply_list_remove_batch(cell_id: &str, keys: &[Arc<str>]) {
+    // Build set of keys to remove for O(1) lookup
+    let keys_to_remove: HashSet<&str> = keys.iter().map(|k| k.as_ref()).collect();
+
+    if keys_to_remove.is_empty() {
+        return;
+    }
+
+    // Find indices to remove (in reverse order for safe removal)
+    let indices_to_remove: Vec<usize> = CELL_STATES.with(|states| {
+        let lock = states.lock_ref();
+        if let Some(current) = lock.get(cell_id) {
+            if let Some(items) = current.as_list_items() {
+                return items.iter().enumerate()
+                    .filter_map(|(i, item)| {
+                        let key = extract_item_key(item);
+                        if keys_to_remove.contains(key.as_str()) {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()  // Reverse for safe removal from end
+                    .collect();
+            }
+        }
+        Vec::new()
+    });
+
+    if indices_to_remove.is_empty() {
+        if LOG_DD_DEBUG { zoon::println!("[DD ListDiff] {} RemoveBatch - no matching keys found", cell_id); }
+        return;
+    }
+
+    // Update MutableVec (removing from end to front to preserve indices)
+    LIST_SIGNAL_VECS.with(|vecs| {
+        let vecs = vecs.borrow(); // ALLOWED: IO layer
+        if let Some(mvec) = vecs.get(cell_id) {
+            let mut lock = mvec.lock_mut();
+            for &idx in &indices_to_remove {
+                if idx < lock.len() {
+                    lock.remove(idx);
+                }
+            }
+        }
+    });
+
+    // Update CELL_STATES
+    CELL_STATES.with(|states| {
+        let mut lock = states.lock_mut();
+        if let Some(current) = lock.get(cell_id).cloned() {
+            if let Some(items) = current.as_list_items() {
+                // Filter out items with matching keys (more efficient than individual removes)
+                let new_items: Vec<Value> = items.iter()
+                    .filter(|item| {
+                        let key = extract_item_key(item);
+                        !keys_to_remove.contains(key.as_str())
+                    })
+                    .cloned()
+                    .collect();
+                lock.insert(cell_id.to_string(), Value::collection(new_items));
+            }
+        }
+    });
+
+    if LOG_DD_DEBUG { zoon::println!("[DD ListDiff] {} RemoveBatch removed {} items", cell_id, indices_to_remove.len()); }
+}
+
+/// Apply ListClear diff - O(1) clear
+fn apply_list_clear(cell_id: &str) {
+    // Update MutableVec
+    LIST_SIGNAL_VECS.with(|vecs| {
+        let vecs = vecs.borrow(); // ALLOWED: IO layer
+        if let Some(mvec) = vecs.get(cell_id) {
+            mvec.lock_mut().clear();
+        }
+    });
+
+    // Update CELL_STATES
+    CELL_STATES.with(|states| {
+        states.lock_mut().insert(cell_id.to_string(), Value::collection(Vec::<Value>::new()));
+    });
+}
+
+/// Apply ListItemUpdate diff - O(1) lookup + O(1) field update
+fn apply_list_item_update(cell_id: &str, key: &str, field_path: &[Arc<str>], new_value: &Value) {
+    // Find index by key
+    let index = CELL_STATES.with(|states| {
+        let lock = states.lock_ref();
+        if let Some(current) = lock.get(cell_id) {
+            if let Some(items) = current.as_list_items() {
+                return items.iter().position(|item| extract_item_key(item) == key);
+            }
+        }
+        None
+    });
+
+    if let Some(idx) = index {
+        // Update the item in CELL_STATES
+        CELL_STATES.with(|states| {
+            let mut lock = states.lock_mut();
+            if let Some(current) = lock.get(cell_id).cloned() {
+                if let Some(items) = current.as_list_items() {
+                    let mut new_items: Vec<Value> = items.to_vec();
+                    if idx < new_items.len() {
+                        // Apply field update
+                        new_items[idx] = apply_field_update(&new_items[idx], field_path, new_value);
+                        lock.insert(cell_id.to_string(), Value::collection(new_items));
+
+                        // Update MutableVec at same index
+                        LIST_SIGNAL_VECS.with(|vecs| {
+                            let vecs = vecs.borrow(); // ALLOWED: IO layer
+                            if let Some(mvec) = vecs.get(cell_id) {
+                                let mut mvec_lock = mvec.lock_mut();
+                                if idx < mvec_lock.len() {
+                                    mvec_lock.set_cloned(idx, apply_field_update(&mvec_lock[idx], field_path, new_value));
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Apply a field update to a value at the given path
+fn apply_field_update(value: &Value, field_path: &[Arc<str>], new_value: &Value) -> Value {
+    if field_path.is_empty() {
+        return new_value.clone();
+    }
+
+    let field = &field_path[0];
+    let remaining = &field_path[1..];
+
+    match value {
+        Value::Object(fields) => {
+            let mut new_fields = (**fields).clone();
+            if remaining.is_empty() {
+                new_fields.insert(field.clone(), new_value.clone());
+            } else if let Some(inner) = fields.get(field.as_ref()) {
+                new_fields.insert(field.clone(), apply_field_update(inner, remaining, new_value));
+            }
+            Value::Object(Arc::new(new_fields))
+        }
+        Value::Tagged { tag, fields } => {
+            let mut new_fields = (**fields).clone();
+            if remaining.is_empty() {
+                new_fields.insert(field.clone(), new_value.clone());
+            } else if let Some(inner) = fields.get(field.as_ref()) {
+                new_fields.insert(field.clone(), apply_field_update(inner, remaining, new_value));
+            }
+            Value::Tagged {
+                tag: tag.clone(),
+                fields: Arc::new(new_fields),
+            }
+        }
+        _ => value.clone(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -141,266 +585,124 @@ thread_local! {
     static CELL_STATES: Mutable<HashMap<String, Value>> = Mutable::new(HashMap::new()); // ALLOWED: view state
 }
 
-// Global list of checkbox toggle hold IDs (used for reactive "items left" count)
-// Set by interpreter when detecting checkbox toggle pattern
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 12: List Signal Infrastructure
+// Provides MutableVec per list cell for incremental rendering via VecDiff.
+// Bridge uses list_signal_vec() with children_signal_vec() for O(delta) DOM updates.
+// ═══════════════════════════════════════════════════════════════════════════
+
 thread_local! {
-    static CHECKBOX_TOGGLE_HOLDS: Mutable<Vec<String>> = Mutable::new(Vec::new()); // ALLOWED: view state
+    /// Per-list MutableVec for incremental rendering.
+    /// Key: cell_id of list cell
+    /// Value: MutableVec containing list items as cloneable handles
+    ///
+    /// When sync_cell_from_dd() is called with a List value, we update the MutableVec.
+    /// Bridge uses list_signal_vec() to get SignalVec for children_signal_vec().
+    static LIST_SIGNAL_VECS: std::cell::RefCell<HashMap<String, MutableVec<Value>>> =
+        std::cell::RefCell::new(HashMap::new()); // ALLOWED: incremental rendering state
 }
 
-// Global set of text-clear HOLD IDs (derived from link IDs, not hardcoded)
-// When these HOLDs are updated, the corresponding text input DOM element is cleared
-// Task 7.1: Replaces hardcoded "text_input_text" with dynamic link-derived names
-thread_local! {
-    static TEXT_CLEAR_HOLDS: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::new(std::collections::HashSet::new()); // ALLOWED: config state
-}
+// ============================================================================
+// Phase 7.3: DELETED OLD THREAD_LOCAL REGISTRIES (config-only, no reactive signals)
+// - TEXT_CLEAR_HOLDS -> DataflowConfig.text_clear_cells
+// - REMOVE_EVENT_PATH -> DataflowConfig.remove_event_path
+// - BULK_REMOVE_EVENT_PATH -> DataflowConfig.bulk_remove_event_path
+// - EDITING_EVENT_BINDINGS -> DataflowConfig.editing_bindings
+// - TOGGLE_EVENT_BINDINGS -> DataflowConfig.toggle_bindings
+// - GLOBAL_TOGGLE_BINDINGS -> DataflowConfig.global_toggle_bindings
+//
+// DELETED: CHECKBOX_TOGGLE_HOLDS - was set but never read (dead code)
+// ============================================================================
 
 thread_local! {
     static CURRENT_ROUTE: Mutable<String> = Mutable::new("/".to_string()); // ALLOWED: route state
-    // Detected list variable name from Boon code (e.g., "items", "list_data", or any List variable)
-    // Set by interpreter during initialization, used by bridge for HOLD lookups
-    static LIST_VAR_NAME: std::cell::RefCell<String> = std::cell::RefCell::new("list_data".to_string()); // ALLOWED: config state
-    // Detected elements field name from list item objects (e.g., "todo_elements", "item_elements")
-    // This is the Object field containing LinkRefs for item UI interactions
-    static ELEMENTS_FIELD_NAME: std::cell::RefCell<String> = std::cell::RefCell::new("item_elements".to_string()); // ALLOWED: config state
-    // Remove event path: parsed from List/remove(item, on: item.X.Y.event.press)
-    // Stores the path ["X", "Y"] from item to the LinkRef that triggers removal
-    // This is PARSED FROM CODE, not guessed from field names
-    static REMOVE_EVENT_PATH: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new()); // ALLOWED: config state
-    // Bulk remove event path: parsed from List/remove(item, on: elements.X.event.press |> THEN {...})
-    // Stores the full path ["elements", "X"] to the global LinkRef that triggers bulk removal
-    // This replaces label-based pattern matching for "Clear completed" button
-    static BULK_REMOVE_EVENT_PATH: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new()); // ALLOWED: config state
 }
 
-/// Set the detected list variable name.
-/// Called by interpreter after detecting the list variable from the Boon code.
-pub fn set_list_var_name(name: String) {
-    LIST_VAR_NAME.with(|n| *n.borrow_mut() = name); // ALLOWED: IO layer
-}
+// DEAD CODE DELETED: set_list_var_name(), get_list_var_name(), clear_list_var_name() - set but never read
+// DEAD CODE DELETED: set_elements_field_name(), get_elements_field_name(), clear_elements_field_name() - set but never read
 
-/// Get the detected list variable name.
-/// Used by bridge when looking up the list HOLD.
-pub fn get_list_var_name() -> String {
-    LIST_VAR_NAME.with(|n| n.borrow().clone()) // ALLOWED: IO layer
-}
-
-// DEAD CODE DELETED: clear_list_var_name() - never called
-
-/// Set the detected elements field name.
-/// Called by interpreter after detecting the elements field from list item objects.
-pub fn set_elements_field_name(name: String) {
-    ELEMENTS_FIELD_NAME.with(|n| *n.borrow_mut() = name); // ALLOWED: IO layer
-}
-
-// DEAD CODE DELETED: get_elements_field_name() - never called
-// DEAD CODE DELETED: clear_elements_field_name() - never called
-
-/// Set the remove event path.
-/// Parsed from List/remove(item, on: item.X.Y.event.press) → ["X", "Y"]
-/// This is the path from item to the LinkRef that triggers removal.
-pub fn set_remove_event_path(path: Vec<String>) {
-    zoon::println!("[DD Config] Setting remove event path: {:?}", path);
-    REMOVE_EVENT_PATH.with(|p| *p.borrow_mut() = path); // ALLOWED: IO layer
-}
+// Phase 7.3: set_remove_event_path DELETED - now set via DataflowConfig
 
 /// Get the remove event path.
 /// Used when cloning templates to wire the correct LinkRef to removal.
+/// Phase 7.3: Delegates to DataflowConfig via core accessor.
 pub fn get_remove_event_path() -> Vec<String> {
-    REMOVE_EVENT_PATH.with(|p| p.borrow().clone()) // ALLOWED: IO layer
+    core_get_remove_event_path()
 }
 
-/// Clear the remove event path.
-/// Called when clearing state between examples.
-pub fn clear_remove_event_path() {
-    REMOVE_EVENT_PATH.with(|p| p.borrow_mut().clear()); // ALLOWED: IO layer
-}
+// Phase 7.3: clear_remove_event_path DELETED - config cleared via clear_active_config
 
-/// Set the bulk remove event path.
-/// Parsed from List/remove(item, on: elements.X.event.press |> THEN {...}) → ["elements", "X"]
-/// This is the path to the global LinkRef that triggers bulk removal (e.g., "Clear completed" button).
-pub fn set_bulk_remove_event_path(path: Vec<String>) {
-    zoon::println!("[DD Config] Setting bulk remove event path: {:?}", path);
-    BULK_REMOVE_EVENT_PATH.with(|p| *p.borrow_mut() = path); // ALLOWED: IO layer
-}
+// Phase 7.3: set_bulk_remove_event_path DELETED - now set via DataflowConfig
 
 /// Get the bulk remove event path.
 /// Used by interpreter to wire the correct LinkRef to bulk removal.
+/// Phase 7.3: Delegates to DataflowConfig via core accessor.
 pub fn get_bulk_remove_event_path() -> Vec<String> {
-    BULK_REMOVE_EVENT_PATH.with(|p| p.borrow().clone()) // ALLOWED: IO layer
+    core_get_bulk_remove_event_path()
 }
 
-/// Clear the bulk remove event path.
-/// Called when clearing state between examples.
-pub fn clear_bulk_remove_event_path() {
-    BULK_REMOVE_EVENT_PATH.with(|p| p.borrow_mut().clear()); // ALLOWED: IO layer
-}
+// Phase 7.3: clear_bulk_remove_event_path DELETED - config cleared via clear_active_config
 
-/// Editing event bindings parsed from HOLD body.
-/// Contains paths to LinkRefs that control editing state.
-#[derive(Clone, Debug, Default)]
-pub struct EditingEventBindings {
-    /// The Cell ID that these bindings control (e.g., "cell_5")
-    pub cell_id: Option<String>,
-    /// Path to LinkRef whose double_click triggers edit mode (e.g., ["todo_elements", "todo_title_element"])
-    pub edit_trigger_path: Vec<String>,
-    /// Actual LinkRef ID for edit trigger (resolved during evaluation)
-    pub edit_trigger_link_id: Option<String>,
-    /// Path to LinkRef whose key_down exits edit mode on Enter/Escape (e.g., ["todo_elements", "editing_todo_title_element"])
-    pub exit_key_path: Vec<String>,
-    /// Actual LinkRef ID for exit key (resolved during evaluation)
-    pub exit_key_link_id: Option<String>,
-    /// Path to LinkRef whose blur exits edit mode (e.g., ["todo_elements", "editing_todo_title_element"])
-    pub exit_blur_path: Vec<String>,
-    /// Actual LinkRef ID for exit blur (resolved during evaluation)
-    pub exit_blur_link_id: Option<String>,
-}
+// ============================================================================
+// Phase 7.3: DELETED OLD REGISTRY TYPES AND FUNCTIONS
+//
+// The following were removed and replaced with DataflowConfig:
+// - EditingEventBindings struct -> now EditingBinding in worker.rs
+// - ToggleEventBinding struct -> now ToggleBinding in worker.rs
+// - GlobalToggleEventBinding struct -> now GlobalToggleBinding in worker.rs
+// - EDITING_EVENT_BINDINGS thread_local
+// - TOGGLE_EVENT_BINDINGS thread_local
+// - GLOBAL_TOGGLE_BINDINGS thread_local
+// - set_editing_event_bindings() -> now DataflowConfig::set_editing_bindings()
+// - add_toggle_event_binding() -> now DataflowConfig::add_toggle_binding()
+// - add_global_toggle_binding() -> now DataflowConfig::add_global_toggle_binding()
+// - clear_editing_event_bindings() -> cleared via clear_active_config()
+// - clear_toggle_event_bindings() -> cleared via clear_active_config()
+// - clear_global_toggle_bindings() -> cleared via clear_active_config()
+// ============================================================================
 
-thread_local! {
-    // Editing event bindings parsed from HOLD body
-    static EDITING_EVENT_BINDINGS: std::cell::RefCell<EditingEventBindings> = std::cell::RefCell::new(EditingEventBindings::default()); // ALLOWED: config state
-}
-
-/// Set the editing event bindings.
-/// Parsed from HOLD body expressions like:
-/// `todo_elements.todo_title_element.event.double_click |> THEN { True }`
-pub fn set_editing_event_bindings(bindings: EditingEventBindings) {
-    zoon::println!("[DD Config] Setting editing bindings: {:?}", bindings);
-    EDITING_EVENT_BINDINGS.with(|b| *b.borrow_mut() = bindings); // ALLOWED: IO layer
-}
+// Re-export types from core for backward compatibility
+pub type EditingEventBindings = EditingBinding;
+pub type ToggleEventBinding = ToggleBinding;
+pub type GlobalToggleEventBinding = GlobalToggleBinding;
 
 /// Get the editing event bindings.
-pub fn get_editing_event_bindings() -> EditingEventBindings {
-    EDITING_EVENT_BINDINGS.with(|b| b.borrow().clone()) // ALLOWED: IO layer
-}
-
-/// Clear the editing event bindings.
-pub fn clear_editing_event_bindings() {
-    EDITING_EVENT_BINDINGS.with(|b| *b.borrow_mut() = EditingEventBindings::default()); // ALLOWED: IO layer
-}
-
-/// Toggle event binding parsed from HOLD body.
-/// Contains the path to a LinkRef whose click event toggles a boolean HOLD.
-#[derive(Clone, Debug)]
-pub struct ToggleEventBinding {
-    /// The Cell ID that this toggle affects
-    pub cell_id: String,
-    /// Path to LinkRef whose click triggers toggle (e.g., ["todo_elements", "todo_checkbox"])
-    pub event_path: Vec<String>,
-    /// Event type (usually "click")
-    pub event_type: String,
-    /// Actual LinkRef ID if available (resolved during evaluation)
-    /// When present, this takes precedence over event_path resolution
-    pub link_id: Option<String>,
-}
-
-thread_local! {
-    // Toggle event bindings parsed from HOLD bodies
-    static TOGGLE_EVENT_BINDINGS: std::cell::RefCell<Vec<ToggleEventBinding>> = std::cell::RefCell::new(Vec::new()); // ALLOWED: config state
-}
-
-/// Add a toggle event binding.
-/// Parsed from HOLD body expressions like:
-/// `todo_elements.todo_checkbox.event.click |> THEN { state |> Bool/not() }`
-pub fn add_toggle_event_binding(binding: ToggleEventBinding) {
-    zoon::println!("[DD Config] Adding toggle binding: {:?}", binding);
-    TOGGLE_EVENT_BINDINGS.with(|b| b.borrow_mut().push(binding)); // ALLOWED: IO layer
+/// Phase 7.3: Delegates to DataflowConfig via core accessor.
+pub fn get_editing_event_bindings() -> Vec<EditingBinding> {
+    core_get_editing_bindings()
 }
 
 /// Get all toggle event bindings.
-pub fn get_toggle_event_bindings() -> Vec<ToggleEventBinding> {
-    TOGGLE_EVENT_BINDINGS.with(|b| b.borrow().clone()) // ALLOWED: IO layer
-}
-
-/// Clear all toggle event bindings.
-pub fn clear_toggle_event_bindings() {
-    TOGGLE_EVENT_BINDINGS.with(|b| b.borrow_mut().clear()); // ALLOWED: IO layer
-}
-
-/// Global toggle event binding for "toggle all" patterns.
-/// Contains the path to a LinkRef whose click toggles ALL items in a list.
-/// Pattern: `store.elements.toggle_all.event.click |> THEN { store.all_completed |> Bool/not() }`
-#[derive(Clone, Debug)]
-pub struct GlobalToggleEventBinding {
-    /// The Cell ID that this toggle affects (the list cell like "todos")
-    pub list_cell_id: String,
-    /// Path to LinkRef whose click triggers toggle (e.g., ["store", "elements", "toggle_all_checkbox"])
-    pub event_path: Vec<String>,
-    /// Event type (usually "click")
-    pub event_type: String,
-    /// Path to the global computed value (e.g., ["store", "all_completed"])
-    pub value_path: Vec<String>,
-}
-
-thread_local! {
-    // Global toggle event bindings parsed from HOLD bodies
-    static GLOBAL_TOGGLE_BINDINGS: std::cell::RefCell<Vec<GlobalToggleEventBinding>> = std::cell::RefCell::new(Vec::new()); // ALLOWED: config state
-}
-
-/// Add a global toggle event binding.
-pub fn add_global_toggle_binding(binding: GlobalToggleEventBinding) {
-    zoon::println!("[DD Config] Adding global toggle binding: {:?}", binding);
-    GLOBAL_TOGGLE_BINDINGS.with(|b| b.borrow_mut().push(binding)); // ALLOWED: IO layer
+/// Phase 7.3: Delegates to DataflowConfig via core accessor.
+pub fn get_toggle_event_bindings() -> Vec<ToggleBinding> {
+    core_get_toggle_bindings()
 }
 
 /// Get all global toggle event bindings.
-pub fn get_global_toggle_bindings() -> Vec<GlobalToggleEventBinding> {
-    GLOBAL_TOGGLE_BINDINGS.with(|b| b.borrow().clone()) // ALLOWED: IO layer
-}
-
-/// Clear all global toggle event bindings.
-pub fn clear_global_toggle_bindings() {
-    GLOBAL_TOGGLE_BINDINGS.with(|b| b.borrow_mut().clear()); // ALLOWED: IO layer
+/// Phase 7.3: Delegates to DataflowConfig via core accessor.
+pub fn get_global_toggle_bindings() -> Vec<GlobalToggleBinding> {
+    core_get_global_toggle_bindings()
 }
 
 // Text input key_down LinkRef extracted from Element/text_input during evaluation
 thread_local! {
     static TEXT_INPUT_KEY_DOWN_LINK: std::cell::Cell<Option<String>> = std::cell::Cell::new(None); // ALLOWED: config state
-    // Flag to skip key_down detection during WHILE pre-evaluation for reactive rendering
-    // When this is > 0, we're inside eval_pattern_match pre-evaluating WHILE arms
-    static WHILE_PREEVAL_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0); // ALLOWED: config state
 }
 
-/// Enter WHILE pre-evaluation context.
-/// Called at the start of eval_pattern_match for CellRef inputs.
-pub fn enter_while_preeval() {
-    WHILE_PREEVAL_DEPTH.with(|d| {
-        let new_depth = d.get() + 1;
-        d.set(new_depth);
-        zoon::println!("[DD WHILE preeval] ENTER depth={}", new_depth);
-    }); // ALLOWED: IO layer
-}
-
-/// Exit WHILE pre-evaluation context.
-/// Called at the end of eval_pattern_match for CellRef inputs.
-pub fn exit_while_preeval() {
-    WHILE_PREEVAL_DEPTH.with(|d| {
-        let current = d.get();
-        if current > 0 {
-            let new_depth = current - 1;
-            d.set(new_depth);
-            zoon::println!("[DD WHILE preeval] EXIT depth={}", new_depth);
-        }
-    }); // ALLOWED: IO layer
-}
-
-/// Check if we're inside WHILE pre-evaluation context.
-fn in_while_preeval() -> bool {
-    WHILE_PREEVAL_DEPTH.with(|d| d.get() > 0) // ALLOWED: IO layer
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// SURGICALLY REMOVED: WHILE_PREEVAL_DEPTH, enter_while_preeval(), exit_while_preeval(), in_while_preeval()
+//
+// This hack was needed because cell_states_signal() (broadcast anti-pattern) caused
+// spurious re-renders during WHILE pre-evaluation. With cell_states_signal() removed
+// (Phase 11b), fine-grained signals prevent the issue. The actors engine never needed
+// this hack because it has fine-grained reactivity by design.
+// ═══════════════════════════════════════════════════════════════════════════
 
 /// Set the text_input key_down LinkRef ID.
 /// Called by eval_element_function when Element/text_input has a key_down event.
 /// Task 4.3: Eliminates extract_text_input_key_down() document scanning.
-///
-/// NOTE: Skips setting during WHILE pre-evaluation to prevent editing text_inputs
-/// inside WHILE branches from overwriting the main document's text_input link.
 pub fn set_text_input_key_down_link(link_id: String) {
-    let depth = WHILE_PREEVAL_DEPTH.with(|d| d.get());
-    if in_while_preeval() {
-        zoon::println!("[DD Config] Skipping text_input key_down link in WHILE preeval (depth={}): {}", depth, link_id);
-        return;
-    }
-    zoon::println!("[DD Config] Setting text_input key_down link (depth={}): {}", depth, link_id);
+    zoon::println!("[DD Config] Setting text_input key_down link: {}", link_id);
     TEXT_INPUT_KEY_DOWN_LINK.with(|l| l.set(Some(link_id))); // ALLOWED: IO layer
 }
 
@@ -439,13 +741,13 @@ pub fn clear_list_clear_link() {
     LIST_CLEAR_LINK.with(|l| l.set(None)); // ALLOWED: IO layer
 }
 
-// Flag for template-based lists (FilteredMappedListWithPredicate/FilteredMappedListRef)
+// Flag for template-based lists (now __mapped_list__ / __filtered_mapped_list__ Tagged values)
 thread_local! {
     static HAS_TEMPLATE_LIST: std::cell::Cell<bool> = std::cell::Cell::new(false); // ALLOWED: config state
 }
 
 /// Set the has_template_list flag.
-/// Called by evaluator when creating FilteredMappedListWithPredicate or FilteredMappedListRef.
+/// Called by evaluator when creating template-based list mappings.
 /// Task 6.3: Eliminates has_filtered_mapped_list() document scanning.
 pub fn set_has_template_list(value: bool) {
     zoon::println!("[DD Config] Setting has_template_list: {}", value);
@@ -494,53 +796,24 @@ pub fn clear_current_route() {
 }
 
 
-/// Register checkbox toggle hold IDs for reactive count computation.
-/// Called by interpreter when detecting the checkbox toggle pattern.
-pub fn set_checkbox_toggle_holds(cell_ids: Vec<String>) {
-    CHECKBOX_TOGGLE_HOLDS.with(|holds| {
-        holds.set(cell_ids);
-    });
-}
-
-/// Clear checkbox toggle holds.
-/// Called when clearing state or starting a new run.
-pub fn clear_checkbox_toggle_holds() {
-    CHECKBOX_TOGGLE_HOLDS.with(|holds| {
-        holds.lock_mut().clear();
-    });
-}
-
-/// Get a signal for checkbox toggle holds.
-/// Returns hold IDs that represent boolean checkbox states.
-pub fn checkbox_toggle_holds_signal() -> MutableSignalCloned<Vec<String>> {
-    CHECKBOX_TOGGLE_HOLDS.with(|holds| holds.signal_cloned())
-}
-
-/// Get current checkbox toggle hold IDs synchronously.
-/// Used by the bridge when rendering "N items left" reactively.
-pub fn get_checkbox_toggle_holds() -> Vec<String> {
-    CHECKBOX_TOGGLE_HOLDS.with(|holds| holds.lock_ref().clone())
-}
+// DEAD CODE DELETED: set_checkbox_toggle_holds, clear_checkbox_toggle_holds,
+// checkbox_toggle_holds_signal, get_checkbox_toggle_holds - all were set but never read
 
 // DEAD CODE DELETED: get_unchecked_checkbox_count() - never called
 
-/// Register a text-clear HOLD ID (derived from link ID).
-/// When this HOLD is updated, the text input DOM will be cleared.
-/// Task 7.1: Replaces hardcoded "text_input_text" with dynamic names.
-pub fn add_text_clear_cell(cell_id: String) {
-    TEXT_CLEAR_HOLDS.with(|holds| holds.borrow_mut().insert(cell_id)); // ALLOWED: IO layer
-}
+// Phase 7.3: add_text_clear_cell DELETED - now registered via DataflowConfig methods
 
 /// Check if a HOLD ID is a text-clear HOLD.
 /// Used by output listener to know when to clear text input DOM.
+/// Phase 7.3: Delegates to DataflowConfig via core accessor.
 pub fn is_text_clear_cell(cell_id: &str) -> bool {
-    TEXT_CLEAR_HOLDS.with(|holds| holds.borrow().contains(cell_id)) // ALLOWED: IO layer
+    core_is_text_clear_cell(cell_id)
 }
 
 /// Clear text-clear hold registry.
-/// Called when clearing state or starting a new run.
+/// Phase 7.3: Now a no-op - clearing happens via clear_active_config().
 pub fn clear_text_clear_cells() {
-    TEXT_CLEAR_HOLDS.with(|holds| holds.borrow_mut().clear()); // ALLOWED: IO layer
+    // No-op: text_clear_cells is now in DataflowConfig, cleared via clear_active_config()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -647,7 +920,8 @@ fn dd_value_to_json(value: &Value) -> Option<zoon::serde_json::Value> {
             })
         }
         // Don't persist complex types - they need code evaluation
-        Value::Tagged { .. } | Value::LinkRef(_) | Value::TimerRef { .. } | Value::WhileRef { .. } | Value::ComputedRef { .. } | Value::FilteredListRef { .. } | Value::FilteredListRefWithPredicate { .. } | Value::ReactiveFilteredList { .. } | Value::ReactiveText { .. } | Value::Placeholder | Value::PlaceholderField { .. } | Value::PlaceholderWhileRef { .. } | Value::NegatedPlaceholderField { .. } | Value::MappedListRef { .. } | Value::FilteredMappedListRef { .. } | Value::FilteredMappedListWithPredicate { .. } | Value::LatestRef { .. } | Value::Flushed(_) => None,
+        // Pure DD: Symbolic refs (WhileRef, PlaceholderField, etc.) were removed in Phase 7
+        Value::Tagged { .. } | Value::LinkRef(_) | Value::TimerRef { .. } | Value::Placeholder | Value::Flushed(_) => None,
     }
 }
 
@@ -682,10 +956,69 @@ fn json_to_dd_value(json: &zoon::serde_json::Value) -> Option<Value> {
     }
 }
 
-/// Get a signal for all HOLD states.
-/// The bridge uses this to reactively update the DOM.
-pub fn cell_states_signal() -> MutableSignalCloned<HashMap<String, Value>> {
-    CELL_STATES.with(|states| states.signal_cloned())
+// ═══════════════════════════════════════════════════════════════════════════
+// SURGICALLY REMOVED: cell_states_signal()
+//
+// This was the global broadcast anti-pattern:
+// - Fired on ANY cell change (O(n) re-evaluation)
+// - Caused spurious re-renders throughout the UI
+// - Root cause of blur issues in WHILE editing (required grace period hack)
+//
+// The actors engine doesn't have this problem because each actor subscribes
+// only to its specific inputs (fine-grained reactivity).
+//
+// Use instead:
+// - cell_signal(cell_id) - watch single cell
+// - cells_signal(cell_ids) - watch multiple specific cells
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Get a granular signal for a specific cell.
+/// Only fires when THIS cell's value changes - O(1) updates.
+///
+/// This is the correct pattern for fine-grained reactivity (actors-style):
+/// ```ignore
+/// // ✅ GRANULAR - only fires when "count" changes
+/// cell_signal("count").map(|v| v.map(|v| v.to_display_string()).unwrap_or_default())
+/// ```
+pub fn cell_signal(cell_id: impl Into<String>) -> impl zoon::Signal<Item = Option<Value>> + Unpin {
+    let cell_id = cell_id.into();
+    CELL_STATES.with(|states| {
+        states.signal_ref(move |map| map.get(&cell_id).cloned())
+    })
+}
+
+/// Get a signal that fires when ANY of the specified cells change.
+/// Use when you need to watch multiple specific cells (e.g., TEXT with CellRef parts).
+///
+/// The signal fires when any watched cell changes.
+/// Use `get_cell_value()` in the map closure to read current values.
+///
+/// ```ignore
+/// // ✅ TARGETED - fires only when cell_a or cell_b changes
+/// cells_signal(vec!["cell_a", "cell_b"]).map(|_| compute_from_cells())
+/// ```
+pub fn cells_signal(cell_ids: Vec<String>) -> impl zoon::Signal<Item = ()> + Unpin {
+    CELL_STATES.with(|states| {
+        states.signal_ref(move |map| {
+            // Extract only the values we care about
+            // This signal fires when any of the watched cells change
+            // We use a hash of the fingerprint for efficient change detection
+            let fingerprint_hash: u64 = cell_ids.iter()
+                .map(|id| {
+                    map.get(id)
+                        .map(|v| v.to_display_string())
+                        .unwrap_or_default()
+                })
+                .fold(0u64, |acc, s| {
+                    // Simple hash combination
+                    acc.wrapping_mul(31).wrapping_add(s.len() as u64)
+                        .wrapping_add(s.chars().map(|c| c as u64).sum::<u64>())
+                });
+            fingerprint_hash
+        })
+        .dedupe()
+        .map(|_| ())
+    })
 }
 
 /// Get the current value of a specific HOLD.
@@ -694,6 +1027,207 @@ pub fn get_cell_value(cell_id: &str) -> Option<Value> {
     CELL_STATES.with(|states| {
         states.lock_ref().get(cell_id).cloned()
     })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 12: List SignalVec API
+// Provides incremental list rendering via VecDiff for children_signal_vec().
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Get a SignalVec for a list cell that enables incremental DOM updates.
+///
+/// # Phase 12 Architecture
+///
+/// Instead of re-rendering the entire list when any item changes, use this
+/// with Zoon's `children_signal_vec()` for O(delta) DOM operations:
+///
+/// ```ignore
+/// // ✅ INCREMENTAL - only changed elements updated
+/// El::new().children_signal_vec(
+///     list_signal_vec("todos")
+///         .map_signal_cloned(|item| render_todo_item(item))
+/// )
+/// ```
+///
+/// # Returns
+///
+/// A SignalVec that emits VecDiff when the list changes:
+/// - `VecDiff::Replace` when list is initially loaded or fully replaced
+/// - `VecDiff::Push` when item is appended (future optimization)
+/// - `VecDiff::RemoveAt` when item is removed (future optimization)
+///
+/// # Current Implementation
+///
+/// Currently emits `VecDiff::Replace` on any list change. Future optimization
+/// will compute actual diffs from DD worker output for true O(delta).
+pub fn list_signal_vec(cell_id: impl Into<String>) -> impl SignalVec<Item = Value> {
+    let cell_id = cell_id.into();
+
+    LIST_SIGNAL_VECS.with(|vecs| {
+        let mut vecs = vecs.borrow_mut(); // ALLOWED: IO layer
+        // Get or create MutableVec for this list cell
+        let mvec = vecs.entry(cell_id.clone()).or_insert_with(|| {
+            // Initialize with current list value if available
+            let initial_items = get_cell_value(&cell_id)
+                .and_then(|v| match v {
+                    Value::List(items) => Some(items.iter().cloned().collect::<Vec<_>>()),
+                    Value::Collection(handle) => Some(handle.iter().cloned().collect::<Vec<_>>()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            MutableVec::new_with_values(initial_items)
+        });
+        mvec.signal_vec_cloned()
+    })
+}
+
+/// Update the MutableVec for a list cell with incremental diff detection.
+/// Called internally when sync_cell_from_dd receives a list value.
+///
+/// # Phase 12 Optimization: Diff Detection
+///
+/// Instead of always emitting VecDiff::Replace, this function detects:
+/// - **Single append**: new_items = old_items + [item] → VecDiff::Push (O(1) DOM)
+/// - **Single removal**: new_items = old_items - [item] → VecDiff::RemoveAt (O(1) DOM)
+/// - **Complex change**: Fall back to VecDiff::Replace (O(n) DOM)
+///
+/// This gives O(delta) DOM updates for the common shopping_list/todo_mvc patterns
+/// while still handling edge cases correctly.
+/// Update MutableVec for a list cell - FALLBACK path for full list values.
+///
+/// # Phase 4.2 Note
+/// Most list operations now use ListDiff variants (ListPush, ListRemoveByKey, etc.)
+/// which apply O(delta) updates directly via `apply_list_*()` functions.
+///
+/// This function is the FALLBACK for:
+/// - Initial list population (first sync of a cell)
+/// - Bulk operations (ListRemoveCompleted) that emit full filtered lists
+/// - Field updates (ListItemSetFieldByIdentity) that emit full updated lists
+/// - Non-persistent worker path (dataflow.rs DdTransforms)
+/// - Persisted state restoration
+///
+/// The diff detection here provides correct behavior for these edge cases.
+fn update_list_signal_vec(cell_id: &str, new_items: &[Value]) {
+    LIST_SIGNAL_VECS.with(|vecs| {
+        let mut vecs = vecs.borrow_mut(); // ALLOWED: IO layer
+        if let Some(mvec) = vecs.get_mut(cell_id) {
+            let mut lock = mvec.lock_mut();
+            let old_len = lock.len();
+            let new_len = new_items.len();
+
+            // Case 1: Single append - new list is old list + one item at end
+            if new_len == old_len + 1 {
+                // Check if first old_len items match
+                let prefix_matches = lock.iter()
+                    .zip(new_items.iter().take(old_len))
+                    .all(|(old, new)| values_equal_for_diff(old, new));
+
+                if prefix_matches {
+                    // It's a push! O(1) DOM update
+                    let new_item = new_items.last().unwrap().clone();
+                    if LOG_DD_DEBUG {
+                        zoon::println!("[DD ListDiff] {} Push detected (O(1))", cell_id);
+                    }
+                    lock.push_cloned(new_item);
+                    return;
+                }
+            }
+
+            // Case 2: Single removal - new list is old list minus one item
+            // Phase 2.2: O(1) key-based removal detection using HashMap
+            if new_len + 1 == old_len {
+                // Build set of new item keys - O(new_len)
+                let new_keys: HashSet<String> = new_items
+                    .iter()
+                    .map(extract_item_key)
+                    .collect();
+
+                // Find old item not in new items - O(old_len) but with O(1) lookup per item
+                let mut removed_index = None;
+                for (i, old_item) in lock.iter().enumerate() {
+                    let old_key = extract_item_key(old_item);
+                    if !new_keys.contains(&old_key) {
+                        if removed_index.is_some() {
+                            // More than one removal - fall back to replace
+                            removed_index = None;
+                            break;
+                        }
+                        removed_index = Some(i);
+                    }
+                }
+
+                if let Some(index) = removed_index {
+                    if LOG_DD_DEBUG {
+                        zoon::println!("[DD ListDiff] {} RemoveAt({}) detected (O(1) key lookup)", cell_id, index);
+                    }
+                    lock.remove(index);
+                    return;
+                }
+            }
+
+            // Case 3: Complex change - fall back to replace
+            if LOG_DD_DEBUG {
+                zoon::println!("[DD ListDiff] {} Replace (old_len={}, new_len={})", cell_id, old_len, new_len);
+            }
+            lock.replace_cloned(new_items.iter().cloned().collect());
+        } else {
+            // Create new MutableVec if list cell is first synced
+            if LOG_DD_DEBUG {
+                zoon::println!("[DD ListDiff] {} Initial (len={})", cell_id, new_items.len());
+            }
+            let mvec = MutableVec::new_with_values(new_items.iter().cloned().collect());
+            vecs.insert(cell_id.to_string(), mvec);
+        }
+    });
+}
+
+/// Extract a unique key from a Value for O(1) lookup.
+/// Looks for CellRef or LinkRef IDs which are guaranteed unique per item.
+/// Falls back to display string for simple values.
+fn extract_item_key(value: &Value) -> String {
+    match value {
+        Value::CellRef(cell_id) => format!("hold:{}", cell_id.name()),
+        Value::LinkRef(link_id) => format!("link:{}", link_id.name()),
+        Value::Object(fields) => {
+            // For objects, find first CellRef or LinkRef field (they're unique per item)
+            for (_, field_value) in fields.iter() {
+                match field_value {
+                    Value::CellRef(cell_id) => return format!("hold:{}", cell_id.name()),
+                    Value::LinkRef(link_id) => return format!("link:{}", link_id.name()),
+                    Value::Object(inner) => {
+                        // Check nested objects (e.g., todo_elements)
+                        for (_, inner_value) in inner.iter() {
+                            match inner_value {
+                                Value::CellRef(cell_id) => return format!("hold:{}", cell_id.name()),
+                                Value::LinkRef(link_id) => return format!("link:{}", link_id.name()),
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Fallback to display string
+            value.to_display_string()
+        }
+        _ => value.to_display_string(),
+    }
+}
+
+/// Compare two Values for diff detection purposes.
+/// Uses key-based comparison for objects (O(1) via unique IDs).
+/// Falls back to display string comparison for simple values.
+fn values_equal_for_diff(a: &Value, b: &Value) -> bool {
+    // Phase 2.2: Use key-based comparison for O(1) lookup
+    extract_item_key(a) == extract_item_key(b)
+}
+
+/// Clear all list signal vecs.
+/// Called when clearing state between examples.
+pub fn clear_list_signal_vecs() {
+    LIST_SIGNAL_VECS.with(|vecs| {
+        vecs.borrow_mut().clear(); // ALLOWED: IO layer
+    });
 }
 
 /// Get the current value of a specific HOLD by CellId.

@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::super::core::value::Value;
-use super::super::io::{add_router_mapping, init_cell};
-use super::super::core::{DataflowConfig, CellConfig, CellId, LinkId, EventFilter, StateTransform, BoolTag, ElementTag};
+use super::super::io::init_cell;
+// Phase 11a: add_router_mapping was removed - routing goes through DD dataflow now
+use super::super::core::{DataflowConfig, CellConfig, CellId, LinkId, EventFilter, StateTransform, BoolTag, ElementTag, EditingBinding, ToggleBinding, GlobalToggleBinding};
 
 // Global counter for generating unique HOLD IDs across all runtime instances
 static GLOBAL_CELL_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -52,6 +53,10 @@ pub struct BoonDdRuntime {
     last_list_source: Option<String>,
     /// DataflowConfig built during evaluation (Task 4.4: declarative config builder)
     dataflow_config: DataflowConfig,
+    /// Phase 4: Mapping from CellId (HOLD name) to CollectionId for lists
+    /// When a HOLD contains a list, we register it here so List/retain, List/map
+    /// can look up the source CollectionId for DD operations.
+    cell_to_collection: HashMap<String, super::super::core::value::CollectionId>,
 }
 
 impl BoonDdRuntime {
@@ -66,6 +71,7 @@ impl BoonDdRuntime {
             context_path: Vec::new(),
             last_list_source: None,
             dataflow_config: DataflowConfig::new(),
+            cell_to_collection: HashMap::new(),
         }
     }
 
@@ -87,6 +93,249 @@ impl BoonDdRuntime {
             config.id.name(), config.transform, config.triggered_by.iter().map(|l| l.name()).collect::<Vec<_>>());
         self.dataflow_config.cells.push(config);
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Phase 4: Collection operation helpers
+    //
+    // These methods replace the surgically removed symbolic reference types
+    // (FilteredListRef, MappedListRef, ComputedRef, etc.) with DD-native patterns.
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Register a list HOLD and get its CollectionId.
+    /// Called when evaluating a HOLD that contains a list.
+    fn register_list_hold(&mut self, cell_id: &str, items: Vec<Value>) -> super::super::core::value::CollectionId {
+
+        let collection_id = self.dataflow_config.add_initial_collection(items);
+        self.cell_to_collection.insert(cell_id.to_string(), collection_id.clone());
+        zoon::println!("[DD_EVAL] Registered list HOLD '{}' as CollectionId({:?})", cell_id, collection_id);
+        collection_id
+    }
+
+    /// Get the CollectionId for a HOLD cell, if it contains a list.
+    fn get_collection_id(&self, cell_id: &str) -> Option<super::super::core::value::CollectionId> {
+        self.cell_to_collection.get(cell_id).cloned()
+    }
+
+    /// Create a filtered collection (replaces FilteredListRef).
+    ///
+    /// OLD: Value::FilteredListRef { source_hold, filter_field, filter_value }
+    /// NEW: Register filter op in DataflowConfig, return Value::Collection
+    fn create_filtered_collection(
+        &mut self,
+        source_cell_id: &str,
+        filter_field: std::sync::Arc<str>,
+        filter_value: Value,
+    ) -> Value {
+        use super::super::core::value::CollectionHandle;
+
+        if let Some(source_id) = self.get_collection_id(source_cell_id) {
+            let output_id = self.dataflow_config.add_filter(
+                source_id,
+                Some((filter_field, filter_value)),
+                None,
+            );
+            zoon::println!("[DD_EVAL] Created filtered collection from '{}' -> CollectionId({:?})",
+                source_cell_id, output_id);
+            Value::Collection(CollectionHandle::new_with_id(output_id))
+        } else {
+            // Fallback: source not registered as collection, return CellRef
+            // This maintains backward compatibility during migration
+            zoon::println!("[DD_EVAL] WARNING: source '{}' not registered as collection, returning CellRef", source_cell_id);
+            Value::CellRef(CellId::new(source_cell_id))
+        }
+    }
+
+    /// Create a mapped collection (replaces MappedListRef).
+    ///
+    /// OLD: Value::MappedListRef { source_hold, element_template }
+    /// NEW: Register map op in DataflowConfig, return Value::Collection
+    fn create_mapped_collection(
+        &mut self,
+        source_cell_id: &str,
+        element_template: Value,
+    ) -> Value {
+        use super::super::core::value::CollectionHandle;
+
+        if let Some(source_id) = self.get_collection_id(source_cell_id) {
+            let output_id = self.dataflow_config.add_map(source_id, element_template);
+            zoon::println!("[DD_EVAL] Created mapped collection from '{}' -> CollectionId({:?})",
+                source_cell_id, output_id);
+            Value::Collection(CollectionHandle::new_with_id(output_id))
+        } else {
+            zoon::println!("[DD_EVAL] WARNING: source '{}' not registered as collection, returning CellRef", source_cell_id);
+            Value::CellRef(CellId::new(source_cell_id))
+        }
+    }
+
+    /// Create a list count (replaces ComputedRef::ListCount).
+    ///
+    /// OLD: Value::ComputedRef { computation: ListCount, source_hold }
+    /// NEW: Register count op in DataflowConfig, return Value::Collection
+    fn create_list_count(&mut self, source_cell_id: &str) -> Value {
+        use super::super::core::value::CollectionHandle;
+
+        if let Some(source_id) = self.get_collection_id(source_cell_id) {
+            let output_id = self.dataflow_config.add_count(source_id);
+            zoon::println!("[DD_EVAL] Created list count from '{}' -> CollectionId({:?})",
+                source_cell_id, output_id);
+            Value::Collection(CollectionHandle::new_with_id(output_id))
+        } else {
+            zoon::println!("[DD_EVAL] WARNING: source '{}' not registered as collection, returning CellRef", source_cell_id);
+            Value::CellRef(CellId::new(source_cell_id))
+        }
+    }
+
+    /// Create a count-where (replaces ComputedRef::ListCountWhere).
+    ///
+    /// OLD: Value::ComputedRef { computation: ListCountWhere { filter_field, filter_value }, source_hold }
+    /// NEW: Register count-where op in DataflowConfig, return Value::Collection
+    fn create_list_count_where(
+        &mut self,
+        source_cell_id: &str,
+        filter_field: std::sync::Arc<str>,
+        filter_value: Value,
+    ) -> Value {
+        use super::super::core::value::CollectionHandle;
+
+        if let Some(source_id) = self.get_collection_id(source_cell_id) {
+            let output_id = self.dataflow_config.add_count_where(source_id, filter_field, filter_value);
+            zoon::println!("[DD_EVAL] Created list count-where from '{}' -> CollectionId({:?})",
+                source_cell_id, output_id);
+            Value::Collection(CollectionHandle::new_with_id(output_id))
+        } else {
+            zoon::println!("[DD_EVAL] WARNING: source '{}' not registered as collection, returning CellRef", source_cell_id);
+            Value::CellRef(CellId::new(source_cell_id))
+        }
+    }
+
+    /// Chain a map operation on an existing collection (for filter+map chains).
+    ///
+    /// OLD: FilteredListRef |> List/map() -> FilteredMappedListRef
+    /// NEW: Collection(filtered_id) |> List/map() -> Collection(mapped_id)
+    fn chain_map_on_collection(
+        &mut self,
+        source_id: super::super::core::value::CollectionId,
+        element_template: Value,
+    ) -> Value {
+        use super::super::core::value::CollectionHandle;
+
+        let output_id = self.dataflow_config.add_map(source_id.clone(), element_template);
+        zoon::println!("[DD_EVAL] Chained map on CollectionId({:?}) -> CollectionId({:?})",
+            source_id, output_id);
+        Value::Collection(CollectionHandle::new_with_id(output_id))
+    }
+
+    /// Chain a filter operation on an existing collection (for chained filters).
+    fn chain_filter_on_collection(
+        &mut self,
+        source_id: super::super::core::value::CollectionId,
+        filter_field: Option<(std::sync::Arc<str>, Value)>,
+        predicate_template: Option<Value>,
+    ) -> Value {
+        use super::super::core::value::CollectionHandle;
+
+        let output_id = self.dataflow_config.add_filter(source_id.clone(), filter_field, predicate_template);
+        zoon::println!("[DD_EVAL] Chained filter on CollectionId({:?}) -> CollectionId({:?})",
+            source_id, output_id);
+        Value::Collection(CollectionHandle::new_with_id(output_id))
+    }
+
+    /// Create a list is_empty check (replaces ComputedRef::ListIsEmpty).
+    fn create_list_is_empty(&mut self, source_cell_id: &str) -> Value {
+        use super::super::core::value::CollectionHandle;
+
+        if let Some(source_id) = self.get_collection_id(source_cell_id) {
+            let output_id = self.dataflow_config.add_is_empty(source_id);
+            zoon::println!("[DD_EVAL] Created list is_empty from '{}' -> CollectionId({:?})",
+                source_cell_id, output_id);
+            Value::Collection(CollectionHandle::new_with_id(output_id))
+        } else {
+            zoon::println!("[DD_EVAL] WARNING: source '{}' not registered as collection, returning CellRef", source_cell_id);
+            Value::CellRef(CellId::new(source_cell_id))
+        }
+    }
+
+    /// Chain a count operation on an existing collection.
+    fn chain_count_on_collection(
+        &mut self,
+        source_id: super::super::core::value::CollectionId,
+    ) -> Value {
+        use super::super::core::value::CollectionHandle;
+
+        let output_id = self.dataflow_config.add_count(source_id.clone());
+        zoon::println!("[DD_EVAL] Chained count on CollectionId({:?}) -> CollectionId({:?})",
+            source_id, output_id);
+        Value::Collection(CollectionHandle::new_with_id(output_id))
+    }
+
+    /// Chain an is_empty operation on an existing collection.
+    fn chain_is_empty_on_collection(
+        &mut self,
+        source_id: super::super::core::value::CollectionId,
+    ) -> Value {
+        use super::super::core::value::CollectionHandle;
+
+        let output_id = self.dataflow_config.add_is_empty(source_id.clone());
+        zoon::println!("[DD_EVAL] Chained is_empty on CollectionId({:?}) -> CollectionId({:?})",
+            source_id, output_id);
+        Value::Collection(CollectionHandle::new_with_id(output_id))
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Phase 4: Arithmetic/Comparison Operation Helpers
+    // Replaces: ComputedRef::Subtract, ComputedRef::GreaterThanZero, ComputedRef::Equal
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Create a subtract operation (left - right).
+    /// Replaces: ComputedRef::Subtract
+    /// Used for: active_list_count = list_count - completed_list_count
+    fn create_subtract(
+        &mut self,
+        left: super::super::core::value::CollectionId,
+        right: super::super::core::value::CollectionId,
+    ) -> Value {
+        use super::super::core::value::CollectionHandle;
+
+        let output_id = self.dataflow_config.add_subtract(left.clone(), right.clone());
+        zoon::println!("[DD_EVAL] Created subtract: CollectionId({:?}) - CollectionId({:?}) -> CollectionId({:?})",
+            left, right, output_id);
+        Value::Collection(CollectionHandle::new_with_id(output_id))
+    }
+
+    /// Create a greater-than-zero check.
+    /// Replaces: ComputedRef::GreaterThanZero
+    /// Used for: show_clear_completed = completed_list_count > 0
+    fn create_greater_than_zero(
+        &mut self,
+        source_id: super::super::core::value::CollectionId,
+    ) -> Value {
+        use super::super::core::value::CollectionHandle;
+
+        let output_id = self.dataflow_config.add_greater_than_zero(source_id.clone());
+        zoon::println!("[DD_EVAL] Created greater_than_zero: CollectionId({:?}) > 0 -> CollectionId({:?})",
+            source_id, output_id);
+        Value::Collection(CollectionHandle::new_with_id(output_id))
+    }
+
+    /// Create an equality comparison.
+    /// Replaces: ComputedRef::Equal
+    /// Used for: all_completed = completed_list_count == list_count
+    fn create_equal(
+        &mut self,
+        left: super::super::core::value::CollectionId,
+        right: super::super::core::value::CollectionId,
+    ) -> Value {
+        use super::super::core::value::CollectionHandle;
+
+        let output_id = self.dataflow_config.add_equal(left.clone(), right.clone());
+        zoon::println!("[DD_EVAL] Created equal: CollectionId({:?}) == CollectionId({:?}) -> CollectionId({:?})",
+            left, right, output_id);
+        Value::Collection(CollectionHandle::new_with_id(output_id))
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // End Phase 4 helpers
+    // ══════════════════════════════════════════════════════════════════════════════
 
     /// Determine the StateTransform from HOLD body pattern.
     ///
@@ -268,6 +517,7 @@ impl BoonDdRuntime {
             context_path: Vec::new(),
             last_list_source: None,
             dataflow_config: DataflowConfig::new(),
+            cell_to_collection: HashMap::new(),
         };
 
         // Bind arguments to parameters
@@ -415,6 +665,7 @@ impl BoonDdRuntime {
                     context_path: Vec::new(),
                     last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
+                    cell_to_collection: HashMap::new(),
                 };
                 for var in variables {
                     let name = var.node.name.as_str().to_string();
@@ -511,6 +762,7 @@ impl BoonDdRuntime {
             context_path: Vec::new(),
                 last_list_source: None,
             dataflow_config: DataflowConfig::new(),
+            cell_to_collection: HashMap::new(),
             };
 
         let mut map = BTreeMap::new();
@@ -623,12 +875,12 @@ impl BoonDdRuntime {
                             // Try to extract per-item removal path (item.X.Y.event.press → ["X", "Y"])
                             if let Some(path) = self.extract_linkref_path_from_event(binding, &event_expr.node) {
                                 zoon::println!("[DD_EVAL] List/remove (reactive field) parsed on: binding={}, path={:?}", binding, path);
-                                super::super::io::set_remove_event_path(path);
+                                self.dataflow_config.set_remove_event_path(path);
                             } else {
                                 // Try to extract bulk removal path (elements.X.event.press → global event)
                                 if let Some(global_path) = self.extract_global_event_path(&event_expr.node) {
                                     zoon::println!("[DD_EVAL] List/remove (reactive field) parsed BULK on: path={:?}", global_path);
-                                    super::super::io::set_bulk_remove_event_path(global_path);
+                                    self.dataflow_config.set_bulk_remove_event_path(global_path);
                                 }
                             }
                         }
@@ -654,10 +906,10 @@ impl BoonDdRuntime {
                     if let (Some(binding), Some(event_expr)) = (binding_name, on_expr) {
                         if let Some(path) = self.extract_linkref_path_from_event(binding, &event_expr.node) {
                             zoon::println!("[DD_EVAL] List/remove (direct) parsed on: binding={}, path={:?}", binding, path);
-                            super::super::io::set_remove_event_path(path);
+                            self.dataflow_config.set_remove_event_path(path);
                         } else if let Some(global_path) = self.extract_global_event_path(&event_expr.node) {
                             zoon::println!("[DD_EVAL] List/remove (direct) parsed BULK on: path={:?}", global_path);
-                            super::super::io::set_bulk_remove_event_path(global_path);
+                            self.dataflow_config.set_bulk_remove_event_path(global_path);
                         }
                     }
                 }
@@ -682,11 +934,11 @@ impl BoonDdRuntime {
                 TextPart::Interpolation { var, .. } => {
                     if let Some(value) = self.variables.get(var.as_str()) {
                         // Check if the value is reactive or a placeholder
+                        // Phase 4: Removed ComputedRef, WhileRef - use CellRef and Collection for reactivity
                         let is_reactive = matches!(
                             value,
-                            Value::ComputedRef { .. } |
-                            Value::WhileRef { .. } |
                             Value::CellRef(_) |
+                            Value::Collection(_) |
                             Value::Placeholder
                         );
                         if is_reactive {
@@ -698,18 +950,12 @@ impl BoonDdRuntime {
             }
         }
 
-        // If no reactive parts, use the simple string approach
-        if !has_reactive {
-            let result: String = collected_parts.iter()
-                .map(|v| v.to_display_string())
-                .collect();
-            return Value::text(result);
-        }
-
-        // Has reactive parts - create ReactiveText for bridge to evaluate at render time
-        Value::ReactiveText {
-            parts: Arc::new(collected_parts),
-        }
+        // Phase 4: For now, always evaluate text at evaluation time
+        // TODO: Add DD text concatenation operator for true reactive text
+        let result: String = collected_parts.iter()
+            .map(|v| v.to_display_string())
+            .collect();
+        Value::text(result)
     }
 
     /// Evaluate a function call.
@@ -846,6 +1092,7 @@ impl BoonDdRuntime {
                 context_path: Vec::new(),
                 last_list_source: None,
             dataflow_config: DataflowConfig::new(),
+            cell_to_collection: HashMap::new(),
             };
 
             // Bind arguments to parameters
@@ -900,6 +1147,7 @@ impl BoonDdRuntime {
                 context_path: Vec::new(),
                 last_list_source: None,
             dataflow_config: DataflowConfig::new(),
+            cell_to_collection: HashMap::new(),
             };
 
             // First parameter gets the piped value
@@ -1053,17 +1301,12 @@ impl BoonDdRuntime {
                     }
                     (Some("Math"), "sum") => {
                         // LatestRef |> Math/sum() - create a reactive CellRef for accumulation
-                        if let Value::LatestRef { initial, events, event_values: _ } = from {
-                            // Generate unique HOLD ID for this accumulator
-                            let cell_id = self.generate_cell_id();
-                            init_cell(&cell_id, *initial.clone());
-
-                            zoon::println!("[DD_EVAL] LatestRef |> Math/sum(): {} with initial {:?}, {} events",
-                                cell_id, initial, events.len());
-
-                            // Return CellRef - bridge will render reactively
-                            // The interpreter will configure DataflowConfig based on the events
-                            return Value::CellRef(CellId::new(cell_id));
+                        // Phase 4: LatestRef removed - DD handles event merging natively
+                        // If input is already a CellRef, it's a reactive accumulator
+                        if let Value::CellRef(cell_id) = from {
+                            zoon::println!("[DD_EVAL] CellRef |> Math/sum(): {:?}", cell_id);
+                            // DD already handles accumulation via HOLD - return as-is
+                            return from.clone();
                         }
                         // TimerRef |> Math/sum() - also creates a reactive accumulator
                         if let Value::TimerRef { interval_ms, .. } = from {
@@ -1080,17 +1323,10 @@ impl BoonDdRuntime {
                         from.clone()
                     }
                     (Some("Router"), "go_to") => {
-                        // LatestRef |> Router/go_to() - set up router mappings from events
-                        if let Value::LatestRef { events, event_values, .. } = from {
-                            // Pair each event (LinkRef) with its value (route text)
-                            for (event, route_value) in events.iter().zip(event_values.iter()) {
-                                if let (Value::LinkRef(link_id), Value::Text(route)) = (event, route_value) {
-                                    add_router_mapping(link_id.as_ref(), route.as_ref());
-                                }
-                            }
-                            zoon::println!("[DD_EVAL] LatestRef |> Router/go_to(): configured {} route mappings", events.len());
-                        }
-                        // Return Unit - router actions happen on link fire
+                        // Phase 11a: ROUTER_MAPPINGS removed - routing now goes through DD
+                        // Router/go_to() is now handled by DD output observer
+                        // Simply pass through the input - DD will process link events
+                        zoon::println!("[DD_EVAL] Router/go_to(): DD-native routing (Phase 11a)");
                         Value::Unit
                     }
                     (Some("Timer"), "interval") => {
@@ -1163,13 +1399,13 @@ impl BoonDdRuntime {
                             // Try to extract per-item removal path (item.X.Y.event.press → ["X", "Y"])
                             if let Some(path) = self.extract_linkref_path_from_event(binding, &event_expr.node) {
                                 zoon::println!("[DD_EVAL] List/remove parsed on: binding={}, path={:?}", binding, path);
-                                super::super::io::set_remove_event_path(path);
+                                self.dataflow_config.set_remove_event_path(path);
                             } else {
                                 // Try to extract bulk removal path (elements.X.event.press → global event)
                                 // This handles patterns like: elements.remove_completed_button.event.press |> THEN {...}
                                 if let Some(global_path) = self.extract_global_event_path(&event_expr.node) {
                                     zoon::println!("[DD_EVAL] List/remove parsed BULK on: path={:?}", global_path);
-                                    super::super::io::set_bulk_remove_event_path(global_path);
+                                    self.dataflow_config.set_bulk_remove_event_path(global_path);
                                 }
                             }
                         }
@@ -1179,6 +1415,8 @@ impl BoonDdRuntime {
                     }
                     (Some("List"), "retain") => {
                         // from |> List/retain(item, if: ...) - filter items based on predicate
+                        // Phase 4: Uses DD-native collection filter instead of FilteredListRef
+
                         // Get the binding name (first argument, usually "item")
                         let binding_name = arguments
                             .iter()
@@ -1191,18 +1429,19 @@ impl BoonDdRuntime {
                             .find(|arg| arg.node.name.as_str() == "if")
                             .and_then(|arg| arg.node.value.as_ref());
 
-                        // Handle CellRef input - create FilteredListRef for reactive evaluation
+                        // Handle CellRef input - create DD-native filtered collection
                         if let Value::CellRef(cell_id) = from {
                             if let (Some(binding), Some(pred_expr)) = (binding_name, predicate_expr) {
                                 // Try to extract field access pattern: `item.field`
                                 if let Some((field_name, filter_value)) =
                                     self.extract_field_filter(binding, &pred_expr.node)
                                 {
-                                    return Value::FilteredListRef {
-                                        source_hold: cell_id.clone(),
-                                        filter_field: Arc::from(field_name),
-                                        filter_value: Box::new(filter_value),
-                                    };
+                                    // Phase 4: Use DD-native filter instead of FilteredListRef
+                                    return self.create_filtered_collection(
+                                        cell_id.name(),
+                                        Arc::from(field_name),
+                                        filter_value,
+                                    );
                                 }
                                 // Complex predicate: create predicate template with Placeholder
                                 // Evaluate the predicate with item = Placeholder to create a template
@@ -1214,16 +1453,18 @@ impl BoonDdRuntime {
                                     cell_counter: 0,
                                     context_path: Vec::new(),
                                     last_list_source: None,
-                                dataflow_config: DataflowConfig::new(),
+                                    dataflow_config: DataflowConfig::new(),
+                                    cell_to_collection: HashMap::new(),
                                 };
                                 template_runtime.variables.insert(binding.to_string(), Value::Placeholder);
                                 let predicate_template = template_runtime.eval_expression(&pred_expr.node);
-                                zoon::println!("[DD_EVAL] FilteredListRefWithPredicate: source_hold={}, predicate_template={:?}",
-                                    cell_id, predicate_template);
-                                return Value::FilteredListRefWithPredicate {
-                                    source_hold: cell_id.clone(),
-                                    predicate_template: Box::new(predicate_template),
-                                };
+                                zoon::println!("[DD_EVAL] Phase 4: Complex predicate filter on '{}', template={:?}",
+                                    cell_id.name(), predicate_template);
+
+                                // Phase 4: Register filter with predicate template
+                                // For now, return CellRef - complex predicates need worker support
+                                // TODO: Implement predicate evaluation in DD worker
+                                return Value::CellRef(cell_id.clone());
                             }
                             // Fallback: return CellRef unchanged
                             return from.clone();
@@ -1250,18 +1491,22 @@ impl BoonDdRuntime {
                                     })
                                     .collect();
 
-                                // If all items have CellRef fields, create reactive filtered list
+                                // Phase 4: If all items have CellRef fields, use DD-native filter
+                                // OLD: Created ReactiveFilteredList for deferred evaluation
+                                // NEW: Register filter operation and return Collection
                                 if cell_ids.len() == items.len() && !cell_ids.is_empty() {
-                                    // Get the source name tracked during alias evaluation
                                     let source_hold = self.get_list_source();
-                                    zoon::println!("[DD_EVAL] ReactiveFilteredList: source_hold={}, {} items", source_hold, items.len());
-                                    return Value::ReactiveFilteredList {
-                                        items: items.clone(),
-                                        filter_field: Arc::from(field_name),
-                                        filter_value: Box::new(filter_value),
-                                        cell_ids: Arc::new(cell_ids),
-                                        source_hold,
-                                    };
+                                    zoon::println!("[DD_EVAL] Phase 4: Reactive filter on '{}', {} items with CellRef fields",
+                                        source_hold, items.len());
+                                    // Register the source collection if not already done
+                                    if self.get_collection_id(&source_hold).is_none() {
+                                        self.register_list_hold(&source_hold, items.to_vec());
+                                    }
+                                    return self.create_filtered_collection(
+                                        &source_hold,
+                                        Arc::from(field_name),
+                                        filter_value,
+                                    );
                                 }
                             }
 
@@ -1279,6 +1524,7 @@ impl BoonDdRuntime {
                                         context_path: Vec::new(),
                                         last_list_source: None,
                                     dataflow_config: DataflowConfig::new(),
+                                    cell_to_collection: HashMap::new(),
                                     };
                                     scoped.variables.insert(binding.to_string(), (*item).clone());
 
@@ -1308,8 +1554,8 @@ impl BoonDdRuntime {
                             .and_then(|arg| arg.node.value.as_ref());
 
                         match (binding_name, transform_expr, from) {
-                            // CellRef |> List/map(item, new: ...) -> MappedListRef
-                            // Defers evaluation to render time
+                            // Phase 4: CellRef |> List/map(item, new: ...) -> DD mapped collection
+                            // Registers a map operation in the DD dataflow graph
                             (Some(binding), Some(new_expr), Value::CellRef(cell_id)) => {
                                 // Evaluate the transform with Placeholder as the item
                                 // This creates a template that can be substituted at render time
@@ -1321,18 +1567,20 @@ impl BoonDdRuntime {
                                     cell_counter: 0,
                                     context_path: Vec::new(),
                                     last_list_source: None,
-                                dataflow_config: DataflowConfig::new(),
+                                    dataflow_config: DataflowConfig::new(),
+                                    cell_to_collection: HashMap::new(),
                                 };
                                 scoped.variables.insert(binding.to_string(), Value::Placeholder);
 
                                 let element_template = scoped.eval_expression(&new_expr.node);
                                 zoon::println!("[DD_EVAL] List/map on CellRef: source={}, template={:?}", cell_id, element_template);
 
-                                Value::mapped_list_ref(cell_id.clone(), element_template)
+                                // Phase 4: Use DD-native mapped collection instead of MappedListRef
+                                self.create_mapped_collection(cell_id.name(), element_template)
                             }
-                            // FilteredListRef |> List/map(item, new: ...) -> FilteredMappedListRef
-                            // Defers both filtering and mapping to render time
-                            (Some(binding), Some(new_expr), Value::FilteredListRef { source_hold, filter_field, filter_value }) => {
+                            // Phase 4: Collection |> List/map(item, new: ...) -> chained DD map
+                            // This handles filter+map chains: Collection(filtered) |> List/map()
+                            (Some(binding), Some(new_expr), Value::Collection(handle)) => {
                                 // Evaluate the transform with Placeholder as the item
                                 let mut scoped = BoonDdRuntime {
                                     variables: self.variables.clone(),
@@ -1342,52 +1590,17 @@ impl BoonDdRuntime {
                                     cell_counter: 0,
                                     context_path: Vec::new(),
                                     last_list_source: None,
-                                dataflow_config: DataflowConfig::new(),
+                                    dataflow_config: DataflowConfig::new(),
+                                    cell_to_collection: HashMap::new(),
                                 };
                                 scoped.variables.insert(binding.to_string(), Value::Placeholder);
 
                                 let element_template = scoped.eval_expression(&new_expr.node);
-                                zoon::println!("[DD_EVAL] List/map on FilteredListRef: source={}, filter={}, template={:?}",
-                                    source_hold, filter_field, element_template);
+                                zoon::println!("[DD_EVAL] List/map on Collection: source={:?}, template={:?}",
+                                    handle.id, element_template);
 
-                                // Task 6.3: Set template list flag - eliminates has_filtered_mapped_list() document scanning
-                                super::super::io::set_has_template_list(true);
-
-                                Value::FilteredMappedListRef {
-                                    source_hold: source_hold.clone(),
-                                    filter_field: filter_field.clone(),
-                                    filter_value: filter_value.clone(),
-                                    element_template: Arc::new(element_template),
-                                }
-                            }
-                            // FilteredListRefWithPredicate |> List/map(item, new: ...) -> FilteredMappedListWithPredicate
-                            // For complex predicates (like WHILE expressions), preserves the predicate template
-                            (Some(binding), Some(new_expr), Value::FilteredListRefWithPredicate { source_hold, predicate_template }) => {
-                                // Evaluate the transform with Placeholder as the item
-                                let mut scoped = BoonDdRuntime {
-                                    variables: self.variables.clone(),
-                                    functions: self.functions.clone(),
-                                    passed_context: self.passed_context.clone(),
-                                    link_counter: 0,
-                                    cell_counter: 0,
-                                    context_path: Vec::new(),
-                                    last_list_source: None,
-                                dataflow_config: DataflowConfig::new(),
-                                };
-                                scoped.variables.insert(binding.to_string(), Value::Placeholder);
-
-                                let element_template = scoped.eval_expression(&new_expr.node);
-                                zoon::println!("[DD_EVAL] List/map on FilteredListRefWithPredicate: source={}, template={:?}",
-                                    source_hold, element_template);
-
-                                // Task 6.3: Set template list flag - eliminates has_filtered_mapped_list() document scanning
-                                super::super::io::set_has_template_list(true);
-
-                                Value::FilteredMappedListWithPredicate {
-                                    source_hold: source_hold.clone(),
-                                    predicate_template: predicate_template.clone(),
-                                    element_template: Arc::new(element_template),
-                                }
+                                // Phase 4: Chain map operation on existing collection (e.g., filtered collection)
+                                self.chain_map_on_collection(handle.id.clone(), element_template)
                             }
                             // List |> List/map(item, new: ...) -> concrete list
                             (Some(binding), Some(new_expr), Value::List(items)) => {
@@ -1404,6 +1617,7 @@ impl BoonDdRuntime {
                                             context_path: Vec::new(),
                                             last_list_source: None,
                                         dataflow_config: DataflowConfig::new(),
+                                        cell_to_collection: HashMap::new(),
                                         };
                                         scoped.variables.insert(binding.to_string(), (*item).clone());
 
@@ -1417,93 +1631,58 @@ impl BoonDdRuntime {
                         }
                     }
                     (Some("List"), "count") => {
-                        // from |> List/count() - count items
+                        // Phase 4: from |> List/count() - DD-native count operation
                         match from {
                             Value::List(items) => {
                                 // Check if this list came from a HOLD variable
                                 let source_hold = self.get_list_source();
                                 if !source_hold.name().is_empty() {
-                                    // Return reactive count that reads LIVE from HOLD
+                                    // Phase 4: Use DD-native count instead of ComputedRef
                                     zoon::println!("[DD_EVAL] List/count() on List from HOLD: source_hold={}", source_hold);
-                                    Value::ComputedRef {
-                                        computation: ComputedType::ListCountHold {
-                                            source_hold: source_hold.clone(),
-                                        },
-                                        source_hold,
-                                    }
+                                    self.create_list_count(source_hold.name())
                                 } else {
                                     // Static count for lists not from HOLD
                                     Value::int(items.len() as i64)
                                 }
                             }
-                            // CellRef |> List/count() -> ComputedRef::ListCount
-                            Value::CellRef(cell_id) => Value::computed_ref(
-                                ComputedType::ListCount,
-                                cell_id.clone(),
-                            ),
-                            // FilteredListRef |> List/count() -> ComputedRef::ListCountWhere
-                            Value::FilteredListRef {
-                                source_hold,
-                                filter_field,
-                                filter_value,
-                            } => Value::computed_ref(
-                                ComputedType::ListCountWhere {
-                                    field: filter_field.clone(),
-                                    value: filter_value.clone(),
-                                },
-                                source_hold.clone(),
-                            ),
-                            // ReactiveFilteredList |> List/count() -> ComputedRef::ListCountWhereHold
-                            // Uses the new ListCountWhereHold that reads LIVE data from source_hold,
-                            // enabling proper counting for both static and dynamic items.
-                            Value::ReactiveFilteredList {
-                                filter_field,
-                                filter_value,
-                                source_hold,
-                                ..  // items and cell_ids are unused (legacy fields)
-                            } => {
-                                zoon::println!("[DD_EVAL] List/count() on ReactiveFilteredList: source_hold={}", source_hold);
-                                Value::ComputedRef {
-                                    computation: ComputedType::ListCountWhereHold {
-                                        source_hold: source_hold.clone(),
-                                        field: filter_field.clone(),
-                                        value: filter_value.clone(),
-                                    },
-                                    source_hold: source_hold.clone(),  // Watch the source HOLD for changes
-                                }
+                            // Phase 4: CellRef |> List/count() -> DD-native count
+                            Value::CellRef(cell_id) => {
+                                zoon::println!("[DD_EVAL] List/count() on CellRef: {}", cell_id);
+                                self.create_list_count(cell_id.name())
+                            }
+                            // Phase 4: Collection |> List/count() -> chain count on collection
+                            // Handles chained operations like filter+count
+                            Value::Collection(handle) => {
+                                zoon::println!("[DD_EVAL] List/count() on Collection: {:?}", handle.id);
+                                self.chain_count_on_collection(handle.id.clone())
                             }
                             _ => Value::int(0),
                         }
                     }
                     (Some("List"), "is_empty") => {
-                        // from |> List/is_empty()
+                        // Phase 4: from |> List/is_empty() - DD-native is_empty operation
                         match from {
                             Value::List(items) => {
                                 // Check if this list came from a HOLD variable
                                 let source_hold = self.get_list_source();
                                 if !source_hold.name().is_empty() {
-                                    // Return reactive is_empty that reads LIVE from HOLD
+                                    // Phase 4: Use DD-native is_empty instead of ComputedRef
                                     zoon::println!("[DD_EVAL] List/is_empty() on List from HOLD: source_hold={}", source_hold);
-                                    Value::ComputedRef {
-                                        computation: ComputedType::ListIsEmptyHold {
-                                            source_hold: source_hold.clone(),
-                                        },
-                                        source_hold,
-                                    }
+                                    self.create_list_is_empty(source_hold.name())
                                 } else {
                                     // Static is_empty for lists not from HOLD
                                     Value::Bool(items.is_empty())
                                 }
                             }
-                            // CellRef |> List/is_empty() -> reactive ComputedRef
+                            // Phase 4: CellRef |> List/is_empty() -> DD-native is_empty
                             Value::CellRef(cell_id) => {
                                 zoon::println!("[DD_EVAL] List/is_empty() on CellRef: cell_id={}", cell_id);
-                                Value::ComputedRef {
-                                    computation: ComputedType::ListIsEmptyHold {
-                                        source_hold: cell_id.clone(),
-                                    },
-                                    source_hold: cell_id.clone(),
-                                }
+                                self.create_list_is_empty(cell_id.name())
+                            }
+                            // Phase 4: Collection |> List/is_empty() -> chain is_empty on collection
+                            Value::Collection(handle) => {
+                                zoon::println!("[DD_EVAL] List/is_empty() on Collection: {:?}", handle.id);
+                                self.chain_is_empty_on_collection(handle.id.clone())
                             }
                             _ => Value::Bool(true),
                         }
@@ -1539,10 +1718,8 @@ impl BoonDdRuntime {
                     }
                     (Some("Bool"), "not") => {
                         // from |> Bool/not()
-                        // Handle PlaceholderField specially - create a negation template
-                        if let Value::PlaceholderField { path } = from {
-                            return Value::NegatedPlaceholderField { path: path.clone() };
-                        }
+                        // Phase 4: PlaceholderField and NegatedPlaceholderField removed
+                        // DD handles template substitution natively
                         let from_bool = match from {
                             Value::Bool(b) => *b,
                             Value::Tagged { tag, .. } => BoolTag::is_true(tag.as_ref()),
@@ -1601,20 +1778,35 @@ impl BoonDdRuntime {
             Expression::FieldAccess { path } => {
                 let mut current = from.clone();
                 for field in path {
-                    // Handle Placeholder specially - create PlaceholderField
-                    // This preserves the field access path for later substitution
+                    // Handle Placeholder specially - create Tagged placeholder for field access
+                    // Pure DD: Use Tagged value with "__placeholder_field__" tag instead of symbolic ref
+                    // The path is stored as a List of Text values for later template substitution
                     current = match &current {
                         Value::Placeholder => {
-                            Value::PlaceholderField {
-                                path: Arc::new(vec![Arc::from(field.as_ref())]),
+                            Value::Tagged {
+                                tag: Arc::from("__placeholder_field__"),
+                                fields: Arc::new(BTreeMap::from([(
+                                    Arc::from("path"),
+                                    Value::List(Arc::new(vec![Value::text(field.as_str())])),
+                                )])),
                             }
                         }
-                        Value::PlaceholderField { path: existing_path } => {
-                            // Extend the existing path (clone the inner Vec, not the Arc)
-                            let mut new_path: Vec<Arc<str>> = existing_path.as_ref().clone();
-                            new_path.push(Arc::from(field.as_ref()));
-                            Value::PlaceholderField {
-                                path: Arc::new(new_path),
+                        Value::Tagged { tag, fields } if tag.as_ref() == "__placeholder_field__" => {
+                            // Extend the existing path
+                            let existing_path = fields.get("path")
+                                .and_then(|v| match v {
+                                    Value::List(items) => Some(items.as_ref().clone()),
+                                    _ => None,
+                                })
+                                .unwrap_or_default();
+                            let mut new_path = existing_path;
+                            new_path.push(Value::text(field.as_str()));
+                            Value::Tagged {
+                                tag: Arc::from("__placeholder_field__"),
+                                fields: Arc::new(BTreeMap::from([(
+                                    Arc::from("path"),
+                                    Value::List(Arc::new(new_path)),
+                                )])),
                             }
                         }
                         // Handle LinkRef.event - create synthetic event object with all event types
@@ -1650,12 +1842,27 @@ impl BoonDdRuntime {
                     let result = self.replace_link_ref_in_value(from, target_id);
                     zoon::println!("[DD_EVAL] LinkSetter: replaced LinkRef with {}", target_id);
                     result
-                } else if let Value::PlaceholderField { path } = &target_link {
-                    // Template evaluation: replace LinkRef with PlaceholderField
-                    // During cloning, this will be resolved to the real LinkRef from the data item
-                    let result = self.replace_link_ref_with_placeholder(from, path);
-                    zoon::println!("[DD_EVAL] LinkSetter: replaced LinkRef with PlaceholderField {:?}", path);
-                    result
+                } else if let Value::Tagged { tag, fields } = &target_link {
+                    if tag.as_ref() == "__placeholder_field__" {
+                        // Template evaluation: replace LinkRef with placeholder field tagged value
+                        // During cloning, this will be resolved to the real LinkRef from the data item
+                        let path: Vec<Arc<str>> = fields.get("path")
+                            .and_then(|v| match v {
+                                Value::List(items) => Some(items.iter().filter_map(|item| match item {
+                                    Value::Text(t) => Some(Arc::clone(t)),
+                                    _ => None,
+                                }).collect()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        let result = self.replace_link_ref_with_placeholder(from, &path);
+                        zoon::println!("[DD_EVAL] LinkSetter: replaced LinkRef with placeholder field {:?}", path);
+                        result
+                    } else {
+                        // Other tagged value - pass through unchanged
+                        zoon::println!("[DD_EVAL] LinkSetter: tagged value not a placeholder, passing through unchanged");
+                        from.clone()
+                    }
                 } else {
                     // If alias doesn't resolve to a LinkRef or PlaceholderField, just pass through unchanged
                     zoon::println!("[DD_EVAL] LinkSetter: alias did not resolve to LinkRef, passing through unchanged");
@@ -1771,14 +1978,14 @@ impl BoonDdRuntime {
                     }
 
                     if !bindings.edit_trigger_path.is_empty() || bindings.edit_trigger_link_id.is_some() {
-                        super::super::io::set_editing_event_bindings(bindings);
+                        self.dataflow_config.set_editing_bindings(bindings);
                     }
 
                     // Also extract toggle event bindings (click |> THEN { state |> Bool/not() })
                     // Task 4.3: Use new method that evaluates to get actual LinkRef IDs
                     let toggle_bindings = self.extract_toggle_bindings_with_link_ids(body, state_name);
                     for (event_path, event_type, link_id) in toggle_bindings {
-                        super::super::io::add_toggle_event_binding(super::super::io::ToggleEventBinding {
+                        self.dataflow_config.add_toggle_binding(ToggleBinding {
                             cell_id: cell_id.clone(),
                             event_path,
                             event_type,
@@ -1798,7 +2005,7 @@ impl BoonDdRuntime {
                             zoon::println!("[DD_EVAL] Adding global toggle binding: event_path={:?}, value_path={:?}", event_path, value_path);
                             // For boolean HOLDs, the list_cell_id is the HOLD ID of this completed field
                             // The action will toggle this specific HOLD based on store.all_completed
-                            super::super::io::add_global_toggle_binding(super::super::io::GlobalToggleEventBinding {
+                            self.dataflow_config.add_global_toggle_binding(GlobalToggleBinding {
                                 list_cell_id: cell_id.clone(),  // This is the completed HOLD, not a list
                                 event_path,
                                 event_type,
@@ -1880,6 +2087,7 @@ impl BoonDdRuntime {
                 context_path: Vec::new(),
                 last_list_source: None,
                 dataflow_config: DataflowConfig::new(), // Iteration doesn't accumulate config
+                cell_to_collection: HashMap::new(),
             };
             iter_runtime.variables.insert(state_name.to_string(), current_state.clone());
 
@@ -2149,8 +2357,8 @@ impl BoonDdRuntime {
     ///
     /// This method EVALUATES the `from` expression in editing patterns to get actual LinkRef IDs.
     /// Used for Task 4.3: eliminate interpreter's extract_editing_toggles dependency.
-    fn extract_editing_bindings_with_link_ids(&mut self, body: &Expression) -> super::super::io::EditingEventBindings {
-        let mut bindings = super::super::io::EditingEventBindings::default();
+    fn extract_editing_bindings_with_link_ids(&mut self, body: &Expression) -> EditingBinding {
+        let mut bindings = EditingBinding::default();
 
         // Helper to extract inputs from LATEST
         let inputs = match body {
@@ -2740,6 +2948,8 @@ impl BoonDdRuntime {
     ///
     /// We extract `nav.home` → evaluate to LinkRef("link_1") → map to route.
     fn extract_router_mappings(&mut self, expr: &Expression) {
+        // Phase 11a: Router mappings now go through DD dataflow
+        // This function logs mappings for debugging but doesn't add to global state
         if let Expression::Latest { inputs } = expr {
             for input in inputs {
                 // Each input should be: alias.event.press |> THEN { route_text }
@@ -2752,7 +2962,8 @@ impl BoonDdRuntime {
                         let route = self.eval_expression(&body.node);
 
                         if let (Some(link_id), Value::Text(route_text)) = (link_ref, route) {
-                            add_router_mapping(&link_id, route_text.as_ref());
+                            // Phase 11a: Routing now goes through DD - just log for debugging
+                            zoon::println!("[DD_EVAL] Router mapping (DD-routed): link={} -> route={}", link_id, route_text);
                         }
                     }
                 }
@@ -2832,13 +3043,49 @@ impl BoonDdRuntime {
         }
 
         if has_events {
-            // Return LatestRef for downstream operators like Math/sum() to process
-            zoon::println!("[DD_EVAL] LATEST with events: initial={:?}, events={:?}", initial_value, events.len());
-            Value::LatestRef {
-                initial: Box::new(initial_value),
-                events: Arc::new(events),
-                event_values: Arc::new(event_values),
+            // Pure DD: LATEST with events requires DD merge operator integration
+            // For now, create a cell and return CellRef for basic reactivity
+            // Full merge behavior will be added when DD LATEST operator is implemented
+            let cell_id = format!("latest_{}", GLOBAL_CELL_COUNTER.fetch_add(1, Ordering::SeqCst));
+
+            // Initialize the cell with the initial value
+            init_cell(&cell_id, initial_value.clone());
+
+            // For each event source, configure DD to update this cell
+            // Note: Full LATEST merge semantics require a dedicated DD operator
+            for event in events.iter() {
+                match event {
+                    Value::LinkRef(link_id) => {
+                        // Add cell config for this event trigger using Identity transform
+                        // The event value becomes the cell state
+                        self.dataflow_config.cells.push(CellConfig {
+                            id: CellId::new(&cell_id),
+                            initial: initial_value.clone(),
+                            triggered_by: vec![LinkId::new(&link_id.name())],
+                            timer_interval_ms: 0,
+                            filter: EventFilter::Any,
+                            transform: StateTransform::Identity,
+                            persist: false,
+                        });
+                    }
+                    Value::TimerRef { id, interval_ms } => {
+                        // Timer-triggered update
+                        self.dataflow_config.cells.push(CellConfig {
+                            id: CellId::new(&cell_id),
+                            initial: initial_value.clone(),
+                            triggered_by: vec![],
+                            timer_interval_ms: *interval_ms,
+                            filter: EventFilter::Any,
+                            transform: StateTransform::Identity,
+                            persist: false,
+                        });
+                    }
+                    _ => {}
+                }
             }
+
+            zoon::println!("[DD_EVAL] LATEST with events: cell={}, initial={:?}, events={:?}", cell_id, initial_value, events.len());
+            Value::CellRef(CellId::new(&cell_id))
         } else {
             // All static - return first non-Unit value (current behavior)
             initial_value
@@ -2912,12 +3159,9 @@ impl BoonDdRuntime {
 
         // If input is a CellRef, return a WhileRef for reactive rendering
         if let Value::CellRef(cell_id) = value {
-            // Enter WHILE pre-eval context to skip text_input key_down detection
-            // This prevents editing text_inputs inside WHILE branches from overwriting
-            // the main document's text_input link
-            super::super::io::enter_while_preeval();
-
             // Pre-evaluate all arms for the bridge to render reactively
+            // Note: WHILE_PREEVAL_DEPTH hack was removed (Phase 11b) - fine-grained signals
+            // from cell_signal() prevent spurious side effects during pre-evaluation
             let mut evaluated_arms = Vec::new();
             let mut default_value = None;
 
@@ -2937,6 +3181,7 @@ impl BoonDdRuntime {
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
+                    cell_to_collection: HashMap::new(),
                     };
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     default_value = Some(Arc::new(body_result));
@@ -2951,6 +3196,7 @@ impl BoonDdRuntime {
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
+                    cell_to_collection: HashMap::new(),
                     };
                     // Bind the alias name to the CellRef value
                     match_runtime.variables.insert(name.to_string(), value.clone());
@@ -2968,34 +3214,49 @@ impl BoonDdRuntime {
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
+                    cell_to_collection: HashMap::new(),
                     };
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     evaluated_arms.push((pv, body_result));
                 }
             }
 
-            zoon::println!("[DD_EVAL] Created WhileRef for hold {} with {} arms", cell_id, evaluated_arms.len());
+            zoon::println!("[DD_EVAL] Created WHILE config for hold {} with {} arms", cell_id, evaluated_arms.len());
 
-            // Exit WHILE pre-eval context
-            super::super::io::exit_while_preeval();
+            // Pure DD: Return Tagged value with WHILE configuration
+            // The bridge interprets this to render conditionally based on cell value
+            let arms_list: Vec<Value> = evaluated_arms.into_iter()
+                .map(|(pattern, body)| Value::object([
+                    ("pattern", pattern),
+                    ("body", body),
+                ]))
+                .collect();
 
-            return Value::WhileRef {
-                cell_id: cell_id.clone(),
-                computation: None,  // No computation for direct CellRef
-                arms: Arc::new(evaluated_arms),
-                default: default_value,
+            return Value::Tagged {
+                tag: Arc::from("__while_config__"),
+                fields: Arc::new(BTreeMap::from([
+                    (Arc::from("cell_id"), Value::text(&cell_id.name())),
+                    (Arc::from("computation"), Value::Unit),  // No computation for direct CellRef
+                    (Arc::from("arms"), Value::List(Arc::new(arms_list))),
+                    (Arc::from("default"), default_value.map(|v| (*v).clone()).unwrap_or(Value::Unit)),
+                ])),
             };
         }
 
-        // If input is a PlaceholderField, create a PlaceholderWhileRef for deferred resolution
+        // If input is a placeholder field tagged value, create placeholder WHILE config
         // This handles: todo.editing |> WHILE { True => ..., False => ... } in templates
-        if let Value::PlaceholderField { path } = value {
-            // Enter WHILE pre-eval context to skip text_input key_down detection
-            // This prevents editing text_inputs inside WHILE branches from overwriting
-            // the main document's text_input link
-            super::super::io::enter_while_preeval();
+        if let Value::Tagged { tag, fields } = value {
+            if tag.as_ref() == "__placeholder_field__" {
+                let path = fields.get("path")
+                    .and_then(|v| match v {
+                        Value::List(items) => Some(items.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| Arc::new(vec![]));
 
             // Pre-evaluate all arms for later substitution
+            // Note: WHILE_PREEVAL_DEPTH hack was removed (Phase 11b) - fine-grained signals
+            // from cell_signal() prevent spurious side effects during pre-evaluation
             let mut evaluated_arms = Vec::new();
             let mut default_value = None;
 
@@ -3012,6 +3273,7 @@ impl BoonDdRuntime {
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
+                    cell_to_collection: HashMap::new(),
                     };
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     default_value = Some(Arc::new(body_result));
@@ -3025,100 +3287,37 @@ impl BoonDdRuntime {
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
+                    cell_to_collection: HashMap::new(),
                     };
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     evaluated_arms.push((pv, body_result));
                 }
             }
 
-            zoon::println!("[DD_EVAL] Created PlaceholderWhileRef for path {:?} with {} arms", path, evaluated_arms.len());
+            zoon::println!("[DD_EVAL] Created placeholder WHILE config for path with {} arms", evaluated_arms.len());
 
-            // Exit WHILE pre-eval context
-            super::super::io::exit_while_preeval();
+            // Pure DD: Return Tagged value with placeholder WHILE configuration
+            // This is resolved during template instantiation
+            let arms_list: Vec<Value> = evaluated_arms.into_iter()
+                .map(|(pattern, body)| Value::object([
+                    ("pattern", pattern),
+                    ("body", body),
+                ]))
+                .collect();
 
-            return Value::PlaceholderWhileRef {
-                field_path: path.clone(),
-                arms: Arc::new(evaluated_arms),
-                default: default_value,
+            return Value::Tagged {
+                tag: Arc::from("__placeholder_while__"),
+                fields: Arc::new(BTreeMap::from([
+                    (Arc::from("field_path"), Value::List(path)),
+                    (Arc::from("arms"), Value::List(Arc::new(arms_list))),
+                    (Arc::from("default"), default_value.map(|v| (*v).clone()).unwrap_or(Value::Unit)),
+                ])),
             };
-        }
-
-        // If input is a ComputedRef (boolean computation), create a WhileRef with the computation
-        // This handles: completed_list_count > 0 |> WHILE { True => button, False => NoElement }
-        if let Value::ComputedRef { computation, source_hold } = value {
-            // Enter WHILE pre-eval context to skip text_input key_down detection
-            // This prevents editing text_inputs inside WHILE branches from overwriting
-            // the main document's text_input link
-            super::super::io::enter_while_preeval();
-
-            // Pre-evaluate all arms for the bridge to render reactively
-            let mut evaluated_arms = Vec::new();
-            let mut default_value = None;
-
-            for arm in arms {
-                let pattern_value = self.pattern_to_value(&arm.pattern);
-
-                // Alias patterns (like `count => body`) are catch-all patterns that bind the value
-                // They should be treated like wildcards, but with the value bound to the alias name
-                if matches!(arm.pattern, Pattern::WildCard) {
-                    let mut match_runtime = BoonDdRuntime {
-                        variables: self.variables.clone(),
-                        functions: self.functions.clone(),
-                        passed_context: self.passed_context.clone(),
-                        link_counter: 0,
-                        cell_counter: 0,
-                        context_path: Vec::new(),
-                        last_list_source: None,
-                    dataflow_config: DataflowConfig::new(),
-                    };
-                    let body_result = match_runtime.eval_expression(&arm.body.node);
-                    default_value = Some(Arc::new(body_result));
-                } else if let Pattern::Alias { name } = &arm.pattern {
-                    // Alias pattern - treat as catch-all but bind the ComputedRef to the alias name
-                    // This enables patterns like: count |> WHEN { n => TEXT { {n} items } }
-                    let mut match_runtime = BoonDdRuntime {
-                        variables: self.variables.clone(),
-                        functions: self.functions.clone(),
-                        passed_context: self.passed_context.clone(),
-                        link_counter: 0,
-                        cell_counter: 0,
-                        context_path: Vec::new(),
-                        last_list_source: None,
-                    dataflow_config: DataflowConfig::new(),
-                    };
-                    // Bind the alias name to the ComputedRef value
-                    match_runtime.variables.insert(name.to_string(), value.clone());
-                    zoon::println!("[DD_EVAL] ComputedRef WHEN: binding '{}' to ComputedRef for body evaluation", name);
-                    let body_result = match_runtime.eval_expression(&arm.body.node);
-                    default_value = Some(Arc::new(body_result));
-                } else if let Some(pv) = pattern_value {
-                    let mut match_runtime = BoonDdRuntime {
-                        variables: self.variables.clone(),
-                        functions: self.functions.clone(),
-                        passed_context: self.passed_context.clone(),
-                        link_counter: 0,
-                        cell_counter: 0,
-                        context_path: Vec::new(),
-                        last_list_source: None,
-                    dataflow_config: DataflowConfig::new(),
-                    };
-                    let body_result = match_runtime.eval_expression(&arm.body.node);
-                    evaluated_arms.push((pv, body_result));
-                }
             }
-
-            zoon::println!("[DD_EVAL] Created WhileRef for ComputedRef (source: {}) with {} arms", source_hold, evaluated_arms.len());
-
-            // Exit WHILE pre-eval context
-            super::super::io::exit_while_preeval();
-
-            return Value::WhileRef {
-                cell_id: source_hold.clone(),
-                computation: Some(computation.clone()),  // Store the computation for bridge to evaluate
-                arms: Arc::new(evaluated_arms),
-                default: default_value,
-            };
         }
+
+        // NOTE: ComputedRef handling was removed in pure DD migration
+        // Boolean computations should go through DD operators instead
 
         // If input is a LinkRef (e.g., element.hovered), create a synthetic hold for boolean state
         // This handles: element.hovered |> WHILE { True => delete_button, False => NoElement }
@@ -3146,6 +3345,7 @@ impl BoonDdRuntime {
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
+                    cell_to_collection: HashMap::new(),
                     };
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     default_value = Some(Arc::new(body_result));
@@ -3159,6 +3359,7 @@ impl BoonDdRuntime {
                         context_path: Vec::new(),
                         last_list_source: None,
                     dataflow_config: DataflowConfig::new(),
+                    cell_to_collection: HashMap::new(),
                     };
                     let body_result = match_runtime.eval_expression(&arm.body.node);
                     evaluated_arms.push((pv, body_result));
@@ -3206,19 +3407,47 @@ impl BoonDdRuntime {
                 }
             }
 
-            zoon::println!("[DD_EVAL] Created WhileRef for LinkRef {} (hover hold: {}) with {} arms", link_id, cell_id, evaluated_arms.len());
+            zoon::println!("[DD_EVAL] Created WHILE config for LinkRef {} (hover hold: {}) with {} arms", link_id, cell_id, evaluated_arms.len());
 
-            return Value::WhileRef {
-                cell_id: CellId::new(cell_id),
-                computation: None,  // No computation - just read hold state directly
-                arms: Arc::new(evaluated_arms),
-                default: default_value,
+            // Pure DD: Return Tagged value with WHILE configuration
+            let arms_list: Vec<Value> = evaluated_arms.into_iter()
+                .map(|(pattern, body)| Value::object([
+                    ("pattern", pattern),
+                    ("body", body),
+                ]))
+                .collect();
+
+            return Value::Tagged {
+                tag: Arc::from("__while_config__"),
+                fields: Arc::new(BTreeMap::from([
+                    (Arc::from("cell_id"), Value::text(&cell_id)),
+                    (Arc::from("computation"), Value::Unit),  // No computation - just read hold state directly
+                    (Arc::from("arms"), Value::List(Arc::new(arms_list))),
+                    (Arc::from("default"), default_value.map(|v| (*v).clone()).unwrap_or(Value::Unit)),
+                ])),
             };
         }
 
-        // If input is a WhileRef, chain the pattern matching
+        // If input is a WHILE config (Tagged), chain the pattern matching
         // This happens when: route |> WHEN { "/" => Home } |> WHILE { Home => page(...) }
-        if let Value::WhileRef { cell_id, computation: input_computation, arms: input_arms, default: input_default } = value {
+        if let Value::Tagged { tag, fields } = value {
+            if tag.as_ref() == "__while_config__" {
+                let cell_id = fields.get("cell_id")
+                    .and_then(|v| v.as_text())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let input_computation = fields.get("computation").cloned().unwrap_or(Value::Unit);
+                let input_arms: Vec<(Value, Value)> = fields.get("arms")
+                    .and_then(|v| match v {
+                        Value::List(items) => Some(items.iter().filter_map(|item| {
+                            let pattern = item.get("pattern").cloned()?;
+                            let body = item.get("body").cloned()?;
+                            Some((pattern, body))
+                        }).collect()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let input_default = fields.get("default").cloned().filter(|v| *v != Value::Unit);
             // For each arm in this WHILE, evaluate the body for each possible input value
             // This creates a composed transformation: route → page tag → page element
             let mut evaluated_arms = Vec::new();
@@ -3253,6 +3482,7 @@ impl BoonDdRuntime {
                                 context_path: Vec::new(),
                                 last_list_source: None,
                             dataflow_config: DataflowConfig::new(),
+                            cell_to_collection: HashMap::new(),
                             };
                             let body_result = match_runtime.eval_expression(&arm.body.node);
                             evaluated_arms.push((input_pattern.clone(), body_result));
@@ -3276,6 +3506,7 @@ impl BoonDdRuntime {
                             context_path: Vec::new(),
                             last_list_source: None,
                         dataflow_config: DataflowConfig::new(),
+                        cell_to_collection: HashMap::new(),
                         };
                         let body_result = match_runtime.eval_expression(&arm.body.node);
                         default_value = Some(Arc::new(body_result));
@@ -3298,6 +3529,7 @@ impl BoonDdRuntime {
                                 context_path: Vec::new(),
                                 last_list_source: None,
                             dataflow_config: DataflowConfig::new(),
+                            cell_to_collection: HashMap::new(),
                             };
                             let body_result = match_runtime.eval_expression(&arm.body.node);
                             default_value = Some(Arc::new(body_result));
@@ -3320,6 +3552,7 @@ impl BoonDdRuntime {
                             context_path: Vec::new(),
                             last_list_source: None,
                         dataflow_config: DataflowConfig::new(),
+                        cell_to_collection: HashMap::new(),
                         };
                         let body_result = match_runtime.eval_expression(&arm.body.node);
                         default_value = Some(Arc::new(body_result));
@@ -3328,14 +3561,26 @@ impl BoonDdRuntime {
                 }
             }
 
-            zoon::println!("[DD_EVAL] Chained WhileRef for cell {} with {} arms", cell_id, evaluated_arms.len());
+            zoon::println!("[DD_EVAL] Chained WHILE config for cell {} with {} arms", cell_id, evaluated_arms.len());
 
-            return Value::WhileRef {
-                cell_id: cell_id.clone(),
-                computation: input_computation.clone(),  // Preserve computation from input
-                arms: Arc::new(evaluated_arms),
-                default: default_value,
+            // Pure DD: Return Tagged value with chained WHILE configuration
+            let arms_list: Vec<Value> = evaluated_arms.into_iter()
+                .map(|(pattern, body)| Value::object([
+                    ("pattern", pattern),
+                    ("body", body),
+                ]))
+                .collect();
+
+            return Value::Tagged {
+                tag: Arc::from("__while_config__"),
+                fields: Arc::new(BTreeMap::from([
+                    (Arc::from("cell_id"), Value::text(&cell_id)),
+                    (Arc::from("computation"), input_computation),  // Preserve computation from input
+                    (Arc::from("arms"), Value::List(Arc::new(arms_list))),
+                    (Arc::from("default"), default_value.map(|v| (*v).clone()).unwrap_or(Value::Unit)),
+                ])),
             };
+            }
         }
 
         // Static evaluation for non-CellRef inputs
@@ -3351,6 +3596,7 @@ impl BoonDdRuntime {
                     context_path: Vec::new(),
                     last_list_source: None,
                 dataflow_config: DataflowConfig::new(),
+                    cell_to_collection: HashMap::new(),
                 };
                 for (name, bound_value) in bindings {
                     match_runtime.variables.insert(name, bound_value);
@@ -3493,66 +3739,25 @@ impl BoonDdRuntime {
             Comparator::Equal { operand_a, operand_b } => {
                 let a = self.eval_expression(&operand_a.node);
                 let b = self.eval_expression(&operand_b.node);
-                // Handle reactive equality: WhileRef == static value
-                // Returns a WhileRef where each arm's result is compared to the static value
+                // Phase 4: DD-native equality comparison
+                // Replaces removed WhileRef and ComputedRef patterns with DD collection operators
                 match (&a, &b) {
-                    (Value::WhileRef { cell_id, computation, arms, default }, other) |
-                    (other, Value::WhileRef { cell_id, computation, arms, default }) => {
-                        // Create new arms where each result is compared with other
-                        let new_arms: Vec<(Value, Value)> = arms.iter()
-                            .map(|(pattern, result)| {
-                                let eq_result = self.values_equal(result, other);
-                                (pattern.clone(), Value::Bool(eq_result))
-                            })
-                            .collect();
-                        let new_default = default.as_ref().map(|d| {
-                            let eq_result = self.values_equal(d.as_ref(), other);
-                            Arc::new(Value::Bool(eq_result))
-                        });
-                        #[cfg(debug_assertions)]
-                        zoon::println!("[DD_EVAL] Reactive equality: WhileRef({}) == {:?} => WhileRef with {} arms", cell_id, other, new_arms.len());
-                        Value::WhileRef {
-                            cell_id: cell_id.clone(),
-                            computation: computation.clone(),
-                            arms: Arc::new(new_arms),
-                            default: new_default,
-                        }
-                    }
-                    // ComputedRef == ComputedRef => ComputedRef::Equal
+                    // Collection == Collection => DD Equal operator
                     // Used for: all_completed: completed_list_count == list_count
-                    (Value::ComputedRef { source_hold, .. }, Value::ComputedRef { .. }) => {
-                        Value::computed_ref(
-                            ComputedType::Equal {
-                                left: Box::new(a.clone()),
-                                right: Box::new(b.clone()),
-                            },
-                            source_hold.clone(),
-                        )
+                    // Phase 4: Replaces ComputedRef::Equal with DD-native pattern
+                    (Value::Collection(left_handle), Value::Collection(right_handle)) => {
+                        self.create_equal(left_handle.id.clone(), right_handle.id.clone())
                     }
-                    // ComputedRef == non-ComputedRef (e.g., Int) => ComputedRef::Equal
-                    // Used for: all_completed: list_count == completed_list_count
-                    // where list_count is Int and completed_list_count is ComputedRef
-                    (Value::ComputedRef { source_hold, .. }, _) => {
+                    // Collection == Number => We need to compare collection's value to the number
+                    // For now, treat the Collection's snapshot value and compare
+                    // TODO: Add a DD operator for comparing collection value to constant
+                    (Value::Collection(handle), Value::Number(_)) |
+                    (Value::Number(_), Value::Collection(handle)) => {
                         #[cfg(debug_assertions)]
-                        zoon::println!("[DD_EVAL] Reactive equality: ComputedRef({}) == {:?}", source_hold, b);
-                        Value::computed_ref(
-                            ComputedType::Equal {
-                                left: Box::new(a.clone()),
-                                right: Box::new(b.clone()),
-                            },
-                            source_hold.clone(),
-                        )
-                    }
-                    (_, Value::ComputedRef { source_hold, .. }) => {
-                        #[cfg(debug_assertions)]
-                        zoon::println!("[DD_EVAL] Reactive equality: {:?} == ComputedRef({})", a, source_hold);
-                        Value::computed_ref(
-                            ComputedType::Equal {
-                                left: Box::new(a.clone()),
-                                right: Box::new(b.clone()),
-                            },
-                            source_hold.clone(),
-                        )
+                        zoon::println!("[DD_EVAL] Reactive equality: Collection({:?}) == Number", handle.id);
+                        // For Collection == Number, we'd need a CompareToConstant operator
+                        // For now, fall through to regular comparison
+                        Value::Bool(a == b)
                     }
                     _ => {
                         #[cfg(debug_assertions)]
@@ -3575,15 +3780,11 @@ impl BoonDdRuntime {
                 let a = self.eval_expression(&operand_a.node);
                 let b = self.eval_expression(&operand_b.node);
                 match (&a, &b) {
-                    // ComputedRef > 0 => ComputedRef::GreaterThanZero
+                    // Collection > 0 => DD GreaterThanZero operator
                     // Used for: show_clear_completed: completed_list_count > 0
-                    (Value::ComputedRef { source_hold, .. }, Value::Number(n)) if n.0 == 0.0 => {
-                        Value::computed_ref(
-                            ComputedType::GreaterThanZero {
-                                operand: Box::new(a.clone()),
-                            },
-                            source_hold.clone(),
-                        )
+                    // Phase 4: Replaces ComputedRef::GreaterThanZero with DD-native pattern
+                    (Value::Collection(handle), Value::Number(n)) if n.0 == 0.0 => {
+                        self.create_greater_than_zero(handle.id.clone())
                     }
                     _ => Value::Bool(a > b),
                 }
@@ -3619,17 +3820,12 @@ impl BoonDdRuntime {
                 zoon::println!("[DD_EVAL] Subtract: a={:?}, b={:?}", a, b);
                 match (&a, &b) {
                     (Value::Number(x), Value::Number(y)) => Value::float(x.0 - y.0),
-                    // ComputedRef - ComputedRef => ComputedRef::Subtract
+                    // Collection - Collection => DD Subtract operator
                     // Used for: active_list_count: list_count - completed_list_count
-                    (Value::ComputedRef { source_hold, .. }, Value::ComputedRef { .. }) => {
-                        zoon::println!("[DD_EVAL] Creating ComputedRef(Subtract) with source_hold={}", source_hold);
-                        Value::computed_ref(
-                            ComputedType::Subtract {
-                                left: Box::new(a.clone()),
-                                right: Box::new(b.clone()),
-                            },
-                            source_hold.clone(),
-                        )
+                    // Phase 4: Replaces ComputedRef::Subtract with DD-native pattern
+                    (Value::Collection(left_handle), Value::Collection(right_handle)) => {
+                        zoon::println!("[DD_EVAL] Creating DD Subtract: {:?} - {:?}", left_handle.id, right_handle.id);
+                        self.create_subtract(left_handle.id.clone(), right_handle.id.clone())
                     }
                     _ => {
                         zoon::println!("[DD_EVAL] Subtract: returning Unit (no match)");
@@ -3686,19 +3882,34 @@ impl BoonDdRuntime {
 
                 // Rest are field accesses
                 for field in parts.iter().skip(1) {
-                    // Handle Placeholder specially - create PlaceholderField for deferred access
+                    // Handle Placeholder specially - create Tagged placeholder for field access
+                    // Pure DD: Use Tagged value instead of symbolic PlaceholderField
                     current = match &current {
                         Value::Placeholder => {
-                            Value::PlaceholderField {
-                                path: Arc::new(vec![Arc::from(field.as_ref())]),
+                            Value::Tagged {
+                                tag: Arc::from("__placeholder_field__"),
+                                fields: Arc::new(BTreeMap::from([(
+                                    Arc::from("path"),
+                                    Value::List(Arc::new(vec![Value::text(field.as_str())])),
+                                )])),
                             }
                         }
-                        Value::PlaceholderField { path: existing_path } => {
+                        Value::Tagged { tag, fields } if tag.as_ref() == "__placeholder_field__" => {
                             // Extend the existing path
-                            let mut new_path: Vec<Arc<str>> = existing_path.as_ref().clone();
-                            new_path.push(Arc::from(field.as_ref()));
-                            Value::PlaceholderField {
-                                path: Arc::new(new_path),
+                            let existing_path = fields.get("path")
+                                .and_then(|v| match v {
+                                    Value::List(items) => Some(items.as_ref().clone()),
+                                    _ => None,
+                                })
+                                .unwrap_or_default();
+                            let mut new_path = existing_path;
+                            new_path.push(Value::text(field.as_str()));
+                            Value::Tagged {
+                                tag: Arc::from("__placeholder_field__"),
+                                fields: Arc::new(BTreeMap::from([(
+                                    Arc::from("path"),
+                                    Value::List(Arc::new(new_path)),
+                                )])),
                             }
                         }
                         // Handle LinkRef.event - create synthetic event object with all event types
@@ -3739,19 +3950,34 @@ impl BoonDdRuntime {
 
                 // Navigate through extra_parts (field accesses after PASSED)
                 for field in extra_parts {
-                    // Handle Placeholder specially - create PlaceholderField for deferred access
+                    // Handle Placeholder specially - create Tagged placeholder for field access
+                    // Pure DD: Use Tagged value instead of symbolic PlaceholderField
                     current = match &current {
                         Value::Placeholder => {
-                            Value::PlaceholderField {
-                                path: Arc::new(vec![Arc::from(field.as_ref())]),
+                            Value::Tagged {
+                                tag: Arc::from("__placeholder_field__"),
+                                fields: Arc::new(BTreeMap::from([(
+                                    Arc::from("path"),
+                                    Value::List(Arc::new(vec![Value::text(field.as_str())])),
+                                )])),
                             }
                         }
-                        Value::PlaceholderField { path: existing_path } => {
+                        Value::Tagged { tag, fields } if tag.as_ref() == "__placeholder_field__" => {
                             // Extend the existing path
-                            let mut new_path: Vec<Arc<str>> = existing_path.as_ref().clone();
-                            new_path.push(Arc::from(field.as_ref()));
-                            Value::PlaceholderField {
-                                path: Arc::new(new_path),
+                            let existing_path = fields.get("path")
+                                .and_then(|v| match v {
+                                    Value::List(items) => Some(items.as_ref().clone()),
+                                    _ => None,
+                                })
+                                .unwrap_or_default();
+                            let mut new_path = existing_path;
+                            new_path.push(Value::text(field.as_str()));
+                            Value::Tagged {
+                                tag: Arc::from("__placeholder_field__"),
+                                fields: Arc::new(BTreeMap::from([(
+                                    Arc::from("path"),
+                                    Value::List(Arc::new(new_path)),
+                                )])),
                             }
                         }
                         // Handle LinkRef.event - create synthetic event object with all event types
@@ -3839,17 +4065,28 @@ impl BoonDdRuntime {
         }
     }
 
-    /// Replace any LinkRef in a value with a PlaceholderField.
+    /// Replace any LinkRef in a value with a placeholder field Tagged value.
     ///
     /// This is used by `|> LINK { alias }` during template evaluation when the alias
-    /// resolves to a PlaceholderField (deferred field access). The PlaceholderField
+    /// resolves to a placeholder field (deferred field access). The placeholder
     /// will be resolved to a real LinkRef during template cloning/substitution.
+    ///
+    /// Pure DD: Uses Tagged value with "__placeholder_field__" tag instead of symbolic ref.
     fn replace_link_ref_with_placeholder(&self, value: &Value, path: &[Arc<str>]) -> Value {
         use std::collections::BTreeMap;
 
         match value {
-            // Replace any LinkRef with the PlaceholderField
-            Value::LinkRef(_) => Value::PlaceholderField { path: Arc::new(path.to_vec()) },
+            // Replace any LinkRef with the placeholder Tagged value
+            Value::LinkRef(_) => {
+                let path_list: Vec<Value> = path.iter().map(|s| Value::text(s.as_ref())).collect();
+                Value::Tagged {
+                    tag: Arc::from("__placeholder_field__"),
+                    fields: Arc::new(BTreeMap::from([(
+                        Arc::from("path"),
+                        Value::List(Arc::new(path_list)),
+                    )])),
+                }
+            }
 
             // Recursively process objects
             Value::Object(fields) => {

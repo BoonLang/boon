@@ -8,7 +8,7 @@
 //! Unlike the batch-per-event model in `worker.rs`, this module:
 //! 1. Creates ONE long-lived Timely dataflow at startup
 //! 2. Keeps input handles for event injection
-//! 3. Uses `inspect()` callbacks for output observation
+//! 3. Uses `capture()` for pure output observation (no side effects)
 //! 4. Steps the worker periodically via async loop
 //!
 //! # Benefits
@@ -16,6 +16,7 @@
 //! - O(delta) complexity for all operations
 //! - Arrangements persist across batches (no rebuild cost)
 //! - True incremental computation
+//! - Pure dataflow (no Mutex/inspect side effects)
 //!
 //! # WASM Compatibility
 //!
@@ -28,39 +29,17 @@ use std::sync::{Arc, Mutex};
 use differential_dataflow::input::Input;
 use timely::communication::allocator::thread::Thread;
 use timely::dataflow::operators::probe::Handle as ProbeHandle;
+use timely::dataflow::operators::Capture;
+use timely::dataflow::operators::capture::Extract;
 use timely::worker::Worker as TimelyWorker;
 
 use ordered_float::OrderedFloat;
 
 use super::operators::hold;
-use super::types::{CellId, EventPayload, EventValue, LinkId};
+use super::types::{CellId, EventPayload, EventValue, LinkId, BoolTag, EventFilter};
 use super::value::Value;
 
-/// Event filter for DD cells - determines which events trigger the cell.
-#[derive(Clone, Debug)]
-pub enum DdEventFilter {
-    /// Accept any event
-    Any,
-    /// Accept events with text starting with this prefix (e.g., "Enter:")
-    TextStartsWith(String),
-    /// Accept events with this exact text
-    TextEquals(String),
-}
-
-impl DdEventFilter {
-    /// Check if an event value matches this filter.
-    pub fn matches(&self, event_value: &EventValue) -> bool {
-        match self {
-            DdEventFilter::Any => true,
-            DdEventFilter::TextStartsWith(prefix) => {
-                matches!(event_value, EventValue::Text(t) if t.starts_with(prefix))
-            }
-            DdEventFilter::TextEquals(pattern) => {
-                matches!(event_value, EventValue::Text(t) if t == pattern)
-            }
-        }
-    }
-}
+// Note: EventFilter removed in Phase 3.3 - now using consolidated EventFilter from types.rs
 
 /// Configuration for a DD-first cell (reactive state).
 #[derive(Clone, Debug)]
@@ -74,7 +53,7 @@ pub struct DdCellConfig {
     /// Transform to apply when triggered
     pub transform: DdTransform,
     /// Event filter - only events matching this filter trigger the cell
-    pub filter: DdEventFilter,
+    pub filter: EventFilter,
 }
 
 /// Transforms for DD-first cells.
@@ -103,8 +82,10 @@ pub enum DdTransform {
     ListMap { field: String, transform: Box<DdTransform> },
     /// Count list items
     ListCount,
-    /// Custom transform function (fallback)
-    Custom(Arc<dyn Fn(&Value, &Value) -> Value + Send + Sync>),
+    /// Identity transform - returns state unchanged.
+    /// Phase 7: Replaces Custom(|state, _| state.clone()) for serializable/deterministic transforms.
+    Identity,
+    // Phase 7 COMPLETE: Custom variant REMOVED - all transforms are now serializable/deterministic
 }
 
 impl std::fmt::Debug for DdTransform {
@@ -119,7 +100,8 @@ impl std::fmt::Debug for DdTransform {
             Self::ListFilter { field, value } => write!(f, "ListFilter {{ field: {:?}, value: {:?} }}", field, value),
             Self::ListMap { field, transform } => write!(f, "ListMap {{ field: {:?}, transform: {:?} }}", field, transform),
             Self::ListCount => write!(f, "ListCount"),
-            Self::Custom(_) => write!(f, "Custom(<function>)"),
+            Self::Identity => write!(f, "Identity"),
+            // Phase 7 COMPLETE: Custom variant removed
         }
     }
 }
@@ -143,9 +125,14 @@ pub fn apply_link_action(
         LinkAction::BoolToggle => {
             match current_value {
                 Value::Bool(b) => Value::Bool(!*b),
-                // Handle Boon's Tagged booleans
-                Value::Tagged { tag, .. } if tag.as_ref() == "True" => Value::Bool(false),
-                Value::Tagged { tag, .. } if tag.as_ref() == "False" => Value::Bool(true),
+                // Handle Boon's Tagged booleans using type-safe BoolTag
+                Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag) => {
+                    match BoolTag::from_tag(tag) {
+                        Some(BoolTag::True) => Value::Bool(false),
+                        Some(BoolTag::False) => Value::Bool(true),
+                        None => current_value.clone(),
+                    }
+                }
                 _ => current_value.clone(),
             }
         }
@@ -329,7 +316,6 @@ impl DataflowBuilder {
     /// This creates a persistent Timely worker that runs until dropped.
     pub fn build(self) -> DdFirstHandle {
         let outputs = Arc::new(Mutex::new(Vec::new()));
-        let outputs_clone = outputs.clone();
         let current_time = Arc::new(Mutex::new(0u64));
         let inputs = Arc::new(Mutex::new(HashMap::new()));
         let probe = Arc::new(Mutex::new(None));
@@ -357,6 +343,12 @@ impl Default for DataflowBuilder {
 ///
 /// This is a bridge between the current batch model and the target persistent model.
 /// It uses actual DD operators for all transformations.
+///
+/// # Pure DD Architecture
+///
+/// This uses `capture()` instead of `inspect()` for output observation:
+/// - NO Mutex locks during dataflow execution
+/// - Outputs flow through mpsc channel (pure message passing)
 pub fn run_dd_first_batch(
     cells: &[DdCellConfig],
     events: &[(LinkId, EventValue)],
@@ -364,22 +356,24 @@ pub fn run_dd_first_batch(
 ) -> HashMap<String, Value> {
     use differential_dataflow::input::Input;
 
-    let final_states = Arc::new(Mutex::new(initial_states.clone()));
-    let final_states_clone = final_states.clone();
     let events = events.to_vec();
     let cells = cells.to_vec();
+    let initial_states_clone = initial_states.clone();
 
-    // Execute DD computation
+    // Execute DD computation with capture() for pure output observation
     execute_directly_wasm(move |worker| {
-        let (mut event_input, probe) = worker.dataflow::<u64, _, _>(|scope| {
+        let (mut event_input, probe, outputs_rx) = worker.dataflow::<u64, _, _>(|scope| {
             // Create input collection for events
             let (event_handle, events_collection) =
                 scope.new_collection::<(String, EventValue), isize>();
 
+            // Collect all cell outputs to merge into single capture stream
+            let mut all_outputs: Vec<differential_dataflow::Collection<_, TaggedCellOutput, isize>> = Vec::new();
+
             // For each cell, create a HOLD operator
             for cell_config in &cells {
                 let cell_id = cell_config.id.name().to_string();
-                let initial = initial_states
+                let initial = initial_states_clone
                     .get(&cell_id)
                     .cloned()
                     .unwrap_or_else(|| cell_config.initial.clone());
@@ -396,30 +390,38 @@ pub fn run_dd_first_batch(
                     trigger_ids.contains(link_id) && event_filter.matches(event_value)
                 });
 
-                // Apply transform using DD operators
+                // Apply transform using DD operators (pure, no side effects)
                 let transform = cell_config.transform.clone();
-                let states_for_transform = final_states_clone.clone();
-                let cell_id_for_output = cell_id.clone();
+                let cell_id_for_tag = cell_id.clone();
+                let cell_id_for_transform = cell_id.clone();  // Phase 4: For O(delta) list ops
 
                 let output = hold(initial, &triggered, move |state, event| {
-                    apply_dd_transform(&transform, state, event, &states_for_transform)
+                    apply_dd_transform(&transform, state, event, &cell_id_for_transform)
                 });
 
-                // Capture outputs
-                let states_for_inspect = final_states_clone.clone();
-                output.inspect(move |(value, _time, diff)| {
-                    if *diff > 0 {
-                        states_for_inspect
-                            .lock()
-                            .unwrap()
-                            .insert(cell_id_for_output.clone(), value.clone());
-                    }
+                // Tag output with cell ID for identification
+                let tagged_output = output.map(move |value| TaggedCellOutput {
+                    cell_id: cell_id_for_tag.clone(),
+                    value,
                 });
+
+                all_outputs.push(tagged_output);
             }
+
+            // Merge all outputs and capture via pure message passing
+            let merged = if all_outputs.is_empty() {
+                scope.new_collection::<TaggedCellOutput, isize>().1
+            } else {
+                let first = all_outputs.remove(0);
+                all_outputs.into_iter().fold(first, |acc, c| acc.concat(&c))
+            };
+
+            // Use capture() for pure output observation - NO Mutex, NO side effects!
+            let outputs_rx = merged.inner.capture();
 
             // Create probe for progress tracking
             let probe = events_collection.probe();
-            (event_handle, probe)
+            (event_handle, probe, outputs_rx)
         });
 
         // Insert events
@@ -433,20 +435,41 @@ pub fn run_dd_first_batch(
                 worker.step();
             }
         }
-    });
 
-    Arc::try_unwrap(final_states)
-        .unwrap_or_else(|arc| Mutex::new((*arc.lock().unwrap()).clone()))
-        .into_inner()
-        .unwrap()
+        // Extract outputs from capture channel AFTER all events processed
+        let captured: Vec<(u64, Vec<(TaggedCellOutput, u64, isize)>)> = outputs_rx.extract();
+
+        // Build final states from captured outputs (take latest value for each cell)
+        let mut final_states = initial_states_clone.clone();
+        for (_time, items) in captured {
+            for (tagged, _t, diff) in items {
+                if diff > 0 {
+                    final_states.insert(tagged.cell_id, tagged.value);
+                }
+            }
+        }
+
+        final_states
+    })
 }
 
 /// Apply a DD transform to produce new state.
+///
+/// # Pure Function
+///
+/// This is a pure function with no side effects - it takes state and event,
+/// returns new state. No Mutex, no global state access.
+///
+/// # Phase 4: O(delta) List Operations
+///
+/// For list operations, this returns ListDiff variants (e.g., Value::ListPush)
+/// instead of full lists. The output observation layer applies these diffs
+/// incrementally to MutableVec.
 fn apply_dd_transform(
     transform: &DdTransform,
     state: &Value,
     event: &(String, EventValue),
-    _states: &Arc<Mutex<HashMap<String, Value>>>,
+    cell_id: &str,  // Phase 4: Added for ListDiff cell_id
 ) -> Value {
     match transform {
         DdTransform::Increment => match state {
@@ -455,54 +478,50 @@ fn apply_dd_transform(
         },
         DdTransform::Toggle => match state {
             Value::Bool(b) => Value::Bool(!*b),
-            Value::Tagged { tag, .. } if tag.as_ref() == "True" => Value::Bool(false),
-            Value::Tagged { tag, .. } if tag.as_ref() == "False" => Value::Bool(true),
+            // Use type-safe BoolTag instead of string comparison
+            Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag) => {
+                match BoolTag::from_tag(tag) {
+                    Some(BoolTag::True) => Value::Bool(false),
+                    Some(BoolTag::False) => Value::Bool(true),
+                    None => state.clone(),
+                }
+            }
             _ => state.clone(),
         },
         DdTransform::SetValue(v) => v.clone(),
         DdTransform::ListAppend => {
-            if let (Value::List(items), (_, EventValue::Text(text))) = (state, event) {
+            // Phase 4: Emit ListPush diff instead of cloning entire list (O(delta))
+            if let (Value::List(_), (_, EventValue::Text(text))) = (state, event) {
                 if let Some(item_text) = EventPayload::parse_enter_text(text) {
-                    let mut new_items = items.to_vec();
-                    new_items.push(Value::text(item_text));
-                    return Value::List(Arc::new(new_items));
+                    // Return ListPush diff - output observation applies it incrementally
+                    return Value::list_push(cell_id, Value::text(item_text));
                 }
             }
             state.clone()
         }
         DdTransform::ListAppendPrepared => {
-            // Pure append of pre-instantiated item (O(delta) optimization).
+            // Phase 4: Pure append via ListPush diff (O(delta) optimization).
             // The item was already instantiated with fresh IDs BEFORE DD injection.
-            // This transform just appends - no side effects.
-            if let (Value::List(items), (_, EventValue::PreparedItem(item))) = (state, event) {
-                let mut new_items = items.to_vec();
-                new_items.push(item.clone());
-                return Value::List(Arc::new(new_items));
+            // This transform emits a diff - no list cloning.
+            if let (Value::List(_), (_, EventValue::PreparedItem(item))) = (state, event) {
+                // Return ListPush diff - output observation applies it incrementally
+                return Value::list_push(cell_id, item.clone());
             }
             // Also handle legacy Text events for backward compatibility
-            if let (Value::List(items), (_, EventValue::Text(text))) = (state, event) {
+            if let (Value::List(_), (_, EventValue::Text(text))) = (state, event) {
                 if let Some(item_text) = EventPayload::parse_enter_text(text) {
-                    let mut new_items = items.to_vec();
-                    new_items.push(Value::text(item_text));
-                    return Value::List(Arc::new(new_items));
+                    return Value::list_push(cell_id, Value::text(item_text));
                 }
             }
             state.clone()
         }
-        DdTransform::ListRemove { identity_path } => {
-            if let (Value::List(items), (_, EventValue::Text(text))) = (state, event) {
+        DdTransform::ListRemove { identity_path: _ } => {
+            // Phase 4: Emit ListRemoveByKey diff instead of filtering entire list (O(delta))
+            if let (Value::List(_), (_, EventValue::Text(text))) = (state, event) {
                 if let Some(link_id) = EventPayload::parse_remove_link(text) {
-                    // Find item by identity path and remove
-                    let new_items: Vec<Value> = items
-                        .iter()
-                        .filter(|item| {
-                            super::worker::get_link_ref_at_path(item, identity_path)
-                                .map(|id| id != link_id)
-                                .unwrap_or(true)
-                        })
-                        .cloned()
-                        .collect();
-                    return Value::List(Arc::new(new_items));
+                    // Return ListRemoveByKey diff - output observation applies it incrementally
+                    // The link_id is the unique key for the item to remove
+                    return Value::list_remove_by_key(cell_id, link_id);
                 }
             }
             state.clone()
@@ -528,8 +547,9 @@ fn apply_dd_transform(
                     .iter()
                     .map(|item| {
                         if let Some(field_value) = item.get(field) {
+                            // Phase 4: Pass cell_id for nested transforms
                             let new_field_value =
-                                apply_dd_transform(transform, field_value, event, _states);
+                                apply_dd_transform(transform, field_value, event, cell_id);
                             item.with_field(field, new_field_value)
                         } else {
                             item.clone()
@@ -546,16 +566,11 @@ fn apply_dd_transform(
             }
             state.clone()
         }
-        DdTransform::Custom(f) => {
-            let event_value = match &event.1 {
-                EventValue::Unit => Value::Unit,
-                EventValue::Bool(b) => Value::Bool(*b),
-                EventValue::Text(t) => Value::text(t.as_str()),
-                EventValue::Number(n) => Value::Number(*n),
-                EventValue::PreparedItem(v) => v.clone(),
-            };
-            f(state, &event_value)
+        DdTransform::Identity => {
+            // Phase 7: Explicit identity transform - returns state unchanged
+            state.clone()
         }
+        // Phase 7 COMPLETE: Custom variant removed - all transforms are serializable/deterministic
     }
 }
 
@@ -593,13 +608,27 @@ thread_local! {
     static PERSISTENT_WORKER: RefCell<Option<PersistentDdWorker>> = RefCell::new(None); // ALLOWED: DD execution context
 }
 
+/// Tagged output for capture() - contains cell ID with the value
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TaggedCellOutput {
+    pub cell_id: String,
+    pub value: Value,
+}
+
 /// Persistent Differential Dataflow worker that stays alive across event batches.
 ///
 /// Unlike the batch-per-event model, this worker:
 /// 1. Creates ONE Timely dataflow at initialization
 /// 2. Keeps input handles for event injection
 /// 3. Steps incrementally when events arrive
-/// 4. Outputs changes via callback
+/// 4. Outputs changes via capture() (pure, no side effects)
+///
+/// # Pure DD Architecture
+///
+/// This worker uses `capture()` instead of `inspect()` to observe outputs.
+/// - NO Mutex locks during dataflow execution
+/// - NO side effects inside DD operators
+/// - Outputs flow through message passing (mpsc channel)
 pub struct PersistentDdWorker {
     /// The Timely worker (owned, stays alive)
     worker: TimelyWorker<Thread>,
@@ -609,8 +638,8 @@ pub struct PersistentDdWorker {
     probe: ProbeHandle<u64>,
     /// Current logical time
     current_time: u64,
-    /// Accumulated outputs from inspect() callbacks
-    pending_outputs: Arc<Mutex<Vec<DdOutput>>>,
+    /// Output receiver from capture() - NO Mutex needed!
+    outputs_receiver: std::sync::mpsc::Receiver<timely::dataflow::operators::capture::Event<u64, (TaggedCellOutput, u64, isize)>>,
     /// Cell configurations (for rebuilding dataflow if needed)
     cells: Vec<DdCellConfig>,
     /// Config signature for change detection (hash of cell IDs and triggers)
@@ -640,9 +669,14 @@ fn compute_config_signature(cells: &[DdCellConfig]) -> u64 {
 
 impl PersistentDdWorker {
     /// Create a new persistent worker with the given cell configurations.
+    ///
+    /// # Pure DD Architecture
+    ///
+    /// This uses `capture()` instead of `inspect()` for output observation:
+    /// - NO Mutex locks during dataflow execution
+    /// - Outputs flow through mpsc channel (pure message passing)
+    /// - `drain_outputs()` extracts from the channel AFTER stepping
     pub fn new(cells: Vec<DdCellConfig>, initial_states: HashMap<String, Value>) -> Self {
-        let pending_outputs = Arc::new(Mutex::new(Vec::new()));
-        let pending_outputs_clone = pending_outputs.clone();
         let cells_clone = cells.clone();
         let initial_states_clone = initial_states.clone();
 
@@ -650,14 +684,17 @@ impl PersistentDdWorker {
         let alloc = Thread::default();
         let mut worker = TimelyWorker::new(timely::WorkerConfig::default(), alloc, None);
 
-        // Build the dataflow graph
-        let (event_input, probe) = worker.dataflow::<u64, _, _>(move |scope| {
+        // Build the dataflow graph - returns (input_handle, probe, outputs_receiver)
+        let (event_input, probe, outputs_receiver) = worker.dataflow::<u64, _, _>(move |scope| {
             use differential_dataflow::input::Input;
             use super::operators::hold;
 
             // Create input collection for events
             let (event_handle, events_collection) =
                 scope.new_collection::<(String, EventValue), isize>();
+
+            // Collect all cell outputs to merge into single capture stream
+            let mut all_outputs: Vec<differential_dataflow::Collection<_, TaggedCellOutput, isize>> = Vec::new();
 
             // For each cell, create a HOLD operator
             for cell_config in &cells_clone {
@@ -681,29 +718,36 @@ impl PersistentDdWorker {
 
                 // Apply transform using DD operators
                 let transform = cell_config.transform.clone();
-                let cell_id_for_output = cell_id.clone();
-                let outputs_for_inspect = pending_outputs_clone.clone();
+                let cell_id_for_tag = cell_id.clone();
+                let cell_id_for_transform = cell_id.clone();  // Phase 4: For O(delta) list ops
 
                 let output = hold(initial, &triggered, move |state, event| {
-                    apply_dd_transform(&transform, state, event, &Arc::new(Mutex::new(HashMap::new())))
+                    apply_dd_transform(&transform, state, event, &cell_id_for_transform)
                 });
 
-                // Capture outputs via inspect()
-                output.inspect(move |(value, time, diff)| {
-                    if *diff > 0 {
-                        outputs_for_inspect.lock().unwrap().push(DdOutput {
-                            cell_id: CellId::new(&cell_id_for_output),
-                            value: value.clone(),
-                            time: *time,
-                            diff: *diff,
-                        });
-                    }
+                // Tag output with cell ID for identification
+                let tagged_output = output.map(move |value| TaggedCellOutput {
+                    cell_id: cell_id_for_tag.clone(),
+                    value,
                 });
+
+                all_outputs.push(tagged_output);
             }
+
+            // Merge all outputs and capture via pure message passing
+            let merged = if all_outputs.is_empty() {
+                scope.new_collection::<TaggedCellOutput, isize>().1
+            } else {
+                let first = all_outputs.remove(0);
+                all_outputs.into_iter().fold(first, |acc, c| acc.concat(&c))
+            };
+
+            // Use capture() for pure output observation - NO Mutex, NO side effects!
+            let outputs_rx = merged.inner.capture();
 
             // Create probe for progress tracking
             let probe = events_collection.probe();
-            (event_handle, probe)
+            (event_handle, probe, outputs_rx)
         });
 
         let config_signature = compute_config_signature(&cells);
@@ -713,7 +757,7 @@ impl PersistentDdWorker {
             event_input,
             probe,
             current_time: 0,
-            pending_outputs,
+            outputs_receiver,
             cells,
             config_signature,
         }
@@ -738,9 +782,28 @@ impl PersistentDdWorker {
         }
     }
 
-    /// Drain accumulated outputs.
+    /// Drain accumulated outputs using extract() on the capture channel.
+    ///
+    /// # Pure DD Architecture
+    ///
+    /// This extracts outputs from the mpsc receiver - NO Mutex locks!
+    /// The receiver was populated during `worker.step()` via pure message passing.
     pub fn drain_outputs(&self) -> Vec<DdOutput> {
-        std::mem::take(&mut *self.pending_outputs.lock().unwrap())
+        // Extract all accumulated outputs from the capture channel
+        let captured: Vec<(u64, Vec<(TaggedCellOutput, u64, isize)>)> = self.outputs_receiver.extract();
+
+        // Convert to DdOutput format, filtering to only positive diffs (inserts)
+        captured
+            .into_iter()
+            .flat_map(|(_time, items)| items)
+            .filter(|(_, _, diff)| *diff > 0)
+            .map(|(tagged, time, diff)| DdOutput {
+                cell_id: CellId::new(&tagged.cell_id),
+                value: tagged.value,
+                time,
+                diff,
+            })
+            .collect()
     }
 
     /// Get current logical time.
@@ -823,7 +886,7 @@ mod tests {
             initial: Value::Number(super::OrderedFloat(0.0)),
             triggers: vec![LinkId::new("click")],
             transform: DdTransform::Increment,
-            filter: DdEventFilter::Any,
+            filter: EventFilter::Any,
         }];
 
         let events = vec![
@@ -848,7 +911,7 @@ mod tests {
             initial: Value::Bool(false),
             triggers: vec![LinkId::new("toggle")],
             transform: DdTransform::Toggle,
-            filter: DdEventFilter::Any,
+            filter: EventFilter::Any,
         }];
 
         let events = vec![
@@ -870,7 +933,7 @@ mod tests {
             initial: Value::List(Arc::new(vec![])),
             triggers: vec![LinkId::new("add")],
             transform: DdTransform::ListAppend,
-            filter: DdEventFilter::TextStartsWith("Enter:".to_string()),
+            filter: EventFilter::TextStartsWith("Enter:".to_string()),
         }];
 
         let events = vec![
@@ -896,7 +959,7 @@ mod tests {
             initial: Value::Number(super::OrderedFloat(0.0)),
             triggers: vec![LinkId::new("click")],
             transform: DdTransform::Increment,
-            filter: DdEventFilter::Any,
+            filter: EventFilter::Any,
         }];
 
         let mut worker = PersistentDdWorker::new(cells, HashMap::new());
@@ -930,14 +993,14 @@ mod tests {
                 initial: Value::Number(super::OrderedFloat(0.0)),
                 triggers: vec![LinkId::new("inc")],
                 transform: DdTransform::Increment,
-                filter: DdEventFilter::Any,
+                filter: EventFilter::Any,
             },
             DdCellConfig {
                 id: CellId::new("enabled"),
                 initial: Value::Bool(false),
                 triggers: vec![LinkId::new("toggle")],
                 transform: DdTransform::Toggle,
-                filter: DdEventFilter::Any,
+                filter: EventFilter::Any,
             },
         ];
 

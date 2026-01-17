@@ -38,17 +38,23 @@ pub use guards::{
 };
 pub use types::{
     channel, Event, EventValue, Input, Output, CellId, LinkId, TimerId,
-    BoolTag, ElementTag, EventPayload,
+    BoolTag, ElementTag, EventPayload, EventFilter,
     // Phase 8: DD-native LINK handling
     LinkAction, LinkCellMapping, EditingHandlerConfig,
 };
 pub use worker::{
-    DataflowConfig, Worker, WorkerHandle, EventFilter, CellConfig,
+    DataflowConfig, Worker, WorkerHandle, CellConfig,
     StateTransform, reconstruct_persisted_item, instantiate_fresh_item,
     // Generic template system exports
     FieldPath, ItemIdentitySpec, FieldInitializer, LinkActionSpec, LinkActionConfig,
     ListItemTemplate, InstantiatedItem, FieldUpdate,
     instantiate_template, get_at_path, get_link_ref_at_path, get_hold_ref_at_path, update_field_at_path,
+    // Phase 7.3: Registry types moved to DataflowConfig
+    EditingBinding, ToggleBinding, GlobalToggleBinding,
+    // Phase 7.3: Config accessor functions
+    set_active_config, clear_active_config, with_active_config,
+    is_text_clear_cell, get_remove_event_path, get_bulk_remove_event_path,
+    get_editing_bindings, get_toggle_bindings, get_global_toggle_bindings,
 };
 // Note: DocumentUpdate is now internal-only (Phase 6 cleanup)
 pub use dataflow::{
@@ -57,3 +63,7 @@ pub use dataflow::{
     // Phase 8: DD-native link action processing
     apply_link_action, mapping_matches_event,
 };
+// Phase 4: DD Collection types for incremental list operations
+pub use value::{CollectionId, CollectionHandle};
+// Phase 7.3: CellUpdate for pure DD operations
+pub use value::CellUpdate;

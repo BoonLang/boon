@@ -11,12 +11,14 @@ use super::super::core::types::{BoolTag, ElementTag};
 use super::super::core::value::Value;
 use zoon::*;
 
-use super::super::io::{fire_global_link, fire_global_link_with_bool, fire_global_blur, fire_global_key_down, cell_states_signal, get_cell_value, add_dynamic_link_action, DynamicLinkAction, sync_cell_from_dd};
+use super::super::io::{fire_global_link, fire_global_link_with_bool, fire_global_link_with_text, fire_global_blur, fire_global_key_down, cell_signal, list_signal_vec, get_cell_value};
 // Phase 7: toggle_cell_bool, update_cell_no_persist removed - runtime updates flow through DD
 // Phase 7: find_template_hover_link, find_template_hover_cell removed - symbolic refs eliminated
-use std::sync::atomic::{AtomicU32, Ordering};
+// Phase 11b: cell_states_signal REMOVED - was broadcast anti-pattern causing spurious re-renders
+// Cleanup: removed unused imports (cells_signal, add_dynamic_link_action, DynamicLinkAction, sync_cell_from_dd, AtomicU32, Ordering)
 
 /// Helper function to get the variant name of a Value for debug logging.
+/// Phase 7: Only pure DD value types - no symbolic references.
 fn dd_value_variant_name(value: &Value) -> &'static str {
     match value {
         Value::Unit => "Unit",
@@ -26,31 +28,17 @@ fn dd_value_variant_name(value: &Value) -> &'static str {
         Value::List(_) => "List",
         Value::Collection(_) => "Collection",
         Value::Object(_) => "Object",
-        Value::Tagged { tag, .. } => {
-            // For Tagged, we want to show the tag name, but we can't return a dynamic string
-            // So we'll just return "Tagged" and log the tag separately
-            "Tagged"
-        }
+        Value::Tagged { .. } => "Tagged",
         Value::CellRef(_) => "CellRef",
         Value::LinkRef(_) => "LinkRef",
         Value::TimerRef { .. } => "TimerRef",
-        Value::WhileRef { .. } => "WhileRef",
-        Value::ComputedRef { .. } => "ComputedRef",
-        Value::FilteredListRef { .. } => "FilteredListRef",
-        Value::ReactiveFilteredList { .. } => "ReactiveFilteredList",
-        Value::ReactiveText { .. } => "ReactiveText",
         Value::Placeholder => "Placeholder",
-        Value::PlaceholderField { .. } => "PlaceholderField",
-        Value::PlaceholderWhileRef { .. } => "PlaceholderWhileRef",
-        Value::NegatedPlaceholderField { .. } => "NegatedPlaceholderField",
-        Value::MappedListRef { .. } => "MappedListRef",
-        Value::FilteredMappedListRef { .. } => "FilteredMappedListRef",
-        Value::FilteredListRefWithPredicate { .. } => "FilteredListRefWithPredicate",
-        Value::FilteredMappedListWithPredicate { .. } => "FilteredMappedListWithPredicate",
-        Value::LatestRef { .. } => "LatestRef",
         Value::Flushed(_) => "Flushed",
     }
 }
+
+// Phase 6: Removed dead code - extract_cell_ids() and extract_cell_ids_from_parts()
+// These were unused after Phase 12 refactoring to use targeted multi-cell signals.
 
 /// Get the current value of the focused text input via DOM access.
 /// This is used when Enter is pressed to capture the input text.
@@ -120,125 +108,52 @@ pub fn clear_dd_text_input_value() {
 
 // REMOVED: get_dynamic_item_edit_value - dead code (render_dynamic_item was removed)
 
-/// Convert a Value Oklch color to CSS color string.
-/// Returns None if the color should be invisible (alpha=0 or broken WhileRef).
-/// Evaluate a WhileRef with computation to get the current value.
-/// Returns the matching arm's body value or None if no match.
-fn evaluate_while_ref_now(cell_id: &super::super::core::types::CellId, computation: &Option<super::super::core::value::ComputedType>, arms: &[(Value, Value)]) -> Option<Value> {
-    use super::super::core::value::evaluate_computed;
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 7: REMOVED FUNCTIONS
+//   - evaluate_while_ref_now() - WhileRef is removed, DD computes arm selection
+//   - evaluate_dd_value_for_filter() - Filtering happens in DD operators
+//
+// Pure DD: All computation happens in DD dataflow, not at render time.
+// The bridge only renders pure data values from DD output streams.
+// ═══════════════════════════════════════════════════════════════════════════
 
-    // Get the source value from hold states
-    let source_value = get_cell_value(&cell_id.name()).unwrap_or(Value::Unit);
-
-    // If there's a computation, evaluate it to get the actual value to match
-    let value_to_match = if let Some(comp) = computation {
-        evaluate_computed(comp, &source_value)
-    } else {
-        source_value
-    };
-
-    // Match against arms
-    for (pattern, body) in arms.iter() {
-        let matches = match (&value_to_match, pattern) {
-            (&Value::Bool(b), Value::Tagged { tag, .. }) => {
-                BoolTag::matches_bool(tag.as_ref(), b)
-            }
-            (Value::Text(curr), Value::Text(pat)) => curr == pat,
-            (Value::Tagged { tag: curr_tag, .. }, Value::Tagged { tag: pat_tag, .. }) => curr_tag == pat_tag,
-            _ => &value_to_match == pattern,
-        };
-        if matches {
-            return Some(body.clone());
-        }
-    }
-    None
-}
-
-/// Evaluate a Value for filter comparison, resolving CellRefs and WhileRefs.
-/// Used by FilteredMappedListRef to compare field values with filter values.
-/// Recursively evaluates until we get a concrete value (Bool, Tagged, etc.).
-fn evaluate_dd_value_for_filter(value: &Value, states: &std::collections::HashMap<String, Value>) -> Value {
+/// Resolve a CellRef to its actual value for rendering.
+/// Phase 7: Only resolves CellRef - no WhileRef or ComputedRef.
+fn resolve_cell_ref(value: &Value, states: &std::collections::HashMap<String, Value>) -> Value {
     match value {
         Value::CellRef(cell_id) => {
-            let resolved = states.get(&cell_id.name()).cloned().unwrap_or(Value::Unit);
-            // Recursively evaluate in case the hold value is itself a CellRef or WhileRef
-            evaluate_dd_value_for_filter(&resolved, states)
-        }
-        Value::WhileRef { cell_id, computation, arms, default } => {
-            let result = evaluate_while_ref_now(cell_id, computation, arms)
-                .or_else(|| default.as_ref().map(|d| (**d).clone()))
-                .unwrap_or(Value::Unit);
-            // Recursively evaluate in case the WhileRef body is a CellRef
-            evaluate_dd_value_for_filter(&result, states)
+            states.get(&cell_id.name()).cloned().unwrap_or(Value::Unit)
         }
         other => other.clone(),
     }
 }
 
+/// Convert a Value Oklch color to CSS color string.
+/// Phase 7: Pure DD - only handles Number values, no WhileRef evaluation.
+/// Reactive color changes come from DD output streams, not render-time evaluation.
 fn dd_oklch_to_css(value: &Value) -> Option<String> {
     match value {
         Value::Tagged { tag, fields } if tag.as_ref() == "Oklch" => {
-            // Handle lightness - can be Number or WhileRef (reactive)
-            let lightness = match fields.get("lightness") {
-                Some(Value::Number(n)) => n.0,
-                Some(Value::WhileRef { cell_id, computation, arms, .. }) => {
-                    // Evaluate WhileRef to get current lightness value
-                    let result = evaluate_while_ref_now(cell_id, computation, arms);
-                    zoon::println!("[DD dd_oklch_to_css] WhileRef lightness: cell_id={}, computation={:?}, result={:?}", cell_id, computation.is_some(), result);
-                    match result {
-                        Some(Value::Number(n)) => n.0,
-                        _ => 0.5, // default
-                    }
-                }
-                _ => 0.5, // default
-            };
+            // Phase 7: Only handle Number values - DD computes reactive colors
+            let lightness = fields.get("lightness")
+                .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })
+                .unwrap_or(0.5);
             let chroma = fields.get("chroma")
                 .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })
                 .unwrap_or(0.0);
             let hue = fields.get("hue")
                 .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })
                 .unwrap_or(0.0);
-
-            // Handle alpha - can be Number or WhileRef
-            let alpha_value = fields.get("alpha");
-            let alpha = match alpha_value {
-                Some(Value::Number(n)) => Some(n.0),
-                Some(Value::WhileRef { cell_id, arms, .. }) => {
-                    // Try to evaluate WhileRef based on cell state
-                    // If arms is empty, it's a broken WhileRef - use default alpha (0.4 for selected state)
-                    if arms.is_empty() {
-                        zoon::println!("[DD Bridge] dd_oklch_to_css: WhileRef alpha has empty arms, using default alpha 0.4");
-                        return Some(format!("oklch({}% {} {} / 0.4)", lightness * 100.0, chroma, hue));
-                    }
-                    // Try to get current value from cell_states and match against arms
-                    let current = get_cell_value(&cell_id.name());
-                    if let Some(current_val) = current {
-                        for (pattern, body) in arms.iter() {
-                            let matches = match (&current_val, pattern) {
-                                (Value::Text(curr), Value::Text(pat)) => curr == pat,
-                                (Value::Bool(b), Value::Tagged { tag, .. }) =>
-                                    BoolTag::matches_bool(tag.as_ref(), *b),
-                                _ => &current_val == pattern,
-                            };
-                            if matches {
-                                if let Value::Number(n) = body {
-                                    return if n.0 == 0.0 {
-                                        None  // alpha=0 means invisible
-                                    } else {
-                                        Some(format!("oklch({}% {} {} / {})", lightness * 100.0, chroma, hue, n.0))
-                                    };
-                                }
-                            }
-                        }
-                    }
-                    None  // No match, default to invisible
-                }
-                _ => None,
-            };
+            let alpha = fields.get("alpha")
+                .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None });
 
             // oklch(lightness% chroma hue / alpha)
             if let Some(a) = alpha {
-                Some(format!("oklch({}% {} {} / {})", lightness * 100.0, chroma, hue, a))
+                if a == 0.0 {
+                    None  // alpha=0 means invisible
+                } else {
+                    Some(format!("oklch({}% {} {} / {})", lightness * 100.0, chroma, hue, a))
+                }
             } else {
                 Some(format!("oklch({}% {} {})", lightness * 100.0, chroma, hue))
             }
@@ -333,22 +248,8 @@ fn render_dd_value(value: &Value) -> RawElOrText {
             Text::new(format!("[{}]", debug)).unify()
         }
 
-        Value::ReactiveText { parts } => {
-            // Reactive TEXT with interpolated values - evaluated at render time
-            let parts = parts.clone();
-            El::new()
-                .child_signal(
-                    cell_states_signal()
-                        .map(move |_states| {
-                            // Evaluate all parts with current HOLD state
-                            let result: String = parts.iter()
-                                .map(|part| part.to_display_string())
-                                .collect();
-                            Text::new(result)
-                        })
-                )
-                .unify()
-        }
+        // Phase 7: ReactiveText REMOVED - DD produces Text values directly
+        // Text interpolation is computed in DD, not at render time
 
         Value::Tagged { tag, fields } => {
             zoon::println!("[DD render_dd_value] Tagged(tag='{}', fields={:?})", tag, fields.keys().collect::<Vec<_>>());
@@ -357,22 +258,38 @@ fn render_dd_value(value: &Value) -> RawElOrText {
 
         Value::CellRef(name) => {
             // CellRef is a reactive reference to a HOLD value
-            // Observe cell_states_signal and render current value reactively
+            // Phase 12: Use granular cell_signal() instead of coarse cell_states_signal()
+            // This only fires when THIS specific cell changes, not when ANY cell changes
             let cell_id = name.to_string();
 
-            // Create reactive element that updates when CELL_STATES change
-            El::new()
-                .child_signal(
-                    cell_states_signal()
-                        .map(move |states| {
-                            let text = states
-                                .get(&cell_id)
-                                .map(|v| v.to_display_string())
-                                .unwrap_or_else(|| "?".to_string());
-                            Text::new(text)
-                        })
-                )
-                .unify()
+            // Phase 12: Check if this cell contains a list for incremental rendering
+            let is_list_cell = get_cell_value(&cell_id)
+                .map(|v| matches!(v, Value::List(_) | Value::Collection(_)))
+                .unwrap_or(false);
+
+            if is_list_cell {
+                // Use incremental list rendering via VecDiff
+                // children_signal_vec() only updates changed elements (O(delta))
+                Column::new()
+                    .items_signal_vec(
+                        list_signal_vec(cell_id)  // Pass owned String
+                            .map(|item| render_dd_value(&item))
+                    )
+                    .unify()
+            } else {
+                // Use scalar rendering for non-list cells
+                El::new()
+                    .child_signal(
+                        cell_signal(cell_id)  // Pass owned String
+                            .map(|value| {
+                                let text = value
+                                    .map(|v| v.to_display_string())
+                                    .unwrap_or_else(|| "?".to_string());
+                                Text::new(text)
+                            })
+                    )
+                    .unify()
+            }
         }
 
         Value::LinkRef(link_id) => {
@@ -384,16 +301,16 @@ fn render_dd_value(value: &Value) -> RawElOrText {
         Value::TimerRef { id, interval_ms: _ } => {
             // TimerRef represents a timer-driven HOLD accumulator
             // The `id` is the HOLD id - render its reactive value
+            // Phase 12: Use granular cell_signal() - only fires when this timer's cell changes
             let cell_id = id.to_string();
 
-            // Create reactive element that updates when CELL_STATES change
+            // Create reactive element that updates only when this timer cell changes
             // NOTE: Returns empty string if HOLD hasn't been set yet (timer not fired)
             El::new()
                 .child_signal(
-                    cell_states_signal()
-                        .map(move |states| {
-                            let text = states
-                                .get(&cell_id)
+                    cell_signal(cell_id)  // Pass owned String
+                        .map(|value| {
+                            let text = value
                                 .map(|v| v.to_display_string())
                                 .unwrap_or_default(); // Empty until first timer tick
                             Text::new(text)
@@ -402,340 +319,27 @@ fn render_dd_value(value: &Value) -> RawElOrText {
                 .unify()
         }
 
-        Value::WhileRef { cell_id, computation, arms, default } => {
-            // WhileRef is a reactive WHILE/WHEN expression
-            // Observe the cell value and render the matching arm
-            let cell_id = cell_id.to_string();
-            let computation = computation.clone();
-            let arms = arms.clone();
-            let default = default.clone();
-
-            // Debug: log the arms Arc address and first arm body to detect sharing
-            let arms_ptr = Arc::as_ptr(&arms) as usize;
-            let first_arm_summary = arms.first().map(|(pattern, body)| {
-                // Check if body is a button with a press LinkRef
-                fn find_press_link(v: &Value) -> Option<String> {
-                    match v {
-                        Value::Tagged { tag, fields } if ElementTag::is_element(tag.as_ref()) => {
-                            if let Some(element) = fields.get("element") {
-                                if let Some(event) = element.get("event") {
-                                    if let Some(Value::LinkRef(id)) = event.get("press") {
-                                        return Some(id.to_string());
-                                    }
-                                }
-                            }
-                            None
-                        }
-                        _ => None,
-                    }
-                }
-                format!("pattern={:?}, body_press={:?}", pattern, find_press_link(body))
-            });
-
-            // Create reactive element that updates when relevant hold values change
-            // Use map + dedupe to avoid re-rendering on unrelated hold changes (like hover)
-            //
-            // For ListCountHold/ListCountWhereHold: we need to watch ALL holds, not just the source_hold.
-            // This is because the count depends on the list items in the HOLD (which can be dynamically added).
-            // For ListCountWhereHold specifically, the count also depends on CellRef values inside items (e.g., checkbox states).
-            fn contains_list_count_hold(comp: &super::super::core::value::ComputedType) -> bool {
-                use super::super::core::value::ComputedType;
-                match comp {
-                    // List computations that need to watch all holds
-                    ComputedType::ListCountWhereHold { .. } => true,
-                    ComputedType::ListCountHold { .. } => true,
-                    ComputedType::ListIsEmptyHold { .. } => true,
-                    ComputedType::GreaterThanZero { operand } => {
-                        if let Value::ComputedRef { computation: inner_comp, .. } = operand.as_ref() {
-                            contains_list_count_hold(inner_comp)
-                        } else {
-                            false
-                        }
-                    }
-                    ComputedType::Equal { left, right } => {
-                        // Check if either operand contains ListCountHold/ListCountWhereHold
-                        let left_has = if let Value::ComputedRef { computation: inner_comp, .. } = left.as_ref() {
-                            contains_list_count_hold(inner_comp)
-                        } else {
-                            false
-                        };
-                        let right_has = if let Value::ComputedRef { computation: inner_comp, .. } = right.as_ref() {
-                            contains_list_count_hold(inner_comp)
-                        } else {
-                            false
-                        };
-                        left_has || right_has
-                    }
-                    _ => false,
-                }
-            }
-            let needs_watch_all_cells = computation.as_ref().map_or(false, contains_list_count_hold);
-            let cell_id_for_extract = cell_id.clone();
-            let cell_id_for_log = cell_id.clone();
-            El::new()
-                .child_signal(
-                    cell_states_signal()
-                        .map(move |states| {
-                            let main_value = states.get(&cell_id_for_extract).cloned();
-                            if needs_watch_all_cells {
-                                // For ListCountHold/ListCountWhereHold: include all states so any cell change triggers re-evaluation
-                                // This is necessary because the count depends on cell contents (dynamic list additions/removals)
-                                (main_value, Some(states))
-                            } else {
-                                // For other computations: only watch the main cell
-                                (main_value, None)
-                            }
-                        })
-                        .dedupe_cloned()  // Emit when watched cell values change
-                        .map(move |(source_value, _watched_source)| {
-                            zoon::println!("[DD WhileRef RENDER] cell_id={}, value={:?}", cell_id_for_log, source_value);
-                            let source_value = source_value.as_ref();
-
-                            // Determine the value to match against patterns
-                            // If there's a computation, evaluate it first
-                            let current_value: Option<Value> = if let Some(ref comp) = computation {
-                                // Evaluate the computation to get a boolean
-                                if let Some(source) = source_value {
-                                    use super::super::core::value::evaluate_computed;
-                                    let result = evaluate_computed(comp, source);
-                                    Some(result)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                source_value.cloned()
-                            };
-
-
-                            // Find matching arm based on current value
-                            if let Some(ref current) = current_value {
-                                // For text values (like route paths), match against text patterns
-                                for (pattern, body) in arms.iter() {
-                                    let matches = match (current, pattern) {
-                                        // Bool to True/False tag comparison
-                                        (Value::Bool(b), Value::Tagged { tag, .. }) => {
-                                            BoolTag::matches_bool(tag.as_ref(), *b)
-                                        }
-                                        // Text to text comparison
-                                        (Value::Text(curr), Value::Text(pat)) => curr == pat,
-                                        // Tag comparison (e.g., Home, About)
-                                        (Value::Tagged { tag: curr_tag, .. }, Value::Tagged { tag: pat_tag, .. }) => curr_tag == pat_tag,
-                                        // Text to tag comparison - compare the text with tag name (case-insensitive)
-                                        // For route matching, "/" maps to root tag, "/foo" maps to "Foo" tag
-                                        (Value::Text(text), Value::Tagged { tag, .. }) => {
-                                            let text_ref = text.as_ref();
-                                            let tag_ref = tag.as_ref();
-                                            // Root path "/" or "" matches tag if tag is the root tag name
-                                            if text_ref == "/" || text_ref.is_empty() {
-                                                // Check if tag matches common root names
-                                                tag_ref.eq_ignore_ascii_case("home") ||
-                                                tag_ref.eq_ignore_ascii_case("root") ||
-                                                tag_ref.eq_ignore_ascii_case("all")
-                                            } else {
-                                                // "/foo" should match "Foo" tag (strip leading /, compare case-insensitive)
-                                                let route_name = text_ref.trim_start_matches('/');
-                                                route_name.eq_ignore_ascii_case(tag_ref)
-                                            }
-                                        }
-                                        _ => current == pattern,
-                                    };
-
-                                    if matches {
-                                        return render_dd_value(body);
-                                    }
-                                }
-                            }
-
-                            // No match - use default if available
-                            if let Some(ref def) = default {
-                                // If we have a computed numeric value and the default is text,
-                                // render the number followed by the default text (generic approach)
-                                if let (Some(Value::Number(n)), Value::Text(text)) = (&current_value, def.as_ref()) {
-                                    // Render: "N" + default_text (e.g., "2" + " items left" = "2 items left")
-                                    let text_str = text.to_string();
-                                    // Clean up any placeholder markers in the text
-                                    let clean_text = text_str
-                                        .replace("[while:", "")
-                                        .replace("]", "");
-                                    return Text::new(format!("{}{}", n.0 as i64, clean_text)).unify();
-                                }
-                                return render_dd_value(def.as_ref());
-                            }
-
-                            // No match and no default - render empty
-                            El::new().unify()
-                        })
-                )
-                .unify()
-        }
-
-        Value::ComputedRef { computation, source_hold } => {
-            // ComputedRef is a reactive computed value that depends on a HOLD
-            // Observe cell_states_signal and re-evaluate computation when source changes
-            use super::super::core::value::evaluate_computed;
-
-            let source_hold = source_hold.to_string();
-            let computation = computation.clone();
-
-            El::new()
-                .child_signal(
-                    cell_states_signal()
-                        .map(move |states| {
-                            // Get source HOLD value
-                            let source_value = states.get(&source_hold)
-                                .cloned()
-                                .unwrap_or(Value::Unit);
-
-                            // Evaluate the computation
-                            let result = evaluate_computed(&computation, &source_value);
-
-                            // Render the result as text
-                            Text::new(result.to_display_string())
-                        })
-                )
-                .unify()
-        }
-
-        Value::FilteredListRef { source_hold, filter_field, filter_value: _ } => {
-            // FilteredListRef is an intermediate value - shouldn't normally be rendered directly
-            // If it is rendered, show debug info
-            Text::new(format!("[filtered:{}@{}]", filter_field, source_hold)).unify()
-        }
-
-        Value::ReactiveFilteredList { items, filter_field, filter_value: _, cell_ids: _, source_hold: _ } => {
-            // ReactiveFilteredList is an intermediate value - shouldn't normally be rendered directly
-            // If it is rendered, show debug info
-            Text::new(format!("[reactive-filtered:{}#{}]", filter_field, items.len())).unify()
-        }
-
-        Value::FilteredListRefWithPredicate { source_hold, .. } => {
-            // FilteredListRefWithPredicate is an intermediate value - shouldn't normally be rendered directly
-            // If it is rendered, show debug info
-            Text::new(format!("[filtered-list-predicate:{}]", source_hold)).unify()
-        }
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Phase 7: SYMBOLIC REFERENCE VARIANTS REMOVED
+        //
+        // The following variants no longer exist in the pure DD Value enum:
+        //   - WhileRef, ComputedRef, FilteredListRef, ReactiveFilteredList
+        //   - FilteredListRefWithPredicate, MappedListRef, FilteredMappedListRef
+        //   - FilteredMappedListWithPredicate, LatestRef, ReactiveText
+        //   - PlaceholderField, PlaceholderWhileRef, NegatedPlaceholderField
+        //
+        // In pure DD:
+        //   - All computation happens in DD dataflow, not at render time
+        //   - Lists are rendered as Collection with children_signal_vec()
+        //   - Reactive values flow through DD output streams
+        //   - The bridge only renders pure data values
+        // ═══════════════════════════════════════════════════════════════════════════
 
         Value::Placeholder => {
-            // Placeholder should never be rendered directly - it's a template marker
+            // Placeholder should never be rendered directly - it's a DD map template marker
             Text::new("[placeholder]").unify()
         }
 
-        Value::PlaceholderField { path } => {
-            // PlaceholderField should never be rendered directly - it's a deferred field access marker
-            Text::new(format!("[placeholder.{}]", path.join("."))).unify()
-        }
-
-        Value::PlaceholderWhileRef { field_path, .. } => {
-            // PlaceholderWhileRef should never be rendered directly - it's a deferred WHILE marker
-            Text::new(format!("[placeholder-while.{}]", field_path.join("."))).unify()
-        }
-
-        Value::NegatedPlaceholderField { path } => {
-            // NegatedPlaceholderField should never be rendered directly - it's a deferred negation marker
-            Text::new(format!("[not-placeholder.{}]", path.join("."))).unify()
-        }
-
-        Value::MappedListRef { source_hold, element_template } => {
-            // MappedListRef should be handled in render_stripe; if rendered directly, show reactive column
-            zoon::println!("[DD render_dd_value] MappedListRef: source_hold={}", source_hold);
-            let source_hold = source_hold.clone();
-            let element_template = element_template.clone();
-            El::new()
-                .child_signal(
-                    cell_states_signal()
-                        .map(move |states| {
-                            let items = states.get(&source_hold.name());
-                            if let Some(list_items) = items.and_then(|v| v.as_list_items()) {
-                                zoon::println!("[DD MappedListRef direct] rendering {} items", list_items.len());
-                                let children: Vec<RawElOrText> = list_items.iter().map(|item| {
-                                    let concrete_element = element_template.substitute_placeholder(item);
-                                    render_dd_value(&concrete_element)
-                                }).collect();
-                                Column::new().items(children).unify_option()
-                            } else {
-                                None
-                            }
-                        })
-                )
-                .unify()
-        }
-
-        Value::FilteredMappedListRef { source_hold, filter_field, filter_value, element_template } => {
-            // FilteredMappedListRef: render filtered then mapped list from HOLD
-            zoon::println!("[DD render_dd_value] FilteredMappedListRef: source_hold={}, filter={}", source_hold, filter_field);
-            let source_hold = source_hold.clone();
-            let filter_field = filter_field.clone();
-            let filter_value = filter_value.clone();
-            let element_template = element_template.clone();
-            El::new()
-                .child_signal(
-                    cell_states_signal()
-                        .map(move |states| {
-                            let items = states.get(&source_hold.name());
-                            if let Some(list_items) = items.and_then(|v| v.as_list_items()) {
-                                // Filter items by field value
-                                let filtered: Vec<&Value> = list_items.iter().filter(|item| {
-                                    if let Value::Object(obj) = item {
-                                        if let Some(field_val) = obj.get(filter_field.as_ref()) {
-                                            // Evaluate the field value (might be a CellRef or WhileRef)
-                                            let evaluated = evaluate_dd_value_for_filter(field_val, &states);
-                                            let filter_eval = evaluate_dd_value_for_filter(&filter_value, &states);
-                                            return evaluated == filter_eval;
-                                        }
-                                    }
-                                    false
-                                }).collect();
-                                zoon::println!("[DD FilteredMappedListRef direct] filtered {} -> {} items",
-                                    list_items.len(), filtered.len());
-                                let children: Vec<RawElOrText> = filtered.iter().map(|item| {
-                                    let concrete_element = element_template.substitute_placeholder(item);
-                                    render_dd_value(&concrete_element)
-                                }).collect();
-                                Column::new().items(children).unify_option()
-                            } else {
-                                None
-                            }
-                        })
-                )
-                .unify()
-        }
-
-        Value::FilteredMappedListWithPredicate { source_hold, predicate_template, element_template } => {
-            // FilteredMappedListWithPredicate: render list with generic predicate filtering
-            // The predicate_template contains Placeholder markers that get substituted with each item
-            let source_hold = source_hold.clone();
-            let predicate_template = predicate_template.clone();
-            let element_template = element_template.clone();
-            El::new()
-                .child_signal(
-                    cell_states_signal()
-                        .map(move |states| {
-                            let items = states.get(&source_hold.name());
-                            if let Some(list_items) = items.and_then(|v| v.as_list_items()) {
-                                // Filter items by evaluating predicate for each
-                                let filtered: Vec<&Value> = list_items.iter().filter(|item| {
-                                    let resolved_predicate = predicate_template.substitute_placeholder(item);
-                                    let evaluated = evaluate_dd_value_for_filter(&resolved_predicate, &states);
-                                    evaluated.is_truthy()
-                                }).collect();
-                                let children: Vec<RawElOrText> = filtered.iter().map(|item| {
-                                    let concrete_element = element_template.substitute_placeholder(item);
-                                    render_dd_value(&concrete_element)
-                                }).collect();
-                                Column::new().items(children).unify_option()
-                            } else {
-                                None
-                            }
-                        })
-                )
-                .unify()
-        }
-
-        Value::LatestRef { initial, .. } => {
-            // LatestRef should have been processed by Math/sum() or Router/go_to()
-            // If we reach here, just render the initial value
-            zoon::println!("[DD render_dd_value] LatestRef reached render - using initial value");
-            render_dd_value(initial)
-        }
         Value::Flushed(inner) => {
             // Flushed values propagate through rendering - render the inner value
             // In actual FLUSH blocks, this would be caught and handled differently
@@ -822,12 +426,9 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
     zoon::println!("[DD render_button] Extracted link_id={:?}", link_id);
 
     // Extract outline from style.outline
-    // Note: outline may be a WhileRef for reactive styling based on selection state
+    // Phase 7: DD computes reactive styling - bridge receives final values
     let style_value = fields.get("style");
     let outline_value = style_value.and_then(|s| s.get("outline"));
-
-    // Check if outline is a WhileRef (reactive) - need to render reactively
-    let is_reactive_outline = matches!(outline_value, Some(Value::WhileRef { .. }));
 
     let outline_opt: Option<Outline> = outline_value
         .and_then(|outline| {
@@ -885,12 +486,8 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
 
     if let Some(outline) = outline_opt {
         button = button.s(outline);
-    } else if is_reactive_outline {
-        // For reactive outline (WhileRef), wrap button in reactive container
-        // For now, apply transparent outline as default to override Zoon's default button styling
-        button = button.s(Outline::outer().width(0).color("transparent"));
     } else if outline_value.is_some() {
-        // Outline was specified but didn't match any pattern - apply no-outline
+        // Phase 7: Outline was specified but didn't match any pattern - apply no-outline
         button = button.s(Outline::outer().width(0).color("transparent"));
     }
 
@@ -945,227 +542,48 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
         zoon::println!("[DD render_stripe DEBUG] items_value variant={}", dd_value_variant_name(iv));
     }
 
-    // MappedListRef: Reactive list rendering from HOLD with template substitution
-    // Detects hover patterns in the template and remaps to unique IDs per item
-    if let Some(Value::MappedListRef { source_hold, element_template }) = items_value {
-        zoon::println!("[DD render_stripe] MappedListRef: source_hold={}", source_hold);
-        let source_hold = source_hold.clone();
-        let element_template = element_template.clone();
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Phase 7: SYMBOLIC LIST REFS REMOVED
+    //
+    // MappedListRef, FilteredMappedListRef, FilteredMappedListWithPredicate
+    // are removed. In pure DD:
+    //   - List rendering uses Collection + children_signal_vec()
+    //   - Filtering and mapping happen in DD operators
+    //   - The bridge renders pre-computed Collection values
+    // ═══════════════════════════════════════════════════════════════════════════
 
-        // Find original hover link/cell from template for remapping
-        let original_hover_link = find_template_hover_link(&element_template);
-        let original_hover_cell = find_template_hover_cell(&element_template);
-        zoon::println!("[DD MappedListRef] Template hover detection: link={:?}, cell={:?}",
-            original_hover_link, original_hover_cell);
+    // Phase 2.3: Check if items is a CellRef (cell-backed list) for reactive rendering
+    let items_hold_ref = fields.get("items").and_then(|v| match v {
+        Value::CellRef(cell_id) => Some(cell_id.name().to_string()),
+        _ => None,
+    });
 
-        return El::new()
-            .child_signal(
-                cell_states_signal()
-                    .map(move |states| {
-                        let items = states.get(&source_hold.name());
-                        if let Some(list_items) = items.and_then(|v| v.as_list_items()) {
-                            zoon::println!("[DD MappedListRef] rendering {} items from HOLD", list_items.len());
-                            let children: Vec<RawElOrText> = list_items.iter().enumerate().map(|(idx, item)| {
-                                // Generate unique hover IDs for this item if template has hover pattern
-                                let concrete_element = if original_hover_link.is_some() && original_hover_cell.is_some() {
-                                    // Use STABLE hover IDs based on source_hold name + item index
-                                    // This ensures the same item gets the same hover ID across re-renders
-                                    let new_hover_link = format!("mapped_hover_{}_{}", source_hold.name(), idx);
-                                    let new_hover_cell = format!("hover_{}", new_hover_link);
-
-                                    // Register HoverState action for this item
-                                    // NOTE: Do NOT call update_cell_no_persist here - we're inside a signal callback!
-                                    // Updating CELL_STATES inside cell_states_signal().map() causes infinite recursion.
-                                    // The hover cell will be lazily initialized when the first hover event fires.
-                                    add_dynamic_link_action(
-                                        new_hover_link.clone(),
-                                        DynamicLinkAction::HoverState(new_hover_cell.clone())
-                                    );
-
-                                    zoon::println!("[DD MappedListRef] Item {}: remapped hover {} -> {}, cell {} -> {}",
-                                        idx, original_hover_link.as_ref().unwrap(), new_hover_link,
-                                        original_hover_cell.as_ref().unwrap(), new_hover_cell);
-
-                                    // Substitute with hover remapping
-                                    element_template.substitute_placeholder_with_hover_remap(
-                                        item,
-                                        &new_hover_link,
-                                        &new_hover_cell,
-                                        original_hover_link.as_deref(),
-                                        original_hover_cell.as_deref(),
-                                    )
-                                } else {
-                                    // No hover pattern, use simple substitution
-                                    element_template.substitute_placeholder(item)
-                                };
-                                render_dd_value(&concrete_element)
-                            }).collect();
-                            Some(Column::new().s(Gap::new().y(gap)).items(children).unify())
-                        } else {
-                            zoon::println!("[DD MappedListRef] no items or wrong type in HOLD");
-                            None
-                        }
-                    })
-            )
-            .unify();
-    }
-
-    // FilteredMappedListRef: Reactive filtered + mapped list rendering from HOLD
-    if let Some(Value::FilteredMappedListRef { source_hold, filter_field, filter_value, element_template }) = items_value {
-        zoon::println!("[DD render_stripe] FilteredMappedListRef: source_hold={}, filter={}", source_hold, filter_field);
-        let source_hold = source_hold.clone();
-        let filter_field = filter_field.clone();
-        let filter_value = filter_value.clone();
-        let element_template = element_template.clone();
-        return El::new()
-            .child_signal(
-                cell_states_signal()
-                    .map(move |states| {
-                        let items = states.get(&source_hold.name());
-                        if let Some(list_items) = items.and_then(|v| v.as_list_items()) {
-                            // Filter items by field value
-                            let filtered: Vec<&Value> = list_items.iter().filter(|item| {
-                                if let Value::Object(obj) = item {
-                                    if let Some(field_val) = obj.get(filter_field.as_ref()) {
-                                        // Evaluate the field value (might be a CellRef)
-                                        let evaluated = evaluate_dd_value_for_filter(field_val, &states);
-                                        let filter_eval = evaluate_dd_value_for_filter(&filter_value, &states);
-                                        return evaluated == filter_eval;
-                                    }
-                                }
-                                false
-                            }).collect();
-                            zoon::println!("[DD FilteredMappedListRef] filtered {} -> {} items from HOLD",
-                                list_items.len(), filtered.len());
-                            let children: Vec<RawElOrText> = filtered.iter().map(|item| {
-                                let concrete_element = element_template.substitute_placeholder(item);
-                                render_dd_value(&concrete_element)
-                            }).collect();
-                            Some(Column::new().s(Gap::new().y(gap)).items(children).unify())
-                        } else {
-                            zoon::println!("[DD FilteredMappedListRef] no items or wrong type in HOLD");
-                            None
-                        }
-                    })
-            )
-            .unify();
-    }
-
-    // FilteredMappedListWithPredicate: Generic predicate filtering for stripe rendering
-    // Detects hover patterns in the template and remaps to unique IDs per item
-    if let Some(Value::FilteredMappedListWithPredicate { source_hold, predicate_template, element_template }) = items_value {
-        zoon::println!("[DD render_stripe] FilteredMappedListWithPredicate: source_hold={}", source_hold);
-        let source_hold = source_hold.clone();
-        let predicate_template = predicate_template.clone();
-        let element_template = element_template.clone();
-
-        // Find original hover link/cell from template for remapping
-        let original_hover_link = find_template_hover_link(&element_template);
-        let original_hover_cell = find_template_hover_cell(&element_template);
-        zoon::println!("[DD FilteredMappedListWithPredicate] Template hover detection: link={:?}, cell={:?}",
-            original_hover_link, original_hover_cell);
-
-        return El::new()
-            .child_signal(
-                cell_states_signal()
-                    .map(move |states| {
-                        let items = states.get(&source_hold.name());
-                        // Get pre-instantiated elements from list_elements (these have unique hover IDs)
-                        let list_elements = states.get("list_elements");
-                        let elements_vec: Option<&std::sync::Arc<Vec<Value>>> = match list_elements {
-                            Some(Value::List(elems)) => Some(elems),
-                            _ => None,
-                        };
-                        zoon::println!("[DD FilteredMappedListWithPredicate] source_hold={}, items={:?}, list_elements={}",
-                            source_hold, items.map(|v| dd_value_variant_name(v)),
-                            elements_vec.map(|e| e.len()).unwrap_or(0));
-                        if let Some(list_items) = items.and_then(|v| v.as_list_items()) {
-                            zoon::println!("[DD FilteredMappedListWithPredicate] list has {} items", list_items.len());
-                            // Filter items and their corresponding elements together
-                            // Items and elements are parallel arrays (same order)
-                            let filtered_with_idx: Vec<(usize, &Value)> = list_items.iter()
-                                .enumerate()
-                                .filter(|(_, item)| {
-                                    let resolved_predicate = predicate_template.substitute_placeholder(item);
-                                    let evaluated = evaluate_dd_value_for_filter(&resolved_predicate, &states);
-                                    zoon::println!("[DD FilteredMappedListWithPredicate] predicate evaluated to: {:?} (truthy={})", evaluated, evaluated.is_truthy());
-                                    evaluated.is_truthy()
-                                })
-                                .collect();
-                            zoon::println!("[DD FilteredMappedListWithPredicate] filtered to {} items", filtered_with_idx.len());
-
-                            // Calculate offset: list_elements only has dynamically added items
-                            // Original items (idx < offset) use template, dynamic items use list_elements
-                            let num_list_items = list_items.len();
-                            let num_elements = elements_vec.map(|e| e.len()).unwrap_or(0);
-                            let dynamic_offset = num_list_items.saturating_sub(num_elements);
-
-                            // Render items with hover remapping
-                            let children: Vec<RawElOrText> = filtered_with_idx.iter().map(|(idx, item)| {
-                                // Generate unique hover IDs for this item if template has hover pattern
-                                let concrete_element = if original_hover_link.is_some() && original_hover_cell.is_some() {
-                                    // Use STABLE hover IDs based on source_hold name + item index
-                                    // This ensures the same item gets the same hover ID across re-renders
-                                    let new_hover_link = format!("filtered_hover_{}_{}", source_hold.name(), idx);
-                                    let new_hover_cell = format!("hover_{}", new_hover_link);
-
-                                    // Register HoverState action for this item
-                                    // NOTE: Do NOT call update_cell_no_persist here - we're inside a signal callback!
-                                    // Updating CELL_STATES inside cell_states_signal().map() causes infinite recursion.
-                                    // The hover cell will be lazily initialized when the first hover event fires.
-                                    add_dynamic_link_action(
-                                        new_hover_link.clone(),
-                                        DynamicLinkAction::HoverState(new_hover_cell.clone())
-                                    );
-
-                                    zoon::println!("[DD FilteredMappedListWithPredicate] Item {}: remapped hover {} -> {}, cell {} -> {}",
-                                        idx, original_hover_link.as_ref().unwrap(), new_hover_link,
-                                        original_hover_cell.as_ref().unwrap(), new_hover_cell);
-
-                                    // Substitute with hover remapping
-                                    element_template.substitute_placeholder_with_hover_remap(
-                                        item,
-                                        &new_hover_link,
-                                        &new_hover_cell,
-                                        original_hover_link.as_deref(),
-                                        original_hover_cell.as_deref(),
-                                    )
-                                } else {
-                                    zoon::println!("[DD FilteredMappedListWithPredicate] Using template for idx {} (no hover pattern)", idx);
-                                    element_template.substitute_placeholder(item)
-                                };
-                                render_dd_value(&concrete_element)
-                            }).collect();
-                            Some(Column::new().s(Gap::new().y(gap)).items(children).unify())
-                        } else {
-                            zoon::println!("[DD FilteredMappedListWithPredicate] no list found or wrong type");
-                            None
-                        }
-                    })
-            )
-            .unify();
-    }
-
-    let items: Vec<RawElOrText> = fields
-        .get("items")
-        .and_then(|v| match v {
-            Value::List(items) => {
-                zoon::println!("[DD render_stripe] iterating {} items", items.len());
-                Some(items.iter().enumerate().map(|(idx, item)| {
-                    zoon::println!("[DD render_stripe] item[{}] variant={}", idx, dd_value_variant_name(item));
-                    render_dd_value(item)
-                }).collect())
-            }
-            Value::Collection(handle) => {
-                zoon::println!("[DD render_stripe] iterating {} collection items", handle.len());
-                Some(handle.iter().enumerate().map(|(idx, item)| {
-                    zoon::println!("[DD render_stripe] collection item[{}] variant={}", idx, dd_value_variant_name(item));
-                    render_dd_value(item)
-                }).collect())
-            }
-            _ => None,
-        })
-        .unwrap_or_default();
+    let items: Vec<RawElOrText> = if items_hold_ref.is_none() {
+        // Static items - render directly
+        fields
+            .get("items")
+            .and_then(|v| match v {
+                Value::List(items) => {
+                    zoon::println!("[DD render_stripe] iterating {} items", items.len());
+                    Some(items.iter().enumerate().map(|(idx, item)| {
+                        zoon::println!("[DD render_stripe] item[{}] variant={}", idx, dd_value_variant_name(item));
+                        render_dd_value(item)
+                    }).collect())
+                }
+                Value::Collection(handle) => {
+                    zoon::println!("[DD render_stripe] iterating {} collection items", handle.len());
+                    Some(handle.iter().enumerate().map(|(idx, item)| {
+                        zoon::println!("[DD render_stripe] collection item[{}] variant={}", idx, dd_value_variant_name(item));
+                        render_dd_value(item)
+                    }).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    } else {
+        // Reactive items handled below via items_signal_vec
+        Vec::new()
+    };
 
     // Extract style properties (like render_container does)
     let style = fields.get("style");
@@ -1211,7 +629,40 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
             _ => None,
         });
 
+    // Phase 2.3: Reactive rendering for HoldRef-backed items
     if direction == "Row" {
+        if let Some(ref cell_id) = items_hold_ref {
+            // Reactive Row with items_signal_vec
+            zoon::println!("[DD render_stripe] Row with reactive items from {}", cell_id);
+            let mut row = Row::new()
+                .s(Gap::new().x(gap))
+                .items_signal_vec(
+                    list_signal_vec(cell_id.clone())
+                        .map(|item| render_dd_value(&item))
+                );
+            // Apply styles
+            if width_fill { row = row.s(zoon::Width::fill()); }
+            if let Some(color) = bg_color { row = row.s(zoon::Background::new().color(color)); }
+            if font_size.is_some() || font_color.is_some() {
+                let mut font = zoon::Font::new();
+                if let Some(size) = font_size { font = font.size(size); }
+                if let Some(ref color) = font_color { font = font.color(color.clone()); }
+                row = row.s(font);
+            }
+            if padding_x.is_some() || padding_y.is_some() {
+                let mut padding = zoon::Padding::new();
+                if let Some(x) = padding_x { padding = padding.x(x); }
+                if let Some(y) = padding_y { padding = padding.y(y); }
+                row = row.s(padding);
+            }
+            if let Some(link_id) = hovered_link_id {
+                return row.on_hovered_change(move |is_hovered| {
+                    fire_global_link_with_bool(&link_id, is_hovered);
+                }).unify();
+            }
+            return row.unify();
+        }
+        // Static Row with items Vec
         let mut row = Row::new()
             .s(Gap::new().x(gap))
             .items(items);
@@ -1256,6 +707,38 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
         }
     } else {
         // Default to Column
+        if let Some(ref cell_id) = items_hold_ref {
+            // Reactive Column with items_signal_vec
+            zoon::println!("[DD render_stripe] Column with reactive items from {}", cell_id);
+            let mut column = Column::new()
+                .s(Gap::new().y(gap))
+                .items_signal_vec(
+                    list_signal_vec(cell_id.clone())
+                        .map(|item| render_dd_value(&item))
+                );
+            // Apply styles
+            if width_fill { column = column.s(zoon::Width::fill()); }
+            if let Some(color) = bg_color { column = column.s(zoon::Background::new().color(color)); }
+            if font_size.is_some() || font_color.is_some() {
+                let mut font = zoon::Font::new();
+                if let Some(size) = font_size { font = font.size(size); }
+                if let Some(ref color) = font_color { font = font.color(color.clone()); }
+                column = column.s(font);
+            }
+            if padding_x.is_some() || padding_y.is_some() {
+                let mut padding = zoon::Padding::new();
+                if let Some(x) = padding_x { padding = padding.x(x); }
+                if let Some(y) = padding_y { padding = padding.y(y); }
+                column = column.s(padding);
+            }
+            if let Some(link_id) = hovered_link_id {
+                return column.on_hovered_change(move |is_hovered| {
+                    fire_global_link_with_bool(&link_id, is_hovered);
+                }).unify();
+            }
+            return column.unify();
+        }
+        // Static Column with items Vec
         let mut column = Column::new()
             .s(Gap::new().y(gap))
             .items(items);
@@ -1303,7 +786,22 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
 
 
 /// Render a stack (layered elements).
+/// Phase 6: Added CellRef support for reactive layers via layers_signal_vec.
 fn render_stack(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
+    // Check if layers is a CellRef for reactive rendering
+    if let Some(Value::CellRef(cell_id)) = fields.get("layers") {
+        // Reactive path - use layers_signal_vec for O(delta) updates
+        let cell_id_str = cell_id.name();
+        zoon::println!("[DD render_stack] Reactive layers from CellRef '{}'", cell_id_str);
+        return Stack::new()
+            .layers_signal_vec(
+                list_signal_vec(cell_id_str)
+                    .map(|item| render_dd_value(&item))
+            )
+            .unify();
+    }
+
+    // Static path - materialize layers once
     let layers: Vec<RawElOrText> = fields
         .get("layers")
         .and_then(|v| match v {
@@ -1353,18 +851,7 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
         zoon::println!("[DD render_container] font_color_value: {:?}", font_color_value);
     }
 
-    // Check if font color contains a WhileRef (needs reactive rendering)
-    let is_reactive_font_color = font_color_value.as_ref().map_or(false, |c| {
-        if let Value::Tagged { fields, .. } = c {
-            // Check if any field (like lightness) is a WhileRef with computation
-            let has_reactive = fields.values().any(|v| matches!(v, Value::WhileRef { computation: Some(_), .. }));
-            zoon::println!("[DD render_container] is_reactive_font_color: {}", has_reactive);
-            has_reactive
-        } else {
-            false
-        }
-    });
-
+    // Phase 7: Font color is now computed by DD - bridge receives final values
     // Get font size
     let font_size = style
         .and_then(|s| s.get("font"))
@@ -1385,35 +872,19 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
         None => base,
     };
 
-    // Apply font styling - reactive if color contains WhileRef with computation
-    let base = if is_reactive_font_color {
-        // Reactive font color - need to watch holds
-        let font_color_value = font_color_value.clone();
-        base.s(Font::new().size(font_size.unwrap_or(14)).color_signal(
-            cell_states_signal()
-                .map(move |_states| {
-                    // Re-evaluate color on any hold change
-                    font_color_value.as_ref()
-                        .and_then(|c| dd_oklch_to_css(c))
-                        .unwrap_or_else(|| "inherit".to_string())
-                })
-                .dedupe_cloned()
-        ))
-    } else {
-        // Static font styling
-        let font_color_css = font_color_value.as_ref().and_then(|c| dd_oklch_to_css(c));
-        if font_size.is_some() || font_color_css.is_some() {
-            let mut font = Font::new();
-            if let Some(size) = font_size {
-                font = font.size(size);
-            }
-            if let Some(color) = font_color_css {
-                font = font.color(color);
-            }
-            base.s(font)
-        } else {
-            base
+    // Apply font styling (pure DD - no reactive WhileRef evaluation)
+    let font_color_css = font_color_value.as_ref().and_then(|c| dd_oklch_to_css(c));
+    let base = if font_size.is_some() || font_color_css.is_some() {
+        let mut font = Font::new();
+        if let Some(size) = font_size {
+            font = font.size(size);
         }
+        if let Some(color) = font_color_css {
+            font = font.color(color);
+        }
+        base.s(font)
+    } else {
+        base
     };
 
     // Apply padding
@@ -1731,7 +1202,7 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
 
                                     // Only clear the hold for editing inputs (blur-based workflow)
                                     if is_editing_input && !input_text.is_empty() {
-                                        super::super::io::clear_cell(cell_id);
+                                        super::super::io::update_cell_no_persist(cell_id, Value::text(""));
                                     }
                                 }
 
@@ -1755,7 +1226,7 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
                             // For editing inputs, clear the tracked hold on Escape
                             if is_editing_input {
                                 if let Some(ref cell_id) = text_cell_for_keydown {
-                                    super::super::io::clear_cell(cell_id);
+                                    super::super::io::update_cell_no_persist(cell_id, Value::text(""));
                                 }
                             }
                             "Escape"
@@ -1952,46 +1423,39 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
         let cell_id_for_signal = cell_id.to_string();
         let cell_id_for_icon = cell_id.to_string();
 
+        // Phase 12: Use granular cell_signal() for checkbox - only updates when this cell changes
         let checkbox = Checkbox::new()
             .label_hidden("checkbox")
             .checked_signal(
-                cell_states_signal()
-                    .map({
-                        let cell_id = cell_id_for_signal.clone();
-                        move |states| {
-                            states.get(&cell_id)
-                                .map(|v| match v {
-                                    Value::Bool(b) => *b,
-                                    Value::Tagged { tag, .. } => BoolTag::is_true(tag.as_ref()),
-                                    _ => false,
-                                })
-                                .unwrap_or(false)
-                        }
+                cell_signal(cell_id_for_signal)  // Pass owned String
+                    .map(|value| {
+                        value
+                            .map(|v| match v {
+                                Value::Bool(b) => b,
+                                Value::Tagged { tag, .. } => BoolTag::is_true(tag.as_ref()),
+                                _ => false,
+                            })
+                            .unwrap_or(false)
                     })
             )
             .icon({
-                // Observe HOLD state directly for icon - more reliable than checked_mutable
-                // when elements are recreated during re-renders
-                let cell_id_for_icon = cell_id.to_string();
+                // Phase 12: Use granular cell_signal() for icon - only updates when this cell changes
                 move |_checked_mutable| {
                     El::new()
                         .s(zoon::Width::exact(40))
                         .s(zoon::Height::exact(40))
                         .update_raw_el(|raw_el| raw_el.style("pointer-events", "none"))
                         .s(zoon::Background::new().url_signal(
-                            cell_states_signal()
-                                .map({
-                                    let cell_id = cell_id_for_icon.clone();
-                                    move |states| {
-                                        let checked = states.get(&cell_id)
-                                            .map(|v| match v {
-                                                Value::Bool(b) => *b,
-                                                Value::Tagged { tag, .. } => BoolTag::is_true(tag.as_ref()),
-                                                _ => false,
-                                            })
-                                            .unwrap_or(false);
-                                        if checked { CHECKED_SVG } else { UNCHECKED_SVG }
-                                    }
+                            cell_signal(cell_id_for_icon.clone())  // Clone and pass owned
+                                .map(|value| {
+                                    let checked = value
+                                        .map(|v| match v {
+                                            Value::Bool(b) => b,
+                                            Value::Tagged { tag, .. } => BoolTag::is_true(tag.as_ref()),
+                                            _ => false,
+                                        })
+                                        .unwrap_or(false);
+                                    if checked { CHECKED_SVG } else { UNCHECKED_SVG }
                                 })
                         ))
                 }
@@ -2018,109 +1482,26 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
                 .unify();
         } else {
             zoon::println!("[DD render_checkbox] RETURNING reactive checkbox WITHOUT link_id");
-            // No link, just toggle the HOLD directly
+            // No link, toggle via DD event system (Phase 7: toggle_cell_bool was removed)
             let cell_id_clone = cell_id_for_toggle.clone();
             return checkbox
                 .update_raw_el(move |raw_el| {
                     let cell_id = cell_id_clone.clone();
                     raw_el.event_handler(move |_: zoon::events::Click| {
-                        toggle_cell_bool(&cell_id);
+                        zoon::println!("[DD CHECKBOX CLICK] RAW event handler (no link_id), toggling {}", cell_id);
+                        // Fire toggle event through DD - runtime updates flow through DD, not direct mutation
+                        fire_global_link_with_text(
+                            "dd_cell_update",
+                            &format!("bool_toggle:{}", cell_id)
+                        );
                     })
                 })
                 .unify();
         }
     }
 
-    // Check for ComputedRef (e.g., toggle all checkbox where checked = items_count == completed_items_count)
-    if let Some(Value::ComputedRef { computation, source_hold }) = &checked_value {
-        zoon::println!("[DD render_checkbox] ComputedRef checkbox with source_hold={}", source_hold);
-
-        // Check if there's a custom icon - toggle all uses a "❯" character with reactive color
-        let custom_icon = fields.get("icon").cloned();
-
-        let computation = computation.clone();
-        let source_hold = source_hold.clone();
-
-        let checkbox = if let Some(icon_value) = custom_icon {
-            zoon::println!("[DD render_checkbox] Using custom icon for ComputedRef checkbox");
-            // Use custom icon with reactive rendering
-            Checkbox::new()
-                .label_hidden("checkbox")
-                .checked_signal(
-                    cell_states_signal()
-                        .map({
-                            let computation = computation.clone();
-                            move |_states| {
-                                // Evaluate the computation to get current checked state
-                                use super::super::core::value::evaluate_computed;
-                                let result = evaluate_computed(&computation, &Value::Unit);
-                                match result {
-                                    Value::Bool(b) => b,
-                                    _ => false,
-                                }
-                            }
-                        })
-                )
-                .icon(move |_checked_mutable| {
-                    // Render the custom icon value - wrap with pointer-events: none so clicks propagate to checkbox
-                    El::new()
-                        .update_raw_el(|raw_el| raw_el.style("pointer-events", "none"))
-                        .child(render_dd_value(&icon_value))
-                })
-        } else {
-            // Use default SVG icon
-            Checkbox::new()
-                .label_hidden("checkbox")
-                .checked_signal(
-                    cell_states_signal()
-                        .map({
-                            let computation = computation.clone();
-                            move |_states| {
-                                use super::super::core::value::evaluate_computed;
-                                let result = evaluate_computed(&computation, &Value::Unit);
-                                match result {
-                                    Value::Bool(b) => b,
-                                    _ => false,
-                                }
-                            }
-                        })
-                )
-                .icon({
-                    let computation = computation.clone();
-                    move |_checked_mutable| {
-                        El::new()
-                            .s(zoon::Width::exact(40))
-                            .s(zoon::Height::exact(40))
-                            .update_raw_el(|raw_el| raw_el.style("pointer-events", "none"))
-                            .s(zoon::Background::new().url_signal(
-                                cell_states_signal()
-                                    .map({
-                                        let computation = computation.clone();
-                                        move |_states| {
-                                            use super::super::core::value::evaluate_computed;
-                                            let result = evaluate_computed(&computation, &Value::Unit);
-                                            let checked = match result {
-                                                Value::Bool(b) => b,
-                                                _ => false,
-                                            };
-                                            if checked { CHECKED_SVG } else { UNCHECKED_SVG }
-                                        }
-                                    })
-                            ))
-                    }
-                })
-        };
-
-        if let Some(link_id) = click_link_id {
-            return checkbox
-                .on_click(move || {
-                    fire_global_link(&link_id);
-                })
-                .unify();
-        } else {
-            return checkbox.unify();
-        }
-    }
+    // Phase 7: ComputedRef REMOVED - DD computes checkbox state directly
+    // The bridge receives final Bool values, not deferred computations
 
     // Static checkbox - extract checked state directly
     let checked = checked_value
@@ -2210,34 +1591,20 @@ fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
     let label = match label_value {
         Some(Value::CellRef(name)) => {
             // Reactive label - update when HOLD state changes
+            // Phase 12: Use granular cell_signal() for label - only updates when this cell changes
             let cell_id = name.to_string();
             Label::new()
                 .label_signal(
-                    cell_states_signal()
-                        .map(move |states| {
-                            states
-                                .get(&cell_id)
+                    cell_signal(cell_id)  // Pass owned String directly
+                        .map(|value| {
+                            value
                                 .map(|v| v.to_display_string())
                                 .unwrap_or_default()
                         })
                 )
                 .for_input("dd_text_input")
         }
-        Some(Value::ReactiveText { parts }) => {
-            // Reactive TEXT with interpolated values - evaluated at render time
-            let parts = parts.clone();
-            Label::new()
-                .label_signal(
-                    cell_states_signal()
-                        .map(move |_states| {
-                            // Evaluate all parts with current HOLD state
-                            parts.iter()
-                                .map(|part| part.to_display_string())
-                                .collect::<String>()
-                        })
-                )
-                .for_input("dd_text_input")
-        }
+        // Phase 7: ReactiveText REMOVED - DD produces Text values directly
         Some(v) => {
             // Static label
             Label::new()
@@ -2277,7 +1644,26 @@ fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
 }
 
 /// Render a paragraph element.
+/// Phase 6: Added CellRef support for reactive text via content_signal.
 fn render_paragraph(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
+    // Check if contents/content is a CellRef for reactive rendering
+    if let Some(Value::CellRef(cell_id)) = fields.get("contents").or_else(|| fields.get("content")) {
+        // Reactive path - use content_signal for O(delta) updates
+        let cell_id_str = cell_id.name();
+        zoon::println!("[DD render_paragraph] Reactive content from CellRef '{}'", cell_id_str);
+        return Paragraph::new()
+            .content_signal(
+                cell_signal(cell_id_str)
+                    .map(|value| {
+                        value
+                            .map(|v| extract_text_content(&v))
+                            .unwrap_or_default()
+                    })
+            )
+            .unify();
+    }
+
+    // Static path - extract content once
     // Try "contents" first (plural - used by Element/paragraph), then fallback to "content" or "text"
     let content = if let Some(items) = fields.get("contents").and_then(|v| v.as_list_items()) {
         // Render list items and join their text representations

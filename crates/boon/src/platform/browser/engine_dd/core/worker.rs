@@ -26,27 +26,29 @@
 //! - NO `RefCell<T>` - No shared mutable state
 //! - NO `.get()` - All observation through Output streams
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::cell::RefCell;
+// Phase 10: Mutex removed - outputs captured via pure DD channels
 
 use zoon::futures_channel::mpsc;
 use zoon::{Task, Timer};
 
-use super::types::{Event, EventValue, Input, Output, CellId, LinkId, DYNAMIC_LINK_PREFIX, BoolTag, EventPayload};
+use super::types::{Event, EventValue, Input, CellId, LinkId, DYNAMIC_LINK_PREFIX, BoolTag, ElementTag, EventPayload, EventFilter};
 use super::value::Value;
 use super::super::io::{
     get_cell_value,
     load_persisted_cell_value,
     sync_cell_from_dd,
     sync_cell_from_dd_with_persist,
+    update_cell_no_persist,
 };
 use super::super::LOG_DD_DEBUG;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 // Persistent DD Worker (Phase 5)
 use super::dataflow::{
-    DdCellConfig, DdTransform, DdOutput, DdEventFilter,
+    DdCellConfig, DdTransform,
     inject_event_persistent, reinit_if_config_changed,
 };
 
@@ -59,11 +61,106 @@ use super::dataflow::{
 /// outside DD, then passed as PreparedItem events for pure DD append.
 const USE_PERSISTENT_WORKER: bool = true;
 
-/// Global counter for generating unique HOLD IDs for dynamic items
-static DYNAMIC_CELL_COUNTER: AtomicU32 = AtomicU32::new(1000);
+// ============================================================================
+// PHASE 5: THREAD-LOCAL ID COUNTERS (Deterministic Generation)
+// ============================================================================
+//
+// ID counters are thread_local instead of global static. This gives:
+// - Determinism: reset_id_counters() resets both to 1000 for each Worker session
+// - Replayability: same inputs always produce same IDs
+// - No global mutation: counters scoped to current thread
+//
+// Worker calls reset_id_counters() in new() to start each session fresh.
 
-/// Global counter for generating unique LINK IDs for dynamic items
-static DYNAMIC_LINK_COUNTER: AtomicU32 = AtomicU32::new(1000);
+thread_local! {
+    /// Counter for generating unique HOLD IDs for dynamic items
+    static DYNAMIC_CELL_COUNTER: RefCell<u32> = RefCell::new(1000);
+
+    /// Counter for generating unique LINK IDs for dynamic items
+    static DYNAMIC_LINK_COUNTER: RefCell<u32> = RefCell::new(1000);
+
+    /// Active DataflowConfig for the current Worker session.
+    /// Set by Worker::with_config() and read by outputs.rs consumers.
+    /// This consolidates all registry state into one config object.
+    static ACTIVE_CONFIG: RefCell<Option<DataflowConfig>> = RefCell::new(None);
+}
+
+/// Set the active config for this session.
+/// Called by Worker::with_config() when starting.
+pub fn set_active_config(config: DataflowConfig) {
+    ACTIVE_CONFIG.with(|c| *c.borrow_mut() = Some(config));
+}
+
+/// Get a reference to the active config.
+/// Returns None if no Worker is running.
+pub fn with_active_config<R>(f: impl FnOnce(&DataflowConfig) -> R) -> Option<R> {
+    ACTIVE_CONFIG.with(|c| {
+        c.borrow().as_ref().map(f)
+    })
+}
+
+/// Check if a cell ID is a text-clear cell.
+pub fn is_text_clear_cell(cell_id: &str) -> bool {
+    with_active_config(|config| config.text_clear_cells.contains(cell_id)).unwrap_or(false)
+}
+
+/// Get the remove event path from the active config.
+pub fn get_remove_event_path() -> Vec<String> {
+    with_active_config(|config| config.remove_event_path.clone()).unwrap_or_default()
+}
+
+/// Get the bulk remove event path from the active config.
+pub fn get_bulk_remove_event_path() -> Vec<String> {
+    with_active_config(|config| config.bulk_remove_event_path.clone()).unwrap_or_default()
+}
+
+/// Get the editing bindings from the active config.
+pub fn get_editing_bindings() -> Vec<EditingBinding> {
+    with_active_config(|config| config.editing_bindings.clone()).unwrap_or_default()
+}
+
+/// Get the toggle bindings from the active config.
+pub fn get_toggle_bindings() -> Vec<ToggleBinding> {
+    with_active_config(|config| config.toggle_bindings.clone()).unwrap_or_default()
+}
+
+/// Get the global toggle bindings from the active config.
+pub fn get_global_toggle_bindings() -> Vec<GlobalToggleBinding> {
+    with_active_config(|config| config.global_toggle_bindings.clone()).unwrap_or_default()
+}
+
+/// Clear the active config.
+/// Called when clearing state between examples.
+pub fn clear_active_config() {
+    ACTIVE_CONFIG.with(|c| *c.borrow_mut() = None);
+}
+
+/// Reset ID counters to starting values (1000).
+/// Called by Worker::new() to ensure deterministic ID generation per session.
+pub fn reset_id_counters() {
+    DYNAMIC_CELL_COUNTER.with(|c| *c.borrow_mut() = 1000);
+    DYNAMIC_LINK_COUNTER.with(|c| *c.borrow_mut() = 1000);
+}
+
+/// Allocate a new dynamic cell ID from thread-local counter.
+fn allocate_dynamic_cell_id() -> String {
+    DYNAMIC_CELL_COUNTER.with(|c| {
+        let mut counter = c.borrow_mut();
+        let id = *counter;
+        *counter += 1;
+        format!("{}{}", DYNAMIC_CELL_PREFIX, id)
+    })
+}
+
+/// Allocate a new dynamic link ID from thread-local counter.
+fn allocate_dynamic_link_id() -> String {
+    DYNAMIC_LINK_COUNTER.with(|c| {
+        let mut counter = c.borrow_mut();
+        let id = *counter;
+        *counter += 1;
+        format!("{}{}", DYNAMIC_LINK_PREFIX, id)
+    })
+}
 
 /// Prefix for dynamically generated HOLD IDs (used for list items)
 const DYNAMIC_CELL_PREFIX: &str = "dynamic_cell_";
@@ -71,80 +168,49 @@ const DYNAMIC_CELL_PREFIX: &str = "dynamic_cell_";
 // NOTE: DYNAMIC_LINK_PREFIX is imported from super::types
 
 // ============================================================================
-// GENERIC CHECKBOX TOGGLE DETECTION
+// PURE FIELD CHECKING
 // ============================================================================
 
-use super::super::io::get_checkbox_toggle_holds;
-
-/// Find the checkbox toggle CellRef in an item object.
-/// Returns (cell_id, is_completed) if a checkbox toggle hold is found.
-/// This is generic - works with any field name, not just "completed".
-fn find_checkbox_toggle_in_item(obj: &BTreeMap<Arc<str>, Value>) -> Option<(String, bool)> {
-    let toggle_holds = get_checkbox_toggle_holds();
-    for (_, value) in obj.iter() {
-        match value {
-            Value::CellRef(cell_id) => {
-                // Check if this CellRef is a checkbox toggle
-                let cell_name = cell_id.name();
-                if toggle_holds.contains(&cell_name) || cell_id.is_dynamic() {
-                    // Get current value from global CELL_STATES
-                    // Handle both Bool and Tagged { tag: "True"/"False" } variants
-                    let is_completed = super::super::io::get_cell_value(&cell_name)
-                        .map(|v| match v {
-                            Value::Bool(b) => b,
-                            Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => BoolTag::is_true(tag.as_ref()),
-                            _ => false,
-                        })
-                        .unwrap_or(false);
-                    return Some((cell_name, is_completed));
-                }
-            }
-            Value::Bool(b) => {
-                // Direct boolean value (legacy items without CellRef)
-                // We can't distinguish which bool is the "toggle" one
-                // For now, return the first bool we find
-                // A better approach would need metadata about which field is the toggle
-                return Some((String::new(), *b));
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Get the checkbox toggle value for an item (true = completed).
-/// Works with both CellRef and direct Bool values.
-/// Task 7.2: Generic - checks ANY boolean CellRef field, not just "completed".
-fn is_item_completed_generic(item: &Value) -> bool {
+/// Check if a specific boolean field on an item is true.
+/// PURE: Does not read from IO layer - checks item data directly.
+///
+/// Parameters:
+/// - item: The list item Value (expected to be an Object)
+/// - field_name: The name of the boolean field to check (e.g., "completed", "done", "checked")
+///
+/// Returns true if the field exists and is a true boolean value.
+/// For CellRef fields, this reads the referenced cell from IO layer (still has IO dependency).
+fn is_item_field_true(item: &Value, field_name: &str) -> bool {
     match item {
         Value::Object(obj) => {
-            // First try the registered checkbox toggles
-            if let Some((_, is_completed)) = find_checkbox_toggle_in_item(obj) {
-                return is_completed;
-            }
-
-            // Task 7.2: Generic approach - find ANY boolean CellRef field
-            // Excludes "editing" fields which are UI state, not completion state
-            for (field_name, field_value) in obj.iter() {
-                // Skip editing-related fields (UI state, not completion state)
-                if field_name.contains("edit") {
-                    continue;
-                }
-                if let Value::CellRef(cell_id) = field_value {
-                    if let Some(cell_value) = super::super::io::get_cell_value(&cell_id.name()) {
-                        match cell_value {
-                            Value::Bool(b) => return b,
-                            Value::Tagged { tag, .. } => {
-                                if BoolTag::is_bool_tag(tag.as_ref()) {
-                                    return BoolTag::is_true(tag.as_ref());
-                                }
-                            }
-                            _ => continue,
+            if let Some(field_value) = obj.get(field_name) {
+                match field_value {
+                    // Direct boolean value
+                    Value::Bool(b) => return *b,
+                    // Tagged boolean (True/False)
+                    Value::Tagged { tag, .. } => {
+                        if BoolTag::is_bool_tag(tag.as_ref()) {
+                            return BoolTag::is_true(tag.as_ref());
                         }
                     }
+                    // CellRef - need to look up the cell value (still has IO dependency)
+                    // TODO: In a fully pure implementation, item data would embed the value directly
+                    Value::CellRef(cell_id) => {
+                        if let Some(cell_value) = super::super::io::get_cell_value(&cell_id.name()) {
+                            match cell_value {
+                                Value::Bool(b) => return b,
+                                Value::Tagged { tag, .. } => {
+                                    if BoolTag::is_bool_tag(tag.as_ref()) {
+                                        return BoolTag::is_true(tag.as_ref());
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
-
             false
         }
         _ => false,
@@ -337,6 +403,55 @@ pub fn update_field_at_path(value: &Value, path: &[String], update: &FieldUpdate
     }
 }
 
+/// Compute the new field value for a ListItemUpdate diff.
+/// Given an item, field path, and update type, returns just the new field value.
+/// Phase 4: Used by ListItemSetFieldByIdentity to emit O(1) diffs instead of cloning lists.
+fn compute_field_update(item: &Value, path: &[String], update: &FieldUpdate, event_value: Option<&str>) -> Value {
+    // Navigate to the field at the path
+    let mut current = item;
+    for segment in path.iter().take(path.len().saturating_sub(1)) {
+        match current {
+            Value::Object(fields) => {
+                if let Some(next) = fields.get(segment.as_str()) {
+                    current = next;
+                } else {
+                    return Value::Unit; // Field not found
+                }
+            }
+            Value::Tagged { fields, .. } => {
+                if let Some(next) = fields.get(segment.as_str()) {
+                    current = next;
+                } else {
+                    return Value::Unit;
+                }
+            }
+            _ => return Value::Unit,
+        }
+    }
+
+    // Get the current value of the final field
+    let final_field = path.last().map(|s| s.as_str()).unwrap_or("");
+    let current_value = match current {
+        Value::Object(fields) => fields.get(final_field).cloned().unwrap_or(Value::Unit),
+        Value::Tagged { fields, .. } => fields.get(final_field).cloned().unwrap_or(Value::Unit),
+        _ => Value::Unit,
+    };
+
+    // Apply the update to compute the new value
+    match update {
+        FieldUpdate::Constant(v) => v.clone(),
+        FieldUpdate::Toggle => match &current_value {
+            Value::Bool(b) => Value::Bool(!b),
+            _ => current_value,
+        },
+        FieldUpdate::SetTrue => Value::Bool(true),
+        FieldUpdate::SetFalse => Value::Bool(false),
+        FieldUpdate::FromEventTextAfterIdentity => {
+            event_value.map(|s| Value::text(s)).unwrap_or(current_value)
+        }
+    }
+}
+
 // ============================================================================
 // END GENERIC TEMPLATE SYSTEM
 // ============================================================================
@@ -392,23 +507,19 @@ fn clone_template_with_fresh_ids_impl(
     match template {
         Value::CellRef(old_id) => {
             // Generate or reuse fresh ID for this CellRef
+            // Phase 5: Use thread-local allocator for deterministic IDs
             let new_id = cell_id_map
                 .entry(old_id.name())
-                .or_insert_with(|| {
-                    let counter = DYNAMIC_CELL_COUNTER.fetch_add(1, Ordering::SeqCst);
-                    format!("{}{}", DYNAMIC_CELL_PREFIX, counter)
-                })
+                .or_insert_with(allocate_dynamic_cell_id)
                 .clone();
             Value::CellRef(CellId::new(new_id))
         }
         Value::LinkRef(old_id) => {
             // Generate or reuse fresh ID for this LinkRef
+            // Phase 5: Use thread-local allocator for deterministic IDs
             let new_id = link_id_map
                 .entry(old_id.name().to_string())
-                .or_insert_with(|| {
-                    let counter = DYNAMIC_LINK_COUNTER.fetch_add(1, Ordering::SeqCst);
-                    format!("{}{}", DYNAMIC_LINK_PREFIX, counter)
-                })
+                .or_insert_with(allocate_dynamic_link_id)
                 .clone();
             Value::LinkRef(LinkId::new(new_id))
         }
@@ -424,7 +535,7 @@ fn clone_template_with_fresh_ids_impl(
                 .iter()
                 .map(|v| clone_template_with_fresh_ids_impl(v, cell_id_map, link_id_map, None))
                 .collect();
-            Value::List(Arc::new(new_items))
+            Value::collection(new_items)
         }
         Value::Tagged { tag, fields } => {
             let new_fields: BTreeMap<Arc<str>, Value> = fields
@@ -438,13 +549,60 @@ fn clone_template_with_fresh_ids_impl(
     }
 }
 
-/// Find the cell_id of a WhileRef that controls hover-based visibility.
+/// Find the cell_id of a __while_config__ Tagged value that controls hover-based visibility.
 ///
-/// NOTE: WhileRef variant was surgically removed in Phase 6.
-/// This function now always returns None - hover handling needs DD-based replacement.
-fn find_hover_while_cell_id(_items: Option<&Value>) -> Option<String> {
-    // WhileRef variant was removed - return None until DD-based hover handling is implemented
+/// Pure DD: WhileRef variant was replaced with __while_config__ Tagged value in Phase 7.
+/// This function now searches for the Tagged pattern.
+fn find_hover_while_cell_id(items: Option<&Value>) -> Option<String> {
+    // Search for __while_config__ Tagged value in items
+    let items = items?;
+    if let Value::List(item_list) = items {
+        for item in item_list.iter() {
+            if let Value::Tagged { tag, fields, .. } = item {
+                if tag.as_ref() == "__while_config__" {
+                    // Extract cell_id from the Tagged value
+                    if let Some(Value::Text(cell_id)) = fields.get("cell_id") {
+                        return Some(cell_id.to_string());
+                    }
+                }
+            }
+        }
+    }
     None
+}
+
+/// Extract a unique key from a Value for O(1) lookup.
+/// Looks for CellRef or LinkRef IDs which are guaranteed unique per item.
+/// Falls back to display string for simple values.
+/// Used by ListRemoveCompleted to emit batch removal keys.
+fn extract_item_key_for_removal(value: &Value) -> Arc<str> {
+    match value {
+        Value::CellRef(cell_id) => Arc::from(format!("hold:{}", cell_id.name())),
+        Value::LinkRef(link_id) => Arc::from(format!("link:{}", link_id.name())),
+        Value::Object(fields) => {
+            // For objects, find first CellRef or LinkRef field (they're unique per item)
+            for (_, field_value) in fields.iter() {
+                match field_value {
+                    Value::CellRef(cell_id) => return Arc::from(format!("hold:{}", cell_id.name())),
+                    Value::LinkRef(link_id) => return Arc::from(format!("link:{}", link_id.name())),
+                    Value::Object(inner) => {
+                        // Check nested objects (e.g., todo_elements)
+                        for (_, inner_value) in inner.iter() {
+                            match inner_value {
+                                Value::CellRef(cell_id) => return Arc::from(format!("hold:{}", cell_id.name())),
+                                Value::LinkRef(link_id) => return Arc::from(format!("link:{}", link_id.name())),
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Fallback to display string
+            Arc::from(value.to_display_string())
+        }
+        _ => Arc::from(value.to_display_string()),
+    }
 }
 
 /// Find the checkbox's `checked` CellRef ID within an Element AST.
@@ -452,13 +610,13 @@ fn find_hover_while_cell_id(_items: Option<&Value>) -> Option<String> {
 fn find_checkbox_cell_id(element: &Value) -> Option<String> {
     // Element structure: Tagged { tag: "Element", fields: { items: List([checkbox, ...]) } }
     if let Value::Tagged { tag, fields } = element {
-        if tag.as_ref() == "Element" {
+        if ElementTag::is_element(tag.as_ref()) {
             // Look for items list
             if let Some(Value::List(items)) = fields.get("items") {
                 for item in items.iter() {
                     // Check if this item is a checkbox element
                     if let Value::Tagged { tag: item_tag, fields: item_fields } = item {
-                        if item_tag.as_ref() == "Element" {
+                        if ElementTag::is_element(item_tag.as_ref()) {
                             if let Some(Value::Text(elem_type)) = item_fields.get("_element_type") {
                                 if elem_type.as_ref() == "checkbox" {
                                     // Found checkbox - extract checked CellRef
@@ -635,12 +793,10 @@ pub fn reconstruct_persisted_item(
         // We need to map it to "hover_{new_link_id}" before clone processes the WhileRef
         if let (Some(old_link), Some(old_hold)) = (&hover_link_old_id, &hover_cell_old_id) {
             // First ensure the link gets a new ID
+            // Phase 5: Use thread-local allocator for deterministic IDs
             let new_link_id = link_id_map
                 .entry(old_link.clone())
-                .or_insert_with(|| {
-                    let counter = DYNAMIC_LINK_COUNTER.fetch_add(1, Ordering::SeqCst);
-                    format!("{}{}", DYNAMIC_LINK_PREFIX, counter)
-                })
+                .or_insert_with(allocate_dynamic_link_id)
                 .clone();
             // Then create the hover hold mapping: hover_link_22 → hover_dynamic_link_1000
             let new_hover_cell = format!("hover_{}", new_link_id);
@@ -793,13 +949,11 @@ pub fn instantiate_fresh_item(
         };
 
         // Pre-populate hover hold mapping BEFORE cloning
+        // Phase 5: Use thread-local allocator for deterministic IDs
         if let (Some(old_link), Some(old_hold)) = (&hover_link_old_id, &hover_cell_old_id) {
             let new_link_id = link_id_map
                 .entry(old_link.clone())
-                .or_insert_with(|| {
-                    let counter = DYNAMIC_LINK_COUNTER.fetch_add(1, Ordering::SeqCst);
-                    format!("{}{}", DYNAMIC_LINK_PREFIX, counter)
-                })
+                .or_insert_with(allocate_dynamic_link_id)
                 .clone();
             let new_hover_cell = format!("hover_{}", new_link_id);
             cell_id_map.insert(old_hold.clone(), new_hover_cell.clone());
@@ -887,12 +1041,10 @@ pub fn instantiate_template(
         // We need to map it to "hover_{new_link_id}" before clone processes the WhileRef
         if let (Some(old_link), Some(old_hold)) = (&hover_link_old_id, &hover_cell_old_id) {
             // First ensure the link gets a new ID
+            // Phase 5: Use thread-local allocator for deterministic IDs
             let new_link_id = link_id_map
                 .entry(old_link.clone())
-                .or_insert_with(|| {
-                    let counter = DYNAMIC_LINK_COUNTER.fetch_add(1, Ordering::SeqCst);
-                    format!("{}{}", DYNAMIC_LINK_PREFIX, counter)
-                })
+                .or_insert_with(allocate_dynamic_link_id)
                 .clone();
             // Then create the hover hold mapping: hover_link_22 → hover_dynamic_link_1000
             let new_hover_cell = format!("hover_{}", new_link_id);
@@ -1047,6 +1199,42 @@ impl WorkerHandle {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// Phase 10: PURE DD OUTPUT TYPE
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// TaggedCellOutput flows through DD operators and is captured at the end using
+// timely's built-in capture() mechanism. This avoids any shared mutable state
+// (Mutex/RefCell) inside the dataflow - pure DD!
+//
+// See docs/plans/pure_dd.md Phase 10 for details.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// A tagged cell output that flows through DD and is captured via timely::Capture.
+/// This replaces the inspect() + Mutex pattern with pure DD message passing.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TaggedCellOutput {
+    /// The cell id this output belongs to
+    pub cell_id: Arc<str>,
+    /// The new state value
+    pub state: Value,
+    /// Whether this cell should persist to localStorage
+    pub should_persist: bool,
+    /// Logical time of this update
+    pub time: u64,
+}
+
+impl TaggedCellOutput {
+    pub fn new(cell_id: impl Into<Arc<str>>, state: Value, should_persist: bool, time: u64) -> Self {
+        Self {
+            cell_id: cell_id.into(),
+            state,
+            should_persist,
+            time,
+        }
+    }
+}
+
 /// A document update from the DD worker.
 #[derive(Clone, Debug)]
 pub struct DocumentUpdate {
@@ -1061,16 +1249,8 @@ pub struct DocumentUpdate {
     pub hold_state_updates: HashMap<String, Value>,
 }
 
-/// Filter for WHEN pattern matching on event values.
-#[derive(Clone, Debug)]
-pub enum EventFilter {
-    /// Accept any event value
-    Any,
-    /// Only accept events with this exact text value (e.g., "Enter" for key events)
-    TextEquals(String),
-    /// Accept events starting with this prefix (e.g., "Enter:" for Enter+text)
-    TextStartsWith(String),
-}
+// Note: EventFilter is now defined in types.rs and re-exported via mod.rs
+// Phase 3.3: Consolidated with DdEventFilter
 
 /// Type of state transformation to apply.
 #[derive(Clone, Debug)]
@@ -1115,8 +1295,13 @@ pub enum StateTransform {
     },
     /// Clear to empty text (for text input clearing after submit)
     ClearText,
-    /// Remove all items where completed=true (for Clear completed button)
-    ListRemoveCompleted,
+    /// Remove all items where the specified boolean field is true (for Clear completed button)
+    /// The completed_field parameter specifies which field to check (e.g., "completed", "done", "checked")
+    /// NO HARDCODED FIELD NAMES: This must be explicitly configured, not inferred
+    ListRemoveCompleted {
+        /// The field name to check for completion (e.g., "completed")
+        completed_field: String,
+    },
     /// Remove a specific list item by LinkRef identity (event format: "remove:LINK_ID")
     RemoveListItem,
 
@@ -1195,7 +1380,142 @@ pub struct CellConfig {
     pub persist: bool,
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// Phase 4: Collection Operation Configuration
+//
+// These types configure DD collection operators (filter, map, count) that replace
+// the surgically removed symbolic reference variants (FilteredListRef, MappedListRef, etc.).
+//
+// Instead of storing "deferred evaluation recipes" that the bridge evaluates
+// imperatively, the evaluator now registers collection operations here.
+// The worker builds actual DD dataflow operators from this config.
+// ══════════════════════════════════════════════════════════════════════════════
+
+use super::value::CollectionId;
+
+/// Type of collection operation.
+#[derive(Clone, Debug)]
+pub enum CollectionOp {
+    /// Filter items by predicate.
+    /// Replaces: FilteredListRef, FilteredListRefWithPredicate, ReactiveFilteredList
+    Filter {
+        /// For simple field equality: Some((field_name, expected_value))
+        /// For complex predicates: None (use predicate_template)
+        field_filter: Option<(Arc<str>, Value)>,
+        /// For complex predicates: evaluated template with Placeholder
+        predicate_template: Option<Value>,
+    },
+    /// Map/transform items.
+    /// Replaces: MappedListRef, FilteredMappedListRef
+    Map {
+        /// Element template with Placeholder for item substitution
+        element_template: Value,
+    },
+    /// Count items.
+    /// Replaces: ComputedRef::ListCount
+    Count,
+    /// Count items matching filter.
+    /// Replaces: ComputedRef::ListCountWhere, ComputedRef::ListCountWhereHold
+    CountWhere {
+        /// Field to filter on
+        filter_field: Arc<str>,
+        /// Value to match
+        filter_value: Value,
+    },
+    /// Check if list is empty.
+    IsEmpty,
+    /// Concatenate two collections.
+    Concat {
+        /// Second collection to concatenate
+        other_source: CollectionId,
+    },
+    // ══════════════════════════════════════════════════════════════════════════
+    // Phase 4: Arithmetic/Comparison Operations
+    // Replaces: ComputedRef::Subtract, ComputedRef::GreaterThanZero, ComputedRef::Equal
+    // These operate on Count/CountWhere outputs to produce derived values.
+    // ══════════════════════════════════════════════════════════════════════════
+    /// Subtract one count from another (produces Number).
+    /// Used for: active_list_count = list_count - completed_list_count
+    Subtract {
+        /// Second operand (subtracted from source)
+        right_source: CollectionId,
+    },
+    /// Check if a count is greater than zero (produces Bool).
+    /// Used for: show_clear_completed = completed_list_count > 0
+    GreaterThanZero,
+    /// Compare two values for equality (produces Bool).
+    /// Used for: all_completed = completed_list_count == list_count
+    Equal {
+        /// Second operand to compare against source
+        right_source: CollectionId,
+    },
+}
+
+/// Configuration for a collection operation in the DD dataflow.
+///
+/// Each operation takes one (or more) input collections and produces
+/// an output collection. The worker builds a DAG of DD operators from these.
+#[derive(Clone, Debug)]
+pub struct CollectionOpConfig {
+    /// Unique ID for the output collection
+    pub output_id: CollectionId,
+    /// Source collection ID (input to this operation)
+    pub source_id: CollectionId,
+    /// The operation to perform
+    pub op: CollectionOp,
+}
+
 /// Configuration for the entire DD dataflow.
+/// Editing event bindings parsed from HOLD body.
+/// Contains paths to LinkRefs that control editing state.
+#[derive(Clone, Debug, Default)]
+pub struct EditingBinding {
+    /// The Cell ID that these bindings control (e.g., "cell_5")
+    pub cell_id: Option<String>,
+    /// Path to LinkRef whose double_click triggers edit mode
+    pub edit_trigger_path: Vec<String>,
+    /// Actual LinkRef ID for edit trigger (resolved during evaluation)
+    pub edit_trigger_link_id: Option<String>,
+    /// Path to LinkRef whose key_down exits edit mode on Enter/Escape
+    pub exit_key_path: Vec<String>,
+    /// Actual LinkRef ID for exit key (resolved during evaluation)
+    pub exit_key_link_id: Option<String>,
+    /// Path to LinkRef whose blur exits edit mode
+    pub exit_blur_path: Vec<String>,
+    /// Actual LinkRef ID for exit blur (resolved during evaluation)
+    pub exit_blur_link_id: Option<String>,
+}
+
+/// Toggle event binding parsed from HOLD body.
+/// Contains the path to a LinkRef whose click event toggles a boolean HOLD.
+#[derive(Clone, Debug)]
+pub struct ToggleBinding {
+    /// The Cell ID that this toggle affects
+    pub cell_id: String,
+    /// Path to LinkRef whose click triggers toggle (e.g., ["todo_elements", "todo_checkbox"])
+    pub event_path: Vec<String>,
+    /// Event type (usually "click")
+    pub event_type: String,
+    /// Actual LinkRef ID if available (resolved during evaluation)
+    /// When present, this takes precedence over event_path resolution
+    pub link_id: Option<String>,
+}
+
+/// Global toggle event binding for "toggle all" patterns.
+/// Contains the path to a LinkRef whose click toggles ALL items in a list.
+/// Pattern: `store.elements.toggle_all.event.click |> THEN { store.all_completed |> Bool/not() }`
+#[derive(Clone, Debug)]
+pub struct GlobalToggleBinding {
+    /// The Cell ID that this toggle affects (the list cell like "todos")
+    pub list_cell_id: String,
+    /// Path to LinkRef whose click triggers toggle (e.g., ["store", "elements", "toggle_all_checkbox"])
+    pub event_path: Vec<String>,
+    /// Event type (usually "click")
+    pub event_type: String,
+    /// Path to the global computed value (e.g., ["store", "all_completed"])
+    pub value_path: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DataflowConfig {
     /// HOLD operators to create
@@ -1203,6 +1523,57 @@ pub struct DataflowConfig {
     /// Link-to-cell mappings for DD-native LINK handling (Phase 8).
     /// These replace DYNAMIC_LINK_ACTIONS HashMap with DD joins.
     pub link_mappings: Vec<super::types::LinkCellMapping>,
+    /// Collection operations (Phase 4).
+    /// Replaces symbolic reference variants with DD dataflow operators.
+    pub collection_ops: Vec<CollectionOpConfig>,
+    /// Initial collections (list literals evaluated at startup)
+    pub initial_collections: HashMap<CollectionId, Vec<Value>>,
+
+    // ========================================================================
+    // Phase 7.3: Registry fields moved to DataflowConfig
+    // These replace the thread_local registries in outputs.rs
+    // ========================================================================
+
+    /// Checkbox toggle field names for reactive "items left" count.
+    /// Replaces CHECKBOX_TOGGLE_HOLDS registry.
+    pub toggle_fields: Vec<String>,
+
+    /// Cell IDs that should be cleared on text submit (Enter key).
+    /// Replaces TEXT_CLEAR_HOLDS registry.
+    pub text_clear_cells: HashSet<String>,
+
+    /// Remove event path: path from item to LinkRef that triggers removal.
+    /// Parsed from List/remove(item, on: item.X.Y.event.press) → ["X", "Y"]
+    /// Replaces REMOVE_EVENT_PATH registry.
+    pub remove_event_path: Vec<String>,
+
+    /// Bulk remove event path: path to global LinkRef that triggers bulk removal.
+    /// Parsed from List/remove(item, on: elements.X.event.press |> THEN {...})
+    /// Replaces BULK_REMOVE_EVENT_PATH registry.
+    pub bulk_remove_event_path: Vec<String>,
+
+    /// Editing event bindings for edit mode control.
+    /// Replaces EDITING_EVENT_BINDINGS registry.
+    pub editing_bindings: Vec<EditingBinding>,
+
+    /// Toggle event bindings for checkbox-like toggling.
+    /// Replaces TOGGLE_EVENT_BINDINGS registry.
+    pub toggle_bindings: Vec<ToggleBinding>,
+
+    /// Global toggle bindings for "toggle all" patterns.
+    /// Replaces GLOBAL_TOGGLE_BINDINGS registry.
+    pub global_toggle_bindings: Vec<GlobalToggleBinding>,
+}
+
+/// Template info for pre-instantiation (O(delta) optimization).
+/// Moved outside impl block to satisfy Rust's grammar rules.
+#[derive(Clone)]
+struct TemplateInfo {
+    data_template: Value,
+    element_template: Option<Value>,
+    title_cell_field: String,
+    cell_id: String,
+    filter: EventFilter,
 }
 
 impl DataflowConfig {
@@ -1211,13 +1582,197 @@ impl DataflowConfig {
         Self {
             cells: Vec::new(),
             link_mappings: Vec::new(),
+            collection_ops: Vec::new(),
+            initial_collections: HashMap::new(),
+            // Phase 7.3: Registry fields
+            toggle_fields: Vec::new(),
+            text_clear_cells: HashSet::new(),
+            remove_event_path: Vec::new(),
+            bulk_remove_event_path: Vec::new(),
+            editing_bindings: Vec::new(),
+            toggle_bindings: Vec::new(),
+            global_toggle_bindings: Vec::new(),
         }
+    }
+
+    // ========================================================================
+    // Phase 7.3: Registry field setters
+    // These replace the set_* functions in outputs.rs
+    // ========================================================================
+
+    /// Add a toggle field name (for reactive "items left" count).
+    pub fn add_toggle_field(&mut self, field: impl Into<String>) {
+        self.toggle_fields.push(field.into());
+    }
+
+    /// Add a text clear cell (cleared on Enter key).
+    pub fn add_text_clear_cell(&mut self, cell_id: impl Into<String>) {
+        self.text_clear_cells.insert(cell_id.into());
+    }
+
+    /// Set the remove event path.
+    pub fn set_remove_event_path(&mut self, path: Vec<String>) {
+        self.remove_event_path = path;
+    }
+
+    /// Set the bulk remove event path.
+    pub fn set_bulk_remove_event_path(&mut self, path: Vec<String>) {
+        self.bulk_remove_event_path = path;
+    }
+
+    /// Set the editing bindings.
+    pub fn set_editing_bindings(&mut self, binding: EditingBinding) {
+        zoon::println!("[DD Config] Setting editing bindings: {:?}", binding);
+        self.editing_bindings.push(binding);
+    }
+
+    /// Add a toggle binding.
+    pub fn add_toggle_binding(&mut self, binding: ToggleBinding) {
+        zoon::println!("[DD Config] Adding toggle binding: {:?}", binding);
+        self.toggle_bindings.push(binding);
+    }
+
+    /// Add a global toggle binding.
+    pub fn add_global_toggle_binding(&mut self, binding: GlobalToggleBinding) {
+        zoon::println!("[DD Config] Adding global toggle binding: {:?}", binding);
+        self.global_toggle_bindings.push(binding);
     }
 
     /// Add a link-to-cell mapping (Phase 8).
     /// This replaces add_dynamic_link_action for DD-native handling.
     pub fn add_link_mapping(&mut self, mapping: super::types::LinkCellMapping) {
         self.link_mappings.push(mapping);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Phase 4: Collection operation builders
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// Register an initial collection (list literal).
+    /// Returns the CollectionId for referencing in operations.
+    pub fn add_initial_collection(&mut self, items: Vec<Value>) -> CollectionId {
+        let id = CollectionId::new();
+        self.initial_collections.insert(id.clone(), items);
+        id
+    }
+
+    /// Add a filter operation.
+    /// Replaces: FilteredListRef, FilteredListRefWithPredicate
+    pub fn add_filter(
+        &mut self,
+        source_id: CollectionId,
+        field_filter: Option<(Arc<str>, Value)>,
+        predicate_template: Option<Value>,
+    ) -> CollectionId {
+        let output_id = CollectionId::new();
+        self.collection_ops.push(CollectionOpConfig {
+            output_id: output_id.clone(),
+            source_id,
+            op: CollectionOp::Filter {
+                field_filter,
+                predicate_template,
+            },
+        });
+        output_id
+    }
+
+    /// Add a map operation.
+    /// Replaces: MappedListRef
+    pub fn add_map(&mut self, source_id: CollectionId, element_template: Value) -> CollectionId {
+        let output_id = CollectionId::new();
+        self.collection_ops.push(CollectionOpConfig {
+            output_id: output_id.clone(),
+            source_id,
+            op: CollectionOp::Map { element_template },
+        });
+        output_id
+    }
+
+    /// Add a count operation.
+    /// Replaces: ComputedRef::ListCount
+    pub fn add_count(&mut self, source_id: CollectionId) -> CollectionId {
+        let output_id = CollectionId::new();
+        self.collection_ops.push(CollectionOpConfig {
+            output_id: output_id.clone(),
+            source_id,
+            op: CollectionOp::Count,
+        });
+        output_id
+    }
+
+    /// Add a count-where operation.
+    /// Replaces: ComputedRef::ListCountWhere
+    pub fn add_count_where(
+        &mut self,
+        source_id: CollectionId,
+        filter_field: Arc<str>,
+        filter_value: Value,
+    ) -> CollectionId {
+        let output_id = CollectionId::new();
+        self.collection_ops.push(CollectionOpConfig {
+            output_id: output_id.clone(),
+            source_id,
+            op: CollectionOp::CountWhere {
+                filter_field,
+                filter_value,
+            },
+        });
+        output_id
+    }
+
+    /// Add an is-empty operation.
+    pub fn add_is_empty(&mut self, source_id: CollectionId) -> CollectionId {
+        let output_id = CollectionId::new();
+        self.collection_ops.push(CollectionOpConfig {
+            output_id: output_id.clone(),
+            source_id,
+            op: CollectionOp::IsEmpty,
+        });
+        output_id
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Phase 4: Arithmetic/Comparison Operation Helpers
+    // Replaces: ComputedRef::Subtract, ComputedRef::GreaterThanZero, ComputedRef::Equal
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// Add a subtract operation (left - right).
+    /// Replaces: ComputedRef::Subtract
+    /// Used for: active_list_count = list_count - completed_list_count
+    pub fn add_subtract(&mut self, left_source: CollectionId, right_source: CollectionId) -> CollectionId {
+        let output_id = CollectionId::new();
+        self.collection_ops.push(CollectionOpConfig {
+            output_id: output_id.clone(),
+            source_id: left_source,
+            op: CollectionOp::Subtract { right_source },
+        });
+        output_id
+    }
+
+    /// Add a greater-than-zero check.
+    /// Replaces: ComputedRef::GreaterThanZero
+    /// Used for: show_clear_completed = completed_list_count > 0
+    pub fn add_greater_than_zero(&mut self, source_id: CollectionId) -> CollectionId {
+        let output_id = CollectionId::new();
+        self.collection_ops.push(CollectionOpConfig {
+            output_id: output_id.clone(),
+            source_id,
+            op: CollectionOp::GreaterThanZero,
+        });
+        output_id
+    }
+
+    /// Add an equality comparison.
+    /// Replaces: ComputedRef::Equal
+    /// Used for: all_completed = completed_list_count == list_count
+    pub fn add_equal(&mut self, left_source: CollectionId, right_source: CollectionId) -> CollectionId {
+        let output_id = CollectionId::new();
+        self.collection_ops.push(CollectionOpConfig {
+            output_id: output_id.clone(),
+            source_id: left_source,
+            op: CollectionOp::Equal { right_source },
+        });
+        output_id
     }
 
     /// Add a HOLD operator configuration.
@@ -1321,6 +1876,8 @@ impl DataflowConfig {
             transform: StateTransform::ClearText,
             persist: false, // UI-only, not persisted
         });
+        // Phase 7.3: Register in text_clear_cells set
+        self.text_clear_cells.insert(text_clear_cell_id.to_string());
         self
     }
 
@@ -1361,6 +1918,8 @@ impl DataflowConfig {
             transform: StateTransform::ClearText,
             persist: false, // UI-only, not persisted
         });
+        // Phase 7.3: Register in text_clear_cells set
+        self.text_clear_cells.insert(text_clear_cell_id.to_string());
         self
     }
 
@@ -1401,19 +1960,35 @@ impl DataflowConfig {
 pub struct Worker {
     /// Configuration for the dataflow
     config: DataflowConfig,
+    // Phase 5: ID counters moved to thread-locals (allocate_dynamic_cell_id/link_id)
+    // Worker calls reset_id_counters() on creation for deterministic sessions.
 }
 
 impl Worker {
     /// Create a new DD worker with default configuration.
+    ///
+    /// Phase 5: Resets thread-local ID counters for deterministic ID generation.
+    /// Each Worker session starts fresh at ID 1000.
     pub fn new() -> Self {
+        // Reset thread-local counters for deterministic replays
+        reset_id_counters();
         Self {
             config: DataflowConfig::default(),
         }
     }
 
     /// Create a DD worker with specific configuration.
+    ///
+    /// Phase 5: Resets thread-local ID counters for deterministic ID generation.
+    /// Phase 7.3: Sets active config for outputs.rs consumers to read.
     pub fn with_config(config: DataflowConfig) -> Self {
-        Self { config }
+        // Reset thread-local counters for deterministic replays
+        reset_id_counters();
+        // Set active config for outputs.rs to read
+        set_active_config(config.clone());
+        Self {
+            config,
+        }
     }
 
     /// Spawn the DD worker and return a handle for interaction.
@@ -1694,9 +2269,10 @@ impl Worker {
                 StateTransform::ListAppendWithTemplate { .. } => DdTransform::ListAppendPrepared,
                 StateTransform::ListAppendWithTemplateAndClear { .. } => DdTransform::ListAppendPrepared,
                 StateTransform::ListAppendFromTemplate { .. } => DdTransform::ListAppendPrepared,
-                StateTransform::RemoveListItem => DdTransform::Custom(Arc::new(|state, _| state.clone())),
-                // Other complex transforms - use Custom fallback for now
-                _ => DdTransform::Custom(Arc::new(|state, _| state.clone())),
+                StateTransform::RemoveListItem => DdTransform::Identity,
+                // Phase 7: Use Identity for transforms handled in HOLD closure
+                // The actual transform logic is in the HOLD closure (below), not here.
+                _ => DdTransform::Identity,
             };
 
             // Build trigger list - start with explicit triggers
@@ -1708,31 +2284,15 @@ impl Worker {
                 triggers.push(timer_link_id);
             }
 
-            // Convert EventFilter to DdEventFilter
-            let filter = match &cell.filter {
-                EventFilter::Any => DdEventFilter::Any,
-                EventFilter::TextEquals(s) => DdEventFilter::TextEquals(s.clone()),
-                EventFilter::TextStartsWith(s) => DdEventFilter::TextStartsWith(s.clone()),
-            };
-
+            // Phase 3.3: EventFilter is now unified - no conversion needed
             DdCellConfig {
                 id: cell.id.clone(),
                 initial: cell.initial.clone(),
                 triggers,
                 transform,
-                filter,
+                filter: cell.filter.clone(),
             }
         }).collect()
-    }
-
-    /// Template info for pre-instantiation (O(delta) optimization).
-    #[derive(Clone)]
-    struct TemplateInfo {
-        data_template: Value,
-        element_template: Option<Value>,
-        title_cell_field: String,
-        cell_id: String,
-        filter: EventFilter,
     }
 
     /// Build a map of link_id -> template info for cells that use template-based transforms.
@@ -1762,17 +2322,27 @@ impl Worker {
                 }
                 StateTransform::ListAppendFromTemplate { template, .. } => {
                     // Extract title field from template initializers
+                    // NO FALLBACKS: Field MUST be found in template, no silent "title" default
                     let title_field = template.field_initializers.iter()
                         .find(|(_, init)| matches!(init, FieldInitializer::FromEventText))
-                        .map(|(path, _)| path.first().cloned().unwrap_or_default())
-                        .unwrap_or_else(|| "title".to_string());
-                    Some(TemplateInfo {
-                        data_template: template.data_template.clone(),
-                        element_template: template.element_template.clone(),
-                        title_cell_field: title_field,
-                        cell_id: cell.id.name(),
-                        filter: cell.filter.clone(),
-                    })
+                        .and_then(|(path, _)| path.first().cloned());
+
+                    match title_field {
+                        Some(field) if !field.is_empty() => {
+                            Some(TemplateInfo {
+                                data_template: template.data_template.clone(),
+                                element_template: template.element_template.clone(),
+                                title_cell_field: field,
+                                cell_id: cell.id.name(),
+                                filter: cell.filter.clone(),
+                            })
+                        }
+                        _ => {
+                            zoon::println!("[DD Worker] WARNING: ListAppendFromTemplate has no FromEventText field. \
+                                Skipping template info (no silent 'title' fallback).");
+                            None
+                        }
+                    }
                 }
                 _ => None,
             };
@@ -1831,11 +2401,18 @@ impl Worker {
                 initial_values.insert(template.title_cell_field.clone(), Value::text(item_text));
 
                 // Build ListItemTemplate from template info
+                // TODO: identity.link_ref_path should come from template config, not be hardcoded!
+                // Currently hardcoded to "remove_button" which assumes todo_mvc structure.
+                // FIX NEEDED: Add identity_path to TemplateInfo and populate from evaluator
+                let identity_path = vec!["remove_button".to_string()]; // HARDCODED - see TODO above
+                zoon::println!("[DD Worker] WARNING: Using hardcoded identity path {:?} for template. \
+                    This should be configured in the template, not hardcoded.", identity_path);
+
                 let list_template = ListItemTemplate {
                     data_template: template.data_template.clone(),
                     element_template: template.element_template.clone(),
                     identity: ItemIdentitySpec {
-                        link_ref_path: vec!["remove_button".to_string()], // Default identity path
+                        link_ref_path: identity_path,
                     },
                     field_initializers: vec![(
                         vec![template.title_cell_field.clone()],
@@ -1865,6 +2442,14 @@ impl Worker {
     ///
     /// This uses the actual `hold()` function from dd_runtime for proper DD semantics.
     /// Uses WASM-compatible execute_directly that doesn't require std::time::Instant.
+    ///
+    /// # Phase 10: Pure DD Output Capture
+    ///
+    /// This function uses timely's built-in `capture()` mechanism instead of
+    /// `inspect()` with Mutex. All outputs flow through DD operators as pure
+    /// data and are captured at the end using message passing.
+    ///
+    /// See docs/plans/pure_dd.md Phase 10 for details.
     fn process_batch_with_hold(
         config: &DataflowConfig,
         events: &[Event],
@@ -1873,12 +2458,21 @@ impl Worker {
     ) -> (Vec<DocumentUpdate>, u64, HashMap<String, Value>) {
         use super::operators::hold;
         use differential_dataflow::input::Input;
+        use timely::dataflow::operators::{Capture, Concatenate};
+        use timely::dataflow::operators::capture::Extract;
 
-        let outputs = Arc::new(Mutex::new(Vec::new()));
-        // Pre-populate with initial_states so transforms can resolve CellRefs from previous batches
-        let final_states = Arc::new(Mutex::new(initial_states.clone()));
-        let outputs_clone = outputs.clone();
-        let final_states_clone = final_states.clone();
+        // ══════════════════════════════════════════════════════════════════════════════
+        // Phase 10: PURE DD OUTPUT CAPTURE
+        // ══════════════════════════════════════════════════════════════════════════════
+        //
+        // NO Mutex, NO RefCell - outputs flow through DD operators:
+        // 1. Each HOLD output is tagged with (cell_id, state, should_persist, time)
+        // 2. All outputs are concatenated into a single collection
+        // 3. The collection's inner stream is captured via timely::Capture
+        // 4. After stepping, we extract() to get all outputs
+        //
+        // This is pure DD - no shared mutable state anywhere in the dataflow.
+        // ══════════════════════════════════════════════════════════════════════════════
 
         // Clone data for the closure
         let events: Vec<Event> = events.to_vec();
@@ -1887,13 +2481,18 @@ impl Worker {
         let config = config.clone();
         let num_events = events.len();
 
-        Self::execute_directly_wasm(move |worker| {
+        // Phase 10: execute_directly_wasm returns the captured outputs receiver
+        let outputs_rx = Self::execute_directly_wasm(move |worker| {
             // Build dataflow for each HOLD in config
-            let (mut link_input, probe) = worker.dataflow::<u64, _, _>(|scope| {
+            let (mut link_input, probe, outputs_rx) = worker.dataflow::<u64, _, _>(|scope| {
                 // Create input collection for LINK events
                 // Each link event is (LinkId, EventValue)
                 let (link_input_handle, links) =
                     scope.new_collection::<(String, EventValue), isize>();
+
+                // Phase 10: Collect all tagged output streams for pure DD capture
+                use timely::dataflow::Stream;
+                let mut tagged_outputs: Vec<Stream<_, (TaggedCellOutput, u64, isize)>> = Vec::new();
 
                 // For each HOLD config, create a HOLD operator
                 for hold_config in &config.cells {
@@ -1938,13 +2537,14 @@ impl Worker {
                             }
                         });
 
-                    // Clone transform for the closure
+                    // Clone transform and cell_id for the closure
                     let state_transform = hold_config.transform.clone();
-                    // Clone final_states_clone for transforms that need to resolve CellRefs
-                    let transform_states = final_states_clone.clone();
+                    let cell_id_for_transform = cell_id.clone();
 
                     // Apply HOLD operator with configured transform
                     let hold_output = hold(initial, &triggered_events, move |state, event| {
+                        // Phase 2.1: cell_id_for_transform is available for ListDiff variants
+                        let _ = &cell_id_for_transform; // Silence unused warning when not using ListDiff
                         match &state_transform {
                             StateTransform::Increment => {
                                 // Increment if numeric
@@ -1972,401 +2572,85 @@ impl Worker {
                                 Value::Bool(false)
                             }
                             StateTransform::ListAppend => {
-                                // Append event text to list as plain text
-                                // Event format is "Enter:text" - extract the text after ":"
-                                // DEPRECATED: Use ListAppendWithTemplate for proper Element AST items
-                                // This fallback is generic - no assumed object structure
-                                match (state, event) {
-                                    (Value::List(items), (_, EventValue::Text(text))) => {
+                                // Phase 2.1: Emit ListPush diff instead of cloning full list
+                                // O(1) operation - no list clone needed
+                                if state.is_list_like() {
+                                    if let (_, EventValue::Text(text)) = event {
                                         // Only process Enter key events with non-empty text
                                         let Some(item_text) = EventPayload::parse_enter_text(text) else {
                                             return state.clone();
                                         };
-                                        let mut new_items: Vec<Value> = items.to_vec();
-                                        // Append as plain text (generic fallback)
-                                        new_items.push(Value::text(item_text));
-                                        Value::List(Arc::new(new_items))
+                                        // Return ListPush diff - applied by sync_cell_from_dd()
+                                        Value::list_push(cell_id_for_transform.clone(), Value::text(item_text))
+                                    } else {
+                                        state.clone()
                                     }
-                                    _ => state.clone(),
+                                } else {
+                                    state.clone()
                                 }
                             }
-                            StateTransform::ListAppendWithTemplate { data_template, element_template, title_cell_field } => {
-                                // Append item using template cloning with fresh IDs
-                                // Both data and element templates use the SAME ID mapping,
-                                // so the cloned element references the cloned data's HOLDs
-                                match (state, event) {
-                                    (Value::List(items), (_, EventValue::Text(text))) => {
-                                        // Only process Enter key events with non-empty text
-                                        let Some(item_text) = EventPayload::parse_enter_text(text) else {
+                            StateTransform::ListAppendWithTemplate { data_template: _, element_template: _, title_cell_field: _ } => {
+                                // Phase 2.1: Emit ListPush diff instead of cloning full list
+                                // Template handling moved to pre-instantiation (Phase 1.2)
+                                match event {
+                                    (_, EventValue::PreparedItem(prepared_data)) => {
+                                        // Pure DD: Emit ListPush diff - O(1) operation
+                                        if !state.is_list_like() {
                                             return state.clone();
-                                        };
-
-                                        // Extract field-to-hold mapping from data template
-                                        // e.g., {"title" -> "hold_18", "completed" -> "hold_20", "editing" -> "hold_19"}
-                                        let field_to_hold = extract_field_to_hold_map(data_template);
-
-                                        // Clone data template with fresh CellRef/LinkRef IDs
-                                        let mut cell_id_map: HashMap<String, String> = HashMap::new();
-                                        let mut link_id_map: HashMap<String, String> = HashMap::new();
-                                        let new_data_item = clone_template_with_fresh_ids(data_template, &mut cell_id_map, &mut link_id_map);
-
-                                        // Create reverse mapping: old_cell_id -> field_name
-                                        let hold_to_field: HashMap<String, String> = field_to_hold
-                                            .iter()
-                                            .map(|(field, hold)| (hold.clone(), field.clone()))
-                                            .collect();
-
-                                        // Register new HOLDs with initial values
-                                        // Task 7.2: Generic - text field uses input, others use template defaults
-                                        for (old_id, new_id) in &cell_id_map {
-                                            let field_name = hold_to_field.get(old_id).map(|s| s.as_str());
-                                            let initial_value = if field_name == Some(title_cell_field.as_str()) {
-                                                // This is the text field - set to input text
-                                                Value::text(item_text)
-                                            } else {
-                                                // Use template's default value for this HOLD
-                                                // Task 7.2: Check template HOLD value type, not hardcoded field names
-                                                get_cell_value(old_id).unwrap_or_else(|| {
-                                                    // If template HOLD not found, check data_template for the value type
-                                                    // by looking at what type of value this field has in the template
-                                                    if let Value::Object(template_fields) = data_template {
-                                                        if let Some(field_name) = field_name {
-                                                            if let Some(template_field_value) = template_fields.get(&std::sync::Arc::from(field_name)) {
-                                                                // If it's a CellRef, the type is unknown here
-                                                                // Default boolean fields to false (common pattern)
-                                                                if matches!(template_field_value, Value::CellRef(_)) {
-                                                                    // Unknown type - try Unit first
-                                                                    return Value::Unit;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    Value::Unit
-                                                })
-                                            };
-                                            if LOG_DD_DEBUG { zoon::println!("[DD Worker] Registering HOLD: {} -> {} = {:?} (field: {:?})", old_id, new_id, initial_value, field_name); }
-                                            update_cell_no_persist(new_id, initial_value);
                                         }
-
-                                        if LOG_DD_DEBUG { zoon::println!("[DD Worker] ListAppendWithTemplate: Created item with {} HOLDs, {} LINKs", cell_id_map.len(), link_id_map.len()); }
-
-                                        // Replicate dynamic link actions from template to cloned item
-                                        // For each LinkRef in the template, look up its action and register with remapped IDs
-                                        use super::super::io::{add_dynamic_link_action, get_dynamic_link_action, DynamicLinkAction};
-                                        for (old_link_id, new_link_id) in &link_id_map {
-                                            if let Some(action) = get_dynamic_link_action(old_link_id) {
-                                                // Remap hold IDs in the action
-                                                let remapped_action = match action {
-                                                    DynamicLinkAction::SetTrue(old_hold) => {
-                                                        cell_id_map.get(&old_hold)
-                                                            .map(|new_hold| DynamicLinkAction::SetTrue(new_hold.clone()))
-                                                    }
-                                                    DynamicLinkAction::SetFalse(old_hold) => {
-                                                        cell_id_map.get(&old_hold)
-                                                            .map(|new_hold| DynamicLinkAction::SetFalse(new_hold.clone()))
-                                                    }
-                                                    DynamicLinkAction::EditingHandler { editing_cell, title_cell } => {
-                                                        match (cell_id_map.get(&editing_cell), cell_id_map.get(&title_cell)) {
-                                                            (Some(new_editing), Some(new_title)) => {
-                                                                Some(DynamicLinkAction::EditingHandler {
-                                                                    editing_cell: new_editing.clone(),
-                                                                    title_cell: new_title.clone(),
-                                                                })
-                                                            }
-                                                            _ => None,
-                                                        }
-                                                    }
-                                                    DynamicLinkAction::HoverState(old_hold) => {
-                                                        cell_id_map.get(&old_hold)
-                                                            .map(|new_hold| DynamicLinkAction::HoverState(new_hold.clone()))
-                                                    }
-                                                    DynamicLinkAction::RemoveListItem { .. } => {
-                                                        Some(DynamicLinkAction::RemoveListItem { link_id: new_link_id.clone() })
-                                                    }
-                                                    DynamicLinkAction::SetFalseOnKeys { cell_id, keys } => {
-                                                        cell_id_map.get(&cell_id)
-                                                            .map(|new_hold| DynamicLinkAction::SetFalseOnKeys {
-                                                                cell_id: new_hold.clone(),
-                                                                keys: keys.clone(),
-                                                            })
-                                                    }
-                                                    DynamicLinkAction::BoolToggle(old_hold) => {
-                                                        cell_id_map.get(&old_hold)
-                                                            .map(|new_hold| DynamicLinkAction::BoolToggle(new_hold.clone()))
-                                                    }
-                                                    DynamicLinkAction::ListToggleAllCompleted { list_cell_id, completed_field } => {
-                                                        // ListToggleAllCompleted operates on the whole list, not per-item
-                                                        // Keep the same action (list_cell_id doesn't change per item)
-                                                        Some(DynamicLinkAction::ListToggleAllCompleted {
-                                                            list_cell_id: list_cell_id.clone(),
-                                                            completed_field: completed_field.clone(),
-                                                        })
-                                                    }
-                                                };
-                                                if let Some(new_action) = remapped_action {
-                                                    if LOG_DD_DEBUG { zoon::println!("[DD Worker] Replicating action {} -> {} {:?}", old_link_id, new_link_id, new_action); }
-                                                    add_dynamic_link_action(new_link_id.clone(), new_action);
-                                                }
-                                            }
+                                        Value::list_push(cell_id_for_transform.clone(), prepared_data.clone())
+                                    }
+                                    (_, EventValue::Text(text)) => {
+                                        // Text events should have been pre-instantiated.
+                                        if LOG_DD_DEBUG {
+                                            zoon::println!("[DD Worker] WARNING: ListAppendWithTemplate received Text event '{}' - should have been pre-instantiated", text);
                                         }
-
-                                        // If element template exists, clone it with SAME ID mapping
-                                        // and add to "list_elements" HOLD for unified rendering
-                                        if let Some(elem_tmpl) = element_template {
-                                            // Find the hover link in the element template BEFORE cloning
-                                            // Element template is Tagged "Element" with fields including element.hovered
-                                            let hover_link_old_id = if let Value::Tagged { fields, .. } = elem_tmpl {
-                                                fields.get("element")
-                                                    .and_then(|e| e.get("hovered"))
-                                                    .and_then(|h| match h {
-                                                        Value::LinkRef(id) => Some(id.to_string()),
-                                                        _ => None,
-                                                    })
-                                            } else {
-                                                None
-                                            };
-
-                                            // Find the WhileRef for hover in the element template's items
-                                            // This is the WhileRef that has arms for True (delete button) and False (NoElement)
-                                            let hover_cell_old_id = if let Value::Tagged { fields, .. } = elem_tmpl {
-                                                find_hover_while_cell_id(fields.get("items"))
-                                            } else {
-                                                None
-                                            };
-
-                                            // Pre-populate hover hold mapping BEFORE cloning
-                                            // The hover WhileRef uses cell_id like "hover_link_22", which is a synthetic hold
-                                            // We need to map it to "hover_{new_link_id}" before clone processes the WhileRef
-                                            if let (Some(old_link), Some(old_hold)) = (&hover_link_old_id, &hover_cell_old_id) {
-                                                // First ensure the link gets a new ID
-                                                let new_link_id = link_id_map
-                                                    .entry(old_link.clone())
-                                                    .or_insert_with(|| {
-                                                        let counter = DYNAMIC_LINK_COUNTER.fetch_add(1, Ordering::SeqCst);
-                                                        format!("{}{}", DYNAMIC_LINK_PREFIX, counter)
-                                                    })
-                                                    .clone();
-                                                // Then create the hover hold mapping: hover_link_22 → hover_dynamic_link_1000
-                                                let new_hover_cell = format!("hover_{}", new_link_id);
-                                                cell_id_map.insert(old_hold.clone(), new_hover_cell.clone());
-                                                if LOG_DD_DEBUG { zoon::println!("[DD Worker] Pre-mapped hover hold: {} -> {}", old_hold, new_hover_cell); }
-                                            }
-
-                                            // Clone element template - reuses the same ID mapping
-                                            // Pass new_data_item as context to resolve PlaceholderFields (e.g., double_click LinkRefs)
-                                            let new_element = clone_template_with_fresh_ids_with_context(elem_tmpl, &mut cell_id_map, &mut link_id_map, &new_data_item);
-
-                                            // Register HoverState action if we found both the hover link and hold
-                                            if let (Some(old_link), Some(old_hold)) = (hover_link_old_id, hover_cell_old_id) {
-                                                if let (Some(new_link), Some(new_hold)) = (link_id_map.get(&old_link), cell_id_map.get(&old_hold)) {
-                                                    if LOG_DD_DEBUG { zoon::println!("[DD Worker] Registering HoverState: {} -> {}", new_link, new_hold); }
-                                                    use super::super::io::{add_dynamic_link_action, DynamicLinkAction};
-                                                    add_dynamic_link_action(new_link.clone(), DynamicLinkAction::HoverState(new_hold.clone()));
-                                                    // Initialize hover hold to false
-                                                    update_cell_no_persist(new_hold, Value::Bool(false));
-                                                }
-                                            }
-
-                                            // Get current list_elements list and append
-                                            let current_elements = super::super::io::get_cell_value("list_elements")
-                                                .unwrap_or_else(|| Value::List(Arc::new(Vec::new())));
-                                            if let Value::List(elems) = current_elements {
-                                                let mut new_elems: Vec<Value> = elems.to_vec();
-                                                new_elems.push(new_element);
-                                                let new_count = new_elems.len();
-                                                update_cell_no_persist("list_elements", Value::List(Arc::new(new_elems)));
-                                                if LOG_DD_DEBUG { zoon::println!("[DD Worker] Added element to list_elements, now {} elements", new_count); }
-                                            }
-                                        }
-
-                                        let mut new_items: Vec<Value> = items.to_vec();
-                                        new_items.push(new_data_item);
-                                        Value::List(Arc::new(new_items))
+                                        state.clone()
                                     }
                                     _ => state.clone(),
                                 }
                             }
                             StateTransform::ListAppendWithClear(clear_link_id) => {
-                                // Combined list operations:
-                                // - "Enter:text" → append text to list
-                                // - Unit event from clear_link_id → clear list to empty
+                                // Phase 2.1: Emit ListPush/ListClear diffs - O(1) operations
                                 match (state, event) {
-                                    (Value::List(items), (_, EventValue::Text(text))) => {
+                                    (state, (_, EventValue::Text(text))) if state.is_list_like() => {
                                         // Only process Enter key events with non-empty text
                                         let Some(item_text) = EventPayload::parse_enter_text(text) else {
                                             return state.clone();
                                         };
-                                        let mut new_items: Vec<Value> = items.to_vec();
-                                        new_items.push(Value::text(item_text));
-                                        Value::List(Arc::new(new_items))
+                                        Value::list_push(cell_id_for_transform.clone(), Value::text(item_text))
                                     }
-                                    // Unit event from clear button → clear list
-                                    // IMPORTANT: Only clear if the event is from the clear button's link,
-                                    // not from other Unit events (like text input change handler)
-                                    (Value::List(_), (link_id, EventValue::Unit)) if link_id == clear_link_id => {
-                                        Value::List(Arc::new(Vec::new()))
+                                    // Unit event from clear button → emit ListClear diff
+                                    (state, (link_id, EventValue::Unit)) if state.is_list_like() && link_id == clear_link_id => {
+                                        Value::list_clear(cell_id_for_transform.clone())
                                     }
                                     _ => state.clone(),
                                 }
                             }
-                            StateTransform::ListAppendWithTemplateAndClear { data_template, element_template, title_cell_field, clear_link_id } => {
-                                // Combined template append + clear button support
-                                // - "Enter:text" → append using template cloning logic
-                                // - Unit event from clear_link_id → clear both list_data and list_elements
-                                match (state, event) {
-                                    // Clear button: clear both lists
-                                    (Value::List(_), (link_id, EventValue::Unit)) if link_id == clear_link_id => {
-                                        // Also clear list_elements
-                                        update_cell_no_persist("list_elements", Value::List(Arc::new(Vec::new())));
-                                        Value::List(Arc::new(Vec::new()))
+                            StateTransform::ListAppendWithTemplateAndClear { data_template: _, element_template: _, title_cell_field: _, clear_link_id } => {
+                                // Phase 2.1: Emit ListPush/ListClear diffs - O(1) operations
+                                match event {
+                                    // Clear button: emit MultiCellUpdate to clear both lists atomically
+                                    (link_id, EventValue::Unit) if state.is_list_like() && link_id == &clear_link_id => {
+                                        // Phase 2: Return MultiCellUpdate instead of side effect
+                                        Value::multi_cell_update(vec![
+                                            ("list_elements", Value::list_clear("list_elements")),
+                                            (cell_id_for_transform.as_str(), Value::list_clear(cell_id_for_transform.clone())),
+                                        ])
                                     }
-                                    // Text input: use template cloning logic
-                                    (Value::List(items), (_, EventValue::Text(text))) => {
-                                        // Only process Enter key events with non-empty text
-                                        let Some(item_text) = EventPayload::parse_enter_text(text) else {
+                                    // PreparedItem: Emit ListPush diff - O(1) operation
+                                    (_, EventValue::PreparedItem(prepared_data)) => {
+                                        if !state.is_list_like() {
                                             return state.clone();
-                                        };
-
-                                        // === Template cloning logic (same as ListAppendWithTemplate) ===
-
-                                        // Extract field-to-hold mapping from data template
-                                        let field_to_hold = extract_field_to_hold_map(data_template);
-
-                                        // Clone data template with fresh CellRef/LinkRef IDs
-                                        let mut cell_id_map: HashMap<String, String> = HashMap::new();
-                                        let mut link_id_map: HashMap<String, String> = HashMap::new();
-                                        let new_data_item = clone_template_with_fresh_ids(data_template, &mut cell_id_map, &mut link_id_map);
-
-                                        // Create reverse mapping: old_cell_id -> field_name
-                                        let hold_to_field: HashMap<String, String> = field_to_hold
-                                            .iter()
-                                            .map(|(field, hold)| (hold.clone(), field.clone()))
-                                            .collect();
-
-                                        // Register new HOLDs with initial values
-                                        for (old_id, new_id) in &cell_id_map {
-                                            let field_name = hold_to_field.get(old_id).map(|s| s.as_str());
-                                            let initial_value = if field_name == Some(title_cell_field.as_str()) {
-                                                Value::text(item_text)
-                                            } else {
-                                                get_cell_value(old_id).unwrap_or_else(|| {
-                                                    if let Value::Object(template_fields) = data_template {
-                                                        if let Some(field_name) = field_name {
-                                                            if let Some(template_field_value) = template_fields.get(&std::sync::Arc::from(field_name)) {
-                                                                if matches!(template_field_value, Value::CellRef(_)) {
-                                                                    return Value::Unit;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    Value::Unit
-                                                })
-                                            };
-                                            if LOG_DD_DEBUG { zoon::println!("[DD Worker] ListAppendWithTemplateAndClear: Registering HOLD: {} -> {} = {:?}", old_id, new_id, initial_value); }
-                                            update_cell_no_persist(new_id, initial_value);
                                         }
-
-                                        // Replicate dynamic link actions from template to cloned item
-                                        use super::super::io::{add_dynamic_link_action, get_dynamic_link_action, DynamicLinkAction};
-                                        for (old_link_id, new_link_id) in &link_id_map {
-                                            if let Some(action) = get_dynamic_link_action(old_link_id) {
-                                                let remapped_action = match action {
-                                                    DynamicLinkAction::SetTrue(old_hold) => {
-                                                        cell_id_map.get(&old_hold).map(|new_hold| DynamicLinkAction::SetTrue(new_hold.clone()))
-                                                    }
-                                                    DynamicLinkAction::SetFalse(old_hold) => {
-                                                        cell_id_map.get(&old_hold).map(|new_hold| DynamicLinkAction::SetFalse(new_hold.clone()))
-                                                    }
-                                                    DynamicLinkAction::EditingHandler { editing_cell, title_cell } => {
-                                                        match (cell_id_map.get(&editing_cell), cell_id_map.get(&title_cell)) {
-                                                            (Some(new_editing), Some(new_title)) => {
-                                                                Some(DynamicLinkAction::EditingHandler {
-                                                                    editing_cell: new_editing.clone(),
-                                                                    title_cell: new_title.clone(),
-                                                                })
-                                                            }
-                                                            _ => None,
-                                                        }
-                                                    }
-                                                    DynamicLinkAction::HoverState(old_hold) => {
-                                                        cell_id_map.get(&old_hold).map(|new_hold| DynamicLinkAction::HoverState(new_hold.clone()))
-                                                    }
-                                                    DynamicLinkAction::RemoveListItem { .. } => {
-                                                        Some(DynamicLinkAction::RemoveListItem { link_id: new_link_id.clone() })
-                                                    }
-                                                    DynamicLinkAction::SetFalseOnKeys { cell_id, keys } => {
-                                                        cell_id_map.get(&cell_id).map(|new_hold| DynamicLinkAction::SetFalseOnKeys {
-                                                            cell_id: new_hold.clone(),
-                                                            keys: keys.clone(),
-                                                        })
-                                                    }
-                                                    DynamicLinkAction::BoolToggle(old_hold) => {
-                                                        cell_id_map.get(&old_hold).map(|new_hold| DynamicLinkAction::BoolToggle(new_hold.clone()))
-                                                    }
-                                                    DynamicLinkAction::ListToggleAllCompleted { list_cell_id, completed_field } => {
-                                                        Some(DynamicLinkAction::ListToggleAllCompleted {
-                                                            list_cell_id: list_cell_id.clone(),
-                                                            completed_field: completed_field.clone(),
-                                                        })
-                                                    }
-                                                };
-                                                if let Some(new_action) = remapped_action {
-                                                    if LOG_DD_DEBUG { zoon::println!("[DD Worker] ListAppendWithTemplateAndClear: Replicating action {} -> {} {:?}", old_link_id, new_link_id, new_action); }
-                                                    add_dynamic_link_action(new_link_id.clone(), new_action);
-                                                }
-                                            }
+                                        Value::list_push(cell_id_for_transform.clone(), prepared_data.clone())
+                                    }
+                                    // Text events should have been pre-instantiated
+                                    (_, EventValue::Text(text)) => {
+                                        if LOG_DD_DEBUG {
+                                            zoon::println!("[DD Worker] WARNING: ListAppendWithTemplateAndClear received Text event '{}' - should have been pre-instantiated", text);
                                         }
-
-                                        // If element template exists, clone it with SAME ID mapping
-                                        if let Some(elem_tmpl) = element_template {
-                                            let hover_link_old_id = if let Value::Tagged { fields, .. } = elem_tmpl {
-                                                fields.get("element").and_then(|e| e.get("hovered")).and_then(|h| match h {
-                                                    Value::LinkRef(id) => Some(id.to_string()),
-                                                    _ => None,
-                                                })
-                                            } else {
-                                                None
-                                            };
-
-                                            let hover_cell_old_id = if let Value::Tagged { fields, .. } = elem_tmpl {
-                                                find_hover_while_cell_id(fields.get("items"))
-                                            } else {
-                                                None
-                                            };
-
-                                            if let (Some(old_link), Some(old_hold)) = (&hover_link_old_id, &hover_cell_old_id) {
-                                                let new_link_id = link_id_map
-                                                    .entry(old_link.clone())
-                                                    .or_insert_with(|| {
-                                                        let counter = DYNAMIC_LINK_COUNTER.fetch_add(1, Ordering::SeqCst);
-                                                        format!("{}{}", DYNAMIC_LINK_PREFIX, counter)
-                                                    })
-                                                    .clone();
-                                                let new_hover_cell = format!("hover_{}", new_link_id);
-                                                cell_id_map.insert(old_hold.clone(), new_hover_cell.clone());
-                                            }
-
-                                            let new_element = clone_template_with_fresh_ids_with_context(elem_tmpl, &mut cell_id_map, &mut link_id_map, &new_data_item);
-
-                                            if let (Some(old_link), Some(old_hold)) = (hover_link_old_id, hover_cell_old_id) {
-                                                if let (Some(new_link), Some(new_hold)) = (link_id_map.get(&old_link), cell_id_map.get(&old_hold)) {
-                                                    add_dynamic_link_action(new_link.clone(), DynamicLinkAction::HoverState(new_hold.clone()));
-                                                    update_cell_no_persist(new_hold, Value::Bool(false));
-                                                }
-                                            }
-
-                                            let current_elements = super::super::io::get_cell_value("list_elements")
-                                                .unwrap_or_else(|| Value::List(Arc::new(Vec::new())));
-                                            if let Value::List(elems) = current_elements {
-                                                let mut new_elems: Vec<Value> = elems.to_vec();
-                                                new_elems.push(new_element);
-                                                update_cell_no_persist("list_elements", Value::List(Arc::new(new_elems)));
-                                            }
-                                        }
-
-                                        let mut new_items: Vec<Value> = items.to_vec();
-                                        new_items.push(new_data_item);
-                                        Value::List(Arc::new(new_items))
+                                        state.clone()
                                     }
                                     _ => state.clone(),
                                 }
@@ -2385,161 +2669,51 @@ impl Worker {
                                     _ => state.clone(),
                                 }
                             }
-                            StateTransform::ListRemoveCompleted => {
-                                // Remove all items where completed=true
-                                // Uses generic checkbox toggle detection (no hardcoded field names)
-                                let _states_map = transform_states.lock().unwrap();
-                                match state {
-                                    Value::List(items) => {
-                                        // Use generic checkbox toggle detection (no hardcoded field names)
-                                        // Filter the data list to keep only uncompleted items
-                                        let filtered: Vec<Value> = items.iter()
-                                            .filter(|item| !is_item_completed_generic(item))
-                                            .cloned()
-                                            .collect();
-                                        zoon::println!("[DD Transform] ListRemoveCompleted: Filtered {} -> {} items", items.len(), filtered.len());
+                            StateTransform::ListRemoveCompleted { completed_field } => {
+                                // Phase 7.3: Remove all items where the specified boolean field is true
+                                // Uses ListRemoveBatch diffs instead of filtering + full list clone
+                                //
+                                // PURE IMPLEMENTATION: Checks item data directly via is_item_field_true()
+                                // with the explicit completed_field parameter from config. No IO layer reads.
+                                //
+                                // Key improvement: We emit batch removal keys instead of cloned filtered lists.
+                                // This gives O(k) diff application instead of O(n) list clone.
+                                if let Some(items) = state.as_list_items() {
+                                    // Collect keys of completed items using explicit field name
+                                    let completed_keys: Vec<Arc<str>> = items.iter()
+                                        .filter(|item| is_item_field_true(item, completed_field))
+                                        .map(|item| extract_item_key_for_removal(item))
+                                        .collect();
 
-                                        // Also filter "list_elements" to remove corresponding elements
-                                        // Uses same generic detection for consistency
-                                        if let Some(Value::List(elements)) = super::super::io::get_cell_value("list_elements") {
-                                            let filtered_elements: Vec<Value> = elements.iter()
-                                                .filter(|element| {
-                                                    // Find the checkbox's checked CellRef using generic detection
-                                                    let completed_cell_id = find_checkbox_cell_id(element);
-                                                    if let Some(cell_id) = completed_cell_id {
-                                                        // Always read from global CELL_STATES (generic approach)
-                                                        // Handle both Bool and Tagged { tag: "True"/"False" } variants
-                                                        let is_completed = super::super::io::get_cell_value(&cell_id)
-                                                            .map(|v| match v {
-                                                                Value::Bool(b) => b,
-                                                                Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => BoolTag::is_true(tag.as_ref()),
-                                                                _ => false,
-                                                            })
-                                                            .unwrap_or(false);
-                                                        zoon::println!("[DD Transform] Element hold {} is_completed={}, keeping={}", cell_id, is_completed, !is_completed);
-                                                        !is_completed
-                                                    } else {
-                                                        true // Keep elements we can't determine
-                                                    }
-                                                })
-                                                .cloned()
-                                                .collect();
-                                            zoon::println!("[DD Transform] ListRemoveCompleted: Filtered elements {} -> {}", elements.len(), filtered_elements.len());
-                                            update_cell_no_persist("list_elements", Value::List(Arc::new(filtered_elements)));
-                                        }
-
-                                        Value::List(Arc::new(filtered))
+                                    if completed_keys.is_empty() {
+                                        zoon::println!("[DD Transform] ListRemoveCompleted: No completed items to remove");
+                                        return state.clone();
                                     }
-                                    _ => state.clone(),
+
+                                    zoon::println!("[DD Transform] ListRemoveCompleted: Emitting batch removal for {} keys", completed_keys.len());
+
+                                    // Emit MultiCellUpdate with ListRemoveBatch for both lists
+                                    // The output observer will apply the batch removal to both lists
+                                    Value::multi_cell_update(vec![
+                                        ("list_elements", Value::list_remove_batch("list_elements", completed_keys.clone())),
+                                        (cell_id_for_transform.as_str(), Value::list_remove_batch(cell_id_for_transform.clone(), completed_keys)),
+                                    ])
+                                } else {
+                                    state.clone()
                                 }
                             }
                             StateTransform::RemoveListItem => {
-                                // Remove a specific list item by link_id (matches remove_item_button LinkRef)
-                                // Event format: "remove:LINK_ID" where LINK_ID identifies the item to remove
-                                // HACK: list-specific - used for delete button on hover
-                                zoon::println!("[DD Transform] RemoveListItem: Received event {:?}, state has {} items",
-                                    event, if let Value::List(items) = state { items.len() } else { 0 });
+                                // Phase 2.1: Emit ListRemoveByKey diff - O(1) lookup
+                                // The key is the link_id from the event
+                                zoon::println!("[DD Transform] RemoveListItem: Received event {:?}", event);
                                 match (state, event) {
-                                    (Value::List(items), (_, EventValue::Text(text))) => {
+                                    (state, (_, EventValue::Text(text))) if state.is_list_like() => {
                                         zoon::println!("[DD Transform] RemoveListItem: Processing text event: {}", text);
                                         if let Some(link_id_str) = EventPayload::parse_remove_link(text) {
-                                            // Find the item whose remove button matches this link_id
-                                            // Uses the PARSED PATH from List/remove(item, on: item.X.Y.event.press)
-                                            // The path tells us exactly where the LinkRef is - no pattern matching needed
-                                            let remove_path = super::super::io::get_remove_event_path();
-                                            zoon::println!("[DD Transform] RemoveListItem: Using parsed path {:?} to find remove button", remove_path);
-
-                                            let index_to_remove = items.iter().position(|item| {
-                                                if remove_path.is_empty() {
-                                                    // Fallback: no path parsed, can't find button
-                                                    return false;
-                                                }
-
-                                                // Navigate through the parsed path to find the LinkRef
-                                                // E.g., path = ["todo_elements", "remove_todo_button"]
-                                                // Navigate: item -> todo_elements -> remove_todo_button -> LinkRef
-                                                let mut current: Option<&Value> = Some(item);
-                                                for path_segment in &remove_path {
-                                                    current = current.and_then(|v| v.get(path_segment));
-                                                }
-
-                                                // Check if we found a matching LinkRef
-                                                if let Some(Value::LinkRef(remove_link)) = current {
-                                                    if remove_link.as_ref() == link_id_str {
-                                                        return true;
-                                                    }
-                                                }
-                                                false
-                                            });
-
-                                            if let Some(index) = index_to_remove {
-                                                zoon::println!("[DD Transform] RemoveListItem: Found item with link_id {} at index {}", link_id_str, index);
-                                                let mut new_items: Vec<Value> = items.to_vec();
-                                                new_items.remove(index);
-
-                                                // Also remove from "list_elements" - find by matching hover link or checkbox link
-                                                // The element has a checkbox whose element.event.click LinkRef matches the item's item_checkbox
-                                                // NOTE: list_elements only contains dynamic items, not initial ones
-                                                if let Some(Value::List(elements)) = super::super::io::get_cell_value("list_elements") {
-                                                    // For dynamic items, the link_id starts with "dynamic_link_"
-                                                    // Find the element whose hover WhileRef matches our link_id pattern
-                                                    let element_index = elements.iter().position(|element| {
-                                                        // Check if this element's hover link matches
-                                                        if let Value::Tagged { fields, .. } = element {
-                                                            if let Some(Value::LinkRef(hover_link)) = fields.get("element").and_then(|e| e.get("hovered")) {
-                                                                // The hover link ID pattern: e.g., "dynamic_link_1004" for an item with remove button "dynamic_link_1001"
-                                                                // They share the same base, so check if our link_id starts with "dynamic_link_"
-                                                                // and extract the base number
-                                                                if link_id_str.starts_with(DYNAMIC_LINK_PREFIX) {
-                                                                    // Extract base number from remove button link
-                                                                    if let Some(base) = link_id_str.strip_prefix(DYNAMIC_LINK_PREFIX) {
-                                                                        if let Ok(remove_num) = base.parse::<u32>() {
-                                                                            // The hover link is usually remove_num + 3 (based on ID allocation pattern)
-                                                                            // But safer to check the element's items for our specific link_id
-                                                                            if let Some(Value::List(elem_items)) = fields.get("items") {
-                                                                                for item in elem_items.iter() {
-                                                                                    // Look for the delete button WhileRef
-                                                                                    if let Value::WhileRef { arms, .. } = item {
-                                                                                        for (_, body) in arms.iter() {
-                                                                                            if let Value::Tagged { fields: btn_fields, tag } = body {
-                                                                                                if tag.as_ref() == "Element" {
-                                                                                                    if let Some(Value::Object(btn_elem)) = btn_fields.get("element") {
-                                                                                                        if let Some(Value::Object(event)) = btn_elem.get("event") {
-                                                                                                            if let Some(Value::LinkRef(press_link)) = event.get("press") {
-                                                                                                                if press_link.as_ref() == link_id_str {
-                                                                                                                    return true;
-                                                                                                                }
-                                                                                                            }
-                                                                                                        }
-                                                                                                    }
-                                                                                                }
-                                                                                            }
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        false
-                                                    });
-
-                                                    if let Some(elem_idx) = element_index {
-                                                        let mut new_elements: Vec<Value> = elements.to_vec();
-                                                        new_elements.remove(elem_idx);
-                                                        zoon::println!("[DD Transform] RemoveListItem: Also removed element at index {}, now {} elements", elem_idx, new_elements.len());
-                                                        update_cell_no_persist("list_elements", Value::List(Arc::new(new_elements)));
-                                                    } else {
-                                                        zoon::println!("[DD Transform] RemoveListItem: No matching element found in list_elements for link_id {}", link_id_str);
-                                                    }
-                                                }
-
-                                                return Value::List(Arc::new(new_items));
-                                            } else {
-                                                zoon::println!("[DD Transform] RemoveListItem: No item found with link_id {}", link_id_str);
-                                            }
+                                            // Phase 2.1: Emit ListRemoveByKey diff with link_id as key
+                                            // The sync_cell_from_dd() will apply this and also handle list_elements
+                                            zoon::println!("[DD Transform] RemoveListItem: Emitting ListRemoveByKey for link:{}", link_id_str);
+                                            return Value::list_remove_by_key(cell_id_for_transform.clone(), format!("link:{}", link_id_str));
                                         }
                                         state.clone()
                                     }
@@ -2554,8 +2728,10 @@ impl Worker {
                             StateTransform::ListItemSetFieldByIdentity { identity_path, field_path, update } => {
                                 // Generic: Set a field on a list item identified by LinkRef
                                 // Event format: "action:LINK_ID" or "action:LINK_ID:value"
+                                // Phase 4: Use ListItemUpdate diff for O(1) updates (no list clone)
                                 match (state, event) {
-                                    (Value::List(items), (_, EventValue::Text(text))) => {
+                                    (state, (_, EventValue::Text(text))) if state.is_list_like() => {
+                                        let items = state.as_list_items().unwrap();
                                         // Parse event format: extract link_id and optional value
                                         // Format: "action:LINK_ID" or "action:LINK_ID:value"
                                         let parts: Vec<&str> = text.splitn(3, ':').collect();
@@ -2565,22 +2741,26 @@ impl Worker {
                                         let link_id_str = parts[1];
                                         let event_value = parts.get(2).map(|s| s.trim());
 
-                                        // Find item by matching LinkRef at identity_path
-                                        let index = items.iter().position(|item| {
+                                        // Find item to get the key and compute new value
+                                        let item_opt = items.iter().find(|item| {
                                             get_link_ref_at_path(item, identity_path)
                                                 .map(|id| id == link_id_str)
                                                 .unwrap_or(false)
                                         });
 
-                                        if let Some(idx) = index {
-                                            let mut new_items: Vec<Value> = items.to_vec();
-                                            new_items[idx] = update_field_at_path(
-                                                &new_items[idx],
-                                                field_path,
-                                                update,
-                                                event_value,
+                                        if let Some(item) = item_opt {
+                                            // Compute the new field value using the update function
+                                            let new_field_value = compute_field_update(item, field_path, update, event_value);
+
+                                            // Phase 4: Return ListItemUpdate diff - O(1) key lookup in output observer
+                                            let key = format!("link:{}", link_id_str);
+                                            let field_path_arc: Vec<Arc<str>> = field_path.iter().map(|s| Arc::from(s.as_str())).collect();
+                                            return Value::list_item_update(
+                                                cell_id_for_transform.clone(),
+                                                key,
+                                                field_path_arc,
+                                                new_field_value,
                                             );
-                                            return Value::List(Arc::new(new_items));
                                         }
                                         state.clone()
                                     }
@@ -2588,71 +2768,23 @@ impl Worker {
                                 }
                             }
 
-                            StateTransform::ListItemRemoveByIdentity { identity_path, elements_hold } => {
-                                // Generic: Remove a list item identified by LinkRef
-                                // Event format: "remove:LINK_ID"
+                            StateTransform::ListItemRemoveByIdentity { identity_path: _, elements_hold } => {
+                                // Phase 2.1: Emit ListRemoveByKey diff - O(1) lookup
+                                // Note: identity_path is no longer needed as we use the link_id directly as key
                                 match (state, event) {
-                                    (Value::List(items), (_, EventValue::Text(text))) => {
+                                    (state, (_, EventValue::Text(text))) if state.is_list_like() => {
                                         if let Some(link_id_str) = EventPayload::parse_remove_link(text) {
-                                            // Find item by matching LinkRef at identity_path
-                                            let index = items.iter().position(|item| {
-                                                get_link_ref_at_path(item, identity_path)
-                                                    .map(|id| id == link_id_str)
-                                                    .unwrap_or(false)
-                                            });
-
-                                            if let Some(idx) = index {
-                                                let mut new_items: Vec<Value> = items.to_vec();
-                                                new_items.remove(idx);
-
-                                                // Also remove from parallel elements list if specified
-                                                if let Some(cell_id) = elements_hold {
-                                                    if let Some(Value::List(elements)) = super::super::io::get_cell_value(cell_id) {
-                                                        // Find matching element by hover link or same identity
-                                                        let elem_idx = elements.iter().position(|element| {
-                                                            // Check hover link pattern for dynamic items
-                                                            if let Value::Tagged { fields, .. } = element {
-                                                                if let Some(Value::LinkRef(hover_link)) = fields.get("element").and_then(|e| e.get("hovered")) {
-                                                                    // Dynamic items share ID ranges
-                                                                    if link_id_str.starts_with(DYNAMIC_LINK_PREFIX) && hover_link.is_dynamic() {
-                                                                        // Check by searching element's items for our link_id
-                                                                        if let Some(Value::List(elem_items)) = fields.get("items") {
-                                                                            for item in elem_items.iter() {
-                                                                                if let Value::WhileRef { arms, .. } = item {
-                                                                                    for (_, body) in arms.iter() {
-                                                                                        if let Value::Tagged { fields: btn_fields, tag } = body {
-                                                                                            if tag.as_ref() == "Element" {
-                                                                                                if let Some(Value::Object(btn_elem)) = btn_fields.get("element") {
-                                                                                                    if let Some(Value::Object(evt)) = btn_elem.get("event") {
-                                                                                                        if let Some(Value::LinkRef(press_link)) = evt.get("press") {
-                                                                                                            if press_link.as_ref() == link_id_str {
-                                                                                                                return true;
-                                                                                                            }
-                                                                                                        }
-                                                                                                    }
-                                                                                                }
-                                                                                            }
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                            false
-                                                        });
-
-                                                        if let Some(e_idx) = elem_idx {
-                                                            let mut new_elements: Vec<Value> = elements.to_vec();
-                                                            new_elements.remove(e_idx);
-                                                            update_cell_no_persist(cell_id, Value::List(Arc::new(new_elements)));
-                                                        }
-                                                    }
-                                                }
-
-                                                return Value::List(Arc::new(new_items));
+                                            let key = format!("link:{}", link_id_str);
+                                            // Phase 2: Use MultiCellUpdate if we need to update both lists
+                                            if let Some(elements_cell_id) = elements_hold {
+                                                // Return MultiCellUpdate for both lists
+                                                return Value::multi_cell_update(vec![
+                                                    (elements_cell_id.as_str(), Value::list_remove_by_key(elements_cell_id.clone(), key.clone())),
+                                                    (cell_id_for_transform.as_str(), Value::list_remove_by_key(cell_id_for_transform.clone(), key)),
+                                                ]);
                                             }
+                                            // Single list removal
+                                            return Value::list_remove_by_key(cell_id_for_transform.clone(), key);
                                         }
                                         state.clone()
                                     }
@@ -2660,43 +2792,22 @@ impl Worker {
                                 }
                             }
 
-                            StateTransform::ListAppendFromTemplate { template, elements_hold } => {
-                                // Generic: Append item using ListItemTemplate
-                                // Template's field_initializers define how each field is initialized
-                                // No hardcoded field names - uses FromEventText and Constant initializers
-                                match (state, event) {
-                                    (Value::List(items), (_, EventValue::Text(text))) => {
-                                        // Extract text from "Enter:text" format using type-safe parser
-                                        let Some(input_text) = EventPayload::parse_enter_text(text) else {
+                            StateTransform::ListAppendFromTemplate { template: _, elements_hold: _ } => {
+                                // Phase 2.1: Emit ListPush diff - O(1) operation
+                                match event {
+                                    (_, EventValue::PreparedItem(prepared_data)) => {
+                                        // Emit ListPush diff instead of cloning list
+                                        if !state.is_list_like() {
                                             return state.clone();
-                                        };
-
-                                        // Instantiate template using only field_initializers
-                                        // No hardcoded initial_values - let template config define everything
-                                        let instantiated = instantiate_template(
-                                            template,
-                                            &HashMap::new(), // Empty - use field_initializers from template
-                                            Some(input_text), // For FromEventText initializers
-                                        );
-
-                                        let mut new_items: Vec<Value> = items.to_vec();
-                                        new_items.push(instantiated.data);
-
-                                        // Also append to elements list if specified
-                                        if let Some(cell_id) = elements_hold {
-                                            if let Some(element) = instantiated.element {
-                                                if let Some(Value::List(elements)) = super::super::io::get_cell_value(cell_id) {
-                                                    let mut new_elements: Vec<Value> = elements.to_vec();
-                                                    new_elements.push(element);
-                                                    update_cell_no_persist(cell_id, Value::List(Arc::new(new_elements)));
-                                                } else {
-                                                    // Create new elements list
-                                                    update_cell_no_persist(cell_id, Value::List(Arc::new(vec![element])));
-                                                }
-                                            }
                                         }
-
-                                        Value::List(Arc::new(new_items))
+                                        Value::list_push(cell_id_for_transform.clone(), prepared_data.clone())
+                                    }
+                                    (_, EventValue::Text(text)) => {
+                                        // Text events should have been pre-instantiated
+                                        if LOG_DD_DEBUG {
+                                            zoon::println!("[DD Worker] WARNING: ListAppendFromTemplate received Text event '{}' - should have been pre-instantiated", text);
+                                        }
+                                        state.clone()
                                     }
                                     _ => state.clone(),
                                 }
@@ -2710,40 +2821,21 @@ impl Worker {
                         }
                     });
 
-                    // Capture outputs for this HOLD
-                    let outputs = outputs_clone.clone();
-                    let final_states = final_states_clone.clone();
-                    let cell_id_for_inspect = hold_config.id.name().to_string();
-                    let cell_id_for_state = hold_config.id.name().to_string();
+                    // Phase 10: Tag outputs for pure DD capture (no Mutex!)
+                    let cell_id_for_tag: Arc<str> = Arc::from(hold_config.id.name());
                     let should_persist = hold_config.persist;
 
-                    hold_output.inspect(move |(state, time, diff)| {
-                        if *diff > 0 {
-                            // Record the new state
-                            final_states
-                                .lock()
-                                .unwrap()
-                                .insert(cell_id_for_state.clone(), state.clone());
-
-                            // Create output update
-                            // - hold_updates: persisted to localStorage
-                            // - hold_state_updates: UI only, not persisted
-                            let mut hold_updates = HashMap::new();
-                            let mut hold_state_updates = HashMap::new();
-                            if should_persist {
-                                hold_updates.insert(cell_id_for_inspect.clone(), state.clone());
-                            } else {
-                                hold_state_updates.insert(cell_id_for_inspect.clone(), state.clone());
-                            }
-
-                            outputs.lock().unwrap().push(DocumentUpdate {
-                                document: state.clone(),
-                                time: *time,
-                                hold_updates,
-                                hold_state_updates,
-                            });
-                        }
+                    // Map hold_output to TaggedCellOutput - flows through DD as pure data
+                    let tagged = hold_output.inner.map(move |(state, time, diff)| {
+                        (TaggedCellOutput::new(
+                            cell_id_for_tag.clone(),
+                            state,
+                            should_persist,
+                            time,
+                        ), time, diff)
                     });
+
+                    tagged_outputs.push(tagged);
                 }
 
                 // If no HOLDs configured, just count events as before
@@ -2751,22 +2843,27 @@ impl Worker {
                     use differential_dataflow::operators::Count;
 
                     let count = links.map(|_| ()).count();
-                    let outputs = outputs_clone.clone();
 
-                    count.inspect(move |(((), total), time, diff)| {
-                        if *diff > 0 {
-                            outputs.lock().unwrap().push(DocumentUpdate {
-                                document: Value::int(i64::try_from(*total).unwrap_or(0)),
-                                time: *time,
-                                hold_updates: HashMap::new(),
-                                hold_state_updates: HashMap::new(),
-                            });
-                        }
+                    // Phase 10: Tag count output for pure DD capture
+                    let count_tagged = count.inner.map(|(((), total), time, diff)| {
+                        (TaggedCellOutput::new(
+                            "__count__",
+                            Value::int(i64::try_from(total).unwrap_or(0)),
+                            false,
+                            time,
+                        ), time, diff)
                     });
+                    tagged_outputs.push(count_tagged);
                 }
 
+                // Phase 10: Concatenate all tagged outputs and capture
+                // This is pure DD - no Mutex, no RefCell, just message passing!
+                use timely::dataflow::operators::Concatenate;
+                let combined = scope.concatenate(tagged_outputs);
+                let outputs_rx = combined.capture();
+
                 let probe = links.probe();
-                (link_input_handle, probe)
+                (link_input_handle, probe, outputs_rx)
             });
 
             // Process events
@@ -2796,21 +2893,43 @@ impl Worker {
                     worker.step();
                 }
             }
+
+            // Phase 10: Return the captured outputs receiver
+            outputs_rx
         });
 
-        let outputs = Arc::try_unwrap(outputs)
-            .expect("outputs still borrowed")
-            .into_inner()
-            .unwrap();
+        // Phase 10: Extract captured outputs using timely's Extract trait
+        // This is pure DD - no Mutex unwrap, just channel extraction!
+        // Note: Extract trait is imported at the top of this function
+        let captured = outputs_rx.extract();
 
-        // Merge new states with initial states
+        // Build DocumentUpdates and final_states from captured TaggedCellOutputs
+        let mut outputs = Vec::new();
         let mut new_states = initial_states_for_merge;
-        let state_updates = Arc::try_unwrap(final_states)
-            .expect("final_states still borrowed")
-            .into_inner()
-            .unwrap();
-        for (k, v) in state_updates {
-            new_states.insert(k, v);
+
+        for (_time, batch) in captured {
+            for (tagged, _t, diff) in batch {
+                if diff > 0 {
+                    // Record the new state
+                    new_states.insert(tagged.cell_id.to_string(), tagged.state.clone());
+
+                    // Create output update
+                    let mut hold_updates = HashMap::new();
+                    let mut hold_state_updates = HashMap::new();
+                    if tagged.should_persist {
+                        hold_updates.insert(tagged.cell_id.to_string(), tagged.state.clone());
+                    } else {
+                        hold_state_updates.insert(tagged.cell_id.to_string(), tagged.state.clone());
+                    }
+
+                    outputs.push(DocumentUpdate {
+                        document: tagged.state,
+                        time: tagged.time,
+                        hold_updates,
+                        hold_state_updates,
+                    });
+                }
+            }
         }
 
         (outputs, start_time + num_events as u64, new_states)

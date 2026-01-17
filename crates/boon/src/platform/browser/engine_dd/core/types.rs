@@ -270,14 +270,29 @@ impl ElementTag {
 }
 
 /// Structured event payload - type-safe event data.
+///
+/// Phase 3.1: Replaces string-based event encoding (format! strings) with type-safe variants.
+/// This enables compile-time checking of event payloads and eliminates string parsing overhead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventPayload {
-    /// Text input submission
+    /// Text input submission: "Enter:text"
     Enter(String),
-    /// Remove button click
+    /// Remove button click: "remove:link_id"
     Remove(LinkId),
-    /// Toggle action
+    /// Toggle action: "toggle:cell_id"
     Toggle(CellId),
+    /// Set cell to true: "set_true:cell_id"
+    SetTrue(CellId),
+    /// Set cell to false: "set_false:cell_id"
+    SetFalse(CellId),
+    /// Toggle boolean cell: "bool_toggle:cell_id"
+    BoolToggle(CellId),
+    /// Set hover state: "hover_set:cell_id:value"
+    HoverSet { cell_id: CellId, value: bool },
+    /// Toggle all items in list: "list_toggle_all:list_cell_id:field"
+    ListToggleAll { list_cell_id: CellId, field: String },
+    /// Set text value: "set_text:cell_id:value"
+    SetText { cell_id: CellId, value: String },
     /// Simple trigger with no data
     Unit,
 }
@@ -289,6 +304,12 @@ impl EventPayload {
     /// - `"Enter:text"` → `EventPayload::Enter("text")`
     /// - `"remove:link_id"` → `EventPayload::Remove(LinkId)`
     /// - `"toggle:cell_id"` → `EventPayload::Toggle(CellId)`
+    /// - `"set_true:cell_id"` → `EventPayload::SetTrue(CellId)`
+    /// - `"set_false:cell_id"` → `EventPayload::SetFalse(CellId)`
+    /// - `"bool_toggle:cell_id"` → `EventPayload::BoolToggle(CellId)`
+    /// - `"hover_set:cell_id:value"` → `EventPayload::HoverSet { cell_id, value }`
+    /// - `"list_toggle_all:list_cell_id:field"` → `EventPayload::ListToggleAll { list_cell_id, field }`
+    /// - `"set_text:cell_id:value"` → `EventPayload::SetText { cell_id, value }`
     /// - Other text → `EventPayload::Unit`
     pub fn parse(text: &str) -> Self {
         if let Some(enter_text) = text.strip_prefix("Enter:") {
@@ -297,8 +318,60 @@ impl EventPayload {
             Self::Remove(LinkId::new(link_id))
         } else if let Some(cell_id) = text.strip_prefix("toggle:") {
             Self::Toggle(CellId::new(cell_id))
+        } else if let Some(cell_id) = text.strip_prefix("set_true:") {
+            Self::SetTrue(CellId::new(cell_id))
+        } else if let Some(cell_id) = text.strip_prefix("set_false:") {
+            Self::SetFalse(CellId::new(cell_id))
+        } else if let Some(cell_id) = text.strip_prefix("bool_toggle:") {
+            Self::BoolToggle(CellId::new(cell_id))
+        } else if let Some(rest) = text.strip_prefix("hover_set:") {
+            // Format: "hover_set:cell_id:value" where value is "true" or "false"
+            if let Some((cell_id, value_str)) = rest.rsplit_once(':') {
+                let value = value_str == "true";
+                Self::HoverSet { cell_id: CellId::new(cell_id), value }
+            } else {
+                Self::Unit
+            }
+        } else if let Some(rest) = text.strip_prefix("list_toggle_all:") {
+            // Format: "list_toggle_all:list_cell_id:field"
+            if let Some((list_cell_id, field)) = rest.split_once(':') {
+                Self::ListToggleAll {
+                    list_cell_id: CellId::new(list_cell_id),
+                    field: field.to_string(),
+                }
+            } else {
+                Self::Unit
+            }
+        } else if let Some(rest) = text.strip_prefix("set_text:") {
+            // Format: "set_text:cell_id:value" (value may contain colons, so use first colon only)
+            if let Some((cell_id, value)) = rest.split_once(':') {
+                Self::SetText {
+                    cell_id: CellId::new(cell_id),
+                    value: value.to_string(),
+                }
+            } else {
+                Self::Unit
+            }
         } else {
             Self::Unit
+        }
+    }
+
+    /// Convert to format string for backwards compatibility with string-based APIs.
+    /// Phase 3.1: This method enables gradual migration - existing code can call
+    /// to_format_string() instead of format!() directly.
+    pub fn to_format_string(&self) -> String {
+        match self {
+            Self::Enter(text) => format!("Enter:{}", text),
+            Self::Remove(link_id) => format!("remove:{}", link_id.name()),
+            Self::Toggle(cell_id) => format!("toggle:{}", cell_id.name()),
+            Self::SetTrue(cell_id) => format!("set_true:{}", cell_id.name()),
+            Self::SetFalse(cell_id) => format!("set_false:{}", cell_id.name()),
+            Self::BoolToggle(cell_id) => format!("bool_toggle:{}", cell_id.name()),
+            Self::HoverSet { cell_id, value } => format!("hover_set:{}:{}", cell_id.name(), value),
+            Self::ListToggleAll { list_cell_id, field } => format!("list_toggle_all:{}:{}", list_cell_id.name(), field),
+            Self::SetText { cell_id, value } => format!("set_text:{}:{}", cell_id.name(), value),
+            Self::Unit => String::new(),
         }
     }
 
@@ -366,6 +439,44 @@ impl EventPayload {
     /// This is a convenience method for the common pattern in worker.rs.
     pub fn parse_remove_link<'a>(text: &'a str) -> Option<&'a str> {
         text.strip_prefix("remove:")
+    }
+}
+
+/// Filter for WHEN pattern matching on event values.
+///
+/// Phase 3.3: Consolidated from duplicate EventFilter (worker.rs) and DdEventFilter (dataflow.rs).
+/// This is now the single source of truth for event filtering.
+#[derive(Clone, Debug)]
+pub enum EventFilter {
+    /// Accept any event value
+    Any,
+    /// Only accept events with this exact text value (e.g., "Enter" for key events)
+    TextEquals(String),
+    /// Accept events starting with this prefix (e.g., "Enter:" for Enter+text)
+    TextStartsWith(String),
+}
+
+impl EventFilter {
+    /// Check if an event value matches this filter.
+    pub fn matches(&self, event_value: &EventValue) -> bool {
+        match self {
+            EventFilter::Any => true,
+            EventFilter::TextStartsWith(prefix) => {
+                matches!(event_value, EventValue::Text(t) if t.starts_with(prefix))
+            }
+            EventFilter::TextEquals(pattern) => {
+                matches!(event_value, EventValue::Text(t) if t == pattern)
+            }
+        }
+    }
+
+    /// Check if a text value matches this filter.
+    pub fn matches_text(&self, text: &str) -> bool {
+        match self {
+            EventFilter::Any => true,
+            EventFilter::TextEquals(pattern) => text == pattern,
+            EventFilter::TextStartsWith(prefix) => text.starts_with(prefix),
+        }
     }
 }
 

@@ -5,9 +5,9 @@
     "cl"
   ],
   "store_prompts": null,
-  "supervisor_prompt": "Make sure everything from plan ~/.claude/plans/optimized-purring-crescent.md is implemented. Don't guess, run subagent(s) to verify. Nothing (excluding WebWorkers) are deferred! Full migration to pure DD, including LATEST and similar constructs as mapped in the plan. Also update `makers verify-playground-dd` if it's old (conflicting with plans / new architecture) but don't try to bend it to make it pass. Again - ensure complete migration to pure DD architecture is done!",
+  "supervisor_prompt": "Don't stop until all phases of pure_dd.md are done. Verify with a subagent. Ignore time estimations - continue until done, pure DD everywhere. No fallbacks or transitive code to make code compile before the migration is done. Resolving compilation errors and warning should be done when all others steps are done to not accidentally reintroduce non-pure DD hacks or business logic to the engine (also verify such problems with subagents). ",
   "completion_condition": "+completed+",
-  "completion_command": "makers verify-playground-dd",
+  "completion_command": null,
   "protected_patterns": [
     "tools/**/*.rs",
     "crates/boon-cli/tests/*.bn.test",

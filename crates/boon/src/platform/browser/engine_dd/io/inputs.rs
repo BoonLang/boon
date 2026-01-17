@@ -5,7 +5,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use super::super::core::{Event, EventValue, Input, LinkId, TimerId};
+use super::super::core::{Event, EventValue, Input, LinkId, TimerId, CellId, EventPayload};
 
 /// Action to perform when a dynamic link fires.
 #[derive(Clone, Debug)]
@@ -39,14 +39,23 @@ pub enum DynamicLinkAction {
 thread_local! {
     static GLOBAL_DISPATCHER: RefCell<Option<EventInjector>> = RefCell::new(None); // ALLOWED: global dispatcher
 
-    // Track editing holds that were just enabled - blur events should be ignored for these
-    // until the input has been properly focused. This prevents spurious blur events during
-    // the WhileRef arm switch when transitioning from label to text_input.
-    static EDITING_HOLDS_GRACE_PERIOD: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new()); // ALLOWED: global state
+    // Phase 3: EDITING_HOLDS_GRACE_PERIOD removed - blur debouncing moves to DD temporal operators
     static TASK_HANDLE: RefCell<Option<zoon::TaskHandle>> = RefCell::new(None); // ALLOWED: task handle
     static OUTPUT_LISTENER_HANDLE: RefCell<Option<zoon::TaskHandle>> = RefCell::new(None); // ALLOWED: listener handle
     static TIMER_HANDLE: RefCell<Option<zoon::TaskHandle>> = RefCell::new(None); // ALLOWED: timer handle
-    static ROUTER_MAPPINGS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new()); // ALLOWED: router state
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SURGICALLY REMOVED: ROUTER_MAPPINGS
+    //
+    // This was business logic in the I/O layer that bypassed DD:
+    // - fire_global_link() checked ROUTER_MAPPINGS before injecting to DD
+    // - If found, navigated directly + mutated cell state
+    // - DD never saw the link event!
+    //
+    // Pure DD architecture:
+    // - ALL link events go to DD
+    // - Router/go_to() is a DD operator that outputs navigation commands
+    // - Output observer handles browser navigation
+    // ═══════════════════════════════════════════════════════════════════════════
     static DYNAMIC_LINK_ACTIONS: RefCell<HashMap<String, DynamicLinkAction>> = RefCell::new(HashMap::new()); // ALLOWED: dynamic link handlers
 }
 
@@ -107,23 +116,17 @@ pub fn clear_timer_handle() {
     });
 }
 
-/// Add a router mapping (link_id → route).
-/// Used for LATEST → Router/go_to patterns.
-pub fn add_router_mapping(link_id: impl Into<String>, route: impl Into<String>) {
-    let link_id = link_id.into();
-    let route = route.into();
-    zoon::println!("[DD Router] Mapping {} -> {}", link_id, route);
-    ROUTER_MAPPINGS.with(|cell| {
-        cell.borrow_mut().insert(link_id, route); // ALLOWED: IO layer
-    });
-}
-
-/// Clear all router mappings.
-pub fn clear_router_mappings() {
-    ROUTER_MAPPINGS.with(|cell| {
-        cell.borrow_mut().clear(); // ALLOWED: IO layer
-    });
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// SURGICALLY REMOVED: add_router_mapping(), clear_router_mappings()
+//
+// These registered link→route mappings that bypassed DD:
+// - add_router_mapping(link_id, route) - stored mapping in I/O layer
+// - fire_global_link() checked mappings before injecting to DD
+// - If found, navigated + mutated state WITHOUT going through DD!
+//
+// Pure DD: Router/go_to() should be a DD operator that outputs navigation
+// commands, handled by the output observer.
+// ═══════════════════════════════════════════════════════════════════════════
 
 /// Register a dynamic link action.
 /// Called when cloning templates to wire up dynamic links to their hold actions.
@@ -157,7 +160,7 @@ pub fn get_dynamic_link_action(link_id: &str) -> Option<DynamicLinkAction> {
 /// to work while we transition to pure DD link handling. The returned mappings are
 /// added to DataflowConfig and processed by the DD worker.
 pub fn get_all_link_mappings() -> Vec<super::super::core::types::LinkCellMapping> {
-    use super::super::core::types::{LinkCellMapping, LinkAction, CellId, LinkId};
+    use super::super::core::types::{LinkCellMapping, LinkAction, CellId};
 
     DYNAMIC_LINK_ACTIONS.with(|cell| {
         let actions = cell.borrow(); // ALLOWED: IO layer
@@ -222,141 +225,51 @@ pub fn get_all_link_mappings() -> Vec<super::super::core::types::LinkCellMapping
     })
 }
 
-/// Check if a link has a dynamic action and execute it.
-/// Returns true if the action was handled.
+/// Check if a link has a dynamic action registered.
+/// Phase 3: GUTTED - no longer fires events. Worker's link_mappings handle all routing.
+/// Returns true if the link is registered (for logging purposes only).
 fn check_dynamic_link_action(link_id: &str) -> bool {
-    DYNAMIC_LINK_ACTIONS.with(|cell| {
-        if let Some(action) = cell.borrow().get(link_id).cloned() { // ALLOWED: IO layer
-            match action {
-                DynamicLinkAction::SetTrue(cell_id) => {
-                    zoon::println!("[DD DynamicLink] {} -> SetTrue({})", link_id, cell_id);
-                    // Add to grace period - blur events for this editing_cell should be ignored
-                    // until the focus race settles (use timeout instead of relying on focus event)
-                    let cell_id_for_timeout = cell_id.clone();
-                    EDITING_HOLDS_GRACE_PERIOD.with(|cell| {
-                        cell.borrow_mut().insert(cell_id.clone()); // ALLOWED: IO layer
-                    });
-                    // NOTE: Grace period is cleared ONLY by key events (Enter/Escape) in check_dynamic_key_action.
-                    let _ = cell_id_for_timeout; // Mark as used
-                    // Phase 7: Fire to DD instead of direct update
-                    // Format: "cell_set_true:{cell_id}" - DD worker processes this
-                    GLOBAL_DISPATCHER.with(|disp_cell| {
-                        if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
-                            injector.fire_link_text(LinkId::new("dd_cell_update"), format!("set_true:{}", cell_id));
-                            zoon::println!("[DD Phase7] Fired dd_cell_update with set_true:{}", cell_id);
-                        }
-                    });
-                }
-                DynamicLinkAction::SetFalse(cell_id) => {
-                    zoon::println!("[DD DynamicLink] {} -> SetFalse({})", link_id, cell_id);
-                    // Phase 7: Fire to DD instead of direct update
-                    GLOBAL_DISPATCHER.with(|disp_cell| {
-                        if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
-                            injector.fire_link_text(LinkId::new("dd_cell_update"), format!("set_false:{}", cell_id));
-                            zoon::println!("[DD Phase7] Fired dd_cell_update with set_false:{}", cell_id);
-                        }
-                    });
-                }
-                DynamicLinkAction::BoolToggle(cell_id) => {
-                    zoon::println!("[DD DynamicLink] {} -> BoolToggle({})", link_id, cell_id);
-                    // Phase 7: Fire to DD instead of direct update
-                    GLOBAL_DISPATCHER.with(|disp_cell| {
-                        if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
-                            injector.fire_link_text(LinkId::new("dd_cell_update"), format!("bool_toggle:{}", cell_id));
-                            zoon::println!("[DD Phase7] Fired dd_cell_update with bool_toggle:{}", cell_id);
-                        }
-                    });
-                }
-                DynamicLinkAction::SetFalseOnKeys { .. } => {
-                    // SetFalseOnKeys is handled by check_dynamic_key_action, not here
-                    // Return false to let the event propagate to DD worker
-                    return false;
-                }
-                DynamicLinkAction::EditingHandler { .. } => {
-                    // EditingHandler is only handled by:
-                    // - fire_global_blur() for blur events
-                    // - check_dynamic_key_action() for key events
-                    // Change events should propagate to DD worker, not exit edit mode
-                    return false;
-                }
-                DynamicLinkAction::HoverState(_) => {
-                    // HoverState is handled by fire_global_link_with_bool, not here
-                    return false;
-                }
-                DynamicLinkAction::RemoveListItem { link_id: remove_link_id } => {
-                    // Fire the link-id based remove event to trigger list item removal
-                    zoon::println!("[DD DynamicLink] {} -> RemoveListItem(link_id={})", link_id, remove_link_id);
-                    // Fire via global dispatcher with link_id format (not index, since indices shift)
-                    GLOBAL_DISPATCHER.with(|disp_cell| {
-                        if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
-                            injector.fire_link_text(LinkId::new("dynamic_list_remove"), format!("remove:{}", remove_link_id));
-                            zoon::println!("[DD Dispatcher] Fired dynamic_list_remove with remove:{}", remove_link_id);
-                        }
-                    });
-                }
-                DynamicLinkAction::ListToggleAllCompleted { list_cell_id, completed_field } => {
-                    // Toggle ALL items' completed field - fire DD event
-                    zoon::println!("[DD DynamicLink] {} -> ListToggleAllCompleted(list={}, field={})", link_id, list_cell_id, completed_field);
-                    // Phase 7: Fire to DD instead of direct mutation
-                    GLOBAL_DISPATCHER.with(|disp_cell| {
-                        if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
-                            injector.fire_link_text(LinkId::new("dd_cell_update"), format!("list_toggle_all:{}:{}", list_cell_id, completed_field));
-                            zoon::println!("[DD Phase7] Fired dd_cell_update with list_toggle_all:{}:{}", list_cell_id, completed_field);
-                        }
-                    });
-                }
-            }
-            true
-        } else {
-            false
-        }
-    })
+    // Phase 3: IO layer is thin routing only
+    // Worker's link_mappings (loaded from get_all_link_mappings()) handle event→action mapping
+    // We just check if registered for logging purposes
+    let is_registered = DYNAMIC_LINK_ACTIONS.with(|cell| {
+        cell.borrow().contains_key(link_id) // ALLOWED: IO layer read
+    });
+
+    if is_registered {
+        zoon::println!("[DD DynamicLink] {} is registered (Worker link_mappings will handle)", link_id);
+    }
+
+    is_registered
 }
 
-/// Check if a link has a router mapping and navigate if so.
-/// Returns true if navigation occurred.
-fn check_router_mapping(link_id: &str) -> bool {
-    ROUTER_MAPPINGS.with(|cell| {
-        if let Some(route) = cell.borrow().get(link_id) { // ALLOWED: IO layer
-            // Update filter state based on route (for reactive list filtering)
-            super::outputs::set_filter_from_route(route);
-
-            #[cfg(target_arch = "wasm32")]
-            {
-                use zoon::*;
-                if let Ok(history) = window().history() {
-                    let _ = history.push_state_with_url(&zoon::JsValue::NULL, "", Some(route));
-                    zoon::println!("[DD Router] Navigated to {}", route);
-                    // Fire popstate event to trigger Router/route() updates
-                    // Use regular Event since PopStateEvent may not be exported from web_sys
-                    if let Ok(event) = zoon::web_sys::Event::new("popstate") {
-                        let _ = window().dispatch_event(&event);
-                    }
-                }
-            }
-            true
-        } else {
-            false
-        }
-    })
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// SURGICALLY REMOVED: check_router_mapping()
+//
+// This function intercepted link events BEFORE they reached DD:
+// - Checked ROUTER_MAPPINGS for link→route mapping
+// - If found: navigated browser + mutated cell state directly
+// - DD never saw the event!
+//
+// Pure DD: ALL link events should go to DD. Router/go_to() outputs
+// navigation commands that the output observer handles.
+// ═══════════════════════════════════════════════════════════════════════════
 
 /// Fire a link event via the global dispatcher.
 /// Used by the bridge when button events occur.
+///
+/// Phase 3: ALL link events go to DD. No early returns.
+/// DD's link_mappings handle event→action mapping.
+/// IO layer may still do browser-specific things (grace periods) but doesn't prevent DD from seeing events.
 pub fn fire_global_link(link_id: &str) {
     zoon::println!("[DD fire_global_link] CALLED with link_id={}", link_id);
-    // Check if this link has a dynamic action (for dynamic list item editing)
-    if check_dynamic_link_action(link_id) {
-        // Action executed directly, no need to fire DD event
-        return;
-    }
 
-    // Check if this link has a router mapping (LATEST → Router/go_to pattern)
-    if check_router_mapping(link_id) {
-        // Navigation occurred, no need to fire DD event
-        return;
-    }
+    // Phase 3: Check dynamic action for browser-specific handling (grace periods, etc.)
+    // but DON'T early return - let events flow to DD as well
+    let _ = check_dynamic_link_action(link_id);
 
+    // Fire to DD - DD's link_mappings will process via apply_link_action
+    // DD has change detection, so duplicate processing is safe
     GLOBAL_DISPATCHER.with(|cell| {
         if let Some(injector) = cell.borrow().as_ref() { // ALLOWED: IO layer
             injector.fire_link_unit(LinkId::new(link_id));
@@ -382,124 +295,55 @@ pub fn fire_global_link_with_text(link_id: &str, text: &str) {
 
 /// Fire a link event with a boolean value.
 /// Used by the bridge when hover state changes.
+///
+/// Phase 3: Simplified - deduplication kept for performance (hover can fire 100s/sec),
+/// but events always flow to DD for processing via link_mappings.
 pub fn fire_global_link_with_bool(link_id: &str, value: bool) {
-    // Check if this link has a HoverState action (for dynamic list item hover)
-    let handled = DYNAMIC_LINK_ACTIONS.with(|cell| {
-        if let Some(action) = cell.borrow().get(link_id).cloned() { // ALLOWED: IO layer
-            if let DynamicLinkAction::HoverState(cell_id) = action {
-                // Skip update if value hasn't changed - prevents signal spam on continuous hover
-                let current = super::outputs::get_cell_value(&cell_id);
-                let same_value = match current {
-                    Some(super::super::core::value::Value::Bool(b)) => b == value,
-                    _ => false,
-                };
-                if same_value {
-                    return true; // Already handled, skip redundant update
-                }
-                zoon::println!("[DD Hover] {} -> update {} to {}", link_id, cell_id, value);
-                // Phase 7: Fire to DD instead of direct mutation
-                GLOBAL_DISPATCHER.with(|disp_cell| {
-                    if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
-                        injector.fire_link_text(LinkId::new("dd_cell_update"), format!("hover_set:{}:{}", cell_id, value));
-                        zoon::println!("[DD Phase7] Fired dd_cell_update with hover_set:{}:{}", cell_id, value);
-                    }
-                });
-                return true;
-            }
-        }
-        false
-    });
-
-    if handled {
-        return;
-    }
-
-    // Also update synthetic hover hold for statically-defined hover WhileRefs
-    // The evaluator creates holds named "hover_{link_id}" for element.hovered |> WHILE patterns
+    // Performance optimization: deduplicate hover events to prevent signal spam
+    // Check current value and skip if unchanged
     let hover_cell_id = format!("hover_{}", link_id);
-    // Skip update if value hasn't changed - prevents signal spam on continuous hover
     let current = super::outputs::get_cell_value(&hover_cell_id);
     let same_value = match current {
         Some(super::super::core::value::Value::Bool(b)) => b == value,
         _ => false,
     };
-    if !same_value {
-        // Phase 7: Fire to DD instead of direct mutation
-        GLOBAL_DISPATCHER.with(|disp_cell| {
-            if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
-                injector.fire_link_text(LinkId::new("dd_cell_update"), format!("hover_set:{}:{}", hover_cell_id, value));
-                zoon::println!("[DD Phase7] Fired dd_cell_update with hover_set:{}:{}", hover_cell_id, value);
-            }
-        });
-        zoon::println!("[DD Hover] {} -> synthetic hold {} = {}", link_id, hover_cell_id, value);
 
-        // Only fire to dispatcher when value actually changed
-        GLOBAL_DISPATCHER.with(|cell| {
-            if let Some(injector) = cell.borrow().as_ref() { // ALLOWED: IO layer
-                injector.fire_link_bool(LinkId::new(link_id), value);
-                zoon::println!("[DD Dispatcher] Fired link with bool: {} value={}", link_id, value);
-            } else {
-                zoon::println!("[DD Dispatcher] Warning: No dispatcher set for link: {}", link_id);
-            }
-        });
+    if same_value {
+        // Value unchanged - skip to prevent signal spam from continuous hover
+        return;
     }
+
+    // Fire to DD - DD's link_mappings will handle via apply_link_action
+    GLOBAL_DISPATCHER.with(|cell| {
+        if let Some(injector) = cell.borrow().as_ref() { // ALLOWED: IO layer
+            injector.fire_link_bool(LinkId::new(link_id), value);
+            zoon::println!("[DD Dispatcher] Fired link with bool: {} value={}", link_id, value);
+        } else {
+            zoon::println!("[DD Dispatcher] Warning: No dispatcher set for link: {}", link_id);
+        }
+    });
 }
 
 /// Fire a blur event.
 /// Used by text_input when the input loses focus.
-/// This specifically handles EditingHandler to exit edit mode on blur.
+/// Phase 3: SIMPLIFIED - just forwards blur event to DD. Worker's link_mappings handle EditingHandler.
 pub fn fire_global_blur(link_id: &str) {
-    // Check if this link has an EditingHandler
-    DYNAMIC_LINK_ACTIONS.with(|cell| {
-        if let Some(action) = cell.borrow().get(link_id).cloned() { // ALLOWED: IO layer
-            if let DynamicLinkAction::EditingHandler { editing_cell, .. } = action {
-                // Check if this editing_cell is in grace period (just enabled, input hasn't been focused yet)
-                let in_grace_period = EDITING_HOLDS_GRACE_PERIOD.with(|grace| {
-                    grace.borrow().contains(&editing_cell) // ALLOWED: IO layer
-                });
-                if in_grace_period {
-                    // Ignore spurious blur during WhileRef arm switch
-                    zoon::println!("[DD Blur] {} -> IGNORED (grace period for {})", link_id, editing_cell);
-                    return;
-                }
-                // Exit edit mode without saving on blur
-                // IMPORTANT: Boon uses Tagged booleans, not Rust bools
-                zoon::println!("[DD Blur] {} -> exit edit (no save)", link_id);
-                // Phase 7: Fire to DD instead of direct mutation
-                GLOBAL_DISPATCHER.with(|disp_cell| {
-                    if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
-                        injector.fire_link_text(LinkId::new("dd_cell_update"), format!("set_false:{}", editing_cell));
-                        zoon::println!("[DD Phase7] Fired dd_cell_update with set_false:{}", editing_cell);
-                    }
-                });
-                return;
-            }
-        }
-        // For non-EditingHandler links, fire as a regular link event
-        fire_global_link(link_id);
-    });
-}
-
-/// Clear the grace period for an editing hold (call when input receives focus)
-pub fn clear_editing_grace_period(editing_cell: &str) {
-    EDITING_HOLDS_GRACE_PERIOD.with(|cell| {
-        cell.borrow_mut().remove(editing_cell); // ALLOWED: IO layer
-    });
-    zoon::println!("[DD Focus] Cleared grace period for {}", editing_cell);
-}
-
-/// Clear the grace period for a link's editing hold (call when input receives focus)
-/// This looks up the EditingHandler for the given blur_link_id and clears its grace period.
-pub fn clear_editing_grace_period_for_link(blur_link_id: &str) {
-    DYNAMIC_LINK_ACTIONS.with(|cell| {
-        if let Some(DynamicLinkAction::EditingHandler { editing_cell, .. }) = cell.borrow().get(blur_link_id).cloned() { // ALLOWED: IO layer
-            EDITING_HOLDS_GRACE_PERIOD.with(|grace| {
-                grace.borrow_mut().remove(&editing_cell); // ALLOWED: IO layer
-            });
-            zoon::println!("[DD Focus] Cleared grace period for {} (via link {})", editing_cell, blur_link_id);
+    zoon::println!("[DD fire_global_blur] {} - forwarding to DD", link_id);
+    // Phase 3: IO layer is thin routing - just fire the blur event with a "blur" marker
+    // Worker's link_mappings will match on this and handle EditingHandler actions
+    GLOBAL_DISPATCHER.with(|cell| {
+        if let Some(injector) = cell.borrow().as_ref() { // ALLOWED: IO layer
+            // Fire as blur event - Worker can distinguish blur from regular link events
+            injector.fire_link_text(LinkId::new(link_id), "blur");
+            zoon::println!("[DD Dispatcher] Fired blur event: {}", link_id);
+        } else {
+            zoon::println!("[DD Dispatcher] Warning: No dispatcher set for blur: {}", link_id);
         }
     });
 }
+
+// Phase 3: clear_editing_grace_period and clear_editing_grace_period_for_link removed
+// DD handles blur debouncing via temporal operators
 
 /// Fire a key_down event with the key name.
 /// Used by text_input when a key is pressed.
@@ -521,74 +365,22 @@ pub fn fire_global_key_down(link_id: &str, key: &str) {
     });
 }
 
-/// Check if a link has a dynamic key action and execute it.
-/// Returns true if the action was handled.
+/// Check if a link has a dynamic key action registered.
+/// Phase 3: GUTTED - no longer handles key events. Worker's link_mappings do pattern matching.
+/// Always returns false so key events flow to DD.
 fn check_dynamic_key_action(link_id: &str, key: &str) -> bool {
-    zoon::println!("[DD check_dynamic_key_action] link_id='{}', key='{}'", link_id, key);
-    DYNAMIC_LINK_ACTIONS.with(|cell| {
-        let actions = cell.borrow(); // ALLOWED: IO layer
-        zoon::println!("[DD check_dynamic_key_action] DYNAMIC_LINK_ACTIONS has {} entries", actions.len());
-        if let Some(action) = actions.get(link_id).cloned() {
-            zoon::println!("[DD check_dynamic_key_action] Found action for {}: {:?}", link_id, action);
-            match action {
-                DynamicLinkAction::SetFalseOnKeys { cell_id, keys } => {
-                    if keys.iter().any(|k| k == key) {
-                        zoon::println!("[DD DynamicLink] {} key='{}' -> SetFalse({})", link_id, key, cell_id);
-                        // Phase 7: Fire to DD instead of direct mutation
-                        GLOBAL_DISPATCHER.with(|disp_cell| {
-                            if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
-                                injector.fire_link_text(LinkId::new("dd_cell_update"), format!("set_false:{}", cell_id));
-                                zoon::println!("[DD Phase7] Fired dd_cell_update with set_false:{}", cell_id);
-                            }
-                        });
-                        return true;
-                    }
-                }
-                DynamicLinkAction::EditingHandler { editing_cell, title_cell } => {
-                    // Handle editing key events
-                    if key == "Escape" {
-                        // Exit edit mode without saving
-                        // Clear grace period first (user is explicitly exiting)
-                        EDITING_HOLDS_GRACE_PERIOD.with(|cell| {
-                            cell.borrow_mut().remove(&editing_cell); // ALLOWED: IO layer
-                        });
-                        zoon::println!("[DD DynamicLink] {} key='Escape' -> exit edit (no save)", link_id);
-                        // Phase 7: Fire to DD instead of direct mutation
-                        GLOBAL_DISPATCHER.with(|disp_cell| {
-                            if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
-                                injector.fire_link_text(LinkId::new("dd_cell_update"), format!("set_false:{}", editing_cell));
-                                zoon::println!("[DD Phase7] Fired dd_cell_update with set_false:{}", editing_cell);
-                            }
-                        });
-                        return true;
-                    } else if let Some(text) = key.strip_prefix("Enter:") {
-                        // Save title and exit edit mode
-                        // Clear grace period first (user is explicitly saving)
-                        EDITING_HOLDS_GRACE_PERIOD.with(|cell| {
-                            cell.borrow_mut().remove(&editing_cell); // ALLOWED: IO layer
-                        });
-                        zoon::println!("[DD DynamicLink] {} key='Enter' -> save '{}' to {}, exit edit", link_id, text, title_cell);
-                        // Phase 7: Fire to DD instead of direct mutation
-                        // Fire text update first, then set editing to false
-                        GLOBAL_DISPATCHER.with(|disp_cell| {
-                            if let Some(injector) = disp_cell.borrow().as_ref() { // ALLOWED: IO layer
-                                // Encode text with base64 to avoid delimiter issues
-                                let encoded_text = text.replace(':', "::"); // Escape colons
-                                injector.fire_link_text(LinkId::new("dd_cell_update"), format!("set_text:{}:{}", title_cell, encoded_text));
-                                zoon::println!("[DD Phase7] Fired dd_cell_update with set_text:{}:{}", title_cell, text);
-                                injector.fire_link_text(LinkId::new("dd_cell_update"), format!("set_false:{}", editing_cell));
-                                zoon::println!("[DD Phase7] Fired dd_cell_update with set_false:{}", editing_cell);
-                            }
-                        });
-                        return true;
-                    }
-                }
-                // Other action types don't handle key events
-                _ => {}
-            }
-        }
-        false
-    })
+    // Phase 3: IO layer is thin routing - just log and forward to DD
+    // Worker's link_mappings will match on key patterns (Escape, Enter:text)
+    let is_registered = DYNAMIC_LINK_ACTIONS.with(|cell| {
+        cell.borrow().contains_key(link_id) // ALLOWED: IO layer read
+    });
+
+    if is_registered {
+        zoon::println!("[DD check_dynamic_key_action] {} key='{}' - forwarding to DD (link_mappings will handle)", link_id, key);
+    }
+
+    // Always return false - let key events flow to DD
+    false
 }
 
 /// Event injector for sending events to the DD worker.
