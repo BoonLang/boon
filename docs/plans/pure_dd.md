@@ -28,7 +28,7 @@
 > **Phase 7 (O(delta) List Operations):** ✅ COMPLETE
 > **Phase 8 (Pure LINK Handling):** ✅ COMPLETE - Bridge pattern for incremental migration
 > **Phase 9 (True Incremental Lists):** 🔴 NOT STARTED - Replace Arc<Vec> with CollectionHandle
-> **Phase 10 (Eliminate inspect() Side Effects):** 🔴 NOT STARTED - Pure DD output channels
+> **Phase 10 (Eliminate inspect() Side Effects):** 🟡 IN PROGRESS - Using timely's capture() approach
 > **Phase 11 (Move Business Logic to DD):** 🔴 NOT STARTED - Migrate 13 IO thread_locals to DD
 > **Phase 12 (Incremental Rendering):** 🔴 NOT STARTED - Diff-based DOM updates
 **Goal:** Transform the DD engine to fully leverage Differential Dataflow's incremental computation, eliminate string-based matching, establish clear naming, and clean module hierarchy.
@@ -1754,7 +1754,7 @@ grep -n "\.to_vec()" crates/boon/src/platform/browser/engine_dd/core/worker.rs
 
 ## Phase 10: Eliminate `inspect()` Side Effects
 
-**Status:** 🔴 NOT STARTED
+**Status:** 🟡 IN PROGRESS - Implementing Option A (capture() approach)
 
 ### The Problem: Impure DD Operations
 
@@ -1778,7 +1778,64 @@ The DD dataflow uses `inspect()` callbacks to push results into an external `Arc
 3. Can't replay/retry dataflow without duplicate side effects
 4. Locks (`Mutex`) inside DD can cause deadlocks
 
-### The Solution: DD Output Channels
+### The Solution: Two Approaches
+
+#### Option A: Timely's Built-in `capture()` (SIMPLER - RECOMMENDED)
+
+Timely dataflow provides a built-in `capture()` mechanism that's simpler than arrange()+trace:
+
+```rust
+use timely::dataflow::operators::Capture;
+use timely::dataflow::operators::capture::Extract;
+
+// 1. Tag outputs with metadata (flows through DD as pure data)
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TaggedHoldOutput {
+    pub hold_id: Arc<str>,
+    pub state: DdValue,
+    pub should_persist: bool,
+}
+
+// 2. Inside dataflow: capture to mpsc channel
+let outputs_rx = worker.dataflow(|scope| {
+    // ... build collections ...
+
+    // Tag outputs and capture - NO Mutex needed!
+    let tagged = hold_output.map(move |(state, _, _)| TaggedHoldOutput {
+        hold_id: hold_id.clone(),
+        state,
+        should_persist,
+    });
+
+    tagged.inner.capture()  // Returns mpsc::Receiver
+});
+
+// 3. Step the dataflow
+while probe.less_than(&time) {
+    worker.step();
+}
+
+// 4. Extract results AFTER stepping completes
+let captured: Vec<(u64, Vec<TaggedHoldOutput>)> = outputs_rx.extract();
+
+// 5. Convert to DocumentUpdates outside the dataflow
+let outputs = captured.into_iter()
+    .flat_map(|(time, items)| items.into_iter().map(|item| DocumentUpdate { ... }))
+    .collect();
+```
+
+**How `capture()` Works:**
+1. `stream.capture()` returns `mpsc::Receiver<Event<T, C>>`
+2. Dataflow sends events to this channel as they're produced (pure message passing)
+3. `receiver.extract()` drains the channel and sorts by time AFTER dataflow completes
+
+**Benefits of capture() approach:**
+- No Mutex/RefCell anywhere in the dataflow
+- Built into timely - no custom infrastructure needed
+- Pure message passing semantics
+- Simpler than arrange()+trace for streaming outputs
+
+#### Option B: DD Arrange + Trace (COMPLEX - For indexed lookups)
 
 Replace `inspect()` side effects with proper DD output channels that are read AFTER the dataflow step completes:
 
