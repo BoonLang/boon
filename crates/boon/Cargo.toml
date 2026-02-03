@@ -38,10 +38,10 @@ timely = { version = "0.25", optional = true }
 differential-dataflow = { version = "0.18", optional = true }
 
 [features]
-default = ["debug-channels", "engine-actors"]
+default = ["debug-channels", "engine-dd"]
 
 # Engine selection features - at least one must be enabled
-# Use engine-actors (default) for the actor-based reactive engine
+# Use engine-actors for the legacy actor-based reactive engine
 # Use engine-dd for the differential dataflow engine
 # Use engine-both to enable runtime engine switching
 engine-actors = []

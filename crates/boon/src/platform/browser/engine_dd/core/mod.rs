@@ -28,6 +28,7 @@
 
 pub mod dataflow;
 pub mod guards;
+pub mod collection_ops;
 pub mod operators;
 pub mod types;
 pub mod value;
@@ -37,33 +38,29 @@ pub use guards::{
     assert_in_dd_context, assert_not_in_dd_context, dd_operation_count, DdContextGuard,
 };
 pub use types::{
-    channel, Event, EventValue, Input, Output, CellId, LinkId, TimerId,
-    BoolTag, ElementTag, EventPayload, EventFilter,
+    channel, Event, EventValue, Input, Output, CellId, LinkId, TimerId, Key,
+    BoolTag, ElementTag, EventFilter, ITEM_KEY_FIELD, ROUTE_CHANGE_LINK_ID,
     // Phase 8: DD-native LINK handling
-    LinkAction, LinkCellMapping, EditingHandlerConfig,
+    LinkAction, LinkCellMapping,
 };
 pub use worker::{
     DataflowConfig, Worker, WorkerHandle, CellConfig,
     StateTransform, reconstruct_persisted_item, instantiate_fresh_item,
     // Generic template system exports
     FieldPath, ItemIdentitySpec, FieldInitializer, LinkActionSpec, LinkActionConfig,
-    ListItemTemplate, InstantiatedItem, FieldUpdate,
-    instantiate_template, get_at_path, get_link_ref_at_path, get_hold_ref_at_path, update_field_at_path,
-    // Phase 7.3: Registry types moved to DataflowConfig
-    EditingBinding, ToggleBinding, GlobalToggleBinding,
-    // Phase 7.3: Config accessor functions
-    set_active_config, clear_active_config, with_active_config,
-    is_text_clear_cell, get_remove_event_path, get_bulk_remove_event_path,
-    get_editing_bindings, get_toggle_bindings, get_global_toggle_bindings,
+    ListItemTemplate, InstantiatedItem, FieldUpdate, ListAppendBinding,
+    instantiate_template, remap_link_mappings_for_item, get_at_path, get_link_ref_at_path, get_hold_ref_at_path, update_field_at_path,
 };
 // Note: DocumentUpdate is now internal-only (Phase 6 cleanup)
 pub use dataflow::{
-    DataflowBuilder, DdCellConfig, DdFirstHandle, DdOutput, DdTransform,
+    DdCellConfig, DdCollectionConfig, DdOutput, DdTransform,
     run_dd_first_batch, merge_latest,
     // Phase 8: DD-native link action processing
     apply_link_action, mapping_matches_event,
 };
 // Phase 4: DD Collection types for incremental list operations
-pub use value::{CollectionId, CollectionHandle};
+pub use value::{CollectionId, CollectionHandle, TemplateValue};
+// Phase 4: Collection op config shared between worker/dataflow
+pub use collection_ops::{CollectionOp, CollectionOpConfig};
 // Phase 7.3: CellUpdate for pure DD operations
 pub use value::CellUpdate;

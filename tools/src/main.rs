@@ -352,6 +352,13 @@ enum ExecAction {
         examples_dir: Option<PathBuf>,
     },
 
+    /// Smoke-run all built-in playground examples from EXAMPLE_DATAS
+    SmokeExamples {
+        /// Only run built-in examples matching pattern (e.g., "todo", "list_")
+        #[arg(short, long)]
+        filter: Option<String>,
+    },
+
     /// Get localStorage entries (for debugging persistence)
     LocalStorage {
         /// Filter keys containing this pattern
@@ -870,6 +877,22 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
             let results = run_tests(opts).await?;
 
             // Exit with error code if any tests failed
+            let all_passed = results.iter().all(|r| r.passed);
+            if !all_passed {
+                std::process::exit(1);
+            }
+        }
+
+        ExecAction::SmokeExamples { filter } => {
+            use commands::test_examples::{run_builtin_smoke, SmokeOptions};
+
+            let opts = SmokeOptions {
+                port,
+                filter,
+            };
+
+            let results = run_builtin_smoke(opts).await?;
+
             let all_passed = results.iter().all(|r| r.passed);
             if !all_passed {
                 std::process::exit(1);

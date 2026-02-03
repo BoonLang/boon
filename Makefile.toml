@@ -119,3 +119,13 @@ script = '''
 ./target/release/boon-tools exec set-engine DD
 ./target/release/boon-tools exec test-examples "$@"
 '''
+
+[tasks.verify-playground-dd-smoke]
+description = "Smoke-run all built-in playground examples with DD engine"
+workspace = false
+dependencies = ["build-tools", "verify-dd-no-cheats"]
+script_runner = "@shell"
+script = '''
+./target/release/boon-tools exec set-engine DD
+./target/release/boon-tools exec smoke-examples "$@"
+'''

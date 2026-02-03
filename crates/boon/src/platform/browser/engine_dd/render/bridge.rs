@@ -7,15 +7,15 @@
 use std::sync::Arc;
 
 use super::super::eval::interpreter::{DdContext, DdResult};
-use super::super::core::types::{BoolTag, ElementTag};
-use super::super::core::value::Value;
+use super::super::core::types::{BoolTag, ElementTag, Key as DdKey};
+use super::super::core::value::{Value, WhileArm};
 use zoon::*;
 
-use super::super::io::{fire_global_link, fire_global_link_with_bool, fire_global_link_with_text, fire_global_blur, fire_global_key_down, cell_signal, list_signal_vec, get_cell_value};
-// Phase 7: toggle_cell_bool, update_cell_no_persist removed - runtime updates flow through DD
+use super::super::io::{fire_global_link, fire_global_link_with_text, fire_global_link_with_bool, fire_global_blur, fire_global_key_down, cell_signal, list_signal_vec, is_list_cell};
+// Phase 7: toggle_cell_bool removed - runtime updates flow through DD
 // Phase 7: find_template_hover_link, find_template_hover_cell removed - symbolic refs eliminated
 // Phase 11b: cell_states_signal REMOVED - was broadcast anti-pattern causing spurious re-renders
-// Cleanup: removed unused imports (cells_signal, add_dynamic_link_action, DynamicLinkAction, sync_cell_from_dd, AtomicU32, Ordering)
+// Cleanup: removed unused imports (cells_signal, sync_cell_from_dd, AtomicU32, Ordering)
 
 /// Helper function to get the variant name of a Value for debug logging.
 /// Phase 7: Only pure DD value types - no symbolic references.
@@ -26,13 +26,15 @@ fn dd_value_variant_name(value: &Value) -> &'static str {
         Value::Number(_) => "Number",
         Value::Text(_) => "Text",
         Value::List(_) => "List",
-        Value::Collection(_) => "Collection",
         Value::Object(_) => "Object",
         Value::Tagged { .. } => "Tagged",
         Value::CellRef(_) => "CellRef",
         Value::LinkRef(_) => "LinkRef",
         Value::TimerRef { .. } => "TimerRef",
         Value::Placeholder => "Placeholder",
+        Value::PlaceholderField(_) => "PlaceholderField",
+        Value::WhileConfig(_) => "WhileConfig",
+        Value::PlaceholderWhile(_) => "PlaceholderWhile",
         Value::Flushed(_) => "Flushed",
     }
 }
@@ -42,68 +44,23 @@ fn dd_value_variant_name(value: &Value) -> &'static str {
 
 /// Get the current value of the focused text input via DOM access.
 /// This is used when Enter is pressed to capture the input text.
-/// We try multiple methods to ensure we get the value (CDP typing can be tricky).
+/// Pure DD: fail fast if there is no active input element.
 #[cfg(target_arch = "wasm32")]
 fn get_dd_text_input_value() -> String {
     use zoon::*;
 
-    // Method 1: Try activeElement first (preferred for editing inputs where multiple inputs exist)
     let active = document().active_element();
     let active_tag = active.as_ref().map(|el| el.tag_name()).unwrap_or_default();
-    let active_value = active
-        .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
-        .map(|input| input.value())
-        .unwrap_or_default();
-
-    if !active_value.is_empty() {
-        zoon::println!("[DD TextInput] get_dd_text_input_value: active_tag={}, value='{}'", active_tag, active_value);
-        return active_value;
-    }
-
-    // Method 2: Try reading by ID
-    let id_value = document()
-        .get_element_by_id("dd_text_input")
-        .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
-        .map(|input| input.value())
-        .unwrap_or_default();
-
-    if !id_value.is_empty() {
-        zoon::println!("[DD TextInput] get_dd_text_input_value: fallback_id='{}'", id_value);
-        return id_value;
-    }
-
-    // Method 3: Use JavaScript evaluation as final fallback (works around CDP quirks)
-    // CDP's Input.insertText may not update the DOM value property synchronously
-    let js_result = js_sys::eval(r#"
-        (function() {
-            var el = document.activeElement;
-            if (el && el.tagName === 'INPUT') return el.value || '';
-            el = document.getElementById('dd_text_input');
-            if (el) return el.value || '';
-            return '';
-        })()
-    "#);
-
-    let js_value = js_result
-        .ok()
-        .and_then(|v| v.as_string())
-        .unwrap_or_default();
-
-    zoon::println!("[DD TextInput] get_dd_text_input_value: active_tag={}, js_eval='{}'", active_tag, js_value);
-    js_value
-}
-
-/// Clear the DD text input value via DOM access.
-/// This implements the Boon pattern: text_to_add |> THEN { Text/empty() }
-/// Called when the text_input_text HOLD is updated after a successful List/append.
-#[cfg(target_arch = "wasm32")]
-pub fn clear_dd_text_input_value() {
-    use zoon::*;
-    if let Some(el) = document().get_element_by_id("dd_text_input") {
-        if let Ok(input) = el.dyn_into::<web_sys::HtmlInputElement>() {
-            input.set_value("");
-        }
-    }
+    let input = active.and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "[DD TextInput] Unable to read input value: active element is not an input (tag='{}')",
+                active_tag
+            );
+        });
+    let value = input.value();
+    zoon::println!("[DD TextInput] get_dd_text_input_value: active_tag={}, value='{}'", active_tag, value);
+    value
 }
 
 // REMOVED: get_dynamic_item_edit_value - dead code (render_dynamic_item was removed)
@@ -117,17 +74,6 @@ pub fn clear_dd_text_input_value() {
 // The bridge only renders pure data values from DD output streams.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Resolve a CellRef to its actual value for rendering.
-/// Phase 7: Only resolves CellRef - no WhileRef or ComputedRef.
-fn resolve_cell_ref(value: &Value, states: &std::collections::HashMap<String, Value>) -> Value {
-    match value {
-        Value::CellRef(cell_id) => {
-            states.get(&cell_id.name()).cloned().unwrap_or(Value::Unit)
-        }
-        other => other.clone(),
-    }
-}
-
 /// Convert a Value Oklch color to CSS color string.
 /// Phase 7: Pure DD - only handles Number values, no WhileRef evaluation.
 /// Reactive color changes come from DD output streams, not render-time evaluation.
@@ -137,13 +83,19 @@ fn dd_oklch_to_css(value: &Value) -> Option<String> {
             // Phase 7: Only handle Number values - DD computes reactive colors
             let lightness = fields.get("lightness")
                 .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })
-                .unwrap_or(0.5);
+                .unwrap_or_else(|| {
+                    panic!("[DD Render] Oklch missing numeric 'lightness'");
+                });
             let chroma = fields.get("chroma")
                 .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })
-                .unwrap_or(0.0);
+                .unwrap_or_else(|| {
+                    panic!("[DD Render] Oklch missing numeric 'chroma'");
+                });
             let hue = fields.get("hue")
                 .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })
-                .unwrap_or(0.0);
+                .unwrap_or_else(|| {
+                    panic!("[DD Render] Oklch missing numeric 'hue'");
+                });
             let alpha = fields.get("alpha")
                 .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None });
 
@@ -193,10 +145,7 @@ pub fn render_dd_result_reactive_signal(
 ) -> impl Element {
     match result.document {
         Some(doc) => render_dd_value(&doc).unify(),
-        None => El::new()
-            .s(Font::new().color(color!("LightCoral")))
-            .child("DD Engine: No document produced")
-            .unify(),
+        None => panic!("[DD Render] No document produced"),
     }
 }
 
@@ -222,26 +171,45 @@ fn render_dd_value(value: &Value) -> RawElOrText {
             Text::new(s.to_string()).unify()
         }
 
-        Value::List(items) => {
-            // Render list as column of items
-            let children: Vec<RawElOrText> = items.iter().map(|item| render_dd_value(item)).collect();
+        Value::List(handle) => {
+            let cell_id = handle.cell_id
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| handle.id.to_string());
             Column::new()
-                .items(children)
+                .items_signal_vec(
+                    list_signal_vec(cell_id.to_string())
+                        .map(|item| render_dd_value(&item))
+                )
                 .unify()
         }
 
-        Value::Collection(handle) => {
-            // Render DD collection the same as List (from snapshot)
-            let children: Vec<RawElOrText> = handle.iter().map(|item| render_dd_value(item)).collect();
-            Column::new()
-                .items(children)
+        Value::WhileConfig(config) => {
+            let cell_id = config.cell_id.name().to_string();
+            let arms = config.arms.clone();
+            let default = config.default.clone();
+            let cell_id_for_signal = cell_id.clone();
+            El::new()
+                .child_signal(
+                    cell_signal(cell_id)
+                        .map(move |value| {
+                            let value = value.unwrap_or_else(|| {
+                                panic!("[DD Render] Missing cell value for '{}'", cell_id_for_signal);
+                            });
+                            let selected = select_while_arm(&value, &arms, &default);
+                            render_dd_value(&selected)
+                        })
+                )
                 .unify()
         }
-
+        Value::PlaceholderWhile(_) => {
+            panic!("[DD Render] Placeholder WHILE reached render; template substitution failed");
+        }
         Value::Object(fields) => {
             // Render object as debug representation
             let debug = fields
                 .iter()
+                .filter(|(k, _)| k.as_ref() != "__key")
                 .map(|(k, v)| format!("{}: {:?}", k, v))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -263,11 +231,7 @@ fn render_dd_value(value: &Value) -> RawElOrText {
             let cell_id = name.to_string();
 
             // Phase 12: Check if this cell contains a list for incremental rendering
-            let is_list_cell = get_cell_value(&cell_id)
-                .map(|v| matches!(v, Value::List(_) | Value::Collection(_)))
-                .unwrap_or(false);
-
-            if is_list_cell {
+            if is_list_cell(&cell_id) {
                 // Use incremental list rendering via VecDiff
                 // children_signal_vec() only updates changed elements (O(delta))
                 Column::new()
@@ -278,14 +242,15 @@ fn render_dd_value(value: &Value) -> RawElOrText {
                     .unify()
             } else {
                 // Use scalar rendering for non-list cells
+                let cell_id_for_signal = cell_id.clone();
                 El::new()
                     .child_signal(
                         cell_signal(cell_id)  // Pass owned String
-                            .map(|value| {
-                                let text = value
-                                    .map(|v| v.to_display_string())
-                                    .unwrap_or_else(|| "?".to_string());
-                                Text::new(text)
+                            .map(move |value| {
+                                let value = value.unwrap_or_else(|| {
+                                    panic!("[DD Render] Missing cell value for '{}'", cell_id_for_signal);
+                                });
+                                Text::new(value.to_display_string())
                             })
                     )
                     .unify()
@@ -305,15 +270,15 @@ fn render_dd_value(value: &Value) -> RawElOrText {
             let cell_id = id.to_string();
 
             // Create reactive element that updates only when this timer cell changes
-            // NOTE: Returns empty string if HOLD hasn't been set yet (timer not fired)
+            let cell_id_for_signal = cell_id.clone();
             El::new()
                 .child_signal(
                     cell_signal(cell_id)  // Pass owned String
-                        .map(|value| {
-                            let text = value
-                                .map(|v| v.to_display_string())
-                                .unwrap_or_default(); // Empty until first timer tick
-                            Text::new(text)
+                        .map(move |value| {
+                            let value = value.unwrap_or_else(|| {
+                                panic!("[DD Render] Missing timer cell value for '{}'", cell_id_for_signal);
+                            });
+                            Text::new(value.to_display_string())
                         })
                 )
                 .unify()
@@ -336,15 +301,13 @@ fn render_dd_value(value: &Value) -> RawElOrText {
         // ═══════════════════════════════════════════════════════════════════════════
 
         Value::Placeholder => {
-            // Placeholder should never be rendered directly - it's a DD map template marker
-            Text::new("[placeholder]").unify()
+            panic!("[DD Render] Placeholder reached render; DD map substitution failed");
         }
-
-        Value::Flushed(inner) => {
-            // Flushed values propagate through rendering - render the inner value
-            // In actual FLUSH blocks, this would be caught and handled differently
-            zoon::println!("[DD render_dd_value] Flushed value reached render - propagating inner");
-            render_dd_value(inner)
+        Value::PlaceholderField(_) => {
+            panic!("[DD Render] PlaceholderField reached render; template substitution failed");
+        }
+        Value::Flushed(_) => {
+            panic!("[DD Render] Flushed value reached render; missing FLUSH handler");
         }
     }
 }
@@ -352,13 +315,14 @@ fn render_dd_value(value: &Value) -> RawElOrText {
 /// Render a tagged object as a Zoon element.
 fn render_tagged_element(tag: &str, fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
     zoon::println!("[DD render_tagged] tag='{}', fields={:?}", tag, fields.keys().collect::<Vec<_>>());
+    if BoolTag::is_bool_tag(tag) {
+        return Text::new(tag).unify();
+    }
     match tag {
         "Element" => render_element(fields),
         "NoElement" => El::new().unify(),
         _ => {
-            // Unknown tag - render as text
-            zoon::println!("[DD render_tagged] UNKNOWN tag '{}' - rendering as text", tag);
-            Text::new(format!("{}[...]", tag)).unify()
+            panic!("[DD render_tagged] Unknown tag '{}'", tag);
         }
     }
 }
@@ -371,7 +335,9 @@ fn render_element(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> 
             Value::Text(s) => Some(s.as_ref()),
             _ => None,
         })
-        .unwrap_or("container");
+        .unwrap_or_else(|| {
+            panic!("[DD render_element] Missing required '_element_type' field");
+        });
 
     zoon::println!("[DD render_element] type='{}', all_fields={:?}", element_type, fields.keys().collect::<Vec<_>>());
 
@@ -395,9 +361,7 @@ fn render_element(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> 
         "paragraph" => render_paragraph(fields),
         "link" => render_link(fields),
         _ => {
-            zoon::println!("[DD render_element] UNKNOWN type '{}' - rendering as container", element_type);
-            // Unknown element type - render as container
-            render_container(fields)
+            panic!("[DD render_element] Unknown element type '{}'", element_type);
         }
     }
 }
@@ -407,7 +371,9 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
     let label = fields
         .get("label")
         .map(|v| v.to_display_string())
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            panic!("[DD render_button] Missing required 'label' field");
+        });
 
     // Extract LinkRef from element.event.press if present
     let element_value = fields.get("element");
@@ -430,36 +396,39 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
     let style_value = fields.get("style");
     let outline_value = style_value.and_then(|s| s.get("outline"));
 
-    let outline_opt: Option<Outline> = outline_value
-        .and_then(|outline| {
-            match outline {
-                Value::Tagged { tag, .. } if tag.as_ref() == "NoOutline" => None,
-                Value::Object(obj) => {
-                    // Get color from outline object
-                    let css_color = obj.get("color").and_then(|c| dd_oklch_to_css(c));
-                    if let Some(color) = css_color {
-                        // Check for side: Inner vs outer (default outer)
-                        let is_inner = obj.get("side")
-                            .map(|s| matches!(s, Value::Tagged { tag, .. } if tag.as_ref() == "Inner"))
-                            .unwrap_or(false);
-                        // Get width (default 1)
-                        let width = obj.get("width")
-                            .and_then(|w| if let Value::Number(n) = w { Some(n.0 as u32) } else { None })
-                            .unwrap_or(1);
-                        // Build outline
-                        let outline = if is_inner {
-                            Outline::inner().width(width).solid().color(color)
-                        } else {
-                            Outline::outer().width(width).solid().color(color)
-                        };
-                        Some(outline)
-                    } else {
-                        None
-                    }
+    let outline_opt: Option<Outline> = match outline_value {
+        None => None,
+        Some(Value::Tagged { tag, .. }) if tag.as_ref() == "NoOutline" => None,
+        Some(Value::Object(obj)) => {
+            let color = obj.get("color").and_then(|c| dd_oklch_to_css(c)).unwrap_or_else(|| {
+                panic!("[DD render_button] outline.color must be Oklch");
+            });
+            let is_inner = match obj.get("side") {
+                None => false,
+                Some(Value::Tagged { tag, .. }) if tag.as_ref() == "Inner" => true,
+                Some(Value::Tagged { tag, .. }) if tag.as_ref() == "Outer" => false,
+                Some(other) => {
+                    panic!("[DD render_button] outline.side must be Inner/Outer, found {:?}", other);
                 }
-                _ => None,
-            }
-        });
+            };
+            let width = match obj.get("width") {
+                None => 1,
+                Some(Value::Number(n)) => n.0 as u32,
+                Some(other) => {
+                    panic!("[DD render_button] outline.width must be Number, found {:?}", other);
+                }
+            };
+            let outline = if is_inner {
+                Outline::inner().width(width).solid().color(color)
+            } else {
+                Outline::outer().width(width).solid().color(color)
+            };
+            Some(outline)
+        }
+        Some(other) => {
+            panic!("[DD render_button] outline must be NoOutline or object, found {:?}", other);
+        }
+    };
 
     // Extract font styling from style.font
     let font_color_css = style_value
@@ -486,9 +455,6 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
 
     if let Some(outline) = outline_opt {
         button = button.s(outline);
-    } else if outline_value.is_some() {
-        // Phase 7: Outline was specified but didn't match any pattern - apply no-outline
-        button = button.s(Outline::outer().width(0).color("transparent"));
     }
 
     if let Some(link_id) = link_id {
@@ -507,20 +473,26 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
 fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
     let direction = fields
         .get("direction")
-        .and_then(|v| match v {
-            Value::Tagged { tag, .. } => Some(tag.as_ref().to_string()),
-            Value::Text(s) => Some(s.to_string()),
-            _ => None,
+        .map(|v| match v {
+            Value::Tagged { tag, .. } => tag.as_ref().to_string(),
+            Value::Text(s) => s.to_string(),
+            other => {
+                panic!("[DD render_stripe] direction must be Text or Tag, found {:?}", other);
+            }
         })
-        .unwrap_or_else(|| "Column".to_string());
+        .unwrap_or_else(|| {
+            panic!("[DD render_stripe] Missing required 'direction' field");
+        });
 
     let gap = fields
         .get("gap")
-        .and_then(|v| match v {
-            Value::Number(n) => Some(n.0 as u32),
-            _ => None,
+        .map(|v| match v {
+            Value::Number(n) => n.0 as u32,
+            other => panic!("[DD render_stripe] gap must be Number, found {:?}", other),
         })
-        .unwrap_or(0);
+        .unwrap_or_else(|| {
+            panic!("[DD render_stripe] Missing required 'gap' field");
+        });
 
     // Extract hovered LinkRef from element.hovered if present
     let hovered_link_id = fields
@@ -531,10 +503,6 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
             _ => None,
         });
 
-    // Check if this is a list (Ul tag) - needs reactive filtering
-    let element_tag = fields
-        .get("element")
-        .and_then(|e| e.get("tag"));
     let items_value = fields.get("items");
 
     // Debug: what type is items_value?
@@ -552,38 +520,21 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
     //   - The bridge renders pre-computed Collection values
     // ═══════════════════════════════════════════════════════════════════════════
 
-    // Phase 2.3: Check if items is a CellRef (cell-backed list) for reactive rendering
+    // Phase 2.3: Check if items is a CellRef/Collection (list-backed) for reactive rendering
     let items_hold_ref = fields.get("items").and_then(|v| match v {
         Value::CellRef(cell_id) => Some(cell_id.name().to_string()),
+        Value::List(handle) => Some(
+            handle.cell_id
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| handle.id.to_string())
+        ),
         _ => None,
     });
 
-    let items: Vec<RawElOrText> = if items_hold_ref.is_none() {
-        // Static items - render directly
-        fields
-            .get("items")
-            .and_then(|v| match v {
-                Value::List(items) => {
-                    zoon::println!("[DD render_stripe] iterating {} items", items.len());
-                    Some(items.iter().enumerate().map(|(idx, item)| {
-                        zoon::println!("[DD render_stripe] item[{}] variant={}", idx, dd_value_variant_name(item));
-                        render_dd_value(item)
-                    }).collect())
-                }
-                Value::Collection(handle) => {
-                    zoon::println!("[DD render_stripe] iterating {} collection items", handle.len());
-                    Some(handle.iter().enumerate().map(|(idx, item)| {
-                        zoon::println!("[DD render_stripe] collection item[{}] variant={}", idx, dd_value_variant_name(item));
-                        render_dd_value(item)
-                    }).collect())
-                }
-                _ => None,
-            })
-            .unwrap_or_default()
-    } else {
-        // Reactive items handled below via items_signal_vec
-        Vec::new()
-    };
+    if items_hold_ref.is_none() {
+        panic!("[DD render_stripe] 'items' must be CellRef or Collection");
+    }
 
     // Extract style properties (like render_container does)
     let style = fields.get("style");
@@ -630,8 +581,11 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
         });
 
     // Phase 2.3: Reactive rendering for HoldRef-backed items
-    if direction == "Row" {
-        if let Some(ref cell_id) = items_hold_ref {
+    match direction.as_str() {
+        "Row" => {
+            let cell_id = items_hold_ref.as_ref().unwrap_or_else(|| {
+                panic!("[DD render_stripe] 'items' must be CellRef or Collection");
+            });
             // Reactive Row with items_signal_vec
             zoon::println!("[DD render_stripe] Row with reactive items from {}", cell_id);
             let mut row = Row::new()
@@ -660,54 +614,12 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
                     fire_global_link_with_bool(&link_id, is_hovered);
                 }).unify();
             }
-            return row.unify();
-        }
-        // Static Row with items Vec
-        let mut row = Row::new()
-            .s(Gap::new().x(gap))
-            .items(items);
-
-        // Apply styles
-        if width_fill {
-            row = row.s(zoon::Width::fill());
-        }
-        if let Some(color) = bg_color {
-            row = row.s(zoon::Background::new().color(color));
-        }
-        // Apply font styling (size and/or color)
-        if font_size.is_some() || font_color.is_some() {
-            let mut font = zoon::Font::new();
-            if let Some(size) = font_size {
-                font = font.size(size);
-            }
-            if let Some(ref color) = font_color {
-                font = font.color(color.clone());
-            }
-            row = row.s(font);
-        }
-        if padding_x.is_some() || padding_y.is_some() {
-            let mut padding = zoon::Padding::new();
-            if let Some(x) = padding_x {
-                padding = padding.x(x);
-            }
-            if let Some(y) = padding_y {
-                padding = padding.y(y);
-            }
-            row = row.s(padding);
-        }
-
-        // Add hovered handler if present
-        if let Some(link_id) = hovered_link_id {
-            row.on_hovered_change(move |is_hovered| {
-                fire_global_link_with_bool(&link_id, is_hovered);
-            })
-            .unify()
-        } else {
             row.unify()
         }
-    } else {
-        // Default to Column
-        if let Some(ref cell_id) = items_hold_ref {
+        "Column" => {
+            let cell_id = items_hold_ref.as_ref().unwrap_or_else(|| {
+                panic!("[DD render_stripe] 'items' must be CellRef or Collection");
+            });
             // Reactive Column with items_signal_vec
             zoon::println!("[DD render_stripe] Column with reactive items from {}", cell_id);
             let mut column = Column::new()
@@ -736,51 +648,9 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
                     fire_global_link_with_bool(&link_id, is_hovered);
                 }).unify();
             }
-            return column.unify();
-        }
-        // Static Column with items Vec
-        let mut column = Column::new()
-            .s(Gap::new().y(gap))
-            .items(items);
-
-        // Apply styles
-        if width_fill {
-            column = column.s(zoon::Width::fill());
-        }
-        if let Some(color) = bg_color {
-            column = column.s(zoon::Background::new().color(color));
-        }
-        // Apply font styling (size and/or color)
-        if font_size.is_some() || font_color.is_some() {
-            let mut font = zoon::Font::new();
-            if let Some(size) = font_size {
-                font = font.size(size);
-            }
-            if let Some(ref color) = font_color {
-                font = font.color(color.clone());
-            }
-            column = column.s(font);
-        }
-        if padding_x.is_some() || padding_y.is_some() {
-            let mut padding = zoon::Padding::new();
-            if let Some(x) = padding_x {
-                padding = padding.x(x);
-            }
-            if let Some(y) = padding_y {
-                padding = padding.y(y);
-            }
-            column = column.s(padding);
-        }
-
-        // Add hovered handler if present
-        if let Some(link_id) = hovered_link_id {
-            column.on_hovered_change(move |is_hovered| {
-                fire_global_link_with_bool(&link_id, is_hovered);
-            })
-            .unify()
-        } else {
             column.unify()
         }
+        other => panic!("[DD render_stripe] direction must be Row/Column, found '{}'", other),
     }
 }
 
@@ -788,32 +658,31 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
 /// Render a stack (layered elements).
 /// Phase 6: Added CellRef support for reactive layers via layers_signal_vec.
 fn render_stack(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    // Check if layers is a CellRef for reactive rendering
-    if let Some(Value::CellRef(cell_id)) = fields.get("layers") {
-        // Reactive path - use layers_signal_vec for O(delta) updates
-        let cell_id_str = cell_id.name();
-        zoon::println!("[DD render_stack] Reactive layers from CellRef '{}'", cell_id_str);
-        return Stack::new()
-            .layers_signal_vec(
-                list_signal_vec(cell_id_str)
-                    .map(|item| render_dd_value(&item))
-            )
-            .unify();
+    // Check if layers is a CellRef/Collection for reactive rendering
+    if let Some(value) = fields.get("layers") {
+        let reactive_cell_id = match value {
+            Value::CellRef(cell_id) => Some(cell_id.name().to_string()),
+            Value::List(handle) => Some(
+                handle.cell_id
+                    .as_deref()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| handle.id.to_string())
+            ),
+            _ => None,
+        };
+        if let Some(cell_id_str) = reactive_cell_id {
+            // Reactive path - use layers_signal_vec for O(delta) updates
+            zoon::println!("[DD render_stack] Reactive layers from '{}'", cell_id_str);
+            return Stack::new()
+                .layers_signal_vec(
+                    list_signal_vec(cell_id_str)
+                        .map(|item| render_dd_value(&item))
+                )
+                .unify();
+        }
     }
 
-    // Static path - materialize layers once
-    let layers: Vec<RawElOrText> = fields
-        .get("layers")
-        .and_then(|v| match v {
-            Value::List(items) => Some(items.iter().map(|item| render_dd_value(item)).collect()),
-            Value::Collection(handle) => Some(handle.iter().map(|item| render_dd_value(item)).collect()),
-            _ => None,
-        })
-        .unwrap_or_default();
-
-    Stack::new()
-        .layers(layers)
-        .unify()
+    panic!("[DD render_stack] 'layers' must be CellRef or Collection");
 }
 
 /// Render a container element.
@@ -1015,54 +884,76 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
 fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
     // Placeholder can be a simple string or an object with a "text" field
     // e.g., placeholder: [text: TEXT { Type and press Enter... }]
-    let placeholder = fields
-        .get("placeholder")
-        .map(|v| {
-            // Try to get .text field from object, otherwise use to_display_string
-            v.get("text")
-                .map(|t| t.to_display_string())
-                .unwrap_or_else(|| v.to_display_string())
-        })
-        .unwrap_or_default();
+    let placeholder_value = fields.get("placeholder").unwrap_or_else(|| {
+        panic!("[DD TextInput] Missing required 'placeholder' field");
+    });
+    let placeholder = match placeholder_value {
+        Value::Unit => None,
+        Value::Text(text) => Some(text.as_ref().to_string()),
+        Value::Object(obj) => {
+            let text_value = obj.get("text").unwrap_or_else(|| {
+                panic!("[DD TextInput] placeholder object must contain 'text'");
+            });
+            match text_value {
+                Value::Text(text) => Some(text.as_ref().to_string()),
+                Value::CellRef(cell_id) => {
+                    panic!("[DD TextInput] placeholder must be static text, found CellRef({})", cell_id);
+                }
+                other => {
+                    panic!("[DD TextInput] placeholder.text must be Text, found {:?}", other);
+                }
+            }
+        }
+        other => {
+            panic!("[DD TextInput] placeholder must be Text, Unit, or object with text, found {:?}", other);
+        }
+    };
 
-    let text_field = fields.get("text");
+    let text_field = fields.get("text").unwrap_or_else(|| {
+        panic!("[DD TextInput] Missing required 'text' field");
+    });
     zoon::println!("[DD TextInput] text field value: {:?}", text_field);
 
-    let text = text_field
-        .map(|v| {
-            // If it's a CellRef, resolve to the actual stored value
-            if let Value::CellRef(cell_id) = v {
-                let resolved = get_cell_value(&cell_id.name())
-                    .map(|hv| hv.to_display_string())
-                    .unwrap_or_default();
-                zoon::println!("[DD TextInput] CellRef({}) resolved to: '{}'", cell_id, resolved);
-                resolved
-            } else {
-                let display = v.to_display_string();
-                zoon::println!("[DD TextInput] Non-CellRef to_display_string: '{}'", display);
-                display
-            }
-        })
-        .unwrap_or_default();
+    let text_cell_id = match text_field {
+        Value::CellRef(cell_id) => Some(cell_id.to_string()),
+        Value::Text(_) => None,
+        other => {
+            panic!("[DD TextInput] text must be Text or CellRef, found {:?}", other);
+        }
+    };
+    let text = match text_field {
+        Value::CellRef(cell_id) => {
+            zoon::println!("[DD TextInput] text field is CellRef({})", cell_id);
+            String::new()
+        }
+        Value::Text(text) => text.as_ref().to_string(),
+        other => {
+            panic!("[DD TextInput] text must be Text or CellRef, found {:?}", other);
+        }
+    };
 
     // Check for focus: True tag
-    let should_focus = fields
-        .get("focus")
-        .map(|v| match v {
-            Value::Tagged { tag, .. } => BoolTag::is_true(tag.as_ref()),
-            Value::Bool(b) => *b,
-            _ => false,
-        })
-        .unwrap_or(false);
+    let focus_value = fields.get("focus").unwrap_or_else(|| {
+        panic!("[DD TextInput] Missing required 'focus' field");
+    });
+    let should_focus = match focus_value {
+        Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => BoolTag::is_true(tag.as_ref()),
+        Value::Bool(b) => *b,
+        other => {
+            panic!("[DD TextInput] focus must be Bool or BoolTag, found {:?}", other);
+        }
+    };
 
     // Extract key_down LinkRef from element.event.key_down
     let key_down_link_id = fields
         .get("element")
         .and_then(|e| e.get("event"))
         .and_then(|e| e.get("key_down"))
-        .and_then(|v| match v {
-            Value::LinkRef(id) => Some(id.to_string()),
-            _ => None,
+        .map(|v| match v {
+            Value::LinkRef(id) => id.to_string(),
+            other => {
+                panic!("[DD TextInput] element.event.key_down must be LinkRef, found {:?}", other);
+            }
         });
 
     // DEBUG: Log text_input rendering info
@@ -1077,9 +968,11 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
         .get("element")
         .and_then(|e| e.get("event"))
         .and_then(|e| e.get("change"))
-        .and_then(|v| match v {
-            Value::LinkRef(id) => Some(id.to_string()),
-            _ => None,
+        .map(|v| match v {
+            Value::LinkRef(id) => id.to_string(),
+            other => {
+                panic!("[DD TextInput] element.event.change must be LinkRef, found {:?}", other);
+            }
         });
 
     // Extract blur LinkRef separately (for editing inputs)
@@ -1087,91 +980,83 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
         .get("element")
         .and_then(|e| e.get("event"))
         .and_then(|e| e.get("blur"))
-        .and_then(|v| match v {
-            Value::LinkRef(id) => Some(id.to_string()),
-            _ => None,
+        .map(|v| match v {
+            Value::LinkRef(id) => id.to_string(),
+            other => {
+                panic!("[DD TextInput] element.event.blur must be LinkRef, found {:?}", other);
+            }
         });
 
-    // TextInput builder uses typestate, so we need separate code paths
-    // for different combinations of event handlers
-    match (key_down_link_id, change_link_id) {
-        (Some(key_link), Some(change_link)) => {
-            let do_focus = should_focus;
+    let is_editing_input = blur_link_id.is_some();
 
-            // CRITICAL: Track text in a cell for ALL inputs with both key_down and change events.
-            // For editing inputs (those with blur handlers), use blur_link_id for the cell name.
-            // For regular inputs (like todo_mvc's main input), use change_link for the cell name.
-            // This ensures we can read the text when Enter is pressed (DOM access fails with CDP).
-            let text_cell = blur_link_id.as_ref()
-                .map(|id| format!("editing_text_{}", id))
-                .or_else(|| Some(format!("input_text_{}", change_link)));
+    if text_cell_id.is_some() && change_link_id.is_none() {
+        panic!("[DD TextInput] text CellRef requires element.event.change LinkRef");
+    }
+    if text_cell_id.is_none() && change_link_id.is_some() {
+        panic!("[DD TextInput] element.event.change requires text CellRef");
+    }
 
-            // Initialize text hold with current text if needed
-            let current_text = if let Some(ref cell_id) = text_cell {
-                let existing = super::super::io::get_cell_value(cell_id);
-                zoon::println!("[DD TextInput] text_cell='{}', existing cell value={:?}", cell_id, existing);
-                existing
-                    .and_then(|v| if let super::super::core::value::Value::Text(t) = v { Some(t.to_string()) } else { None })
-                    .unwrap_or_else(|| {
-                        // First time - initialize with the original text
-                        zoon::println!("[DD TextInput] Initializing text_cell='{}' with text='{}'", cell_id, text);
-                        super::super::io::update_cell_no_persist(cell_id, super::super::core::value::Value::text(text.clone()));
-                        text.clone()
-                    })
+    let build_input = {
+        let placeholder_text = placeholder.clone().unwrap_or_default();
+        let text = text.clone();
+        let text_cell_id = text_cell_id.clone();
+        move || {
+            let input = if let Some(cell_id) = &text_cell_id {
+                let cell_id_for_signal = cell_id.clone();
+                TextInput::new()
+                    .id("dd_text_input")
+                    .text_signal(
+                        cell_signal(cell_id.clone())
+                            .map(move |value| {
+                                let value = value.unwrap_or_else(|| {
+                                    panic!("[DD TextInput] Missing cell value for '{}'", cell_id_for_signal);
+                                });
+                                value.to_display_string()
+                            })
+                    )
             } else {
-                text.clone()
+                TextInput::new()
+                    .id("dd_text_input")
+                    .text(text.clone())
             };
-            zoon::println!("[DD TextInput] Final current_text='{}'", current_text);
+            let input = input.placeholder(Placeholder::new(placeholder_text.clone()));
 
-            let text_cell_for_change = text_cell.clone();
-            let text_cell_for_keydown = text_cell.clone();
-            let is_editing_input = blur_link_id.is_some();
-            let initial_text_for_insert = current_text.clone();
-
-            let input = TextInput::new()
-                .id("dd_text_input")
-                .placeholder(Placeholder::new(placeholder))
-                .text(current_text)  // Use tracked text for editing inputs
+            let do_focus = should_focus;
+            let do_double_focus = is_editing_input;
+            input
                 .focus(should_focus)
                 .update_raw_el(move |raw_el| {
                     let raw_el = raw_el.attr("autocomplete", "off");
                     if do_focus {
-                        // For dynamically shown inputs (like editing input), we need to:
-                        // 1. Set the input value after insert (Zoon's .text() may not work reliably for WhileRef)
-                        // 2. Call focus() after insert
-                        // 3. Defer with requestAnimationFrame to win the focus race
-                        //    against the main input which also has focus=true
-                        let text_for_insert = initial_text_for_insert.clone();
-                        raw_el.after_insert(move |el| {
+                        raw_el.after_insert(|el| {
                             #[cfg(target_arch = "wasm32")]
                             {
                                 use zoon::wasm_bindgen::closure::Closure;
                                 use zoon::wasm_bindgen::JsCast;
-
-                                // Set the input value immediately (critical for editing inputs)
-                                if !text_for_insert.is_empty() {
-                                    if let Some(input) = el.dyn_ref::<zoon::web_sys::HtmlInputElement>() {
-                                        input.set_value(&text_for_insert);
-                                        zoon::println!("[DD TextInput] Set input value via after_insert: '{}'", text_for_insert);
-                                    }
-                                }
-
-                                // Use double requestAnimationFrame: first lets current render complete,
-                                // second ensures we focus after the main input's focus has been processed
                                 let el_clone = el.clone();
-                                let inner_closure = Closure::once(move || {
-                                    let _ = el_clone.focus();
-                                });
-                                let outer_closure = Closure::once(move || {
+                                if do_double_focus {
+                                    let inner_closure = Closure::once(move || {
+                                        let _ = el_clone.focus();
+                                    });
+                                    let outer_closure = Closure::once(move || {
+                                        if let Some(window) = zoon::web_sys::window() {
+                                            let _ = window.request_animation_frame(inner_closure.as_ref().unchecked_ref());
+                                        }
+                                        inner_closure.forget();
+                                    });
                                     if let Some(window) = zoon::web_sys::window() {
-                                        let _ = window.request_animation_frame(inner_closure.as_ref().unchecked_ref());
+                                        let _ = window.request_animation_frame(outer_closure.as_ref().unchecked_ref());
                                     }
-                                    inner_closure.forget();
-                                });
-                                if let Some(window) = zoon::web_sys::window() {
-                                    let _ = window.request_animation_frame(outer_closure.as_ref().unchecked_ref());
+                                    outer_closure.forget();
+                                } else {
+                                    let closure = Closure::once(move || {
+                                        let _ = el_clone.focus();
+                                    });
+                                    if let Some(window) = zoon::web_sys::window() {
+                                        let _ = window.request_animation_frame(closure.as_ref().unchecked_ref());
+                                    }
+                                    closure.forget();
                                 }
-                                outer_closure.forget();
                             }
                             #[cfg(not(target_arch = "wasm32"))]
                             {
@@ -1182,66 +1067,41 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
                         raw_el
                     }
                 })
+        }
+    };
+
+    // TextInput builder uses typestate, so we need separate code paths
+    // for different combinations of event handlers
+    match (key_down_link_id, change_link_id) {
+        (Some(key_link), Some(change_link)) => {
+            let input = build_input()
                 .on_key_down_event(move |event| {
-                    zoon::println!("[DD on_key_down_event] INPUT fired! key_link={}, is_editing={}", key_link, is_editing_input);
-                    let key_name = match event.key() {
+                    zoon::println!("[DD on_key_down_event] INPUT fired! key_link={}", key_link);
+                    match event.key() {
                         Key::Enter => {
-                            zoon::println!("[DD on_key_down_event] Enter pressed, is_editing={}", is_editing_input);
-                            // For Enter key, capture the input's current text value
-                            // Try cell first (set by on_change), then DOM fallback (needed for CDP testing)
+                            zoon::println!("[DD on_key_down_event] Enter pressed");
                             #[cfg(target_arch = "wasm32")]
                             {
-                                let mut input_text = String::new();
-
-                                // Try reading from tracked cell first (set by on_change events)
-                                if let Some(ref cell_id) = text_cell_for_keydown {
-                                    input_text = super::super::io::get_cell_value(cell_id)
-                                        .and_then(|v| if let super::super::core::value::Value::Text(t) = v { Some(t.to_string()) } else { None })
-                                        .unwrap_or_default();
-                                    zoon::println!("[DD on_key_down_event] Cell value: '{}'", input_text);
-
-                                    // Only clear the hold for editing inputs (blur-based workflow)
-                                    if is_editing_input && !input_text.is_empty() {
-                                        super::super::io::update_cell_no_persist(cell_id, Value::text(""));
-                                    }
-                                }
-
-                                // If cell is empty, try DOM fallback (needed when CDP typing doesn't trigger on_change)
-                                if input_text.is_empty() {
-                                    input_text = get_dd_text_input_value();
-                                    zoon::println!("[DD on_key_down_event] DOM fallback value: '{}'", input_text);
-                                }
-
+                                let input_text = get_dd_text_input_value();
                                 zoon::println!("[DD on_key_down_event] Enter text captured: '{}'", input_text);
-                                // Send input text (not just "Enter") so ListAppend can use it
-                                fire_global_key_down(&key_link, &format!("Enter:{}", input_text));
+                                fire_global_key_down(&key_link, DdKey::Enter, Some(input_text));
                             }
                             #[cfg(not(target_arch = "wasm32"))]
                             {
-                                fire_global_key_down(&key_link, "Enter");
+                                fire_global_key_down(&key_link, DdKey::Enter, Some(String::new()));
                             }
                             return;
                         }
                         Key::Escape => {
-                            // For editing inputs, clear the tracked hold on Escape
-                            if is_editing_input {
-                                if let Some(ref cell_id) = text_cell_for_keydown {
-                                    super::super::io::update_cell_no_persist(cell_id, Value::text(""));
-                                }
-                            }
-                            "Escape"
-                        },
-                        Key::Other(k) => k.as_str(),
-                    };
-                    // Send key name with the event so WHEN pattern matching works
-                    fire_global_key_down(&key_link, key_name);
+                            fire_global_key_down(&key_link, DdKey::Escape, None);
+                        }
+                        Key::Other(k) => {
+                            fire_global_key_down(&key_link, DdKey::from(k.as_str()), None);
+                        }
+                    }
                 })
                 .on_change(move |new_text| {
-                    // Track text changes in the cell (for all inputs with change event)
-                    if let Some(ref cell_id) = text_cell_for_change {
-                        super::super::io::update_cell_no_persist(cell_id, super::super::core::value::Value::text(new_text.clone()));
-                    }
-                    fire_global_link(&change_link);
+                    fire_global_link_with_text(&change_link, new_text);
                 });
             // Add blur handler if blur_link_id is set (for editing inputs)
             if let Some(blur_link) = blur_link_id.clone() {
@@ -1257,134 +1117,43 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
             }
         }
         (Some(key_link), None) => {
-            let do_focus = should_focus;
-            TextInput::new()
-                .id("dd_text_input")
-                .placeholder(Placeholder::new(placeholder))
-                .text(text)
-                .focus(should_focus)
-                .update_raw_el(move |raw_el| {
-                    let raw_el = raw_el.attr("autocomplete", "off");
-                    if do_focus {
-                        raw_el.after_insert(|el| {
-                            #[cfg(target_arch = "wasm32")]
-                            {
-                                use zoon::wasm_bindgen::closure::Closure;
-                                use zoon::wasm_bindgen::JsCast;
-                                let el_clone = el.clone();
-                                let closure = Closure::once(move || {
-                                    let _ = el_clone.focus();
-                                });
-                                if let Some(window) = zoon::web_sys::window() {
-                                    let _ = window.request_animation_frame(closure.as_ref().unchecked_ref());
-                                }
-                                closure.forget();
-                            }
-                            #[cfg(not(target_arch = "wasm32"))]
-                            {
-                                let _ = el.focus();
-                            }
-                        })
-                    } else {
-                        raw_el
-                    }
-                })
+            build_input()
                 .on_key_down_event(move |event| {
                     zoon::println!("[DD on_key_down_event] SIMPLE INPUT fired! key_link={}", key_link);
-                    let key_name = match event.key() {
+                    match event.key() {
                         Key::Enter => {
                             zoon::println!("[DD on_key_down_event] Enter pressed in SIMPLE input");
                             #[cfg(target_arch = "wasm32")]
                             {
                                 let input_text = get_dd_text_input_value();
-                                fire_global_key_down(&key_link, &format!("Enter:{}", input_text));
+                                fire_global_key_down(&key_link, DdKey::Enter, Some(input_text));
                             }
                             #[cfg(not(target_arch = "wasm32"))]
                             {
-                                fire_global_key_down(&key_link, "Enter");
+                                fire_global_key_down(&key_link, DdKey::Enter, Some(String::new()));
                             }
                             return;
                         }
-                        Key::Escape => "Escape",
-                        Key::Other(k) => k.as_str(),
-                    };
-                    // Send key name with the event so WHEN pattern matching works
-                    fire_global_key_down(&key_link, key_name);
+                        Key::Escape => {
+                            fire_global_key_down(&key_link, DdKey::Escape, None);
+                        }
+                        Key::Other(k) => {
+                            fire_global_key_down(&key_link, DdKey::from(k.as_str()), None);
+                        }
+                    }
                 })
                 .on_change(|_| {})
                 .unify()
         }
         (None, Some(change_link)) => {
-            let do_focus = should_focus;
-            TextInput::new()
-                .id("dd_text_input")
-                .placeholder(Placeholder::new(placeholder))
-                .text(text)
-                .focus(should_focus)
-                .update_raw_el(move |raw_el| {
-                    let raw_el = raw_el.attr("autocomplete", "off");
-                    if do_focus {
-                        raw_el.after_insert(|el| {
-                            #[cfg(target_arch = "wasm32")]
-                            {
-                                use zoon::wasm_bindgen::closure::Closure;
-                                use zoon::wasm_bindgen::JsCast;
-                                let el_clone = el.clone();
-                                let closure = Closure::once(move || {
-                                    let _ = el_clone.focus();
-                                });
-                                if let Some(window) = zoon::web_sys::window() {
-                                    let _ = window.request_animation_frame(closure.as_ref().unchecked_ref());
-                                }
-                                closure.forget();
-                            }
-                            #[cfg(not(target_arch = "wasm32"))]
-                            {
-                                let _ = el.focus();
-                            }
-                        })
-                    } else {
-                        raw_el
-                    }
-                })
-                .on_change(move |_text| {
-                    fire_global_link(&change_link);
+            build_input()
+                .on_change(move |new_text| {
+                    fire_global_link_with_text(&change_link, new_text);
                 })
                 .unify()
         }
         (None, None) => {
-            let do_focus = should_focus;
-            TextInput::new()
-                .id("dd_text_input")
-                .placeholder(Placeholder::new(placeholder))
-                .text(text)
-                .focus(should_focus)
-                .update_raw_el(move |raw_el| {
-                    let raw_el = raw_el.attr("autocomplete", "off");
-                    if do_focus {
-                        raw_el.after_insert(|el| {
-                            #[cfg(target_arch = "wasm32")]
-                            {
-                                use zoon::wasm_bindgen::closure::Closure;
-                                use zoon::wasm_bindgen::JsCast;
-                                let el_clone = el.clone();
-                                let closure = Closure::once(move || {
-                                    let _ = el_clone.focus();
-                                });
-                                if let Some(window) = zoon::web_sys::window() {
-                                    let _ = window.request_animation_frame(closure.as_ref().unchecked_ref());
-                                }
-                                closure.forget();
-                            }
-                            #[cfg(not(target_arch = "wasm32"))]
-                            {
-                                let _ = el.focus();
-                            }
-                        })
-                    } else {
-                        raw_el
-                    }
-                })
+            build_input()
                 .on_change(|_| {})
                 .unify()
         }
@@ -1401,7 +1170,12 @@ const CHECKED_SVG: &str = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//
 fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
     zoon::println!("[DD render_checkbox] CALLED with fields={:?}", fields.keys().collect::<Vec<_>>());
     // Extract checked value - can be Bool, Tagged, or CellRef (reactive)
-    let checked_value = fields.get("checked").cloned();
+    let checked_value = fields
+        .get("checked")
+        .unwrap_or_else(|| {
+            panic!("[DD render_checkbox] Missing required 'checked' field");
+        })
+        .clone();
     zoon::println!("[DD render_checkbox] checked_value={:?}", checked_value);
 
     // Extract click LinkRef from element.event.click if present
@@ -1418,24 +1192,27 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
     // with custom 40x40 SVG icon for visual consistency
 
     // Check if checked is a CellRef (reactive checkbox)
-    if let Some(Value::CellRef(cell_id)) = &checked_value {
+    if let Value::CellRef(cell_id) = &checked_value {
         // Reactive checkbox - observe HOLD state changes
         let cell_id_for_signal = cell_id.to_string();
+        let cell_id_for_checked = cell_id_for_signal.clone();
         let cell_id_for_icon = cell_id.to_string();
+        let cell_id_for_icon_checked = cell_id_for_icon.clone();
 
         // Phase 12: Use granular cell_signal() for checkbox - only updates when this cell changes
         let checkbox = Checkbox::new()
             .label_hidden("checkbox")
             .checked_signal(
                 cell_signal(cell_id_for_signal)  // Pass owned String
-                    .map(|value| {
-                        value
-                            .map(|v| match v {
-                                Value::Bool(b) => b,
-                                Value::Tagged { tag, .. } => BoolTag::is_true(tag.as_ref()),
-                                _ => false,
-                            })
-                            .unwrap_or(false)
+                    .map(move |value| {
+                        let value = value.unwrap_or_else(|| {
+                            panic!("[DD Checkbox] Missing cell value for '{}'", cell_id_for_checked);
+                        });
+                        match value {
+                            Value::Bool(b) => b,
+                            Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => BoolTag::is_true(tag.as_ref()),
+                            other => panic!("[DD Checkbox] Expected Bool for '{}', found {:?}", cell_id_for_checked, other),
+                        }
                     })
             )
             .icon({
@@ -1447,14 +1224,15 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
                         .update_raw_el(|raw_el| raw_el.style("pointer-events", "none"))
                         .s(zoon::Background::new().url_signal(
                             cell_signal(cell_id_for_icon.clone())  // Clone and pass owned
-                                .map(|value| {
-                                    let checked = value
-                                        .map(|v| match v {
-                                            Value::Bool(b) => b,
-                                            Value::Tagged { tag, .. } => BoolTag::is_true(tag.as_ref()),
-                                            _ => false,
-                                        })
-                                        .unwrap_or(false);
+                                .map(move |value| {
+                                    let value = value.unwrap_or_else(|| {
+                                        panic!("[DD Checkbox] Missing cell value for '{}'", cell_id_for_icon_checked);
+                                    });
+                                    let checked = match value {
+                                        Value::Bool(b) => b,
+                                        Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => BoolTag::is_true(tag.as_ref()),
+                                        other => panic!("[DD Checkbox] Expected Bool for '{}', found {:?}", cell_id_for_icon_checked, other),
+                                    };
                                     if checked { CHECKED_SVG } else { UNCHECKED_SVG }
                                 })
                         ))
@@ -1462,9 +1240,9 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
             });
 
         // For reactive checkboxes with a CellRef, toggle the HOLD value directly
-        // Fire the link event - DynamicLinkAction::BoolToggle will handle the actual toggle
+        // Fire the link event - LinkCellMapping::BoolToggle handles the actual toggle
         // NOTE: Don't call toggle_cell_bool directly here! That would cause a double toggle
-        // because fire_global_link checks for DynamicLinkAction and executes BoolToggle.
+        // because DD link mappings handle BoolToggle.
         let cell_id_for_toggle = cell_id.to_string();
         if let Some(ref link_id) = click_link_id {
             zoon::println!("[DD render_checkbox] RETURNING reactive checkbox with link_id={}", link_id);
@@ -1475,28 +1253,13 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
                     let link_id = link_id_owned.clone();
                     raw_el.event_handler(move |_: zoon::events::Click| {
                         zoon::println!("[DD CHECKBOX CLICK] RAW event handler invoked! link_id={}", link_id);
-                        // Only fire link - DynamicLinkAction::BoolToggle handles the toggle
+                        // Only fire link - DD link mappings handle the toggle
                         fire_global_link(&link_id);
                     })
                 })
                 .unify();
         } else {
-            zoon::println!("[DD render_checkbox] RETURNING reactive checkbox WITHOUT link_id");
-            // No link, toggle via DD event system (Phase 7: toggle_cell_bool was removed)
-            let cell_id_clone = cell_id_for_toggle.clone();
-            return checkbox
-                .update_raw_el(move |raw_el| {
-                    let cell_id = cell_id_clone.clone();
-                    raw_el.event_handler(move |_: zoon::events::Click| {
-                        zoon::println!("[DD CHECKBOX CLICK] RAW event handler (no link_id), toggling {}", cell_id);
-                        // Fire toggle event through DD - runtime updates flow through DD, not direct mutation
-                        fire_global_link_with_text(
-                            "dd_cell_update",
-                            &format!("bool_toggle:{}", cell_id)
-                        );
-                    })
-                })
-                .unify();
+            panic!("[DD render_checkbox] Bug: reactive checkbox missing click LinkRef for {}", cell_id_for_toggle);
         }
     }
 
@@ -1504,14 +1267,13 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
     // The bridge receives final Bool values, not deferred computations
 
     // Static checkbox - extract checked state directly
-    let checked = checked_value
-        .as_ref()
-        .map(|v| match v {
-            Value::Bool(b) => *b,
-            Value::Tagged { tag, .. } => BoolTag::is_true(tag.as_ref()),
-            _ => false,
-        })
-        .unwrap_or(false);
+    let checked = match checked_value {
+        Value::Bool(b) => b,
+        Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => BoolTag::is_true(tag.as_ref()),
+        other => {
+            panic!("[DD render_checkbox] checked must be Bool/BoolTag, found {:?}", other);
+        }
+    };
 
     // Check for custom icon (static case)
     let custom_icon = fields.get("icon").cloned();
@@ -1555,7 +1317,10 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
 fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
     let label_value = fields
         .get("label")
-        .or_else(|| fields.get("text"));
+        .or_else(|| fields.get("text"))
+        .unwrap_or_else(|| {
+            panic!("[DD render_label] Missing required 'label'/'text' field");
+        });
 
     // Extract double_click LinkRef from element.event.double_click if present
     let double_click_link_id = fields
@@ -1589,31 +1354,28 @@ fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
         });
 
     let label = match label_value {
-        Some(Value::CellRef(name)) => {
+        Value::CellRef(name) => {
             // Reactive label - update when HOLD state changes
             // Phase 12: Use granular cell_signal() for label - only updates when this cell changes
             let cell_id = name.to_string();
+            let cell_id_for_signal = cell_id.clone();
             Label::new()
                 .label_signal(
                     cell_signal(cell_id)  // Pass owned String directly
-                        .map(|value| {
-                            value
-                                .map(|v| v.to_display_string())
-                                .unwrap_or_default()
+                        .map(move |value| {
+                            let value = value.unwrap_or_else(|| {
+                                panic!("[DD Label] Missing cell value for '{}'", cell_id_for_signal);
+                            });
+                            value.to_display_string()
                         })
                 )
                 .for_input("dd_text_input")
         }
         // Phase 7: ReactiveText REMOVED - DD produces Text values directly
-        Some(v) => {
+        v => {
             // Static label
             Label::new()
                 .label(v.to_display_string())
-                .for_input("dd_text_input")
-        }
-        None => {
-            Label::new()
-                .label("")
                 .for_input("dd_text_input")
         }
     };
@@ -1646,42 +1408,70 @@ fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
 /// Render a paragraph element.
 /// Phase 6: Added CellRef support for reactive text via content_signal.
 fn render_paragraph(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    // Check if contents/content is a CellRef for reactive rendering
-    if let Some(Value::CellRef(cell_id)) = fields.get("contents").or_else(|| fields.get("content")) {
-        // Reactive path - use content_signal for O(delta) updates
-        let cell_id_str = cell_id.name();
+    let contents_field = fields.get("contents");
+    let content_field = fields.get("content");
+    let text_field = fields.get("text");
+    let field_count = contents_field.is_some() as u8 + content_field.is_some() as u8 + text_field.is_some() as u8;
+    if field_count != 1 {
+        panic!(
+            "[DD render_paragraph] Provide exactly one of 'contents', 'content', or 'text' (found contents={}, content={}, text={})",
+            contents_field.is_some(),
+            content_field.is_some(),
+            text_field.is_some()
+        );
+    }
+
+    let field_value = contents_field.or(content_field).or(text_field).unwrap_or_else(|| {
+        panic!("[DD render_paragraph] Missing required 'contents'/'content'/'text' field");
+    });
+
+    if let Value::CellRef(cell_id) = field_value {
+        // Reactive path - use content_signal for scalar cells, contents_signal_vec for lists
+        let cell_id_str = cell_id.name().to_string();
+        if is_list_cell(&cell_id_str) {
+            return Paragraph::new()
+                .contents_signal_vec(
+                    list_signal_vec(cell_id_str)
+                        .map(|item| render_dd_value(&item))
+                )
+                .unify();
+        }
+        let cell_id_for_signal = cell_id_str.clone();
         zoon::println!("[DD render_paragraph] Reactive content from CellRef '{}'", cell_id_str);
         return Paragraph::new()
             .content_signal(
                 cell_signal(cell_id_str)
-                    .map(|value| {
-                        value
-                            .map(|v| extract_text_content(&v))
-                            .unwrap_or_default()
+                    .map(move |value| {
+                        let value = value.unwrap_or_else(|| {
+                            panic!("[DD Paragraph] Missing cell value for '{}'", cell_id_for_signal);
+                        });
+                        extract_text_content(&value)
                     })
             )
             .unify();
     }
 
-    // Static path - extract content once
-    // Try "contents" first (plural - used by Element/paragraph), then fallback to "content" or "text"
-    let content = if let Some(items) = fields.get("contents").and_then(|v| v.as_list_items()) {
-        // Render list items and join their text representations
-        items.iter()
-            .map(|item| extract_text_content(item))
-            .collect::<Vec<_>>()
-            .join("")
-    } else {
-        fields
-            .get("content")
-            .or_else(|| fields.get("text"))
-            .map(|v| extract_text_content(v))
-            .unwrap_or_default()
-    };
-
-    Paragraph::new()
-        .content(content)
-        .unify()
+    match field_value {
+        Value::List(handle) => {
+            let list_id = handle
+                .cell_id
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| handle.id.to_string());
+            Paragraph::new()
+                .contents_signal_vec(
+                    list_signal_vec(list_id)
+                        .map(|item| render_dd_value(&item))
+                )
+                .unify()
+        }
+        other => {
+            let content = extract_text_content(other);
+            Paragraph::new()
+                .content(content)
+                .unify()
+        }
+    }
 }
 
 /// Extract display text from a Value, handling nested elements like links.
@@ -1689,6 +1479,7 @@ fn extract_text_content(value: &Value) -> String {
     match value {
         Value::Text(s) => s.to_string(),
         Value::Unit => " ".to_string(), // Text/space() renders as Unit
+        Value::Tagged { tag, fields } if tag.as_ref() == "NoElement" => String::new(),
         Value::Tagged { tag, fields } if ElementTag::is_element(tag.as_ref()) => {
             // For Element tags, check the element type and extract appropriate text
             let element_type = fields
@@ -1703,29 +1494,63 @@ fn extract_text_content(value: &Value) -> String {
                     // Extract label from link element
                     fields.get("label")
                         .map(|v| extract_text_content(v))
-                        .unwrap_or_default()
+                        .unwrap_or_else(|| {
+                            panic!("[DD extract_text_content] link element missing 'label'");
+                        })
                 }
                 Some("paragraph") => {
                     // Recursively extract from paragraph contents
-                    if let Some(items) = fields.get("contents").and_then(|v| v.as_list_items()) {
-                        items.iter()
-                            .map(|item| extract_text_content(item))
-                            .collect::<Vec<_>>()
-                            .join("")
-                    } else {
-                        String::new()
+                    if let Some(contents) = fields.get("contents") {
+                        match contents {
+                            Value::List(_) => {
+                                panic!("[DD extract_text_content] paragraph contents cannot be Collection");
+                            }
+                            _ => {}
+                        }
                     }
+                    fields.get("content")
+                        .or_else(|| fields.get("text"))
+                        .map(|v| extract_text_content(v))
+                        .unwrap_or_else(|| {
+                            panic!("[DD extract_text_content] paragraph element missing 'contents'/'content'/'text'");
+                        })
                 }
                 _ => {
                     // For other elements, try to extract from label or child
                     fields.get("label")
                         .or_else(|| fields.get("child"))
                         .map(|v| extract_text_content(v))
-                        .unwrap_or_default()
+                        .unwrap_or_else(|| {
+                            panic!("[DD extract_text_content] element missing 'label' or 'child'");
+                        })
                 }
             }
         }
+        Value::List(_) => {
+            panic!("[DD extract_text_content] Collection is not valid text content");
+        }
         _ => value.to_display_string(),
+    }
+}
+
+fn select_while_arm(value: &Value, arms: &Arc<Vec<WhileArm>>, default: &Value) -> Value {
+    for arm in arms.iter() {
+        if while_pattern_matches(value, &arm.pattern) {
+            return arm.body.clone();
+        }
+    }
+    if !matches!(default, Value::Unit) {
+        return default.clone();
+    }
+    Value::Unit
+}
+
+fn while_pattern_matches(value: &Value, pattern: &Value) -> bool {
+    match (value, pattern) {
+        (Value::Bool(b), Value::Tagged { tag, .. }) if BoolTag::is_bool_tag(tag.as_ref()) => {
+            BoolTag::matches_bool(tag.as_ref(), *b)
+        }
+        _ => value == pattern,
     }
 }
 
@@ -1734,12 +1559,16 @@ fn render_link(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Raw
     let label = fields
         .get("label")
         .map(|v| v.to_display_string())
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            panic!("[DD render_link] Missing required 'label' field");
+        });
 
     let to = fields
         .get("to")
         .map(|v| v.to_display_string())
-        .unwrap_or_else(|| "#".to_string());
+        .unwrap_or_else(|| {
+            panic!("[DD render_link] Missing required 'to' field");
+        });
 
     Link::new()
         .label(label)

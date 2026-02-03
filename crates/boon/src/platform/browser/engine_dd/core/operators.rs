@@ -7,7 +7,7 @@
 //! # Architecture
 //!
 //! ```text
-//! Browser Events → inject_event() → DD Worker → inspect() callbacks → DOM
+//! Browser Events → inject_event() → DD Worker → capture() output → DOM
 //! ```
 //!
 //! # Phase 1 Goals
@@ -20,8 +20,6 @@
 //!
 //! - Implement HOLD operator using DD's unary operator
 //! - Test stateful accumulation patterns
-
-use std::sync::{Arc, Mutex};
 
 use differential_dataflow::collection::{AsCollection, VecCollection};
 use differential_dataflow::input::Input;
@@ -84,13 +82,13 @@ impl Default for DdRuntime {
 /// // outputs: [(0, 1), (1, 2), (2, 1)] - count after each event
 /// ```
 pub fn run_counter_dataflow(events: Vec<(i32, bool)>) -> Vec<(u64, isize)> {
-    let outputs = Arc::new(Mutex::new(Vec::new()));
-    let outputs_clone = outputs.clone();
+    use timely::dataflow::operators::Capture;
+    use timely::dataflow::operators::capture::Extract;
 
     // Run a single-threaded Timely computation
-    timely::execute_directly(move |worker| {
+    let outputs_rx = timely::execute_directly(move |worker| {
         // Create input handle and probe for tracking progress
-        let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
+        let (mut input, probe, outputs_rx) = worker.dataflow::<u64, _, _>(|scope| {
             // Create an input collection
             let (input_handle, collection) = scope.new_collection::<i32, isize>();
 
@@ -101,18 +99,12 @@ pub fn run_counter_dataflow(events: Vec<(i32, bool)>) -> Vec<(u64, isize)> {
                 .map(|_item| ())  // Map all items to unit key ()
                 .count();         // Now count gives us ((), total_count)
 
-            let outputs = outputs_clone.clone();
-            total_count.inspect(move |(((), count), time, diff)| {
-                // () is the key (unit), count is the total count
-                if *diff > 0 {
-                    outputs.lock().unwrap().push((*time, *count));
-                }
-            });
+            let outputs_rx = total_count.inner.capture();
 
             // Create a probe to track progress
             let probe = total_count.probe();
 
-            (input_handle, probe)
+            (input_handle, probe, outputs_rx)
         });
 
         // Process events one at a time
@@ -134,13 +126,21 @@ pub fn run_counter_dataflow(events: Vec<(i32, bool)>) -> Vec<(u64, isize)> {
                 worker.step();
             }
         }
+
+        outputs_rx
     });
 
-    // Return collected outputs
-    Arc::try_unwrap(outputs)
-        .expect("outputs still borrowed")
-        .into_inner()
-        .unwrap()
+    // Return captured outputs
+    let captured = outputs_rx.extract();
+    let mut outputs = Vec::new();
+    for (_cap_time, data) in captured {
+        for (((), count), time, diff) in data {
+            if diff > 0 {
+                outputs.push((time, count));
+            }
+        }
+    }
+    outputs
 }
 
 /// Apply a HOLD transformation to a collection.
@@ -206,6 +206,45 @@ where
         .as_collection()
 }
 
+/// HOLD variant that separates internal state from emitted output.
+///
+/// This allows transforms to update state (e.g., list snapshots) while emitting
+/// diffs for O(delta) rendering.
+pub fn hold_with_output<G, S, E, F, O>(
+    initial: S,
+    events: &VecCollection<G, E>,
+    transform: F,
+) -> VecCollection<G, O>
+where
+    G: Scope,
+    G::Timestamp: Clone,
+    S: timely::Data + Clone,
+    E: timely::Data,
+    O: timely::Data + Clone,
+    F: Fn(&S, &E) -> (S, O) + 'static,
+{
+    events
+        .inner
+        .unary(Pipeline, "HoldWithOutput", move |_capability, _info| {
+            let mut state = initial;
+
+            move |input, output| {
+                input.for_each(|time, data| {
+                    let mut session = output.session(&time);
+
+                    for (event, _event_time, diff) in data.iter() {
+                        if *diff > 0 {
+                            let (new_state, out) = transform(&state, event);
+                            state = new_state;
+                            session.give((out.clone(), time.time().clone(), 1isize));
+                        }
+                    }
+                });
+            }
+        })
+        .as_collection()
+}
+
 /// Run a HOLD-based counter dataflow as proof of concept.
 ///
 /// This demonstrates:
@@ -220,11 +259,11 @@ where
 /// }
 /// ```
 pub fn run_hold_counter_dataflow(num_clicks: usize) -> Vec<(u64, i64)> {
-    let outputs = Arc::new(Mutex::new(Vec::new()));
-    let outputs_clone = outputs.clone();
+    use timely::dataflow::operators::Capture;
+    use timely::dataflow::operators::capture::Extract;
 
-    timely::execute_directly(move |worker| {
-        let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
+    let outputs_rx = timely::execute_directly(move |worker| {
+        let (mut input, probe, outputs_rx) = worker.dataflow::<u64, _, _>(|scope| {
             // Create input collection for click events
             // Using () as the event type since we only care about event occurrence
             let (input_handle, clicks) = scope.new_collection::<(), isize>();
@@ -235,15 +274,10 @@ pub fn run_hold_counter_dataflow(num_clicks: usize) -> Vec<(u64, i64)> {
             let count = hold(0i64, &clicks, |state, _event: &()| state + 1);
 
             // Capture outputs
-            let outputs = outputs_clone.clone();
-            count.inspect(move |(state, time, diff)| {
-                if *diff > 0 {
-                    outputs.lock().unwrap().push((*time, *state));
-                }
-            });
+            let outputs_rx = count.inner.capture();
 
             let probe = count.probe();
-            (input_handle, probe)
+            (input_handle, probe, outputs_rx)
         });
 
         // Simulate clicks
@@ -260,12 +294,20 @@ pub fn run_hold_counter_dataflow(num_clicks: usize) -> Vec<(u64, i64)> {
                 worker.step();
             }
         }
+
+        outputs_rx
     });
 
-    Arc::try_unwrap(outputs)
-        .expect("outputs still borrowed")
-        .into_inner()
-        .unwrap()
+    let captured = outputs_rx.extract();
+    let mut outputs = Vec::new();
+    for (_cap_time, data) in captured {
+        for (state, time, diff) in data {
+            if diff > 0 {
+                outputs.push((time, state));
+            }
+        }
+    }
+    outputs
 }
 
 // ============================================================================
@@ -464,25 +506,20 @@ where
 /// }
 /// ```
 pub fn run_hold_sum_dataflow(numbers: Vec<i64>) -> Vec<(u64, i64)> {
-    let outputs = Arc::new(Mutex::new(Vec::new()));
-    let outputs_clone = outputs.clone();
+    use timely::dataflow::operators::Capture;
+    use timely::dataflow::operators::capture::Extract;
 
-    timely::execute_directly(move |worker| {
-        let (mut input, probe) = worker.dataflow::<u64, _, _>(|scope| {
+    let outputs_rx = timely::execute_directly(move |worker| {
+        let (mut input, probe, outputs_rx) = worker.dataflow::<u64, _, _>(|scope| {
             let (input_handle, nums) = scope.new_collection::<i64, isize>();
 
             // HOLD that sums all incoming numbers
             let sum = hold(0i64, &nums, |total, num| total + num);
 
-            let outputs = outputs_clone.clone();
-            sum.inspect(move |(state, time, diff)| {
-                if *diff > 0 {
-                    outputs.lock().unwrap().push((*time, *state));
-                }
-            });
+            let outputs_rx = sum.inner.capture();
 
             let probe = sum.probe();
-            (input_handle, probe)
+            (input_handle, probe, outputs_rx)
         });
 
         for (time, num) in numbers.into_iter().enumerate() {
@@ -495,12 +532,20 @@ pub fn run_hold_sum_dataflow(numbers: Vec<i64>) -> Vec<(u64, i64)> {
                 worker.step();
             }
         }
+
+        outputs_rx
     });
 
-    Arc::try_unwrap(outputs)
-        .expect("outputs still borrowed")
-        .into_inner()
-        .unwrap()
+    let captured = outputs_rx.extract();
+    let mut outputs = Vec::new();
+    for (_cap_time, data) in captured {
+        for (state, time, diff) in data {
+            if diff > 0 {
+                outputs.push((time, state));
+            }
+        }
+    }
+    outputs
 }
 
 #[cfg(test)]

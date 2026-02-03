@@ -12,12 +12,12 @@
 //! The bridge reads DD output streams to render UI - it does NOT
 //! interpret symbolic references or perform imperative computation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use ordered_float::OrderedFloat;
 
-use super::types::{CellId, LinkId};
+use super::types::{CellId, LinkId, ITEM_KEY_FIELD};
 
 // ============================================================================
 // CELL UPDATE OPERATIONS - Phase 7.3: Separate operations from values
@@ -41,13 +41,13 @@ use super::types::{CellId, LinkId};
 /// # Phase 7.3: Pure DD Design
 ///
 /// Previously, operations were mixed into the `Value` enum, causing confusion:
-/// - Is `Value::ListPush` a value or a command?
+/// - Is this value data or an update command?
 /// - Transforms returned `Value` but sometimes it was actually an operation
 ///
 /// Now operations are clearly separated:
 /// - `Value`: Pure data that can be stored, compared, serialized
 /// - `CellUpdate`: Commands that mutate state
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CellUpdate {
     /// Set cell to a new value (full replacement)
     SetValue {
@@ -58,6 +58,13 @@ pub enum CellUpdate {
     /// Append an item to a list cell. O(1) operation.
     ListPush {
         cell_id: Arc<str>,
+        item: Value,
+    },
+
+    /// Insert an item into a list cell at index. O(n) shift.
+    ListInsertAt {
+        cell_id: Arc<str>,
+        index: usize,
         item: Value,
     },
 
@@ -74,7 +81,7 @@ pub enum CellUpdate {
     },
 
     /// Remove multiple items from a list cell by keys. O(k) where k = keys.len().
-    /// Used by ListRemoveCompleted to emit batch removals instead of reading IO state.
+    /// Used to emit batch removals instead of reading IO state.
     ListRemoveBatch {
         cell_id: Arc<str>,
         keys: Vec<Arc<str>>,
@@ -114,6 +121,15 @@ impl CellUpdate {
     pub fn list_push(cell_id: impl Into<Arc<str>>, item: Value) -> Self {
         Self::ListPush {
             cell_id: cell_id.into(),
+            item,
+        }
+    }
+
+    /// Create a ListInsertAt update.
+    pub fn list_insert_at(cell_id: impl Into<Arc<str>>, index: usize, item: Value) -> Self {
+        Self::ListInsertAt {
+            cell_id: cell_id.into(),
+            index,
             item,
         }
     }
@@ -179,6 +195,7 @@ impl CellUpdate {
         match self {
             Self::SetValue { cell_id, .. } => Some(cell_id),
             Self::ListPush { cell_id, .. } => Some(cell_id),
+            Self::ListInsertAt { cell_id, .. } => Some(cell_id),
             Self::ListRemoveAt { cell_id, .. } => Some(cell_id),
             Self::ListRemoveByKey { cell_id, .. } => Some(cell_id),
             Self::ListRemoveBatch { cell_id, .. } => Some(cell_id),
@@ -186,46 +203,6 @@ impl CellUpdate {
             Self::ListItemUpdate { cell_id, .. } => Some(cell_id),
             Self::Multi(_) => None, // Multiple cells
             Self::NoOp => None,
-        }
-    }
-}
-
-/// Convert CellUpdate to Value for backward compatibility during migration.
-///
-/// This allows gradual migration from Value-based operations to CellUpdate.
-/// Once migration is complete, the operation variants can be removed from Value.
-impl From<CellUpdate> for Value {
-    fn from(update: CellUpdate) -> Self {
-        match update {
-            CellUpdate::SetValue { value, .. } => value,
-            CellUpdate::ListPush { cell_id, item } => Value::ListPush {
-                cell_id,
-                item: Box::new(item),
-            },
-            CellUpdate::ListRemoveAt { cell_id, index } => Value::ListRemoveAt { cell_id, index },
-            CellUpdate::ListRemoveByKey { cell_id, key } => Value::ListRemoveByKey { cell_id, key },
-            CellUpdate::ListRemoveBatch { cell_id, keys } => Value::ListRemoveBatch { cell_id, keys },
-            CellUpdate::ListClear { cell_id } => Value::ListClear { cell_id },
-            CellUpdate::ListItemUpdate { cell_id, key, field_path, new_value } => Value::ListItemUpdate {
-                cell_id,
-                key,
-                field_path,
-                new_value: Box::new(new_value),
-            },
-            CellUpdate::Multi(updates) => Value::MultiCellUpdate(
-                updates.into_iter()
-                    .filter_map(|u| {
-                        match u {
-                            CellUpdate::SetValue { cell_id, value } => Some((cell_id, Box::new(value))),
-                            other => {
-                                let cell_id = other.cell_id()?.to_string();
-                                Some((Arc::from(cell_id), Box::new(Value::from(other))))
-                            }
-                        }
-                    })
-                    .collect()
-            ),
-            CellUpdate::NoOp => Value::Unit,
         }
     }
 }
@@ -253,6 +230,11 @@ impl CollectionId {
     pub fn id(&self) -> u64 {
         self.0
     }
+
+    /// String name used in cell IDs when collection outputs become scalar cells.
+    pub fn name(&self) -> String {
+        self.to_string()
+    }
 }
 
 impl Default for CollectionId {
@@ -278,75 +260,76 @@ impl std::fmt::Display for CollectionId {
 /// CollectionHandle does NOT provide synchronous access to the full list.
 /// All reads must go through the DD dataflow system, ensuring reactive
 /// updates propagate correctly.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug)]
 pub struct CollectionHandle {
     /// Unique identifier for this collection in the DD graph
     pub id: CollectionId,
     /// The cell ID where this collection's state is stored (for mutations)
     pub cell_id: Option<Arc<str>>,
-    /// Snapshot of current items (for rendering - updated reactively)
-    /// This is populated by the DD output stream, not read directly
-    items: Arc<Vec<Value>>,
 }
 
 impl CollectionHandle {
-    /// Create a new collection handle with initial items.
-    pub fn new(items: Vec<Value>) -> Self {
+    /// Create a new collection handle (ID-only).
+    pub fn new() -> Self {
         Self {
             id: CollectionId::new(),
             cell_id: None,
-            items: Arc::new(items),
         }
     }
 
-    /// Create a collection handle linked to a cell for mutations.
-    pub fn with_cell(items: Vec<Value>, cell_id: impl Into<String>) -> Self {
+    /// Create a new collection handle linked to a cell (ID-only).
+    pub fn new_with_cell_id(cell_id: impl Into<Arc<str>>) -> Self {
         Self {
             id: CollectionId::new(),
-            cell_id: Some(Arc::from(cell_id.into())),
-            items: Arc::new(items),
+            cell_id: Some(cell_id.into()),
         }
     }
 
     /// Create a collection handle for a DD-registered collection.
     /// Used by evaluator helpers when registering DD operators.
-    /// The items are initially empty - DD will populate them through the output stream.
+    /// This is ID-only and intentionally unbound (`cell_id = None`):
+    /// list state lives in ListState/SignalVec, and cell binding is explicit.
     pub fn new_with_id(id: CollectionId) -> Self {
         Self {
             id,
             cell_id: None,
-            items: Arc::new(Vec::new()),
         }
     }
 
-    /// Get the current items snapshot (for rendering).
-    /// Note: This is the last-known state from DD, not a synchronous read.
-    pub fn items(&self) -> &[Value] {
-        &self.items
-    }
-
-    /// Get the number of items (from snapshot).
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    /// Check if empty (from snapshot).
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    /// Create a new handle with updated items (called from DD output stream).
-    pub fn with_items(&self, items: Vec<Value>) -> Self {
+    /// Create a collection handle with explicit id and cell id (ID-only).
+    pub fn with_id_and_cell(id: CollectionId, cell_id: impl Into<Arc<str>>) -> Self {
         Self {
-            id: self.id,
-            cell_id: self.cell_id.clone(),
-            items: Arc::new(items),
+            id,
+            cell_id: Some(cell_id.into()),
         }
     }
 
-    /// Get an iterator over items (from snapshot).
-    pub fn iter(&self) -> impl Iterator<Item = &Value> {
-        self.items.iter()
+}
+
+impl PartialEq for CollectionHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.cell_id == other.cell_id
+    }
+}
+
+impl Eq for CollectionHandle {}
+
+impl PartialOrd for CollectionHandle {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CollectionHandle {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.id, &self.cell_id).cmp(&(other.id, &other.cell_id))
+    }
+}
+
+impl std::hash::Hash for CollectionHandle {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.cell_id.hash(state);
     }
 }
 
@@ -362,7 +345,7 @@ impl CollectionHandle {
 /// # Phase 7: Pure DD
 ///
 /// This enum contains ONLY:
-/// - Pure data types: Unit, Bool, Number, Text, Object, List, Collection, Tagged
+/// - Pure data types: Unit, Bool, Number, Text, Object, List, Tagged
 /// - Reference types: CellRef, LinkRef, TimerRef (resolved by DD output observer)
 /// - Template support: Placeholder (for DD map operations)
 /// - Error handling: Flushed (for fail-fast propagation)
@@ -381,10 +364,8 @@ pub enum Value {
     Text(Arc<str>),
     /// Object (key-value pairs, ordered for Ord impl)
     Object(Arc<BTreeMap<Arc<str>, Value>>),
-    /// List of values
-    List(Arc<Vec<Value>>),
-    /// DD Collection - provides O(delta) list operations via incremental computation.
-    Collection(CollectionHandle),
+    /// DD List - provides O(delta) list operations via incremental computation.
+    List(CollectionHandle),
     /// Tagged object (like Object but with a tag name)
     Tagged {
         tag: Arc<str>,
@@ -401,79 +382,20 @@ pub enum Value {
     /// Used in DD map operations to mark where collection items should be inserted.
     /// The DD map operator substitutes actual item values for placeholders.
     Placeholder,
+    /// Placeholder field access (e.g., item.field.subfield) used in templates.
+    /// Resolved during template substitution/cloning.
+    PlaceholderField(Arc<Vec<Arc<str>>>),
+    /// Reactive WHILE configuration driven by a placeholder field.
+    /// Resolved to WhileConfig during template substitution.
+    PlaceholderWhile(Arc<PlaceholderWhileConfig>),
+    /// Reactive WHILE configuration driven by a cell value.
+    WhileConfig(Arc<WhileConfig>),
     /// Flushed value wrapper - propagates through pipelines for fail-fast error handling.
     ///
     /// When a FLUSH expression triggers, it wraps the value in Flushed.
     /// Operators should check for Flushed and propagate unchanged until
     /// caught by a FLUSH { ... } block.
     Flushed(Box<Value>),
-
-    // ========================================================================
-    // LIST DIFF VARIANTS - Phase 2.1: O(delta) list operations
-    // ========================================================================
-    // These variants represent list mutations that flow through DD without
-    // requiring full list clones. The output observer applies them directly
-    // to MutableVec for incremental DOM updates.
-
-    /// Append an item to a list cell. O(1) operation.
-    /// The cell_id identifies which list to append to.
-    /// Applied by sync_cell_from_dd() directly to MutableVec.
-    ListPush {
-        cell_id: Arc<str>,
-        item: Box<Value>,
-    },
-
-    /// Remove an item from a list cell by index. O(n) shift but no clone.
-    /// The cell_id identifies which list to modify.
-    ListRemoveAt {
-        cell_id: Arc<str>,
-        index: usize,
-    },
-
-    /// Remove an item from a list cell by key (HoldRef/LinkRef ID). O(1) lookup.
-    /// The cell_id identifies which list to modify.
-    /// The key is extracted from HoldRef/LinkRef for O(1) HashMap lookup.
-    ListRemoveByKey {
-        cell_id: Arc<str>,
-        key: Arc<str>,
-    },
-
-    /// Clear all items from a list cell. O(1) operation.
-    /// The cell_id identifies which list to clear.
-    ListClear {
-        cell_id: Arc<str>,
-    },
-
-    /// Remove multiple items from a list cell by keys. O(k) where k = keys.len().
-    /// Used by ListRemoveCompleted to emit batch removals instead of reading IO state.
-    /// The cell_id identifies which list to modify.
-    /// Keys are extracted from HoldRef/LinkRef for O(1) HashMap lookup per key.
-    ListRemoveBatch {
-        cell_id: Arc<str>,
-        keys: Vec<Arc<str>>,
-    },
-
-    /// Update a field on a list item identified by key. O(1) lookup + O(1) update.
-    /// Used for toggling checkboxes, updating text, etc.
-    ListItemUpdate {
-        cell_id: Arc<str>,
-        key: Arc<str>,
-        field_path: Arc<Vec<Arc<str>>>,
-        new_value: Box<Value>,
-    },
-
-    // ========================================================================
-    // MULTI-CELL UPDATE - Phase 2: Eliminate side effects in transforms
-    // ========================================================================
-    // When a transform needs to update multiple cells atomically (e.g., clearing
-    // both a data list and its parallel elements list), it returns MultiCellUpdate
-    // instead of calling update_cell_no_persist() as a side effect.
-    // The output observer expands this into individual cell updates.
-
-    /// Multiple cell updates to apply atomically.
-    /// Used when a single transform needs to update multiple cells.
-    /// The output observer expands this into individual sync_cell_from_dd calls.
-    MultiCellUpdate(Vec<(Arc<str>, Box<Value>)>),
 }
 
 impl Value {
@@ -516,129 +438,14 @@ impl Value {
         Self::Object(Arc::new(map))
     }
 
-    /// Create a list from values.
-    pub fn list(items: impl IntoIterator<Item = Value>) -> Self {
-        Self::List(Arc::new(items.into_iter().collect()))
+    /// Create a DD list handle linked to a cell (ID-only).
+    pub fn list_with_cell(cell_id: impl Into<String>) -> Self {
+        Self::List(CollectionHandle::new_with_cell_id(Arc::from(cell_id.into())))
     }
 
-    /// Create a DD collection from values - provides O(delta) incremental operations.
-    pub fn collection(items: impl IntoIterator<Item = Value>) -> Self {
-        Self::Collection(CollectionHandle::new(items.into_iter().collect()))
-    }
-
-    /// Create a DD collection linked to a cell for mutations.
-    pub fn collection_with_cell(items: impl IntoIterator<Item = Value>, cell_id: impl Into<String>) -> Self {
-        Self::Collection(CollectionHandle::with_cell(items.into_iter().collect(), cell_id))
-    }
-
-    /// Convert a List to a Collection (upgrade for incremental operations).
-    pub fn to_collection(&self) -> Option<Self> {
-        match self {
-            Self::List(items) => Some(Self::Collection(CollectionHandle::new(items.as_ref().clone()))),
-            Self::Collection(_) => Some(self.clone()),
-            _ => None,
-        }
-    }
-
-    /// Get items from either List or Collection.
-    pub fn as_list_items(&self) -> Option<&[Value]> {
-        match self {
-            Self::List(items) => Some(items.as_slice()),
-            Self::Collection(handle) => Some(handle.items()),
-            _ => None,
-        }
-    }
-
-    /// Check if this value is a list-like type (List or Collection).
+    /// Check if this value is a list-like type (List only).
     pub fn is_list_like(&self) -> bool {
-        matches!(self, Self::List(_) | Self::Collection(_))
-    }
-
-    // ========================================================================
-    // LIST DIFF CONSTRUCTORS - Phase 2.1: O(delta) list operations
-    // ========================================================================
-
-    /// Create a ListPush diff - appends item to list cell. O(1) operation.
-    /// Use this instead of cloning the full list and pushing.
-    pub fn list_push(cell_id: impl Into<Arc<str>>, item: Value) -> Self {
-        Self::ListPush {
-            cell_id: cell_id.into(),
-            item: Box::new(item),
-        }
-    }
-
-    /// Create a ListRemoveAt diff - removes item at index. O(n) shift but no clone.
-    pub fn list_remove_at(cell_id: impl Into<Arc<str>>, index: usize) -> Self {
-        Self::ListRemoveAt {
-            cell_id: cell_id.into(),
-            index,
-        }
-    }
-
-    /// Create a ListRemoveByKey diff - removes item by HoldRef/LinkRef key. O(1) lookup.
-    pub fn list_remove_by_key(cell_id: impl Into<Arc<str>>, key: impl Into<Arc<str>>) -> Self {
-        Self::ListRemoveByKey {
-            cell_id: cell_id.into(),
-            key: key.into(),
-        }
-    }
-
-    /// Create a ListRemoveBatch diff - removes multiple items by keys. O(k) operation.
-    /// Used when removing all completed items (ListRemoveCompleted) to emit batch removal
-    /// instead of reading from IO layer.
-    pub fn list_remove_batch(cell_id: impl Into<Arc<str>>, keys: Vec<Arc<str>>) -> Self {
-        Self::ListRemoveBatch {
-            cell_id: cell_id.into(),
-            keys,
-        }
-    }
-
-    /// Create a ListClear diff - clears all items. O(1) operation.
-    pub fn list_clear(cell_id: impl Into<Arc<str>>) -> Self {
-        Self::ListClear {
-            cell_id: cell_id.into(),
-        }
-    }
-
-    /// Create a ListItemUpdate diff - updates field on item by key. O(1) lookup + O(1) update.
-    pub fn list_item_update(
-        cell_id: impl Into<Arc<str>>,
-        key: impl Into<Arc<str>>,
-        field_path: Vec<Arc<str>>,
-        new_value: Value,
-    ) -> Self {
-        Self::ListItemUpdate {
-            cell_id: cell_id.into(),
-            key: key.into(),
-            field_path: Arc::new(field_path),
-            new_value: Box::new(new_value),
-        }
-    }
-
-    /// Create a MultiCellUpdate - atomic batch of cell updates.
-    /// Used when a transform needs to update multiple cells (e.g., data list + elements list).
-    /// The output observer expands this into individual sync_cell_from_dd calls.
-    pub fn multi_cell_update(updates: Vec<(impl Into<Arc<str>>, Value)>) -> Self {
-        Self::MultiCellUpdate(
-            updates
-                .into_iter()
-                .map(|(cell_id, value)| (cell_id.into(), Box::new(value)))
-                .collect()
-        )
-    }
-
-    /// Check if this value is a list diff operation.
-    pub fn is_list_diff(&self) -> bool {
-        matches!(
-            self,
-            Self::ListPush { .. }
-                | Self::ListRemoveAt { .. }
-                | Self::ListRemoveByKey { .. }
-                | Self::ListRemoveBatch { .. }
-                | Self::ListClear { .. }
-                | Self::ListItemUpdate { .. }
-                | Self::MultiCellUpdate(_)
-        )
+        matches!(self, Self::List(_))
     }
 
     /// Create a tagged object.
@@ -693,8 +500,7 @@ impl Value {
 
     /// Check if this is a truthy value.
     ///
-    /// For CellRef values, looks up the actual stored value from cell state.
-    /// This is important for correct evaluation of patterns in DD operators.
+    /// CellRef values are not resolved here; they must be handled by DD operators.
     pub fn is_truthy(&self) -> bool {
         match self {
             Self::Unit => false,
@@ -702,15 +508,14 @@ impl Value {
             Self::Number(n) => n.0 != 0.0,
             Self::Text(s) => !s.is_empty(),
             Self::Object(map) => !map.is_empty(),
-            Self::List(items) => !items.is_empty(),
-            Self::Collection(handle) => !handle.is_empty(),
+            Self::List(_) => {
+                panic!("[DD Value] is_truthy called on List without resolved list state");
+            }
             // False tag is falsy, True and all other tags are truthy
             Self::Tagged { tag, .. } => tag.as_ref() != "False",
-            // CellRef - look up actual value from cell state
+            // CellRef requires resolved value; evaluator must not inspect IO state here.
             Self::CellRef(cell_id) => {
-                super::super::io::get_cell_value(&cell_id.name())
-                    .map(|v| v.is_truthy())
-                    .unwrap_or(false)
+                panic!("[DD Value] is_truthy called on CellRef {} without resolved value", cell_id.name());
             }
             // LinkRef is truthy (represents an event source)
             Self::LinkRef(_) => true,
@@ -718,16 +523,17 @@ impl Value {
             Self::TimerRef { .. } => true,
             // Placeholder - always truthy (represents a value slot)
             Self::Placeholder => true,
+            Self::PlaceholderField(_) => {
+                panic!("[DD Value] is_truthy called on PlaceholderField without substitution");
+            }
+            Self::WhileConfig(_) => {
+                panic!("[DD Value] is_truthy called on WhileConfig; evaluate via DD/render");
+            }
+            Self::PlaceholderWhile(_) => {
+                panic!("[DD Value] is_truthy called on PlaceholderWhile without substitution");
+            }
             // Flushed - truthy based on inner value
             Self::Flushed(inner) => inner.is_truthy(),
-            // ListDiff variants are truthy (they represent pending operations)
-            Self::ListPush { .. } => true,
-            Self::ListRemoveAt { .. } => true,
-            Self::ListRemoveByKey { .. } => true,
-            Self::ListRemoveBatch { .. } => true,
-            Self::ListClear { .. } => true,
-            Self::ListItemUpdate { .. } => true,
-            Self::MultiCellUpdate(_) => true,
         }
     }
 
@@ -746,31 +552,25 @@ impl Value {
             }
             Self::Text(s) => s.to_string(),
             Self::Object(_) => "[object]".to_string(),
-            Self::List(items) => format!("[list of {}]", items.len()),
-            Self::Collection(handle) => format!("[collection of {}]", handle.len()),
+            Self::List(handle) => match &handle.cell_id {
+                Some(cell_id) => format!("[list:{}]", cell_id),
+                None => "[list]".to_string(),
+            },
             Self::Tagged { tag, .. } => format!("[{tag}]"),
             Self::CellRef(cell_id) => {
-                // Resolve CellRef to actual cell value for display
-                super::super::io::get_cell_value(&cell_id.name())
-                    .map(|v| v.to_display_string())
-                    .unwrap_or_else(|| String::new())
+                panic!("[DD Value] to_display_string called on CellRef {} without resolved value", cell_id.name());
             }
             Self::LinkRef(link_id) => format!("[link:{}]", link_id.name()),
             Self::TimerRef { id, interval_ms } => format!("[timer:{}@{}ms]", id, interval_ms),
             Self::Placeholder => "[placeholder]".to_string(),
+            Self::PlaceholderField(path) => {
+                format!("[placeholder_field:{:?}]", path)
+            }
+            Self::WhileConfig(_) => "[while]".to_string(),
+            Self::PlaceholderWhile(_) => "[placeholder_while]".to_string(),
             Self::Flushed(inner) => {
                 format!("[flushed:{}]", inner.to_display_string())
             }
-            // ListDiff variants - display as operations
-            Self::ListPush { cell_id, item } => format!("[list_push:{} <- {}]", cell_id, item.to_display_string()),
-            Self::ListRemoveAt { cell_id, index } => format!("[list_remove_at:{}[{}]]", cell_id, index),
-            Self::ListRemoveByKey { cell_id, key } => format!("[list_remove_by_key:{}[{}]]", cell_id, key),
-            Self::ListRemoveBatch { cell_id, keys } => format!("[list_remove_batch:{}[{} keys]]", cell_id, keys.len()),
-            Self::ListClear { cell_id } => format!("[list_clear:{}]", cell_id),
-            Self::ListItemUpdate { cell_id, key, field_path, new_value } => {
-                format!("[list_item_update:{}[{}].{:?} = {}]", cell_id, key, field_path, new_value.to_display_string())
-            }
-            Self::MultiCellUpdate(updates) => format!("[multi_cell_update:{} updates]", updates.len()),
         }
     }
 
@@ -798,19 +598,17 @@ impl Value {
         }
     }
 
-    /// Try to get as list.
-    pub fn as_list(&self) -> Option<&[Value]> {
-        match self {
-            Self::List(items) => Some(items),
-            _ => None,
-        }
-    }
-
     /// Substitute Placeholder values with a concrete item value.
     /// Used by DD map operations when rendering collection items.
     pub fn substitute_placeholder(&self, item: &Value) -> Value {
         match self {
             Self::Placeholder => item.clone(),
+            Self::PlaceholderField(path) => resolve_placeholder_field(item, path),
+            Self::WhileConfig(config) => {
+                let substituted = substitute_while_config(config, item);
+                Value::WhileConfig(Arc::new(substituted))
+            }
+            Self::PlaceholderWhile(config) => resolve_placeholder_while(item, config),
             Self::Object(fields) => {
                 let new_fields: BTreeMap<Arc<str>, Value> = fields.iter()
                     .map(|(k, v)| (k.clone(), v.substitute_placeholder(item)))
@@ -826,15 +624,289 @@ impl Value {
                     fields: Arc::new(new_fields),
                 }
             }
-            Self::List(items) => {
-                let new_items: Vec<Value> = items.iter()
-                    .map(|v| v.substitute_placeholder(item))
-                    .collect();
-                Self::List(Arc::new(new_items))
-            }
             // Atomic values - no substitution needed
             _ => self.clone(),
         }
+    }
+
+    /// Substitute Placeholder and __placeholder_field__ tags with concrete item values.
+    pub fn substitute_placeholders(&self, item: &Value) -> Value {
+        match self {
+            Self::Placeholder => item.clone(),
+            Self::PlaceholderField(path) => resolve_placeholder_field(item, path),
+            Self::WhileConfig(config) => {
+                let substituted = substitute_while_config(config, item);
+                Value::WhileConfig(Arc::new(substituted))
+            }
+            Self::PlaceholderWhile(config) => resolve_placeholder_while(item, config),
+            Self::Object(fields) => {
+                let new_fields: BTreeMap<Arc<str>, Value> = fields.iter()
+                    .map(|(k, v)| (k.clone(), v.substitute_placeholders(item)))
+                    .collect();
+                Self::Object(Arc::new(new_fields))
+            }
+            Self::Tagged { tag, fields } => {
+                let new_fields: BTreeMap<Arc<str>, Value> = fields.iter()
+                    .map(|(k, v)| (k.clone(), v.substitute_placeholders(item)))
+                    .collect();
+                Self::Tagged {
+                    tag: tag.clone(),
+                    fields: Arc::new(new_fields),
+                }
+            }
+            _ => self.clone(),
+        }
+    }
+}
+
+fn resolve_placeholder_field(item: &Value, path: &[Arc<str>]) -> Value {
+    let mut current = item;
+    for segment in path {
+        let segment = segment.as_ref();
+        current = match current {
+            Value::Object(fields) => fields.get(segment).unwrap_or_else(|| {
+                panic!(
+                    "[DD Value] placeholder field missing '{}' on {:?}",
+                    segment, current
+                )
+            }),
+            Value::Tagged { fields, .. } => fields.get(segment).unwrap_or_else(|| {
+                panic!(
+                    "[DD Value] placeholder field missing '{}' on {:?}",
+                    segment, current
+                )
+            }),
+            other => panic!(
+                "[DD Value] placeholder field path on non-object value {:?}",
+                other
+            ),
+        };
+    }
+    current.clone()
+}
+
+fn substitute_while_config(config: &WhileConfig, item: &Value) -> WhileConfig {
+    let arms: Vec<WhileArm> = config
+        .arms
+        .iter()
+        .map(|arm| WhileArm {
+            pattern: arm.pattern.substitute_placeholders(item),
+            body: arm.body.substitute_placeholders(item),
+        })
+        .collect();
+    let default = config.default.substitute_placeholders(item);
+    WhileConfig {
+        cell_id: config.cell_id.clone(),
+        arms: Arc::new(arms),
+        default: Box::new(default),
+    }
+}
+
+fn resolve_placeholder_while(item: &Value, config: &PlaceholderWhileConfig) -> Value {
+    let input = resolve_placeholder_field(item, &config.field_path);
+    let arms: Vec<WhileArm> = config
+        .arms
+        .iter()
+        .map(|arm| WhileArm {
+            pattern: arm.pattern.substitute_placeholders(item),
+            body: arm.body.substitute_placeholders(item),
+        })
+        .collect();
+    let default = config.default.substitute_placeholders(item);
+
+    match input {
+        Value::CellRef(cell_id) => Value::WhileConfig(Arc::new(WhileConfig {
+            cell_id,
+            arms: Arc::new(arms),
+            default: Box::new(default),
+        })),
+        Value::LinkRef(link_id) => {
+            panic!(
+                "[DD Value] Placeholder WHILE resolved to LinkRef {}; use a CellRef-backed state for WHILE in templates",
+                link_id.name()
+            );
+        }
+        other => {
+            for arm in arms {
+                if pattern_matches_value(&arm.pattern, &other) {
+                    return arm.body;
+                }
+            }
+            if !matches!(default, Value::Unit) {
+                return default;
+            }
+            Value::Unit
+        }
+    }
+}
+
+fn pattern_matches_value(pattern: &Value, value: &Value) -> bool {
+    use super::types::BoolTag;
+    match (value, pattern) {
+        (Value::Bool(b), Value::Tagged { tag, .. }) if BoolTag::is_bool_tag(tag.as_ref()) => {
+            BoolTag::matches_bool(tag.as_ref(), *b)
+        }
+        _ => value == pattern,
+    }
+}
+
+// ============================================================================
+// WHILE CONFIG (internal runtime representation)
+// ============================================================================
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WhileArm {
+    pub pattern: Value,
+    pub body: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WhileConfig {
+    pub cell_id: CellId,
+    pub arms: Arc<Vec<WhileArm>>,
+    pub default: Box<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlaceholderWhileConfig {
+    pub field_path: Arc<Vec<Arc<str>>>,
+    pub arms: Arc<Vec<WhileArm>>,
+    pub default: Box<Value>,
+}
+
+// ============================================================================
+// LIST ITEM KEY UTILITIES (shared by worker/dataflow)
+// ============================================================================
+
+/// Get the __key field from an item fields map.
+pub fn get_item_key_from_fields(fields: &BTreeMap<Arc<str>, Value>, context: &str) -> Arc<str> {
+    match fields.get(ITEM_KEY_FIELD) {
+        Some(Value::Text(key)) => key.clone(),
+        Some(other) => panic!("[DD Value] __key must be Text in {}, found {:?}", context, other),
+        None => panic!("[DD Value] missing __key in {}", context),
+    }
+}
+
+/// Extract the __key from an item Value (Object or Tagged).
+pub fn extract_item_key(value: &Value, context: &str) -> Arc<str> {
+    match value {
+        Value::Object(fields) => get_item_key_from_fields(fields, context),
+        Value::Tagged { fields, .. } => get_item_key_from_fields(fields, context),
+        other => panic!("[DD Value] {} item missing __key (expected Object/Tagged), found {:?}", context, other),
+    }
+}
+
+/// Ensure all items have unique __key values.
+pub fn ensure_unique_item_keys(items: &[Value], context: &str) {
+    let mut seen: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
+    for item in items {
+        let key = extract_item_key(item, context);
+        if !seen.insert(key.clone()) {
+            panic!("[DD Value] Duplicate __key '{}' in {}", key, context);
+        }
+    }
+}
+
+/// Attach a __key field to an item Value (Object or Tagged).
+pub fn attach_item_key(value: Value, key: &str) -> Value {
+    match value {
+        Value::Object(fields) => {
+            let mut new_fields = (*fields).clone();
+            new_fields.insert(Arc::from(ITEM_KEY_FIELD), Value::text(key));
+            Value::Object(Arc::new(new_fields))
+        }
+        Value::Tagged { tag, fields } => {
+            let mut new_fields = (*fields).clone();
+            new_fields.insert(Arc::from(ITEM_KEY_FIELD), Value::text(key));
+            Value::Tagged { tag, fields: Arc::new(new_fields) }
+        }
+        other => {
+            panic!("[DD Value] item must be Object or Tagged to attach __key, found {:?}", other);
+        }
+    }
+}
+
+/// Attach a __key if missing, or validate if present.
+pub fn attach_or_validate_item_key(value: Value, source_key: &Arc<str>, context: &str) -> Value {
+    match value {
+        Value::Object(fields) => {
+            if fields.contains_key(ITEM_KEY_FIELD) {
+                let mapped_key = get_item_key_from_fields(&fields, context);
+                if &mapped_key != source_key {
+                    panic!(
+                        "[DD Value] {} __key mismatch: '{}' != '{}'",
+                        context, mapped_key, source_key
+                    );
+                }
+                Value::Object(fields)
+            } else {
+                attach_item_key(Value::Object(fields), source_key)
+            }
+        }
+        Value::Tagged { tag, fields } => {
+            if fields.contains_key(ITEM_KEY_FIELD) {
+                let mapped_key = get_item_key_from_fields(&fields, context);
+                if &mapped_key != source_key {
+                    panic!(
+                        "[DD Value] {} __key mismatch: '{}' != '{}'",
+                        context, mapped_key, source_key
+                    );
+                }
+                Value::Tagged { tag, fields }
+            } else {
+                attach_item_key(Value::Tagged { tag, fields }, source_key)
+            }
+        }
+        other => panic!("[DD Value] {} item must be Object/Tagged, found {:?}", context, other),
+    }
+}
+
+/// Check if a value tree contains Placeholder markers.
+pub fn contains_placeholder(value: &Value) -> bool {
+    match value {
+        Value::Placeholder => true,
+        Value::PlaceholderField(_) => true,
+        Value::PlaceholderWhile(_) => true,
+        Value::WhileConfig(config) => {
+            config.arms.iter().any(|arm| {
+                contains_placeholder(&arm.pattern) || contains_placeholder(&arm.body)
+            }) || contains_placeholder(&config.default)
+        }
+        Value::Object(fields) => fields.values().any(contains_placeholder),
+        Value::Tagged { fields, .. } => fields.values().any(contains_placeholder),
+        _ => false,
+    }
+}
+
+/// Template-only wrapper for Values that may contain placeholders.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TemplateValue(pub Value);
+
+impl TemplateValue {
+    pub fn from_value(value: Value) -> Self {
+        Self(value)
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+
+    pub fn into_value(self) -> Value {
+        self.0
+    }
+
+    pub fn contains_placeholder(&self) -> bool {
+        contains_placeholder(&self.0)
+    }
+
+    pub fn substitute_placeholders(&self, item: &Value) -> Value {
+        self.0.substitute_placeholders(item)
+    }
+}
+
+impl From<Value> for TemplateValue {
+    fn from(value: Value) -> Self {
+        TemplateValue::from_value(value)
     }
 }
 
@@ -891,14 +963,14 @@ mod tests {
         let float_num = Value::float(3.14);
         let text = Value::text("hello");
         let obj = Value::object([("x", Value::int(1)), ("y", Value::int(2))]);
-        let list = Value::list([Value::int(1), Value::int(2), Value::int(3)]);
+        let list = Value::list_with_cell("items");
 
         assert_eq!(unit, Value::Unit);
         assert_eq!(num.as_int(), Some(42));
         assert_eq!(float_num.as_float(), Some(3.14));
         assert_eq!(text.as_text(), Some("hello"));
         assert_eq!(obj.get("x"), Some(&Value::int(1)));
-        assert_eq!(list.as_list().map(|l| l.len()), Some(3));
+        assert!(list.is_list_like());
     }
 
     #[test]
@@ -932,5 +1004,13 @@ mod tests {
 
         assert_eq!(result.get("name"), Some(&Value::text("Alice")));
         assert_eq!(result.get("count"), Some(&Value::int(5)));
+    }
+
+    #[test]
+    fn test_collection_handle_new_with_id_is_unbound() {
+        let id = CollectionId::new();
+        let handle = CollectionHandle::new_with_id(id);
+        assert_eq!(handle.id, id);
+        assert!(handle.cell_id.is_none());
     }
 }

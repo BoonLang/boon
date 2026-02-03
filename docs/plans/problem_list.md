@@ -1,7 +1,9 @@
 # DD Engine Problem List
 
 **Created:** 2026-01-18
-**Status:** Active - Problems being fixed one by one
+**Status:** Complete - All listed problems resolved (2026-02-10)
+
+**Update (2026-02-10):** DD no longer routes list diff operations through `Value` variants; list mutations are represented only as `CellUpdate` in engine dataflow/worker/IO paths.
 
 This document lists ALL problems found in the DD engine that violate pure DD architecture.
 Each problem includes exact location, how to find it, why it's wrong, and how to fix it.
@@ -19,6 +21,9 @@ Each problem includes exact location, how to find it, why it's wrong, and how to
 7. [Medium: Global Atomic Counters](#7-medium-global-atomic-counters)
 8. [Medium: String-Based Dispatch](#8-medium-string-based-dispatch)
 9. [Low: Unused Infrastructure](#9-low-unused-infrastructure)
+10. [High: Nested Collection Identity](#10-high-nested-collection-identity)
+11. [High: Nested Collection Persistence](#11-high-nested-collection-persistence)
+12. [Medium: Implicit List Source For Collection Inputs](#12-medium-implicit-list-source-for-collection-inputs)
 
 ---
 
@@ -81,7 +86,7 @@ fn is_item_completed_generic(item: &Value) -> bool {
 3. Add `completion_field: Option<String>` to template config
 4. `ListRemoveCompleted` should use configured field, not inference
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
 
 ---
 
@@ -133,7 +138,7 @@ fn find_checkbox_toggle_in_item(obj: &BTreeMap<Arc<str>, Value>) -> Option<(Stri
 2. Remove `CHECKBOX_TOGGLE_HOLDS` registry
 3. Make toggle fields explicit in template config
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
 
 ---
 
@@ -163,7 +168,7 @@ grep -n "fn find_boolean_field_in_template" crates/boon/src/platform/browser/eng
 2. Require explicit field declaration in Boon code
 3. Parse field role from Boon syntax, not infer from type
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
 
 ---
 
@@ -193,7 +198,7 @@ grep -n "fn extract_item_key_for_removal" crates/boon/src/platform/browser/engin
 2. Key assigned at instantiation time
 3. Remove deep search logic
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
 
 ---
 
@@ -231,7 +236,9 @@ let completed_field_name = data_template.as_ref()
     .expect("Bug: template must declare completion field explicitly");
 ```
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** Fallback removed; completion field must be explicit.
 
 ---
 
@@ -255,7 +262,9 @@ let completed_field_name = data_template.as_ref()
 
 **How to fix:** Same as 2.1 - fail explicitly.
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** Fallback removed; explicit field required.
 
 ---
 
@@ -280,7 +289,9 @@ let title_field = template.field_initializers.iter()
 
 **How to fix:** Fail explicitly if field not found.
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** Fallback removed; event-text field must be explicit.
 
 ---
 
@@ -310,7 +321,9 @@ identity: ItemIdentitySpec {
 - Parse identity path from Boon code
 - Make it part of template configuration
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** Hardcoded identity path removed; identity now explicit.
 
 ---
 
@@ -333,7 +346,9 @@ grep -n "init_cell" crates/boon/src/platform/browser/engine_dd/eval/evaluator.rs
 
 **How to fix:** Store initial values in `DataflowConfig.cell_initializations`, let worker init.
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** `init_cell()` removed; evaluator no longer mutates state.
 
 ---
 
@@ -360,7 +375,9 @@ grep -n "current_route" crates/boon/src/platform/browser/engine_dd/eval/evaluato
 
 **How to fix:** Router initialization should be in interpreter, not evaluator.
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** Router init moved; evaluator no longer calls `init_cell()`.
 
 ---
 
@@ -372,7 +389,7 @@ grep -n "current_route" crates/boon/src/platform/browser/engine_dd/eval/evaluato
 
 **Context:** HOLD with link trigger.
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
 
 ---
 
@@ -384,7 +401,7 @@ grep -n "current_route" crates/boon/src/platform/browser/engine_dd/eval/evaluato
 
 **Context:** LATEST with events.
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
 
 ---
 
@@ -396,7 +413,7 @@ grep -n "current_route" crates/boon/src/platform/browser/engine_dd/eval/evaluato
 
 **Context:** WHILE with LinkRef.
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
 
 ---
 
@@ -423,7 +440,9 @@ add_dynamic_link_action(exit_key_link_id.clone(), DynamicLinkAction::SetFalseOnK
 
 **How to fix:** Store in DataflowConfig, let interpreter register.
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** Dynamic link actions moved into DD config; evaluator no longer mutates IO.
 
 ---
 
@@ -461,7 +480,9 @@ grep -n "\.to_vec()" crates/boon/src/platform/browser/engine_dd/core/worker.rs
 - Return only the appended item as diff
 - Let outputs.rs use `VecDiff::Push`
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** List append/remove `.to_vec()` paths removed; diffs are O(delta).
 
 ---
 
@@ -485,7 +506,9 @@ grep -n "\.to_vec()" crates/boon/src/platform/browser/engine_dd/core/worker.rs
 - Return removal index, not full list
 - Use `VecDiff::RemoveAt`
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** List removals are diff-based; no full list materialization.
 
 ---
 
@@ -517,7 +540,9 @@ EditingHandler { editing_cell: String, title_cell: String },
 - Use generic `LinkAction::SetFalse` with key filter
 - Let Boon code define editing behavior
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** EditingHandler removed; behavior expressed via LinkAction + DD config.
 
 ---
 
@@ -550,7 +575,9 @@ ListToggleAllCompleted {
 - Implement as generic "map all items" DD operator
 - Let Boon code define the transformation
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** ListToggleAllCompleted removed; transformations are explicit in DD.
 
 ---
 
@@ -584,7 +611,7 @@ thread_local! {
 - Add toggle field info to `DataflowConfig`
 - Remove `find_checkbox_toggle_in_item()`
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
 
 ---
 
@@ -609,7 +636,9 @@ grep -n "DYNAMIC_LINK_ACTIONS" crates/boon/src/platform/browser/engine_dd/io/inp
 - All link mappings in `DataflowConfig`
 - Remove `add_dynamic_link_action()` function
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** DYNAMIC_LINK_ACTIONS registry removed; all mappings in DataflowConfig.
 
 ---
 
@@ -641,7 +670,9 @@ static GLOBAL_CELL_COUNTER: AtomicU32 = AtomicU32::new(0);
 - Remove global atomic
 - Counter resets with each runtime instance
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** Global counters removed; runtime counters are instance-scoped.
 
 ---
 
@@ -658,7 +689,7 @@ grep -n "GLOBAL_LINK_COUNTER" crates/boon/src/platform/browser/engine_dd/eval/ev
 
 **Same issue as 7.1.**
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
 
 ---
 
@@ -688,7 +719,9 @@ vec!["Escape".to_string()]
 - Use enum `Key::Escape`
 - Or at least const: `const KEY_ESCAPE: &str = "Escape";`
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** String-based key dispatch removed; Key enum used everywhere.
 
 ---
 
@@ -707,7 +740,9 @@ grep -n "Enter:" crates/boon/src/platform/browser/engine_dd/io/inputs.rs
 - Text encoding protocol in IO layer
 - Should use `EventPayload::Enter(String)` which already exists
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** Event payloads carry text; no "Enter:text" protocol.
 
 ---
 
@@ -731,7 +766,9 @@ let hover_cell_id = format!("hover_{}", link_id);
 - IO layer invents DD cell naming convention
 - Should be explicit in DataflowConfig
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** Hover cell naming explicit; no "hover_" prefix inference.
 
 ---
 
@@ -750,13 +787,109 @@ grep -rn "dd_diffs_to_vec_diff_stream" crates/boon/src/platform/browser/engine_d
 **Issue:**
 - `dd_diffs_to_vec_diff_stream()` exists
 - `bridge.rs` never imports or uses it
-- Bridge still does `.children(items.collect())`
+- Bridge used to do `.children(items.collect())`
 
 **How to fix:**
 - Import adapter in bridge.rs
 - Use `children_signal_vec()` with adapter
 
-**Status:** ⬜ TODO
+**Status:** ✅ FIXED (2026-02-03)
+
+**Update (2026-02-03):** VecDiff adapter removed; bridge uses list_signal_vec directly.
+
+---
+
+## 10. High: Nested Collection Identity
+
+### Problem 10.1: Collection handles inside templates are cloned without fresh IDs
+
+**Severity:** 🟠 HIGH  
+**File:** `crates/boon/src/platform/browser/engine_dd/core/worker.rs`  
+**Location:** `clone_template_with_fresh_ids_impl` (no `Value::Collection` handling)
+
+**How to find:**
+```bash
+grep -n "clone_template_with_fresh_ids_impl" crates/boon/src/platform/browser/engine_dd/core/worker.rs
+```
+
+**What it does:**
+- Template cloning rewrites `CellRef`/`LinkRef` IDs
+- `Value::Collection` is cloned as-is (same `CollectionId`)
+- List literals inside templates therefore share collection IDs across items
+
+**Why it's wrong:**
+1. Nested lists can share state across items (identity collision)
+2. Violates "one collection instance per item" expectation
+3. Breaks nested list persistence/rendering invariants
+
+**How to fix:**
+1. Detect `Value::Collection` in template cloning
+2. Allocate a fresh `CollectionId` per cloned instance
+3. Register initial items for the new collection ID
+4. Ensure IO list state is seeded for the new collection
+
+**Status:** ✅ FIXED (2026-02-03)
+
+---
+
+## 11. High: Nested Collection Persistence
+
+### Problem 11.1: Persisted list items cannot contain nested `__collection__`
+
+**Severity:** 🟠 HIGH  
+**File:** `crates/boon/src/platform/browser/engine_dd/io/outputs.rs`  
+**Location:** `json_to_dd_value` / `json_to_dd_list_items`
+
+**How to find:**
+```bash
+grep -n "json_to_dd_value" crates/boon/src/platform/browser/engine_dd/io/outputs.rs
+```
+
+**What it does:**
+- `json_to_dd_value` panics if it sees `__collection__`
+- `json_to_dd_list_items` only supports top-level list payloads
+
+**Why it's wrong:**
+1. Persisted list items cannot contain nested collections
+2. Prevents persistence of nested lists (common UI pattern)
+
+**How to fix:**
+1. Allow nested `__collection__` decoding inside objects
+2. Ensure `dd_value_to_json` persists nested `Collection` values recursively
+3. Add invariants/tests for nested list persistence
+
+**Status:** ✅ FIXED (2026-02-03)
+
+---
+
+## 12. Medium: Implicit List Source For Collection Inputs
+
+### Problem 12.1: `List/remove` relies on `last_list_source` for Collections without `cell_id`
+
+**Severity:** 🟡 MEDIUM  
+**File:** `crates/boon/src/platform/browser/engine_dd/eval/evaluator.rs`  
+**Location:** `eval_pipe` → `List/remove` (collection input path)
+
+**How to find:**
+```bash
+grep -n "List/remove requires list cell source" crates/boon/src/platform/browser/engine_dd/eval/evaluator.rs
+```
+
+**What it does:**
+- If a `Collection` lacks `cell_id`, it falls back to `last_list_source`
+- This is implicit and order-dependent
+
+**Why it's wrong:**
+1. Hidden coupling between evaluation order and list target
+2. Breaks pure-data principle (implicit global state)
+3. Makes list ops on non-cell collections ambiguous
+
+**How to fix:**
+1. Require explicit list target (cell or collection id)
+2. Or propagate `cell_id` through collections used with List ops
+3. Remove `last_list_source` fallback
+
+**Status:** ✅ FIXED (2026-02-03)
 
 ---
 
@@ -764,49 +897,37 @@ grep -rn "dd_diffs_to_vec_diff_stream" crates/boon/src/platform/browser/engine_d
 
 | Category | Count | Fully Fixed | Partial | Remaining | Severity |
 |----------|-------|-------------|---------|-----------|----------|
-| Business Logic Functions | 4 | 2 | 1 | 1 | 🔴 CRITICAL |
-| Hardcoded Fallbacks | 4 | 3 | 1 | 0 | 🟢 MOSTLY DONE |
-| Evaluator Side Effects | 6 | 0 | 0 | 6 | 🔴 CRITICAL |
-| O(n) List Operations | 14 | 0 | 0 | 14 | 🟠 HIGH |
-| DynamicLinkAction | 2 | 0 | 0 | 2 | 🟠 HIGH |
-| Thread-Local Registries | 2 | 1 | 0 | 1 | 🟡 MEDIUM |
-| Global Counters | 2 | 0 | 0 | 2 | 🟡 MEDIUM (deferred) |
-| String-Based Dispatch | 3 | 0 | 0 | 3 | 🟡 MEDIUM |
-| Unused Infrastructure | 1 | 0 | 0 | 1 | 🟢 LOW |
-| **TOTAL** | **38** | **6** | **2** | **30** | |
+| Business Logic Functions | 4 | 4 | 0 | 0 | 🔴 CRITICAL |
+| Hardcoded Fallbacks | 4 | 4 | 0 | 0 | 🟢 DONE |
+| Evaluator Side Effects | 6 | 6 | 0 | 0 | 🔴 CRITICAL |
+| O(n) List Operations | 14 | 14 | 0 | 0 | 🟠 HIGH |
+| DynamicLinkAction | 2 | 2 | 0 | 0 | 🟠 HIGH |
+| Thread-Local Registries | 2 | 2 | 0 | 0 | 🟡 MEDIUM |
+| Global Counters | 2 | 2 | 0 | 0 | 🟡 MEDIUM |
+| String-Based Dispatch | 3 | 3 | 0 | 0 | 🟡 MEDIUM |
+| Unused Infrastructure | 1 | 1 | 0 | 0 | 🟢 LOW |
+| Nested Collections | 2 | 2 | 0 | 0 | 🟠 HIGH |
+| Implicit Sources | 1 | 1 | 0 | 0 | 🟡 MEDIUM |
+| **TOTAL** | **41** | **41** | **0** | **0** | |
 
 ---
 
 ## Progress Tracking
 
-### ✅ FULLY COMPLETED (2026-01-18)
+### ✅ FULLY COMPLETED (2026-02-03)
 
-- [x] Problem 1.1: `is_item_completed_generic()` - **DELETED** (replaced by `is_item_field_true()` with explicit field name)
+- [x] Problem 1.1: `is_item_completed_generic()` - **DELETED** (completion field must be explicit; no inference)
 - [x] Problem 1.2: `find_checkbox_toggle_in_item()` - **DELETED** (was unused after 1.1 removal)
-- [x] Problem 2.1: "completed" fallback worker.rs - **FIXED** (now Option pattern, skips if not found)
-- [x] Problem 2.2: "completed" fallback interpreter.rs - **FIXED** (now Option pattern, skips if not found)
-- [x] Problem 2.3: "title" fallback worker.rs - **FIXED** (returns None instead of fallback)
+- [x] Problem 2.1: "completed" fallback worker.rs - **FIXED** (fallback removed; no implicit defaults)
+- [x] Problem 2.2: "completed" fallback interpreter.rs - **FIXED** (fallback removed; no implicit defaults)
+- [x] Problem 2.3: "title" fallback worker.rs - **FIXED** (fallback removed; no implicit defaults)
 - [x] Problem 6.1: CHECKBOX_TOGGLE_HOLDS - **DELETED** (registry was dead code - set but never read)
+- [x] Problem 10.1: Nested collection identity - **FIXED** (fresh `CollectionId` per template clone)
 
-### 🟡 PARTIALLY FIXED (2026-01-18)
+### 🟢 OPEN (2026-02-03)
 
-- [~] Problem 1.3: `find_boolean_field_in_template()` - **FALLBACKS REMOVED** but function still has IO reads
-- [~] Problem 2.4: "remove_button" hardcoded - **WARNING ADDED** but string still hardcoded
+All problems tracked in this document have been fixed or removed.
 
-### ⏸️ DEFERRED (need larger refactors)
+### ✅ HISTORICAL ISSUES RESOLVED (2026-02-03)
 
-- [ ] Problem 1.4: `extract_item_key_for_removal()` - needs template-based key extraction
-- [ ] Problem 3.1-3.6: init_cell() in evaluator - needs DataflowConfig.cell_initializations
-- [ ] Problem 7.1-7.2: Global counters - needs counter propagation through sub-runtimes
-
-### ⬜ TODO
-
-- [ ] Problem 4.1-4.8: List Append .to_vec() (8 locations)
-- [ ] Problem 4.9-4.14: List Remove .to_vec() (6 locations)
-- [ ] Problem 5.1: EditingHandler variant
-- [ ] Problem 5.2: ListToggleAllCompleted variant
-- [ ] Problem 6.2: DYNAMIC_LINK_ACTIONS registry
-- [ ] Problem 8.1: "Escape" string dispatch
-- [ ] Problem 8.2: "Enter:text" protocol
-- [ ] Problem 8.3: "hover_" prefix
-- [ ] Problem 9.1: VecDiff adapter not wired
+Problems 1–12 were fixed or removed. Keep this list for historical context and future audits.

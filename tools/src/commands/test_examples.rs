@@ -1,6 +1,7 @@
 //! Test runner for Boon playground examples
 
 use anyhow::{Context, Result};
+use regex::Regex;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -19,6 +20,21 @@ pub struct TestOptions {
     pub screenshot_on_fail: bool,
     pub verbose: bool,
     pub examples_dir: Option<PathBuf>,
+}
+
+/// Options for built-in playground smoke command
+pub struct SmokeOptions {
+    pub port: u16,
+    pub filter: Option<String>,
+}
+
+/// Result of a single built-in smoke check
+#[derive(Debug)]
+pub struct SmokeResult {
+    pub name: String,
+    pub passed: bool,
+    pub duration: Duration,
+    pub error: Option<String>,
 }
 
 /// Result of a single test
@@ -493,6 +509,148 @@ pub async fn run_tests(opts: TestOptions) -> Result<Vec<TestResult>> {
     }
 
     result
+}
+
+/// Smoke-run all built-in examples declared in playground `EXAMPLE_DATAS`.
+pub async fn run_builtin_smoke(opts: SmokeOptions) -> Result<Vec<SmokeResult>> {
+    let setup = ensure_browser_connection(opts.port).await?;
+    let result = run_builtin_smoke_inner(&opts).await;
+
+    if setup.started_mzoon {
+        kill_mzoon_server();
+    }
+
+    result
+}
+
+async fn run_builtin_smoke_inner(opts: &SmokeOptions) -> Result<Vec<SmokeResult>> {
+    let main_rs = find_playground_main_file()?;
+    let mut examples = discover_builtin_examples(&main_rs)?;
+
+    if let Some(ref filter) = opts.filter {
+        examples.retain(|name| name.contains(filter));
+        if examples.is_empty() {
+            println!("No built-in examples match filter '{}'", filter);
+            return Ok(vec![]);
+        }
+    }
+
+    println!("Boon Built-in Example Smoke");
+    println!("===========================\n");
+    println!("Running {} built-in example(s)...\n", examples.len());
+
+    let mut results = Vec::new();
+    for example in examples {
+        let result = run_single_builtin_smoke(&example, opts.port).await;
+        let status = if result.passed { "[PASS]" } else { "[FAIL]" };
+        println!("{} {} ({:?})", status, result.name, result.duration);
+        if let Some(error) = &result.error {
+            println!("       {}", error);
+        }
+        results.push(result);
+    }
+
+    let passed = results.iter().filter(|r| r.passed).count();
+    println!("\n===========================");
+    println!("{}/{} passed", passed, results.len());
+
+    Ok(results)
+}
+
+fn find_playground_main_file() -> Result<PathBuf> {
+    let root = find_boon_root().context("Could not find boon repository root")?;
+    let main_rs = root.join("playground/frontend/src/main.rs");
+    if !main_rs.exists() {
+        anyhow::bail!(
+            "Could not find playground main.rs at {}",
+            main_rs.display()
+        );
+    }
+    Ok(main_rs)
+}
+
+fn discover_builtin_examples(main_rs: &Path) -> Result<Vec<String>> {
+    let source = std::fs::read_to_string(main_rs)
+        .with_context(|| format!("Failed to read {}", main_rs.display()))?;
+
+    let re = Regex::new(r#"make_example_data!\("([^"]+)"\)"#)?;
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+
+    for caps in re.captures_iter(&source) {
+        let Some(m) = caps.get(1) else { continue };
+        let name = m.as_str().to_string();
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+
+    if names.is_empty() {
+        anyhow::bail!(
+            "No built-in examples found in {} (expected EXAMPLE_DATAS entries)",
+            main_rs.display()
+        );
+    }
+
+    Ok(names)
+}
+
+async fn run_single_builtin_smoke(name: &str, port: u16) -> SmokeResult {
+    let start = Instant::now();
+    let fail = |message: String, started: Instant| SmokeResult {
+        name: name.to_string(),
+        passed: false,
+        duration: started.elapsed(),
+        error: Some(message),
+    };
+
+    let _ = send_command_to_server(port, WsCommand::ClearStates).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let _ = send_command_to_server(port, WsCommand::NavigateTo { path: "/".to_string() }).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let _ = send_command_to_server(port, WsCommand::Refresh).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let example_name = format!("{}.bn", name);
+    match send_command_to_server(port, WsCommand::SelectExample { name: example_name }).await {
+        Ok(WsResponse::Success { .. }) => {}
+        Ok(WsResponse::Error { message }) => {
+            return fail(format!("SelectExample failed: {}", message), start);
+        }
+        Ok(other) => {
+            return fail(format!("SelectExample unexpected response: {:?}", other), start);
+        }
+        Err(err) => {
+            return fail(format!("SelectExample request failed: {}", err), start);
+        }
+    }
+
+    match send_command_to_server(port, WsCommand::TriggerRun).await {
+        Ok(WsResponse::Success { .. }) => {}
+        Ok(WsResponse::Error { message }) => {
+            return fail(format!("TriggerRun failed: {}", message), start);
+        }
+        Ok(other) => {
+            return fail(format!("TriggerRun unexpected response: {:?}", other), start);
+        }
+        Err(err) => {
+            return fail(format!("TriggerRun request failed: {}", err), start);
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    match send_command_to_server(port, WsCommand::GetPreviewText).await {
+        Ok(WsResponse::PreviewText { .. }) => SmokeResult {
+            name: name.to_string(),
+            passed: true,
+            duration: start.elapsed(),
+            error: None,
+        },
+        Ok(WsResponse::Error { message }) => fail(format!("GetPreviewText failed: {}", message), start),
+        Ok(other) => fail(format!("GetPreviewText unexpected response: {:?}", other), start),
+        Err(err) => fail(format!("GetPreviewText request failed: {}", err), start),
+    }
 }
 
 /// Inner test runner (separated for cleanup handling)

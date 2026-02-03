@@ -354,7 +354,7 @@ Each `List/remove` tracks removed items by `PersistenceId` in a `HashSet`. When 
 
 **When LIST is input to THEN:**
 
-The LIST is passed as a single `Value::List(Arc<List>, metadata)`:
+The LIST is passed as a single `Value::Collection(CollectionHandle)`:
 ```boon
 my_list |> THEN { body }
 ```

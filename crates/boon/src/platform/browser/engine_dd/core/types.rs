@@ -161,12 +161,6 @@ impl std::fmt::Display for CellId {
 
 impl From<&str> for CellId {
     fn from(s: &str) -> Self {
-        // Check if it's a dynamic ID pattern
-        if let Some(num_str) = s.strip_prefix("dynamic_cell_") {
-            if let Ok(num) = num_str.parse::<u32>() {
-                return CellId::Dynamic(num);
-            }
-        }
         CellId::Static(std::sync::Arc::from(s))
     }
 }
@@ -269,191 +263,18 @@ impl ElementTag {
     }
 }
 
-/// Structured event payload - type-safe event data.
-///
-/// Phase 3.1: Replaces string-based event encoding (format! strings) with type-safe variants.
-/// This enables compile-time checking of event payloads and eliminates string parsing overhead.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EventPayload {
-    /// Text input submission: "Enter:text"
-    Enter(String),
-    /// Remove button click: "remove:link_id"
-    Remove(LinkId),
-    /// Toggle action: "toggle:cell_id"
-    Toggle(CellId),
-    /// Set cell to true: "set_true:cell_id"
-    SetTrue(CellId),
-    /// Set cell to false: "set_false:cell_id"
-    SetFalse(CellId),
-    /// Toggle boolean cell: "bool_toggle:cell_id"
-    BoolToggle(CellId),
-    /// Set hover state: "hover_set:cell_id:value"
-    HoverSet { cell_id: CellId, value: bool },
-    /// Toggle all items in list: "list_toggle_all:list_cell_id:field"
-    ListToggleAll { list_cell_id: CellId, field: String },
-    /// Set text value: "set_text:cell_id:value"
-    SetText { cell_id: CellId, value: String },
-    /// Simple trigger with no data
-    Unit,
-}
-
-impl EventPayload {
-    /// Parse an event payload from a text string.
-    ///
-    /// Recognizes:
-    /// - `"Enter:text"` → `EventPayload::Enter("text")`
-    /// - `"remove:link_id"` → `EventPayload::Remove(LinkId)`
-    /// - `"toggle:cell_id"` → `EventPayload::Toggle(CellId)`
-    /// - `"set_true:cell_id"` → `EventPayload::SetTrue(CellId)`
-    /// - `"set_false:cell_id"` → `EventPayload::SetFalse(CellId)`
-    /// - `"bool_toggle:cell_id"` → `EventPayload::BoolToggle(CellId)`
-    /// - `"hover_set:cell_id:value"` → `EventPayload::HoverSet { cell_id, value }`
-    /// - `"list_toggle_all:list_cell_id:field"` → `EventPayload::ListToggleAll { list_cell_id, field }`
-    /// - `"set_text:cell_id:value"` → `EventPayload::SetText { cell_id, value }`
-    /// - Other text → `EventPayload::Unit`
-    pub fn parse(text: &str) -> Self {
-        if let Some(enter_text) = text.strip_prefix("Enter:") {
-            Self::Enter(enter_text.to_string())
-        } else if let Some(link_id) = text.strip_prefix("remove:") {
-            Self::Remove(LinkId::new(link_id))
-        } else if let Some(cell_id) = text.strip_prefix("toggle:") {
-            Self::Toggle(CellId::new(cell_id))
-        } else if let Some(cell_id) = text.strip_prefix("set_true:") {
-            Self::SetTrue(CellId::new(cell_id))
-        } else if let Some(cell_id) = text.strip_prefix("set_false:") {
-            Self::SetFalse(CellId::new(cell_id))
-        } else if let Some(cell_id) = text.strip_prefix("bool_toggle:") {
-            Self::BoolToggle(CellId::new(cell_id))
-        } else if let Some(rest) = text.strip_prefix("hover_set:") {
-            // Format: "hover_set:cell_id:value" where value is "true" or "false"
-            if let Some((cell_id, value_str)) = rest.rsplit_once(':') {
-                let value = value_str == "true";
-                Self::HoverSet { cell_id: CellId::new(cell_id), value }
-            } else {
-                Self::Unit
-            }
-        } else if let Some(rest) = text.strip_prefix("list_toggle_all:") {
-            // Format: "list_toggle_all:list_cell_id:field"
-            if let Some((list_cell_id, field)) = rest.split_once(':') {
-                Self::ListToggleAll {
-                    list_cell_id: CellId::new(list_cell_id),
-                    field: field.to_string(),
-                }
-            } else {
-                Self::Unit
-            }
-        } else if let Some(rest) = text.strip_prefix("set_text:") {
-            // Format: "set_text:cell_id:value" (value may contain colons, so use first colon only)
-            if let Some((cell_id, value)) = rest.split_once(':') {
-                Self::SetText {
-                    cell_id: CellId::new(cell_id),
-                    value: value.to_string(),
-                }
-            } else {
-                Self::Unit
-            }
-        } else {
-            Self::Unit
-        }
-    }
-
-    /// Convert to format string for backwards compatibility with string-based APIs.
-    /// Phase 3.1: This method enables gradual migration - existing code can call
-    /// to_format_string() instead of format!() directly.
-    pub fn to_format_string(&self) -> String {
-        match self {
-            Self::Enter(text) => format!("Enter:{}", text),
-            Self::Remove(link_id) => format!("remove:{}", link_id.name()),
-            Self::Toggle(cell_id) => format!("toggle:{}", cell_id.name()),
-            Self::SetTrue(cell_id) => format!("set_true:{}", cell_id.name()),
-            Self::SetFalse(cell_id) => format!("set_false:{}", cell_id.name()),
-            Self::BoolToggle(cell_id) => format!("bool_toggle:{}", cell_id.name()),
-            Self::HoverSet { cell_id, value } => format!("hover_set:{}:{}", cell_id.name(), value),
-            Self::ListToggleAll { list_cell_id, field } => format!("list_toggle_all:{}:{}", list_cell_id.name(), field),
-            Self::SetText { cell_id, value } => format!("set_text:{}:{}", cell_id.name(), value),
-            Self::Unit => String::new(),
-        }
-    }
-
-    /// Check if this payload is an Enter event.
-    pub fn is_enter(&self) -> bool {
-        matches!(self, Self::Enter(_))
-    }
-
-    /// Check if this payload is a Remove event.
-    pub fn is_remove(&self) -> bool {
-        matches!(self, Self::Remove(_))
-    }
-
-    /// Get the text from an Enter payload.
-    pub fn enter_text(&self) -> Option<&str> {
-        if let Self::Enter(text) = self {
-            Some(text)
-        } else {
-            None
-        }
-    }
-
-    /// Get the trimmed text from an Enter payload, or None if not Enter or empty.
-    /// This is the common pattern used throughout the worker.
-    pub fn enter_text_trimmed(&self) -> Option<&str> {
-        if let Self::Enter(text) = self {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        } else {
-            None
-        }
-    }
-
-    /// Parse an event text and get the trimmed Enter text if it's an Enter event.
-    /// Returns None for non-Enter events or empty text.
-    /// This is a convenience method for the common pattern in worker.rs.
-    pub fn parse_enter_text(text: &str) -> Option<&str> {
-        if let Some(stripped) = text.strip_prefix("Enter:") {
-            let trimmed = stripped.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        } else {
-            None
-        }
-    }
-
-    /// Get the link ID from a Remove payload.
-    pub fn remove_link_id(&self) -> Option<&LinkId> {
-        if let Self::Remove(link_id) = self {
-            Some(link_id)
-        } else {
-            None
-        }
-    }
-
-    /// Parse an event text and get the link ID string if it's a "remove:" event.
-    /// Returns None for non-remove events.
-    /// This is a convenience method for the common pattern in worker.rs.
-    pub fn parse_remove_link<'a>(text: &'a str) -> Option<&'a str> {
-        text.strip_prefix("remove:")
-    }
-}
-
 /// Filter for WHEN pattern matching on event values.
 ///
 /// Phase 3.3: Consolidated from duplicate EventFilter (worker.rs) and DdEventFilter (dataflow.rs).
 /// This is now the single source of truth for event filtering.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EventFilter {
     /// Accept any event value
     Any,
-    /// Only accept events with this exact text value (e.g., "Enter" for key events)
+    /// Only accept events with this exact text value
     TextEquals(String),
-    /// Accept events starting with this prefix (e.g., "Enter:" for Enter+text)
-    TextStartsWith(String),
+    /// Only accept key-down events matching this key
+    KeyEquals(Key),
 }
 
 impl EventFilter {
@@ -461,11 +282,13 @@ impl EventFilter {
     pub fn matches(&self, event_value: &EventValue) -> bool {
         match self {
             EventFilter::Any => true,
-            EventFilter::TextStartsWith(prefix) => {
-                matches!(event_value, EventValue::Text(t) if t.starts_with(prefix))
-            }
             EventFilter::TextEquals(pattern) => {
                 matches!(event_value, EventValue::Text(t) if t == pattern)
+                    || matches!(event_value, EventValue::PreparedItem { source_text: Some(t), .. } if t == pattern)
+            }
+            EventFilter::KeyEquals(key) => {
+                matches!(event_value, EventValue::KeyDown { key: k, .. } if k == key)
+                    || matches!(event_value, EventValue::PreparedItem { source_key: Some(k), .. } if k == key)
             }
         }
     }
@@ -475,7 +298,7 @@ impl EventFilter {
         match self {
             EventFilter::Any => true,
             EventFilter::TextEquals(pattern) => text == pattern,
-            EventFilter::TextStartsWith(prefix) => text.starts_with(prefix),
+            EventFilter::KeyEquals(key) => key.as_str() == text,
         }
     }
 }
@@ -485,51 +308,62 @@ impl EventFilter {
 /// NOTE: This is exposed for migration purposes. Prefer using `LinkId::dynamic()`
 /// and `LinkId::is_dynamic()` methods instead of using this constant directly.
 pub const DYNAMIC_LINK_PREFIX: &str = "dynamic_link_";
+/// Internal link ID used to propagate browser route changes into DD.
+pub const ROUTE_CHANGE_LINK_ID: &str = "__route_change__";
+/// Field name for per-item identity keys embedded in list items.
+pub const ITEM_KEY_FIELD: &str = "__key";
 
 /// A unique identifier for LINK events.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LinkId(pub String);
+pub enum LinkId {
+    /// Static link defined in source code
+    Static(std::sync::Arc<str>),
+    /// Dynamic link generated for list items
+    Dynamic { counter: u32, name: std::sync::Arc<str> },
+}
 
 impl LinkId {
     pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
+        Self::Static(std::sync::Arc::from(name.into()))
     }
 
     /// Create a dynamic link ID from a counter.
     pub fn dynamic(counter: u32) -> Self {
-        Self(format!("{}{}", DYNAMIC_LINK_PREFIX, counter))
+        let name = format!("{}{}", DYNAMIC_LINK_PREFIX, counter);
+        Self::Dynamic { counter, name: std::sync::Arc::from(name) }
     }
 
     /// Get the name of this LINK ID.
     pub fn name(&self) -> &str {
-        &self.0
+        match self {
+            Self::Static(name) => name.as_ref(),
+            Self::Dynamic { name, .. } => name.as_ref(),
+        }
     }
 
     /// Check if this is a dynamic link ID.
     pub fn is_dynamic(&self) -> bool {
-        self.0.starts_with(DYNAMIC_LINK_PREFIX)
+        matches!(self, Self::Dynamic { .. })
     }
 
     /// Get the dynamic counter if this is a dynamic link ID.
     pub fn dynamic_counter(&self) -> Option<u32> {
-        if self.is_dynamic() {
-            self.0.strip_prefix(DYNAMIC_LINK_PREFIX)
-                .and_then(|s| s.parse().ok())
-        } else {
-            None
+        match self {
+            Self::Dynamic { counter, .. } => Some(*counter),
+            _ => None,
         }
     }
 }
 
 impl std::fmt::Display for LinkId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.name())
     }
 }
 
 impl AsRef<str> for LinkId {
     fn as_ref(&self) -> &str {
-        &self.0
+        self.name()
     }
 }
 
@@ -541,25 +375,25 @@ impl From<&str> for LinkId {
 
 impl From<String> for LinkId {
     fn from(s: String) -> Self {
-        LinkId(s)
+        LinkId::new(s)
     }
 }
 
 impl From<std::sync::Arc<str>> for LinkId {
     fn from(s: std::sync::Arc<str>) -> Self {
-        LinkId::new(s.to_string())
+        LinkId::Static(s)
     }
 }
 
 impl PartialEq<str> for LinkId {
     fn eq(&self, other: &str) -> bool {
-        self.0 == other
+        self.name() == other
     }
 }
 
 impl PartialEq<String> for LinkId {
     fn eq(&self, other: &String) -> bool {
-        self.0 == *other
+        self.name() == other.as_str()
     }
 }
 
@@ -595,6 +429,38 @@ pub enum Event {
     External { name: String, value: EventValue },
 }
 
+/// Normalized key representation for DD events.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Key {
+    Enter,
+    Escape,
+    Other(std::sync::Arc<str>),
+}
+
+impl Key {
+    pub fn from_str(key: &str) -> Self {
+        match key {
+            "Enter" => Self::Enter,
+            "Escape" => Self::Escape,
+            other => Self::Other(std::sync::Arc::from(other)),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Enter => "Enter",
+            Self::Escape => "Escape",
+            Self::Other(s) => s.as_ref(),
+        }
+    }
+}
+
+impl From<&str> for Key {
+    fn from(value: &str) -> Self {
+        Self::from_str(value)
+    }
+}
+
 /// Value types for DD events.
 ///
 /// This is a simplified event value type. The full Value from dd_value.rs
@@ -607,14 +473,26 @@ pub enum EventValue {
     Unit,
     /// Text value (e.g., text input change)
     Text(String),
+    /// Key-down event with optional text (e.g., Enter with input contents)
+    KeyDown { key: Key, text: Option<String> },
     /// Boolean value (e.g., checkbox toggle)
     Bool(bool),
     /// Numeric value (using OrderedFloat for Ord impl)
     Number(ordered_float::OrderedFloat<f64>),
     /// Pre-instantiated item for list append (O(delta) optimization).
-    /// The item has already had its CellRef/LinkRef IDs generated and registered
-    /// BEFORE being injected into DD. This allows DD to do pure appending.
-    PreparedItem(super::value::Value),
+    /// The item has fresh CellRef/LinkRef IDs generated BEFORE being injected into DD.
+    /// Initial cell values are carried alongside to keep DD transforms pure.
+    PreparedItem {
+        /// Fully instantiated item with fresh CellRef/LinkRef IDs.
+        item: super::value::Value,
+        /// Initial values for any new cells created during instantiation.
+        /// Each entry is (cell_id, initial_value).
+        initializations: Vec<(String, super::value::Value)>,
+        /// Original event text (if any) for filter matching and downstream transforms.
+        source_text: Option<String>,
+        /// Original event key (if any) for filter matching and downstream transforms.
+        source_key: Option<Key>,
+    },
 }
 
 impl EventValue {
@@ -626,6 +504,10 @@ impl EventValue {
         Self::Text(s.into())
     }
 
+    pub fn key_down(key: Key, text: Option<String>) -> Self {
+        Self::KeyDown { key, text }
+    }
+
     pub fn bool(b: bool) -> Self {
         Self::Bool(b)
     }
@@ -635,22 +517,66 @@ impl EventValue {
     }
 
     /// Create a prepared item event value for O(delta) list operations.
-    /// The item should have already had its IDs generated and registered.
-    pub fn prepared_item(item: super::value::Value) -> Self {
-        Self::PreparedItem(item)
+    /// The item should have already had its IDs generated and initializations collected.
+    pub fn prepared_item(item: super::value::Value, initializations: Vec<(String, super::value::Value)>) -> Self {
+        Self::PreparedItem {
+            item,
+            initializations,
+            source_text: None,
+            source_key: None,
+        }
+    }
+
+    /// Create a prepared item with original event metadata.
+    pub fn prepared_item_with_source(
+        item: super::value::Value,
+        initializations: Vec<(String, super::value::Value)>,
+        source_key: Option<Key>,
+        source_text: Option<String>,
+    ) -> Self {
+        Self::PreparedItem {
+            item,
+            initializations,
+            source_text,
+            source_key,
+        }
     }
 
     /// Check if this is a prepared item.
     pub fn is_prepared_item(&self) -> bool {
-        matches!(self, Self::PreparedItem(_))
+        matches!(self, Self::PreparedItem { .. })
     }
 
     /// Get the prepared item if this is a PreparedItem variant.
-    pub fn as_prepared_item(&self) -> Option<&super::value::Value> {
-        if let Self::PreparedItem(item) = self {
-            Some(item)
+    pub fn as_prepared_item(&self) -> Option<(&super::value::Value, &Vec<(String, super::value::Value)>)> {
+        if let Self::PreparedItem { item, initializations, .. } = self {
+            Some((item, initializations))
         } else {
             None
+        }
+    }
+
+    pub fn key(&self) -> Option<&Key> {
+        match self {
+            Self::KeyDown { key, .. } => Some(key),
+            Self::PreparedItem { source_key: Some(key), .. } => Some(key),
+            _ => None,
+        }
+    }
+
+    pub fn enter_text(&self) -> Option<&str> {
+        match self {
+            Self::KeyDown { key: Key::Enter, text: Some(text) } => Some(text.as_str()),
+            Self::KeyDown { key: Key::Enter, text: None } => {
+                panic!("[DD EventValue] Enter key event missing text payload");
+            }
+            Self::PreparedItem { source_key: Some(Key::Enter), source_text: Some(text), .. } => {
+                Some(text.as_str())
+            }
+            Self::PreparedItem { source_key: Some(Key::Enter), source_text: None, .. } => {
+                panic!("[DD EventValue] PreparedItem missing source_text for Enter key");
+            }
+            _ => None,
         }
     }
 }
@@ -668,25 +594,18 @@ impl EventValue {
 pub enum LinkAction {
     /// Toggle a boolean cell: `!state`
     BoolToggle,
-    /// Set a cell to true (e.g., entering edit mode via double-click)
+    /// Set a cell to true
     SetTrue,
-    /// Set a cell to false (e.g., exiting edit mode via Escape/blur)
+    /// Set a cell to false
     SetFalse,
+    /// Add a constant numeric value to a numeric cell
+    AddValue(super::value::Value),
     /// Update cell to match event boolean value (for hover state)
     HoverState,
     /// Remove a list item by identity (antijoin operation)
     RemoveListItem {
         /// The list cell containing items
         list_cell_id: CellId,
-        /// Path to the identity field (e.g., ["remove", "link_ref"])
-        identity_path: Vec<String>,
-    },
-    /// Toggle ALL items' completed field in a list
-    ListToggleAllCompleted {
-        /// The list cell to iterate
-        list_cell_id: CellId,
-        /// Field to toggle on each item (e.g., "completed")
-        completed_field: String,
     },
     /// Set a text cell from the event text value
     SetText,
@@ -723,19 +642,29 @@ pub struct LinkCellMapping {
     pub cell_id: CellId,
     /// The action to perform
     pub action: LinkAction,
-    /// Optional key filter (e.g., ["Escape", "Enter"] for SetFalseOnKeys)
-    pub key_filter: Option<Vec<String>>,
+    /// Optional key filter (e.g., [Key::Escape, Key::Enter] for SetFalseOnKeys)
+    pub key_filter: Option<Vec<Key>>,
 }
 
 impl LinkCellMapping {
     /// Create a new simple mapping (link → cell with action).
     pub fn new(link_id: impl Into<LinkId>, cell_id: impl Into<CellId>, action: LinkAction) -> Self {
-        Self {
+        let mapping = Self {
             link_id: link_id.into(),
             cell_id: cell_id.into(),
             action,
             key_filter: None,
+        };
+        if let LinkAction::RemoveListItem { list_cell_id } = &mapping.action {
+            if *list_cell_id != mapping.cell_id {
+                panic!(
+                    "[DD LinkCellMapping] RemoveListItem list_cell_id '{}' must match mapping cell_id '{}'",
+                    list_cell_id.name(),
+                    mapping.cell_id.name()
+                );
+            }
         }
+        mapping
     }
 
     /// Create a mapping with a key filter (for SetFalseOnKeys pattern).
@@ -743,8 +672,11 @@ impl LinkCellMapping {
         link_id: impl Into<LinkId>,
         cell_id: impl Into<CellId>,
         action: LinkAction,
-        keys: Vec<String>,
+        keys: Vec<Key>,
     ) -> Self {
+        if keys.is_empty() {
+            panic!("[DD LinkCellMapping] key_filter must not be empty");
+        }
         Self {
             link_id: link_id.into(),
             cell_id: cell_id.into(),
@@ -758,12 +690,12 @@ impl LinkCellMapping {
         Self::new(link_id, cell_id, LinkAction::BoolToggle)
     }
 
-    /// Create a SetTrue mapping (e.g., double-click to edit).
+    /// Create a SetTrue mapping.
     pub fn set_true(link_id: impl Into<LinkId>, cell_id: impl Into<CellId>) -> Self {
         Self::new(link_id, cell_id, LinkAction::SetTrue)
     }
 
-    /// Create a SetFalse mapping (e.g., blur to exit edit).
+    /// Create a SetFalse mapping.
     pub fn set_false(link_id: impl Into<LinkId>, cell_id: impl Into<CellId>) -> Self {
         Self::new(link_id, cell_id, LinkAction::SetFalse)
     }
@@ -777,14 +709,13 @@ impl LinkCellMapping {
     pub fn remove_list_item(
         link_id: impl Into<LinkId>,
         list_cell_id: impl Into<CellId>,
-        identity_path: Vec<String>,
     ) -> Self {
+        let list_cell_id: CellId = list_cell_id.into();
         Self {
             link_id: link_id.into(),
-            cell_id: list_cell_id.clone().into(), // Same as list_cell_id for convenience
+            cell_id: list_cell_id.clone(), // Same as list_cell_id for convenience
             action: LinkAction::RemoveListItem {
-                list_cell_id: list_cell_id.into(),
-                identity_path,
+                list_cell_id,
             },
             key_filter: None,
         }
@@ -799,65 +730,11 @@ impl LinkCellMapping {
 
         // Check key filter if present
         if let Some(ref keys) = self.key_filter {
-            if let EventValue::Text(text) = event_value {
-                // Check if text is one of the allowed keys
-                return keys.iter().any(|k| text == k || text.starts_with(&format!("{}:", k)));
-            }
-            return false;
+            return matches!(event_value, EventValue::KeyDown { key, .. } if keys.contains(key))
+                || matches!(event_value, EventValue::PreparedItem { source_key: Some(key), .. } if keys.contains(key));
         }
 
         true
-    }
-}
-
-/// Editing handler configuration - maps multiple links to a pair of cells.
-///
-/// This replaces `DynamicLinkAction::EditingHandler` with a declarative
-/// structure that can be expanded into multiple `LinkCellMapping`s.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EditingHandlerConfig {
-    /// The cell that tracks whether we're in edit mode
-    pub editing_cell: CellId,
-    /// The cell that stores the text being edited
-    pub title_cell: CellId,
-    /// Link for double-click to enter edit mode
-    pub double_click_link: LinkId,
-    /// Link for key events (Enter to save, Escape to cancel)
-    pub key_down_link: LinkId,
-    /// Link for blur event (exit edit mode)
-    pub blur_link: LinkId,
-}
-
-impl EditingHandlerConfig {
-    /// Expand this config into individual LinkCellMappings for DD.
-    pub fn to_mappings(&self) -> Vec<LinkCellMapping> {
-        vec![
-            // Double-click → editing = true
-            LinkCellMapping::set_true(self.double_click_link.clone(), self.editing_cell.clone()),
-            // Blur → editing = false
-            LinkCellMapping::set_false(self.blur_link.clone(), self.editing_cell.clone()),
-            // Escape → editing = false
-            LinkCellMapping::with_key_filter(
-                self.key_down_link.clone(),
-                self.editing_cell.clone(),
-                LinkAction::SetFalse,
-                vec!["Escape".to_string()],
-            ),
-            // Enter:text → title = text, editing = false
-            // Note: This needs special handling for the two-step update
-            LinkCellMapping::with_key_filter(
-                self.key_down_link.clone(),
-                self.title_cell.clone(),
-                LinkAction::SetText,
-                vec!["Enter".to_string()],
-            ),
-            LinkCellMapping::with_key_filter(
-                self.key_down_link.clone(),
-                self.editing_cell.clone(),
-                LinkAction::SetFalse,
-                vec!["Enter".to_string()],
-            ),
-        ]
     }
 }
 
@@ -943,6 +820,7 @@ mod tests {
     fn test_dd_event_value_constructors() {
         assert!(matches!(EventValue::unit(), EventValue::Unit));
         assert!(matches!(EventValue::text("hello"), EventValue::Text(s) if s == "hello"));
+        assert!(matches!(EventValue::key_down(Key::Enter, None), EventValue::KeyDown { key: Key::Enter, text: None }));
         assert!(matches!(EventValue::bool(true), EventValue::Bool(true)));
         assert!(matches!(EventValue::number(3.14), EventValue::Number(n) if (n.0 - 3.14).abs() < f64::EPSILON));
     }
@@ -961,7 +839,6 @@ mod tests {
         // RemoveListItem
         let remove = LinkAction::RemoveListItem {
             list_cell_id: CellId::new("todos"),
-            identity_path: vec!["remove".to_string(), "link_ref".to_string()],
         };
         assert!(matches!(remove, LinkAction::RemoveListItem { .. }));
     }
@@ -994,7 +871,7 @@ mod tests {
             "key_down",
             "editing",
             LinkAction::SetFalse,
-            vec!["Escape".to_string(), "Enter".to_string()],
+            vec![Key::Escape, Key::Enter],
         );
 
         assert_eq!(mapping.link_id, LinkId::new("key_down"));
@@ -1016,56 +893,21 @@ mod tests {
             "key_down",
             "editing",
             LinkAction::SetFalse,
-            vec!["Escape".to_string()],
+            vec![Key::Escape],
         );
-        assert!(escape_only.matches(&LinkId::new("key_down"), &EventValue::Text("Escape".to_string())));
-        assert!(!escape_only.matches(&LinkId::new("key_down"), &EventValue::Text("Enter".to_string())));
+        assert!(escape_only.matches(&LinkId::new("key_down"), &EventValue::key_down(Key::Escape, None)));
+        assert!(!escape_only.matches(&LinkId::new("key_down"), &EventValue::key_down(Key::Enter, None)));
         assert!(!escape_only.matches(&LinkId::new("key_down"), &EventValue::Unit));
 
-        // Key filter with prefix matching (e.g., "Enter:text")
+        // Key filter with Enter and text payload
         let enter_filter = LinkCellMapping::with_key_filter(
             "key_down",
             "title",
             LinkAction::SetText,
-            vec!["Enter".to_string()],
+            vec![Key::Enter],
         );
-        assert!(enter_filter.matches(&LinkId::new("key_down"), &EventValue::Text("Enter:hello".to_string())));
-        assert!(!enter_filter.matches(&LinkId::new("key_down"), &EventValue::Text("Escape".to_string())));
-    }
-
-    #[test]
-    fn test_editing_handler_config() {
-        let config = EditingHandlerConfig {
-            editing_cell: CellId::new("editing"),
-            title_cell: CellId::new("title"),
-            double_click_link: LinkId::new("dblclick"),
-            key_down_link: LinkId::new("keydown"),
-            blur_link: LinkId::new("blur"),
-        };
-
-        let mappings = config.to_mappings();
-
-        // Should produce 5 mappings:
-        // 1. dblclick → editing = true
-        // 2. blur → editing = false
-        // 3. Escape → editing = false
-        // 4. Enter → title = text
-        // 5. Enter → editing = false
-        assert_eq!(mappings.len(), 5);
-
-        // Check double-click mapping
-        assert_eq!(mappings[0].link_id, LinkId::new("dblclick"));
-        assert_eq!(mappings[0].cell_id, CellId::new("editing"));
-        assert_eq!(mappings[0].action, LinkAction::SetTrue);
-
-        // Check blur mapping
-        assert_eq!(mappings[1].link_id, LinkId::new("blur"));
-        assert_eq!(mappings[1].cell_id, CellId::new("editing"));
-        assert_eq!(mappings[1].action, LinkAction::SetFalse);
-
-        // Check Escape mapping has key filter
-        assert!(mappings[2].key_filter.is_some());
-        assert!(mappings[2].key_filter.as_ref().unwrap().contains(&"Escape".to_string()));
+        assert!(enter_filter.matches(&LinkId::new("key_down"), &EventValue::key_down(Key::Enter, Some("hello".to_string()))));
+        assert!(!enter_filter.matches(&LinkId::new("key_down"), &EventValue::key_down(Key::Escape, None)));
     }
 
     #[test]
@@ -1073,15 +915,13 @@ mod tests {
         let mapping = LinkCellMapping::remove_list_item(
             "delete_btn",
             "todos",
-            vec!["remove".to_string(), "link_ref".to_string()],
         );
 
         assert_eq!(mapping.link_id, LinkId::new("delete_btn"));
         assert!(matches!(mapping.action, LinkAction::RemoveListItem { .. }));
 
-        if let LinkAction::RemoveListItem { list_cell_id, identity_path } = mapping.action {
+        if let LinkAction::RemoveListItem { list_cell_id } = mapping.action {
             assert_eq!(list_cell_id, CellId::new("todos"));
-            assert_eq!(identity_path, vec!["remove".to_string(), "link_ref".to_string()]);
         }
     }
 }
