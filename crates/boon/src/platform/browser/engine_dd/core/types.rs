@@ -265,7 +265,7 @@ impl ElementTag {
 
 /// Filter for WHEN pattern matching on event values.
 ///
-/// Phase 3.3: Consolidated from duplicate EventFilter (worker.rs) and DdEventFilter (dataflow.rs).
+/// Consolidated from duplicate EventFilter (worker.rs) and DdEventFilter (dataflow.rs).
 /// This is now the single source of truth for event filtering.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EventFilter {
@@ -825,7 +825,7 @@ mod tests {
         assert!(matches!(EventValue::number(3.14), EventValue::Number(n) if (n.0 - 3.14).abs() < f64::EPSILON));
     }
 
-    // Phase 8: LinkCellMapping tests
+    // LinkCellMapping tests
 
     #[test]
     fn test_link_action_variants() {

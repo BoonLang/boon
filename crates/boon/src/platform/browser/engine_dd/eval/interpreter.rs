@@ -9,7 +9,7 @@
 //! 2. Resolve references and persistence
 //! 3. Convert to static expressions
 //! 4. Evaluate with `BoonDdRuntime`
-//! 5. Return `DdResult` with document and context
+//! 5. Return `DdResult` with document
 //!
 //! # Current Limitations
 //!
@@ -20,11 +20,13 @@
 //! These will be added in subsequent phases using Worker.
 
 use chumsky::Parser as _;
+use chumsky::input::Stream;
 use std::collections::HashMap;
+#[allow(unused_imports)]
+use super::super::dd_log;
 use super::evaluator::BoonDdRuntime;
-use super::super::core::value::{CollectionHandle, Value, WhileConfig, PlaceholderWhileConfig, WhileArm};
+use super::super::core::value::{CollectionHandle, Value};
 use super::super::core::{Worker, DataflowConfig, CellConfig, CellId, LinkId, EventFilter, StateTransform, reconstruct_persisted_item, instantiate_fresh_item, remap_link_mappings_for_item, LinkAction, LinkCellMapping, Key, ITEM_KEY_FIELD, get_link_ref_at_path, ROUTE_CHANGE_LINK_ID};
-// Phase 7.3: Removed imports of deleted setter/clear functions (now in DataflowConfig)
 use super::super::io::{
     EventInjector, set_global_dispatcher, clear_global_dispatcher,
     set_task_handle, clear_task_handle, clear_output_listener_handle,
@@ -33,88 +35,68 @@ use super::super::io::{
     // Getters only - setters removed (now via DataflowConfig)
     init_current_route, get_current_route,
 };
-// Phase 11a: clear_router_mappings was removed - routing goes through DD dataflow now
-use zoon::{Task, StreamExt};
+use serde_json_any_key::MapIterToJson;
+use zoon::{Task, StreamExt, WebStorage, local_storage};
 use crate::parser::{
-    Input, SourceCode, Spanned, Token, lexer, parser, reset_expression_depth,
+    Expression, Input, SourceCode, Spanned, Token, lexer, parser, reset_expression_depth,
     resolve_persistence, resolve_references, span_at, static_expression,
 };
+
+const DD_OLD_CODE_KEY: &str = "dd_old_code";
+const DD_SPAN_IDS_KEY: &str = "dd_span_ids";
 
 /// Result of running DD reactive evaluation.
 #[derive(Clone)]
 pub struct DdResult {
     /// The document value if evaluation succeeded
     pub document: Option<Value>,
-    /// Evaluation context with runtime information
-    pub context: DdContext,
 }
 
-/// Context for DD evaluation containing runtime state.
-#[derive(Clone, Default)]
-pub struct DdContext {
-    /// Active timers (empty for static evaluation)
-    timers: Vec<TimerInfo>,
-    /// Whether there are sum accumulators
-    has_accumulators: bool,
-}
-
-/// Information about an active timer.
-#[derive(Clone)]
-pub struct TimerInfo {
-    /// Timer identifier
-    pub id: String,
-    /// Interval in milliseconds
-    pub interval_ms: u64,
-}
-
-impl DdContext {
-    /// Create a new empty context.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Get active timers.
-    pub fn get_timers(&self) -> &[TimerInfo] {
-        &self.timers
-    }
-
-    /// Check if there are sum accumulators.
-    pub fn has_sum_accumulators(&self) -> bool {
-        self.has_accumulators
-    }
-
-    /// Add a timer to the context.
-    pub fn add_timer(&mut self, id: String, interval_ms: u64) {
-        self.timers.push(TimerInfo { id, interval_ms });
-    }
-
-    /// Mark that sum accumulators are present.
-    pub fn set_has_accumulators(&mut self, has: bool) {
-        self.has_accumulators = has;
-    }
-}
-
-/// Run Boon code with DD reactive evaluation and persistence.
-/// Check if a Value contains CellRefs (indicating it uses item data).
-/// Used to distinguish element templates that use item data (like todo_item)
-/// from container elements that don't (like main_panel).
-fn has_dynamic_holds(value: &Value) -> bool {
+/// Check if a Value contains Unit anywhere in its immediate children.
+/// Used to detect already-instantiated items where LinkRefs were stripped to Unit.
+fn contains_unit(value: &Value) -> bool {
     match value {
-        Value::CellRef(_) => true,
-        Value::PlaceholderField(_) => true,
-        Value::WhileConfig(config) => {
-            let arms_have_holds = config.arms.iter().any(|arm| has_dynamic_holds(&arm.body));
-            let default_has_holds = has_dynamic_holds(&config.default);
-            arms_have_holds || default_has_holds
-        }
-        Value::PlaceholderWhile(config) => {
-            let arms_have_holds = config.arms.iter().any(|arm| has_dynamic_holds(&arm.body));
-            let default_has_holds = has_dynamic_holds(&config.default);
-            arms_have_holds || default_has_holds
-        }
-        Value::Object(fields) => fields.values().any(has_dynamic_holds),
-        Value::Tagged { fields, .. } => fields.values().any(has_dynamic_holds),
+        Value::Object(fields) => fields.values().any(|v| matches!(v, Value::Unit)),
+        Value::Tagged { fields, .. } => fields.values().any(|v| matches!(v, Value::Unit)),
         _ => false,
+    }
+}
+
+/// Check if a persisted value should be skipped during overlay (stripped LinkRef structure).
+/// Returns true if the value is Unit or an Object/Tagged where all values are Unit.
+fn is_stripped_linkref_structure(value: &Value) -> bool {
+    match value {
+        Value::Unit => true,
+        Value::Object(fields) => !fields.is_empty() && fields.values().all(|v| matches!(v, Value::Unit)),
+        _ => false,
+    }
+}
+
+/// Parse old source code into AST for persistence ID matching.
+fn parse_old_dd<'old_code>(
+    filename: &str,
+    source_code: &'old_code str,
+) -> Option<Vec<Spanned<Expression<'old_code>>>> {
+    let (tokens, _lex_errors) = lexer().parse(source_code).into_output_errors();
+    let Some(mut tokens) = tokens else {
+        return None;
+    };
+    tokens.retain(|spanned_token| !matches!(spanned_token.node, Token::Comment(_)));
+
+    reset_expression_depth();
+    let (ast, _parse_errors) = parser()
+        .parse(Stream::from_iter(tokens).map(
+            span_at(source_code.len()),
+            |Spanned { node, span, persistence: _ }| (node, span),
+        ))
+        .into_output_errors();
+    let Some(ast) = ast else {
+        return None;
+    };
+
+    match resolve_references(ast) {
+        Ok(ast) => Some(ast),
+        Err(_) => None,
     }
 }
 
@@ -133,7 +115,7 @@ pub fn run_dd_reactive_with_persistence(
     source_code: &str,
     _states_storage_key: Option<&str>,
 ) -> Option<DdResult> {
-    zoon::println!("[DD Interpreter] Parsing: {}", filename);
+    dd_log!("[DD Interpreter] Parsing: {}", filename);
 
     // Clean up any existing components from previous runs
     // This ensures old timers/workers stop before new ones start
@@ -141,9 +123,7 @@ pub fn run_dd_reactive_with_persistence(
     clear_output_listener_handle();
     clear_task_handle();
     clear_global_dispatcher();
-    // Phase 11a: clear_router_mappings() removed - routing goes through DD dataflow now
-    // Dynamic link registry removed - no-op
-    // Phase 7.3: Config clearing now handled by worker lifecycle
+    // Config clearing is handled by worker lifecycle
     // Removed: clear_remove_event_path, clear_bulk_remove_bindings,
     //          clear_editing_event_bindings, clear_toggle_event_bindings, clear_global_toggle_bindings
     // DELETED: clear_checkbox_toggle_holds() - registry was dead code (set but never read)
@@ -201,8 +181,17 @@ pub fn run_dd_reactive_with_persistence(
         }
     };
 
-    // Step 4: Resolve persistence (with empty old AST for now)
-    let (ast, _span_id_pairs) = match resolve_persistence(ast, None, "dd_span_ids") {
+    // Step 4: Resolve persistence (load old AST for stable IDs across page reloads)
+    let old_source_code = local_storage().get::<String>(DD_OLD_CODE_KEY);
+    let old_ast = if let Some(Ok(old_source_code)) = &old_source_code {
+        parse_old_dd(filename, old_source_code)
+    } else {
+        None
+    };
+
+    let source_code_for_storage = source_code.to_string();
+
+    let (ast, new_span_id_pairs) = match resolve_persistence(ast, old_ast, DD_SPAN_IDS_KEY) {
         Ok(result) => result,
         Err(errors) => {
             zoon::eprintln!("[DD Interpreter] Persistence errors:");
@@ -229,9 +218,11 @@ pub fn run_dd_reactive_with_persistence(
     // Attach element templates to list item templates (fail-fast if missing).
     evaluator_config.attach_list_element_templates();
     evaluator_config.register_collection_cells();
-    zoon::println!("[DD Interpreter] Evaluator built {} CellConfig entries", evaluator_config.cells.len());
+    dd_log!("[DD Interpreter] Evaluator built {} CellConfig entries, {} initial_collections, {} collection_ops, {} link_mappings",
+        evaluator_config.cells.len(), evaluator_config.initial_collections.len(),
+        evaluator_config.collection_ops.len(), evaluator_config.link_mappings.len());
     for (i, cell) in evaluator_config.cells.iter().enumerate() {
-        zoon::println!("[DD Interpreter]   [{}] id={}, transform={:?}, timer={}ms",
+        dd_log!("[DD Interpreter]   [{}] id={}, transform={:?}, timer={}ms",
             i, cell.id.name(), cell.transform, cell.timer_interval_ms);
     }
 
@@ -266,13 +257,13 @@ pub fn run_dd_reactive_with_persistence(
 
     // Detect list cells from evaluator-built config (no runtime scanning).
     let (static_list, list_var_name) = detect_list_cell_from_config(&evaluator_config);
-    zoon::println!("[DD Interpreter] Detected list cell from config: {:?}", list_var_name);
+    dd_log!("[DD Interpreter] Detected list cell from config: {:?}", list_var_name);
     let static_items = static_list.clone();
 
-    zoon::println!("[DD Interpreter] Evaluation complete, has document: {}",
+    dd_log!("[DD Interpreter] Evaluation complete, has document: {}",
         document.is_some());
-    zoon::println!("[DD Interpreter] static_list = {:?}", static_list);
-    zoon::println!("[DD Interpreter] static_items = {:?}", static_items);
+    dd_log!("[DD Interpreter] static_list = {:?}", static_list);
+    dd_log!("[DD Interpreter] static_items = {:?}", static_items);
 
     // Step 7: Set up Worker for reactive updates
     // Task 4.3: Prefer evaluator-built config over extract_* pattern detection
@@ -297,7 +288,7 @@ pub fn run_dd_reactive_with_persistence(
         binding.append_link_ids.first().cloned()
     });
     if key_down_link.is_some() {
-        zoon::println!("[DD Interpreter] Using evaluator-provided List/append link: {:?}", key_down_link);
+        dd_log!("[DD Interpreter] Using evaluator-provided List/append link: {:?}", key_down_link);
     }
     if key_down_link.is_some() && list_var_name.is_none() {
         panic!("[DD Interpreter] Bug: List/append binding present but no list cell detected");
@@ -310,7 +301,7 @@ pub fn run_dd_reactive_with_persistence(
         binding.clear_link_ids.first().cloned()
     });
     if button_press_link.is_some() {
-        zoon::println!("[DD Interpreter] Using evaluator-provided List/clear link: {:?}", button_press_link);
+        dd_log!("[DD Interpreter] Using evaluator-provided List/clear link: {:?}", button_press_link);
     }
     if button_press_link.is_some() && list_var_name.is_none() {
         panic!("[DD Interpreter] Bug: List/clear binding present but no list cell detected");
@@ -329,13 +320,8 @@ pub fn run_dd_reactive_with_persistence(
     if list_var_name.is_some() && !has_append_binding && !has_remove_path {
         panic!("[DD Interpreter] Bug: reactive list detected but no List/append or List/remove bindings were parsed.");
     }
-    if has_append_binding && !has_list_template {
-        let list_id = list_name.as_ref().map(|s| s.as_str()).unwrap_or("<unknown>");
-        panic!(
-            "[DD Interpreter] List/append requires ListItemTemplate for list '{}'",
-            list_id
-        );
-    }
+    // Simple append+clear lists (no per-item remove) may not have a template.
+    // Template is only required when List/remove exists (per-item identity tracking).
     // Task 6.3: Checkbox and editing toggles are derived from evaluator config only.
     // NOTE: clear_completed_link is no longer extracted by label matching!
     // Bulk remove bindings are parsed into DataflowConfig.bulk_remove_bindings
@@ -343,8 +329,8 @@ pub fn run_dd_reactive_with_persistence(
     let config = if has_timer_hold {
         // Task 4.3: Use evaluator-built config for timer patterns
         // This eliminates extract_timer_info() for timer-driven patterns
-        zoon::println!("[DD Interpreter] Using evaluator-built config for timer pattern ({} cells)", evaluator_config.cells.len());
-        evaluator_config
+        dd_log!("[DD Interpreter] Using evaluator-built config for timer pattern ({} cells)", evaluator_config.cells.len());
+        Some(evaluator_config)
     } else if let Some(list_name) = list_var_name.clone() {
         let mut config = evaluator_config.clone();
         config.attach_list_element_templates();
@@ -362,9 +348,8 @@ pub fn run_dd_reactive_with_persistence(
         }
 
         let initial_cell_values = build_initial_cell_values(&config);
-        let remove_path = config.remove_event_paths.get(&list_name).cloned().unwrap_or_else(|| {
-            panic!("[DD Interpreter] Bug: missing remove identity path for list '{}'", list_name);
-        });
+        let remove_path = config.remove_event_paths.get(&list_name).cloned()
+            .unwrap_or_default(); // Empty for append+clear lists (no per-item remove)
         if let Some(template) = list_template.as_ref() {
             if template.identity.link_ref_path != remove_path {
                 panic!(
@@ -383,6 +368,16 @@ pub fn run_dd_reactive_with_persistence(
             });
 
         // Use persisted list items (with nested collections), or fall back to evaluator-provided initial collection.
+        dd_log!("[DD Interpreter] Loading items for list '{}', collection_id={:?}", list_name, collection_id);
+        dd_log!("[DD Interpreter] static_items = {:?}", static_items);
+        if let Some(items) = config.initial_collections.get(&collection_id) {
+            dd_log!("[DD Interpreter] initial_collections has {} items for {:?}", items.len(), collection_id);
+            for (i, item) in items.iter().enumerate() {
+                dd_log!("[DD Interpreter]   raw_item[{}] = {:?}", i, item);
+            }
+        } else {
+            dd_log!("[DD Interpreter] initial_collections MISSING for {:?}", collection_id);
+        }
         let initial_items_raw: Vec<Value> = if let Some(persisted) = load_persisted_list_items_with_collections(&list_name) {
             for (collection_id, items) in persisted.collections {
                 if config.initial_collections.insert(collection_id, items).is_some() {
@@ -452,9 +447,29 @@ pub fn run_dd_reactive_with_persistence(
             let mut reconstructed_items = Vec::new();
             let mut item_initializations: Vec<(String, Value)> = Vec::new();
 
-            for item in initial_items_raw.iter() {
+            // Debug: dump all items before processing loop
+            for (idx, item) in initial_items_raw.iter().enumerate() {
+                dd_log!("[DD Interpreter] BEFORE LOOP list='{}' item[{}] = {:?}", list_name, idx, item);
+                if let Value::Object(obj) = item {
+                    dd_log!("[DD Interpreter] BEFORE LOOP list='{}' item[{}] has_key={}, fields={:?}",
+                        list_name, idx, obj.contains_key("__key"), obj.keys().collect::<Vec<_>>());
+                }
+            }
+
+            // Clone per-item cell value snapshots for this collection (avoids borrow conflict
+            // with &mut config.initial_collections used in instantiate_fresh_item)
+            let per_item_snapshots = config.per_item_cell_values.get(&collection_id).cloned();
+
+            for (item_idx, item) in initial_items_raw.iter().enumerate() {
                 let needs_reconstruction = if let Value::Object(obj) = item {
+                    // Case 1: Items deserialized from persistence that lost CellRef structure
+                    // (CellRefs become empty Objects `{}` during JSON roundtrip)
                     obj.values().any(|v| matches!(v, Value::Object(inner) if inner.is_empty()))
+                    // Case 2: Items already instantiated (CellRefs resolved, LinkRefs stripped to Unit)
+                    // These have no CellRef values but have Unit or resolved values where
+                    // template CellRefs/LinkRefs used to be.
+                    || (!obj.values().any(|v| matches!(v, Value::CellRef(_)))
+                        && obj.values().any(|v| matches!(v, Value::Unit) || contains_unit(v)))
                 } else {
                     false
                 };
@@ -482,12 +497,16 @@ pub fn run_dd_reactive_with_persistence(
                     item_initializations.extend(instantiated.initializations);
                     reconstructed_items.push(instantiated.data);
                 } else {
+                    // Get per-item cell values snapshot (if available)
+                    let item_cell_values = per_item_snapshots.as_ref()
+                        .and_then(|snapshots| snapshots.get(item_idx));
                     let Some(instantiated) = instantiate_fresh_item(
                         item,
                         list_template.element_template.as_ref(),
                         &list_template.identity.link_ref_path,
                         &initial_cell_values,
                         &mut config.initial_collections,
+                        item_cell_values,
                     ) else {
                         panic!("[DD Interpreter] Bug: Failed to instantiate fresh item.");
                     };
@@ -544,80 +563,107 @@ pub fn run_dd_reactive_with_persistence(
         ));
 
         // Register RemoveListItem mappings for initial items using the configured identity path.
-        for item in &initial_items {
-            let link_id = get_link_ref_at_path(item, &remove_path)
-                .unwrap_or_else(|| {
+        // Only needed when there IS per-item remove (non-empty remove_path).
+        if !remove_path.is_empty() {
+            for item in &initial_items {
+                let link_id = get_link_ref_at_path(item, &remove_path)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "[DD Interpreter] Bug: identity path {:?} did not resolve in initial item",
+                            remove_path
+                        );
+                    });
+                let expected_key = format!("link:{}", link_id);
+                let key_value = match item {
+                    Value::Object(fields) => fields.get(ITEM_KEY_FIELD),
+                    Value::Tagged { fields, .. } => fields.get(ITEM_KEY_FIELD),
+                    other => {
+                        panic!(
+                            "[DD Interpreter] Bug: list item must be Object/Tagged, found {:?}",
+                            other
+                        );
+                    }
+                }.unwrap_or_else(|| {
                     panic!(
-                        "[DD Interpreter] Bug: identity path {:?} did not resolve in initial item",
-                        remove_path
+                        "[DD Interpreter] Bug: list item missing '{}' for remove mapping",
+                        ITEM_KEY_FIELD
                     );
                 });
-            let expected_key = format!("link:{}", link_id);
-            let key_value = match item {
-                Value::Object(fields) => fields.get(ITEM_KEY_FIELD),
-                Value::Tagged { fields, .. } => fields.get(ITEM_KEY_FIELD),
-                other => {
-                    panic!(
-                        "[DD Interpreter] Bug: list item must be Object/Tagged, found {:?}",
-                        other
-                    );
+                match key_value {
+                    Value::Text(key) if key.as_ref() == expected_key => {}
+                    other => {
+                        panic!(
+                            "[DD Interpreter] Bug: list item '{}' mismatch: expected '{}', found {:?}",
+                            ITEM_KEY_FIELD, expected_key, other
+                        );
+                    }
                 }
-            }.unwrap_or_else(|| {
-                panic!(
-                    "[DD Interpreter] Bug: list item missing '{}' for remove mapping",
-                    ITEM_KEY_FIELD
-                );
-            });
-            match key_value {
-                Value::Text(key) if key.as_ref() == expected_key => {}
-                other => {
-                    panic!(
-                        "[DD Interpreter] Bug: list item '{}' mismatch: expected '{}', found {:?}",
-                        ITEM_KEY_FIELD, expected_key, other
-                    );
-                }
+                config.add_link_mapping(LinkCellMapping::remove_list_item(
+                    link_id,
+                    list_name.clone(),
+                ));
             }
-            config.add_link_mapping(LinkCellMapping::remove_list_item(
-                link_id,
-                list_name.clone(),
-            ));
         }
 
         // Toggle/set actions are encoded in evaluator config link mappings and remapped per item.
 
         if has_append_binding {
             let link_id = key_down_link.clone().unwrap_or_else(|| {
-                panic!("[DD Interpreter] Bug: list template present but no List/append link");
+                panic!("[DD Interpreter] Bug: list append binding present but no List/append link");
             });
-            let list_template = list_template.unwrap_or_else(|| {
-                panic!("[DD Interpreter] Bug: missing list item template for '{}'", list_name);
-            });
-            // Add list append HOLD config (template-based)
-            if let Some(ref clear_link_id) = button_press_link {
-                config.cells.push(CellConfig {
-                    id: CellId::new(&list_name),
-                    initial: initial_list.clone(),
-                    triggered_by: vec![LinkId::new(&link_id), LinkId::new(clear_link_id)],
-                    timer_interval_ms: 0,
-                    filter: EventFilter::Any,
-                    transform: StateTransform::ListAppendWithTemplateAndClear {
-                        template: list_template.clone(),
-                        clear_link_id: clear_link_id.to_string(),
-                    },
-                    persist: true,
-                });
+            if let Some(list_template) = list_template {
+                // Template-based append (complex items with per-item reactivity)
+                if let Some(ref clear_link_id) = button_press_link {
+                    config.cells.push(CellConfig {
+                        id: CellId::new(&list_name),
+                        initial: initial_list.clone(),
+                        triggered_by: vec![LinkId::new(&link_id), LinkId::new(clear_link_id)],
+                        timer_interval_ms: 0,
+                        filter: EventFilter::Any,
+                        transform: StateTransform::ListAppendWithTemplateAndClear {
+                            template: list_template.clone(),
+                            clear_link_id: clear_link_id.to_string(),
+                        },
+                        persist: true,
+                    });
+                } else {
+                    config.cells.push(CellConfig {
+                        id: CellId::new(&list_name),
+                        initial: initial_list.clone(),
+                        triggered_by: vec![LinkId::new(&link_id)],
+                        timer_interval_ms: 0,
+                        filter: EventFilter::KeyEquals(Key::Enter),
+                        transform: StateTransform::ListAppendWithTemplate {
+                            template: list_template.clone(),
+                        },
+                        persist: true,
+                    });
+                }
             } else {
-                config.cells.push(CellConfig {
-                    id: CellId::new(&list_name),
-                    initial: initial_list.clone(),
-                    triggered_by: vec![LinkId::new(&link_id)],
-                    timer_interval_ms: 0,
-                    filter: EventFilter::KeyEquals(Key::Enter),
-                    transform: StateTransform::ListAppendWithTemplate {
-                        template: list_template.clone(),
-                    },
-                    persist: true,
-                });
+                // Simple append (plain values like text, no per-item reactivity)
+                if let Some(ref clear_link_id) = button_press_link {
+                    config.cells.push(CellConfig {
+                        id: CellId::new(&list_name),
+                        initial: initial_list.clone(),
+                        triggered_by: vec![LinkId::new(&link_id), LinkId::new(clear_link_id)],
+                        timer_interval_ms: 0,
+                        filter: EventFilter::Any,
+                        transform: StateTransform::ListAppendSimpleWithClear {
+                            clear_link_id: clear_link_id.to_string(),
+                        },
+                        persist: true,
+                    });
+                } else {
+                    config.cells.push(CellConfig {
+                        id: CellId::new(&list_name),
+                        initial: initial_list.clone(),
+                        triggered_by: vec![LinkId::new(&link_id)],
+                        timer_interval_ms: 0,
+                        filter: EventFilter::KeyEquals(Key::Enter),
+                        transform: StateTransform::ListAppendSimple,
+                        persist: true,
+                    });
+                }
             }
         } else {
             // Remove-only list: create identity HOLD so link mappings can apply.
@@ -632,7 +678,7 @@ pub fn run_dd_reactive_with_persistence(
             });
         }
 
-        config
+        Some(config)
     } else {
         // Link-driven pattern: button |> THEN |> HOLD/LATEST
         // Task 7.1: Use evaluator-built config with dynamic trigger IDs (no hardcoded fallback)
@@ -640,54 +686,81 @@ pub fn run_dd_reactive_with_persistence(
         let has_evaluator_counter_holds = evaluator_config.cells.iter()
             .any(|h| !h.triggered_by.is_empty() && h.timer_interval_ms == 0);
         let has_evaluator_link_mappings = !evaluator_config.link_mappings.is_empty();
+        let has_initial_collections = !evaluator_config.initial_collections.is_empty();
 
-        if has_evaluator_counter_holds || has_evaluator_link_mappings {
-            zoon::println!(
-                "[DD Interpreter] Using evaluator-built config (cells: {}, link_mappings: {})",
+        if has_evaluator_counter_holds || has_evaluator_link_mappings || has_initial_collections {
+            dd_log!(
+                "[DD Interpreter] Using evaluator-built config (cells: {}, link_mappings: {}, collections: {})",
                 evaluator_config.cells.len(),
-                evaluator_config.link_mappings.len()
+                evaluator_config.link_mappings.len(),
+                evaluator_config.initial_collections.len()
             );
-            // Phase 6: init_cell removed - Worker::spawn() handles initialization synchronously
-            evaluator_config
+            Some(evaluator_config)
         } else {
-            panic!("[DD Interpreter] Bug: No evaluator config for link-driven pattern.");
+            // Static document: no reactive behavior (no timers, no lists, no link-driven patterns).
+            // Skip Worker creation — the document is fully computed from evaluation.
+            dd_log!("[DD Interpreter] Static document, no Worker needed");
+            None
         }
     };
 
-    let worker_handle = Worker::with_config(config).spawn();
+    // Only create a Worker if we have reactive config
+    if let Some(config) = config {
+        let worker_handle = Worker::with_config(config).spawn();
 
-    // Phase 6: Split returns just (event_input, task_handle) - no output channel needed
-    let (event_input, task_handle) = worker_handle.split();
+        // Split returns just (event_input, task_handle) - no output channel needed
+        let (event_input, task_handle) = worker_handle.split();
 
-    // Set up global dispatcher so button clicks inject events
-    let injector = EventInjector::new(event_input);
-    set_global_dispatcher(injector.clone());
+        // Set up global dispatcher so button clicks inject events
+        let injector = EventInjector::new(event_input);
+        set_global_dispatcher(injector.clone());
 
-    // If timer-driven, start JavaScript timer to fire events
-    if let Some((ref _cell_id, interval_ms)) = timer_info {
-        let timer_injector = injector.clone();
-        let timer_handle = Task::start_droppable(async move {
-            let mut tick: u64 = 0;
-            loop {
-                zoon::Timer::sleep(interval_ms as u32).await;
-                tick += 1;
-                timer_injector.fire_timer(super::super::core::TimerId::new(interval_ms.to_string()), tick);
-                zoon::println!("[DD Timer] Tick {} for {}ms timer", tick, interval_ms);
-            }
-        });
-        // Store timer handle separately to keep it alive
-        set_timer_handle(timer_handle);
-        zoon::println!("[DD Interpreter] Timer started: {}ms interval", interval_ms);
+        // TODO(interval + interval_hold tests): Timer-driven examples fail:
+        // - interval: After clear+re-run, counter="3" instead of "1". Timer ticks accumulate
+        //   during page refresh cycle. The persistent DD worker and/or this timer loop may not
+        //   be fully reset on clear_states + re-run.
+        // - interval_hold: Shows "7" instead of "1" after 1 second. Timer fires too many rapid
+        //   ticks during initialization, possibly because Timer::sleep(0) in the worker event
+        //   loop processes queued timer events before the first real interval.
+        // Debug: Check if set_timer_handle properly cancels the old timer on re-run.
+        // Check if shutdown_persistent_worker() is called before re-initialization.
+        if let Some((ref _cell_id, interval_ms)) = timer_info {
+            let timer_injector = injector.clone();
+            let timer_handle = Task::start_droppable(async move {
+                let mut tick: u64 = 0;
+                loop {
+                    zoon::Timer::sleep(u32::try_from(interval_ms).expect("[DD] timer interval too large for u32")).await;
+                    tick += 1;
+                    timer_injector.fire_timer(super::super::core::TimerId::new(interval_ms.to_string()), tick);
+                    dd_log!("[DD Timer] Tick {} for {}ms timer", tick, interval_ms);
+                }
+            });
+            // Store timer handle separately to keep it alive
+            set_timer_handle(timer_handle);
+            dd_log!("[DD Interpreter] Timer started: {}ms interval", interval_ms);
+        }
+
+        // Store task handle to keep the async worker alive
+        set_task_handle(task_handle);
+
+        dd_log!("[DD Interpreter] Worker started, dispatcher configured");
     }
 
-    // Store task handle to keep the async worker alive
-    set_task_handle(task_handle);
-
-    zoon::println!("[DD Interpreter] Worker started, dispatcher configured (Phase 6: single state authority)");
+    // Save source code and span→ID pairs for persistence across page reloads.
+    // On next load, the old AST will be re-parsed and matched against the new AST
+    // so that persistence IDs remain stable (same HOLD → same localStorage key).
+    if let Err(error) = local_storage().insert(DD_OLD_CODE_KEY, &source_code_for_storage) {
+        zoon::eprintln!("Failed to store DD source code: {error:#?}");
+    }
+    if let Err(error) = local_storage().insert(
+        DD_SPAN_IDS_KEY,
+        &new_span_id_pairs.to_json_map().unwrap(),
+    ) {
+        zoon::eprintln!("Failed to store DD Span-PersistenceId pairs: {error:#}");
+    }
 
     Some(DdResult {
         document,
-        context: DdContext::new(),
     })
 }
 
@@ -742,56 +815,6 @@ fn build_initial_cell_values(config: &DataflowConfig) -> HashMap<String, Value> 
     values
 }
 
-// Task 6.3: extract_timer_info DELETED - evaluator builds timer config directly
-// Task 6.3: extract_text_input_key_down DELETED - evaluator parses List/append bindings
-
-/// Resolve a path like ["store", "elements", "toggle_all_checkbox"] to its LinkRef ID.
-/// Traverses the runtime variables to find the LinkRef at the end of the path.
-fn resolve_path_to_link_ref(runtime: &BoonDdRuntime, path: &[String]) -> Option<String> {
-    if path.is_empty() {
-        return None;
-    }
-
-    // Helper to traverse a path from a starting value
-    fn traverse_path(start: &Value, path: &[String]) -> Option<String> {
-        let mut current = start.clone();
-        for segment in path {
-            match &current {
-                Value::Object(fields) => {
-                    current = fields.get(segment.as_str())?.clone();
-                }
-                Value::Tagged { fields, .. } => {
-                    current = fields.get(segment.as_str())?.clone();
-                }
-                _ => return None,
-            }
-        }
-        // The final value should be a LinkRef
-        if let Value::LinkRef(link_id) = current {
-            Some(link_id.to_string())
-        } else {
-            None
-        }
-    }
-
-    // First try: direct path lookup (e.g., "store" -> "elements" -> "button")
-    if let Some(start) = runtime.get_variable(&path[0]) {
-        if let Some(result) = traverse_path(start, &path[1..]) {
-            return Some(result);
-        }
-    }
-
-    None
-}
-
-// Task 6.3: extract_checkbox_toggles_from_value DELETED - evaluator provides toggle bindings directly
-// Task 6.3: extract_editing_toggles DELETED - evaluator provides editing bindings directly
-// Note: toggle-all patterns are rejected; must be expressed via pure DD list/map.
-
-// Task 6.3: extract_key_down_from_value DELETED - evaluator parses List/append bindings
-// Task 6.3: extract_button_press_link DELETED - evaluator parses List/clear bindings
-// Task 6.3: extract_timer_info_from_value DELETED - evaluator builds timer config directly
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,3 +830,4 @@ mod tests {
         assert!(result.document.is_some());
     }
 }
+

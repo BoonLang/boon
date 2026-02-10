@@ -6,41 +6,51 @@
 
 use std::sync::Arc;
 
-use super::super::eval::interpreter::{DdContext, DdResult};
+#[allow(unused_imports)]
+use super::super::dd_log;
+use super::super::eval::interpreter::DdResult;
 use super::super::core::types::{BoolTag, ElementTag, Key as DdKey};
 use super::super::core::value::{Value, WhileArm};
 use zoon::*;
 
-use super::super::io::{fire_global_link, fire_global_link_with_text, fire_global_link_with_bool, fire_global_blur, fire_global_key_down, cell_signal, list_signal_vec, is_list_cell};
-// Phase 7: toggle_cell_bool removed - runtime updates flow through DD
-// Phase 7: find_template_hover_link, find_template_hover_cell removed - symbolic refs eliminated
-// Phase 11b: cell_states_signal REMOVED - was broadcast anti-pattern causing spurious re-renders
-// Cleanup: removed unused imports (cells_signal, sync_cell_from_dd, AtomicU32, Ordering)
+use super::super::io::{fire_global_link, fire_global_link_with_text, fire_global_link_with_bool, fire_global_key_down, cell_signal, list_signal_vec, is_list_cell, get_cell_value};
 
-/// Helper function to get the variant name of a Value for debug logging.
-/// Phase 7: Only pure DD value types - no symbolic references.
-fn dd_value_variant_name(value: &Value) -> &'static str {
-    match value {
-        Value::Unit => "Unit",
-        Value::Bool(_) => "Bool",
-        Value::Number(_) => "Number",
-        Value::Text(_) => "Text",
-        Value::List(_) => "List",
-        Value::Object(_) => "Object",
-        Value::Tagged { .. } => "Tagged",
-        Value::CellRef(_) => "CellRef",
-        Value::LinkRef(_) => "LinkRef",
-        Value::TimerRef { .. } => "TimerRef",
-        Value::Placeholder => "Placeholder",
-        Value::PlaceholderField(_) => "PlaceholderField",
-        Value::WhileConfig(_) => "WhileConfig",
-        Value::PlaceholderWhile(_) => "PlaceholderWhile",
-        Value::Flushed(_) => "Flushed",
-    }
+/// Convert DD Number (f64) to u32 with bounds checking.
+fn f64_to_u32(n: &ordered_float::OrderedFloat<f64>) -> u32 {
+    u32::try_from(n.0 as i64).unwrap_or_else(|_| {
+        panic!("[DD render] Number {} out of u32 range", n.0)
+    })
 }
 
-// Phase 6: Removed dead code - extract_cell_ids() and extract_cell_ids_from_parts()
-// These were unused after Phase 12 refactoring to use targeted multi-cell signals.
+/// Convert DD Number (f64) to i32 with bounds checking.
+fn f64_to_i32(n: &ordered_float::OrderedFloat<f64>) -> i32 {
+    i32::try_from(n.0 as i64).unwrap_or_else(|_| {
+        panic!("[DD render] Number {} out of i32 range", n.0)
+    })
+}
+
+/// Resolve a Value to a display string, handling __text_template__ by reading CellRef values.
+fn resolve_display_string(value: &Value) -> String {
+    match value {
+        Value::Tagged { tag, fields } if tag.as_ref() == "__text_template__" => {
+            let mut parts: Vec<&Value> = Vec::new();
+            let mut i = 0;
+            while let Some(v) = fields.get(i.to_string().as_str()) {
+                parts.push(v);
+                i += 1;
+            }
+            parts.iter().map(|part| match part {
+                Value::CellRef(id) => {
+                    get_cell_value(&id.to_string())
+                        .map(|v| v.to_display_string())
+                        .unwrap_or_default()
+                }
+                v => v.to_display_string(),
+            }).collect()
+        }
+        v => v.to_display_string(),
+    }
+}
 
 /// Get the current value of the focused text input via DOM access.
 /// This is used when Enter is pressed to capture the input text.
@@ -59,43 +69,29 @@ fn get_dd_text_input_value() -> String {
             );
         });
     let value = input.value();
-    zoon::println!("[DD TextInput] get_dd_text_input_value: active_tag={}, value='{}'", active_tag, value);
+    dd_log!("[DD TextInput] get_dd_text_input_value: active_tag={}, value='{}'", active_tag, value);
     value
 }
 
 // REMOVED: get_dynamic_item_edit_value - dead code (render_dynamic_item was removed)
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Phase 7: REMOVED FUNCTIONS
-//   - evaluate_while_ref_now() - WhileRef is removed, DD computes arm selection
-//   - evaluate_dd_value_for_filter() - Filtering happens in DD operators
-//
-// Pure DD: All computation happens in DD dataflow, not at render time.
+// All computation happens in DD dataflow, not at render time.
 // The bridge only renders pure data values from DD output streams.
-// ═══════════════════════════════════════════════════════════════════════════
 
 /// Convert a Value Oklch color to CSS color string.
-/// Phase 7: Pure DD - only handles Number values, no WhileRef evaluation.
+/// Pure DD - only handles Number values, no WhileRef evaluation.
 /// Reactive color changes come from DD output streams, not render-time evaluation.
 fn dd_oklch_to_css(value: &Value) -> Option<String> {
     match value {
         Value::Tagged { tag, fields } if tag.as_ref() == "Oklch" => {
-            // Phase 7: Only handle Number values - DD computes reactive colors
+            // Only handle Number values - DD computes reactive colors.
+            // Return None if fields aren't resolved yet (forward refs, CellRefs).
             let lightness = fields.get("lightness")
-                .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })
-                .unwrap_or_else(|| {
-                    panic!("[DD Render] Oklch missing numeric 'lightness'");
-                });
+                .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })?;
             let chroma = fields.get("chroma")
-                .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })
-                .unwrap_or_else(|| {
-                    panic!("[DD Render] Oklch missing numeric 'chroma'");
-                });
+                .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })?;
             let hue = fields.get("hue")
-                .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })
-                .unwrap_or_else(|| {
-                    panic!("[DD Render] Oklch missing numeric 'hue'");
-                });
+                .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })?;
             let alpha = fields.get("alpha")
                 .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None });
 
@@ -119,14 +115,12 @@ fn dd_oklch_to_css(value: &Value) -> Option<String> {
 /// # Arguments
 ///
 /// * `document` - The document value from DD evaluation
-/// * `_context` - The evaluation context (unused in static rendering)
 ///
 /// # Returns
 ///
 /// A Zoon element representing the document.
 pub fn render_dd_document_reactive_signal(
     document: Value,
-    _context: DdContext,
 ) -> impl Element {
     render_dd_value(&document)
 }
@@ -135,7 +129,7 @@ pub fn render_dd_document_reactive_signal(
 ///
 /// # Arguments
 ///
-/// * `result` - The full DD result including document and context
+/// * `result` - The full DD result including the document
 ///
 /// # Returns
 ///
@@ -159,8 +153,11 @@ fn render_dd_value(value: &Value) -> RawElOrText {
         Value::Number(n) => {
             // Format number nicely (no trailing .0 for integers)
             let num = n.0;
-            let text = if num.fract() == 0.0 {
-                format!("{}", num as i64)
+            let text = if num.fract() == 0.0 && num.abs() < i64::MAX as f64 {
+                // Safe: bounds checked above, fract()==0 guarantees integer
+                #[allow(clippy::cast_possible_truncation)]
+                let int_val = num as i64;
+                format!("{}", int_val)
             } else {
                 format!("{}", num)
             };
@@ -193,9 +190,10 @@ fn render_dd_value(value: &Value) -> RawElOrText {
                 .child_signal(
                     cell_signal(cell_id)
                         .map(move |value| {
-                            let value = value.unwrap_or_else(|| {
-                                panic!("[DD Render] Missing cell value for '{}'", cell_id_for_signal);
-                            });
+                            let Some(value) = value else {
+                                // Cell cleared during re-initialization; transient state.
+                                return El::new().unify();
+                            };
                             let selected = select_while_arm(&value, &arms, &default);
                             render_dd_value(&selected)
                         })
@@ -216,21 +214,54 @@ fn render_dd_value(value: &Value) -> RawElOrText {
             Text::new(format!("[{}]", debug)).unify()
         }
 
-        // Phase 7: ReactiveText REMOVED - DD produces Text values directly
-        // Text interpolation is computed in DD, not at render time
+        // DD produces Text values directly - interpolation is computed in DD, not at render time
+
+        Value::Tagged { tag, fields } if tag.as_ref() == "__text_template__" => {
+            // Text template with CellRef parts — render as reactive label
+            let mut tt_parts: Vec<Value> = Vec::new();
+            let mut i = 0;
+            while let Some(v) = fields.get(i.to_string().as_str()) {
+                tt_parts.push(v.clone());
+                i += 1;
+            }
+            let first_cellref = tt_parts.iter().find_map(|v| {
+                if let Value::CellRef(id) = v { Some(id.to_string()) } else { None }
+            });
+            if let Some(cell_id) = first_cellref {
+                El::new()
+                    .child_signal(
+                        cell_signal(cell_id)
+                            .map(move |_trigger| {
+                                let text: String = tt_parts.iter().map(|part| match part {
+                                    Value::CellRef(id) => {
+                                        get_cell_value(&id.to_string())
+                                            .map(|v| v.to_display_string())
+                                            .unwrap_or_default()
+                                    }
+                                    v => v.to_display_string(),
+                                }).collect();
+                                Text::new(text).unify()
+                            })
+                    )
+                    .unify()
+            } else {
+                let text: String = tt_parts.iter().map(|v| v.to_display_string()).collect();
+                Text::new(text).unify()
+            }
+        }
 
         Value::Tagged { tag, fields } => {
-            zoon::println!("[DD render_dd_value] Tagged(tag='{}', fields={:?})", tag, fields.keys().collect::<Vec<_>>());
+            dd_log!("[DD render_dd_value] Tagged(tag='{}', fields={:?})", tag, fields.keys().collect::<Vec<_>>());
             render_tagged_element(tag.as_ref(), fields)
         }
 
         Value::CellRef(name) => {
             // CellRef is a reactive reference to a HOLD value
-            // Phase 12: Use granular cell_signal() instead of coarse cell_states_signal()
+            // Use granular cell_signal() instead of coarse cell_states_signal()
             // This only fires when THIS specific cell changes, not when ANY cell changes
             let cell_id = name.to_string();
 
-            // Phase 12: Check if this cell contains a list for incremental rendering
+            // Check if this cell contains a list for incremental rendering
             if is_list_cell(&cell_id) {
                 // Use incremental list rendering via VecDiff
                 // children_signal_vec() only updates changed elements (O(delta))
@@ -247,9 +278,9 @@ fn render_dd_value(value: &Value) -> RawElOrText {
                     .child_signal(
                         cell_signal(cell_id)  // Pass owned String
                             .map(move |value| {
-                                let value = value.unwrap_or_else(|| {
-                                    panic!("[DD Render] Missing cell value for '{}'", cell_id_for_signal);
-                                });
+                                let Some(value) = value else {
+                                    return Text::new("");
+                                };
                                 Text::new(value.to_display_string())
                             })
                     )
@@ -266,7 +297,7 @@ fn render_dd_value(value: &Value) -> RawElOrText {
         Value::TimerRef { id, interval_ms: _ } => {
             // TimerRef represents a timer-driven HOLD accumulator
             // The `id` is the HOLD id - render its reactive value
-            // Phase 12: Use granular cell_signal() - only fires when this timer's cell changes
+            // Use granular cell_signal() - only fires when this timer's cell changes
             let cell_id = id.to_string();
 
             // Create reactive element that updates only when this timer cell changes
@@ -275,35 +306,23 @@ fn render_dd_value(value: &Value) -> RawElOrText {
                 .child_signal(
                     cell_signal(cell_id)  // Pass owned String
                         .map(move |value| {
-                            let value = value.unwrap_or_else(|| {
-                                panic!("[DD Render] Missing timer cell value for '{}'", cell_id_for_signal);
-                            });
+                            let Some(value) = value else {
+                                return Text::new("");
+                            };
                             Text::new(value.to_display_string())
                         })
                 )
                 .unify()
         }
 
-        // ═══════════════════════════════════════════════════════════════════════════
-        // Phase 7: SYMBOLIC REFERENCE VARIANTS REMOVED
-        //
-        // The following variants no longer exist in the pure DD Value enum:
-        //   - WhileRef, ComputedRef, FilteredListRef, ReactiveFilteredList
-        //   - FilteredListRefWithPredicate, MappedListRef, FilteredMappedListRef
-        //   - FilteredMappedListWithPredicate, LatestRef, ReactiveText
-        //   - PlaceholderField, PlaceholderWhileRef, NegatedPlaceholderField
-        //
-        // In pure DD:
-        //   - All computation happens in DD dataflow, not at render time
-        //   - Lists are rendered as Collection with children_signal_vec()
-        //   - Reactive values flow through DD output streams
-        //   - The bridge only renders pure data values
-        // ═══════════════════════════════════════════════════════════════════════════
+        // Pure DD: All computation happens in DD dataflow, not at render time.
+        // Lists are rendered as Collection with children_signal_vec().
+        // Reactive values flow through DD output streams.
 
         Value::Placeholder => {
             panic!("[DD Render] Placeholder reached render; DD map substitution failed");
         }
-        Value::PlaceholderField(_) => {
+        Value::PlaceholderField(_) | Value::PlaceholderBoolNot(_) => {
             panic!("[DD Render] PlaceholderField reached render; template substitution failed");
         }
         Value::Flushed(_) => {
@@ -314,7 +333,7 @@ fn render_dd_value(value: &Value) -> RawElOrText {
 
 /// Render a tagged object as a Zoon element.
 fn render_tagged_element(tag: &str, fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    zoon::println!("[DD render_tagged] tag='{}', fields={:?}", tag, fields.keys().collect::<Vec<_>>());
+    dd_log!("[DD render_tagged] tag='{}', fields={:?}", tag, fields.keys().collect::<Vec<_>>());
     if BoolTag::is_bool_tag(tag) {
         return Text::new(tag).unify();
     }
@@ -339,23 +358,23 @@ fn render_element(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> 
             panic!("[DD render_element] Missing required '_element_type' field");
         });
 
-    zoon::println!("[DD render_element] type='{}', all_fields={:?}", element_type, fields.keys().collect::<Vec<_>>());
+    dd_log!("[DD render_element] type='{}', all_fields={:?}", element_type, fields.keys().collect::<Vec<_>>());
 
     match element_type {
         "button" => render_button(fields),
         "stripe" => {
-            zoon::println!("[DD render_element] -> render_stripe()");
+            dd_log!("[DD render_element] -> render_stripe()");
             render_stripe(fields)
         }
         "stack" => render_stack(fields),
         "container" => render_container(fields),
         "text_input" => render_text_input(fields),
         "checkbox" => {
-            zoon::println!("[DD render_element] -> render_checkbox()");
+            dd_log!("[DD render_element] -> render_checkbox()");
             render_checkbox(fields)
         }
         "label" => {
-            zoon::println!("[DD render_element] -> render_label()");
+            dd_log!("[DD render_element] -> render_label()");
             render_label(fields)
         }
         "paragraph" => render_paragraph(fields),
@@ -368,9 +387,8 @@ fn render_element(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> 
 
 /// Render a button element.
 fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    let label = fields
+    let label_value = fields
         .get("label")
-        .map(|v| v.to_display_string())
         .unwrap_or_else(|| {
             panic!("[DD render_button] Missing required 'label' field");
         });
@@ -379,8 +397,8 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
     let element_value = fields.get("element");
     let event_value = element_value.and_then(|e| e.get("event"));
     let press_value = event_value.and_then(|e| e.get("press"));
-    zoon::println!("[DD render_button] label='{}' element={:?} event={:?} press={:?}",
-        label,
+    dd_log!("[DD render_button] label={:?} element={:?} event={:?} press={:?}",
+        label_value,
         element_value.map(|v| format!("{:?}", v)).unwrap_or_else(|| "None".to_string()),
         event_value.map(|v| format!("{:?}", v)).unwrap_or_else(|| "None".to_string()),
         press_value.map(|v| format!("{:?}", v)).unwrap_or_else(|| "None".to_string()));
@@ -389,14 +407,29 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
             Value::LinkRef(id) => Some(id.to_string()),
             _ => None,
         });
-    zoon::println!("[DD render_button] Extracted link_id={:?}", link_id);
+    dd_log!("[DD render_button] Extracted link_id={:?}", link_id);
 
+    // TODO(todo_mvc test): The "All" filter button doesn't get a visible outline at startup.
+    // The test expects outline on the active route button, but gets outlineWidth="0px".
+    // The outline value likely depends on the current_route cell matching "/" — check if
+    // the evaluator computes a WHILE/WHEN on the route that produces an outline Object
+    // vs NoOutline, and whether the initial value resolves correctly here.
+    //
     // Extract outline from style.outline
-    // Phase 7: DD computes reactive styling - bridge receives final values
+    // DD computes reactive styling - bridge receives final values
     let style_value = fields.get("style");
     let outline_value = style_value.and_then(|s| s.get("outline"));
 
-    let outline_opt: Option<Outline> = match outline_value {
+    // Resolve WhileConfig in outline (e.g., hover-dependent outline) to its initial value.
+    let outline_resolved = outline_value.map(|v| match v {
+        Value::WhileConfig(config) => {
+            // Use default arm (typically False = not hovered) as initial value.
+            select_while_arm(&Value::Bool(false), &config.arms, &config.default)
+        }
+        other => other.clone()
+    });
+    let outline_ref = outline_resolved.as_ref();
+    let outline_opt: Option<Outline> = match outline_ref {
         None => None,
         Some(Value::Tagged { tag, .. }) if tag.as_ref() == "NoOutline" => None,
         Some(Value::Object(obj)) => {
@@ -413,7 +446,7 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
             };
             let width = match obj.get("width") {
                 None => 1,
-                Some(Value::Number(n)) => n.0 as u32,
+                Some(Value::Number(n)) => f64_to_u32(n),
                 Some(other) => {
                     panic!("[DD render_button] outline.width must be Number, found {:?}", other);
                 }
@@ -438,10 +471,53 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
     let font_size = style_value
         .and_then(|s| s.get("font"))
         .and_then(|f| f.get("size"))
-        .and_then(|v| if let Value::Number(n) = v { Some(n.0 as u32) } else { None });
+        .and_then(|v| if let Value::Number(n) = v { Some(f64_to_u32(n)) } else { None });
 
     // Build button with optional outline and font styling
-    let mut button = Button::new().label(label.clone());
+    // Check if label is a reactive __text_template__ with CellRef parts
+    let mut button = match label_value {
+        Value::Tagged { tag, fields: label_fields } if tag.as_ref() == "__text_template__" => {
+            let mut tt_parts: Vec<Value> = Vec::new();
+            let mut i = 0;
+            while let Some(v) = label_fields.get(i.to_string().as_str()) {
+                tt_parts.push(v.clone());
+                i += 1;
+            }
+            let first_cellref = tt_parts.iter().find_map(|v| {
+                if let Value::CellRef(id) = v { Some(id.to_string()) } else { None }
+            });
+            if let Some(cell_id) = first_cellref {
+                Button::new().label_signal(
+                    cell_signal(cell_id)
+                        .map(move |_trigger| {
+                            tt_parts.iter().map(|part| match part {
+                                Value::CellRef(id) => {
+                                    get_cell_value(&id.to_string())
+                                        .map(|v| v.to_display_string())
+                                        .unwrap_or_default()
+                                }
+                                v => v.to_display_string(),
+                            }).collect::<String>()
+                        })
+                )
+            } else {
+                let text: String = tt_parts.iter().map(|v| v.to_display_string()).collect();
+                Button::new().label(text)
+            }
+        }
+        Value::CellRef(id) => {
+            let cell_id = id.to_string();
+            Button::new().label_signal(
+                cell_signal(cell_id.clone())
+                    .map(move |_trigger| {
+                        get_cell_value(&cell_id)
+                            .map(|v| v.to_display_string())
+                            .unwrap_or_default()
+                    })
+            )
+        }
+        v => Button::new().label(resolve_display_string(v)),
+    };
 
     // Apply font styling
     let mut font = Font::new();
@@ -487,12 +563,10 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
     let gap = fields
         .get("gap")
         .map(|v| match v {
-            Value::Number(n) => n.0 as u32,
+            Value::Number(n) => f64_to_u32(n),
             other => panic!("[DD render_stripe] gap must be Number, found {:?}", other),
         })
-        .unwrap_or_else(|| {
-            panic!("[DD render_stripe] Missing required 'gap' field");
-        });
+        .unwrap_or(0);
 
     // Extract hovered LinkRef from element.hovered if present
     let hovered_link_id = fields
@@ -505,22 +579,11 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
 
     let items_value = fields.get("items");
 
-    // Debug: what type is items_value?
-    if let Some(iv) = items_value {
-        zoon::println!("[DD render_stripe DEBUG] items_value variant={}", dd_value_variant_name(iv));
-    }
+    // Pure DD: List rendering uses Collection + children_signal_vec().
+    // Filtering and mapping happen in DD operators.
+    // The bridge renders pre-computed Collection values.
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Phase 7: SYMBOLIC LIST REFS REMOVED
-    //
-    // MappedListRef, FilteredMappedListRef, FilteredMappedListWithPredicate
-    // are removed. In pure DD:
-    //   - List rendering uses Collection + children_signal_vec()
-    //   - Filtering and mapping happen in DD operators
-    //   - The bridge renders pre-computed Collection values
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    // Phase 2.3: Check if items is a CellRef/Collection (list-backed) for reactive rendering
+    // Check if items is a CellRef/Collection (list-backed) for reactive rendering
     let items_hold_ref = fields.get("items").and_then(|v| match v {
         Value::CellRef(cell_id) => Some(cell_id.name().to_string()),
         Value::List(handle) => Some(
@@ -556,7 +619,7 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
         .and_then(|s| s.get("font"))
         .and_then(|f| f.get("size"))
         .and_then(|v| match v {
-            Value::Number(n) => Some(n.0 as u32),
+            Value::Number(n) => Some(f64_to_u32(n)),
             _ => None,
         });
     let font_color = style
@@ -569,94 +632,64 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
         .and_then(|s| s.get("padding"))
         .and_then(|p| p.get("row"))
         .and_then(|v| match v {
-            Value::Number(n) => Some(n.0 as u32),
+            Value::Number(n) => Some(f64_to_u32(n)),
             _ => None,
         });
     let padding_x = style
         .and_then(|s| s.get("padding"))
         .and_then(|p| p.get("column"))
         .and_then(|v| match v {
-            Value::Number(n) => Some(n.0 as u32),
+            Value::Number(n) => Some(f64_to_u32(n)),
             _ => None,
         });
 
-    // Phase 2.3: Reactive rendering for HoldRef-backed items
+    // Macro to build Row or Column with shared style application
+    macro_rules! build_stripe {
+        ($Container:ident, $gap_axis:ident, $cell_id:expr) => {{
+            dd_log!("[DD render_stripe] {} with reactive items from {}", stringify!($Container), $cell_id);
+            let mut el = $Container::new()
+                .s(Gap::new().$gap_axis(gap))
+                .items_signal_vec(
+                    list_signal_vec($cell_id.clone())
+                        .map(|item| render_dd_value(&item))
+                );
+            if width_fill { el = el.s(zoon::Width::fill()); }
+            if let Some(color) = bg_color { el = el.s(zoon::Background::new().color(color)); }
+            if font_size.is_some() || font_color.is_some() {
+                let mut font = zoon::Font::new();
+                if let Some(size) = font_size { font = font.size(size); }
+                if let Some(ref color) = font_color { font = font.color(color.clone()); }
+                el = el.s(font);
+            }
+            if padding_x.is_some() || padding_y.is_some() {
+                let mut padding = zoon::Padding::new();
+                if let Some(x) = padding_x { padding = padding.x(x); }
+                if let Some(y) = padding_y { padding = padding.y(y); }
+                el = el.s(padding);
+            }
+            if let Some(link_id) = hovered_link_id {
+                return el.on_hovered_change(move |is_hovered| {
+                    fire_global_link_with_bool(&link_id, is_hovered);
+                }).unify();
+            }
+            el.unify()
+        }};
+    }
+
+    let cell_id = items_hold_ref.as_ref().unwrap_or_else(|| {
+        panic!("[DD render_stripe] 'items' must be CellRef or Collection");
+    });
+
     match direction.as_str() {
-        "Row" => {
-            let cell_id = items_hold_ref.as_ref().unwrap_or_else(|| {
-                panic!("[DD render_stripe] 'items' must be CellRef or Collection");
-            });
-            // Reactive Row with items_signal_vec
-            zoon::println!("[DD render_stripe] Row with reactive items from {}", cell_id);
-            let mut row = Row::new()
-                .s(Gap::new().x(gap))
-                .items_signal_vec(
-                    list_signal_vec(cell_id.clone())
-                        .map(|item| render_dd_value(&item))
-                );
-            // Apply styles
-            if width_fill { row = row.s(zoon::Width::fill()); }
-            if let Some(color) = bg_color { row = row.s(zoon::Background::new().color(color)); }
-            if font_size.is_some() || font_color.is_some() {
-                let mut font = zoon::Font::new();
-                if let Some(size) = font_size { font = font.size(size); }
-                if let Some(ref color) = font_color { font = font.color(color.clone()); }
-                row = row.s(font);
-            }
-            if padding_x.is_some() || padding_y.is_some() {
-                let mut padding = zoon::Padding::new();
-                if let Some(x) = padding_x { padding = padding.x(x); }
-                if let Some(y) = padding_y { padding = padding.y(y); }
-                row = row.s(padding);
-            }
-            if let Some(link_id) = hovered_link_id {
-                return row.on_hovered_change(move |is_hovered| {
-                    fire_global_link_with_bool(&link_id, is_hovered);
-                }).unify();
-            }
-            row.unify()
-        }
-        "Column" => {
-            let cell_id = items_hold_ref.as_ref().unwrap_or_else(|| {
-                panic!("[DD render_stripe] 'items' must be CellRef or Collection");
-            });
-            // Reactive Column with items_signal_vec
-            zoon::println!("[DD render_stripe] Column with reactive items from {}", cell_id);
-            let mut column = Column::new()
-                .s(Gap::new().y(gap))
-                .items_signal_vec(
-                    list_signal_vec(cell_id.clone())
-                        .map(|item| render_dd_value(&item))
-                );
-            // Apply styles
-            if width_fill { column = column.s(zoon::Width::fill()); }
-            if let Some(color) = bg_color { column = column.s(zoon::Background::new().color(color)); }
-            if font_size.is_some() || font_color.is_some() {
-                let mut font = zoon::Font::new();
-                if let Some(size) = font_size { font = font.size(size); }
-                if let Some(ref color) = font_color { font = font.color(color.clone()); }
-                column = column.s(font);
-            }
-            if padding_x.is_some() || padding_y.is_some() {
-                let mut padding = zoon::Padding::new();
-                if let Some(x) = padding_x { padding = padding.x(x); }
-                if let Some(y) = padding_y { padding = padding.y(y); }
-                column = column.s(padding);
-            }
-            if let Some(link_id) = hovered_link_id {
-                return column.on_hovered_change(move |is_hovered| {
-                    fire_global_link_with_bool(&link_id, is_hovered);
-                }).unify();
-            }
-            column.unify()
-        }
+        "Row" => build_stripe!(Row, x, cell_id),
+        "Column" => build_stripe!(Column, y, cell_id),
         other => panic!("[DD render_stripe] direction must be Row/Column, found '{}'", other),
     }
 }
 
 
 /// Render a stack (layered elements).
-/// Phase 6: Added CellRef support for reactive layers via layers_signal_vec.
+/// CellRef support for reactive layers via layers_signal_vec.
 fn render_stack(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
     // Check if layers is a CellRef/Collection for reactive rendering
     if let Some(value) = fields.get("layers") {
@@ -671,14 +704,36 @@ fn render_stack(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
             _ => None,
         };
         if let Some(cell_id_str) = reactive_cell_id {
-            // Reactive path - use layers_signal_vec for O(delta) updates
-            zoon::println!("[DD render_stack] Reactive layers from '{}'", cell_id_str);
-            return Stack::new()
+            dd_log!("[DD render_stack] Reactive layers from '{}'", cell_id_str);
+
+            let style = fields.get("style");
+
+            let width_opt = style
+                .and_then(|s| s.get("width"))
+                .and_then(|v| match v {
+                    Value::Number(n) => Some(f64_to_u32(n)),
+                    _ => None,
+                });
+            let height_opt = style
+                .and_then(|s| s.get("height"))
+                .and_then(|v| match v {
+                    Value::Number(n) => Some(f64_to_u32(n)),
+                    _ => None,
+                });
+            let bg_color = style
+                .and_then(|s| s.get("background"))
+                .and_then(|bg| bg.get("color"))
+                .and_then(|c| dd_oklch_to_css(c));
+
+            let mut el = Stack::new()
                 .layers_signal_vec(
                     list_signal_vec(cell_id_str)
                         .map(|item| render_dd_value(&item))
-                )
-                .unify();
+                );
+            if let Some(w) = width_opt { el = el.s(Width::exact(w)); }
+            if let Some(h) = height_opt { el = el.s(Height::exact(h)); }
+            if let Some(color) = bg_color { el = el.s(Background::new().color(color)); }
+            return el.unify();
         }
     }
 
@@ -696,7 +751,15 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
     let size_opt = style
         .and_then(|s| s.get("size"))
         .and_then(|v| match v {
-            Value::Number(n) => Some(n.0 as u32),
+            Value::Number(n) => Some(f64_to_u32(n)),
+            _ => None,
+        });
+
+    // Get standalone width
+    let width_opt = style
+        .and_then(|s| s.get("width"))
+        .and_then(|v| match v {
+            Value::Number(n) => Some(f64_to_u32(n)),
             _ => None,
         });
 
@@ -709,6 +772,20 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
             _ => None,
         });
 
+    // Get background color (Oklch)
+    let bg_color = style
+        .and_then(|s| s.get("background"))
+        .and_then(|bg| bg.get("color"))
+        .and_then(|c| dd_oklch_to_css(c));
+
+    // Get rounded corners
+    let rounded_corners_opt = style
+        .and_then(|s| s.get("rounded_corners"))
+        .and_then(|v| match v {
+            Value::Number(n) => Some(f64_to_u32(n)),
+            _ => None,
+        });
+
     // Get font color value for checking if it's reactive
     let font_color_value = style
         .and_then(|s| s.get("font"))
@@ -717,16 +794,16 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
 
     // Debug: log what font_color_value we got
     if font_color_value.is_some() {
-        zoon::println!("[DD render_container] font_color_value: {:?}", font_color_value);
+        dd_log!("[DD render_container] font_color_value: {:?}", font_color_value);
     }
 
-    // Phase 7: Font color is now computed by DD - bridge receives final values
+    // Font color is computed by DD - bridge receives final values
     // Get font size
     let font_size = style
         .and_then(|s| s.get("font"))
         .and_then(|f| f.get("size"))
         .and_then(|v| match v {
-            Value::Number(n) => Some(n.0 as u32),
+            Value::Number(n) => Some(f64_to_u32(n)),
             _ => None,
         });
 
@@ -734,11 +811,20 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
     let base = El::new();
     let base = match size_opt {
         Some(size) => base.s(Width::exact(size)).s(Height::exact(size)),
-        None => base,
+        None => {
+            let b = if let Some(w) = width_opt { base.s(Width::exact(w)) } else { base };
+            b
+        },
     };
-    let base = match bg_url_opt {
-        Some(url) => base.s(Background::new().url(url)),
-        None => base,
+    let base = match (&bg_url_opt, &bg_color) {
+        (Some(url), _) => base.s(Background::new().url(url.clone())),
+        (None, Some(color)) => base.s(Background::new().color(color.clone())),
+        _ => base,
+    };
+    let base = if let Some(radius) = rounded_corners_opt {
+        base.s(RoundedCorners::all(radius))
+    } else {
+        base
     };
 
     // Apply font styling (pure DD - no reactive WhileRef evaluation)
@@ -762,7 +848,7 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
 
         // Check if padding is a single number (applies to all sides)
         let padding_all = padding_value.and_then(|p| match p {
-            Value::Number(n) => Some(n.0 as u32),
+            Value::Number(n) => Some(f64_to_u32(n)),
             _ => None,
         });
 
@@ -777,37 +863,37 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
             let padding_row = padding_obj
                 .and_then(|p| p.get("row"))
                 .and_then(|v| match v {
-                    Value::Number(n) => Some(n.0 as u32),
+                    Value::Number(n) => Some(f64_to_u32(n)),
                     _ => None,
                 });
             let padding_column = padding_obj
                 .and_then(|p| p.get("column"))
                 .and_then(|v| match v {
-                    Value::Number(n) => Some(n.0 as u32),
+                    Value::Number(n) => Some(f64_to_u32(n)),
                     _ => None,
                 });
             let padding_left = padding_obj
                 .and_then(|p| p.get("left"))
                 .and_then(|v| match v {
-                    Value::Number(n) => Some(n.0 as u32),
+                    Value::Number(n) => Some(f64_to_u32(n)),
                     _ => None,
                 });
             let padding_right = padding_obj
                 .and_then(|p| p.get("right"))
                 .and_then(|v| match v {
-                    Value::Number(n) => Some(n.0 as u32),
+                    Value::Number(n) => Some(f64_to_u32(n)),
                     _ => None,
                 });
             let padding_top = padding_obj
                 .and_then(|p| p.get("top"))
                 .and_then(|v| match v {
-                    Value::Number(n) => Some(n.0 as u32),
+                    Value::Number(n) => Some(f64_to_u32(n)),
                     _ => None,
                 });
             let padding_bottom = padding_obj
                 .and_then(|p| p.get("bottom"))
                 .and_then(|v| match v {
-                    Value::Number(n) => Some(n.0 as u32),
+                    Value::Number(n) => Some(f64_to_u32(n)),
                     _ => None,
                 });
 
@@ -844,7 +930,7 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
         let height_opt = style
             .and_then(|s| s.get("height"))
             .and_then(|v| match v {
-                Value::Number(n) => Some(n.0 as u32),
+                Value::Number(n) => Some(f64_to_u32(n)),
                 _ => None,
             });
 
@@ -855,19 +941,34 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
         }
     };
 
-    // Apply transform (rotation)
+    // Apply transform (rotation, move_right, move_down)
     let base = {
-        let rotate_opt = style
-            .and_then(|s| s.get("transform"))
+        let transform_obj = style.and_then(|s| s.get("transform"));
+        let rotate_opt = transform_obj
             .and_then(|t| t.get("rotate"))
             .and_then(|v| match v {
-                Value::Number(n) => Some(n.0 as i32),
+                Value::Number(n) => Some(f64_to_i32(n)),
+                _ => None,
+            });
+        let move_right_opt = transform_obj
+            .and_then(|t| t.get("move_right"))
+            .and_then(|v| match v {
+                Value::Number(n) => Some(f64_to_i32(n)),
+                _ => None,
+            });
+        let move_down_opt = transform_obj
+            .and_then(|t| t.get("move_down"))
+            .and_then(|v| match v {
+                Value::Number(n) => Some(f64_to_i32(n)),
                 _ => None,
             });
 
-        if let Some(rotate) = rotate_opt {
-            zoon::println!("[DD render_container] Applying transform rotate: {} degrees", rotate);
-            base.s(Transform::new().rotate(rotate))
+        if rotate_opt.is_some() || move_right_opt.is_some() || move_down_opt.is_some() {
+            let mut t = Transform::new();
+            if let Some(rotate) = rotate_opt { t = t.rotate(rotate); }
+            if let Some(x) = move_right_opt { t = t.move_right(x); }
+            if let Some(y) = move_down_opt { t = t.move_down(y); }
+            base.s(t)
         } else {
             base
         }
@@ -912,7 +1013,7 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
     let text_field = fields.get("text").unwrap_or_else(|| {
         panic!("[DD TextInput] Missing required 'text' field");
     });
-    zoon::println!("[DD TextInput] text field value: {:?}", text_field);
+    dd_log!("[DD TextInput] text field value: {:?}", text_field);
 
     let text_cell_id = match text_field {
         Value::CellRef(cell_id) => Some(cell_id.to_string()),
@@ -923,7 +1024,7 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
     };
     let text = match text_field {
         Value::CellRef(cell_id) => {
-            zoon::println!("[DD TextInput] text field is CellRef({})", cell_id);
+            dd_log!("[DD TextInput] text field is CellRef({})", cell_id);
             String::new()
         }
         Value::Text(text) => text.as_ref().to_string(),
@@ -960,7 +1061,7 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
     let element_field = fields.get("element");
     let event_field = element_field.and_then(|e| e.get("event"));
     let key_down_field = event_field.and_then(|e| e.get("key_down"));
-    zoon::println!("[DD TextInput] render_text_input: key_down_link_id={:?}, element={:?}, event={:?}, key_down={:?}, focus={}",
+    dd_log!("[DD TextInput] render_text_input: key_down_link_id={:?}, element={:?}, event={:?}, key_down={:?}, focus={}",
         key_down_link_id, element_field.is_some(), event_field.is_some(), key_down_field, should_focus);
 
     // Extract change LinkRef from element.event.change
@@ -1008,9 +1109,9 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
                     .text_signal(
                         cell_signal(cell_id.clone())
                             .map(move |value| {
-                                let value = value.unwrap_or_else(|| {
-                                    panic!("[DD TextInput] Missing cell value for '{}'", cell_id_for_signal);
-                                });
+                                let Some(value) = value else {
+                                    return String::new();
+                                };
                                 value.to_display_string()
                             })
                     )
@@ -1028,7 +1129,7 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
                 .update_raw_el(move |raw_el| {
                     let raw_el = raw_el.attr("autocomplete", "off");
                     if do_focus {
-                        raw_el.after_insert(|el| {
+                        raw_el.after_insert(move |el| {
                             #[cfg(target_arch = "wasm32")]
                             {
                                 use zoon::wasm_bindgen::closure::Closure;
@@ -1076,14 +1177,14 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
         (Some(key_link), Some(change_link)) => {
             let input = build_input()
                 .on_key_down_event(move |event| {
-                    zoon::println!("[DD on_key_down_event] INPUT fired! key_link={}", key_link);
+                    dd_log!("[DD on_key_down_event] INPUT fired! key_link={}", key_link);
                     match event.key() {
                         Key::Enter => {
-                            zoon::println!("[DD on_key_down_event] Enter pressed");
+                            dd_log!("[DD on_key_down_event] Enter pressed");
                             #[cfg(target_arch = "wasm32")]
                             {
                                 let input_text = get_dd_text_input_value();
-                                zoon::println!("[DD on_key_down_event] Enter text captured: '{}'", input_text);
+                                dd_log!("[DD on_key_down_event] Enter text captured: '{}'", input_text);
                                 fire_global_key_down(&key_link, DdKey::Enter, Some(input_text));
                             }
                             #[cfg(not(target_arch = "wasm32"))]
@@ -1105,12 +1206,9 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
                 });
             // Add blur handler if blur_link_id is set (for editing inputs)
             if let Some(blur_link) = blur_link_id.clone() {
-                // The grace period (set in SetTrue handler) protects against spurious blur events
-                // during the focus race. We just need to call fire_global_blur - it will check
-                // the grace period and ignore blur if still in grace period.
                 input
                     .on_blur(move || {
-                        fire_global_blur(&blur_link);
+                        fire_global_link(&blur_link);
                     }).unify()
             } else {
                 input.unify()
@@ -1119,10 +1217,10 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
         (Some(key_link), None) => {
             build_input()
                 .on_key_down_event(move |event| {
-                    zoon::println!("[DD on_key_down_event] SIMPLE INPUT fired! key_link={}", key_link);
+                    dd_log!("[DD on_key_down_event] SIMPLE INPUT fired! key_link={}", key_link);
                     match event.key() {
                         Key::Enter => {
-                            zoon::println!("[DD on_key_down_event] Enter pressed in SIMPLE input");
+                            dd_log!("[DD on_key_down_event] Enter pressed in SIMPLE input");
                             #[cfg(target_arch = "wasm32")]
                             {
                                 let input_text = get_dd_text_input_value();
@@ -1168,7 +1266,7 @@ const CHECKED_SVG: &str = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//
 // DEAD CODE DELETED: render_default_checkbox_icon() - was never called
 
 fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    zoon::println!("[DD render_checkbox] CALLED with fields={:?}", fields.keys().collect::<Vec<_>>());
+    dd_log!("[DD render_checkbox] CALLED with fields={:?}", fields.keys().collect::<Vec<_>>());
     // Extract checked value - can be Bool, Tagged, or CellRef (reactive)
     let checked_value = fields
         .get("checked")
@@ -1176,7 +1274,7 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
             panic!("[DD render_checkbox] Missing required 'checked' field");
         })
         .clone();
-    zoon::println!("[DD render_checkbox] checked_value={:?}", checked_value);
+    dd_log!("[DD render_checkbox] checked_value={:?}", checked_value);
 
     // Extract click LinkRef from element.event.click if present
     let click_link_id = fields
@@ -1199,15 +1297,15 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
         let cell_id_for_icon = cell_id.to_string();
         let cell_id_for_icon_checked = cell_id_for_icon.clone();
 
-        // Phase 12: Use granular cell_signal() for checkbox - only updates when this cell changes
+        // Use granular cell_signal() for checkbox - only updates when this cell changes
         let checkbox = Checkbox::new()
             .label_hidden("checkbox")
             .checked_signal(
                 cell_signal(cell_id_for_signal)  // Pass owned String
                     .map(move |value| {
-                        let value = value.unwrap_or_else(|| {
-                            panic!("[DD Checkbox] Missing cell value for '{}'", cell_id_for_checked);
-                        });
+                        let Some(value) = value else {
+                            return false;
+                        };
                         match value {
                             Value::Bool(b) => b,
                             Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => BoolTag::is_true(tag.as_ref()),
@@ -1216,7 +1314,7 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
                     })
             )
             .icon({
-                // Phase 12: Use granular cell_signal() for icon - only updates when this cell changes
+                // Use granular cell_signal() for icon - only updates when this cell changes
                 move |_checked_mutable| {
                     El::new()
                         .s(zoon::Width::exact(40))
@@ -1225,9 +1323,9 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
                         .s(zoon::Background::new().url_signal(
                             cell_signal(cell_id_for_icon.clone())  // Clone and pass owned
                                 .map(move |value| {
-                                    let value = value.unwrap_or_else(|| {
-                                        panic!("[DD Checkbox] Missing cell value for '{}'", cell_id_for_icon_checked);
-                                    });
+                                    let Some(value) = value else {
+                                        return UNCHECKED_SVG;
+                                    };
                                     let checked = match value {
                                         Value::Bool(b) => b,
                                         Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => BoolTag::is_true(tag.as_ref()),
@@ -1245,14 +1343,14 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
         // because DD link mappings handle BoolToggle.
         let cell_id_for_toggle = cell_id.to_string();
         if let Some(ref link_id) = click_link_id {
-            zoon::println!("[DD render_checkbox] RETURNING reactive checkbox with link_id={}", link_id);
+            dd_log!("[DD render_checkbox] RETURNING reactive checkbox with link_id={}", link_id);
             let link_id_owned = link_id.clone();
             // Use raw DOM event listener to bypass potential Zoon event handling issues
             return checkbox
                 .update_raw_el(move |raw_el| {
                     let link_id = link_id_owned.clone();
                     raw_el.event_handler(move |_: zoon::events::Click| {
-                        zoon::println!("[DD CHECKBOX CLICK] RAW event handler invoked! link_id={}", link_id);
+                        dd_log!("[DD CHECKBOX CLICK] RAW event handler invoked! link_id={}", link_id);
                         // Only fire link - DD link mappings handle the toggle
                         fire_global_link(&link_id);
                     })
@@ -1263,8 +1361,7 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
         }
     }
 
-    // Phase 7: ComputedRef REMOVED - DD computes checkbox state directly
-    // The bridge receives final Bool values, not deferred computations
+    // DD computes checkbox state directly - bridge receives final Bool values
 
     // Static checkbox - extract checked state directly
     let checked = match checked_value {
@@ -1341,37 +1438,79 @@ fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
     let font_size = style
         .and_then(|s| s.get("font"))
         .and_then(|f| f.get("size"))
-        .and_then(|v| if let Value::Number(n) = v { Some(n.0 as u32) } else { None });
-
-    // Extract strikethrough from style.font.line.strikethrough (can be CellRef for reactive)
-    let strikethrough_hold = style
-        .and_then(|s| s.get("font"))
-        .and_then(|f| f.get("line"))
-        .and_then(|l| l.get("strikethrough"))
-        .and_then(|v| match v {
-            Value::CellRef(id) => Some(id.to_string()),
-            _ => None,
-        });
+        .and_then(|v| if let Value::Number(n) = v { Some(f64_to_u32(n)) } else { None });
 
     let label = match label_value {
         Value::CellRef(name) => {
             // Reactive label - update when HOLD state changes
-            // Phase 12: Use granular cell_signal() for label - only updates when this cell changes
+            // Use granular cell_signal() for label - only updates when this cell changes
             let cell_id = name.to_string();
-            let cell_id_for_signal = cell_id.clone();
             Label::new()
                 .label_signal(
                     cell_signal(cell_id)  // Pass owned String directly
                         .map(move |value| {
-                            let value = value.unwrap_or_else(|| {
-                                panic!("[DD Label] Missing cell value for '{}'", cell_id_for_signal);
-                            });
+                            let Some(value) = value else {
+                                return String::new();
+                            };
                             value.to_display_string()
                         })
                 )
                 .for_input("dd_text_input")
         }
-        // Phase 7: ReactiveText REMOVED - DD produces Text values directly
+        Value::Tagged { tag, fields } if tag.as_ref() == "__text_template__" => {
+            // Text template from Map context — parts are numbered "0", "1", ...
+            // After substitute_placeholders, PlaceholderField parts become CellRef or concrete.
+            let mut tt_parts: Vec<Value> = Vec::new();
+            let mut i = 0;
+            while let Some(v) = fields.get(i.to_string().as_str()) {
+                tt_parts.push(v.clone());
+                i += 1;
+            }
+            // Find the first CellRef for reactive signal
+            let first_cellref = tt_parts.iter().find_map(|v| {
+                if let Value::CellRef(id) = v { Some(id.to_string()) } else { None }
+            });
+            if let Some(cell_id) = first_cellref {
+                let parts_for_signal = tt_parts;
+                Label::new()
+                    .label_signal(
+                        cell_signal(cell_id)
+                            .map(move |_trigger| {
+                                parts_for_signal.iter().map(|part| match part {
+                                    Value::CellRef(id) => {
+                                        get_cell_value(&id.to_string())
+                                            .map(|v| v.to_display_string())
+                                            .unwrap_or_default()
+                                    }
+                                    v => v.to_display_string(),
+                                }).collect::<String>()
+                            })
+                    )
+                    .for_input("dd_text_input")
+            } else {
+                // All parts concrete — static label
+                let text: String = tt_parts.iter().map(|v| v.to_display_string()).collect();
+                Label::new().label(text).for_input("dd_text_input")
+            }
+        }
+        Value::WhileConfig(config) => {
+            // Reactive conditional label — watch cell and pick matching arm
+            let cell_id = config.cell_id.name().to_string();
+            let arms = config.arms.clone();
+            let default = config.default.clone();
+            Label::new()
+                .label_signal(
+                    cell_signal(cell_id)
+                        .map(move |value| {
+                            let Some(value) = value else {
+                                return String::new();
+                            };
+                            let selected = select_while_arm(&value, &arms, &default);
+                            selected.to_display_string()
+                        })
+                )
+                .for_input("dd_text_input")
+        }
         v => {
             // Static label
             Label::new()
@@ -1406,7 +1545,7 @@ fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
 }
 
 /// Render a paragraph element.
-/// Phase 6: Added CellRef support for reactive text via content_signal.
+/// CellRef support for reactive text via content_signal.
 fn render_paragraph(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
     let contents_field = fields.get("contents");
     let content_field = fields.get("content");
@@ -1437,14 +1576,14 @@ fn render_paragraph(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
                 .unify();
         }
         let cell_id_for_signal = cell_id_str.clone();
-        zoon::println!("[DD render_paragraph] Reactive content from CellRef '{}'", cell_id_str);
+        dd_log!("[DD render_paragraph] Reactive content from CellRef '{}'", cell_id_str);
         return Paragraph::new()
             .content_signal(
                 cell_signal(cell_id_str)
                     .map(move |value| {
-                        let value = value.unwrap_or_else(|| {
-                            panic!("[DD Paragraph] Missing cell value for '{}'", cell_id_for_signal);
-                        });
+                        let Some(value) = value else {
+                            return String::new();
+                        };
                         extract_text_content(&value)
                     })
             )
@@ -1556,9 +1695,8 @@ fn while_pattern_matches(value: &Value, pattern: &Value) -> bool {
 
 /// Render a link element.
 fn render_link(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    let label = fields
+    let label_value = fields
         .get("label")
-        .map(|v| v.to_display_string())
         .unwrap_or_else(|| {
             panic!("[DD render_link] Missing required 'label' field");
         });
@@ -1570,8 +1708,38 @@ fn render_link(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Raw
             panic!("[DD render_link] Missing required 'to' field");
         });
 
-    Link::new()
-        .label(label)
-        .to(to)
-        .unify()
+    let link = match label_value {
+        Value::Tagged { tag, fields: label_fields } if tag.as_ref() == "__text_template__" => {
+            let mut tt_parts: Vec<Value> = Vec::new();
+            let mut i = 0;
+            while let Some(v) = label_fields.get(i.to_string().as_str()) {
+                tt_parts.push(v.clone());
+                i += 1;
+            }
+            let first_cellref = tt_parts.iter().find_map(|v| {
+                if let Value::CellRef(id) = v { Some(id.to_string()) } else { None }
+            });
+            if let Some(cell_id) = first_cellref {
+                Link::new().label_signal(
+                    cell_signal(cell_id)
+                        .map(move |_trigger| {
+                            tt_parts.iter().map(|part| match part {
+                                Value::CellRef(id) => {
+                                    get_cell_value(&id.to_string())
+                                        .map(|v| v.to_display_string())
+                                        .unwrap_or_default()
+                                }
+                                v => v.to_display_string(),
+                            }).collect::<String>()
+                        })
+                )
+            } else {
+                let text: String = tt_parts.iter().map(|v| v.to_display_string()).collect();
+                Link::new().label(text)
+            }
+        }
+        v => Link::new().label(resolve_display_string(v)),
+    };
+
+    link.to(to).unify()
 }

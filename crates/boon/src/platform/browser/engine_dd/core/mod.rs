@@ -40,7 +40,7 @@ pub use guards::{
 pub use types::{
     channel, Event, EventValue, Input, Output, CellId, LinkId, TimerId, Key,
     BoolTag, ElementTag, EventFilter, ITEM_KEY_FIELD, ROUTE_CHANGE_LINK_ID,
-    // Phase 8: DD-native LINK handling
+    // DD-native LINK handling
     LinkAction, LinkCellMapping,
 };
 pub use worker::{
@@ -51,16 +51,16 @@ pub use worker::{
     ListItemTemplate, InstantiatedItem, FieldUpdate, ListAppendBinding,
     instantiate_template, remap_link_mappings_for_item, get_at_path, get_link_ref_at_path, get_hold_ref_at_path, update_field_at_path,
 };
-// Note: DocumentUpdate is now internal-only (Phase 6 cleanup)
+// Note: DocumentUpdate is now internal-only
 pub use dataflow::{
     DdCellConfig, DdCollectionConfig, DdOutput, DdTransform,
     run_dd_first_batch, merge_latest,
-    // Phase 8: DD-native link action processing
+    // DD-native link action processing
     apply_link_action, mapping_matches_event,
 };
-// Phase 4: DD Collection types for incremental list operations
+// DD Collection types for incremental list operations
 pub use value::{CollectionId, CollectionHandle, TemplateValue};
-// Phase 4: Collection op config shared between worker/dataflow
+// Collection op config shared between worker/dataflow
 pub use collection_ops::{CollectionOp, CollectionOpConfig};
-// Phase 7.3: CellUpdate for pure DD operations
+// CellUpdate for pure DD operations
 pub use value::CellUpdate;

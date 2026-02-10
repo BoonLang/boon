@@ -5,7 +5,7 @@
 //! # Module Structure
 //!
 //! - `bridge` - Converts DD Value types to Zoon UI elements
-//! - `list_adapter` - Phase 12: (removed) diff adapter was unused in bridge
+//! - `list_adapter` - (removed) diff adapter was unused in bridge
 
 pub mod bridge;
 

@@ -4,13 +4,14 @@
 //! inject events (LINK fires, timer ticks) into the DD dataflow.
 
 use std::cell::RefCell;
+#[allow(unused_imports)]
+use super::super::dd_log;
 use super::super::core::{Event, EventValue, Input, Key, LinkId, TimerId};
 
 // Global event dispatcher for browser environment (single-threaded)
 thread_local! {
     static GLOBAL_DISPATCHER: RefCell<Option<EventInjector>> = RefCell::new(None); // ALLOWED: global dispatcher
 
-    // Phase 3: EDITING_HOLDS_GRACE_PERIOD removed - blur debouncing moves to DD temporal operators
     static TASK_HANDLE: RefCell<Option<zoon::TaskHandle>> = RefCell::new(None); // ALLOWED: task handle
     static OUTPUT_LISTENER_HANDLE: RefCell<Option<zoon::TaskHandle>> = RefCell::new(None); // ALLOWED: listener handle
     static TIMER_HANDLE: RefCell<Option<zoon::TaskHandle>> = RefCell::new(None); // ALLOWED: timer handle
@@ -73,48 +74,21 @@ pub fn clear_timer_handle() {
     });
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// SURGICALLY REMOVED: add_router_mapping(), clear_router_mappings()
-//
-// These registered link→route mappings that bypassed DD:
-// - add_router_mapping(link_id, route) - stored mapping in I/O layer
-// - fire_global_link() checked mappings before injecting to DD
-// - If found, navigated + mutated state WITHOUT going through DD!
-//
-// Pure DD: Router/go_to() should be a DD operator that outputs navigation
-// commands, handled by the output observer.
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Register a dynamic link action.
-/// Called when cloning templates to wire up dynamic links to their hold actions.
-
-// ═══════════════════════════════════════════════════════════════════════════
-// SURGICALLY REMOVED: check_router_mapping()
-//
-// This function intercepted link events BEFORE they reached DD:
-// - Checked ROUTER_MAPPINGS for link→route mapping
-// - If found: navigated browser + mutated cell state directly
-// - DD never saw the event!
-//
-// Pure DD: ALL link events should go to DD. Router/go_to() outputs
-// navigation commands that the output observer handles.
-// ═══════════════════════════════════════════════════════════════════════════
-
 /// Fire a link event via the global dispatcher.
 /// Used by the bridge when button events occur.
 ///
-/// Phase 3: ALL link events go to DD. No early returns.
+/// ALL link events go to DD. No early returns.
 /// DD's link_mappings handle event→action mapping.
 /// IO layer may still do browser-specific things (grace periods) but doesn't prevent DD from seeing events.
 pub fn fire_global_link(link_id: &str) {
-    zoon::println!("[DD fire_global_link] CALLED with link_id={}", link_id);
+    dd_log!("[DD fire_global_link] CALLED with link_id={}", link_id);
 
     // Fire to DD - DD's link_mappings will process via apply_link_action
     // DD has change detection, so duplicate processing is safe
     GLOBAL_DISPATCHER.with(|cell| {
         if let Some(injector) = cell.borrow().as_ref() { // ALLOWED: IO layer
             injector.fire_link_unit(LinkId::new(link_id));
-            zoon::println!("[DD Dispatcher] Fired link event: {}", link_id);
+            dd_log!("[DD Dispatcher] Fired link event: {}", link_id);
         } else {
             panic!("[DD Dispatcher] Bug: No dispatcher set for link: {}", link_id);
         }
@@ -127,7 +101,7 @@ pub fn fire_global_link_with_text(link_id: &str, text: String) {
     GLOBAL_DISPATCHER.with(|cell| {
         if let Some(injector) = cell.borrow().as_ref() { // ALLOWED: IO layer
             injector.fire_link_text(LinkId::new(link_id), text);
-            zoon::println!("[DD Dispatcher] Fired link with text: {}", link_id);
+            dd_log!("[DD Dispatcher] Fired link with text: {}", link_id);
         } else {
             panic!("[DD Dispatcher] Bug: No dispatcher set for link with text: {}", link_id);
         }
@@ -137,36 +111,19 @@ pub fn fire_global_link_with_text(link_id: &str, text: String) {
 /// Fire a link event with a boolean value.
 /// Used by the bridge when hover state changes.
 ///
-/// Phase 3: Simplified - always forward to DD (no dedup or IO reads).
+/// Always forward to DD (no dedup or IO reads).
 pub fn fire_global_link_with_bool(link_id: &str, value: bool) {
     // Fire to DD - DD's link_mappings will handle via apply_link_action
     GLOBAL_DISPATCHER.with(|cell| {
         if let Some(injector) = cell.borrow().as_ref() { // ALLOWED: IO layer
             injector.fire_link_bool(LinkId::new(link_id), value);
-            zoon::println!("[DD Dispatcher] Fired link with bool: {} value={}", link_id, value);
+            dd_log!("[DD Dispatcher] Fired link with bool: {} value={}", link_id, value);
         } else {
             panic!("[DD Dispatcher] Bug: No dispatcher set for link: {}", link_id);
         }
     });
 }
 
-/// Fire a blur event.
-/// Used by text_input when the input loses focus.
-/// Phase 3: SIMPLIFIED - just forwards blur event to DD. Worker's link_mappings handle edit actions.
-pub fn fire_global_blur(link_id: &str) {
-    zoon::println!("[DD fire_global_blur] {} - forwarding to DD", link_id);
-    GLOBAL_DISPATCHER.with(|cell| {
-        if let Some(injector) = cell.borrow().as_ref() { // ALLOWED: IO layer
-            injector.fire_link_unit(LinkId::new(link_id));
-            zoon::println!("[DD Dispatcher] Fired blur event: {}", link_id);
-        } else {
-            panic!("[DD Dispatcher] Bug: No dispatcher set for blur: {}", link_id);
-        }
-    });
-}
-
-// Phase 3: clear_editing_grace_period and clear_editing_grace_period_for_link removed
-// DD handles blur debouncing via temporal operators
 
 /// Fire a key_down event with the key and optional text.
 /// Used by text_input when a key is pressed.
@@ -175,7 +132,7 @@ pub fn fire_global_key_down(link_id: &str, key: Key, text: Option<String>) {
     GLOBAL_DISPATCHER.with(|cell| {
         if let Some(injector) = cell.borrow().as_ref() { // ALLOWED: IO layer
             injector.fire_link_key_down(LinkId::new(link_id), key.clone(), text);
-            zoon::println!("[DD Dispatcher] Fired key_down event: {} key='{}'", link_id, key.as_str());
+            dd_log!("[DD Dispatcher] Fired key_down event: {} key='{}'", link_id, key.as_str());
         } else {
             panic!("[DD Dispatcher] Bug: No dispatcher set for key_down: {}", link_id);
         }
@@ -227,11 +184,4 @@ impl EventInjector {
         self.event_input.send_or_drop(Event::Timer { id, tick });
     }
 
-    /// Fire an external event with arbitrary name and value.
-    pub fn fire_external(&self, name: impl Into<String>, value: EventValue) {
-        self.event_input.send_or_drop(Event::External {
-            name: name.into(),
-            value,
-        });
-    }
 }

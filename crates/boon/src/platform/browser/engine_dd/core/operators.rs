@@ -595,7 +595,7 @@ mod tests {
         assert_eq!(runtime.current_time(), 2);
     }
 
-    // Phase 2: HOLD operator tests
+    // HOLD operator tests
 
     #[test]
     fn test_hold_counter() {

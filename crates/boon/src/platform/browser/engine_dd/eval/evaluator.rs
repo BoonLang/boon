@@ -7,13 +7,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+#[allow(unused_imports)]
+use super::super::dd_log;
 use super::super::core::value::{
     attach_item_key, CollectionHandle, CollectionId, PlaceholderWhileConfig, TemplateValue, Value, WhileArm,
     WhileConfig,
 };
-// Phase 11a: add_router_mapping was removed - routing goes through DD dataflow now
 use super::super::core::{
-    DataflowConfig, CellConfig, CellId, LinkId, EventFilter, StateTransform, BoolTag, ElementTag,
+    DataflowConfig, CellConfig, CellId, LinkId, EventFilter, StateTransform, BoolTag,
     Key, ListAppendBinding, ITEM_KEY_FIELD,
     ListItemTemplate, FieldInitializer, ItemIdentitySpec, get_link_ref_at_path,
 };
@@ -22,6 +23,33 @@ use crate::parser::{Persistence, PersistenceId};
 use crate::parser::static_expression::{
     Alias, Arm, ArithmeticOperator, Comparator, Expression, Literal, Object, Pattern, Spanned, TextPart,
 };
+
+/// Extract milliseconds from a Duration value or bare Number.
+/// Panics if the value is not a valid duration.
+fn duration_to_millis(value: &Value) -> u64 {
+    match value {
+        Value::Tagged { tag, fields } if tag.as_ref() == "Duration" => {
+            if let Some(Value::Number(secs)) = fields.get("seconds") {
+                let ms = secs.0 * 1000.0;
+                u64::try_from(ms as i64).unwrap_or_else(|_| {
+                    panic!("[DD_EVAL] Duration seconds {} out of u64 range", secs.0)
+                })
+            } else if let Some(Value::Number(ms)) = fields.get("millis") {
+                u64::try_from(ms.0 as i64).unwrap_or_else(|_| {
+                    panic!("[DD_EVAL] Duration millis {} out of u64 range", ms.0)
+                })
+            } else {
+                panic!("[DD_EVAL] Duration missing seconds/millis fields")
+            }
+        }
+        Value::Number(ms) => {
+            u64::try_from(ms.0 as i64).unwrap_or_else(|_| {
+                panic!("[DD_EVAL] Timer interval {} out of u64 range", ms.0)
+            })
+        }
+        other => panic!("[DD_EVAL] Timer/interval expects Duration or Number, found {:?}", other),
+    }
+}
 
 /// A stored function definition.
 #[derive(Clone)]
@@ -60,7 +88,7 @@ pub struct BoonDdRuntime {
     context_path: Vec<String>,
     /// DataflowConfig built during evaluation (Task 4.4: declarative config builder)
     dataflow_config: DataflowConfig,
-    /// Phase 4: Mapping from CellId (HOLD name) to CollectionId for lists
+    /// Mapping from CellId (HOLD name) to CollectionId for lists
     /// When a HOLD contains a list, we register it here so List/retain, List/map
     /// can look up the source CollectionId for DD operations.
     cell_to_collection: HashMap<String, super::super::core::value::CollectionId>,
@@ -82,6 +110,69 @@ impl BoonDdRuntime {
         }
     }
 
+    /// Create a forked runtime for evaluating sub-expressions.
+    /// Clones variables, functions, passed_context, context_path, and latest_cells
+    /// but starts fresh with empty dataflow_config and cell_to_collection.
+    fn fork(&self) -> Self {
+        Self {
+            variables: self.variables.clone(),
+            functions: self.functions.clone(),
+            passed_context: self.passed_context.clone(),
+            context_path: self.context_path.clone(),
+            dataflow_config: DataflowConfig::new(),
+            cell_to_collection: self.cell_to_collection.clone(),
+            latest_cells: self.latest_cells.clone(),
+        }
+    }
+
+    /// Fork, evaluate an expression, and merge the fork's dataflow_config and
+    /// cell_to_collection back into self. This ensures collections, cells, and
+    /// link mappings created during forked evaluation (e.g., WHILE arm bodies)
+    /// are not lost.
+    fn fork_eval_merge(
+        &mut self,
+        setup: impl FnOnce(&mut Self),
+        expr: &Expression,
+    ) -> Value {
+        let mut forked = self.fork();
+        setup(&mut forked);
+        let result = forked.eval_expression(expr);
+        let n_cells = forked.dataflow_config.cells.len();
+        let n_colls = forked.dataflow_config.initial_collections.len();
+        let n_ops = forked.dataflow_config.collection_ops.len();
+        let n_links = forked.dataflow_config.link_mappings.len();
+        let n_c2c = forked.cell_to_collection.len();
+        if n_cells > 0 || n_colls > 0 || n_ops > 0 || n_links > 0 || n_c2c > 0 {
+            dd_log!("[DD_EVAL] fork_eval_merge: merging {} cells, {} collections, {} ops, {} links, {} c2c",
+                n_cells, n_colls, n_ops, n_links, n_c2c);
+        }
+        self.dataflow_config.merge_from(forked.dataflow_config);
+        self.cell_to_collection.extend(forked.cell_to_collection);
+        result
+    }
+
+    /// Build a synthetic event object for a LINK reference.
+    /// Maps event types to the same LinkRef, with sub-objects for events that carry typed payloads.
+    /// - `press`, `click`, `blur`, `double_click` → LinkRef directly (no sub-fields)
+    /// - `key_down` → Object { key: LinkRef, text: LinkRef } (key_down events carry key + optional text)
+    /// - `change` → Object { text: LinkRef } (change events carry text)
+    fn build_link_event_object(link_id: &LinkId) -> Value {
+        let link_ref = Value::LinkRef(link_id.clone());
+        Value::object([
+            ("press", link_ref.clone()),
+            ("click", link_ref.clone()),
+            ("blur", link_ref.clone()),
+            ("key_down", Value::object([
+                ("key", link_ref.clone()),
+                ("text", link_ref.clone()),
+            ])),
+            ("double_click", link_ref.clone()),
+            ("change", Value::object([
+                ("text", link_ref),
+            ])),
+        ])
+    }
+
     /// Take the built DataflowConfig, leaving an empty one in its place.
     /// Called by dd_interpreter.rs after evaluation to get the config.
     pub fn take_config(&mut self) -> DataflowConfig {
@@ -96,15 +187,15 @@ impl BoonDdRuntime {
     /// Add a CellConfig entry during evaluation.
     /// This is called from eval_hold when a HOLD is encountered.
     fn add_cell_config(&mut self, config: CellConfig) {
-        zoon::println!("[DD_EVAL] Adding CellConfig: id={}, transform={:?}, triggers={:?}",
+        dd_log!("[DD_EVAL] Adding CellConfig: id={}, transform={:?}, triggers={:?}",
             config.id.name(), config.transform, config.triggered_by.iter().map(|l| l.name()).collect::<Vec<_>>());
         self.dataflow_config.cells.push(config);
     }
 
     // ══════════════════════════════════════════════════════════════════════════════
-    // Phase 4: Collection operation helpers
+    // Collection operation helpers
     //
-    // These methods replace the surgically removed symbolic reference types
+    // These methods replace the symbolic reference types
     // (FilteredListRef, MappedListRef, ComputedRef, etc.) with DD-native patterns.
     // ══════════════════════════════════════════════════════════════════════════════
 
@@ -115,6 +206,10 @@ impl BoonDdRuntime {
         cell_id: &str,
         items: Vec<Value>,
     ) -> super::super::core::value::CollectionId {
+        dd_log!("[DD_EVAL] register_list_hold: cell_id={}, {} items", cell_id, items.len());
+        for (i, item) in items.iter().enumerate() {
+            dd_log!("[DD_EVAL]   hold_item[{}] = {:?}", i, item);
+        }
         if !items.is_empty() {
             let mut seen: HashSet<Arc<str>> = HashSet::new();
             for item in &items {
@@ -150,18 +245,25 @@ impl BoonDdRuntime {
                             cell_id, existing_items, items
                         );
                     }
+                } else if self.dataflow_config.initial_collections.contains_key(&existing) {
+                    // Already registered, skip
                 } else {
+                    // Only register source if this collection is local (not inherited from parent fork)
                     self.dataflow_config.initial_collections.insert(existing.clone(), items.clone());
                 }
             }
-            self.dataflow_config.add_collection_source(existing.clone(), cell_id.to_string());
+            // Only register source if this collection is in local initial_collections
+            // (inherited collections from parent fork don't need re-registration)
+            if self.dataflow_config.initial_collections.contains_key(&existing) {
+                self.dataflow_config.add_collection_source(existing.clone(), cell_id.to_string());
+            }
             return existing;
         }
 
         let collection_id = self.dataflow_config.add_initial_collection(items);
         self.dataflow_config.add_collection_source(collection_id.clone(), cell_id.to_string());
         self.cell_to_collection.insert(cell_id.to_string(), collection_id.clone());
-        zoon::println!("[DD_EVAL] Registered list HOLD '{}' as CollectionId({:?})", cell_id, collection_id);
+        dd_log!("[DD_EVAL] Registered list HOLD '{}' as CollectionId({:?})", cell_id, collection_id);
         collection_id
     }
 
@@ -169,6 +271,10 @@ impl BoonDdRuntime {
     fn register_list_literal_collection(&mut self, items: Vec<Value>) -> CollectionId {
         let collection_id = CollectionId::new();
         let key_prefix = collection_id.to_string();
+        dd_log!("[DD_EVAL] register_list_literal_collection: {} items, prefix={}", items.len(), key_prefix);
+        for (i, item) in items.iter().enumerate() {
+            dd_log!("[DD_EVAL]   item[{}] = {:?}", i, item);
+        }
         let items_with_keys = self.attach_auto_keys_to_list_literal(items, &key_prefix);
         self.dataflow_config
             .add_initial_collection_with_id(collection_id, items_with_keys);
@@ -193,8 +299,10 @@ impl BoonDdRuntime {
                     );
                 }
             }
-            other => {
-                panic!("[DD_EVAL] list item must be Object/Tagged, found {:?}", other);
+            _ => {
+                // Non-Object/Tagged items (e.g., Text in font-family lists)
+                // don't support __key fields — return as-is.
+                return item;
             }
         }
         let key = format!("{}#{}", key_prefix, index);
@@ -224,6 +332,13 @@ impl BoonDdRuntime {
         }
     }
 
+    /// Wrap a CollectionId as a Value::List and register it in cell_to_collection
+    /// so it can be resolved later from CellRef names (e.g., in Subtract).
+    fn collection_value(&mut self, id: CollectionId) -> Value {
+        self.cell_to_collection.insert(id.name(), id);
+        Value::List(CollectionHandle::new_with_id(id))
+    }
+
     /// Create a filtered collection (replaces FilteredListRef).
     ///
     /// OLD: Value::FilteredListRef { source_hold, filter_field, filter_value }
@@ -244,9 +359,9 @@ impl BoonDdRuntime {
             Some((filter_field, filter_value)),
             None,
         );
-        zoon::println!("[DD_EVAL] Created filtered collection from '{}' -> CollectionId({:?})",
+        dd_log!("[DD_EVAL] Created filtered collection from '{}' -> CollectionId({:?})",
             source_cell_id, output_id);
-        Value::List(CollectionHandle::new_with_id(output_id))
+        self.collection_value(output_id)
     }
 
     /// Create a mapped collection (replaces MappedListRef).
@@ -265,9 +380,9 @@ impl BoonDdRuntime {
             .unwrap_or_else(|| self.register_list_hold(source_cell_id, Vec::new()));
         self.dataflow_config.set_list_element_template(source_cell_id, element_template.clone());
         let output_id = self.dataflow_config.add_map(source_id, element_template);
-        zoon::println!("[DD_EVAL] Created mapped collection from '{}' -> CollectionId({:?})",
+        dd_log!("[DD_EVAL] Created mapped collection from '{}' -> CollectionId({:?})",
             source_cell_id, output_id);
-        Value::List(CollectionHandle::new_with_id(output_id))
+        self.collection_value(output_id)
     }
 
     /// Create a list count (replaces ComputedRef::ListCount).
@@ -279,11 +394,12 @@ impl BoonDdRuntime {
             .get_collection_id(source_cell_id)
             .unwrap_or_else(|| self.register_list_hold(source_cell_id, Vec::new()));
         let output_id = self.dataflow_config.add_count(source_id);
-        zoon::println!(
+        dd_log!(
             "[DD_EVAL] Created list count from '{}' -> cell '{}'",
             source_cell_id,
             output_id.name()
         );
+        self.cell_to_collection.insert(output_id.name(), output_id);
         Value::CellRef(super::super::core::types::CellId::new(&output_id.name()))
     }
 
@@ -301,11 +417,12 @@ impl BoonDdRuntime {
             .get_collection_id(source_cell_id)
             .unwrap_or_else(|| self.register_list_hold(source_cell_id, Vec::new()));
         let output_id = self.dataflow_config.add_count_where(source_id, filter_field, filter_value);
-        zoon::println!(
+        dd_log!(
             "[DD_EVAL] Created list count-where from '{}' -> cell '{}'",
             source_cell_id,
             output_id.name()
         );
+        self.cell_to_collection.insert(output_id.name(), output_id);
         Value::CellRef(super::super::core::types::CellId::new(&output_id.name()))
     }
 
@@ -321,9 +438,9 @@ impl BoonDdRuntime {
         use super::super::core::value::CollectionHandle;
 
         let output_id = self.dataflow_config.add_map(source_id.clone(), element_template);
-        zoon::println!("[DD_EVAL] Chained map on CollectionId({:?}) -> CollectionId({:?})",
+        dd_log!("[DD_EVAL] Chained map on CollectionId({:?}) -> CollectionId({:?})",
             source_id, output_id);
-        Value::List(CollectionHandle::new_with_id(output_id))
+        self.collection_value(output_id)
     }
 
     /// Chain a filter operation on an existing collection (for chained filters).
@@ -336,9 +453,9 @@ impl BoonDdRuntime {
         use super::super::core::value::CollectionHandle;
 
         let output_id = self.dataflow_config.add_filter(source_id.clone(), filter_field, predicate_template);
-        zoon::println!("[DD_EVAL] Chained filter on CollectionId({:?}) -> CollectionId({:?})",
+        dd_log!("[DD_EVAL] Chained filter on CollectionId({:?}) -> CollectionId({:?})",
             source_id, output_id);
-        Value::List(CollectionHandle::new_with_id(output_id))
+        self.collection_value(output_id)
     }
 
     /// Create a list is_empty check (replaces ComputedRef::ListIsEmpty).
@@ -347,11 +464,12 @@ impl BoonDdRuntime {
             .get_collection_id(source_cell_id)
             .unwrap_or_else(|| self.register_list_hold(source_cell_id, Vec::new()));
         let output_id = self.dataflow_config.add_is_empty(source_id);
-        zoon::println!(
+        dd_log!(
             "[DD_EVAL] Created list is_empty from '{}' -> cell '{}'",
             source_cell_id,
             output_id.name()
         );
+        self.cell_to_collection.insert(output_id.name(), output_id);
         Value::CellRef(super::super::core::types::CellId::new(&output_id.name()))
     }
 
@@ -361,11 +479,12 @@ impl BoonDdRuntime {
         source_id: super::super::core::value::CollectionId,
     ) -> Value {
         let output_id = self.dataflow_config.add_count(source_id.clone());
-        zoon::println!(
+        dd_log!(
             "[DD_EVAL] Chained count on CollectionId({:?}) -> cell '{}'",
             source_id,
             output_id.name()
         );
+        self.cell_to_collection.insert(output_id.name(), output_id);
         Value::CellRef(super::super::core::types::CellId::new(&output_id.name()))
     }
 
@@ -375,11 +494,12 @@ impl BoonDdRuntime {
         source_id: super::super::core::value::CollectionId,
     ) -> Value {
         let output_id = self.dataflow_config.add_is_empty(source_id.clone());
-        zoon::println!(
+        dd_log!(
             "[DD_EVAL] Chained is_empty on CollectionId({:?}) -> cell '{}'",
             source_id,
             output_id.name()
         );
+        self.cell_to_collection.insert(output_id.name(), output_id);
         Value::CellRef(super::super::core::types::CellId::new(&output_id.name()))
     }
 
@@ -389,7 +509,7 @@ impl BoonDdRuntime {
         right: super::super::core::value::CollectionId,
     ) -> super::super::core::value::CollectionId {
         let output_id = self.dataflow_config.add_concat(left, right);
-        zoon::println!(
+        dd_log!(
             "[DD_EVAL] Chained concat -> CollectionId({:?})",
             output_id
         );
@@ -397,8 +517,7 @@ impl BoonDdRuntime {
     }
 
     // ══════════════════════════════════════════════════════════════════════════════
-    // Phase 4: Arithmetic/Comparison Operation Helpers
-    // Replaces: ComputedRef::Subtract, ComputedRef::GreaterThanZero, ComputedRef::Equal
+    // Arithmetic/Comparison Operation Helpers
     // ══════════════════════════════════════════════════════════════════════════════
 
     /// Create a subtract operation (left - right).
@@ -410,12 +529,13 @@ impl BoonDdRuntime {
         right: super::super::core::value::CollectionId,
     ) -> Value {
         let output_id = self.dataflow_config.add_subtract(left.clone(), right.clone());
-        zoon::println!(
+        dd_log!(
             "[DD_EVAL] Created subtract: CollectionId({:?}) - CollectionId({:?}) -> cell '{}'",
             left,
             right,
             output_id.name()
         );
+        self.cell_to_collection.insert(output_id.name(), output_id);
         Value::CellRef(super::super::core::types::CellId::new(&output_id.name()))
     }
 
@@ -427,11 +547,12 @@ impl BoonDdRuntime {
         source_id: super::super::core::value::CollectionId,
     ) -> Value {
         let output_id = self.dataflow_config.add_greater_than_zero(source_id.clone());
-        zoon::println!(
+        dd_log!(
             "[DD_EVAL] Created greater_than_zero: CollectionId({:?}) > 0 -> cell '{}'",
             source_id,
             output_id.name()
         );
+        self.cell_to_collection.insert(output_id.name(), output_id);
         Value::CellRef(super::super::core::types::CellId::new(&output_id.name()))
     }
 
@@ -444,17 +565,58 @@ impl BoonDdRuntime {
         right: super::super::core::value::CollectionId,
     ) -> Value {
         let output_id = self.dataflow_config.add_equal(left.clone(), right.clone());
-        zoon::println!(
+        dd_log!(
             "[DD_EVAL] Created equal: CollectionId({:?}) == CollectionId({:?}) -> cell '{}'",
             left,
             right,
             output_id.name()
         );
+        self.cell_to_collection.insert(output_id.name(), output_id);
         Value::CellRef(super::super::core::types::CellId::new(&output_id.name()))
     }
 
+    /// Create a scalar pattern-match cell (ScalarWhen).
+    /// Used for reactive WHEN on scalar cells (e.g., count |> WHEN { 1 => "", __ => "s" }).
+    fn create_scalar_when(
+        &mut self,
+        source_collection: super::super::core::value::CollectionId,
+        arms: Vec<(Value, Value)>,
+        default: Value,
+    ) -> Value {
+        let output_id = self.dataflow_config.add_scalar_when(source_collection.clone(), arms, default);
+        dd_log!(
+            "[DD_EVAL] Created ScalarWhen: source {:?} -> cell '{}'",
+            source_collection,
+            output_id.name()
+        );
+        self.cell_to_collection.insert(output_id.name(), output_id);
+        Value::CellRef(super::super::core::types::CellId::new(&output_id.name()))
+    }
+
+    /// Create a computed text cell (reactive TEXT interpolation).
+    /// Used for TEXT { {count} item{maybe_s} left } with reactive CellRef parts.
+    fn create_computed_text(
+        &mut self,
+        sources: Vec<super::super::core::value::CollectionId>,
+        parts: Vec<super::super::core::collection_ops::ComputedTextPart>,
+    ) -> Value {
+        let output_id = self.dataflow_config.add_computed_text(sources, parts);
+        dd_log!(
+            "[DD_EVAL] Created ComputedText -> cell '{}'",
+            output_id.name()
+        );
+        self.cell_to_collection.insert(output_id.name(), output_id);
+        Value::CellRef(super::super::core::types::CellId::new(&output_id.name()))
+    }
+
+    /// Try to get the CollectionId for a CellRef name.
+    /// Returns None if the cell is not backed by a collection op.
+    fn try_get_collection_id_for_cellref(&self, cell_id: &super::super::core::types::CellId) -> Option<super::super::core::value::CollectionId> {
+        self.get_collection_id(&cell_id.name())
+    }
+
     // ══════════════════════════════════════════════════════════════════════════════
-    // End Phase 4 helpers
+    // End helpers
     // ══════════════════════════════════════════════════════════════════════════════
 
     /// Determine the StateTransform from HOLD body pattern.
@@ -533,11 +695,16 @@ impl BoonDdRuntime {
             }
             // Pattern: state + 1 → Increment
             Expression::ArithmeticOperator(ArithmeticOperator::Add { operand_a, .. }) => {
-                // Check if left operand is state
-                if let Expression::Variable(var) = &operand_a.node {
-                    if var.name.as_ref() == state_name {
-                        return StateTransform::Increment;
+                // Check if left operand is state (Variable declaration or Alias reference)
+                let is_state = match &operand_a.node {
+                    Expression::Variable(var) => var.name.as_ref() == state_name,
+                    Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
+                        parts.len() == 1 && parts[0].as_ref() == state_name
                     }
+                    _ => false,
+                };
+                if is_state {
+                    return StateTransform::Increment;
                 }
                 StateTransform::Identity
             }
@@ -553,16 +720,116 @@ impl BoonDdRuntime {
         }
     }
 
+    /// Extract per-input link mappings from a LATEST body inside HOLD.
+    /// For patterns like: `LATEST { btn1.press |> THEN { state + 1 }, btn2.press |> THEN { state - 1 } }`
+    /// Returns Vec of (link_id, LinkAction) pairs, or None if the pattern isn't recognized.
+    fn extract_hold_latest_link_mappings(
+        &mut self,
+        body: &Expression,
+        state_name: &str,
+    ) -> Option<Vec<(String, LinkAction)>> {
+        let inputs = match body {
+            Expression::Latest { inputs, .. } => inputs,
+            _ => return None,
+        };
+        let mut mappings = Vec::new();
+        for input in inputs {
+            if let Expression::Pipe { from, to } = &input.node {
+                if let Expression::Then { body: then_body } = &to.node {
+                    let Some(link_id) = self.extract_link_trigger_id(&input.node) else {
+                        continue;
+                    };
+                    match &then_body.node {
+                        // state + N
+                        Expression::ArithmeticOperator(ArithmeticOperator::Add { operand_a, operand_b }) => {
+                            let is_state = match &operand_a.node {
+                                Expression::Alias(Alias::WithoutPassed { parts, .. }) =>
+                                    parts.len() == 1 && parts[0].as_ref() == state_name,
+                                Expression::Variable(var) => var.name.as_ref() == state_name,
+                                _ => false,
+                            };
+                            if is_state {
+                                let step = self.eval_expression(&operand_b.node);
+                                mappings.push((link_id, LinkAction::AddValue(step)));
+                            }
+                        }
+                        // state - N → AddValue(-N)
+                        Expression::ArithmeticOperator(ArithmeticOperator::Subtract { operand_a, operand_b }) => {
+                            let is_state = match &operand_a.node {
+                                Expression::Alias(Alias::WithoutPassed { parts, .. }) =>
+                                    parts.len() == 1 && parts[0].as_ref() == state_name,
+                                Expression::Variable(var) => var.name.as_ref() == state_name,
+                                _ => false,
+                            };
+                            if is_state {
+                                let step = self.eval_expression(&operand_b.node);
+                                if let Value::Number(n) = step {
+                                    mappings.push((link_id, LinkAction::AddValue(Value::Number(-n))));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if mappings.is_empty() { None } else { Some(mappings) }
+    }
+
     /// Generate a unique HOLD ID using persistence.
+    /// When inside a LIST item context (context_path contains "[N]" segments),
+    /// appends the index to disambiguate per-item HOLDs from the same source location.
     fn generate_cell_id(&mut self, persistence: Option<&Persistence>) -> String {
         let persistence = persistence.unwrap_or_else(|| {
             panic!("[DD_EVAL] HOLD must have persistence metadata for stable id");
         });
-        Self::cell_id_from_persistence(persistence.id)
+        let base = Self::cell_id_from_persistence(persistence.id);
+        // Include full context path for per-call-site uniqueness.
+        // This differentiates HOLDs inside functions called multiple times
+        // (e.g., store.btn_a.clicked vs store.btn_b.clicked).
+        if self.context_path.is_empty() {
+            base
+        } else {
+            format!("{}_{}", base, self.context_path.join("."))
+        }
     }
 
     fn cell_id_from_persistence(persistence_id: PersistenceId) -> String {
         format!("hold_{}", persistence_id)
+    }
+
+    /// Snapshot current initial values for any CellRefs found in an item.
+    /// Used when building list literals to capture per-item HOLD initial values
+    /// before the next item's evaluation overwrites the shared cell configs.
+    fn snapshot_cell_values_for_item(&self, item: &Value) -> HashMap<String, Value> {
+        let mut snapshot = HashMap::new();
+        self.collect_cellref_initial_values(item, &mut snapshot);
+        snapshot
+    }
+
+    fn collect_cellref_initial_values(&self, value: &Value, snapshot: &mut HashMap<String, Value>) {
+        match value {
+            Value::CellRef(cell_id) => {
+                let name = cell_id.name();
+                // Find the LAST CellConfig with this name (most recent evaluation)
+                if let Some(cell_config) = self.dataflow_config.cells.iter().rev()
+                    .find(|c| c.id.name() == name)
+                {
+                    snapshot.insert(name, cell_config.initial.clone());
+                }
+            }
+            Value::Object(fields) => {
+                for v in fields.values() {
+                    self.collect_cellref_initial_values(v, snapshot);
+                }
+            }
+            Value::Tagged { fields, .. } => {
+                for v in fields.values() {
+                    self.collect_cellref_initial_values(v, snapshot);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Generate a deterministic LINK ID from the current context path.
@@ -603,17 +870,6 @@ impl BoonDdRuntime {
         self.variables.get(name)
     }
 
-    /// Get all variables.
-    pub fn get_all_variables(&self) -> &HashMap<String, Value> {
-        &self.variables
-    }
-
-    /// Get all defined function names.
-    /// Used by interpreter to detect available template functions.
-    pub fn get_function_names(&self) -> Vec<&String> {
-        self.functions.keys().collect()
-    }
-
     fn with_scoped_context<R>(
         &mut self,
         scoped_vars: HashMap<String, Value>,
@@ -630,12 +886,6 @@ impl BoonDdRuntime {
         self.passed_context = saved_passed;
 
         result
-    }
-
-    /// Get the parameter names for a function.
-    /// Used by interpreter to detect correct parameter names for element templates.
-    pub fn get_function_parameters(&self, name: &str) -> Option<&[String]> {
-        self.functions.get(name).map(|def| def.parameters.as_slice())
     }
 
     /// Get the document output (the root rendering output).
@@ -663,15 +913,7 @@ impl BoonDdRuntime {
         let func_def = self.functions.get(name)?.clone();
 
         // Create a new runtime with the function arguments as variables
-        let mut func_runtime = BoonDdRuntime {
-            variables: self.variables.clone(),
-            functions: self.functions.clone(),
-            passed_context: self.passed_context.clone(),
-            context_path: self.context_path.clone(),
-            dataflow_config: DataflowConfig::new(),
-            cell_to_collection: HashMap::new(),
-            latest_cells: self.latest_cells.clone(),
-        };
+        let mut func_runtime = self.fork();
 
         // Bind arguments to parameters
         for (param, arg_name) in func_def.parameters.iter().zip(args.iter()) {
@@ -706,7 +948,18 @@ impl BoonDdRuntime {
             }
         }
 
-        // First pass: evaluate all variables (forward refs will be Unit)
+        // Pre-seed all variable names with Unit so forward references resolve
+        // instead of panicking during the first pass.
+        for expr in expressions {
+            if let Expression::Variable(var) = &expr.node {
+                let name = var.name.as_str().to_string();
+                if !injected_vars.contains(&name) {
+                    self.variables.entry(name).or_insert(Value::Unit);
+                }
+            }
+        }
+
+        // First pass: evaluate all variables (forward refs resolve to Unit)
         // Skip pre-injected variables
         for expr in expressions {
             if let Expression::Variable(var) = &expr.node {
@@ -719,6 +972,14 @@ impl BoonDdRuntime {
                 }
             }
         }
+
+        // Reset accumulation fields between passes.
+        // Pass 1 populated `variables` (needed for forward ref resolution),
+        // but dataflow_config, cell_to_collection, and latest_cells contain
+        // stale entries with wrong CollectionIds, cell mappings, etc.
+        self.dataflow_config = DataflowConfig::new();
+        self.cell_to_collection.clear();
+        self.latest_cells.clear();
 
         // Second pass: re-evaluate to resolve forward references
         // Now all variable names are defined, so references should resolve
@@ -734,10 +995,14 @@ impl BoonDdRuntime {
                 let value = if self.contains_reactive_list_ops(&var.value.node) {
                     // Extract and evaluate the initial list expression (before reactive ops)
                     if let Some(initial_expr) = self.extract_initial_list_expr(&var.value.node) {
+                        dd_log!("[DD_EVAL] Pass 2: reactive list '{}' found initial_expr", name);
                         let initial_value = self.eval_expression(initial_expr);
+                        dd_log!("[DD_EVAL] Pass 2: reactive list '{}' initial_value = {:?}", name, initial_value);
                         let initial_value = self.bind_list_initial_to_cell(&name, initial_value);
                         let persist = var.value.persistence.is_some();
                         self.dataflow_config.add_cell_initialization(&name, initial_value, persist);
+                    } else {
+                        dd_log!("[DD_EVAL] Pass 2: reactive list '{}' NO initial_expr found!", name);
                     }
 
                     // Parse List/remove bindings in top-level expressions
@@ -753,7 +1018,52 @@ impl BoonDdRuntime {
                     self.eval_expression(&var.value.node)
                 };
                 #[cfg(debug_assertions)]
-                zoon::println!("[DD_EVAL] {} = {:?}", name, value);
+                dd_log!("[DD_EVAL] {} = {:?}", name, value);
+                self.pop_context();
+                self.variables.insert(name.clone(), value);
+
+                let sources = self.collect_event_links(&var.value.node, &event_sources);
+                if !sources.is_empty() {
+                    event_sources.insert(name, sources);
+                }
+            }
+        }
+
+        // Third pass: handle cascading forward references (depth > 1).
+        // Example: document → counter → increment_button requires 3 passes:
+        //   Pass 1: increment_button resolved, counter/document still Unit
+        //   Pass 2: counter resolved (uses increment_button), document still stale
+        //   Pass 3: document resolved (uses updated counter)
+        self.dataflow_config = DataflowConfig::new();
+        self.cell_to_collection.clear();
+        self.latest_cells.clear();
+
+        let mut event_sources: HashMap<String, Vec<String>> = HashMap::new();
+        for expr in expressions {
+            if let Expression::Variable(var) = &expr.node {
+                let name = var.name.as_str().to_string();
+                if injected_vars.contains(&name) {
+                    continue;
+                }
+                self.push_context(&name);
+                let value = if self.contains_reactive_list_ops(&var.value.node) {
+                    if let Some(initial_expr) = self.extract_initial_list_expr(&var.value.node) {
+                        dd_log!("[DD_EVAL] Pass 3: reactive list '{}' found initial_expr", name);
+                        let initial_value = self.eval_expression(initial_expr);
+                        let initial_value = self.bind_list_initial_to_cell(&name, initial_value);
+                        let persist = var.value.persistence.is_some();
+                        self.dataflow_config.add_cell_initialization(&name, initial_value, persist);
+                    }
+                    self.parse_list_remove_bindings(&name, &var.value.node);
+                    if let Some(binding) = self.extract_list_append_binding(&name, &var.value.node, &event_sources) {
+                        self.dataflow_config.add_list_append_binding(binding);
+                    }
+                    Value::CellRef(CellId::new(&name))
+                } else {
+                    self.eval_expression(&var.value.node)
+                };
+                #[cfg(debug_assertions)]
+                dd_log!("[DD_EVAL] {} = {:?}", name, value);
                 self.pop_context();
                 self.variables.insert(name.clone(), value);
 
@@ -779,12 +1089,29 @@ impl BoonDdRuntime {
 
             // List literal: LIST { a, b, c }
             Expression::List { items } => {
-                let values: Vec<Value> = items
-                    .iter()
-                    .map(|spanned| self.eval_expression(&spanned.node))
-                    .collect();
+                let mut values: Vec<Value> = Vec::new();
+                let mut per_item_cells: Vec<HashMap<String, Value>> = Vec::new();
+                for (idx, spanned) in items.iter().enumerate() {
+                    // Push item index context so nested LINK/HOLD get per-item unique IDs.
+                    // Without this, LIST { make_counter(), make_counter(), make_counter() }
+                    // would share IDs across all items.
+                    self.push_context(&format!("[{}]", idx));
+                    let item = self.eval_expression(&spanned.node);
+                    // Snapshot cell initial values for CellRefs in this item.
+                    // This is needed because multiple items from the same function template
+                    // share CellRef IDs, and later calls overwrite earlier initial values.
+                    let snapshot = self.snapshot_cell_values_for_item(&item);
+                    values.push(item);
+                    per_item_cells.push(snapshot);
+                    self.pop_context();
+                }
                 let collection_id = self.register_list_literal_collection(values);
-                Value::List(CollectionHandle::new_with_id(collection_id))
+                // Store per-item cell values so instantiate_fresh_item can use
+                // the correct initial value for each item's HOLDs.
+                if per_item_cells.iter().any(|m| !m.is_empty()) {
+                    self.dataflow_config.per_item_cell_values.insert(collection_id, per_item_cells);
+                }
+                self.collection_value(collection_id)
             }
 
             // Text literal: TEXT { ... }
@@ -810,12 +1137,12 @@ impl BoonDdRuntime {
                         // The test expects empty output until the first timer fires.
                         // The interpreter will handle initialization via DataflowConfig.
 
-                        zoon::println!("[DD_EVAL] Timer+sum pattern detected: {} @ {}ms", cell_id, interval_ms);
+                        dd_log!("[DD_EVAL] Timer+sum pattern detected: {} @ {}ms", cell_id, interval_ms);
 
                         // Task 6.3: Build CellConfig during evaluation (eliminates interpreter fallback)
                         self.add_cell_config(CellConfig {
                             id: CellId::new(cell_id),
-                            initial: Value::int(0), // Timer counters start at 0
+                            initial: Value::Unit, // Unit = "not yet rendered" until first timer tick
                             triggered_by: Vec::new(), // Timer-triggered, no external triggers
                             timer_interval_ms: interval_ms,
                             filter: EventFilter::Any,
@@ -967,13 +1294,13 @@ impl BoonDdRuntime {
                 // Check if this field contains reactive list operations (List/append, List/clear)
                 // If so, evaluate the initial list, store in HOLD, and return CellRef
                 let value = if runtime.contains_reactive_list_ops(&var.node.value.node) {
-                    zoon::println!("[DD_EVAL] Field '{}' has reactive list ops - creating CellRef", name_str);
+                    dd_log!("[DD_EVAL] Field '{}' has reactive list ops - creating CellRef", name_str);
 
                     // Extract and evaluate the initial list expression (before List/append, List/clear, List/remove)
                     if let Some(initial_expr) = runtime.extract_initial_list_expr(&var.node.value.node) {
                         let initial_value = runtime.eval_expression(initial_expr);
                         let initial_value = runtime.bind_list_initial_to_cell(name_str, initial_value);
-                        zoon::println!("[DD_EVAL] Field '{}' initial list value: {:?}", name_str, initial_value);
+                        dd_log!("[DD_EVAL] Field '{}' initial list value: {:?}", name_str, initial_value);
 
                         // Register the initial value for interpreter/worker initialization
                         let persist = var.node.value.persistence.is_some();
@@ -1319,15 +1646,7 @@ impl BoonDdRuntime {
 
     /// Build a template evaluation runtime with event-derived variables replaced by Placeholder.
     fn build_template_runtime(&self, event_sources: &HashMap<String, Vec<String>>) -> BoonDdRuntime {
-        let mut template_runtime = BoonDdRuntime {
-            variables: self.variables.clone(),
-            functions: self.functions.clone(),
-            passed_context: self.passed_context.clone(),
-            context_path: self.context_path.clone(),
-            dataflow_config: DataflowConfig::new(),
-            cell_to_collection: HashMap::new(),
-            latest_cells: self.latest_cells.clone(),
-        };
+        let mut template_runtime = self.fork();
 
         for name in event_sources.keys() {
             template_runtime.variables.insert(name.clone(), Value::Placeholder);
@@ -1380,10 +1699,17 @@ impl BoonDdRuntime {
                     handle.id
                 });
                 if handle.id != collection_id {
-                    panic!(
-                        "[DD_EVAL] Collection id mismatch for '{}': expected {:?}, found {:?}",
+                    // Second pass produced a new CollectionId — update mapping.
+                    // This is expected: pass 1 creates draft collections, pass 2
+                    // re-evaluates with all forward refs resolved, yielding new IDs.
+                    dd_log!(
+                        "[DD_EVAL] Updating collection mapping for '{}': {:?} -> {:?}",
                         cell_id, collection_id, handle.id
                     );
+                    self.dataflow_config
+                        .add_collection_source(handle.id, cell_id.to_string());
+                    self.cell_to_collection
+                        .insert(cell_id.to_string(), handle.id);
                 }
                 if !self.dataflow_config.initial_collections.contains_key(&collection_id) {
                     panic!(
@@ -1421,12 +1747,9 @@ impl BoonDdRuntime {
         remove_event_path: Option<&[String]>,
     ) -> Option<(ListItemTemplate, Vec<LinkCellMapping>)> {
         let item_expr = self.extract_list_append_item_expr(expr)?;
-        let remove_event_path = remove_event_path.unwrap_or_else(|| {
-            panic!(
-                "[DD_EVAL] Bug: List/append template requires List/remove identity path for '{}'",
-                list_cell_id
-            );
-        });
+        // If there's no List/remove path, items are simple values without per-item
+        // identity tracking (e.g., append + clear only). Skip template building.
+        let remove_event_path = remove_event_path?;
 
         let mut template_runtime = self.build_template_runtime(event_sources);
         let data_template = template_runtime.eval_expression(item_expr);
@@ -1526,24 +1849,22 @@ impl BoonDdRuntime {
                         }
                     }
                     if let Some((path, _)) = runtime.extract_event_path(expr) {
-                        let link_val = runtime.resolve_field_path(&path).unwrap_or_else(|| {
-                            panic!("[DD_EVAL] Bug: could not resolve event path {:?}", path);
-                        });
-                        let Value::LinkRef(link_id) = link_val else {
-                            panic!("[DD_EVAL] Bug: event path did not resolve to LinkRef: {:?}", path);
-                        };
-                        links.push(link_id.to_string());
+                        // Template binding variables (e.g., `item` in List/remove) can't be
+                        // resolved during evaluation — they only exist at runtime. Skip them.
+                        if let Some(link_val) = runtime.resolve_field_path(&path) {
+                            if let Value::LinkRef(link_id) = link_val {
+                                links.push(link_id.to_string());
+                            }
+                        }
                     }
                 }
                 Expression::FieldAccess { .. } => {
                     if let Some((path, _)) = runtime.extract_event_path(expr) {
-                        let link_val = runtime.resolve_field_path(&path).unwrap_or_else(|| {
-                            panic!("[DD_EVAL] Bug: could not resolve event path {:?}", path);
-                        });
-                        let Value::LinkRef(link_id) = link_val else {
-                            panic!("[DD_EVAL] Bug: event path did not resolve to LinkRef: {:?}", path);
-                        };
-                        links.push(link_id.to_string());
+                        if let Some(link_val) = runtime.resolve_field_path(&path) {
+                            if let Value::LinkRef(link_id) = link_val {
+                                links.push(link_id.to_string());
+                            }
+                        }
                     }
                 }
                 Expression::Pipe { from, to } => {
@@ -1594,12 +1915,13 @@ impl BoonDdRuntime {
     }
 
     /// Evaluate a text literal with interpolation.
-    /// If any interpolated value is reactive (ComputedRef, WhileRef, CellRef),
-    /// create a ReactiveText that the bridge evaluates at render time.
+    /// If any interpolated value is reactive (CellRef, WhileConfig),
+    /// create a ComputedText DD cell for reactive text rendering.
     fn eval_text_literal(&mut self, parts: &[TextPart]) -> Value {
-        // First pass: collect values and check for reactive parts
+        use super::super::core::collection_ops::ComputedTextPart;
+
+        // First pass: collect values
         let mut collected_parts: Vec<Value> = Vec::new();
-        let mut has_reactive = false;
 
         for part in parts {
             match part {
@@ -1607,32 +1929,145 @@ impl BoonDdRuntime {
                     collected_parts.push(Value::text(s.as_str()));
                 }
                 TextPart::Interpolation { var, .. } => {
-                    let value = self.variables.get(var.as_str()).unwrap_or_else(|| {
-                        panic!("[DD_EVAL] Bug: missing interpolated variable '{}'", var);
-                    });
-                    // Check if the value is reactive or a placeholder
-                    // Phase 4: Removed ComputedRef, WhileRef - use CellRef and Collection for reactivity
-                    let is_reactive = matches!(
-                        value,
-                        Value::CellRef(_) |
-                        Value::List(_) |
-                        Value::Placeholder
-                    );
-                    if is_reactive {
-                        has_reactive = true;
+                    if var.as_str().contains("|>") {
+                        collected_parts.push(Value::text(""));
+                        continue;
                     }
-                    collected_parts.push(value.clone());
+                    let value = self.variables.get(var.as_str()).cloned().unwrap_or_else(|| {
+                        let parts: Vec<String> = var.as_str().split('.').map(String::from).collect();
+                        self.resolve_field_path(&parts).unwrap_or_else(|| {
+                            panic!("[DD_EVAL] Bug: missing interpolated variable '{}'", var)
+                        })
+                    });
+                    collected_parts.push(value);
                 }
             }
         }
 
-        if has_reactive {
-            panic!("[DD_EVAL] Reactive text interpolation is not supported in pure DD mode");
+        // Check if any part contains Placeholder markers (inside Map template context).
+        // If so, produce a __text_template__ Tagged value that preserves the parts
+        // for later resolution during substitute_placeholders.
+        let has_placeholder = collected_parts.iter().any(|v| {
+            matches!(v, Value::Placeholder | Value::PlaceholderField(_) | Value::PlaceholderBoolNot(_))
+        });
+        if has_placeholder {
+            let mut fields = std::collections::BTreeMap::new();
+            for (i, part) in collected_parts.into_iter().enumerate() {
+                fields.insert(Arc::from(i.to_string().as_str()), part);
+            }
+            return Value::Tagged {
+                tag: Arc::from("__text_template__"),
+                fields: Arc::new(fields),
+            };
         }
 
-        // Phase 4: Evaluate text at evaluation time for static values
+        // Check if any part is reactive (CellRef or WhileConfig)
+        let has_reactive_cellref = collected_parts.iter().any(|v| {
+            matches!(v, Value::CellRef(_) | Value::WhileConfig(_))
+        });
+
+        if has_reactive_cellref {
+            // Check if all CellRefs have collection op backing.
+            // HOLD cells (boolean toggle, increment, etc.) don't have collection ops —
+            // for these, fall back to __text_template__ which the bridge renders via cell_signal.
+            let all_cellrefs_have_collections = collected_parts.iter().all(|v| match v {
+                Value::CellRef(cell_id) => self.try_get_collection_id_for_cellref(cell_id).is_some(),
+                _ => true,
+            });
+            if !all_cellrefs_have_collections {
+                let mut fields = std::collections::BTreeMap::new();
+                for (i, part) in collected_parts.into_iter().enumerate() {
+                    fields.insert(Arc::from(i.to_string().as_str()), part);
+                }
+                return Value::Tagged {
+                    tag: Arc::from("__text_template__"),
+                    fields: Arc::new(fields),
+                };
+            }
+
+            // Reactive text interpolation: create ComputedText DD operator.
+            // Convert each reactive part to a CellRef with a CollectionId,
+            // then build a ComputedText that watches all sources.
+            let mut sources: Vec<super::super::core::value::CollectionId> = Vec::new();
+            let mut template_parts: Vec<ComputedTextPart> = Vec::new();
+            // Map from CollectionId name to source index (dedup shared sources)
+            let mut source_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+            for value in &collected_parts {
+                match value {
+                    Value::CellRef(cell_id) => {
+                        let col_name = cell_id.name();
+                        let idx = if let Some(&existing_idx) = source_index.get(&col_name) {
+                            existing_idx
+                        } else if let Some(col_id) = self.try_get_collection_id_for_cellref(cell_id) {
+                            let idx = sources.len();
+                            sources.push(col_id);
+                            source_index.insert(col_name, idx);
+                            idx
+                        } else {
+                            // CellRef not backed by collection op (e.g., HOLD cell)
+                            // Fall back to empty string for now
+                            dd_log!("[DD_EVAL] TEXT interpolation: CellRef '{}' not in cell_to_collection, using empty", cell_id.name());
+                            template_parts.push(ComputedTextPart::Static(Arc::from("")));
+                            continue;
+                        };
+                        template_parts.push(ComputedTextPart::CellSource(idx));
+                    }
+                    Value::WhileConfig(config) => {
+                        // Convert WhileConfig to ScalarWhen CellRef for text interpolation
+                        let cell_name = config.cell_id.name();
+                        if let Some(source_col) = self.get_collection_id(&cell_name) {
+                            let arms: Vec<(Value, Value)> = config.arms.iter()
+                                .map(|arm| (arm.pattern.clone(), arm.body.clone()))
+                                .collect();
+                            let default = (*config.default).clone();
+                            let scalar_ref = self.create_scalar_when(source_col, arms, default);
+                            if let Value::CellRef(scalar_cell_id) = &scalar_ref {
+                                let col_id = self.try_get_collection_id_for_cellref(scalar_cell_id).unwrap();
+                                let idx = sources.len();
+                                sources.push(col_id);
+                                source_index.insert(scalar_cell_id.name(), idx);
+                                template_parts.push(ComputedTextPart::CellSource(idx));
+                            }
+                        } else {
+                            dd_log!("[DD_EVAL] TEXT interpolation: WhileConfig cell '{}' not in cell_to_collection", cell_name);
+                            template_parts.push(ComputedTextPart::Static(Arc::from("[while]")));
+                        }
+                    }
+                    Value::Text(s) => {
+                        template_parts.push(ComputedTextPart::Static(s.clone()));
+                    }
+                    _ => {
+                        // Static display for other types (Number, Bool, etc.)
+                        template_parts.push(ComputedTextPart::Static(Arc::from(value.to_display_string())));
+                    }
+                }
+            }
+
+            if sources.is_empty() {
+                // All reactive parts failed to resolve — fall back to static text
+                let result: String = template_parts.iter()
+                    .map(|p| match p {
+                        ComputedTextPart::Static(s) => s.to_string(),
+                        ComputedTextPart::CellSource(_) => String::new(),
+                    })
+                    .collect();
+                return Value::text(result);
+            }
+
+            dd_log!("[DD_EVAL] TEXT interpolation: creating ComputedText with {} sources, {} parts",
+                sources.len(), template_parts.len());
+            return self.create_computed_text(sources, template_parts);
+        }
+
+        // Static text: no reactive parts, build string directly
         let result: String = collected_parts.iter()
-            .map(|v| v.to_display_string())
+            .map(|v| match v {
+                Value::Placeholder | Value::PlaceholderField(_) | Value::PlaceholderBoolNot(_) => {
+                    String::new()
+                }
+                _ => v.to_display_string(),
+            })
             .collect();
         Value::text(result)
     }
@@ -1818,7 +2253,7 @@ impl BoonDdRuntime {
 
     /// Evaluate an Element function.
     fn eval_element_function(&mut self, name: &str, args: &HashMap<&str, Value>) -> Value {
-        zoon::println!("[DD_EVAL] Element/{}() called with args: {:?}", name, args.keys().collect::<Vec<_>>());
+        dd_log!("[DD_EVAL] Element/{}() called with args: {:?}", name, args.keys().collect::<Vec<_>>());
         if name == "text_input" {
             let text_cell_id = args.get("text").and_then(|v| {
                 if let Value::CellRef(cell_id) = v {
@@ -1858,7 +2293,7 @@ impl BoonDdRuntime {
         // NOTE: List/append/List/clear bindings are parsed from Boon code, not element scanning.
 
         let result = Value::tagged("Element", fields.into_iter());
-        zoon::println!("[DD_EVAL] Element/{}() -> Tagged(Element)", name);
+        dd_log!("[DD_EVAL] Element/{}() -> Tagged(Element)", name);
         result
     }
 
@@ -1923,6 +2358,18 @@ impl BoonDdRuntime {
         }
     }
 
+    /// Try to extract a concrete boolean from a Value, returning None for reactive values
+    /// (LinkRef, CellRef, etc.) that can't be resolved statically.
+    fn try_as_bool(&self, value: &Value) -> Option<bool> {
+        match value {
+            Value::Bool(b) => Some(*b),
+            Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => {
+                Some(BoolTag::is_true(tag.as_ref()))
+            }
+            _ => None,
+        }
+    }
+
     /// Evaluate a Text function.
     fn eval_text_function(&mut self, name: &str, args: &HashMap<&str, Value>) -> Value {
         match name {
@@ -1952,6 +2399,8 @@ impl BoonDdRuntime {
             }
             // Text/empty() -> ""
             "empty" => Value::text(""),
+            // Text/space() -> " "
+            "space" => Value::text(" "),
             _ => panic!("[DD_EVAL] Unknown Text function '{}'", name),
         }
     }
@@ -1970,15 +2419,26 @@ impl BoonDdRuntime {
                     panic!("[DD_EVAL] Bug: empty function path in pipe");
                 };
 
-                // Build args
-                let args: HashMap<&str, Value> = arguments
-                    .iter()
-                    .filter_map(|arg| {
-                        let name = arg.node.name.as_str();
-                        let value = arg.node.value.as_ref().map(|v| self.eval_expression(&v.node))?;
-                        Some((name, value))
-                    })
-                    .collect();
+                // List operations use raw expressions (template bindings like `item`
+                // can't be evaluated as variables). Skip arg evaluation for them.
+                let skip_arg_eval = matches!(
+                    (namespace, name),
+                    (Some("List"), "remove") | (Some("List"), "clear") | (Some("List"), "retain") | (Some("List"), "map")
+                );
+
+                // Build args (only for functions that need evaluated values)
+                let args: HashMap<&str, Value> = if skip_arg_eval {
+                    HashMap::new()
+                } else {
+                    arguments
+                        .iter()
+                        .filter_map(|arg| {
+                            let name = arg.node.name.as_str();
+                            let value = arg.node.value.as_ref().map(|v| self.eval_expression(&v.node))?;
+                            Some((name, value))
+                        })
+                        .collect()
+                };
 
                 match (namespace, name) {
                     (Some("Document"), "new") => {
@@ -1992,7 +2452,7 @@ impl BoonDdRuntime {
                     }
                     (Some("Math"), "sum") => {
                         // LatestRef |> Math/sum() - create a reactive CellRef for accumulation
-                        // Phase 4: LatestRef removed - DD handles event merging natively
+                        // DD handles event merging natively
                         // If input is already a CellRef, it's a reactive accumulator
                         if let Value::CellRef(cell_id) = from {
                             if let Some(bindings) = self.latest_cells.get(&cell_id.name()).cloned() {
@@ -2007,7 +2467,7 @@ impl BoonDdRuntime {
                                     timer_interval_ms: 0,
                                     filter: EventFilter::Any,
                                     transform: StateTransform::Identity,
-                                    persist: false,
+                                    persist: true,
                                 });
 
                                 for binding in &bindings {
@@ -2057,7 +2517,7 @@ impl BoonDdRuntime {
                             let cell_id = "timer_counter";
                             // NOTE: Do NOT call init_cell here!
                             // The test expects empty output until the first timer fires.
-                            zoon::println!("[DD_EVAL] TimerRef |> Math/sum(): {} @ {}ms", cell_id, interval_ms);
+                            dd_log!("[DD_EVAL] TimerRef |> Math/sum(): {} @ {}ms", cell_id, interval_ms);
                             return Value::TimerRef {
                                 id: Arc::from(cell_id),
                                 interval_ms: *interval_ms,
@@ -2067,30 +2527,18 @@ impl BoonDdRuntime {
                         from.clone()
                     }
                     (Some("Router"), "go_to") => {
-                        // Phase 11a: ROUTER_MAPPINGS removed - routing now goes through DD
-                        // Router/go_to() is now handled by DD output observer
-                        // Simply pass through the input - DD will process link events
-                        zoon::println!("[DD_EVAL] Router/go_to(): DD-native routing (Phase 11a)");
+                        // Register input cell so worker triggers navigation on update
+                        if let Value::CellRef(cell_id) = from {
+                            dd_log!("[DD_EVAL] Router/go_to(): registering go_to cell '{}'", cell_id.name());
+                            self.dataflow_config.add_go_to_cell(cell_id.name());
+                        }
                         Value::Unit
                     }
                     (Some("Timer"), "interval") => {
                         // Duration |> Timer/interval() - returns TimerRef
-                        // Extract interval from Duration[seconds: n] or Duration[millis: n]
-                        let interval_ms = match from {
-                            Value::Tagged { tag, fields } if tag.as_ref() == "Duration" => {
-                                if let Some(Value::Number(secs)) = fields.get("seconds") {
-                                    (secs.0 * 1000.0) as u64
-                                } else if let Some(Value::Number(ms)) = fields.get("millis") {
-                                    ms.0 as u64
-                                } else {
-                                    panic!("[DD_EVAL] Timer/interval Duration missing seconds/millis");
-                                }
-                            }
-                            Value::Number(ms) => ms.0 as u64,
-                            other => panic!("[DD_EVAL] Timer/interval expects Duration or Number, found {:?}", other),
-                        };
+                        let interval_ms = duration_to_millis(from);
                         let timer_id = format!("timer_{}", interval_ms);
-                        zoon::println!("[DD_EVAL] Timer/interval: {}ms -> {}", interval_ms, timer_id);
+                        dd_log!("[DD_EVAL] Timer/interval: {}ms -> {}", interval_ms, timer_id);
                         Value::timer_ref(timer_id, interval_ms)
                     }
                     (Some("Stream"), "skip") => {
@@ -2171,7 +2619,7 @@ impl BoonDdRuntime {
                     }
                     (Some("List"), "retain") => {
                         // from |> List/retain(item, if: ...) - filter items based on predicate
-                        // Phase 4: Uses DD-native collection filter instead of FilteredListRef
+                        // Uses DD-native collection filter
 
                         // Get the binding name (first argument, usually "item")
                         let binding_name = arguments
@@ -2197,7 +2645,7 @@ impl BoonDdRuntime {
                             if let Some((field_name, filter_value)) =
                                 self.extract_field_filter(binding, &pred_expr.node)
                             {
-                                // Phase 4: Use DD-native filter instead of FilteredListRef
+                                // Use DD-native filter
                                 return self.create_filtered_collection(
                                     &cell_id.name(),
                                     Arc::from(field_name),
@@ -2206,20 +2654,12 @@ impl BoonDdRuntime {
                             }
                             // Complex predicate: create predicate template with Placeholder
                             // Evaluate the predicate with item = Placeholder to create a template
-                            let mut template_runtime = BoonDdRuntime {
-                                variables: self.variables.clone(),
-                                functions: self.functions.clone(),
-                                passed_context: self.passed_context.clone(),
-                                context_path: self.context_path.clone(),
-                                dataflow_config: DataflowConfig::new(),
-                                cell_to_collection: HashMap::new(),
-                                latest_cells: self.latest_cells.clone(),
-                            };
+                            let mut template_runtime = self.fork();
                             template_runtime.variables.insert(binding.to_string(), Value::Placeholder);
                             let predicate_template = TemplateValue::from_value(
                                 template_runtime.eval_expression(&pred_expr.node)
                             );
-                            zoon::println!("[DD_EVAL] Phase 4: Complex predicate filter on '{}', template={:?}",
+                            dd_log!("[DD_EVAL] Phase 4: Complex predicate filter on '{}', template={:?}",
                                 cell_id.name(), predicate_template);
                             let source_id = self
                                 .get_collection_id(&cell_id.name())
@@ -2229,9 +2669,7 @@ impl BoonDdRuntime {
                                 None,
                                 Some(predicate_template),
                             );
-                            return Value::List(
-                                super::super::core::value::CollectionHandle::new_with_id(output_id)
-                            );
+                            return self.collection_value(output_id);
                         }
 
                         // Handle Collection input - chain filters
@@ -2245,20 +2683,12 @@ impl BoonDdRuntime {
                                     None,
                                 );
                             }
-                            let mut template_runtime = BoonDdRuntime {
-                                variables: self.variables.clone(),
-                                functions: self.functions.clone(),
-                                passed_context: self.passed_context.clone(),
-                                context_path: self.context_path.clone(),
-                                dataflow_config: DataflowConfig::new(),
-                                cell_to_collection: HashMap::new(),
-                                latest_cells: self.latest_cells.clone(),
-                            };
+                            let mut template_runtime = self.fork();
                             template_runtime.variables.insert(binding.to_string(), Value::Placeholder);
                             let predicate_template = TemplateValue::from_value(
                                 template_runtime.eval_expression(&pred_expr.node)
                             );
-                            zoon::println!("[DD_EVAL] Phase 4: Complex predicate filter on Collection {:?}, template={:?}",
+                            dd_log!("[DD_EVAL] Phase 4: Complex predicate filter on Collection {:?}, template={:?}",
                                 handle.id, predicate_template);
                             return self.chain_filter_on_collection(
                                 handle.id.clone(),
@@ -2290,85 +2720,73 @@ impl BoonDdRuntime {
                         });
 
                         match from {
-                            // Phase 4: CellRef |> List/map(item, new: ...) -> DD mapped collection
+                            // CellRef |> List/map(item, new: ...) -> DD mapped collection
                             // Registers a map operation in the DD dataflow graph
                             Value::CellRef(cell_id) => {
                                 // Evaluate the transform with Placeholder as the item
-                                // This creates a template that can be substituted at render time
-                                let mut scoped = BoonDdRuntime {
-                                    variables: self.variables.clone(),
-                                    functions: self.functions.clone(),
-                                    passed_context: self.passed_context.clone(),
-                                    context_path: self.context_path.clone(),
-                                    dataflow_config: DataflowConfig::new(),
-                                    cell_to_collection: HashMap::new(),
-                                    latest_cells: self.latest_cells.clone(),
-                                };
-                                scoped.variables.insert(binding.to_string(), Value::Placeholder);
-
+                                // Using fork_eval_merge to preserve collections created in the Map body
+                                // (e.g., nested list literals for Row items)
+                                let binding_owned = binding.to_string();
                                 let element_template = TemplateValue::from_value(
-                                    scoped.eval_expression(&new_expr.node)
+                                    self.fork_eval_merge(
+                                        |scoped| { scoped.variables.insert(binding_owned, Value::Placeholder); },
+                                        &new_expr.node,
+                                    )
                                 );
-                                zoon::println!("[DD_EVAL] List/map on CellRef: source={}, template={:?}", cell_id, element_template);
+                                dd_log!("[DD_EVAL] List/map on CellRef: source={}, template={:?}", cell_id, element_template);
 
-                                // Phase 4: Use DD-native mapped collection instead of MappedListRef
+                                // Use DD-native mapped collection
                                 self.create_mapped_collection(&cell_id.name(), element_template)
                             }
-                            // Phase 4: Collection |> List/map(item, new: ...) -> chained DD map
+                            // Collection |> List/map(item, new: ...) -> chained DD map
                             // This handles filter+map chains: Collection(filtered) |> List/map()
                             Value::List(handle) => {
                                 // Evaluate the transform with Placeholder as the item
-                                let mut scoped = BoonDdRuntime {
-                                    variables: self.variables.clone(),
-                                    functions: self.functions.clone(),
-                                    passed_context: self.passed_context.clone(),
-                                    context_path: self.context_path.clone(),
-                                    dataflow_config: DataflowConfig::new(),
-                                    cell_to_collection: HashMap::new(),
-                                    latest_cells: self.latest_cells.clone(),
-                                };
-                                scoped.variables.insert(binding.to_string(), Value::Placeholder);
-
+                                // Using fork_eval_merge to preserve collections created in the Map body
+                                let binding_owned = binding.to_string();
                                 let element_template = TemplateValue::from_value(
-                                    scoped.eval_expression(&new_expr.node)
+                                    self.fork_eval_merge(
+                                        |scoped| { scoped.variables.insert(binding_owned, Value::Placeholder); },
+                                        &new_expr.node,
+                                    )
                                 );
-                                zoon::println!("[DD_EVAL] List/map on Collection: source={:?}, template={:?}",
+                                dd_log!("[DD_EVAL] List/map on Collection: source={:?}, template={:?}",
                                     handle.id, element_template);
 
-                                // Phase 4: Chain map operation on existing collection (e.g., filtered collection)
+                                // Chain map operation on existing collection (e.g., filtered collection)
                                 self.chain_map_on_collection(handle.id.clone(), element_template)
                             }
                             other => panic!("[DD_EVAL] List/map expects list-like input, found {:?}", other),
                         }
                     }
                     (Some("List"), "count") => {
-                        // Phase 4: from |> List/count() - DD-native count operation
+                        // from |> List/count() - DD-native count operation
                         match from {
-                            // Phase 4: CellRef |> List/count() -> DD-native count
+                            // CellRef |> List/count() -> DD-native count
                             Value::CellRef(cell_id) => {
-                                zoon::println!("[DD_EVAL] List/count() on CellRef: {}", cell_id);
+                                dd_log!("[DD_EVAL] List/count() on CellRef: {}", cell_id);
                                 self.create_list_count(&cell_id.name())
                             }
-                            // Phase 4: Collection |> List/count() -> chain count on collection
+                            // Collection |> List/count() -> chain count on collection
                             // Handles chained operations like filter+count
                             Value::List(handle) => {
-                                zoon::println!("[DD_EVAL] List/count() on Collection: {:?}", handle.id);
+                                dd_log!("[DD_EVAL] List/count() on Collection: {:?}", handle.id);
                                 self.chain_count_on_collection(handle.id.clone())
                             }
                             other => panic!("[DD_EVAL] List/count expects list-like input, found {:?}", other),
                         }
                     }
                     (Some("List"), "is_empty") => {
-                        // Phase 4: from |> List/is_empty() - DD-native is_empty operation
+                        // from |> List/is_empty() - DD-native is_empty operation
                         match from {
-                            // Phase 4: CellRef |> List/is_empty() -> DD-native is_empty
+                            // CellRef |> List/is_empty() -> DD-native is_empty
                             Value::CellRef(cell_id) => {
-                                zoon::println!("[DD_EVAL] List/is_empty() on CellRef: cell_id={}", cell_id);
+                                dd_log!("[DD_EVAL] List/is_empty() on CellRef: cell_id={}", cell_id);
                                 self.create_list_is_empty(&cell_id.name())
                             }
-                            // Phase 4: Collection |> List/is_empty() -> chain is_empty on collection
+                            // Collection |> List/is_empty() -> chain is_empty on collection
                             Value::List(handle) => {
-                                zoon::println!("[DD_EVAL] List/is_empty() on Collection: {:?}", handle.id);
+                                dd_log!("[DD_EVAL] List/is_empty() on Collection: {:?}", handle.id);
                                 self.chain_is_empty_on_collection(handle.id.clone())
                             }
                             other => panic!("[DD_EVAL] List/is_empty expects list-like input, found {:?}", other),
@@ -2377,28 +2795,52 @@ impl BoonDdRuntime {
                     // Bool operations
                     (Some("Bool"), "or") => {
                         // from |> Bool/or(that: other_bool)
-                        let from_bool = self.require_bool(from, "Bool/or input");
+                        // Uses short-circuit algebra for reactive operands:
+                        //   True OR x = True,  False OR x = x
                         let that_value = args.get("that").unwrap_or_else(|| {
                             panic!("[DD_EVAL] Bool/or requires 'that' argument");
                         });
-                        let that_bool = self.require_bool(that_value, "Bool/or 'that'");
-                        Value::Bool(from_bool || that_bool)
+                        match (self.try_as_bool(from), self.try_as_bool(that_value)) {
+                            (Some(a), Some(b)) => Value::Bool(a || b),
+                            (Some(true), None) | (None, Some(true)) => Value::Bool(true),
+                            (Some(false), None) => that_value.clone(),
+                            (None, Some(false)) => from.clone(),
+                            (None, None) => {
+                                dd_log!("[DD_EVAL] Bool/or: both operands reactive, from={:?}, that={:?}", from, that_value);
+                                from.clone()
+                            }
+                        }
                     }
                     (Some("Bool"), "and") => {
                         // from |> Bool/and(that: other_bool)
-                        let from_bool = self.require_bool(from, "Bool/and input");
+                        // Uses short-circuit algebra for reactive operands:
+                        //   False AND x = False,  True AND x = x
                         let that_value = args.get("that").unwrap_or_else(|| {
                             panic!("[DD_EVAL] Bool/and requires 'that' argument");
                         });
-                        let that_bool = self.require_bool(that_value, "Bool/and 'that'");
-                        Value::Bool(from_bool && that_bool)
+                        match (self.try_as_bool(from), self.try_as_bool(that_value)) {
+                            (Some(a), Some(b)) => Value::Bool(a && b),
+                            (Some(false), None) | (None, Some(false)) => Value::Bool(false),
+                            (Some(true), None) => that_value.clone(),
+                            (None, Some(true)) => from.clone(),
+                            (None, None) => {
+                                dd_log!("[DD_EVAL] Bool/and: both operands reactive, from={:?}, that={:?}", from, that_value);
+                                from.clone()
+                            }
+                        }
                     }
                     (Some("Bool"), "not") => {
                         // from |> Bool/not()
-                        // Phase 4: PlaceholderField and NegatedPlaceholderField removed
-                        // DD handles template substitution natively
-                        let from_bool = self.require_bool(from, "Bool/not input");
-                        Value::Bool(!from_bool)
+                        // During template evaluation, placeholders must be deferred
+                        match from {
+                            Value::Placeholder | Value::PlaceholderField(_) | Value::PlaceholderBoolNot(_) => {
+                                Value::PlaceholderBoolNot(Box::new(from.clone()))
+                            }
+                            _ => {
+                                let from_bool = self.require_bool(from, "Bool/not input");
+                                Value::Bool(!from_bool)
+                            }
+                        }
                     }
                     // Text functions (piped)
                     (Some("Text"), "trim") => {
@@ -2464,16 +2906,20 @@ impl BoonDdRuntime {
                         }
                         // Handle LinkRef.event - create synthetic event object with all event types
                         Value::LinkRef(link_id) if field.as_str() == "event" => {
-                            let link_ref = Value::LinkRef(link_id.clone());
-                            Value::object([
-                                ("press", link_ref.clone()),
-                                ("click", link_ref.clone()),
-                                ("blur", link_ref.clone()),
-                                ("key_down", link_ref.clone()),
-                                ("double_click", link_ref.clone()),
-                                ("change", link_ref.clone()),
-                            ])
+                            Self::build_link_event_object(link_id)
                         }
+                        // Handle Element.event - navigate through nested element.event path
+                        Value::Tagged { tag, fields, .. }
+                            if tag.as_ref() == "Element" && field.as_str() == "event" =>
+                        {
+                            fields
+                                .get("element")
+                                .and_then(|e| e.get("event"))
+                                .cloned()
+                                .unwrap_or(Value::Unit)
+                        }
+                        // Forward references are Unit during pass 1; propagate Unit.
+                        Value::Unit => Value::Unit,
                         _ => current.get(field.as_str()).cloned().unwrap_or_else(|| {
                             panic!("[DD_EVAL] Bug: missing field '{}' on {:?}", field, current);
                         }),
@@ -2490,41 +2936,39 @@ impl BoonDdRuntime {
             Expression::LinkSetter { alias } => {
                 // Get the target LinkRef from the alias
                 let target_link = self.eval_alias(&alias.node);
-                zoon::println!("[DD_EVAL] LinkSetter: alias={:?} -> target_link={:?}", alias.node, target_link);
+                dd_log!("[DD_EVAL] LinkSetter: alias={:?} -> target_link={:?}", alias.node, target_link);
 
                 // Replace any LinkRef in the element with the target
                 let result = if let Value::LinkRef(target_id) = &target_link {
                     let result = self.replace_link_ref_in_value(from, target_id);
-                    zoon::println!("[DD_EVAL] LinkSetter: replaced LinkRef with {}", target_id);
+                    dd_log!("[DD_EVAL] LinkSetter: replaced LinkRef with {}", target_id);
                     result
                 } else if let Value::PlaceholderField(path) = &target_link {
                     // Template evaluation: replace LinkRef with placeholder field value
                     // During cloning/substitution, this will be resolved to the real LinkRef from the data item
                     let result = self.replace_link_ref_with_placeholder(from, path);
-                    zoon::println!("[DD_EVAL] LinkSetter: replaced LinkRef with placeholder field {:?}", path);
+                    dd_log!("[DD_EVAL] LinkSetter: replaced LinkRef with placeholder field {:?}", path);
                     result
                 } else {
                     // If alias doesn't resolve to a LinkRef or PlaceholderField, just pass through unchanged
-                    zoon::println!("[DD_EVAL] LinkSetter: alias did not resolve to LinkRef, passing through unchanged");
+                    dd_log!("[DD_EVAL] LinkSetter: alias did not resolve to LinkRef, passing through unchanged");
                     from.clone()
                 };
 
-                // Task 6.3: Detect element events AFTER LinkSetter (not during Element evaluation)
-                // This ensures we capture the final link ID, not the temporary one
-                if let Value::Tagged { tag, fields } = &result {
-                    if ElementTag::is_element(tag.as_ref()) {
-                        if let Some(Value::Text(t)) = fields.get("_element_type") {
-                            let element_type = t.as_ref();
-                            if let Some(element) = fields.get("element") {
-                                if let Some(event) = element.get("event") {
-                                    // List/append/List/clear bindings are parsed from Boon code; no IO registries.
-                                }
-                            }
-                        }
+                result
+            }
+
+            // Pipe to Alias — check if it's a function name (e.g., `value |> value_container`)
+            Expression::Alias(crate::parser::static_expression::Alias::WithoutPassed { parts, .. }) => {
+                if parts.len() == 1 {
+                    let name = parts[0].as_str();
+                    if self.functions.contains_key(name) {
+                        let args = HashMap::new();
+                        return self.eval_user_function_with_piped(name, from, &args);
                     }
                 }
-
-                result
+                // Not a function — evaluate as normal expression
+                self.eval_expression(&to.node)
             }
 
             // Default
@@ -2555,12 +2999,12 @@ impl BoonDdRuntime {
             if let Some(interval_ms) = self.extract_timer_trigger_from_body(body) {
                 let cell_id = "timer_counter";
                 // NOTE: Do NOT call init_cell here - test expects empty until first tick
-                zoon::println!("[DD_EVAL] Timer-triggered HOLD detected: {} @ {}ms", cell_id, interval_ms);
+                dd_log!("[DD_EVAL] Timer-triggered HOLD detected: {} @ {}ms", cell_id, interval_ms);
 
                 // Task 4.4: Build CellConfig during evaluation (not in interpreter)
                 self.add_cell_config(CellConfig {
                     id: CellId::new(cell_id),
-                    initial: initial.clone(),
+                    initial: Value::Unit, // Unit = "not yet rendered" until first timer tick
                     triggered_by: Vec::new(), // Timer-triggered, no external triggers
                     timer_interval_ms: interval_ms,
                     filter: EventFilter::Any,
@@ -2587,7 +3031,7 @@ impl BoonDdRuntime {
                     || matches!(initial, Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()));
                 let mut has_link_actions = false;
                 if is_boolean_hold {
-                    zoon::println!("[DD_EVAL] is_boolean_hold=true for {}, extracting link actions", cell_id);
+                    dd_log!("[DD_EVAL] is_boolean_hold=true for {}, extracting link actions", cell_id);
                     let bindings = self.extract_bool_set_bindings_with_link_ids(body);
                     for binding in bindings {
                         let mapping = if let Some(keys) = binding.key_filter {
@@ -2611,9 +3055,9 @@ impl BoonDdRuntime {
                     // Also extract toggle event bindings (click |> THEN { state |> Bool/not() })
                     let toggle_bindings = self.extract_toggle_bindings_with_link_ids(body, state_name);
                     for (_event_path, _event_type, link_id) in toggle_bindings {
-                        let link_id = link_id.unwrap_or_else(|| {
-                            panic!("[DD_EVAL] Bug: toggle event must resolve to LinkRef for '{}'", cell_id);
-                        });
+                        let Some(link_id) = link_id else {
+                            continue; // pass 1: forward ref
+                        };
                         self.dataflow_config.add_link_mapping(LinkCellMapping::bool_toggle(
                             link_id,
                             cell_id.clone(),
@@ -2625,24 +3069,41 @@ impl BoonDdRuntime {
                 // Global/cross-cell toggle patterns are not supported in pure DD mode.
                 // These now fail fast inside determine_transform_from_then_body.
 
-                zoon::println!("[DD_EVAL] LINK-triggered HOLD detected: {} with initial {:?}", cell_id, initial);
+                dd_log!("[DD_EVAL] LINK-triggered HOLD detected: {} with initial {:?}", cell_id, initial);
 
                 // Task 4.4: Build CellConfig during evaluation
                 // Determine the transform from the body pattern
                 let mut transform = self.determine_transform(body, state_name);
-                zoon::println!("[DD_EVAL] Determined transform: {:?}", transform);
+                dd_log!("[DD_EVAL] Determined transform: {:?}", transform);
 
-                // Task 7.1: Extract trigger LinkId from body dynamically (no hardcoded fallbacks)
+                // Extract trigger LinkId from body dynamically (no hardcoded fallbacks)
                 let mut triggered_by = if has_link_actions {
                     Vec::new()
+                } else if let Some(latest_mappings) = self.extract_hold_latest_link_mappings(body, state_name) {
+                    // LATEST with per-input arithmetic transforms (e.g., +1 / -1)
+                    dd_log!("[DD_EVAL] LATEST HOLD with {} per-input link mappings for {}", latest_mappings.len(), cell_id);
+                    for (link_id, action) in &latest_mappings {
+                        self.dataflow_config.add_link_mapping(LinkCellMapping::new(
+                            link_id.clone(),
+                            cell_id.clone(),
+                            action.clone(),
+                        ));
+                    }
+                    has_link_actions = true;
+                    transform = StateTransform::Identity;
+                    Vec::new()
+                } else if let Some(id) = self.extract_link_trigger_id(body) {
+                    vec![LinkId::new(&id)]
                 } else {
-                    self.extract_link_trigger_id(body)
-                        .map(|id| vec![LinkId::new(&id)])
-                        .unwrap_or_else(|| {
-                            panic!("[DD_EVAL] Bug: LINK-triggered HOLD missing link id for {}", cell_id);
-                        })
+                    // Complex body (e.g., LATEST with link triggers wrapping THEN).
+                    // The inner LATEST already registers its own link mappings and cell config.
+                    // Use empty triggers — the HOLD cell holds its initial value and
+                    // relies on link actions to update it directly.
+                    dd_log!("[DD_EVAL] Complex HOLD body for {} — using empty triggers (LATEST handles links)", cell_id);
+                    transform = StateTransform::Identity;
+                    Vec::new()
                 };
-                zoon::println!("[DD_EVAL] CellConfig triggered_by: {:?}", triggered_by);
+                dd_log!("[DD_EVAL] CellConfig triggered_by: {:?}", triggered_by);
                 if has_link_actions {
                     transform = StateTransform::Identity;
                     triggered_by = Vec::new();
@@ -2699,15 +3160,7 @@ impl BoonDdRuntime {
 
         for _ in 0..pulse_count {
             // Create runtime with state bound to current value
-            let mut iter_runtime = BoonDdRuntime {
-                variables: self.variables.clone(),
-                functions: self.functions.clone(),
-                passed_context: self.passed_context.clone(),
-                context_path: self.context_path.clone(),
-                dataflow_config: DataflowConfig::new(), // Iteration doesn't accumulate config
-                cell_to_collection: HashMap::new(),
-                latest_cells: self.latest_cells.clone(),
-            };
+            let mut iter_runtime = self.fork();
             iter_runtime.variables.insert(state_name.to_string(), current_state.clone());
 
             // Evaluate the THEN body to get next state
@@ -2730,7 +3183,12 @@ impl BoonDdRuntime {
                 // Check if `to` is Stream/pulses: `count |> Stream/pulses()`
                 if self.is_stream_pulses(&to.node) {
                     if let Value::Number(n) = self.eval_expression(&from.node) {
-                        return (n.0 as i64).max(0);
+                        let count = n.0.trunc();
+                        if count < 0.0 { return 0; }
+                        #[allow(clippy::cast_possible_truncation)]
+                        return if count < i64::MAX as f64 { count as i64 } else {
+                            panic!("[DD_EVAL] Pulse count {} too large", count)
+                        };
                     }
                 }
                 // Recurse into BOTH sides of the pipe
@@ -2778,7 +3236,7 @@ impl BoonDdRuntime {
         event_expr: &Expression,
     ) {
         if let Some(path) = self.extract_linkref_path_from_event(binding, event_expr) {
-            zoon::println!("[DD_EVAL] List/remove parsed on: binding={}, path={:?}", binding, path);
+            dd_log!("[DD_EVAL] List/remove parsed on: binding={}, path={:?}", binding, path);
             self.dataflow_config.set_remove_event_path(list_cell_id, path);
             return;
         }
@@ -3015,9 +3473,9 @@ impl BoonDdRuntime {
                 match &to.node {
                     Expression::Then { body: then_body } => {
                         if let Some(result) = self.extract_bool_literal(&then_body.node) {
-                            let link_id = self.resolve_link_id_from_event_source(&from.node).unwrap_or_else(|| {
-                                panic!("[DD_EVAL] Bug: bool set event must resolve to LinkRef");
-                            });
+                            let Some(link_id) = self.resolve_link_id_from_event_source(&from.node) else {
+                                continue; // pass 1: forward ref
+                            };
                             let action = if result { LinkAction::SetTrue } else { LinkAction::SetFalse };
                             bindings.push(BoolLinkBinding {
                                 link_id,
@@ -3042,9 +3500,9 @@ impl BoonDdRuntime {
                         }
 
                         if !true_keys.is_empty() || !false_keys.is_empty() {
-                            let link_id = self.resolve_link_id_from_event_source(&from.node).unwrap_or_else(|| {
-                                panic!("[DD_EVAL] Bug: key-filtered bool event must resolve to LinkRef");
-                            });
+                            let Some(link_id) = self.resolve_link_id_from_event_source(&from.node) else {
+                                continue; // pass 1: forward ref
+                            };
                             if !true_keys.is_empty() {
                                 bindings.push(BoolLinkBinding {
                                     link_id: link_id.clone(),
@@ -3184,14 +3642,47 @@ impl BoonDdRuntime {
         }
         // Start by looking up the first part in variables
         let first = &path[0];
-        let mut current = self.variables.get(first.as_str())?.clone();
-
-        // Traverse the remaining path
-        for part in &path[1..] {
-            current = current.get(part.as_str())?.clone();
+        if let Some(root) = self.variables.get(first.as_str()) {
+            let mut current = root.clone();
+            // Traverse the remaining path — if traversal fails (e.g., stale value from
+            // a prior pass), fall through to the self-reference fallback below.
+            let mut ok = true;
+            for (i, part) in path[1..].iter().enumerate() {
+                // Handle Placeholder types: build PlaceholderField for remaining path
+                match &current {
+                    Value::Placeholder => {
+                        let remaining: Vec<Arc<str>> = path[1 + i..].iter().map(|p| Arc::from(p.as_str())).collect();
+                        return Some(Value::PlaceholderField(Arc::new(remaining)));
+                    }
+                    Value::PlaceholderField(existing) => {
+                        let mut extended = existing.as_ref().clone();
+                        for p in &path[1 + i..] {
+                            extended.push(Arc::from(p.as_str()));
+                        }
+                        return Some(Value::PlaceholderField(Arc::new(extended)));
+                    }
+                    _ => {}
+                }
+                if let Some(next) = current.get(part.as_str()) {
+                    current = next.clone();
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return Some(current);
+            }
         }
-
-        Some(current)
+        // Self-reference fallback: when inside an object like `store: [input: LINK, ...]`,
+        // a reference to `store.input.event.key_down` has path ["store", "input", ...].
+        // The "store" variable from a prior evaluation pass may be Unit or partial,
+        // so traversal above fails. But "input" is available as a scoped variable
+        // (added during the current object evaluation). Try resolving without the first element.
+        if path.len() > 1 {
+            return self.resolve_field_path(&path[1..]);
+        }
+        None
     }
 
     /// Check if expression is a Bool/not() toggle pattern like `state |> Bool/not()`.
@@ -3259,18 +3750,18 @@ impl BoonDdRuntime {
                         // CRITICAL: Evaluate the `from` expression to get actual LinkRef ID
                         let from_value = self.eval_expression(&from.node);
                         let link_id = if let Value::LinkRef(id) = from_value {
-                            zoon::println!("[DD_EVAL] extract_toggle_bindings_with_link_ids: evaluated to LinkRef({})", id);
+                            dd_log!("[DD_EVAL] extract_toggle_bindings_with_link_ids: evaluated to LinkRef({})", id);
                             Some(id.to_string())
                         } else {
                             None
                         };
 
-                        let (path, event_type) = path_info.unwrap_or_else(|| {
-                            panic!("[DD_EVAL] Bug: toggle event path missing for Bool/not on '{}'", state_name);
-                        });
-                        let link_id = link_id.unwrap_or_else(|| {
-                            panic!("[DD_EVAL] Bug: toggle event must resolve to LinkRef for '{}'", state_name);
-                        });
+                        let Some((path, event_type)) = path_info else {
+                            continue; // pass 1: forward ref
+                        };
+                        let Some(link_id) = link_id else {
+                            continue; // pass 1: forward ref
+                        };
                         toggles.push((path, event_type, Some(link_id)));
                     }
                 }
@@ -3324,7 +3815,7 @@ impl BoonDdRuntime {
                 if matches!(to.node, Expression::Then { .. }) {
                     let from_value = self.eval_expression(&from.node);
                     if let Value::LinkRef(id) = from_value {
-                        zoon::println!("[DD_EVAL] extract_link_trigger_id: found LinkRef({})", id);
+                        dd_log!("[DD_EVAL] extract_link_trigger_id: found LinkRef({})", id);
                         return Some(id.to_string());
                     }
                 }
@@ -3384,19 +3875,7 @@ impl BoonDdRuntime {
                     if path_strs == ["Timer", "interval"] {
                         // Evaluate the Duration
                         let duration = self.eval_expression(&from.node);
-                        let interval_ms = match &duration {
-                            Value::Tagged { tag, fields } if tag.as_ref() == "Duration" => {
-                                if let Some(Value::Number(secs)) = fields.get("seconds") {
-                                    (secs.0 * 1000.0) as u64
-                                } else if let Some(Value::Number(ms)) = fields.get("millis") {
-                                    ms.0 as u64
-                                } else {
-                                    1000
-                                }
-                            }
-                            Value::Number(ms) => ms.0 as u64,
-                            _ => 1000,
-                        };
+                        let interval_ms = duration_to_millis(&duration);
                         let timer_id = format!("timer_{}", interval_ms);
                         return Some((timer_id, interval_ms));
                     }
@@ -3494,9 +3973,11 @@ impl BoonDdRuntime {
     fn extract_latest_event_bindings(&mut self, expr: &Expression) -> Option<Vec<LatestLinkBinding>> {
         if let Expression::Pipe { from, to } = expr {
             if let Expression::Then { body } = &to.node {
-                let link_id = self.resolve_link_id_from_event_source(&from.node).unwrap_or_else(|| {
-                    panic!("[DD_EVAL] LATEST event must resolve to LinkRef for THEN input");
-                });
+                let Some(link_id) = self.resolve_link_id_from_event_source(&from.node) else {
+                    // During pass 1, forward-referenced LINKs evaluate to Unit.
+                    // Skip binding extraction; pass 2 will resolve correctly.
+                    return None;
+                };
                 if matches!(body.node, Expression::Skip) {
                     return Some(Vec::new());
                 }
@@ -3514,17 +3995,17 @@ impl BoonDdRuntime {
                 }]);
             }
             if let Expression::When { arms } = &to.node {
-                let link_id = self.resolve_link_id_from_event_source(&from.node).unwrap_or_else(|| {
-                    panic!("[DD_EVAL] LATEST event must resolve to LinkRef for WHEN input");
-                });
+                let Some(link_id) = self.resolve_link_id_from_event_source(&from.node) else {
+                    return None; // pass 1: forward ref
+                };
                 return Some(self.extract_latest_when_bindings(&link_id, arms));
             }
         }
 
         if self.is_event_text_path(expr) {
-            let link_id = self.resolve_link_id_from_event_text(expr).unwrap_or_else(|| {
-                panic!("[DD_EVAL] LATEST text event must resolve to LinkRef");
-            });
+            let Some(link_id) = self.resolve_link_id_from_event_text(expr) else {
+                return None; // pass 1: forward ref
+            };
             return Some(vec![LatestLinkBinding {
                 link_id,
                 action: LinkAction::SetText,
@@ -3596,67 +4077,6 @@ impl BoonDdRuntime {
     /// - `.event.press` is the event path (stripped)
     ///
     /// We extract `nav.home` → evaluate to LinkRef("link_1") → map to route.
-    fn extract_router_mappings(&mut self, expr: &Expression) {
-        // Phase 11a: Router mappings now go through DD dataflow
-        // This function logs mappings for debugging but doesn't add to global state
-        if let Expression::Latest { inputs } = expr {
-            for input in inputs {
-                // Each input should be: alias.event.press |> THEN { route_text }
-                if let Expression::Pipe { from, to } = &input.node {
-                    if let Expression::Then { body } = &to.node {
-                        // Extract the LinkRef from the FROM side
-                        // For `nav.about.event.press`, we need to get `nav.about` and resolve it
-                        let link_ref = self.extract_link_ref_from_event_path(&from.node);
-                        // Extract the route from the body (e.g., TEXT { /about })
-                        let route = self.eval_expression(&body.node);
-
-                        if let (Some(link_id), Value::Text(route_text)) = (link_ref, route) {
-                            // Phase 11a: Routing now goes through DD - just log for debugging
-                            zoon::println!("[DD_EVAL] Router mapping (DD-routed): link={} -> route={}", link_id, route_text);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Extract a LinkRef ID from an event path like `nav.about.event.press`.
-    ///
-    /// The path `nav.about.event.press` means:
-    /// - `nav.about` is the LINK variable (LinkRef)
-    /// - `.event.press` is the event type (we strip this)
-    ///
-    /// We evaluate `nav.about` to get the LinkRef and return its ID.
-    fn extract_link_ref_from_event_path(&mut self, expr: &Expression) -> Option<String> {
-        match expr {
-            Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
-                // Path like ["nav", "about", "event", "press"]
-                // Find where ".event.press" starts and take everything before it
-                // Find the "event" part and take path up to (but not including) it
-                let event_idx = parts.iter().position(|p| p.as_ref() == "event")?;
-                if event_idx == 0 {
-                    return None; // No link path before "event"
-                }
-
-                // Evaluate the link path to get the LinkRef
-                let mut current = self.variables.get(parts[0].as_ref())?.clone();
-                for field in parts.iter().take(event_idx).skip(1) {
-                    current = current.get(field.as_ref()).cloned().unwrap_or_else(|| {
-                        panic!("[DD_EVAL] Bug: missing field '{}' in link path {:?}", field, parts);
-                    });
-                }
-
-                // Extract the link ID from the LinkRef
-                if let Value::LinkRef(id) = current {
-                    Some(id.to_string())
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
     /// Evaluate LATEST expression - merge multiple reactive inputs.
     ///
     /// LATEST { a, b, c } semantics:
@@ -3678,15 +4098,17 @@ impl BoonDdRuntime {
             }
 
             if self.contains_then_pattern(&input.node) {
-                panic!(
-                    "[DD_EVAL] LATEST event input is not supported; use `event |> THEN {{ value }}` or `event.change.text`"
-                );
+                // During pass 1, event sources may be Unit (forward reference).
+                // extract_latest_event_bindings returned None because LinkRef couldn't
+                // be resolved. Mark as event-driven and skip; pass 2 will resolve.
+                has_events = true;
+                continue;
             }
 
             if self.extract_event_path(&input.node).is_some() {
-                panic!(
-                    "[DD_EVAL] LATEST event input must use THEN or .text; unsupported event expression"
-                );
+                // Same as above: unresolved event path during pass 1.
+                has_events = true;
+                continue;
             }
 
             // Static input - evaluate and use as initial if we haven't found one yet
@@ -3723,9 +4145,10 @@ impl BoonDdRuntime {
                     panic!("[DD_EVAL] LATEST expected collection input");
                 });
                 if let Some(cell_id) = input.cell_id {
+                    self.cell_to_collection.insert(input.id.name(), input.id);
                     return Value::List(CollectionHandle::with_id_and_cell(input.id, cell_id));
                 }
-                return Value::List(CollectionHandle::new_with_id(input.id));
+                return self.collection_value(input.id);
             }
             let mut concat_ids: Vec<CollectionId> = Vec::new();
             for input in &collection_inputs {
@@ -3736,14 +4159,16 @@ impl BoonDdRuntime {
                 panic!("[DD_EVAL] LATEST concat requires at least one collection input");
             });
             let output_id = iter.fold(first, |left, right| self.chain_concat_on_collection(left, right));
-            return Value::List(CollectionHandle::new_with_id(output_id));
+            return self.collection_value(output_id);
         } else if !has_events {
             // All static - return first non-Unit value (current behavior)
             return initial_value;
         }
 
         if bindings.is_empty() {
-            panic!("[DD_EVAL] LATEST contains events but no valid bindings (all SKIP)");
+            // During pass 1, all event sources may be unresolved forward references.
+            // Return Unit; pass 2 will resolve them and produce valid bindings.
+            return Value::Unit;
         }
 
         if initial_value.is_list_like() {
@@ -3787,67 +4212,63 @@ impl BoonDdRuntime {
     /// Evaluate pattern matching for WHEN/WHILE.
     fn eval_pattern_match(&mut self, value: &Value, arms: &[Arm]) -> Value {
         // Debug: log what value type is being pattern matched
-        zoon::println!("[DD_EVAL] eval_pattern_match input: {:?}", value);
+        dd_log!("[DD_EVAL] eval_pattern_match input: {:?}", value);
 
-        // If input is a CellRef, return a WhileRef for reactive rendering
+        // If input is a CellRef, handle reactively
         if let Value::CellRef(cell_id) = value {
-            // Pre-evaluate all arms for the bridge to render reactively
-            // Note: WHILE_PREEVAL_DEPTH hack was removed (Phase 11b) - fine-grained signals
-            // from cell_signal() prevent spurious side effects during pre-evaluation
             let mut evaluated_arms = Vec::new();
             let mut default_value = None;
+            let mut is_alias_only = false;
 
             for arm in arms {
-                // Extract the pattern value (tag or literal) for matching
                 let pattern_value = self.pattern_to_value(&arm.pattern);
 
-                // Check if this is a wildcard (default) pattern
                 if matches!(arm.pattern, Pattern::WildCard) {
-                    // Evaluate the body for the default case
-                    let mut match_runtime = BoonDdRuntime {
-                        variables: self.variables.clone(),
-                        functions: self.functions.clone(),
-                        passed_context: self.passed_context.clone(),
-                        context_path: self.context_path.clone(),
-                        dataflow_config: DataflowConfig::new(),
-                        cell_to_collection: HashMap::new(),
-                        latest_cells: self.latest_cells.clone(),
-                    };
-                    let body_result = match_runtime.eval_expression(&arm.body.node);
+                    let body_result = self.fork_eval_merge(|_| {}, &arm.body.node);
                     default_value = Some(Arc::new(body_result));
                 } else if let Pattern::Alias { name } = &arm.pattern {
-                    // Alias pattern - treat as catch-all but bind the CellRef to the alias name
-                    let mut match_runtime = BoonDdRuntime {
-                        variables: self.variables.clone(),
-                        functions: self.functions.clone(),
-                        passed_context: self.passed_context.clone(),
-                        context_path: self.context_path.clone(),
-                        dataflow_config: DataflowConfig::new(),
-                        cell_to_collection: HashMap::new(),
-                        latest_cells: self.latest_cells.clone(),
-                    };
-                    // Bind the alias name to the CellRef value
-                    match_runtime.variables.insert(name.to_string(), value.clone());
-                    zoon::println!("[DD_EVAL] CellRef WHEN: binding '{}' to CellRef for body evaluation", name);
-                    let body_result = match_runtime.eval_expression(&arm.body.node);
+                    // Alias pattern - bind the CellRef to the alias name
+                    let alias_value = value.clone();
+                    let alias_name = name.to_string();
+                    dd_log!("[DD_EVAL] CellRef WHEN: binding '{}' to CellRef for body evaluation", alias_name);
+                    let body_result = self.fork_eval_merge(|rt| {
+                        rt.variables.insert(alias_name, alias_value);
+                    }, &arm.body.node);
                     default_value = Some(Arc::new(body_result));
+                    is_alias_only = true;
                 } else if let Some(pv) = pattern_value {
-                    // Evaluate the body for this pattern
-                    let mut match_runtime = BoonDdRuntime {
-                        variables: self.variables.clone(),
-                        functions: self.functions.clone(),
-                        passed_context: self.passed_context.clone(),
-                        context_path: self.context_path.clone(),
-                        dataflow_config: DataflowConfig::new(),
-                        cell_to_collection: HashMap::new(),
-                        latest_cells: self.latest_cells.clone(),
-                    };
-                    let body_result = match_runtime.eval_expression(&arm.body.node);
+                    let body_result = self.fork_eval_merge(|_| {}, &arm.body.node);
                     evaluated_arms.push((pv, body_result));
                 }
             }
 
-            zoon::println!("[DD_EVAL] Created WHILE config for hold {} with {} arms", cell_id, evaluated_arms.len());
+            // Optimization: alias-only WHEN (catch-all) on CellRef — return body directly.
+            // No WhileConfig needed since there's no conditional logic.
+            if is_alias_only && evaluated_arms.is_empty() {
+                if let Some(body) = default_value {
+                    dd_log!("[DD_EVAL] CellRef WHEN: alias-only, returning body directly");
+                    return (*body).clone();
+                }
+            }
+
+            // Check if all arms produce DD-scalar values (Text, Number, Bool, Unit).
+            // If so, use ScalarWhen DD operator for efficient dataflow processing.
+            let all_scalar = !evaluated_arms.is_empty()
+                && evaluated_arms.iter().all(|(_, body)| is_dd_scalar(body))
+                && default_value.as_ref().map_or(true, |d| is_dd_scalar(d));
+
+            if all_scalar {
+                if let Some(source_col) = self.try_get_collection_id_for_cellref(cell_id) {
+                    let scalar_arms: Vec<(Value, Value)> = evaluated_arms;
+                    let default = default_value.map(|v| (*v).clone()).unwrap_or(Value::Unit);
+                    dd_log!("[DD_EVAL] CellRef WHEN: creating ScalarWhen with {} arms", scalar_arms.len());
+                    return self.create_scalar_when(source_col, scalar_arms, default);
+                }
+            }
+
+            // Fallback: WhileConfig for bridge rendering (element-producing arms
+            // or when source lacks CollectionId)
+            dd_log!("[DD_EVAL] Created WHILE config for hold {} with {} arms", cell_id, evaluated_arms.len());
 
             let arms_list: Vec<WhileArm> = evaluated_arms
                 .into_iter()
@@ -3866,7 +4287,7 @@ impl BoonDdRuntime {
         if let Value::PlaceholderField(path) = value {
 
             // Pre-evaluate all arms for later substitution
-            // Note: WHILE_PREEVAL_DEPTH hack was removed (Phase 11b) - fine-grained signals
+            // Note: WHILE_PREEVAL_DEPTH hack was removed - fine-grained signals
             // from cell_signal() prevent spurious side effects during pre-evaluation
             let mut evaluated_arms = Vec::new();
             let mut default_value = None;
@@ -3875,33 +4296,15 @@ impl BoonDdRuntime {
                 let pattern_value = self.pattern_to_value(&arm.pattern);
 
                 if matches!(arm.pattern, Pattern::WildCard) {
-                    let mut match_runtime = BoonDdRuntime {
-                        variables: self.variables.clone(),
-                        functions: self.functions.clone(),
-                        passed_context: self.passed_context.clone(),
-                        context_path: self.context_path.clone(),
-                        dataflow_config: DataflowConfig::new(),
-                        cell_to_collection: HashMap::new(),
-                        latest_cells: self.latest_cells.clone(),
-                    };
-                    let body_result = match_runtime.eval_expression(&arm.body.node);
+                    let body_result = self.fork_eval_merge(|_| {}, &arm.body.node);
                     default_value = Some(Arc::new(body_result));
                 } else if let Some(pv) = pattern_value {
-                    let mut match_runtime = BoonDdRuntime {
-                        variables: self.variables.clone(),
-                        functions: self.functions.clone(),
-                        passed_context: self.passed_context.clone(),
-                        context_path: self.context_path.clone(),
-                        dataflow_config: DataflowConfig::new(),
-                        cell_to_collection: HashMap::new(),
-                        latest_cells: self.latest_cells.clone(),
-                    };
-                    let body_result = match_runtime.eval_expression(&arm.body.node);
+                    let body_result = self.fork_eval_merge(|_| {}, &arm.body.node);
                     evaluated_arms.push((pv, body_result));
                 }
             }
 
-            zoon::println!("[DD_EVAL] Created placeholder WHILE config for path with {} arms", evaluated_arms.len());
+            dd_log!("[DD_EVAL] Created placeholder WHILE config for path with {} arms", evaluated_arms.len());
 
             let arms_list: Vec<WhileArm> = evaluated_arms
                 .into_iter()
@@ -3918,9 +4321,19 @@ impl BoonDdRuntime {
         // NOTE: ComputedRef handling was removed in pure DD migration
         // Boolean computations should go through DD operators instead
 
-        // If input is a LinkRef (e.g., element.hovered), create a synthetic hold for boolean state
-        // This handles: element.hovered |> WHILE { True => delete_button, False => NoElement }
+        // If input is a LinkRef, check the pattern type:
+        // - Boolean arms (True/False) → hover state: element.hovered |> WHILE { True => ..., False => ... }
+        // - Key/tag arms (Enter, Escape, etc.) → event filter: event.key_down.key |> WHEN { Enter => ... }
         if let Value::LinkRef(link_id) = value {
+            // Non-boolean patterns (key events, etc.) are event filters handled at the AST level.
+            // Return the LinkRef so downstream code can track the event source.
+            let is_boolean_hover = arms.iter().any(|arm| {
+                matches!(&arm.pattern, Pattern::Literal(Literal::Tag(t))
+                    if t.as_ref() == "True" || t.as_ref() == "False")
+            });
+            if !is_boolean_hover {
+                return value.clone();
+            }
             // Reuse existing hover mapping if present; otherwise allocate a fresh cell id.
             let existing_hover_cell = self.dataflow_config.link_mappings.iter().find_map(|mapping| {
                 if mapping.link_id == *link_id && matches!(mapping.action, LinkAction::HoverState) {
@@ -3947,66 +4360,15 @@ impl BoonDdRuntime {
                 let pattern_value = self.pattern_to_value(&arm.pattern);
 
                 if matches!(arm.pattern, Pattern::WildCard) {
-                    let mut match_runtime = BoonDdRuntime {
-                        variables: self.variables.clone(),
-                        functions: self.functions.clone(),
-                        passed_context: self.passed_context.clone(),
-                        context_path: self.context_path.clone(),
-                        dataflow_config: DataflowConfig::new(),
-                        cell_to_collection: HashMap::new(),
-                        latest_cells: self.latest_cells.clone(),
-                    };
-                    let body_result = match_runtime.eval_expression(&arm.body.node);
+                    let body_result = self.fork_eval_merge(|_| {}, &arm.body.node);
                     default_value = Some(Arc::new(body_result));
                 } else if let Some(pv) = pattern_value {
-                    let mut match_runtime = BoonDdRuntime {
-                        variables: self.variables.clone(),
-                        functions: self.functions.clone(),
-                        passed_context: self.passed_context.clone(),
-                        context_path: self.context_path.clone(),
-                        dataflow_config: DataflowConfig::new(),
-                        cell_to_collection: HashMap::new(),
-                        latest_cells: self.latest_cells.clone(),
-                    };
-                    let body_result = match_runtime.eval_expression(&arm.body.node);
+                    let body_result = self.fork_eval_merge(|_| {}, &arm.body.node);
                     evaluated_arms.push((pv, body_result));
                 }
             }
 
-            // Log what the True arm contains (specifically look for button press LinkRef)
-            for (pattern, body) in &evaluated_arms {
-                if matches!(pattern, Value::Tagged { tag, .. } if BoolTag::is_true(tag.as_ref())) {
-                    // Check if body contains a button with a press LinkRef
-                    fn find_press_link(v: &Value) -> Option<String> {
-                        match v {
-                            Value::Tagged { tag, fields } if ElementTag::is_element(tag.as_ref()) => {
-                                if let Some(element) = fields.get("element") {
-                                    if let Some(event) = element.get("event") {
-                                        if let Some(Value::LinkRef(id)) = event.get("press") {
-                                            return Some(id.to_string());
-                                        }
-                                    }
-                                }
-                                None
-                            }
-                            Value::Object(obj) => {
-                                if let Some(event) = obj.get("event") {
-                                    if let Some(Value::LinkRef(id)) = event.get("press") {
-                                        return Some(id.to_string());
-                                    }
-                                }
-                                None
-                            }
-                            _ => None,
-                        }
-                    }
-                    if let Some(press_link) = find_press_link(body) {
-                        zoon::println!("[DD_EVAL] WhileRef {} True arm button press: {}", cell_id, press_link);
-                    }
-                }
-            }
-
-            zoon::println!("[DD_EVAL] Created WHILE config for LinkRef {} (hover hold: {}) with {} arms", link_id, cell_id, evaluated_arms.len());
+            dd_log!("[DD_EVAL] Created WHILE config for LinkRef {} (hover hold: {}) with {} arms", link_id, cell_id, evaluated_arms.len());
 
             let arms_list: Vec<WhileArm> = evaluated_arms
                 .into_iter()
@@ -4057,16 +4419,7 @@ impl BoonDdRuntime {
 
                         if matches {
                             // Evaluate the body and map from input pattern to body result
-                            let mut match_runtime = BoonDdRuntime {
-                                variables: self.variables.clone(),
-                                functions: self.functions.clone(),
-                                passed_context: self.passed_context.clone(),
-                                context_path: self.context_path.clone(),
-                                dataflow_config: DataflowConfig::new(),
-                                cell_to_collection: HashMap::new(),
-                                latest_cells: self.latest_cells.clone(),
-                            };
-                            let body_result = match_runtime.eval_expression(&arm.body.node);
+                            let body_result = self.fork_eval_merge(|_| {}, &arm.body.node);
                             evaluated_arms.push((input_pattern.clone(), body_result));
                             break;
                         }
@@ -4079,16 +4432,7 @@ impl BoonDdRuntime {
                 // Find matching arm for the default intermediate value
                 for arm in arms {
                     if matches!(arm.pattern, Pattern::WildCard) {
-                        let mut match_runtime = BoonDdRuntime {
-                            variables: self.variables.clone(),
-                            functions: self.functions.clone(),
-                            passed_context: self.passed_context.clone(),
-                            context_path: self.context_path.clone(),
-                            dataflow_config: DataflowConfig::new(),
-                            cell_to_collection: HashMap::new(),
-                            latest_cells: self.latest_cells.clone(),
-                        };
-                        let body_result = match_runtime.eval_expression(&arm.body.node);
+                        let body_result = self.fork_eval_merge(|_| {}, &arm.body.node);
                         default_value = Some(Arc::new(body_result));
                         break;
                     }
@@ -4100,16 +4444,7 @@ impl BoonDdRuntime {
                             _ => &**input_def == pv,
                         };
                         if matches {
-                            let mut match_runtime = BoonDdRuntime {
-                                variables: self.variables.clone(),
-                                functions: self.functions.clone(),
-                                passed_context: self.passed_context.clone(),
-                                context_path: self.context_path.clone(),
-                                dataflow_config: DataflowConfig::new(),
-                                cell_to_collection: HashMap::new(),
-                                latest_cells: self.latest_cells.clone(),
-                            };
-                            let body_result = match_runtime.eval_expression(&arm.body.node);
+                            let body_result = self.fork_eval_merge(|_| {}, &arm.body.node);
                             default_value = Some(Arc::new(body_result));
                             break;
                         }
@@ -4121,23 +4456,14 @@ impl BoonDdRuntime {
             if default_value.is_none() {
                 for arm in arms {
                     if matches!(arm.pattern, Pattern::WildCard) {
-                        let mut match_runtime = BoonDdRuntime {
-                            variables: self.variables.clone(),
-                            functions: self.functions.clone(),
-                            passed_context: self.passed_context.clone(),
-                            context_path: self.context_path.clone(),
-                            dataflow_config: DataflowConfig::new(),
-                            cell_to_collection: HashMap::new(),
-                            latest_cells: self.latest_cells.clone(),
-                        };
-                        let body_result = match_runtime.eval_expression(&arm.body.node);
+                        let body_result = self.fork_eval_merge(|_| {}, &arm.body.node);
                         default_value = Some(Arc::new(body_result));
                         break;
                     }
                 }
             }
 
-            zoon::println!("[DD_EVAL] Chained WHILE config for cell {} with {} arms", cell_id, evaluated_arms.len());
+            dd_log!("[DD_EVAL] Chained WHILE config for cell {} with {} arms", cell_id, evaluated_arms.len());
 
             let arms_list: Vec<WhileArm> = evaluated_arms
                 .into_iter()
@@ -4155,19 +4481,11 @@ impl BoonDdRuntime {
         for arm in arms {
             if let Some(bindings) = self.match_pattern(value, &arm.pattern) {
                 // Create new runtime with pattern bindings
-                let mut match_runtime = BoonDdRuntime {
-                    variables: self.variables.clone(),
-                    functions: self.functions.clone(),
-                    passed_context: self.passed_context.clone(),
-                    context_path: self.context_path.clone(),
-                    dataflow_config: DataflowConfig::new(),
-                    cell_to_collection: HashMap::new(),
-                    latest_cells: self.latest_cells.clone(),
-                };
-                for (name, bound_value) in bindings {
-                    match_runtime.variables.insert(name, bound_value);
-                }
-                return match_runtime.eval_expression(&arm.body.node);
+                return self.fork_eval_merge(|rt| {
+                    for (name, bound_value) in bindings {
+                        rt.variables.insert(name, bound_value);
+                    }
+                }, &arm.body.node);
             }
         }
         Value::Unit
@@ -4301,12 +4619,11 @@ impl BoonDdRuntime {
             Comparator::Equal { operand_a, operand_b } => {
                 let a = self.eval_expression(&operand_a.node);
                 let b = self.eval_expression(&operand_b.node);
-                // Phase 4: DD-native equality comparison
-                // Replaces removed WhileRef and ComputedRef patterns with DD collection operators
+                // DD-native equality comparison using DD collection operators
                 match (&a, &b) {
                     // Collection == Collection => DD Equal operator
                     // Used for: all_completed: completed_list_count == list_count
-                    // Phase 4: Replaces ComputedRef::Equal with DD-native pattern
+                    // DD-native pattern for equality
                     (Value::List(left_handle), Value::List(right_handle)) => {
                         self.create_equal(left_handle.id.clone(), right_handle.id.clone())
                     }
@@ -4321,7 +4638,7 @@ impl BoonDdRuntime {
                     }
                     _ => {
                         #[cfg(debug_assertions)]
-                        zoon::println!("[DD_EVAL] Comparing {:?} == {:?} => {:?}", a, b, a == b);
+                        dd_log!("[DD_EVAL] Comparing {:?} == {:?} => {:?}", a, b, a == b);
                         Value::Bool(a == b)
                     }
                 }
@@ -4348,7 +4665,7 @@ impl BoonDdRuntime {
                 match (&a, &b) {
                     // Collection > 0 => DD GreaterThanZero operator
                     // Used for: show_clear_completed: completed_list_count > 0
-                    // Phase 4: Replaces ComputedRef::GreaterThanZero with DD-native pattern
+                    // DD-native pattern for greater-than-zero
                     (Value::List(handle), Value::Number(n)) if n.0 == 0.0 => {
                         self.create_greater_than_zero(handle.id.clone())
                     }
@@ -4394,15 +4711,40 @@ impl BoonDdRuntime {
             ArithmeticOperator::Subtract { operand_a, operand_b } => {
                 let a = self.eval_expression(&operand_a.node);
                 let b = self.eval_expression(&operand_b.node);
-                zoon::println!("[DD_EVAL] Subtract: a={:?}, b={:?}", a, b);
+                dd_log!("[DD_EVAL] Subtract: a={:?}, b={:?}", a, b);
                 match (&a, &b) {
                     (Value::Number(x), Value::Number(y)) => Value::float(x.0 - y.0),
                     // Collection - Collection => DD Subtract operator
                     // Used for: active_list_count: list_count - completed_list_count
-                    // Phase 4: Replaces ComputedRef::Subtract with DD-native pattern
+                    // DD-native pattern for subtraction
                     (Value::List(left_handle), Value::List(right_handle)) => {
-                        zoon::println!("[DD_EVAL] Creating DD Subtract: {:?} - {:?}", left_handle.id, right_handle.id);
+                        dd_log!("[DD_EVAL] Creating DD Subtract: {:?} - {:?}", left_handle.id, right_handle.id);
                         self.create_subtract(left_handle.id.clone(), right_handle.id.clone())
+                    }
+                    // CellRef - CellRef => collection refs from DD operations (e.g., List/filter)
+                    (Value::CellRef(left_id), Value::CellRef(right_id)) => {
+                        let left_col = self.get_collection_id(&left_id.name()).unwrap_or_else(|| {
+                            panic!("[DD_EVAL] Subtract: CellRef '{}' is not a collection", left_id.name());
+                        });
+                        let right_col = self.get_collection_id(&right_id.name()).unwrap_or_else(|| {
+                            panic!("[DD_EVAL] Subtract: CellRef '{}' is not a collection", right_id.name());
+                        });
+                        dd_log!("[DD_EVAL] Creating DD Subtract from CellRefs: {:?} - {:?}", left_col, right_col);
+                        self.create_subtract(left_col, right_col)
+                    }
+                    // Mixed: List - CellRef
+                    (Value::List(handle), Value::CellRef(cell_id)) => {
+                        let right_col = self.get_collection_id(&cell_id.name()).unwrap_or_else(|| {
+                            panic!("[DD_EVAL] Subtract: CellRef '{}' is not a collection", cell_id.name());
+                        });
+                        self.create_subtract(handle.id.clone(), right_col)
+                    }
+                    // Mixed: CellRef - List
+                    (Value::CellRef(cell_id), Value::List(handle)) => {
+                        let left_col = self.get_collection_id(&cell_id.name()).unwrap_or_else(|| {
+                            panic!("[DD_EVAL] Subtract: CellRef '{}' is not a collection", cell_id.name());
+                        });
+                        self.create_subtract(left_col, handle.id.clone())
                     }
                     _ => {
                         panic!("[DD_EVAL] Subtract expects Number-Number or Collection-Collection, found {:?} - {:?}", a, b);
@@ -4481,16 +4823,20 @@ impl BoonDdRuntime {
                         }
                         // Handle LinkRef.event - create synthetic event object with all event types
                         Value::LinkRef(link_id) if field.as_str() == "event" => {
-                            let link_ref = Value::LinkRef(link_id.clone());
-                            Value::object([
-                                ("press", link_ref.clone()),
-                                ("click", link_ref.clone()),
-                                ("blur", link_ref.clone()),
-                                ("key_down", link_ref.clone()),
-                                ("double_click", link_ref.clone()),
-                                ("change", link_ref.clone()),
-                            ])
+                            Self::build_link_event_object(link_id)
                         }
+                        // Handle Element.event - navigate through nested element.event path
+                        Value::Tagged { tag, fields, .. }
+                            if tag.as_ref() == "Element" && field.as_str() == "event" =>
+                        {
+                            fields
+                                .get("element")
+                                .and_then(|e| e.get("event"))
+                                .cloned()
+                                .unwrap_or(Value::Unit)
+                        }
+                        // Forward references are Unit during pass 1; propagate Unit.
+                        Value::Unit => Value::Unit,
                         _ => current.get(field.as_str()).cloned().unwrap_or_else(|| {
                             panic!("[DD_EVAL] Bug: missing field '{}' on {:?}", field, current);
                         }),
@@ -4528,16 +4874,20 @@ impl BoonDdRuntime {
                         }
                         // Handle LinkRef.event - create synthetic event object with all event types
                         Value::LinkRef(link_id) if field.as_str() == "event" => {
-                            let link_ref = Value::LinkRef(link_id.clone());
-                            Value::object([
-                                ("press", link_ref.clone()),
-                                ("click", link_ref.clone()),
-                                ("blur", link_ref.clone()),
-                                ("key_down", link_ref.clone()),
-                                ("double_click", link_ref.clone()),
-                                ("change", link_ref.clone()),
-                            ])
+                            Self::build_link_event_object(link_id)
                         }
+                        // Handle Element.event - navigate through nested element.event path
+                        Value::Tagged { tag, fields, .. }
+                            if tag.as_ref() == "Element" && field.as_str() == "event" =>
+                        {
+                            fields
+                                .get("element")
+                                .and_then(|e| e.get("event"))
+                                .cloned()
+                                .unwrap_or(Value::Unit)
+                        }
+                        // Forward references are Unit during pass 1; propagate Unit.
+                        Value::Unit => Value::Unit,
                         _ => current.get(field.as_str()).cloned().unwrap_or_else(|| {
                             panic!("[DD_EVAL] Bug: missing field '{}' on {:?}", field, current);
                         }),
@@ -4556,7 +4906,7 @@ impl BoonDdRuntime {
                         let has_cell = self.dataflow_config.cell_initializations.contains_key(name)
                             || self.dataflow_config.cells.iter().any(|cell| cell.id.name() == name.as_str());
                         if has_cell {
-                            zoon::println!("[DD_EVAL] PASSED.{} is reactive list - returning CellRef", name);
+                            dd_log!("[DD_EVAL] PASSED.{} is reactive list - returning CellRef", name);
                             return Value::CellRef(CellId::new(name.as_str()));
                         }
                     }
@@ -4572,27 +4922,26 @@ impl BoonDdRuntime {
     /// This is used by `|> LINK { alias }` to replace the internally-generated
     /// LinkRef (from the element's `LINK` expression) with the stored LinkRef.
     /// Recursively traverses Objects, Lists, and Tagged values.
-    fn replace_link_ref_in_value(&self, value: &Value, target_id: &LinkId) -> Value {
+    /// Walk a Value tree, replacing every LinkRef with the result of `replacer`.
+    /// Shared implementation for replace_link_ref_in_value and replace_link_ref_with_placeholder.
+    fn transform_link_refs(&self, value: &Value, replacer: &dyn Fn() -> Value) -> Value {
         use std::collections::BTreeMap;
 
         match value {
-            // Replace any LinkRef with the target
-            Value::LinkRef(_) => Value::LinkRef(target_id.clone()),
+            Value::LinkRef(_) => replacer(),
 
-            // Recursively process objects
             Value::Object(fields) => {
                 let new_fields: BTreeMap<Arc<str>, Value> = fields
                     .iter()
-                    .map(|(k, v)| (k.clone(), self.replace_link_ref_in_value(v, target_id)))
+                    .map(|(k, v)| (k.clone(), self.transform_link_refs(v, replacer)))
                     .collect();
                 Value::Object(Arc::new(new_fields))
             }
 
-            // Recursively process tagged values
             Value::Tagged { tag, fields } => {
                 let new_fields: BTreeMap<Arc<str>, Value> = fields
                     .iter()
-                    .map(|(k, v)| (k.clone(), self.replace_link_ref_in_value(v, target_id)))
+                    .map(|(k, v)| (k.clone(), self.transform_link_refs(v, replacer)))
                     .collect();
                 Value::Tagged {
                     tag: tag.clone(),
@@ -4605,11 +4954,11 @@ impl BoonDdRuntime {
                     .arms
                     .iter()
                     .map(|arm| WhileArm {
-                        pattern: self.replace_link_ref_in_value(&arm.pattern, target_id),
-                        body: self.replace_link_ref_in_value(&arm.body, target_id),
+                        pattern: self.transform_link_refs(&arm.pattern, replacer),
+                        body: self.transform_link_refs(&arm.body, replacer),
                     })
                     .collect();
-                let default = self.replace_link_ref_in_value(&config.default, target_id);
+                let default = self.transform_link_refs(&config.default, replacer);
                 Value::WhileConfig(Arc::new(WhileConfig {
                     cell_id: config.cell_id.clone(),
                     arms: Arc::new(arms),
@@ -4621,11 +4970,11 @@ impl BoonDdRuntime {
                     .arms
                     .iter()
                     .map(|arm| WhileArm {
-                        pattern: self.replace_link_ref_in_value(&arm.pattern, target_id),
-                        body: self.replace_link_ref_in_value(&arm.body, target_id),
+                        pattern: self.transform_link_refs(&arm.pattern, replacer),
+                        body: self.transform_link_refs(&arm.body, replacer),
                     })
                     .collect();
-                let default = self.replace_link_ref_in_value(&config.default, target_id);
+                let default = self.transform_link_refs(&config.default, replacer);
                 Value::PlaceholderWhile(Arc::new(PlaceholderWhileConfig {
                     field_path: config.field_path.clone(),
                     arms: Arc::new(arms),
@@ -4633,105 +4982,36 @@ impl BoonDdRuntime {
                 }))
             }
 
-            // Other values pass through unchanged
             _ => value.clone(),
         }
+    }
+
+    fn replace_link_ref_in_value(&self, value: &Value, target_id: &LinkId) -> Value {
+        self.transform_link_refs(value, &|| Value::LinkRef(target_id.clone()))
     }
 
     /// Replace any LinkRef in a value with a placeholder field Tagged value.
-    ///
-    /// This is used by `|> LINK { alias }` during template evaluation when the alias
-    /// resolves to a placeholder field (deferred field access). The placeholder
-    /// will be resolved to a real LinkRef during template cloning/substitution.
-    ///
+    /// Used by `|> LINK { alias }` during template evaluation when the alias
+    /// resolves to a placeholder field (deferred field access).
     fn replace_link_ref_with_placeholder(&self, value: &Value, path: &[Arc<str>]) -> Value {
-        use std::collections::BTreeMap;
-
-        match value {
-            // Replace any LinkRef with the placeholder field value
-            Value::LinkRef(_) => {
-                Value::PlaceholderField(Arc::new(path.to_vec()))
-            }
-
-            // Recursively process objects
-            Value::Object(fields) => {
-                let new_fields: BTreeMap<Arc<str>, Value> = fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), self.replace_link_ref_with_placeholder(v, path)))
-                    .collect();
-                Value::Object(Arc::new(new_fields))
-            }
-
-            // Recursively process tagged values
-            Value::Tagged { tag, fields } => {
-                let new_fields: BTreeMap<Arc<str>, Value> = fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), self.replace_link_ref_with_placeholder(v, path)))
-                    .collect();
-                Value::Tagged {
-                    tag: tag.clone(),
-                    fields: Arc::new(new_fields),
-                }
-            }
-
-            Value::WhileConfig(config) => {
-                let arms: Vec<WhileArm> = config
-                    .arms
-                    .iter()
-                    .map(|arm| WhileArm {
-                        pattern: self.replace_link_ref_with_placeholder(&arm.pattern, path),
-                        body: self.replace_link_ref_with_placeholder(&arm.body, path),
-                    })
-                    .collect();
-                let default = self.replace_link_ref_with_placeholder(&config.default, path);
-                Value::WhileConfig(Arc::new(WhileConfig {
-                    cell_id: config.cell_id.clone(),
-                    arms: Arc::new(arms),
-                    default: Box::new(default),
-                }))
-            }
-            Value::PlaceholderWhile(config) => {
-                let arms: Vec<WhileArm> = config
-                    .arms
-                    .iter()
-                    .map(|arm| WhileArm {
-                        pattern: self.replace_link_ref_with_placeholder(&arm.pattern, path),
-                        body: self.replace_link_ref_with_placeholder(&arm.body, path),
-                    })
-                    .collect();
-                let default = self.replace_link_ref_with_placeholder(&config.default, path);
-                Value::PlaceholderWhile(Arc::new(PlaceholderWhileConfig {
-                    field_path: config.field_path.clone(),
-                    arms: Arc::new(arms),
-                    default: Box::new(default),
-                }))
-            }
-
-            // Other values pass through unchanged
-            _ => value.clone(),
-        }
+        self.transform_link_refs(value, &|| Value::PlaceholderField(Arc::new(path.to_vec())))
     }
 
-    /// Compare two Values for equality.
-    /// Handles Tagged comparison by comparing only the tag name.
-    fn values_equal(&self, a: &Value, b: &Value) -> bool {
-        match (a, b) {
-            (Value::Tagged { tag: tag_a, .. }, Value::Tagged { tag: tag_b, .. }) => {
-                tag_a.as_ref() == tag_b.as_ref()
-            }
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Number(a), Value::Number(b)) => a == b,
-            (Value::Text(a), Value::Text(b)) => a.as_ref() == b.as_ref(),
-            (Value::Unit, Value::Unit) => true,
-            _ => false,
-        }
-    }
 }
 
 impl Default for BoonDdRuntime {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Check if a Value is a simple DD scalar (suitable for ScalarWhen output).
+/// Scalars are values that can be stored in a DD cell and displayed as text.
+fn is_dd_scalar(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Text(_) | Value::Number(_) | Value::Bool(_) | Value::Unit
+    )
 }
 
 /// Simple function to evaluate expressions and get the document output.

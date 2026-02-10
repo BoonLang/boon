@@ -5,7 +5,7 @@
     "cl"
   ],
   "store_prompts": null,
-  "supervisor_prompt": "Don't stop until all phases of pure_dd.md are done. Verify with a subagent. Ignore time estimations - continue until done, pure DD everywhere. No fallbacks or transitive code to make code compile before the migration is done. Resolving compilation errors and warning should be done when all others steps are done to not accidentally reintroduce non-pure DD hacks or business logic to the engine (also verify such problems with subagents). ",
+  "supervisor_prompt": "Don't stop until all examples work with pure DD engine.",
   "completion_condition": "+completed+",
   "completion_command": null,
   "protected_patterns": [

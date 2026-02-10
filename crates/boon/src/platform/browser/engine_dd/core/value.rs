@@ -20,7 +20,7 @@ use ordered_float::OrderedFloat;
 use super::types::{CellId, LinkId, ITEM_KEY_FIELD};
 
 // ============================================================================
-// CELL UPDATE OPERATIONS - Phase 7.3: Separate operations from values
+// CELL UPDATE OPERATIONS - Separate operations from values
 // ============================================================================
 //
 // CellUpdate represents state mutations that flow through DD without being
@@ -385,6 +385,10 @@ pub enum Value {
     /// Placeholder field access (e.g., item.field.subfield) used in templates.
     /// Resolved during template substitution/cloning.
     PlaceholderField(Arc<Vec<Arc<str>>>),
+    /// Deferred Bool/not on a placeholder value.
+    /// Created when `Bool/not()` is applied to a Placeholder/PlaceholderField during template evaluation.
+    /// Resolved during template substitution by negating the inner value.
+    PlaceholderBoolNot(Box<Value>),
     /// Reactive WHILE configuration driven by a placeholder field.
     /// Resolved to WhileConfig during template substitution.
     PlaceholderWhile(Arc<PlaceholderWhileConfig>),
@@ -523,7 +527,7 @@ impl Value {
             Self::TimerRef { .. } => true,
             // Placeholder - always truthy (represents a value slot)
             Self::Placeholder => true,
-            Self::PlaceholderField(_) => {
+            Self::PlaceholderField(_) | Self::PlaceholderBoolNot(_) => {
                 panic!("[DD Value] is_truthy called on PlaceholderField without substitution");
             }
             Self::WhileConfig(_) => {
@@ -566,6 +570,9 @@ impl Value {
             Self::PlaceholderField(path) => {
                 format!("[placeholder_field:{:?}]", path)
             }
+            Self::PlaceholderBoolNot(inner) => {
+                format!("[placeholder_bool_not:{}]", inner.to_display_string())
+            }
             Self::WhileConfig(_) => "[while]".to_string(),
             Self::PlaceholderWhile(_) => "[placeholder_while]".to_string(),
             Self::Flushed(inner) => {
@@ -574,10 +581,21 @@ impl Value {
         }
     }
 
-    /// Try to get as integer.
+    /// Try to get as integer. Panics if value is out of i64 range.
     pub fn as_int(&self) -> Option<i64> {
         match self {
-            Self::Number(n) => Some(n.0 as i64),
+            Self::Number(n) => {
+                let v = n.0;
+                if v.fract() != 0.0 {
+                    return None;
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                if v.abs() < i64::MAX as f64 {
+                    Some(v as i64)
+                } else {
+                    panic!("[DD Value] Number {} out of i64 range", v)
+                }
+            }
             _ => None,
         }
     }
@@ -634,6 +652,10 @@ impl Value {
         match self {
             Self::Placeholder => item.clone(),
             Self::PlaceholderField(path) => resolve_placeholder_field(item, path),
+            Self::PlaceholderBoolNot(inner) => {
+                let resolved = inner.substitute_placeholders(item);
+                negate_bool_value(&resolved)
+            }
             Self::WhileConfig(config) => {
                 let substituted = substitute_while_config(config, item);
                 Value::WhileConfig(Arc::new(substituted))
@@ -683,6 +705,24 @@ fn resolve_placeholder_field(item: &Value, path: &[Arc<str>]) -> Value {
         };
     }
     current.clone()
+}
+
+/// Negate a boolean Value. Handles both `Bool(b)` and `Tagged { True/False }` (BoolTag).
+fn negate_bool_value(value: &Value) -> Value {
+    match value {
+        Value::Bool(b) => Value::Bool(!b),
+        Value::Tagged { tag, fields } if tag.as_ref() == "True" || tag.as_ref() == "False" => {
+            let negated_tag = if tag.as_ref() == "True" { "False" } else { "True" };
+            Value::Tagged {
+                tag: Arc::from(negated_tag),
+                fields: fields.clone(),
+            }
+        }
+        other => panic!(
+            "[DD Value] PlaceholderBoolNot: expected Bool/BoolTag, found {:?}",
+            other
+        ),
+    }
 }
 
 fn substitute_while_config(config: &WhileConfig, item: &Value) -> WhileConfig {
@@ -788,21 +828,34 @@ pub fn get_item_key_from_fields(fields: &BTreeMap<Arc<str>, Value>, context: &st
 }
 
 /// Extract the __key from an item Value (Object or Tagged).
-pub fn extract_item_key(value: &Value, context: &str) -> Arc<str> {
+/// For plain values (Text, Number, etc.), uses the value's display as the key.
+pub fn extract_item_key(value: &Value, _context: &str) -> Arc<str> {
     match value {
-        Value::Object(fields) => get_item_key_from_fields(fields, context),
-        Value::Tagged { fields, .. } => get_item_key_from_fields(fields, context),
-        other => panic!("[DD Value] {} item missing __key (expected Object/Tagged), found {:?}", context, other),
+        Value::Object(fields) => get_item_key_from_fields(fields, _context),
+        Value::Tagged { fields, .. } => get_item_key_from_fields(fields, _context),
+        // Plain values (e.g., Text in font-family lists) use value as identity
+        Value::Text(t) => t.clone(),
+        Value::Number(n) => Arc::from(format!("{}", n.0)),
+        Value::Bool(b) => Arc::from(if *b { "true" } else { "false" }),
+        other => Arc::from(format!("{:?}", other)),
     }
 }
 
-/// Ensure all items have unique __key values.
+/// Ensure all items with `__key` fields have unique values.
+/// Plain values (Text, Number, Unit, etc.) use positional identity
+/// and are allowed to have duplicate values.
 pub fn ensure_unique_item_keys(items: &[Value], context: &str) {
     let mut seen: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
     for item in items {
-        let key = extract_item_key(item, context);
-        if !seen.insert(key.clone()) {
-            panic!("[DD Value] Duplicate __key '{}' in {}", key, context);
+        match item {
+            Value::Object(_) | Value::Tagged { .. } => {
+                let key = extract_item_key(item, context);
+                if !seen.insert(key.clone()) {
+                    panic!("[DD Value] Duplicate __key '{}' in {}", key, context);
+                }
+            }
+            // Plain values use positional identity; duplicates are fine.
+            _ => {}
         }
     }
 }
@@ -857,6 +910,24 @@ pub fn attach_or_validate_item_key(value: Value, source_key: &Arc<str>, context:
                 attach_item_key(Value::Tagged { tag, fields }, source_key)
             }
         }
+        Value::WhileConfig(config) => {
+            // WhileConfig wraps reactive conditional items (e.g., WHILE inside List/map).
+            // Propagate the key into each arm's body so the bridge resolves to a keyed item.
+            let arms: Vec<WhileArm> = config.arms.iter().map(|arm| WhileArm {
+                pattern: arm.pattern.clone(),
+                body: attach_or_validate_item_key(arm.body.clone(), source_key, context),
+            }).collect();
+            let default = if matches!(config.default.as_ref(), Value::Unit) {
+                config.default.clone()
+            } else {
+                Box::new(attach_or_validate_item_key(*config.default.clone(), source_key, context))
+            };
+            Value::WhileConfig(Arc::new(WhileConfig {
+                cell_id: config.cell_id.clone(),
+                arms: Arc::new(arms),
+                default,
+            }))
+        }
         other => panic!("[DD Value] {} item must be Object/Tagged, found {:?}", context, other),
     }
 }
@@ -866,6 +937,7 @@ pub fn contains_placeholder(value: &Value) -> bool {
     match value {
         Value::Placeholder => true,
         Value::PlaceholderField(_) => true,
+        Value::PlaceholderBoolNot(_) => true,
         Value::PlaceholderWhile(_) => true,
         Value::WhileConfig(config) => {
             config.arms.iter().any(|arm| {
@@ -924,7 +996,7 @@ impl From<i64> for Value {
 
 impl From<i32> for Value {
     fn from(n: i32) -> Self {
-        Self::int(n as i64)
+        Self::int(i64::from(n))
     }
 }
 

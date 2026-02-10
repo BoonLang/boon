@@ -31,6 +31,16 @@
 /// When enabled, prints detailed information about DD operations.
 pub const LOG_DD_DEBUG: bool = true;
 
+/// Debug logging macro for the DD engine. Only prints when `LOG_DD_DEBUG` is true.
+macro_rules! dd_log {
+    ($($arg:tt)*) => {
+        if $crate::platform::browser::engine_dd::LOG_DD_DEBUG {
+            zoon::println!($($arg)*);
+        }
+    };
+}
+pub(crate) use dd_log;
+
 // Core DD modules (anti-cheat compliant)
 pub mod core;
 pub mod io;
@@ -44,7 +54,7 @@ pub mod render;
 // Re-export commonly used types
 pub use core::{Event, EventValue, Input, Output, Worker, WorkerHandle, CellId, LinkId};
 pub use core::value::{Value, CollectionHandle, CollectionId};
-pub use eval::interpreter::{DdContext, DdResult, run_dd_reactive_with_persistence};
+pub use eval::interpreter::{DdResult, run_dd_reactive_with_persistence};
 pub use eval::evaluator::BoonDdRuntime;
 pub use render::bridge::{render_dd_result_reactive_signal, render_dd_document_reactive_signal};
 pub use io::{clear_dd_persisted_states, clear_cells_memory};

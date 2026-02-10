@@ -29,8 +29,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-// Phase 10: Mutex removed - outputs captured via pure DD channels
-
+#[allow(unused_imports)]
+use super::super::dd_log;
 use zoon::futures_channel::mpsc;
 use zoon::{Task, Timer};
 
@@ -40,32 +40,21 @@ use super::value::{
     ensure_unique_item_keys, extract_item_key,
     CellUpdate, CollectionHandle, CollectionId, TemplateValue, Value,
 };
-use super::collection_ops::{CollectionOp, CollectionOpConfig};
+use super::collection_ops::{CollectionOp, CollectionOpConfig, ComputedTextPart};
 use super::super::io::{
     load_persisted_cell_value_with_collections,
     sync_cell_from_dd,
     sync_cell_from_dd_with_persist,
     sync_list_state_from_dd,
     sync_list_state_from_dd_with_persist,
+    navigate_to_route,
 };
-use super::super::LOG_DD_DEBUG;
 use std::collections::BTreeMap;
-use differential_dataflow::collection::VecCollection;
-
-// Persistent DD Worker (Phase 5)
+// Persistent DD Worker
 use super::dataflow::{
-    build_collection_op_outputs, DdCellConfig, DdCollectionConfig, DdTransform,
-    TaggedCellOutput, inject_event_persistent, drain_outputs_persistent, reinit_if_config_changed,
+    DdCellConfig, DdCollectionConfig, DdTransform,
+    inject_event_persistent, drain_outputs_persistent, reinit_if_config_changed,
 };
-
-/// Enable persistent DD worker mode (Phase 5).
-/// When true, uses a single long-lived Timely worker instead of batch-per-event.
-/// This is the key optimization for true O(delta) complexity.
-///
-/// Template-based transforms (ListAppendWithTemplate, etc.) are now supported via
-/// pre-instantiation BEFORE DD injection. Templates are instantiated with fresh IDs
-/// outside DD, then passed as PreparedItem events for pure DD append.
-const USE_PERSISTENT_WORKER: bool = true;
 
 // ============================================================================
 // PHASE 5: DETERMINISTIC ID COUNTERS
@@ -78,12 +67,18 @@ const USE_PERSISTENT_WORKER: bool = true;
 // Worker calls reset_id_counters() in new() to start each session fresh.
 
 /// Counter for generating unique HOLD IDs for dynamic items.
+///
+/// Global atomic because `allocate_dynamic_cell_id()` is called from helper
+/// functions that don't have a `&mut Worker` reference. Reset per session
+/// via `reset_id_counters()` in `Worker::new()`.
 static DYNAMIC_CELL_COUNTER: AtomicU32 = AtomicU32::new(1000);
 
 /// Counter for generating unique LINK IDs for dynamic items.
+///
+/// Global atomic because `allocate_dynamic_link_id()` is called from helper
+/// functions that don't have a `&mut Worker` reference. Reset per session
+/// via `reset_id_counters()` in `Worker::new()`.
 static DYNAMIC_LINK_COUNTER: AtomicU32 = AtomicU32::new(1000);
-
-// Editing/toggle bindings removed: link actions are now encoded as LinkCellMapping in DataflowConfig.
 
 /// Reset ID counters to starting values (1000).
 /// Called by Worker::new() to ensure deterministic ID generation per session.
@@ -114,6 +109,8 @@ fn list_cell_ids(config: &DataflowConfig) -> HashSet<String> {
             StateTransform::ListAppendWithTemplate { .. }
                 | StateTransform::ListAppendWithTemplateAndClear { .. }
                 | StateTransform::ListAppendFromTemplate { .. }
+                | StateTransform::ListAppendSimple
+                | StateTransform::ListAppendSimpleWithClear { .. }
         ) {
             ids.insert(cell.id.name());
         }
@@ -163,10 +160,17 @@ fn derived_list_outputs(config: &DataflowConfig) -> HashSet<String> {
 }
 
 fn collection_id_for_cell(config: &DataflowConfig, cell_id: &str) -> CollectionId {
+    // Check source collections first (e.g., "todos" → CollectionId)
     config.collection_sources
         .iter()
         .find_map(|(collection_id, source_cell)| {
             if source_cell == cell_id { Some(*collection_id) } else { None }
+        })
+        // Also check collection op outputs (e.g., "collection_33" from Filter/Map/Concat)
+        .or_else(|| {
+            config.collection_ops.iter().find_map(|op| {
+                if op.output_id.to_string() == cell_id { Some(op.output_id) } else { None }
+            })
         })
         .unwrap_or_else(|| {
             panic!("[DD Worker] Missing collection id for list cell '{}'", cell_id);
@@ -196,6 +200,11 @@ fn validate_cell_state_value(
                 panic!("[DD Worker] Collection cell_id mismatch: expected '{}', found '{}'", cell_id, existing);
             }
             Value::List(handle)
+        }
+        Value::Unit => {
+            // Forward reference not yet resolved — return Unit; DD will handle it
+            dd_log!("[DD Worker] List cell '{}' has Unit initial value (forward ref?), skipping validation", cell_id);
+            Value::Unit
         }
         other => {
             panic!(
@@ -654,7 +663,7 @@ fn clone_template_with_fresh_ids_impl(
     match template {
         Value::CellRef(old_id) => {
             // Generate or reuse fresh ID for this CellRef
-            // Phase 5: Use thread-local allocator for deterministic IDs
+            // Use thread-local allocator for deterministic IDs
             let new_id = cell_id_map
                 .entry(old_id.name())
                 .or_insert_with(allocate_dynamic_cell_id)
@@ -663,7 +672,7 @@ fn clone_template_with_fresh_ids_impl(
         }
         Value::LinkRef(old_id) => {
             // Generate or reuse fresh ID for this LinkRef
-            // Phase 5: Use thread-local allocator for deterministic IDs
+            // Use thread-local allocator for deterministic IDs
             let new_id = link_id_map
                 .entry(old_id.name().to_string())
                 .or_insert_with(allocate_dynamic_link_id)
@@ -815,6 +824,44 @@ fn find_hover_while_cell_id(
     None
 }
 
+/// Extract hover link/cell IDs from an element template and pre-populate ID mappings.
+/// This ensures hover WHILE holds get fresh cell IDs before template cloning.
+/// Returns (hover_link_old_id, hover_cell_old_id) for downstream initialization.
+fn pre_populate_hover_mappings(
+    elem: &Value,
+    cell_id_map: &mut HashMap<String, String>,
+    link_id_map: &mut HashMap<String, String>,
+    initial_collections: &HashMap<CollectionId, Vec<Value>>,
+) -> (Option<String>, Option<String>) {
+    let hover_link_old_id = if let Value::Tagged { fields, .. } = elem {
+        fields.get("element")
+            .and_then(|e| e.get("hovered"))
+            .and_then(|h| match h {
+                Value::LinkRef(id) => Some(id.name().to_string()),
+                _ => None,
+            })
+    } else {
+        None
+    };
+
+    let hover_cell_old_id = if let Value::Tagged { fields, .. } = elem {
+        find_hover_while_cell_id(fields.get("items"), initial_collections)
+    } else {
+        None
+    };
+
+    if let (Some(old_link), Some(old_hold)) = (&hover_link_old_id, &hover_cell_old_id) {
+        link_id_map
+            .entry(old_link.clone())
+            .or_insert_with(allocate_dynamic_link_id);
+        let new_hover_cell = allocate_dynamic_cell_id();
+        cell_id_map.insert(old_hold.clone(), new_hover_cell.clone());
+        dd_log!("[DD Worker] Pre-mapped hover hold: {} -> {}", old_hold, new_hover_cell);
+    }
+
+    (hover_link_old_id, hover_cell_old_id)
+}
+
 /// Build a stable item key from an optional identity link id.
 /// Fail-fast if identity_path is missing or doesn't resolve.
 fn build_item_key(identity_link_id: Option<&str>, identity_path: &[String], context: &str) -> String {
@@ -824,6 +871,16 @@ fn build_item_key(identity_link_id: Option<&str>, identity_path: &[String], cont
         panic!("Bug: missing identity path in {}", context);
     } else {
         panic!("Bug: identity path {:?} did not resolve to LinkRef in {}", identity_path, context);
+    }
+}
+
+/// Check if a persisted value is a stripped LinkRef structure that should not be overlaid.
+/// Returns true for Unit values or Objects where all values are Unit (stripped LinkRef objects).
+fn is_stripped_linkref_value(value: &Value) -> bool {
+    match value {
+        Value::Unit => true,
+        Value::Object(fields) => !fields.is_empty() && fields.values().all(|v| matches!(v, Value::Unit)),
+        _ => false,
     }
 }
 
@@ -965,7 +1022,8 @@ fn compute_bulk_remove_diff(
                 if !template.contains_placeholder() {
                     panic!("[DD BulkRemove] predicate_template must reference item data via Placeholder");
                 }
-                let substituted = template.substitute_placeholders(item);
+                let resolved_item = super::dataflow::resolve_item_cellrefs(item, cell_states);
+                let substituted = template.substitute_placeholders(&resolved_item);
                 if contains_placeholder(&substituted) {
                     panic!(
                         "[DD BulkRemove] predicate_template substitution left Placeholder in {:?}",
@@ -1137,7 +1195,7 @@ pub fn reconstruct_persisted_item(
         return None;
     };
 
-    zoon::println!("[DD Reconstruct] Persisted item fields: {:?}", persisted_fields.keys().collect::<Vec<_>>());
+    dd_log!("[DD Reconstruct] Persisted item fields: {:?}", persisted_fields.keys().collect::<Vec<_>>());
 
     // Extract field-to-hold mapping from data template
     let field_to_hold = extract_field_to_hold_map(data_template);
@@ -1175,17 +1233,28 @@ pub fn reconstruct_persisted_item(
             .unwrap_or_else(|| {
                 panic!("[DD Reconstruct] Missing persisted field '{}' for hold {}", field_name, old_id);
             });
-        zoon::println!("[DD Reconstruct] Registering HOLD: {} -> {} = {:?} (field: {:?})",
+        dd_log!("[DD Reconstruct] Registering HOLD: {} -> {} = {:?} (field: {:?})",
             old_id, new_id, initial_value, field_name);
         initializations.push((new_id.clone(), initial_value));
     }
 
     // Overlay persisted values for non-HOLD fields (e.g., nested collections).
+    // Skip fields that are:
+    // - HOLD fields (handled via initializations above)
+    // - __key field (gets rewritten by attach_item_key)
+    // - Stripped LinkRef structures (Unit or Object of Units from already-instantiated items)
     data_item = match data_item {
         Value::Object(fields) => {
             let mut new_fields = (*fields).clone();
             for (field_name, persisted_value) in persisted_fields.iter() {
                 if field_to_hold.contains_key(field_name.as_ref()) {
+                    continue;
+                }
+                if field_name.as_ref() == super::types::ITEM_KEY_FIELD {
+                    continue;
+                }
+                if is_stripped_linkref_value(persisted_value) {
+                    dd_log!("[DD Reconstruct] Skipping stripped field '{}' (keeping template LinkRefs)", field_name);
                     continue;
                 }
                 new_fields.insert(field_name.clone(), persisted_value.clone());
@@ -1196,6 +1265,13 @@ pub fn reconstruct_persisted_item(
             let mut new_fields = (*fields).clone();
             for (field_name, persisted_value) in persisted_fields.iter() {
                 if field_to_hold.contains_key(field_name.as_ref()) {
+                    continue;
+                }
+                if field_name.as_ref() == super::types::ITEM_KEY_FIELD {
+                    continue;
+                }
+                if is_stripped_linkref_value(persisted_value) {
+                    dd_log!("[DD Reconstruct] Skipping stripped field '{}' (keeping template LinkRefs)", field_name);
                     continue;
                 }
                 new_fields.insert(field_name.clone(), persisted_value.clone());
@@ -1210,45 +1286,15 @@ pub fn reconstruct_persisted_item(
         }
     };
 
-    zoon::println!("[DD Reconstruct] Created item with {} HOLDs, {} LINKs",
+    dd_log!("[DD Reconstruct] Created item with {} HOLDs, {} LINKs",
         cell_id_map.len(), link_id_map.len());
 
     // Clone element template if provided
     let new_element = element_template.map(|elem_tmpl| {
         let elem_tmpl = elem_tmpl.as_value();
-        // Find the hover link in the element template BEFORE cloning
-        let hover_link_old_id = if let Value::Tagged { fields, .. } = elem_tmpl {
-            fields.get("element")
-                .and_then(|e| e.get("hovered"))
-                .and_then(|h| match h {
-                    Value::LinkRef(id) => Some(id.name().to_string()),
-                    _ => None,
-                })
-        } else {
-            None
-        };
-
-        // Find the WhileRef for hover
-        let hover_cell_old_id = if let Value::Tagged { fields, .. } = elem_tmpl {
-            find_hover_while_cell_id(fields.get("items"), initial_collections)
-        } else {
-            None
-        };
-
-        // Pre-populate hover hold mapping BEFORE cloning
-        // The hover WhileRef uses a synthetic hold; map it to a fresh cell id
-        if let (Some(old_link), Some(old_hold)) = (&hover_link_old_id, &hover_cell_old_id) {
-            // First ensure the link gets a new ID
-            // Phase 5: Use thread-local allocator for deterministic IDs
-            let new_link_id = link_id_map
-                .entry(old_link.clone())
-                .or_insert_with(allocate_dynamic_link_id)
-                .clone();
-            // Then create the hover hold mapping: old hover cell → fresh cell id
-            let new_hover_cell = allocate_dynamic_cell_id();
-            cell_id_map.insert(old_hold.clone(), new_hover_cell.clone());
-            zoon::println!("[DD Reconstruct Persisted] Pre-mapped hover hold: {} -> {}", old_hold, new_hover_cell);
-        }
+        let (hover_link_old_id, hover_cell_old_id) = pre_populate_hover_mappings(
+            elem_tmpl, &mut cell_id_map, &mut link_id_map, initial_collections,
+        );
 
         // Clone element template - reuses the same ID mapping
         // Pass data_item as context to resolve PlaceholderFields (e.g., double_click LinkRefs)
@@ -1264,7 +1310,7 @@ pub fn reconstruct_persisted_item(
         // Initialize hover hold to false if present.
         if let (Some(old_link), Some(old_hold)) = (hover_link_old_id, hover_cell_old_id) {
             if let (Some(new_link), Some(new_hold)) = (link_id_map.get(&old_link), cell_id_map.get(&old_hold)) {
-                zoon::println!("[DD Reconstruct] Initializing HoverState: {} -> {}", new_link, new_hold);
+                dd_log!("[DD Reconstruct] Initializing HoverState: {} -> {}", new_link, new_hold);
                 initializations.push((new_hold.clone(), Value::Bool(false)));
             }
         }
@@ -1308,7 +1354,10 @@ pub fn instantiate_fresh_item(
     identity_path: &[String],
     initial_cell_values: &HashMap<String, Value>,
     initial_collections: &mut HashMap<CollectionId, Vec<Value>>,
+    per_item_cell_values: Option<&HashMap<String, Value>>,
 ) -> Option<InstantiatedItem> {
+    dd_log!("[DD Worker] instantiate_fresh_item: identity_path={:?}, fresh_item={:?}", identity_path, fresh_item);
+    dd_log!("[DD Worker] instantiate_fresh_item: element_template={:?}", element_template.map(|t| t.as_value()));
     let mut cell_id_map: HashMap<String, String> = HashMap::new();
     let mut link_id_map: HashMap<String, String> = HashMap::new();
     let mut collection_id_map: HashMap<CollectionId, CollectionId> = HashMap::new();
@@ -1323,23 +1372,26 @@ pub fn instantiate_fresh_item(
     );
     let mut initializations: Vec<(String, Value)> = Vec::new();
 
-    // Initialize HOLDs from the fresh item's values
-    // For fresh items, we can extract values directly from CellRefs in the original
+    // Initialize HOLDs from the fresh item's values.
+    // Per-item cell values (if available) take priority over global initial_cell_values
+    // because multiple items from the same template share cell IDs but may have
+    // different initial values (e.g., different titles in a todo list).
     if let Value::Object(obj) = fresh_item {
         for (field_name, value) in obj.iter() {
             match value {
                 Value::CellRef(old_cell_id) => {
-                    // Get current value of this hold and initialize the new hold with it
                     let old_cell_name = old_cell_id.name();
                     let new_cell_id = cell_id_map.get(&old_cell_name).unwrap_or_else(|| {
                         panic!("[DD Worker] Bug: missing fresh cell id for {}", old_cell_name);
                     });
-                    let current_value = initial_cell_values.get(&old_cell_name).unwrap_or_else(|| {
-                        panic!("[DD Worker] Bug: missing initial value for template hold {}", old_cell_name);
-                    });
-                    if LOG_DD_DEBUG {
-                        zoon::println!("[DD Worker] instantiate_fresh_item: field {} hold {} -> {}, value={:?}", field_name, old_cell_name, new_cell_id, current_value);
-                    }
+                    // Prefer per-item snapshot over global values
+                    let current_value = per_item_cell_values
+                        .and_then(|piv| piv.get(&old_cell_name))
+                        .or_else(|| initial_cell_values.get(&old_cell_name))
+                        .unwrap_or_else(|| {
+                            panic!("[DD Worker] Bug: missing initial value for template hold {}", old_cell_name);
+                        });
+                    dd_log!("[DD Worker] instantiate_fresh_item: field {} hold {} -> {}, value={:?}", field_name, old_cell_name, new_cell_id, current_value);
                     initializations.push((new_cell_id.clone(), current_value.clone()));
                 }
                 Value::Object(_) => {}
@@ -1351,36 +1403,9 @@ pub fn instantiate_fresh_item(
     // Clone element template if provided
     let new_element = element_template.map(|elem_tmpl| {
         let elem_tmpl = elem_tmpl.as_value();
-        // Find the hover link in the element template BEFORE cloning
-        let hover_link_old_id = if let Value::Tagged { fields, .. } = elem_tmpl {
-            fields.get("element")
-                .and_then(|e| e.get("hovered"))
-                .and_then(|h| match h {
-                    Value::LinkRef(id) => Some(id.name().to_string()),
-                    _ => None,
-                })
-        } else {
-            None
-        };
-
-        // Find the WhileRef for hover
-        let hover_cell_old_id = if let Value::Tagged { fields, .. } = elem_tmpl {
-            find_hover_while_cell_id(fields.get("items"), initial_collections)
-        } else {
-            None
-        };
-
-        // Pre-populate hover hold mapping BEFORE cloning
-        // Phase 5: Use thread-local allocator for deterministic IDs
-        if let (Some(old_link), Some(old_hold)) = (&hover_link_old_id, &hover_cell_old_id) {
-            let new_link_id = link_id_map
-                .entry(old_link.clone())
-                .or_insert_with(allocate_dynamic_link_id)
-                .clone();
-            let new_hover_cell = allocate_dynamic_cell_id();
-            cell_id_map.insert(old_hold.clone(), new_hover_cell.clone());
-            if LOG_DD_DEBUG { zoon::println!("[DD Worker] instantiate_fresh_item: Pre-mapped hover hold: {} -> {}", old_hold, new_hover_cell); }
-        }
+        let (hover_link_old_id, hover_cell_old_id) = pre_populate_hover_mappings(
+            elem_tmpl, &mut cell_id_map, &mut link_id_map, initial_collections,
+        );
 
         // Clone element template with same ID mappings
         let cloned_element = clone_template_with_fresh_ids_with_context(
@@ -1395,7 +1420,7 @@ pub fn instantiate_fresh_item(
         // Initialize hover hold to false if present.
         if let (Some(old_link), Some(old_hold)) = (hover_link_old_id, hover_cell_old_id) {
             if let (Some(new_link), Some(new_hold)) = (link_id_map.get(&old_link), cell_id_map.get(&old_hold)) {
-                if LOG_DD_DEBUG { zoon::println!("[DD Worker] instantiate_fresh_item: Initializing HoverState: {} -> {}", new_link, new_hold); }
+                dd_log!("[DD Worker] instantiate_fresh_item: Initializing HoverState: {} -> {}", new_link, new_hold);
                 initializations.push((new_hold.clone(), Value::Bool(false)));
             }
         }
@@ -1480,37 +1505,9 @@ pub fn instantiate_template(
     // Clone element template if present
     let element = template.element_template.as_ref().map(|elem| {
         let elem = elem.as_value();
-        // Find hover link/hold before cloning (needed for HoverState action)
-        let hover_link_old_id = if let Value::Tagged { fields, .. } = elem {
-            fields.get("element")
-                .and_then(|e| e.get("hovered"))
-                .and_then(|h| match h {
-                    Value::LinkRef(id) => Some(id.name().to_string()),
-                    _ => None,
-                })
-        } else {
-            None
-        };
-        let hover_cell_old_id = if let Value::Tagged { fields, .. } = elem {
-            find_hover_while_cell_id(fields.get("items"), initial_collections)
-        } else {
-            None
-        };
-
-        // Pre-populate hover hold mapping BEFORE cloning
-        // The hover WhileRef uses a synthetic hold; map it to a fresh cell id
-        if let (Some(old_link), Some(old_hold)) = (&hover_link_old_id, &hover_cell_old_id) {
-            // First ensure the link gets a new ID
-            // Phase 5: Use thread-local allocator for deterministic IDs
-            let new_link_id = link_id_map
-                .entry(old_link.clone())
-                .or_insert_with(allocate_dynamic_link_id)
-                .clone();
-            // Then create the hover hold mapping: old hover cell → fresh cell id
-            let new_hover_cell = allocate_dynamic_cell_id();
-            cell_id_map.insert(old_hold.clone(), new_hover_cell.clone());
-            zoon::println!("[DD Instantiate] Pre-mapped hover hold: {} -> {}", old_hold, new_hover_cell);
-        }
+        let (hover_link_old_id, hover_cell_old_id) = pre_populate_hover_mappings(
+            elem, &mut cell_id_map, &mut link_id_map, initial_collections,
+        );
 
         // Pass cloned data as context to resolve PlaceholderFields (e.g., double_click LinkRefs)
         let cloned = clone_template_with_fresh_ids_with_context(
@@ -1716,13 +1713,11 @@ pub fn remap_link_mappings_for_item(
                 }
             }
             _ => {
-                let new_cell_id = cell_id_map.get(&mapping.cell_id.name()).unwrap_or_else(|| {
-                    panic!(
-                        "[DD Instantiate] Bug: missing new cell id for {}",
-                        mapping.cell_id.name()
-                    );
-                });
-                new_mapping.cell_id = super::types::CellId::new(new_cell_id);
+                // Remap cell id if present in map; otherwise keep the original
+                // (global cells like LATEST-derived IDs don't need remapping)
+                if let Some(new_cell_id) = cell_id_map.get(&mapping.cell_id.name()) {
+                    new_mapping.cell_id = super::types::CellId::new(new_cell_id);
+                }
             }
         }
 
@@ -1738,7 +1733,7 @@ pub struct WorkerHandle {
     /// Input channel for injecting events
     event_input: Input<Event>,
     /// Task handle to keep the async event loop alive
-    _task_handle: zoon::TaskHandle,
+    task_handle: zoon::TaskHandle,
 }
 
 impl WorkerHandle {
@@ -1749,9 +1744,8 @@ impl WorkerHandle {
 
     /// Split the handle into (event_input, task_handle).
     ///
-    /// Phase 6: Output channel removed - worker writes directly to CELL_STATES.
     pub fn split(self) -> (Input<Event>, zoon::TaskHandle) {
-        (self.event_input, self._task_handle)
+        (self.event_input, self.task_handle)
     }
 }
 
@@ -1783,7 +1777,6 @@ pub struct DocumentUpdate {
 }
 
 // Note: EventFilter is now defined in types.rs and re-exported via mod.rs
-// Phase 3.3: Consolidated with DdEventFilter
 
 /// Type of state transformation to apply.
 #[derive(Clone, Debug)]
@@ -1823,6 +1816,14 @@ pub enum StateTransform {
     ListAppendFromTemplate {
         /// The template to instantiate
         template: ListItemTemplate,
+    },
+
+    /// Append raw event text value as a simple list item (no template).
+    /// For lists with only append+clear and no per-item reactivity.
+    ListAppendSimple,
+    /// Append raw event text value or clear on unit event (no template).
+    ListAppendSimpleWithClear {
+        clear_link_id: String,
     },
 }
 
@@ -1921,12 +1922,15 @@ pub struct DataflowConfig {
     pub collection_sources: HashMap<CollectionId, String>,
 
     // ========================================================================
-    // Phase 7.3: Registry fields moved to DataflowConfig
-    // These replace the thread_local registries in outputs.rs
+    // Registry fields (replace the thread_local registries in outputs.rs)
     // ========================================================================
 
     /// Route cells that should be initialized from the browser path.
     pub route_cells: HashSet<String>,
+
+    /// Cells whose updates trigger browser navigation (Router/go_to).
+    /// When these cells change, the worker pushes the new URL and fires ROUTE_CHANGE_LINK_ID.
+    pub go_to_cells: HashSet<String>,
 
     /// Remove event paths per list cell: path from item to LinkRef that triggers removal.
     /// Parsed from List/remove(item, on: item.X.Y.event.press) → ["X", "Y"]
@@ -1947,6 +1951,12 @@ pub struct DataflowConfig {
     /// Element templates for list rendering keyed by list cell id.
     /// Populated when List/map registers element templates.
     pub list_element_templates: HashMap<String, TemplateValue>,
+
+    /// Per-item cell initial values for list collections.
+    /// When a list literal evaluates function calls that create HOLDs with shared cell IDs,
+    /// each item may have different initial values for those cells. This stores per-item
+    /// snapshots so `instantiate_fresh_item` can use the correct value for each item.
+    pub per_item_cell_values: HashMap<CollectionId, Vec<HashMap<String, Value>>>,
 }
 
 /// Template info for pre-instantiation (O(delta) optimization).
@@ -1968,19 +1978,43 @@ impl DataflowConfig {
             collection_ops: Vec::new(),
             initial_collections: HashMap::new(),
             collection_sources: HashMap::new(),
-            // Phase 7.3: Registry fields
+            // Registry fields
             route_cells: HashSet::new(),
+            go_to_cells: HashSet::new(),
             remove_event_paths: HashMap::new(),
             bulk_remove_bindings: Vec::new(),
             list_append_bindings: Vec::new(),
             list_item_templates: HashMap::new(),
             list_element_templates: HashMap::new(),
+            per_item_cell_values: HashMap::new(),
         }
     }
 
+    /// Merge another DataflowConfig into this one.
+    /// Used when a forked runtime (e.g., WHILE arm pre-evaluation) creates
+    /// cells, collections, or link mappings that must be registered in the
+    /// parent's config to be processed by the worker.
+    pub fn merge_from(&mut self, other: DataflowConfig) {
+        self.cells.extend(other.cells);
+        self.cell_initializations.extend(other.cell_initializations);
+        self.link_mappings.extend(other.link_mappings);
+        self.collection_ops.extend(other.collection_ops);
+        for (coll_id, items) in other.initial_collections {
+            self.initial_collections.entry(coll_id).or_insert(items);
+        }
+        self.collection_sources.extend(other.collection_sources);
+        self.route_cells.extend(other.route_cells);
+        self.go_to_cells.extend(other.go_to_cells);
+        self.remove_event_paths.extend(other.remove_event_paths);
+        self.bulk_remove_bindings.extend(other.bulk_remove_bindings);
+        self.list_append_bindings.extend(other.list_append_bindings);
+        self.list_item_templates.extend(other.list_item_templates);
+        self.list_element_templates.extend(other.list_element_templates);
+        self.per_item_cell_values.extend(other.per_item_cell_values);
+    }
+
     // ========================================================================
-    // Phase 7.3: Registry field setters
-    // These replace the set_* functions in outputs.rs
+    // Registry field setters (replace the set_* functions in outputs.rs)
     // ========================================================================
 
     /// Register a route cell to initialize from current browser path.
@@ -1988,7 +2022,13 @@ impl DataflowConfig {
         self.route_cells.insert(cell_id.into());
     }
 
+    /// Register a go_to cell (Router/go_to input).
+    pub fn add_go_to_cell(&mut self, cell_id: impl Into<String>) {
+        self.go_to_cells.insert(cell_id.into());
+    }
+
     /// Register a non-HOLD cell initialization.
+    /// Allows overwrite for two-pass evaluation (pass 2 overwrites pass 1).
     pub fn add_cell_initialization(
         &mut self,
         cell_id: impl Into<String>,
@@ -1996,12 +2036,6 @@ impl DataflowConfig {
         persist: bool,
     ) {
         let cell_id = cell_id.into();
-        if self.cell_initializations.contains_key(&cell_id) {
-            panic!(
-                "[DD Config] Duplicate cell initialization for '{}'",
-                cell_id
-            );
-        }
         self.cell_initializations.insert(
             cell_id,
             CellInitialization { value, persist },
@@ -2014,14 +2048,9 @@ impl DataflowConfig {
     }
 
     /// Register a list item template for a list cell.
+    /// Allows overwrite for two-pass evaluation (pass 2 overwrites pass 1).
     pub fn set_list_item_template(&mut self, list_cell_id: impl Into<String>, template: ListItemTemplate) {
         let list_cell_id = list_cell_id.into();
-        if self.list_item_templates.contains_key(&list_cell_id) {
-            panic!(
-                "[DD Config] Duplicate list item template for '{}'",
-                list_cell_id
-            );
-        }
         self.list_item_templates.insert(list_cell_id, template);
     }
 
@@ -2031,27 +2060,23 @@ impl DataflowConfig {
     }
 
     /// Register an element template for a list cell.
+    /// Allows overwrite for two-pass evaluation (pass 2 overwrites pass 1).
     pub fn set_list_element_template(&mut self, list_cell_id: impl Into<String>, template: TemplateValue) {
         let list_cell_id = list_cell_id.into();
-        if self.list_element_templates.contains_key(&list_cell_id) {
-            panic!(
-                "[DD Config] Duplicate list element template for '{}'",
-                list_cell_id
-            );
-        }
         self.list_element_templates.insert(list_cell_id, template);
     }
 
-    /// Attach any known element templates to list item templates (fail-fast if missing).
+    /// Attach any known element templates to list item templates.
+    /// Skips entries where the element template is provided through collection_ops
+    /// (e.g., chained retain → map operations).
     pub fn attach_list_element_templates(&mut self) {
         for (list_cell_id, template) in self.list_item_templates.iter_mut() {
             if template.element_template.is_some() {
                 continue;
             }
-            let element_template = self.list_element_templates.get(list_cell_id).unwrap_or_else(|| {
-                panic!("[DD Config] Missing element template for list '{}'", list_cell_id);
-            });
-            template.element_template = Some(element_template.clone());
+            if let Some(element_template) = self.list_element_templates.get(list_cell_id) {
+                template.element_template = Some(element_template.clone());
+            }
         }
     }
 
@@ -2131,18 +2156,16 @@ impl DataflowConfig {
                     // Idempotent add - mapping already present.
                     return;
                 }
-                if existing.key_filter.is_none() || mapping.key_filter.is_none() {
-                    let allow_set_text_with_keys =
-                        (existing.key_filter.is_none()
-                            && matches!(existing.action, super::types::LinkAction::SetText)
-                            && mapping.key_filter.is_some())
-                        || (mapping.key_filter.is_none()
-                            && matches!(mapping.action, super::types::LinkAction::SetText)
-                            && existing.key_filter.is_some());
-                    if allow_set_text_with_keys {
-                        // Allow SetText (text events) to coexist with key-filtered mappings.
-                        continue;
-                    }
+                if existing.key_filter.is_none() != mapping.key_filter.is_none() {
+                    // One mapping has a key_filter and the other doesn't — they handle
+                    // different event types from the same element LINK:
+                    // - key_down with Enter/Escape filter + blur/press without filter → both valid
+                    // - SetText (text events) + key-filtered mapping → both valid
+                    continue;
+                }
+                if existing.key_filter.is_none() && mapping.key_filter.is_none()
+                    && existing.action != mapping.action
+                {
                     panic!(
                         "[DD Config] Conflicting link mappings for link '{}', cell '{}': {:?} vs {:?}",
                         mapping.link_id.name(),
@@ -2168,7 +2191,7 @@ impl DataflowConfig {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Phase 4: Collection operation builders
+    // Collection operation builders
     // ══════════════════════════════════════════════════════════════════════════
 
     /// Register an initial collection (list literal).
@@ -2335,8 +2358,7 @@ impl DataflowConfig {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Phase 4: Arithmetic/Comparison Operation Helpers
-    // Replaces: ComputedRef::Subtract, ComputedRef::GreaterThanZero, ComputedRef::Equal
+    // Arithmetic/Comparison Operation Helpers
     // ══════════════════════════════════════════════════════════════════════════
 
     /// Add a subtract operation (left - right).
@@ -2374,6 +2396,42 @@ impl DataflowConfig {
             output_id: output_id.clone(),
             source_id: left_source,
             op: CollectionOp::Equal { right_source },
+        });
+        output_id
+    }
+
+    /// Add a scalar pattern-match operation.
+    /// Used for reactive WHEN on scalar cells (e.g., count |> WHEN { 1 => "", __ => "s" }).
+    pub fn add_scalar_when(
+        &mut self,
+        source_id: CollectionId,
+        arms: Vec<(Value, Value)>,
+        default: Value,
+    ) -> CollectionId {
+        let output_id = CollectionId::new();
+        self.collection_ops.push(CollectionOpConfig {
+            output_id: output_id.clone(),
+            source_id,
+            op: CollectionOp::ScalarWhen { arms, default },
+        });
+        output_id
+    }
+
+    /// Add a computed text operation (reactive TEXT interpolation).
+    /// Sources are ordered: index 0 = source_id, 1+ = extra_sources.
+    pub fn add_computed_text(
+        &mut self,
+        sources: Vec<CollectionId>,
+        parts: Vec<ComputedTextPart>,
+    ) -> CollectionId {
+        assert!(!sources.is_empty(), "[DD DataflowConfig] ComputedText requires at least one source");
+        let output_id = CollectionId::new();
+        let source_id = sources[0].clone();
+        let extra_sources = sources[1..].to_vec();
+        self.collection_ops.push(CollectionOpConfig {
+            output_id: output_id.clone(),
+            source_id,
+            op: CollectionOp::ComputedText { parts, extra_sources },
         });
         output_id
     }
@@ -2446,72 +2504,6 @@ impl DataflowConfig {
         self
     }
 
-    /// Deprecated: list append without templates is not supported in pure DD.
-    /// Use ListAppendFromTemplate (keys are internal).
-    pub fn add_list_append_on_enter(
-        mut self,
-        id: impl Into<String>,
-        initial: Value,
-        key_link_id: &str,
-    ) -> Self {
-        let _ = self;
-        let id = id.into();
-        let _ = initial;
-        let _ = key_link_id;
-        panic!(
-            "[DD Config] ListAppend is not supported in pure DD. Use ListAppendFromTemplate for '{}'",
-            id
-        );
-    }
-
-    /// Deprecated: list append/clear without templates is not supported in pure DD.
-    /// Use ListAppendFromTemplate (keys are internal).
-    pub fn add_list_append_with_clear(
-        mut self,
-        id: impl Into<String>,
-        initial: Value,
-        key_link_id: &str,
-        clear_link_id: &str,
-    ) -> Self {
-        let _ = self;
-        let id = id.into();
-        let _ = initial;
-        let _ = key_link_id;
-        let _ = clear_link_id;
-        panic!(
-            "[DD Config] ListAppendWithClear is not supported in pure DD. Use ListAppendFromTemplate for '{}'",
-            id
-        );
-    }
-
-    /// Create a simple counter configuration.
-    ///
-    /// Creates a HOLD that counts link events.
-    pub fn counter(link_id: &str) -> Self {
-        Self::counter_with_initial(link_id, Value::int(0))
-    }
-
-    /// Create a counter configuration with a specific initial value.
-    ///
-    /// Used when restoring persisted state - the counter starts from
-    /// the persisted value instead of 0.
-    pub fn counter_with_initial(link_id: &str, initial: Value) -> Self {
-        Self::new().add_hold("counter", initial, vec![link_id])
-    }
-
-    /// Create a counter configuration with specific HOLD ID and initial value.
-    ///
-    /// Allows specifying the HOLD ID to match what the evaluator generates.
-    pub fn counter_with_initial_hold(link_id: &str, cell_id: &str, initial: Value) -> Self {
-        Self::new().add_hold(cell_id, initial, vec![link_id])
-    }
-
-    /// Create a timer-driven counter configuration.
-    ///
-    /// Creates a HOLD that increments every interval_ms milliseconds.
-    pub fn timer_counter(cell_id: &str, initial: Value, interval_ms: u64) -> Self {
-        Self::new().add_timer_hold(cell_id, initial, interval_ms)
-    }
 }
 
 /// DD Worker that processes events through Differential Dataflow.
@@ -2521,14 +2513,14 @@ impl DataflowConfig {
 pub struct Worker {
     /// Configuration for the dataflow
     config: DataflowConfig,
-    // Phase 5: ID counters moved to thread-locals (allocate_dynamic_cell_id/link_id)
+    // ID counters moved to thread-locals (allocate_dynamic_cell_id/link_id).
     // Worker calls reset_id_counters() on creation for deterministic sessions.
 }
 
 impl Worker {
     /// Create a new DD worker with default configuration.
     ///
-    /// Phase 5: Resets thread-local ID counters for deterministic ID generation.
+    /// Resets thread-local ID counters for deterministic ID generation.
     /// Each Worker session starts fresh at ID 1000.
     pub fn new() -> Self {
         // Reset thread-local counters for deterministic replays
@@ -2540,7 +2532,7 @@ impl Worker {
 
     /// Create a DD worker with specific configuration.
     ///
-    /// Phase 5: Resets thread-local ID counters for deterministic ID generation.
+    /// Resets thread-local ID counters for deterministic ID generation.
     pub fn with_config(config: DataflowConfig) -> Self {
         // Reset thread-local counters for deterministic replays
         reset_id_counters();
@@ -2592,6 +2584,12 @@ impl Worker {
             };
 
             if list_cells.contains(&cell_id) {
+                // Unit means forward reference not yet resolved — skip list processing
+                if matches!(initial_value, Value::Unit) {
+                    dd_log!("[DD Worker] List cell '{}' has Unit initial (forward ref?), skipping", cell_id);
+                    initial_cell_states.insert(cell_id.to_string(), Value::Unit);
+                    continue;
+                }
                 let collection_id = collection_id_for_cell(&self.config, &cell_id);
                 let (items, handle) = match initial_value {
                     Value::List(handle) => {
@@ -2633,6 +2631,14 @@ impl Worker {
                 continue;
             }
 
+            // Skip template cells — their initial values contain Placeholder markers
+            // from List/map template evaluation. These cells will be cloned with fresh IDs
+            // and real values when list items are instantiated.
+            if contains_placeholder(&initial_value) {
+                dd_log!("[DD Worker] Skipping template cell '{}' (contains placeholder)", cell_id);
+                continue;
+            }
+
             let initial_value = validate_cell_state_value(&cell_id, initial_value, &list_cells);
             // Write to global CELL_STATES synchronously
             if cell_config.persist {
@@ -2648,6 +2654,11 @@ impl Worker {
         for (cell_id, init) in &self.config.cell_initializations {
             if initial_cell_states.contains_key(cell_id) {
                 // Avoid overriding cells already initialized from CellConfig.
+                continue;
+            }
+            if derived_list_outputs.contains(cell_id) {
+                // Derived collection outputs (Filter/Map/Concat) are computed
+                // by process_with_persistent_worker below, not initialized here.
                 continue;
             }
             let initial_value = if list_cells.contains(cell_id) {
@@ -2671,6 +2682,12 @@ impl Worker {
             };
 
             if list_cells.contains(cell_id) {
+                // Unit means forward reference not yet resolved — skip list processing
+                if matches!(initial_value, Value::Unit) {
+                    dd_log!("[DD Worker] List cell '{}' has Unit initial (forward ref?), skipping", cell_id);
+                    initial_cell_states.insert(cell_id.clone(), Value::Unit);
+                    continue;
+                }
                 let collection_id = collection_id_for_cell(&self.config, cell_id);
                 let (items, handle) = match initial_value {
                     Value::List(handle) => {
@@ -2712,6 +2729,12 @@ impl Worker {
                 continue;
             }
 
+            // Skip template cells (same as above for CellConfig loop).
+            if contains_placeholder(&initial_value) {
+                dd_log!("[DD Worker] Skipping template cell init '{}' (contains placeholder)", cell_id);
+                continue;
+            }
+
             let initial_value = validate_cell_state_value(cell_id, initial_value, &list_cells);
             if init.persist {
                 sync_cell_from_dd_with_persist(CellUpdate::set_value(cell_id.as_str(), initial_value.clone()));
@@ -2735,74 +2758,48 @@ impl Worker {
 
         if !self.config.collection_ops.is_empty() {
             let list_states = build_list_states(&list_cells, &derived_list_outputs, &list_items_by_cell);
-            if USE_PERSISTENT_WORKER {
-                let mut scalar_states = initial_cell_states.clone();
-                strip_list_cells(&mut scalar_states, &list_cells);
-                let (outputs, _time, new_states, new_list_states) = Self::process_with_persistent_worker(
-                    &mut self.config,
-                    Vec::new(),
-                    0,
-                    &scalar_states,
-                    &list_states,
-                );
+            let mut scalar_states = initial_cell_states.clone();
+            strip_list_cells(&mut scalar_states, &list_cells);
+            let (outputs, _time, new_states, new_list_states) = Self::process_with_persistent_worker(
+                &mut self.config,
+                Vec::new(),
+                0,
+                &scalar_states,
+                &list_states,
+            );
 
-                for output in outputs {
-                    for (cell_id, value) in output.hold_updates {
-                        let update_cell_id = value.cell_id().unwrap_or_else(|| {
-                            panic!("[DD Worker] Missing cell id for update {:?}", value);
-                        });
-                        if update_cell_id != cell_id.as_str() {
-                            panic!(
-                                "[DD Worker] hold_updates key '{}' does not match update cell '{}'",
-                                cell_id, update_cell_id
-                            );
-                        }
-                        sync_cell_from_dd_with_persist(value);
-                    }
-                    for (cell_id, value) in output.hold_state_updates {
-                        let update_cell_id = value.cell_id().unwrap_or_else(|| {
-                            panic!("[DD Worker] Missing cell id for update {:?}", value);
-                        });
-                        if update_cell_id != cell_id.as_str() {
-                            panic!(
-                                "[DD Worker] hold_state_updates key '{}' does not match update cell '{}'",
-                                cell_id, update_cell_id
-                            );
-                        }
-                        sync_cell_from_dd(value);
-                    }
-                }
-
-                initial_scalar_states_override = Some(new_states);
-                initial_list_states_override = Some(new_list_states);
-            } else {
-                let dd_cells = Self::convert_config_to_dd_cells(&self.config);
-                let dd_collections = Self::convert_config_to_dd_collections(&self.config);
-                let initial_collection_items = compute_collection_items(&self.config, &list_states);
-                let dd_result = super::dataflow::run_dd_first_batch(
-                    dd_cells,
-                    dd_collections,
-                    Vec::new(),
-                    &initial_cell_states,
-                    &initial_collection_items,
-                );
-
-                for op in &self.config.collection_ops {
-                    let cell_id = op.output_id.to_string();
-                    let list_state = dd_result.list_states.get(&cell_id).unwrap_or_else(|| {
-                        panic!("[DD Init] Missing collection list state '{}' after init", cell_id);
+            for output in outputs {
+                for (cell_id, value) in output.hold_updates {
+                    let update_cell_id = value.cell_id().unwrap_or_else(|| {
+                        panic!("[DD Worker] Missing cell id for update {:?}", value);
                     });
-                    sync_list_state_from_dd(cell_id.clone(), list_state.items().to_vec());
+                    if update_cell_id != cell_id.as_str() {
+                        panic!(
+                            "[DD Worker] hold_updates key '{}' does not match update cell '{}'",
+                            cell_id, update_cell_id
+                        );
+                    }
+                    sync_cell_from_dd_with_persist(value);
                 }
-
-                initial_scalar_states_override = Some(dd_result.scalar_states);
-                initial_list_states_override = Some(dd_result.list_states);
+                for (cell_id, value) in output.hold_state_updates {
+                    let update_cell_id = value.cell_id().unwrap_or_else(|| {
+                        panic!("[DD Worker] Missing cell id for update {:?}", value);
+                    });
+                    if update_cell_id != cell_id.as_str() {
+                        panic!(
+                            "[DD Worker] hold_state_updates key '{}' does not match update cell '{}'",
+                            cell_id, update_cell_id
+                        );
+                    }
+                    sync_cell_from_dd(value);
+                }
             }
+
+            initial_scalar_states_override = Some(new_states);
+            initial_list_states_override = Some(new_list_states);
         }
 
-        if LOG_DD_DEBUG {
-            zoon::println!("[Worker Phase 6] Initialized {} cells synchronously", self.config.cells.len());
-        }
+        dd_log!("[Worker Phase 6] Initialized {} cells synchronously", self.config.cells.len());
 
         let list_states = initial_list_states_override
             .unwrap_or_else(|| build_list_states(&list_cells, &derived_list_outputs, &list_items_by_cell));
@@ -2823,7 +2820,7 @@ impl Worker {
 
         WorkerHandle {
             event_input: Input::new(event_tx),
-            _task_handle: task_handle,
+            task_handle,
         }
     }
 
@@ -2857,7 +2854,7 @@ impl Worker {
                     Ok(Some(event)) => events.push(event),
                     Ok(None) => {
                         // Channel closed (all senders dropped) - exit event loop
-                        zoon::println!("[Worker] Channel closed, exiting event loop");
+                        dd_log!("[Worker] Channel closed, exiting event loop");
                         return;
                     }
                     Err(_) => {
@@ -2871,36 +2868,28 @@ impl Worker {
                 continue;
             }
 
-            zoon::println!("[Worker] Processing {} events", events.len());
+            dd_log!("[Worker] Processing {} events", events.len());
 
             // Process events through DD
-            let (outputs, new_time, new_states, new_list_states) = if USE_PERSISTENT_WORKER {
+            let (outputs, new_time, new_states, new_list_states) =
                 Self::process_with_persistent_worker(
                     &mut config,
                     events,
                     current_time,
                     &cell_states,
                     &list_states,
-                )
-            } else {
-                Self::process_batch_with_hold(
-                    &config,
-                    events,
-                    current_time,
-                    &cell_states,
-                    &list_states,
-                )
-            };
+                );
 
             current_time = new_time;
             cell_states = new_states;
             list_states = new_list_states;
 
-            zoon::println!("[Worker] Produced {} outputs", outputs.len());
+            dd_log!("[Worker] Produced {} outputs", outputs.len());
 
             // ═══════════════════════════════════════════════════════════════════
             // PHASE 6: Write directly to CELL_STATES instead of via channel
             // ═══════════════════════════════════════════════════════════════════
+            let mut nav_path: Option<String> = None;
             for output in outputs {
                 // Write hold_updates (with persistence)
                 for (cell_id, value) in output.hold_updates {
@@ -2917,6 +2906,14 @@ impl Worker {
                 }
                 // Write hold_state_updates (no persistence)
                 for (cell_id, value) in output.hold_state_updates {
+                    // Check if this is a Router/go_to navigation cell
+                    if config.go_to_cells.contains(&cell_id) {
+                        if let Some(path) = cell_states.get(&cell_id) {
+                            if let Value::Text(p) = path {
+                                nav_path = Some(p.to_string());
+                            }
+                        }
+                    }
                     let update_cell_id = value.cell_id().unwrap_or_else(|| {
                         panic!("[DD Worker] Missing cell id for update {:?}", value);
                     });
@@ -2929,36 +2926,21 @@ impl Worker {
                     sync_cell_from_dd(value);
                 }
             }
+            // Handle Router/go_to navigation
+            if let Some(path) = nav_path {
+                navigate_to_route(&path);
+                // Update all route cells so Router/route() reactive watchers see the change
+                for route_cell in &config.route_cells {
+                    sync_cell_from_dd(CellUpdate::set_value(route_cell.as_str(), Value::text(path.as_str())));
+                }
+            }
 
         }
-    }
-
-    /// Execute a dataflow directly without spawning threads.
-    ///
-    /// This is a WASM-compatible version of `timely::execute_directly` that
-    /// passes `None` for the timestamp to avoid `std::time::Instant::now()`.
-    fn execute_directly_wasm<T, F>(func: F) -> T
-    where
-        F: FnOnce(&mut timely::worker::Worker<timely::communication::allocator::thread::Thread>) -> T,
-    {
-        let alloc = timely::communication::allocator::thread::Thread::default();
-        // Pass None for timestamp to avoid std::time::Instant::now() on WASM
-        let mut worker = timely::worker::Worker::new(
-            timely::WorkerConfig::default(),
-            alloc,
-            None,  // No timestamp - WASM compatible!
-        );
-        let result = func(&mut worker);
-        // Step the worker until all dataflows complete
-        while worker.has_dataflows() {
-            worker.step_or_park(None);
-        }
-        result
     }
 
     /// Process events through the persistent DD worker (Phase 5).
     ///
-    /// Unlike `process_batch_with_hold`, this uses a SINGLE long-lived Timely worker
+    /// Uses a SINGLE long-lived Timely worker
     /// that persists across all event batches. This gives true O(delta) complexity
     /// because DD arrangements are not rebuilt on each batch.
     ///
@@ -2986,7 +2968,7 @@ impl Worker {
             initial_collection_items,
         );
         if reinitialized {
-            zoon::println!("[Worker] (Re)initialized persistent DD worker with {} cells", config.cells.len());
+            dd_log!("[Worker] (Re)initialized persistent DD worker with {} cells", config.cells.len());
         }
 
         // Build template info map for O(delta) pre-instantiation
@@ -3068,8 +3050,8 @@ impl Worker {
                     list_states.clone(),
                     initial_collection_items,
                 );
-                if reinitialized && LOG_DD_DEBUG {
-                    zoon::println!("[Worker] Reinitialized persistent worker after config change");
+                if reinitialized {
+                    dd_log!("[Worker] Reinitialized persistent worker after config change");
                 }
                 // Derived outputs initialize from DD output stream on first emission.
                 if reinitialized {
@@ -3134,6 +3116,10 @@ impl Worker {
                     DdTransform::ListAppendPreparedWithClear { clear_link_id: clear_link_id.clone() }
                 }
                 StateTransform::ListAppendFromTemplate { .. } => DdTransform::ListAppendPrepared,
+                StateTransform::ListAppendSimple => DdTransform::ListAppendSimple,
+                StateTransform::ListAppendSimpleWithClear { clear_link_id } => {
+                    DdTransform::ListAppendSimpleWithClear { clear_link_id: clear_link_id.clone() }
+                }
             };
 
             // Build trigger list - start with explicit triggers
@@ -3177,7 +3163,7 @@ impl Worker {
                 )
             };
 
-            // Phase 3.3: EventFilter is now unified - no conversion needed
+            // EventFilter is now unified - no conversion needed
             DdCellConfig {
                 id: cell.id.clone(),
                 initial: cell.initial.clone(),
@@ -3271,9 +3257,7 @@ impl Worker {
         for template in templates {
             if template.filter.matches(&event_value) {
 
-                if LOG_DD_DEBUG {
-                    zoon::println!("[Worker] Pre-instantiating template for cell {} with text '{}'", template.cell_id, item_text);
-                }
+                dd_log!("[Worker] Pre-instantiating template for cell {} with text '{}'", template.cell_id, item_text);
 
                 // Use the explicit ListItemTemplate (no reconstruction).
                 let list_template = template.template.clone();
@@ -3320,9 +3304,7 @@ impl Worker {
                     config_changed = true;
                 }
 
-                if LOG_DD_DEBUG {
-                    zoon::println!("[Worker] Pre-instantiated item: {:?}", instantiated.data);
-                }
+                dd_log!("[Worker] Pre-instantiated item: {:?}", instantiated.data);
 
                 // Return PreparedItem containing the pre-instantiated data
                 return (
@@ -3341,343 +3323,6 @@ impl Worker {
     }
 
     // Note: List item templates are fully specified in config; no runtime lookups.
-
-    /// Process a batch of events through Differential Dataflow using HOLD operator.
-    ///
-    /// This uses `hold_with_output()` to keep state (ListState for lists) while emitting diffs.
-    /// Uses WASM-compatible execute_directly that doesn't require std::time::Instant.
-    ///
-    /// # Phase 10: Pure DD Output Capture
-    ///
-    /// This function uses timely's built-in `capture()` mechanism instead of
-    /// `inspect()` with Mutex. All outputs flow through DD operators as pure
-    /// data and are captured at the end using message passing.
-    ///
-    /// See docs/plans/pure_dd.md Phase 10 for details.
-    fn process_batch_with_hold(
-        config: &DataflowConfig,
-        events: Vec<Event>,
-        start_time: u64,
-        initial_states: &HashMap<String, Value>,
-        initial_list_states: &HashMap<String, super::dataflow::ListState>,
-    ) -> (Vec<DocumentUpdate>, u64, HashMap<String, Value>, HashMap<String, super::dataflow::ListState>) {
-        use super::operators::hold_with_output;
-        use differential_dataflow::input::Input;
-        use timely::dataflow::operators::Capture;
-        use timely::dataflow::operators::capture::Extract;
-
-        // ══════════════════════════════════════════════════════════════════════════════
-        // Phase 10: PURE DD OUTPUT CAPTURE
-        // ══════════════════════════════════════════════════════════════════════════════
-        //
-        // NO Mutex, NO RefCell - outputs flow through DD operators:
-        // 1. Each HOLD output is tagged with (cell_id, state, should_persist, time)
-        // 2. All outputs are concatenated into a single collection
-        // 3. The collection's inner stream is captured via timely::Capture
-        // 4. After stepping, we extract() to get all outputs
-        //
-        // This is pure DD - no shared mutable state anywhere in the dataflow.
-        // ══════════════════════════════════════════════════════════════════════════════
-
-        // Move events into the closure (no clone)
-        let events = events;
-        let derived_list_outputs = derived_list_outputs(config);
-        let events_for_bulk = events.clone();
-        let list_cells = list_cell_ids(config);
-        let mut list_states = initial_list_states.clone();
-        let mut initial_states_for_closure = initial_states.clone();
-        let mut initial_states_for_merge = initial_states.clone();
-        strip_list_cells(&mut initial_states_for_closure, &list_cells);
-        strip_list_cells(&mut initial_states_for_merge, &list_cells);
-        let derived_cells: HashSet<String> = config
-            .collection_ops
-            .iter()
-            .map(|op| op.output_id.to_string())
-            .collect();
-        for cell_id in &derived_cells {
-            initial_states_for_closure.remove(cell_id);
-            initial_states_for_merge.remove(cell_id);
-        }
-        let config = config.clone();
-        let num_events = events.len();
-        let dd_cells = Self::convert_config_to_dd_cells(&config);
-        let dd_collections = Self::convert_config_to_dd_collections(&config);
-        let initial_collection_items = compute_collection_items(&config, &list_states);
-        let mut initial_by_id: HashMap<String, Value> = dd_cells
-            .iter()
-            .map(|cell| {
-                let cell_id = cell.id.name();
-                let initial = validate_cell_state_value(&cell_id, cell.initial.clone(), &list_cells);
-                (cell_id.to_string(), initial)
-            })
-            .collect();
-        for (cell_id, init) in &config.cell_initializations {
-            initial_by_id.entry(cell_id.clone()).or_insert_with(|| {
-                validate_cell_state_value(cell_id, init.value.clone(), &list_cells)
-            });
-        }
-        let dd_cells_for_closure = dd_cells.clone();
-        let dd_collections_for_closure = dd_collections.clone();
-        let config_for_closure = config.clone();
-        let initial_collection_items_for_closure = initial_collection_items.clone();
-        ensure_list_states(&list_cells, &derived_list_outputs, &mut list_states, initial_list_states);
-        let initial_states_for_collections = initial_states_for_closure.clone();
-        let list_cells_for_closure = list_cells.clone();
-        let list_states_for_closure = list_states.clone();
-
-        // Phase 10: execute_directly_wasm returns the captured outputs receiver
-        let outputs_rx = Self::execute_directly_wasm(move |worker| {
-            // Build dataflow for each HOLD in config
-            let (mut link_input, probe, outputs_rx) = worker.dataflow::<u64, _, _>(|scope| {
-                // Create input collection for LINK events
-                // Each link event is (LinkId, EventValue)
-                let (link_input_handle, links) =
-                    scope.new_collection::<(String, EventValue), isize>();
-
-                // Phase 10: Collect all tagged output collections for pure DD capture
-                let mut tagged_outputs: Vec<VecCollection<_, TaggedCellOutput>> = Vec::new();
-
-                // For each HOLD config, create a HOLD operator
-                for hold_config in &dd_cells_for_closure {
-                    let cell_id = hold_config.id.name().to_string();
-                    let initial = if list_cells_for_closure.contains(&cell_id) {
-                        let list_state = list_states_for_closure.get(&cell_id).unwrap_or_else(|| {
-                            panic!("[DD Worker] Missing list state for hold '{}'", cell_id);
-                        });
-                        super::dataflow::CellState::List(list_state.clone())
-                    } else {
-                        let initial_value = initial_states_for_closure
-                            .get(&cell_id)
-                            .cloned()
-                            .unwrap_or_else(|| hold_config.initial.clone());
-                        let initial_value = validate_cell_state_value(&cell_id, initial_value, &list_cells_for_closure);
-                        super::dataflow::cell_state_from_value(
-                            &cell_id,
-                            initial_value,
-                            &list_cells_for_closure,
-                            &initial_collection_items_for_closure,
-                        )
-                    };
-                    let trigger_ids: Vec<String> = hold_config
-                        .triggers
-                        .iter()
-                        .map(|l| l.name().to_string())
-                        .collect();
-
-                    // Clone filter for the closure
-                    let event_filter = hold_config.filter.clone();
-
-                    // Filter links to only those that trigger this HOLD
-                    // AND match the event filter (WHEN pattern)
-                    let triggered_events = links.filter(move |(link_id, event_value)| {
-                        // First check if link_id matches
-                        if !trigger_ids.contains(link_id) {
-                            return false;
-                        }
-                        // Then apply event value filter (WHEN pattern matching)
-                        event_filter.matches(event_value)
-                    });
-
-                    // Clone transform and cell_id for the closure
-                    let state_transform = hold_config.transform.clone();
-                    let cell_id_for_transform = cell_id.clone();
-
-                    // Apply HOLD operator with configured transform
-                    let hold_output = hold_with_output(initial, &triggered_events, move |state, event| {
-                        super::dataflow::apply_dd_transform_with_state(&state_transform, state, event, &cell_id_for_transform)
-                    });
-
-                    // Phase 10: Tag outputs for pure DD capture (no Mutex!)
-                    let cell_id_for_tag = cell_id.clone();
-
-                    // Map hold_output to TaggedCellOutput - flows through DD as pure data
-                    let tagged = hold_output.map(move |value| TaggedCellOutput {
-                        cell_id: cell_id_for_tag.clone(),
-                        value,
-                    });
-
-                    tagged_outputs.push(tagged);
-                }
-
-                // If no HOLDs configured, just count events as before
-                if config_for_closure.cells.is_empty() {
-                    use differential_dataflow::operators::Count;
-
-                    let count = links.map(|_| ()).count();
-
-                    // Phase 10: Tag count output for pure DD capture
-                    let count_tagged = count.map(|((), total)| {
-                        TaggedCellOutput {
-                            cell_id: "__count__".to_string(),
-                            value: CellUpdate::set_value(
-                                "__count__",
-                                Value::int(i64::try_from(total).unwrap_or_else(|_| {
-                                    panic!("[DD Worker] Bug: count overflow for total={}", total);
-                                })),
-                            ),
-                        }
-                    });
-                    tagged_outputs.push(count_tagged);
-                }
-
-                // Phase 10: Concatenate all tagged outputs and capture
-                // This is pure DD - no Mutex, no RefCell, just message passing!
-                let merged = if tagged_outputs.is_empty() {
-                    scope.new_collection::<TaggedCellOutput, isize>().1
-                } else {
-                    let first = tagged_outputs.remove(0);
-                    tagged_outputs.into_iter().fold(first, |acc, c| acc.concat(&c))
-                };
-
-                let collection_outputs = build_collection_op_outputs(
-                    scope,
-                    &merged,
-                    &dd_collections_for_closure,
-                    &initial_collection_items_for_closure,
-                    &initial_states_for_collections,
-                );
-
-                let merged = merged.concat(&collection_outputs);
-                let outputs_rx = merged.inner.capture();
-
-                let probe = links.probe();
-                (link_input_handle, probe, outputs_rx)
-            });
-
-            // Process events
-            let mut time = start_time;
-            for event in events {
-                match event {
-                    Event::Link { id, value } => {
-                        link_input.insert((id.name().to_string(), value));
-                    }
-                    Event::Timer { id, tick } => {
-                        // Timer events are treated like link events with a special ID
-                        // This allows timer-triggered HOLDs to work with the same logic
-                        let timer_link_id = format!("__timer_{}", id.name());
-                        link_input.insert((timer_link_id, EventValue::Unit));
-                        if LOG_DD_DEBUG { zoon::println!("[DD Worker] Timer {} tick {}", id.name(), tick); }
-                    }
-                    Event::External { name, .. } => {
-                        panic!("[DD Worker] External events not supported: {}", name);
-                    }
-                }
-
-                time += 1;
-                link_input.advance_to(time);
-                link_input.flush();
-
-                while probe.less_than(&time) {
-                    worker.step();
-                }
-            }
-
-            // Phase 10: Return the captured outputs receiver
-            outputs_rx
-        });
-
-        // Phase 10: Extract captured outputs using timely's Extract trait
-        // This is pure DD - no Mutex unwrap, just channel extraction!
-        // Note: Extract trait is imported at the top of this function
-        let captured = outputs_rx.extract();
-
-        // Build DocumentUpdates and final_states from captured TaggedCellOutputs
-        let mut outputs = Vec::new();
-        let mut new_states = initial_states_for_merge;
-
-        for (_time, batch) in captured {
-            for (tagged, time, diff) in batch {
-                if diff > 0 {
-                    let TaggedCellOutput { cell_id, value } = tagged;
-                    let update = value;
-                    if let Some(update_cell_id) = update.cell_id() {
-                        if update_cell_id != cell_id {
-                            panic!(
-                                "[DD Worker] Output cell '{}' does not match '{}': {:?}",
-                                update_cell_id, cell_id, update
-                            );
-                        }
-                    }
-                    apply_output_to_state_maps(
-                        &list_cells,
-                        &mut list_states,
-                        &mut new_states,
-                        &update,
-                        &initial_by_id,
-                    );
-
-                    // Create output update
-                    let mut hold_updates = HashMap::new();
-                    let mut hold_state_updates = HashMap::new();
-                    match &update {
-                        CellUpdate::Multi(updates) => {
-                            for update in updates {
-                                let update_cell_id = update.cell_id().unwrap_or_else(|| {
-                                    panic!("[DD Worker] Missing cell id for update {:?}", update);
-                                });
-                                if should_persist_cell(&config, update_cell_id) {
-                                    hold_updates.insert(update_cell_id.to_string(), update.clone());
-                                } else {
-                                    hold_state_updates.insert(update_cell_id.to_string(), update.clone());
-                                }
-                            }
-                        }
-                        CellUpdate::NoOp => {}
-                        _ => {
-                            if should_persist_cell(&config, &cell_id) {
-                                hold_updates.insert(cell_id.clone(), update.clone());
-                            } else {
-                                hold_state_updates.insert(cell_id.clone(), update.clone());
-                            }
-                        }
-                    }
-
-                    outputs.push(DocumentUpdate {
-                        document: update,
-                        time,
-                        hold_updates,
-                        hold_state_updates,
-                    });
-                }
-            }
-        }
-
-        for (index, event) in events_for_bulk.iter().enumerate() {
-            let time = start_time + index as u64 + 1;
-            match event {
-                Event::Link { id, .. } => {
-                    apply_bulk_remove_for_link(
-                        &config,
-                        id,
-                        time,
-                        &initial_by_id,
-                        &list_cells,
-                        &mut list_states,
-                        &mut new_states,
-                        &mut outputs,
-                    );
-                }
-                Event::Timer { id, .. } => {
-                    let timer_link_id = LinkId::new(&format!("__timer_{}", id.name()));
-                    apply_bulk_remove_for_link(
-                        &config,
-                        &timer_link_id,
-                        time,
-                        &initial_by_id,
-                        &list_cells,
-                        &mut list_states,
-                        &mut new_states,
-                        &mut outputs,
-                    );
-                }
-                Event::External { name, .. } => {
-                    panic!("[DD Worker] External events not supported: {}", name);
-                }
-            }
-        }
-
-        (outputs, start_time + num_events as u64, new_states, list_states)
-    }
 }
 
 impl Default for Worker {
@@ -3694,7 +3339,7 @@ mod tests {
     #[test]
     fn test_dataflow_config_builder() {
         // Test that we can build a simple counter config
-        let config = DataflowConfig::counter("button.press");
+        let config = DataflowConfig::new().add_hold("counter", Value::int(0), vec!["button.press"]);
         assert_eq!(config.cells.len(), 1);
         assert_eq!(config.cells[0].id.name(), "counter");
         assert_eq!(config.cells[0].initial, Value::int(0));
@@ -3713,66 +3358,6 @@ mod tests {
         assert_eq!(config.cells[1].id.name(), "counter2");
         assert_eq!(config.cells[1].initial, Value::int(10));
         assert_eq!(config.cells[1].triggered_by.len(), 2);
-    }
-
-    #[test]
-    fn test_process_batch_with_hold_simple() {
-        // Test the synchronous batch processing directly (no async runtime needed)
-        let config = DataflowConfig::counter("click");
-        let events = vec![
-            Event::Link {
-                id: LinkId::new("click"),
-                value: EventValue::Unit,
-            },
-            Event::Link {
-                id: LinkId::new("click"),
-                value: EventValue::Unit,
-            },
-        ];
-        let initial_states = [("counter".to_string(), Value::int(0))]
-            .into_iter()
-            .collect();
-
-        let (outputs, new_time, new_states, _list_states) =
-            Worker::process_batch_with_hold(&config, events, 0, &initial_states, &HashMap::new());
-
-        // Should have 2 outputs (one per click)
-        assert_eq!(outputs.len(), 2);
-        assert_eq!(new_time, 2);
-
-        // Final state should be 2
-        assert_eq!(new_states.get("counter"), Some(&Value::int(2)));
-    }
-
-    #[test]
-    fn test_process_batch_filters_by_link_id() {
-        // Test that HOLD only responds to its configured triggers
-        let config = DataflowConfig::counter("button");
-        let events = vec![
-            Event::Link {
-                id: LinkId::new("button"),
-                value: EventValue::Unit,
-            },
-            Event::Link {
-                id: LinkId::new("other"),  // Not "button", should be ignored
-                value: EventValue::Unit,
-            },
-            Event::Link {
-                id: LinkId::new("button"),
-                value: EventValue::Unit,
-            },
-        ];
-        let initial_states = [("counter".to_string(), Value::int(0))]
-            .into_iter()
-            .collect();
-
-        let (outputs, _, new_states, _list_states) =
-            Worker::process_batch_with_hold(&config, events, 0, &initial_states, &HashMap::new());
-
-        // Should only have 2 outputs (the "button" clicks)
-        assert_eq!(outputs.len(), 2);
-        // Final state should be 2, not 3
-        assert_eq!(new_states.get("counter"), Some(&Value::int(2)));
     }
 
     #[test]
@@ -3840,7 +3425,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Output cell 'other' does not match 'count'")]
     fn test_apply_dd_outputs_rejects_mismatched_update_cell_id() {
-        let config = DataflowConfig::counter("click");
+        let config = DataflowConfig::new().add_hold("counter", Value::int(0), vec!["click"]);
         let dd_outputs = vec![super::super::dataflow::DdOutput {
             cell_id: CellId::new("count"),
             value: CellUpdate::set_value("other", Value::int(1)),

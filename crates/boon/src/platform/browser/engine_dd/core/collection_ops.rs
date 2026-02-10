@@ -41,25 +41,50 @@ pub enum CollectionOp {
         other_source: CollectionId,
     },
     // ══════════════════════════════════════════════════════════════════════════
-    // Phase 4: Arithmetic/Comparison Operations
-    // Replaces: ComputedRef::Subtract, ComputedRef::GreaterThanZero, ComputedRef::Equal
+    // Arithmetic/Comparison Operations
     // These operate on Count/CountWhere outputs to produce derived values.
     // ══════════════════════════════════════════════════════════════════════════
     /// Subtract one count from another (produces Number).
-    /// Used for: active_list_count = list_count - completed_list_count
     Subtract {
         /// Second operand (subtracted from source)
         right_source: CollectionId,
     },
     /// Check if a count is greater than zero (produces Bool).
-    /// Used for: show_clear_completed = completed_list_count > 0
     GreaterThanZero,
     /// Compare two values for equality (produces Bool).
-    /// Used for: all_completed = completed_list_count == list_count
     Equal {
         /// Second operand to compare against source
         right_source: CollectionId,
     },
+    // ══════════════════════════════════════════════════════════════════════════
+    // Scalar Transform Operations
+    // These transform scalar cell values through pattern matching or formatting.
+    // ══════════════════════════════════════════════════════════════════════════
+    /// Pattern-match a scalar cell value to produce a derived scalar.
+    /// Used for: count |> WHEN { 1 => "", __ => "s" } in reactive text.
+    ScalarWhen {
+        /// Pattern-value pairs: (pattern_to_match, output_value)
+        arms: Vec<(Value, Value)>,
+        /// Default output when no pattern matches
+        default: Value,
+    },
+    /// Format text from multiple reactive cell sources.
+    /// Used for: TEXT { {count} item{maybe_s} left } with reactive interpolation.
+    ComputedText {
+        /// Template parts describing the output format
+        parts: Vec<ComputedTextPart>,
+        /// Additional cell sources beyond source_id (index 1+)
+        extra_sources: Vec<CollectionId>,
+    },
+}
+
+/// A part of a computed text template.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ComputedTextPart {
+    /// Static text segment
+    Static(Arc<str>),
+    /// Reference to a cell source by index (0 = source_id, 1+ = extra_sources)
+    CellSource(usize),
 }
 
 /// Configuration for a collection operation in the DD dataflow.

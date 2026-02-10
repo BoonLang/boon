@@ -18,7 +18,7 @@ use boon::platform::browser::{
 // DD engine imports (feature-gated)
 #[cfg(feature = "engine-dd")]
 use boon::platform::browser::engine_dd::{
-    render_dd_document_reactive_signal, render_dd_result_reactive_signal,
+    render_dd_result_reactive_signal,
     run_dd_reactive_with_persistence,
     clear_dd_persisted_states,
 };
@@ -1121,6 +1121,14 @@ impl Playground {
                             EngineType::Actors => EngineType::DifferentialDataflow,
                             EngineType::DifferentialDataflow => EngineType::Actors,
                         };
+                        // Clear saved states — engines store data differently
+                        #[cfg(feature = "engine-dd")]
+                        clear_dd_persisted_states();
+                        local_storage().remove(STATES_STORAGE_KEY);
+                        local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
+                        local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
+                        clear_prefixed_storage_keys(&["list_calls:", "list_removed:", "dd_"]);
+
                         engine_type.set(new_engine);
                         // Trigger re-run with new engine
                         run_command.set(Some(RunCommand { filename: None }));
@@ -1935,21 +1943,10 @@ impl Playground {
             drop(files);
 
             if let Some(dd_result) = result {
-                if let Some(document) = dd_result.document.clone() {
+                if dd_result.document.is_some() {
                     println!("[DD Engine] Document rendered successfully");
-
-                    // Use simple rendering for examples with timers or sum accumulators
-                    // (re-evaluation breaks timers and accumulator IDs are unstable)
-                    // Use re-evaluation for HOLD-only examples (needed for derived values)
-                    let has_timers = !dd_result.context.get_timers().is_empty();
-                    let has_accumulators = dd_result.context.has_sum_accumulators();
-                    if has_timers || has_accumulators {
-                        return render_dd_document_reactive_signal(document, dd_result.context)
-                            .unify();
-                    } else {
-                        return render_dd_result_reactive_signal(dd_result)
-                            .unify();
-                    }
+                    return render_dd_result_reactive_signal(dd_result)
+                        .unify();
                 }
             }
 

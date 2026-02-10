@@ -31,16 +31,29 @@ pub fn resolve_references(
             node: expression,
             persistence: _,
         } = expressions;
-        if let Expression::Variable(variable) = expression {
-            let name = &variable.name;
-            reachable_referenceables
-                .entry(name)
-                .or_default()
-                .push(Referenceable {
-                    name,
-                    span: *span,
-                    level,
-                });
+        match expression {
+            Expression::Variable(variable) => {
+                let name = &variable.name;
+                reachable_referenceables
+                    .entry(name)
+                    .or_default()
+                    .push(Referenceable {
+                        name,
+                        span: *span,
+                        level,
+                    });
+            }
+            Expression::Function { name, .. } => {
+                reachable_referenceables
+                    .entry(name)
+                    .or_default()
+                    .push(Referenceable {
+                        name,
+                        span: *span,
+                        level,
+                    });
+            }
+            _ => {}
         }
     }
     let mut errors = Vec::new();
