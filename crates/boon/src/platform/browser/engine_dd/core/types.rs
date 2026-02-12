@@ -93,7 +93,9 @@ impl<T> Input<T> {
     ///
     /// Returns `Ok(())` if the event was sent, `Err(T)` if the channel is closed.
     pub fn send(&self, value: T) -> Result<(), T> {
-        self.sender.unbounded_send(value).map_err(|e| e.into_inner())
+        self.sender
+            .unbounded_send(value)
+            .map_err(|e| e.into_inner())
     }
 
     /// Try to inject an event, ignoring if channel is closed.
@@ -208,7 +210,11 @@ impl BoolTag {
 
     /// Convert from a boolean value.
     pub fn from_bool(b: bool) -> Self {
-        if b { Self::True } else { Self::False }
+        if b {
+            Self::True
+        } else {
+            Self::False
+        }
     }
 
     /// Convert to boolean value.
@@ -319,7 +325,10 @@ pub enum LinkId {
     /// Static link defined in source code
     Static(std::sync::Arc<str>),
     /// Dynamic link generated for list items
-    Dynamic { counter: u32, name: std::sync::Arc<str> },
+    Dynamic {
+        counter: u32,
+        name: std::sync::Arc<str>,
+    },
 }
 
 impl LinkId {
@@ -330,7 +339,10 @@ impl LinkId {
     /// Create a dynamic link ID from a counter.
     pub fn dynamic(counter: u32) -> Self {
         let name = format!("{}{}", DYNAMIC_LINK_PREFIX, counter);
-        Self::Dynamic { counter, name: std::sync::Arc::from(name) }
+        Self::Dynamic {
+            counter,
+            name: std::sync::Arc::from(name),
+        }
     }
 
     /// Get the name of this LINK ID.
@@ -423,6 +435,18 @@ impl std::fmt::Display for TimerId {
 pub enum Event {
     /// A LINK was fired (e.g., button click)
     Link { id: LinkId, value: EventValue },
+    /// An item-scoped LINK fired from a list row interaction.
+    ///
+    /// `item_key` identifies the concrete row item. `action_id` identifies which
+    /// per-item interaction fired (for example, title double-click vs checkbox toggle).
+    /// `list_cell_id` is optional during migration and may be populated when the
+    /// bridge knows the owning list cell at dispatch time.
+    ItemLink {
+        list_cell_id: Option<CellId>,
+        item_key: std::sync::Arc<str>,
+        action_id: LinkId,
+        value: EventValue,
+    },
     /// A timer tick occurred
     Timer { id: TimerId, tick: u64 },
     /// An external event (for extensibility)
@@ -518,7 +542,10 @@ impl EventValue {
 
     /// Create a prepared item event value for O(delta) list operations.
     /// The item should have already had its IDs generated and initializations collected.
-    pub fn prepared_item(item: super::value::Value, initializations: Vec<(String, super::value::Value)>) -> Self {
+    pub fn prepared_item(
+        item: super::value::Value,
+        initializations: Vec<(String, super::value::Value)>,
+    ) -> Self {
         Self::PreparedItem {
             item,
             initializations,
@@ -548,8 +575,15 @@ impl EventValue {
     }
 
     /// Get the prepared item if this is a PreparedItem variant.
-    pub fn as_prepared_item(&self) -> Option<(&super::value::Value, &Vec<(String, super::value::Value)>)> {
-        if let Self::PreparedItem { item, initializations, .. } = self {
+    pub fn as_prepared_item(
+        &self,
+    ) -> Option<(&super::value::Value, &Vec<(String, super::value::Value)>)> {
+        if let Self::PreparedItem {
+            item,
+            initializations,
+            ..
+        } = self
+        {
             Some((item, initializations))
         } else {
             None
@@ -559,21 +593,36 @@ impl EventValue {
     pub fn key(&self) -> Option<&Key> {
         match self {
             Self::KeyDown { key, .. } => Some(key),
-            Self::PreparedItem { source_key: Some(key), .. } => Some(key),
+            Self::PreparedItem {
+                source_key: Some(key),
+                ..
+            } => Some(key),
             _ => None,
         }
     }
 
     pub fn enter_text(&self) -> Option<&str> {
         match self {
-            Self::KeyDown { key: Key::Enter, text: Some(text) } => Some(text.as_str()),
-            Self::KeyDown { key: Key::Enter, text: None } => {
+            Self::KeyDown {
+                key: Key::Enter,
+                text: Some(text),
+            } => Some(text.as_str()),
+            Self::KeyDown {
+                key: Key::Enter,
+                text: None,
+            } => {
                 panic!("[DD EventValue] Enter key event missing text payload");
             }
-            Self::PreparedItem { source_key: Some(Key::Enter), source_text: Some(text), .. } => {
-                Some(text.as_str())
-            }
-            Self::PreparedItem { source_key: Some(Key::Enter), source_text: None, .. } => {
+            Self::PreparedItem {
+                source_key: Some(Key::Enter),
+                source_text: Some(text),
+                ..
+            } => Some(text.as_str()),
+            Self::PreparedItem {
+                source_key: Some(Key::Enter),
+                source_text: None,
+                ..
+            } => {
                 panic!("[DD EventValue] PreparedItem missing source_text for Enter key");
             }
             _ => None,
@@ -706,17 +755,12 @@ impl LinkCellMapping {
     }
 
     /// Create a RemoveListItem mapping.
-    pub fn remove_list_item(
-        link_id: impl Into<LinkId>,
-        list_cell_id: impl Into<CellId>,
-    ) -> Self {
+    pub fn remove_list_item(link_id: impl Into<LinkId>, list_cell_id: impl Into<CellId>) -> Self {
         let list_cell_id: CellId = list_cell_id.into();
         Self {
             link_id: link_id.into(),
             cell_id: list_cell_id.clone(), // Same as list_cell_id for convenience
-            action: LinkAction::RemoveListItem {
-                list_cell_id,
-            },
+            action: LinkAction::RemoveListItem { list_cell_id },
             key_filter: None,
         }
     }
@@ -820,9 +864,17 @@ mod tests {
     fn test_dd_event_value_constructors() {
         assert!(matches!(EventValue::unit(), EventValue::Unit));
         assert!(matches!(EventValue::text("hello"), EventValue::Text(s) if s == "hello"));
-        assert!(matches!(EventValue::key_down(Key::Enter, None), EventValue::KeyDown { key: Key::Enter, text: None }));
+        assert!(matches!(
+            EventValue::key_down(Key::Enter, None),
+            EventValue::KeyDown {
+                key: Key::Enter,
+                text: None
+            }
+        ));
         assert!(matches!(EventValue::bool(true), EventValue::Bool(true)));
-        assert!(matches!(EventValue::number(3.14), EventValue::Number(n) if (n.0 - 3.14).abs() < f64::EPSILON));
+        assert!(
+            matches!(EventValue::number(3.14), EventValue::Number(n) if (n.0 - 3.14).abs() < f64::EPSILON)
+        );
     }
 
     // LinkCellMapping tests
@@ -895,8 +947,14 @@ mod tests {
             LinkAction::SetFalse,
             vec![Key::Escape],
         );
-        assert!(escape_only.matches(&LinkId::new("key_down"), &EventValue::key_down(Key::Escape, None)));
-        assert!(!escape_only.matches(&LinkId::new("key_down"), &EventValue::key_down(Key::Enter, None)));
+        assert!(escape_only.matches(
+            &LinkId::new("key_down"),
+            &EventValue::key_down(Key::Escape, None)
+        ));
+        assert!(!escape_only.matches(
+            &LinkId::new("key_down"),
+            &EventValue::key_down(Key::Enter, None)
+        ));
         assert!(!escape_only.matches(&LinkId::new("key_down"), &EventValue::Unit));
 
         // Key filter with Enter and text payload
@@ -906,16 +964,19 @@ mod tests {
             LinkAction::SetText,
             vec![Key::Enter],
         );
-        assert!(enter_filter.matches(&LinkId::new("key_down"), &EventValue::key_down(Key::Enter, Some("hello".to_string()))));
-        assert!(!enter_filter.matches(&LinkId::new("key_down"), &EventValue::key_down(Key::Escape, None)));
+        assert!(enter_filter.matches(
+            &LinkId::new("key_down"),
+            &EventValue::key_down(Key::Enter, Some("hello".to_string()))
+        ));
+        assert!(!enter_filter.matches(
+            &LinkId::new("key_down"),
+            &EventValue::key_down(Key::Escape, None)
+        ));
     }
 
     #[test]
     fn test_remove_list_item_mapping() {
-        let mapping = LinkCellMapping::remove_list_item(
-            "delete_btn",
-            "todos",
-        );
+        let mapping = LinkCellMapping::remove_list_item("delete_btn", "todos");
 
         assert_eq!(mapping.link_id, LinkId::new("delete_btn"));
         assert!(matches!(mapping.action, LinkAction::RemoveListItem { .. }));

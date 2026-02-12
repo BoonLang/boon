@@ -20,12 +20,14 @@ pub struct TestOptions {
     pub screenshot_on_fail: bool,
     pub verbose: bool,
     pub examples_dir: Option<PathBuf>,
+    pub no_launch: bool,
 }
 
 /// Options for built-in playground smoke command
 pub struct SmokeOptions {
     pub port: u16,
     pub filter: Option<String>,
+    pub no_launch: bool,
 }
 
 /// Result of a single built-in smoke check
@@ -251,6 +253,51 @@ enum ConnectionStatus {
     Ready,
 }
 
+/// Wait for a previously running browser extension to reconnect to a restarted WS server.
+async fn wait_for_existing_extension_connection(port: u16, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if matches!(get_connection_status(port).await, ConnectionStatus::Ready) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
+}
+
+/// Ensure the playground runs with the DD engine before test automation.
+async fn ensure_engine_dd(port: u16) -> Result<()> {
+    let response = send_command_to_server(port, WsCommand::GetEngine).await?;
+    let current = match response {
+        WsResponse::EngineInfo { engine, .. } => engine,
+        WsResponse::Error { message } => anyhow::bail!("GetEngine failed: {}", message),
+        other => anyhow::bail!("GetEngine unexpected response: {:?}", other),
+    };
+
+    if current == "DD" {
+        return Ok(());
+    }
+
+    let response = send_command_to_server(port, WsCommand::SetEngine {
+        engine: "DD".to_string(),
+    }).await?;
+    match response {
+        WsResponse::Success { .. } => {}
+        WsResponse::Error { message } => anyhow::bail!("SetEngine(DD) failed: {}", message),
+        other => anyhow::bail!("SetEngine(DD) unexpected response: {:?}", other),
+    }
+
+    let verify = send_command_to_server(port, WsCommand::GetEngine).await?;
+    match verify {
+        WsResponse::EngineInfo { engine, .. } if engine == "DD" => Ok(()),
+        WsResponse::EngineInfo { engine, .. } => {
+            anyhow::bail!("Engine did not switch to DD (current: {})", engine)
+        }
+        WsResponse::Error { message } => anyhow::bail!("GetEngine verify failed: {}", message),
+        other => anyhow::bail!("GetEngine verify unexpected response: {:?}", other),
+    }
+}
+
 /// Check connection status, distinguishing between server issues and extension issues
 async fn get_connection_status(port: u16) -> ConnectionStatus {
     match check_server_connection(port).await {
@@ -285,7 +332,7 @@ pub struct SetupState {
 /// Ensure WebSocket server is running and browser extension is connected.
 /// Will start server and launch browser if needed.
 /// Returns SetupState indicating what was started (for cleanup).
-async fn ensure_browser_connection(port: u16) -> Result<SetupState> {
+async fn ensure_browser_connection(port: u16, no_launch: bool) -> Result<SetupState> {
     let mut setup = SetupState { started_mzoon: false };
 
     // Step 0: Ensure playground (mzoon) is running
@@ -347,6 +394,27 @@ async fn ensure_browser_connection(port: u16) -> Result<SetupState> {
 
     // Step 3: Need to launch browser if extension not connected
     if matches!(status, ConnectionStatus::NoExtension | ConnectionStatus::ServerNotRunning) {
+        if no_launch {
+            anyhow::bail!(
+                "Browser extension is not connected and --no-launch is set. \
+Start/attach a browser with the Boon extension, then retry."
+            );
+        }
+
+        if browser::has_running_automation_browser() {
+            println!("Automation Chromium already running. Waiting for extension to reconnect...");
+            if wait_for_existing_extension_connection(port, Duration::from_secs(25)).await {
+                println!("Extension reconnected to existing Chromium session.");
+                return Ok(setup);
+            }
+            let pids = browser::running_automation_pids();
+            anyhow::bail!(
+                "Automation Chromium already running (PID(s): {:?}) but extension did not reconnect. \
+                Refusing to launch a second browser instance.",
+                pids
+            );
+        }
+
         println!("Browser extension not connected, launching Chromium...");
 
         let opts = browser::LaunchOptions {
@@ -498,7 +566,8 @@ fn kill_mzoon_server() {
 pub async fn run_tests(opts: TestOptions) -> Result<Vec<TestResult>> {
     // Pre-flight check: ensure WebSocket server and browser extension are ready
     // This will auto-start the server and launch browser if needed
-    let setup = ensure_browser_connection(opts.port).await?;
+    let setup = ensure_browser_connection(opts.port, opts.no_launch).await?;
+    ensure_engine_dd(opts.port).await?;
 
     // Run tests and ensure cleanup happens even on error
     let result = run_tests_inner(&opts).await;
@@ -513,7 +582,8 @@ pub async fn run_tests(opts: TestOptions) -> Result<Vec<TestResult>> {
 
 /// Smoke-run all built-in examples declared in playground `EXAMPLE_DATAS`.
 pub async fn run_builtin_smoke(opts: SmokeOptions) -> Result<Vec<SmokeResult>> {
-    let setup = ensure_browser_connection(opts.port).await?;
+    let setup = ensure_browser_connection(opts.port, opts.no_launch).await?;
+    ensure_engine_dd(opts.port).await?;
     let result = run_builtin_smoke_inner(&opts).await;
 
     if setup.started_mzoon {
@@ -610,6 +680,9 @@ async fn run_single_builtin_smoke(name: &str, port: u16) -> SmokeResult {
     tokio::time::sleep(Duration::from_millis(80)).await;
     let _ = send_command_to_server(port, WsCommand::Refresh).await;
     tokio::time::sleep(Duration::from_millis(1200)).await;
+    if let Err(err) = ensure_engine_dd(port).await {
+        return fail(format!("ensure_engine_dd failed: {}", err), start);
+    }
 
     let example_name = format!("{}.bn", name);
     match send_command_to_server(port, WsCommand::SelectExample { name: example_name }).await {
@@ -771,6 +844,7 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
     tokio::time::sleep(Duration::from_millis(100)).await;
     let _ = send_command_to_server(opts.port, WsCommand::Refresh).await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
+    ensure_engine_dd(opts.port).await?;
 
     // Inject code with filename for persistence
     let filename = format!("{}.bn", example.name);

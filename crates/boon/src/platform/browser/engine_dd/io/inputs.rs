@@ -3,10 +3,10 @@
 //! This module provides the EventInjector which allows the bridge to
 //! inject events (LINK fires, timer ticks) into the DD dataflow.
 
-use std::cell::RefCell;
+use super::super::core::{CellId, Event, EventValue, Input, Key, LinkId, TimerId};
 #[allow(unused_imports)]
 use super::super::dd_log;
-use super::super::core::{Event, EventValue, Input, Key, LinkId, TimerId};
+use std::cell::RefCell;
 
 // Global event dispatcher for browser environment (single-threaded)
 thread_local! {
@@ -86,11 +86,15 @@ pub fn fire_global_link(link_id: &str) {
     // Fire to DD - DD's link_mappings will process via apply_link_action
     // DD has change detection, so duplicate processing is safe
     GLOBAL_DISPATCHER.with(|cell| {
-        if let Some(injector) = cell.borrow().as_ref() { // ALLOWED: IO layer
+        if let Some(injector) = cell.borrow().as_ref() {
+            // ALLOWED: IO layer
             injector.fire_link_unit(LinkId::new(link_id));
             dd_log!("[DD Dispatcher] Fired link event: {}", link_id);
         } else {
-            panic!("[DD Dispatcher] Bug: No dispatcher set for link: {}", link_id);
+            panic!(
+                "[DD Dispatcher] Bug: No dispatcher set for link: {}",
+                link_id
+            );
         }
     });
 }
@@ -99,11 +103,15 @@ pub fn fire_global_link(link_id: &str) {
 /// Used by text_input change events to propagate current text to DD.
 pub fn fire_global_link_with_text(link_id: &str, text: String) {
     GLOBAL_DISPATCHER.with(|cell| {
-        if let Some(injector) = cell.borrow().as_ref() { // ALLOWED: IO layer
+        if let Some(injector) = cell.borrow().as_ref() {
+            // ALLOWED: IO layer
             injector.fire_link_text(LinkId::new(link_id), text);
             dd_log!("[DD Dispatcher] Fired link with text: {}", link_id);
         } else {
-            panic!("[DD Dispatcher] Bug: No dispatcher set for link with text: {}", link_id);
+            panic!(
+                "[DD Dispatcher] Bug: No dispatcher set for link with text: {}",
+                link_id
+            );
         }
     });
 }
@@ -115,26 +123,124 @@ pub fn fire_global_link_with_text(link_id: &str, text: String) {
 pub fn fire_global_link_with_bool(link_id: &str, value: bool) {
     // Fire to DD - DD's link_mappings will handle via apply_link_action
     GLOBAL_DISPATCHER.with(|cell| {
-        if let Some(injector) = cell.borrow().as_ref() { // ALLOWED: IO layer
+        if let Some(injector) = cell.borrow().as_ref() {
+            // ALLOWED: IO layer
             injector.fire_link_bool(LinkId::new(link_id), value);
-            dd_log!("[DD Dispatcher] Fired link with bool: {} value={}", link_id, value);
+            dd_log!(
+                "[DD Dispatcher] Fired link with bool: {} value={}",
+                link_id,
+                value
+            );
         } else {
-            panic!("[DD Dispatcher] Bug: No dispatcher set for link: {}", link_id);
+            panic!(
+                "[DD Dispatcher] Bug: No dispatcher set for link: {}",
+                link_id
+            );
         }
     });
 }
-
 
 /// Fire a key_down event with the key and optional text.
 /// Used by text_input when a key is pressed.
 /// The link_id should be for the key_down event.
 pub fn fire_global_key_down(link_id: &str, key: Key, text: Option<String>) {
     GLOBAL_DISPATCHER.with(|cell| {
-        if let Some(injector) = cell.borrow().as_ref() { // ALLOWED: IO layer
+        if let Some(injector) = cell.borrow().as_ref() {
+            // ALLOWED: IO layer
             injector.fire_link_key_down(LinkId::new(link_id), key.clone(), text);
-            dd_log!("[DD Dispatcher] Fired key_down event: {} key='{}'", link_id, key.as_str());
+            dd_log!(
+                "[DD Dispatcher] Fired key_down event: {} key='{}'",
+                link_id,
+                key.as_str()
+            );
         } else {
-            panic!("[DD Dispatcher] Bug: No dispatcher set for key_down: {}", link_id);
+            panic!(
+                "[DD Dispatcher] Bug: No dispatcher set for key_down: {}",
+                link_id
+            );
+        }
+    });
+}
+
+/// Fire an item-scoped link event (unit payload).
+///
+/// This is used for interactions originating from a concrete list item row.
+pub fn fire_global_item_link(item_key: &str, action_id: &str) {
+    GLOBAL_DISPATCHER.with(|cell| {
+        if let Some(injector) = cell.borrow().as_ref() {
+            injector.fire_item_link_unit(None, item_key, LinkId::new(action_id));
+            dd_log!(
+                "[DD Dispatcher] Fired item link event: item_key='{}' action='{}'",
+                item_key,
+                action_id
+            );
+        } else {
+            panic!(
+                "[DD Dispatcher] Bug: No dispatcher set for item link: item_key='{}' action='{}'",
+                item_key, action_id
+            );
+        }
+    });
+}
+
+/// Fire an item-scoped link event with text payload.
+pub fn fire_global_item_link_with_text(item_key: &str, action_id: &str, text: String) {
+    GLOBAL_DISPATCHER.with(|cell| {
+        if let Some(injector) = cell.borrow().as_ref() {
+            injector.fire_item_link_text(None, item_key, LinkId::new(action_id), text);
+            dd_log!(
+                "[DD Dispatcher] Fired item link with text: item_key='{}' action='{}'",
+                item_key,
+                action_id
+            );
+        } else {
+            panic!(
+                "[DD Dispatcher] Bug: No dispatcher set for item link text: item_key='{}' action='{}'",
+                item_key,
+                action_id
+            );
+        }
+    });
+}
+
+/// Fire an item-scoped link event with bool payload.
+pub fn fire_global_item_link_with_bool(item_key: &str, action_id: &str, value: bool) {
+    GLOBAL_DISPATCHER.with(|cell| {
+        if let Some(injector) = cell.borrow().as_ref() {
+            injector.fire_item_link_bool(None, item_key, LinkId::new(action_id), value);
+            dd_log!(
+                "[DD Dispatcher] Fired item link with bool: item_key='{}' action='{}' value={}",
+                item_key,
+                action_id,
+                value
+            );
+        } else {
+            panic!(
+                "[DD Dispatcher] Bug: No dispatcher set for item link bool: item_key='{}' action='{}'",
+                item_key,
+                action_id
+            );
+        }
+    });
+}
+
+/// Fire an item-scoped key_down event.
+pub fn fire_global_item_key_down(item_key: &str, action_id: &str, key: Key, text: Option<String>) {
+    GLOBAL_DISPATCHER.with(|cell| {
+        if let Some(injector) = cell.borrow().as_ref() {
+            injector.fire_item_link_key_down(None, item_key, LinkId::new(action_id), key.clone(), text);
+            dd_log!(
+                "[DD Dispatcher] Fired item key_down: item_key='{}' action='{}' key='{}'",
+                item_key,
+                action_id,
+                key.as_str()
+            );
+        } else {
+            panic!(
+                "[DD Dispatcher] Bug: No dispatcher set for item key_down: item_key='{}' action='{}'",
+                item_key,
+                action_id
+            );
         }
     });
 }
@@ -159,9 +265,35 @@ impl EventInjector {
         self.event_input.send_or_drop(Event::Link { id, value });
     }
 
+    /// Fire an item-scoped LINK event.
+    pub fn fire_item_link(
+        &self,
+        list_cell_id: Option<CellId>,
+        item_key: impl Into<std::sync::Arc<str>>,
+        action_id: LinkId,
+        value: EventValue,
+    ) {
+        self.event_input.send_or_drop(Event::ItemLink {
+            list_cell_id,
+            item_key: item_key.into(),
+            action_id,
+            value,
+        });
+    }
+
     /// Fire a LINK with unit value (most common case - button press).
     pub fn fire_link_unit(&self, id: LinkId) {
         self.fire_link(id, EventValue::Unit);
+    }
+
+    /// Fire an item-scoped LINK with unit value.
+    pub fn fire_item_link_unit(
+        &self,
+        list_cell_id: Option<CellId>,
+        item_key: impl Into<std::sync::Arc<str>>,
+        action_id: LinkId,
+    ) {
+        self.fire_item_link(list_cell_id, item_key, action_id, EventValue::Unit);
     }
 
     /// Fire a LINK with text value (e.g., text input change).
@@ -169,9 +301,42 @@ impl EventInjector {
         self.fire_link(id, EventValue::Text(text.into()));
     }
 
+    /// Fire an item-scoped LINK with text value.
+    pub fn fire_item_link_text(
+        &self,
+        list_cell_id: Option<CellId>,
+        item_key: impl Into<std::sync::Arc<str>>,
+        action_id: LinkId,
+        text: impl Into<String>,
+    ) {
+        self.fire_item_link(
+            list_cell_id,
+            item_key,
+            action_id,
+            EventValue::Text(text.into()),
+        );
+    }
+
     /// Fire a key_down event.
     pub fn fire_link_key_down(&self, id: LinkId, key: Key, text: Option<String>) {
         self.fire_link(id, EventValue::key_down(key, text));
+    }
+
+    /// Fire an item-scoped key_down event.
+    pub fn fire_item_link_key_down(
+        &self,
+        list_cell_id: Option<CellId>,
+        item_key: impl Into<std::sync::Arc<str>>,
+        action_id: LinkId,
+        key: Key,
+        text: Option<String>,
+    ) {
+        self.fire_item_link(
+            list_cell_id,
+            item_key,
+            action_id,
+            EventValue::key_down(key, text),
+        );
     }
 
     /// Fire a LINK with boolean value (e.g., checkbox toggle).
@@ -179,9 +344,19 @@ impl EventInjector {
         self.fire_link(id, EventValue::Bool(value));
     }
 
+    /// Fire an item-scoped LINK with bool value.
+    pub fn fire_item_link_bool(
+        &self,
+        list_cell_id: Option<CellId>,
+        item_key: impl Into<std::sync::Arc<str>>,
+        action_id: LinkId,
+        value: bool,
+    ) {
+        self.fire_item_link(list_cell_id, item_key, action_id, EventValue::Bool(value));
+    }
+
     /// Fire a timer tick event.
     pub fn fire_timer(&self, id: TimerId, tick: u64) {
         self.event_input.send_or_drop(Event::Timer { id, tick });
     }
-
 }

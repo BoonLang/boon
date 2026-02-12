@@ -6,16 +6,18 @@
 //!
 //! Persistence: HOLD values are saved to localStorage and restored on re-run.
 
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use super::super::core::dataflow::ListState;
-use super::super::core::value::{CellUpdate, CollectionHandle, CollectionId, Value};
+use super::super::core::value::{
+    extract_item_key as extract_core_item_key, CellUpdate, CollectionHandle, CollectionId, Value,
+};
 use super::super::core::ITEM_KEY_FIELD;
 #[allow(unused_imports)]
 use super::super::dd_log;
-use zoon::Mutable;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use zoon::futures_signals::signal_vec::{MutableVec, SignalVec};
+use zoon::Mutable;
 use zoon::{local_storage, WebStorage};
 
 // Text input clearing is driven by Boon code; no IO-side text-clear side effects.
@@ -60,11 +62,19 @@ pub fn clear_cells_memory() {
 /// - If the value is a list, updates the MutableVec for incremental rendering
 /// - If persist=true, also writes to localStorage for state recovery
 fn sync_cell_impl(update: CellUpdate, persist: bool) {
-    dd_log!("[DD Sync{}] {:?}", if persist { "+Persist" } else { "" }, update);
+    dd_log!(
+        "[DD Sync{}] {:?}",
+        if persist { "+Persist" } else { "" },
+        update
+    );
 
     match update {
         CellUpdate::Multi(updates) => {
-            dd_log!("[DD MultiUpdate{}] {} updates", if persist { "+Persist" } else { "" }, updates.len());
+            dd_log!(
+                "[DD MultiUpdate{}] {} updates",
+                if persist { "+Persist" } else { "" },
+                updates.len()
+            );
             for update in updates {
                 sync_cell_impl(update, persist);
             }
@@ -73,40 +83,66 @@ fn sync_cell_impl(update: CellUpdate, persist: bool) {
         CellUpdate::ListPush { cell_id, item } => {
             dd_log!("[DD ListDiff] {} Push", cell_id);
             apply_list_push(cell_id.as_ref(), &item);
-            if persist { persist_list_state(cell_id.as_ref()); }
+            if persist {
+                persist_list_state(cell_id.as_ref());
+            }
         }
-        CellUpdate::ListInsertAt { cell_id, index, item } => {
+        CellUpdate::ListInsertAt {
+            cell_id,
+            index,
+            item,
+        } => {
             dd_log!("[DD ListDiff] {} InsertAt({})", cell_id, index);
             apply_list_insert_at(cell_id.as_ref(), index, &item);
-            if persist { persist_list_state(cell_id.as_ref()); }
+            if persist {
+                persist_list_state(cell_id.as_ref());
+            }
         }
         CellUpdate::ListRemoveAt { cell_id, index } => {
             dd_log!("[DD ListDiff] {} RemoveAt({})", cell_id, index);
             apply_list_remove_at(cell_id.as_ref(), index);
-            if persist { persist_list_state(cell_id.as_ref()); }
+            if persist {
+                persist_list_state(cell_id.as_ref());
+            }
         }
         CellUpdate::ListRemoveByKey { cell_id, key } => {
             dd_log!("[DD ListDiff] {} RemoveByKey({})", cell_id, key);
             apply_list_remove_by_key(cell_id.as_ref(), key.as_ref());
-            if persist { persist_list_state(cell_id.as_ref()); }
+            if persist {
+                persist_list_state(cell_id.as_ref());
+            }
         }
         CellUpdate::ListRemoveBatch { cell_id, keys } => {
             dd_log!("[DD ListDiff] {} RemoveBatch({} keys)", cell_id, keys.len());
             apply_list_remove_batch(cell_id.as_ref(), &keys);
-            if persist { persist_list_state(cell_id.as_ref()); }
+            if persist {
+                persist_list_state(cell_id.as_ref());
+            }
         }
         CellUpdate::ListClear { cell_id } => {
             dd_log!("[DD ListDiff] {} Clear", cell_id);
             apply_list_clear(cell_id.as_ref());
-            if persist { persist_list_state(cell_id.as_ref()); }
+            if persist {
+                persist_list_state(cell_id.as_ref());
+            }
         }
-        CellUpdate::ListItemUpdate { cell_id, key, field_path, new_value } => {
+        CellUpdate::ListItemUpdate {
+            cell_id,
+            key,
+            field_path,
+            new_value,
+        } => {
             dd_log!("[DD ListDiff] {} ItemUpdate({})", cell_id, key);
             apply_list_item_update(cell_id.as_ref(), key.as_ref(), &field_path, &new_value);
-            if persist { persist_list_state(cell_id.as_ref()); }
+            if persist {
+                persist_list_state(cell_id.as_ref());
+            }
         }
         CellUpdate::SetValue { cell_id, value } => {
-            if matches!(value, Value::Placeholder | Value::PlaceholderField(_) | Value::PlaceholderWhile(_)) {
+            if matches!(
+                value,
+                Value::Placeholder | Value::PlaceholderField(_) | Value::PlaceholderWhile(_)
+            ) {
                 panic!(
                     "[DD Sync] Placeholder value reached IO boundary for '{}': {:?}",
                     cell_id, value
@@ -145,9 +181,16 @@ pub fn sync_cell_from_dd_with_persist(update: CellUpdate) {
 /// Initialize list state from DD, optionally persisting.
 fn sync_list_state_impl(cell_id: impl Into<String>, items: Vec<Value>, persist: bool) {
     let cell_id = cell_id.into();
-    dd_log!("[DD SyncList{}] {} ({} items)", if persist { "+Persist" } else { "" }, cell_id, items.len());
+    dd_log!(
+        "[DD SyncList{}] {} ({} items)",
+        if persist { "+Persist" } else { "" },
+        cell_id,
+        items.len()
+    );
     init_list_cell_from_items(&cell_id, &items);
-    if persist { persist_list_state(&cell_id); }
+    if persist {
+        persist_list_state(&cell_id);
+    }
 }
 
 /// Initialize list state from DD (snapshot-free CollectionHandle).
@@ -167,16 +210,50 @@ pub fn sync_list_state_from_dd_with_persist(cell_id: impl Into<String>, items: V
 
 /// Apply ListPush diff - O(1) append
 fn apply_list_push(cell_id: &str, item: &Value) {
-    let _ = extract_item_key(item);
+    let item_key = extract_core_item_key(item, "io list push");
     ensure_list_state_initialized(cell_id);
     // Update authoritative list state
-    let index = LIST_STATES.with(|states| {
+    let push_result = LIST_STATES.with(|states| {
         let mut states = states.borrow_mut(); // ALLOWED: IO layer
         let state = states.get_mut(cell_id).unwrap_or_else(|| {
             panic!("[DD ListDiff] Missing list state for '{}'", cell_id);
         });
-        state.push(item.clone(), "list push")
+        // Keep index consistent before duplicate checks (reinit/replay safety).
+        state.rebuild_index("io list push preflight");
+
+        // Detect duplicates by scanning items, not only index map.
+        // This guards against stale/misaligned indexes during replay reinit.
+        let existing_index = state.items().iter().position(|existing_item| {
+            extract_core_item_key(existing_item, "io list push existing") == item_key
+        });
+
+        if let Some(index) = existing_index {
+            let existing = &state.items()[index];
+            if existing == item {
+                dd_log!(
+                    "[DD ListDiff] Skipping idempotent ListPush replay for '{}' key '{}'",
+                    cell_id,
+                    item_key
+                );
+                return None;
+            }
+            state.remove_at(index, "list push conflicting remove");
+            state.insert(index, item.clone(), "list push conflicting insert");
+            dd_log!(
+                "[DD ListDiff] Replaced conflicting ListPush replay for '{}' key '{}'",
+                cell_id,
+                item_key
+            );
+            return Some((index, true));
+        }
+
+        let index = state.push(item.clone(), "list push");
+        Some((index, false))
     });
+
+    let Some((index, replaced)) = push_result else {
+        return;
+    };
 
     // Update MutableVec for incremental rendering
     LIST_SIGNAL_VECS.with(|vecs| {
@@ -185,15 +262,25 @@ fn apply_list_push(cell_id: &str, item: &Value) {
             panic!("[DD ListDiff] Missing list signal vec for '{}'", cell_id);
         });
         let mut lock = mvec.lock_mut();
-        if index != lock.len() {
-            panic!(
-                "[DD ListDiff] ListPush index mismatch for '{}': state={}, vec={}",
-                cell_id,
-                index,
-                lock.len()
-            );
+        if replaced {
+            if index >= lock.len() {
+                panic!(
+                    "[DD ListDiff] ListPush replace index {} out of bounds for '{}'",
+                    index, cell_id
+                );
+            }
+            lock.set_cloned(index, item.clone());
+        } else {
+            if index != lock.len() {
+                panic!(
+                    "[DD ListDiff] ListPush index mismatch for '{}': state={}, vec={}",
+                    cell_id,
+                    index,
+                    lock.len()
+                );
+            }
+            lock.push_cloned(item.clone());
         }
-        lock.push_cloned(item.clone());
     });
 }
 
@@ -217,7 +304,10 @@ fn apply_list_insert_at(cell_id: &str, index: usize, item: &Value) {
         });
         let mut lock = mvec.lock_mut();
         if index > lock.len() {
-            panic!("[DD ListDiff] ListInsertAt index {} out of bounds for {}", index, cell_id);
+            panic!(
+                "[DD ListDiff] ListInsertAt index {} out of bounds for {}",
+                index, cell_id
+            );
         }
         lock.insert_cloned(index, item.clone());
     });
@@ -238,15 +328,20 @@ fn apply_list_remove_at(cell_id: &str, index: usize) {
     LIST_SIGNAL_VECS.with(|vecs| {
         let vecs = vecs.borrow(); // ALLOWED: IO layer
         let mvec = vecs.get(cell_id).unwrap_or_else(|| {
-            panic!("[DD ListDiff] ListRemoveAt missing MutableVec for {}", cell_id);
+            panic!(
+                "[DD ListDiff] ListRemoveAt missing MutableVec for {}",
+                cell_id
+            );
         });
         let mut lock = mvec.lock_mut();
         if index >= lock.len() {
-            panic!("[DD ListDiff] ListRemoveAt index {} out of bounds for {}", index, cell_id);
+            panic!(
+                "[DD ListDiff] ListRemoveAt index {} out of bounds for {}",
+                index, cell_id
+            );
         }
         lock.remove(index);
     });
-
 }
 
 /// Apply ListRemoveByKey diff - O(1) key lookup
@@ -265,13 +360,19 @@ fn apply_list_remove_by_key(cell_id: &str, key: &str) {
     LIST_SIGNAL_VECS.with(|vecs| {
         let vecs = vecs.borrow(); // ALLOWED: IO layer
         let mvec = vecs.get(cell_id).unwrap_or_else(|| {
-            panic!("[DD ListDiff] RemoveByKey missing MutableVec for {}", cell_id);
+            panic!(
+                "[DD ListDiff] RemoveByKey missing MutableVec for {}",
+                cell_id
+            );
         });
         let mut lock = mvec.lock_mut();
         if idx < lock.len() {
             lock.remove(idx);
         } else {
-            panic!("[DD ListDiff] RemoveByKey index {} out of bounds for {}", idx, cell_id);
+            panic!(
+                "[DD ListDiff] RemoveByKey index {} out of bounds for {}",
+                idx, cell_id
+            );
         }
     });
 
@@ -284,7 +385,12 @@ fn apply_list_remove_by_key(cell_id: &str, key: &str) {
         state.remove_by_key(key, "list remove by key");
     });
 
-    dd_log!("[DD ListDiff] {} RemoveByKey({}) at index {}", cell_id, key, idx);
+    dd_log!(
+        "[DD ListDiff] {} RemoveByKey({}) at index {}",
+        cell_id,
+        key,
+        idx
+    );
 }
 
 /// Apply ListRemoveBatch diff - O(k) batch removal where k = keys.len()
@@ -319,12 +425,18 @@ fn apply_list_remove_batch(cell_id: &str, keys: &[Arc<str>]) {
     LIST_SIGNAL_VECS.with(|vecs| {
         let vecs = vecs.borrow(); // ALLOWED: IO layer
         let mvec = vecs.get(cell_id).unwrap_or_else(|| {
-            panic!("[DD ListDiff] RemoveBatch missing MutableVec for {}", cell_id);
+            panic!(
+                "[DD ListDiff] RemoveBatch missing MutableVec for {}",
+                cell_id
+            );
         });
         let mut lock = mvec.lock_mut();
         for &idx in &indices_to_remove {
             if idx >= lock.len() {
-                panic!("[DD ListDiff] RemoveBatch index {} out of bounds for {}", idx, cell_id);
+                panic!(
+                    "[DD ListDiff] RemoveBatch index {} out of bounds for {}",
+                    idx, cell_id
+                );
             }
             lock.remove(idx);
         }
@@ -339,7 +451,11 @@ fn apply_list_remove_batch(cell_id: &str, keys: &[Arc<str>]) {
         state.remove_batch(keys, "list remove batch");
     });
 
-    dd_log!("[DD ListDiff] {} RemoveBatch removed {} items", cell_id, indices_to_remove.len());
+    dd_log!(
+        "[DD ListDiff] {} RemoveBatch removed {} items",
+        cell_id,
+        indices_to_remove.len()
+    );
 }
 
 /// Apply ListClear diff - O(1) clear
@@ -369,7 +485,10 @@ fn apply_list_item_update(cell_id: &str, key: &str, field_path: &[Arc<str>], new
     let idx = LIST_STATES.with(|states| {
         let states = states.borrow(); // ALLOWED: IO layer
         let state = states.get(cell_id).unwrap_or_else(|| {
-            panic!("[DD ListDiff] ListItemUpdate missing list state '{}'", cell_id);
+            panic!(
+                "[DD ListDiff] ListItemUpdate missing list state '{}'",
+                cell_id
+            );
         });
         state.index_of(key, "list item update")
     });
@@ -378,9 +497,13 @@ fn apply_list_item_update(cell_id: &str, key: &str, field_path: &[Arc<str>], new
     let new_item = LIST_STATES.with(|states| {
         let mut states = states.borrow_mut(); // ALLOWED: IO layer
         let state = states.get_mut(cell_id).unwrap_or_else(|| {
-            panic!("[DD ListDiff] ListItemUpdate missing list state '{}'", cell_id);
+            panic!(
+                "[DD ListDiff] ListItemUpdate missing list state '{}'",
+                cell_id
+            );
         });
-        let (_old_item, new_item) = state.update_field(key, field_path, new_value, "list item update");
+        let (_old_item, new_item) =
+            state.update_field(key, field_path, new_value, "list item update");
         new_item
     });
 
@@ -388,13 +511,19 @@ fn apply_list_item_update(cell_id: &str, key: &str, field_path: &[Arc<str>], new
     LIST_SIGNAL_VECS.with(|vecs| {
         let vecs = vecs.borrow(); // ALLOWED: IO layer
         let mvec = vecs.get(cell_id).unwrap_or_else(|| {
-            panic!("[DD ListDiff] ListItemUpdate missing MutableVec for {}", cell_id);
+            panic!(
+                "[DD ListDiff] ListItemUpdate missing MutableVec for {}",
+                cell_id
+            );
         });
         let mut mvec_lock = mvec.lock_mut();
         if idx < mvec_lock.len() {
             mvec_lock.set_cloned(idx, new_item);
         } else {
-            panic!("[DD ListDiff] ListItemUpdate index {} out of bounds for {}", idx, cell_id);
+            panic!(
+                "[DD ListDiff] ListItemUpdate index {} out of bounds for {}",
+                idx, cell_id
+            );
         }
     });
 }
@@ -433,8 +562,6 @@ thread_local! {
     static CURRENT_ROUTE: Mutable<String> = Mutable::new("/".to_string()); // ALLOWED: route state
 }
 
-
-
 /// Get the current route value.
 /// Used by Router/route() when returning a CellRef.
 pub fn get_current_route() -> String {
@@ -446,7 +573,10 @@ pub fn init_current_route() {
     #[cfg(target_arch = "wasm32")]
     {
         use zoon::*;
-        let path = window().location().pathname().unwrap_or_else(|_| "/".to_string());
+        let path = window()
+            .location()
+            .pathname()
+            .unwrap_or_else(|_| "/".to_string());
         CURRENT_ROUTE.with(|r| r.set(path.clone()));
     }
 }
@@ -472,17 +602,23 @@ pub fn navigate_to_route(path: &str) {
     }
 }
 
-
-
 // NOTE: Runtime updates already flow through DD; remaining gap is
 // initial state hydration (persisted values) which still happens in the worker.
 
 fn load_persisted_storage() -> HashMap<String, zoon::serde_json::Value> {
-    let storage: HashMap<String, zoon::serde_json::Value> = match local_storage().get::<HashMap<String, zoon::serde_json::Value>>(DD_HOLD_STORAGE_KEY) {
+    let storage: HashMap<String, zoon::serde_json::Value> = match local_storage().get::<HashMap<
+        String,
+        zoon::serde_json::Value,
+    >>(
+        DD_HOLD_STORAGE_KEY,
+    ) {
         None => return HashMap::new(),
         Some(Ok(s)) => s,
         Some(Err(err)) => {
-            panic!("[DD Persist] Failed to deserialize persisted state: {:?}", err);
+            panic!(
+                "[DD Persist] Failed to deserialize persisted state: {:?}",
+                err
+            );
         }
     };
 
@@ -534,7 +670,10 @@ pub fn load_persisted_cell_value(cell_id: &str) -> Option<Value> {
 /// Returns None if no persisted value exists.
 pub fn load_persisted_cell_value_with_collections(cell_id: &str) -> Option<PersistedValue> {
     if cell_id == DD_PERSIST_VERSION_KEY {
-        panic!("[DD Persist] '{}' is a reserved persistence key", DD_PERSIST_VERSION_KEY);
+        panic!(
+            "[DD Persist] '{}' is a reserved persistence key",
+            DD_PERSIST_VERSION_KEY
+        );
     }
 
     let storage = load_persisted_storage();
@@ -561,7 +700,10 @@ pub fn load_persisted_list_items(cell_id: &str) -> Option<Vec<Value>> {
 /// Returns None if no persisted list exists.
 pub fn load_persisted_list_items_with_collections(cell_id: &str) -> Option<PersistedListItems> {
     if cell_id == DD_PERSIST_VERSION_KEY {
-        panic!("[DD Persist] '{}' is a reserved persistence key", DD_PERSIST_VERSION_KEY);
+        panic!(
+            "[DD Persist] '{}' is a reserved persistence key",
+            DD_PERSIST_VERSION_KEY
+        );
     }
 
     let storage = load_persisted_storage();
@@ -582,11 +724,19 @@ fn persist_hold_value(cell_id: &str, value: &Value) {
 
 fn persist_json_value(cell_id: &str, json: zoon::serde_json::Value) {
     // Load existing storage
-    let mut storage: HashMap<String, zoon::serde_json::Value> = match local_storage().get::<HashMap<String, zoon::serde_json::Value>>(DD_HOLD_STORAGE_KEY) {
+    let mut storage: HashMap<String, zoon::serde_json::Value> = match local_storage().get::<HashMap<
+        String,
+        zoon::serde_json::Value,
+    >>(
+        DD_HOLD_STORAGE_KEY,
+    ) {
         None => HashMap::new(),
         Some(Ok(s)) => s,
         Some(Err(err)) => {
-            panic!("[DD Persist] Failed to deserialize persisted state: {:?}", err);
+            panic!(
+                "[DD Persist] Failed to deserialize persisted state: {:?}",
+                err
+            );
         }
     };
 
@@ -603,7 +753,10 @@ fn persist_json_value(cell_id: &str, json: zoon::serde_json::Value) {
 fn list_state_items(cell_id: &str, context: &str) -> Vec<Value> {
     CELL_STATES.with(|states| {
         if states.lock_ref().contains_key(cell_id) {
-            panic!("[DD {}] List cell '{}' stored in CELL_STATES", context, cell_id);
+            panic!(
+                "[DD {}] List cell '{}' stored in CELL_STATES",
+                context, cell_id
+            );
         }
     });
 
@@ -626,8 +779,8 @@ fn persist_list_state(cell_id: &str) {
 
 /// Convert Value to JSON for storage.
 fn dd_value_to_json(value: &Value) -> zoon::serde_json::Value {
-    use zoon::serde_json::json;
     use super::super::core::types::BoolTag;
+    use zoon::serde_json::json;
     match value {
         Value::Unit => json!(null),
         Value::Bool(b) => json!(b),
@@ -679,7 +832,10 @@ fn dd_value_to_json(value: &Value) -> zoon::serde_json::Value {
                 zoon::serde_json::Value::Bool(false)
             } else {
                 let mut obj = zoon::serde_json::Map::new();
-                obj.insert("__tag__".to_string(), zoon::serde_json::Value::String(tag.to_string()));
+                obj.insert(
+                    "__tag__".to_string(),
+                    zoon::serde_json::Value::String(tag.to_string()),
+                );
                 for (k, v) in fields.iter() {
                     obj.insert(k.to_string(), dd_value_to_json(v));
                 }
@@ -695,7 +851,10 @@ fn dd_value_to_json(value: &Value) -> zoon::serde_json::Value {
         | Value::WhileConfig(_)
         | Value::PlaceholderWhile(_)
         | Value::Flushed(_) => {
-            panic!("[DD Persist] Unsupported Value for persistence: {:?}", value);
+            panic!(
+                "[DD Persist] Unsupported Value for persistence: {:?}",
+                value
+            );
         }
     }
 }
@@ -704,8 +863,8 @@ fn json_to_dd_value_with_collections(
     json: &zoon::serde_json::Value,
     collections: &mut HashMap<CollectionId, Vec<Value>>,
 ) -> Value {
-    use zoon::serde_json::Value as JsonValue;
     use std::collections::BTreeMap;
+    use zoon::serde_json::Value as JsonValue;
     match json {
         JsonValue::Null => Value::Unit,
         // IMPORTANT: Boon uses Tagged booleans (Tagged { tag: "True/False" }), not Rust bools
@@ -724,7 +883,9 @@ fn json_to_dd_value_with_collections(
         JsonValue::Object(obj) => {
             if obj.contains_key("__collection__") {
                 if obj.len() != 1 {
-                    panic!("[DD Persist] '__collection__' marker cannot be mixed with other fields");
+                    panic!(
+                        "[DD Persist] '__collection__' marker cannot be mixed with other fields"
+                    );
                 }
                 let items = obj.get("__collection__").unwrap_or_else(|| {
                     panic!("[DD Persist] Missing '__collection__' field");
@@ -789,7 +950,6 @@ fn json_to_dd_list_items_with_collections(
         .collect()
 }
 
-
 /// Get a granular signal for a specific cell.
 /// Only fires when THIS cell's value changes - O(1) updates.
 ///
@@ -800,9 +960,7 @@ fn json_to_dd_list_items_with_collections(
 /// ```
 pub fn cell_signal(cell_id: impl Into<String>) -> impl zoon::Signal<Item = Option<Value>> + Unpin {
     let cell_id = cell_id.into();
-    CELL_STATES.with(|states| {
-        states.signal_ref(move |map| map.get(&cell_id).cloned())
-    })
+    CELL_STATES.with(|states| states.signal_ref(move |map| map.get(&cell_id).cloned()))
 }
 
 /// Get the current value of a specific HOLD.
@@ -833,7 +991,10 @@ pub fn is_list_cell(cell_id: &str) -> bool {
     let has_list = LIST_STATES.with(|states| states.borrow().contains_key(cell_id));
     let has_scalar = CELL_STATES.with(|states| states.lock_ref().contains_key(cell_id));
     if has_list && has_scalar {
-        panic!("[DD IO] Cell '{}' exists in both LIST_STATES and CELL_STATES", cell_id);
+        panic!(
+            "[DD IO] Cell '{}' exists in both LIST_STATES and CELL_STATES",
+            cell_id
+        );
     }
     if !has_list && !has_scalar {
         if LIST_SIGNAL_VECS.with(|vecs| vecs.borrow().contains_key(cell_id)) {
@@ -913,7 +1074,10 @@ fn init_list_signal_vec_from_items(cell_id: &str, items: &[Value]) {
 fn init_list_cell_from_items(cell_id: &str, items: &[Value]) {
     CELL_STATES.with(|states| {
         if states.lock_ref().contains_key(cell_id) {
-            panic!("[DD ListInit] List cell '{}' stored in CELL_STATES", cell_id);
+            panic!(
+                "[DD ListInit] List cell '{}' stored in CELL_STATES",
+                cell_id
+            );
         }
     });
 
@@ -932,9 +1096,15 @@ fn init_list_cell_from_items(cell_id: &str, items: &[Value]) {
     LIST_STATES.with(|states| {
         let mut states = states.borrow_mut(); // ALLOWED: IO layer
         if states.contains_key(cell_id) {
-            panic!("[DD ListInit] List state for '{}' already initialized", cell_id);
+            panic!(
+                "[DD ListInit] List state for '{}' already initialized",
+                cell_id
+            );
         }
-        states.insert(cell_id.to_string(), ListState::new(items.to_vec(), "list init"));
+        states.insert(
+            cell_id.to_string(),
+            ListState::new(items.to_vec(), "list init"),
+        );
     });
     init_list_signal_vec_from_items(cell_id, items);
 }
@@ -942,7 +1112,10 @@ fn init_list_cell_from_items(cell_id: &str, items: &[Value]) {
 fn ensure_list_state_initialized(cell_id: &str) {
     CELL_STATES.with(|states| {
         if states.lock_ref().contains_key(cell_id) {
-            panic!("[DD ListDiff] List cell '{}' stored in CELL_STATES", cell_id);
+            panic!(
+                "[DD ListDiff] List cell '{}' stored in CELL_STATES",
+                cell_id
+            );
         }
     });
 
@@ -961,7 +1134,10 @@ fn ensure_list_state_initialized(cell_id: &str) {
 
     let has_vec = LIST_SIGNAL_VECS.with(|vecs| vecs.borrow().contains_key(cell_id));
     if has_vec && state_was_new {
-        panic!("[DD ListDiff] Missing list state for existing signal vec '{}'", cell_id);
+        panic!(
+            "[DD ListDiff] Missing list state for existing signal vec '{}'",
+            cell_id
+        );
     }
     if !has_vec {
         let items = items_for_vec.unwrap_or_default();
@@ -975,19 +1151,31 @@ fn extract_item_key(value: &Value) -> String {
     match value {
         Value::Object(fields) => match fields.get(ITEM_KEY_FIELD) {
             Some(Value::Text(key)) => key.to_string(),
-            Some(other) => panic!("Bug: __key must be Text in list item object, found {:?}", other),
+            Some(other) => panic!(
+                "Bug: __key must be Text in list item object, found {:?}",
+                other
+            ),
             None => panic!("Bug: missing __key in list item object"),
         },
         Value::Tagged { fields, .. } => match fields.get(ITEM_KEY_FIELD) {
             Some(Value::Text(key)) => key.to_string(),
-            Some(other) => panic!("Bug: __key must be Text in list item element, found {:?}", other),
+            Some(other) => panic!(
+                "Bug: __key must be Text in list item element, found {:?}",
+                other
+            ),
             None => panic!("Bug: missing __key in list item element"),
         },
         // Plain values (e.g., Text in font-family lists) use value as identity,
         // matching core::value::extract_item_key behavior.
         Value::Text(t) => t.to_string(),
         Value::Number(n) => format!("{}", n.0),
-        Value::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
+        Value::Bool(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
         other => format!("{:?}", other),
     }
 }
@@ -1007,4 +1195,3 @@ pub fn clear_list_states() {
         states.borrow_mut().clear(); // ALLOWED: IO layer
     });
 }
-

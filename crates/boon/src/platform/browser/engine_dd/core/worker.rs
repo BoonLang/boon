@@ -34,7 +34,10 @@ use super::super::dd_log;
 use zoon::futures_channel::mpsc;
 use zoon::{Task, Timer};
 
-use super::types::{Event, EventValue, Input, CellId, LinkId, BoolTag, EventFilter};
+use super::types::{
+    Event, EventValue, Input, CellId, LinkId, BoolTag, EventFilter, Key,
+    ROUTE_CHANGE_LINK_ID,
+};
 use super::value::{
     attach_item_key, attach_or_validate_item_key, contains_placeholder,
     ensure_unique_item_keys, extract_item_key,
@@ -54,6 +57,7 @@ use std::collections::BTreeMap;
 use super::dataflow::{
     DdCellConfig, DdCollectionConfig, DdTransform,
     inject_event_persistent, drain_outputs_persistent, reinit_if_config_changed,
+    init_persistent_worker, shutdown_persistent_worker,
 };
 
 // ============================================================================
@@ -80,11 +84,53 @@ static DYNAMIC_CELL_COUNTER: AtomicU32 = AtomicU32::new(1000);
 /// via `reset_id_counters()` in `Worker::new()`.
 static DYNAMIC_LINK_COUNTER: AtomicU32 = AtomicU32::new(1000);
 
+const DYNAMIC_CELL_PREFIX: &str = "dynamic_cell_";
+const DYNAMIC_LINK_PREFIX: &str = "dynamic_link_";
+
 /// Reset ID counters to starting values (1000).
 /// Called by Worker::new() to ensure deterministic ID generation per session.
 pub fn reset_id_counters() {
     DYNAMIC_CELL_COUNTER.store(1000, Ordering::SeqCst);
     DYNAMIC_LINK_COUNTER.store(1000, Ordering::SeqCst);
+}
+
+fn seed_id_counters_from_config(config: &DataflowConfig) {
+    let mut next_cell: u32 = 1000;
+    let mut next_link: u32 = 1000;
+
+    for cell in &config.cells {
+        if let Some(counter) = cell
+            .id
+            .name()
+            .strip_prefix(DYNAMIC_CELL_PREFIX)
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            next_cell = next_cell.max(counter.saturating_add(1));
+        }
+    }
+
+    for cell_id in config.cell_initializations.keys() {
+        if let Some(counter) = cell_id
+            .strip_prefix(DYNAMIC_CELL_PREFIX)
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            next_cell = next_cell.max(counter.saturating_add(1));
+        }
+    }
+
+    for mapping in &config.link_mappings {
+        if let Some(counter) = mapping
+            .link_id
+            .name()
+            .strip_prefix(DYNAMIC_LINK_PREFIX)
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            next_link = next_link.max(counter.saturating_add(1));
+        }
+    }
+
+    DYNAMIC_CELL_COUNTER.store(next_cell, Ordering::SeqCst);
+    DYNAMIC_LINK_COUNTER.store(next_link, Ordering::SeqCst);
 }
 
 /// Allocate a new dynamic cell ID.
@@ -249,13 +295,15 @@ fn ensure_list_states(
         if list_states.contains_key(cell_id) {
             continue;
         }
-        if let Some(state) = initial_list_states.get(cell_id) {
-            list_states.insert(cell_id.clone(), state.clone());
-        } else if derived_list_outputs.contains(cell_id) {
+        // Derived outputs must be rebuilt from DD streams.
+        // Rehydrating them from stale snapshots causes duplicate replay.
+        if derived_list_outputs.contains(cell_id) {
             list_states.insert(
                 cell_id.clone(),
                 super::dataflow::ListState::new(Vec::new(), cell_id),
             );
+        } else if let Some(state) = initial_list_states.get(cell_id) {
+            list_states.insert(cell_id.clone(), state.clone());
         } else {
             panic!("[DD Worker] Missing list state for '{}'", cell_id);
         }
@@ -274,11 +322,12 @@ fn apply_output_to_state_maps(
     cell_states: &mut HashMap<String, Value>,
     output: &CellUpdate,
     initial_by_id: &HashMap<String, Value>,
-) {
+) -> bool {
     match output {
         CellUpdate::Multi(updates) => {
+            let mut changed = false;
             for update in updates.iter() {
-                apply_output_to_state_maps(
+                changed |= apply_output_to_state_maps(
                     list_cells,
                     list_states,
                     cell_states,
@@ -286,26 +335,28 @@ fn apply_output_to_state_maps(
                     initial_by_id,
                 );
             }
+            changed
         }
-        CellUpdate::NoOp => {}
+        CellUpdate::NoOp => false,
         _ => {
             let cell_id = output.cell_id().unwrap_or_else(|| {
                 panic!("[DD Worker] Missing cell id for update {:?}", output);
             });
             if list_cells.contains(cell_id) {
-                apply_list_update_to_state(list_states, cell_id, output);
+                let changed = apply_list_update_to_state(list_states, cell_id, output);
                 if matches!(output, CellUpdate::SetValue { .. }) {
                     panic!(
                         "[DD Worker] List cell '{}' received non-diff output {:?}",
                         cell_id, output
                     );
                 }
-                return;
+                return changed;
             }
 
             match output {
                 CellUpdate::SetValue { value, .. } => {
-                    cell_states.insert(cell_id.to_string(), value.clone());
+                    let previous = cell_states.insert(cell_id.to_string(), value.clone());
+                    previous.as_ref() != Some(value)
                 }
                 _ => {
                     panic!(
@@ -322,7 +373,7 @@ fn apply_list_update_to_state(
     list_states: &mut HashMap<String, super::dataflow::ListState>,
     cell_id: &str,
     output: &CellUpdate,
-) {
+) -> bool {
     let list_state = list_states.get_mut(cell_id).unwrap_or_else(|| {
         panic!("[DD Worker] Missing list state for '{}'", cell_id);
     });
@@ -335,7 +386,31 @@ fn apply_list_update_to_state(
                     diff_cell_id, cell_id
                 );
             }
+            if matches!(item, Value::Object(_) | Value::Tagged { .. }) {
+                let key = extract_item_key(item, "list push");
+                if list_state.contains_key(key.as_ref()) {
+                    let existing = list_state.item_by_key(key.as_ref(), "list push existing");
+                    if existing == item {
+                    dd_log!(
+                        "[DD Worker] Skipping idempotent ListPush replay for '{}' key '{}'",
+                        cell_id,
+                        key
+                    );
+                        return false;
+                    }
+                    let index = list_state.index_of(key.as_ref(), "list push conflicting index");
+                    list_state.remove_at(index, "list push conflicting remove");
+                    list_state.insert(index, item.clone(), "list push conflicting insert");
+                    dd_log!(
+                        "[DD Worker] Replaced conflicting ListPush replay for '{}' key '{}'",
+                        cell_id,
+                        key
+                    );
+                    return true;
+                }
+            }
             list_state.push(item.clone(), "list push");
+            true
         }
         CellUpdate::ListInsertAt { cell_id: diff_cell_id, index, item } => {
             if diff_cell_id.as_ref() != cell_id {
@@ -345,6 +420,7 @@ fn apply_list_update_to_state(
                 );
             }
             list_state.insert(*index, item.clone(), "list insert");
+            true
         }
         CellUpdate::ListRemoveAt { cell_id: diff_cell_id, index } => {
             if diff_cell_id.as_ref() != cell_id {
@@ -354,6 +430,7 @@ fn apply_list_update_to_state(
                 );
             }
             list_state.remove_at(*index, "list remove");
+            true
         }
         CellUpdate::ListRemoveByKey { cell_id: diff_cell_id, key } => {
             if diff_cell_id.as_ref() != cell_id {
@@ -363,6 +440,7 @@ fn apply_list_update_to_state(
                 );
             }
             list_state.remove_by_key(key.as_ref(), "list remove by key");
+            true
         }
         CellUpdate::ListRemoveBatch { cell_id: diff_cell_id, keys } => {
             if diff_cell_id.as_ref() != cell_id {
@@ -372,6 +450,7 @@ fn apply_list_update_to_state(
                 );
             }
             list_state.remove_batch(keys, "list remove batch");
+            true
         }
         CellUpdate::ListClear { cell_id: diff_cell_id } => {
             if diff_cell_id.as_ref() != cell_id {
@@ -381,6 +460,7 @@ fn apply_list_update_to_state(
                 );
             }
             list_state.clear();
+            true
         }
         CellUpdate::ListItemUpdate { cell_id: diff_cell_id, key, field_path, new_value } => {
             if diff_cell_id.as_ref() != cell_id {
@@ -390,6 +470,7 @@ fn apply_list_update_to_state(
                 );
             }
             list_state.update_field(key.as_ref(), field_path, new_value, "list item update");
+            true
         }
         CellUpdate::SetValue { .. } => {
             panic!(
@@ -400,7 +481,7 @@ fn apply_list_update_to_state(
         CellUpdate::Multi(_) => {
             panic!("[DD Worker] Multi update must be expanded before list state update");
         }
-        CellUpdate::NoOp => {}
+        CellUpdate::NoOp => false,
         other => {
             panic!(
                 "[DD Worker] List cell '{}' received non-diff output {:?}",
@@ -441,12 +522,31 @@ pub enum FieldInitializer {
 /// Specifies an action to register for a LINK when cloning a template.
 #[derive(Clone, Debug)]
 pub enum LinkActionSpec {
+    /// Toggle a boolean HOLD when this link fires
+    BoolToggle {
+        hold_path: FieldPath,
+        key_filter: Option<Vec<Key>>,
+    },
     /// Set a HOLD to true when this link fires (e.g., double-click to enter edit mode)
-    SetHoldTrue { hold_path: FieldPath },
+    SetHoldTrue {
+        hold_path: FieldPath,
+        key_filter: Option<Vec<Key>>,
+    },
     /// Set a HOLD to false when this link fires (e.g., Escape to exit edit mode)
-    SetHoldFalse { hold_path: FieldPath },
+    SetHoldFalse {
+        hold_path: FieldPath,
+        key_filter: Option<Vec<Key>>,
+    },
+    /// Set a text HOLD from event text payload (e.g., Enter in edit input)
+    SetHoldText {
+        hold_path: FieldPath,
+        key_filter: Option<Vec<Key>>,
+    },
     /// Track hover state (true on mouseenter, false on mouseleave)
-    HoverState { hold_path: FieldPath },
+    HoverState {
+        hold_path: FieldPath,
+        key_filter: Option<Vec<Key>>,
+    },
 }
 
 /// Configuration for registering a link action during template cloning.
@@ -547,6 +647,73 @@ pub fn get_hold_ref_at_path(value: &Value, path: &[String]) -> Option<String> {
         Value::CellRef(id) => Some(id.name()),
         _ => None,
     })
+}
+
+fn value_contains_link_id(value: &Value, target_link_id: &str) -> bool {
+    match value {
+        Value::LinkRef(link_id) => link_id.name() == target_link_id,
+        Value::Object(fields) => fields
+            .values()
+            .any(|child| value_contains_link_id(child, target_link_id)),
+        Value::Tagged { fields, .. } => fields
+            .values()
+            .any(|child| value_contains_link_id(child, target_link_id)),
+        _ => false,
+    }
+}
+
+fn item_key_has_action_link(
+    list_states: &HashMap<String, super::dataflow::ListState>,
+    item_key: &str,
+    action_link_id: &str,
+) -> Option<bool> {
+    for list_state in list_states.values() {
+        if list_state.contains_key(item_key) {
+            let item = list_state.item_by_key(item_key, "item action link lookup");
+            return Some(value_contains_link_id(item, action_link_id));
+        }
+    }
+    None
+}
+
+fn item_title_cell_for_edit_link(
+    list_states: &HashMap<String, super::dataflow::ListState>,
+    item_key: &str,
+    action_link_id: &str,
+) -> Option<String> {
+    for list_state in list_states.values() {
+        if !list_state.contains_key(item_key) {
+            continue;
+        }
+        let item = list_state.item_by_key(item_key, "item title lookup");
+        let item_fields = match item {
+            Value::Object(fields) => fields,
+            Value::Tagged { fields, .. } => fields,
+            _ => return None,
+        };
+
+        let title_cell_id = match item_fields.get("title") {
+            Some(Value::CellRef(cell_id)) => cell_id.name(),
+            _ => return None,
+        };
+
+        let todo_elements = match item_fields.get("todo_elements") {
+            Some(Value::Object(fields)) => fields,
+            Some(Value::Tagged { fields, .. }) => fields,
+            _ => return None,
+        };
+
+        let edit_link_id = match todo_elements.get("editing_todo_title_element") {
+            Some(Value::LinkRef(link_id)) => link_id.name(),
+            _ => return None,
+        };
+
+        if edit_link_id == action_link_id {
+            return Some(title_cell_id);
+        }
+        return None;
+    }
+    None
 }
 
 /// Update a field at the given path within a Value.
@@ -1070,9 +1237,10 @@ fn apply_bulk_remove_for_link(
     list_states: &mut HashMap<String, super::dataflow::ListState>,
     new_states: &mut HashMap<String, Value>,
     outputs: &mut Vec<DocumentUpdate>,
-) {
+) -> bool {
+    let mut applied = false;
     if config.bulk_remove_bindings.is_empty() {
-        return;
+        return false;
     }
 
     for binding in &config.bulk_remove_bindings {
@@ -1083,7 +1251,7 @@ fn apply_bulk_remove_for_link(
             continue;
         };
 
-        apply_output_to_state_maps(
+        let _ = apply_output_to_state_maps(
             list_cells,
             list_states,
             new_states,
@@ -1105,7 +1273,10 @@ fn apply_bulk_remove_for_link(
             hold_updates,
             hold_state_updates,
         });
+        applied = true;
     }
+
+    applied
 }
 
 fn apply_dd_outputs_for_worker(
@@ -1128,13 +1299,16 @@ fn apply_dd_outputs_for_worker(
                 );
             }
         }
-        apply_output_to_state_maps(
+        let changed = apply_output_to_state_maps(
             list_cells,
             list_states,
             new_states,
             &update,
             initial_by_id,
         );
+        if !changed {
+            continue;
+        }
 
         let mut hold_updates = HashMap::new();
         let mut hold_state_updates = HashMap::new();
@@ -1167,6 +1341,30 @@ fn apply_dd_outputs_for_worker(
             hold_updates,
             hold_state_updates,
         });
+    }
+}
+
+fn queue_io_update(
+    update: CellUpdate,
+    persist: bool,
+    scalar_updates: &mut Vec<(bool, CellUpdate)>,
+    list_updates: &mut Vec<(bool, CellUpdate)>,
+) {
+    match update {
+        CellUpdate::Multi(updates) => {
+            for nested in updates {
+                queue_io_update(nested, persist, scalar_updates, list_updates);
+            }
+        }
+        CellUpdate::NoOp => {}
+        CellUpdate::SetValue { .. } => scalar_updates.push((persist, update)),
+        CellUpdate::ListPush { .. }
+        | CellUpdate::ListInsertAt { .. }
+        | CellUpdate::ListRemoveAt { .. }
+        | CellUpdate::ListRemoveByKey { .. }
+        | CellUpdate::ListRemoveBatch { .. }
+        | CellUpdate::ListClear { .. }
+        | CellUpdate::ListItemUpdate { .. } => list_updates.push((persist, update)),
     }
 }
 
@@ -1649,41 +1847,126 @@ fn register_link_action(
 ) -> Vec<super::types::LinkCellMapping> {
     let mut mappings = Vec::new();
     match action {
-        LinkActionSpec::SetHoldTrue { hold_path } => {
+        LinkActionSpec::BoolToggle {
+            hold_path,
+            key_filter,
+        } => {
             let old_cell_id = get_hold_ref_at_path(data_template, hold_path).unwrap_or_else(|| {
                 panic!("[DD Instantiate] Bug: hold path {:?} did not resolve in template", hold_path);
             });
             let new_cell_id = cell_id_map.get(&old_cell_id).unwrap_or_else(|| {
                 panic!("[DD Instantiate] Bug: missing new cell id for {}", old_cell_id);
             });
-            mappings.push(super::types::LinkCellMapping::set_true(
-                new_link_id.to_string(),
-                new_cell_id.clone(),
-            ));
+            if let Some(keys) = key_filter {
+                mappings.push(super::types::LinkCellMapping::with_key_filter(
+                    new_link_id.to_string(),
+                    new_cell_id.clone(),
+                    super::types::LinkAction::BoolToggle,
+                    keys.clone(),
+                ));
+            } else {
+                mappings.push(super::types::LinkCellMapping::bool_toggle(
+                    new_link_id.to_string(),
+                    new_cell_id.clone(),
+                ));
+            }
         }
-        LinkActionSpec::SetHoldFalse { hold_path } => {
+        LinkActionSpec::SetHoldTrue {
+            hold_path,
+            key_filter,
+        } => {
             let old_cell_id = get_hold_ref_at_path(data_template, hold_path).unwrap_or_else(|| {
                 panic!("[DD Instantiate] Bug: hold path {:?} did not resolve in template", hold_path);
             });
             let new_cell_id = cell_id_map.get(&old_cell_id).unwrap_or_else(|| {
                 panic!("[DD Instantiate] Bug: missing new cell id for {}", old_cell_id);
             });
-            mappings.push(super::types::LinkCellMapping::set_false(
-                new_link_id.to_string(),
-                new_cell_id.clone(),
-            ));
+            if let Some(keys) = key_filter {
+                mappings.push(super::types::LinkCellMapping::with_key_filter(
+                    new_link_id.to_string(),
+                    new_cell_id.clone(),
+                    super::types::LinkAction::SetTrue,
+                    keys.clone(),
+                ));
+            } else {
+                mappings.push(super::types::LinkCellMapping::set_true(
+                    new_link_id.to_string(),
+                    new_cell_id.clone(),
+                ));
+            }
         }
-        LinkActionSpec::HoverState { hold_path } => {
+        LinkActionSpec::SetHoldFalse {
+            hold_path,
+            key_filter,
+        } => {
             let old_cell_id = get_hold_ref_at_path(data_template, hold_path).unwrap_or_else(|| {
                 panic!("[DD Instantiate] Bug: hold path {:?} did not resolve in template", hold_path);
             });
             let new_cell_id = cell_id_map.get(&old_cell_id).unwrap_or_else(|| {
                 panic!("[DD Instantiate] Bug: missing new cell id for {}", old_cell_id);
             });
-            mappings.push(super::types::LinkCellMapping::hover_state(
-                new_link_id.to_string(),
-                new_cell_id.clone(),
-            ));
+            if let Some(keys) = key_filter {
+                mappings.push(super::types::LinkCellMapping::with_key_filter(
+                    new_link_id.to_string(),
+                    new_cell_id.clone(),
+                    super::types::LinkAction::SetFalse,
+                    keys.clone(),
+                ));
+            } else {
+                mappings.push(super::types::LinkCellMapping::set_false(
+                    new_link_id.to_string(),
+                    new_cell_id.clone(),
+                ));
+            }
+        }
+        LinkActionSpec::SetHoldText {
+            hold_path,
+            key_filter,
+        } => {
+            let old_cell_id = get_hold_ref_at_path(data_template, hold_path).unwrap_or_else(|| {
+                panic!("[DD Instantiate] Bug: hold path {:?} did not resolve in template", hold_path);
+            });
+            let new_cell_id = cell_id_map.get(&old_cell_id).unwrap_or_else(|| {
+                panic!("[DD Instantiate] Bug: missing new cell id for {}", old_cell_id);
+            });
+            if let Some(keys) = key_filter {
+                mappings.push(super::types::LinkCellMapping::with_key_filter(
+                    new_link_id.to_string(),
+                    new_cell_id.clone(),
+                    super::types::LinkAction::SetText,
+                    keys.clone(),
+                ));
+            } else {
+                mappings.push(super::types::LinkCellMapping::new(
+                    new_link_id.to_string(),
+                    new_cell_id.clone(),
+                    super::types::LinkAction::SetText,
+                ));
+            }
+        }
+        LinkActionSpec::HoverState {
+            hold_path,
+            key_filter,
+        } => {
+            let old_cell_id = get_hold_ref_at_path(data_template, hold_path).unwrap_or_else(|| {
+                panic!("[DD Instantiate] Bug: hold path {:?} did not resolve in template", hold_path);
+            });
+            let new_cell_id = cell_id_map.get(&old_cell_id).unwrap_or_else(|| {
+                panic!("[DD Instantiate] Bug: missing new cell id for {}", old_cell_id);
+            });
+            if let Some(keys) = key_filter {
+                mappings.push(super::types::LinkCellMapping::with_key_filter(
+                    new_link_id.to_string(),
+                    new_cell_id.clone(),
+                    super::types::LinkAction::HoverState,
+                    keys.clone(),
+                ));
+            } else {
+                mappings.push(super::types::LinkCellMapping::hover_state(
+                    new_link_id.to_string(),
+                    new_cell_id.clone(),
+                ));
+            }
         }
     }
     mappings
@@ -1698,12 +1981,10 @@ pub fn remap_link_mappings_for_item(
     let mut remapped = Vec::new();
     for mapping in mappings {
         let old_link_id = mapping.link_id.name();
-        let Some(new_link_id) = link_id_map.get(old_link_id) else {
-            continue;
-        };
-
         let mut new_mapping = mapping.clone();
-        new_mapping.link_id = super::types::LinkId::new(new_link_id);
+        if let Some(new_link_id) = link_id_map.get(old_link_id) {
+            new_mapping.link_id = super::types::LinkId::new(new_link_id);
+        }
 
         match &mut new_mapping.action {
             super::types::LinkAction::RemoveListItem { list_cell_id, .. } => {
@@ -2019,7 +2300,22 @@ impl DataflowConfig {
 
     /// Register a route cell to initialize from current browser path.
     pub fn add_route_cell(&mut self, cell_id: impl Into<String>) {
-        self.route_cells.insert(cell_id.into());
+        let cell_id = cell_id.into();
+        self.route_cells.insert(cell_id.clone());
+
+        // Router/route cells must exist in DD cell config so route-change LINK events
+        // can flow through dataflow and trigger dependent collection ops.
+        if !self.cells.iter().any(|cell| cell.id.name() == cell_id) {
+            self.cells.push(CellConfig {
+                id: CellId::new(&cell_id),
+                initial: Value::text("/"),
+                triggered_by: Vec::new(),
+                timer_interval_ms: 0,
+                filter: EventFilter::Any,
+                transform: StateTransform::Identity,
+                persist: false,
+            });
+        }
     }
 
     /// Register a go_to cell (Router/go_to input).
@@ -2534,8 +2830,9 @@ impl Worker {
     ///
     /// Resets thread-local ID counters for deterministic ID generation.
     pub fn with_config(config: DataflowConfig) -> Self {
-        // Reset thread-local counters for deterministic replays
-        reset_id_counters();
+        // Initialize counters from existing config IDs so runtime template
+        // instantiation never collides with already-materialized dynamic items.
+        seed_id_counters_from_config(&config);
         Self {
             config,
         }
@@ -2769,6 +3066,8 @@ impl Worker {
             );
 
             for output in outputs {
+                let mut scalar_updates: Vec<(bool, CellUpdate)> = Vec::new();
+                let mut list_updates: Vec<(bool, CellUpdate)> = Vec::new();
                 for (cell_id, value) in output.hold_updates {
                     let update_cell_id = value.cell_id().unwrap_or_else(|| {
                         panic!("[DD Worker] Missing cell id for update {:?}", value);
@@ -2779,7 +3078,7 @@ impl Worker {
                             cell_id, update_cell_id
                         );
                     }
-                    sync_cell_from_dd_with_persist(value);
+                    queue_io_update(value, true, &mut scalar_updates, &mut list_updates);
                 }
                 for (cell_id, value) in output.hold_state_updates {
                     let update_cell_id = value.cell_id().unwrap_or_else(|| {
@@ -2791,7 +3090,21 @@ impl Worker {
                             cell_id, update_cell_id
                         );
                     }
-                    sync_cell_from_dd(value);
+                    queue_io_update(value, false, &mut scalar_updates, &mut list_updates);
+                }
+                for (persist, update) in scalar_updates {
+                    if persist {
+                        sync_cell_from_dd_with_persist(update);
+                    } else {
+                        sync_cell_from_dd(update);
+                    }
+                }
+                for (persist, update) in list_updates {
+                    if persist {
+                        sync_cell_from_dd_with_persist(update);
+                    } else {
+                        sync_cell_from_dd(update);
+                    }
                 }
             }
 
@@ -2891,6 +3204,8 @@ impl Worker {
             // ═══════════════════════════════════════════════════════════════════
             let mut nav_path: Option<String> = None;
             for output in outputs {
+                let mut scalar_updates: Vec<(bool, CellUpdate)> = Vec::new();
+                let mut list_updates: Vec<(bool, CellUpdate)> = Vec::new();
                 // Write hold_updates (with persistence)
                 for (cell_id, value) in output.hold_updates {
                     let update_cell_id = value.cell_id().unwrap_or_else(|| {
@@ -2902,7 +3217,7 @@ impl Worker {
                             cell_id, update_cell_id
                         );
                     }
-                    sync_cell_from_dd_with_persist(value);
+                    queue_io_update(value, true, &mut scalar_updates, &mut list_updates);
                 }
                 // Write hold_state_updates (no persistence)
                 for (cell_id, value) in output.hold_state_updates {
@@ -2923,15 +3238,95 @@ impl Worker {
                             cell_id, update_cell_id
                         );
                     }
-                    sync_cell_from_dd(value);
+                    queue_io_update(value, false, &mut scalar_updates, &mut list_updates);
+                }
+                for (persist, update) in scalar_updates {
+                    if persist {
+                        sync_cell_from_dd_with_persist(update);
+                    } else {
+                        sync_cell_from_dd(update);
+                    }
+                }
+                for (persist, update) in list_updates {
+                    if persist {
+                        sync_cell_from_dd_with_persist(update);
+                    } else {
+                        sync_cell_from_dd(update);
+                    }
                 }
             }
             // Handle Router/go_to navigation
             if let Some(path) = nav_path {
                 navigate_to_route(&path);
-                // Update all route cells so Router/route() reactive watchers see the change
-                for route_cell in &config.route_cells {
-                    sync_cell_from_dd(CellUpdate::set_value(route_cell.as_str(), Value::text(path.as_str())));
+
+                // Feed route change back through DD so Router/route() watchers update
+                // using the same reactive path as normal events.
+                let route_event = Event::Link {
+                    id: LinkId::new(ROUTE_CHANGE_LINK_ID),
+                    value: EventValue::text(path.clone()),
+                };
+                let (route_outputs, route_time, route_states, route_list_states) =
+                    Self::process_with_persistent_worker(
+                        &mut config,
+                        vec![route_event],
+                        current_time,
+                        &cell_states,
+                        &list_states,
+                    );
+
+                current_time = route_time;
+                cell_states = route_states;
+                list_states = route_list_states;
+
+                // Keep renderer cell state in sync with Router/route() source.
+                // Route-change processing can update DD state without emitting scalar outputs,
+                // but render-side signals read from CELL_STATES.
+                sync_cell_from_dd(CellUpdate::SetValue {
+                    cell_id: "current_route".to_string().into(),
+                    value: Value::Text(Arc::from(path.clone())),
+                });
+
+                for output in route_outputs {
+                    let mut scalar_updates: Vec<(bool, CellUpdate)> = Vec::new();
+                    let mut list_updates: Vec<(bool, CellUpdate)> = Vec::new();
+                    for (cell_id, value) in output.hold_updates {
+                        let update_cell_id = value.cell_id().unwrap_or_else(|| {
+                            panic!("[DD Worker] Missing cell id for update {:?}", value);
+                        });
+                        if update_cell_id != cell_id.as_str() {
+                            panic!(
+                                "[DD Worker] hold_updates key '{}' does not match update cell '{}'",
+                                cell_id, update_cell_id
+                            );
+                        }
+                        queue_io_update(value, true, &mut scalar_updates, &mut list_updates);
+                    }
+                    for (cell_id, value) in output.hold_state_updates {
+                        let update_cell_id = value.cell_id().unwrap_or_else(|| {
+                            panic!("[DD Worker] Missing cell id for update {:?}", value);
+                        });
+                        if update_cell_id != cell_id.as_str() {
+                            panic!(
+                                "[DD Worker] hold_state_updates key '{}' does not match update cell '{}'",
+                                cell_id, update_cell_id
+                            );
+                        }
+                        queue_io_update(value, false, &mut scalar_updates, &mut list_updates);
+                    }
+                    for (persist, update) in scalar_updates {
+                        if persist {
+                            sync_cell_from_dd_with_persist(update);
+                        } else {
+                            sync_cell_from_dd(update);
+                        }
+                    }
+                    for (persist, update) in list_updates {
+                        if persist {
+                            sync_cell_from_dd_with_persist(update);
+                        } else {
+                            sync_cell_from_dd(update);
+                        }
+                    }
                 }
             }
 
@@ -3013,6 +3408,67 @@ impl Worker {
         for event in events {
             let (link_id, event_value) = match event {
                 Event::Link { id, value } => (id, value),
+                Event::ItemLink {
+                    item_key,
+                    action_id,
+                    value,
+                    ..
+                } => {
+                    let item_key = item_key.as_ref();
+                    let action_name = action_id.name();
+                    match item_key_has_action_link(&list_states, item_key, action_name) {
+                        Some(true) => {
+                            let mut adjusted_value = value;
+                            // Editing input currently emits only typed delta text for Enter
+                            // (e.g., " EDITED"). Recompose with current title for item-scoped
+                            // Enter saves so title persistence matches visible append behavior.
+                            if let EventValue::KeyDown {
+                                key: Key::Enter,
+                                text: Some(text),
+                            } = &mut adjusted_value
+                            {
+                                if text.starts_with(' ') {
+                                    if let Some(title_cell_id) = item_title_cell_for_edit_link(
+                                        &list_states,
+                                        item_key,
+                                        action_name,
+                                    ) {
+                                        if let Some(Value::Text(current_title)) =
+                                            new_states.get(&title_cell_id)
+                                        {
+                                            if !current_title.is_empty()
+                                                && !text.starts_with(current_title.as_ref())
+                                            {
+                                                let mut merged = String::with_capacity(
+                                                    current_title.len() + text.len(),
+                                                );
+                                                merged.push_str(current_title.as_ref());
+                                                merged.push_str(text.as_str());
+                                                *text = merged;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            (action_id, adjusted_value)
+                        }
+                        Some(false) => {
+                            panic!(
+                                "[DD Worker] Item-scoped event mismatch: key='{}' does not contain action link '{}'",
+                                item_key,
+                                action_name
+                            );
+                        }
+                        None => {
+                            dd_log!(
+                                "[DD Worker] Dropping stale item-scoped event: key='{}' action='{}'",
+                                item_key,
+                                action_name
+                            );
+                            continue;
+                        }
+                    }
+                }
                 Event::Timer { id, .. } => (LinkId::new(&format!("__timer_{}", id)), EventValue::Unit),
                 Event::External { name, .. } => {
                     panic!("[DD Worker] External events not supported: {}", name);
@@ -3023,6 +3479,22 @@ impl Worker {
             // This moves side effects (ID generation, HOLD registration) outside DD.
             let (event_value, config_changed) = Self::maybe_pre_instantiate(&link_id, event_value, &template_cells, config);
             if config_changed {
+                if let EventValue::PreparedItem { initializations, .. } = &event_value {
+                    for (cell_id, value) in initializations {
+                        if let Some(existing) = new_states.get(cell_id) {
+                            if existing != value {
+                                panic!(
+                                    "[DD Worker] Conflicting pre-instantiated state for '{}': {:?} vs {:?}",
+                                    cell_id,
+                                    existing,
+                                    value
+                                );
+                            }
+                        } else {
+                            new_states.insert(cell_id.clone(), value.clone());
+                        }
+                    }
+                }
                 list_cells = list_cell_ids(config);
                 derived_outputs = derived_list_outputs(config);
                 initial_by_id = config
@@ -3055,21 +3527,55 @@ impl Worker {
                 }
                 // Derived outputs initialize from DD output stream on first emission.
                 if reinitialized {
-                    let init_outputs = drain_outputs_persistent();
-                    apply_dd_outputs_for_worker(
-                        config,
-                        init_outputs,
-                        &list_cells,
-                        &mut list_states,
-                        &mut new_states,
-                        &initial_by_id,
-                        &mut outputs,
-                    );
+                    let source_list_cells: HashSet<String> = config
+                        .collection_sources
+                        .values()
+                        .cloned()
+                        .collect();
+                    list_states.retain(|cell_id, _| source_list_cells.contains(cell_id));
+                    ensure_list_states(&list_cells, &derived_outputs, &mut list_states, initial_list_states);
+                    let bootstrap_outputs = drain_outputs_persistent();
+                    if !bootstrap_outputs.is_empty() {
+                        let mut bootstrap_document_updates = Vec::new();
+                        apply_dd_outputs_for_worker(
+                            config,
+                            bootstrap_outputs,
+                            &list_cells,
+                            &mut list_states,
+                            &mut new_states,
+                            &initial_by_id,
+                            &mut bootstrap_document_updates,
+                        );
+                    }
                 }
             }
 
             // Inject event and get outputs
+            let event_for_log = event_value.clone();
+            if link_id.name() == "store.elements.filter_buttons.active" || link_id.name() == ROUTE_CHANGE_LINK_ID {
+                dd_log!(
+                    "[Worker Debug] before inject link='{}' event={:?} current_route_state={:?}",
+                    link_id.name(),
+                    event_for_log,
+                    new_states.get("current_route")
+                );
+            }
             let dd_outputs = inject_event_persistent(&link_id, event_value);
+            dd_log!(
+                "[Worker] Event {:?} on '{}' produced {} DD outputs",
+                event_for_log,
+                link_id.name(),
+                dd_outputs.len()
+            );
+            for output in &dd_outputs {
+                dd_log!(
+                    "[Worker]   DD output: cell='{}' value={:?} diff={} time={}",
+                    output.cell_id.name(),
+                    output.value,
+                    output.diff,
+                    output.time
+                );
+            }
             current_time += 1;
 
             // Convert DD outputs to DocumentUpdates and update state
@@ -3083,7 +3589,15 @@ impl Worker {
                 &mut outputs,
             );
 
-            apply_bulk_remove_for_link(
+            if link_id.name() == "store.elements.filter_buttons.active" || link_id.name() == ROUTE_CHANGE_LINK_ID {
+                dd_log!(
+                    "[Worker Debug] after inject link='{}' current_route_state={:?}",
+                    link_id.name(),
+                    new_states.get("current_route")
+                );
+            }
+
+            let applied_bulk_remove = apply_bulk_remove_for_link(
                 config,
                 &link_id,
                 current_time,
@@ -3093,6 +3607,46 @@ impl Worker {
                 &mut new_states,
                 &mut outputs,
             );
+
+            if applied_bulk_remove {
+                let dd_cells = Self::convert_config_to_dd_cells(config);
+                let dd_collections = Self::convert_config_to_dd_collections(config);
+                let initial_collection_items = compute_collection_items(config, &list_states);
+
+                shutdown_persistent_worker();
+                init_persistent_worker(
+                    dd_cells,
+                    dd_collections,
+                    new_states.clone(),
+                    list_states.clone(),
+                    initial_collection_items,
+                );
+
+                // Keep only source list cells before applying bootstrap refresh.
+                // Derived lists (e.g. mapped/filtered collections) must be rebuilt
+                // from DD outputs after reinit; retaining stale derived state can
+                // duplicate rows or keep removed items alive.
+                let source_list_cells: HashSet<String> = config
+                    .collection_sources
+                    .values()
+                    .cloned()
+                    .collect();
+                list_states.retain(|cell_id, _| source_list_cells.contains(cell_id));
+                ensure_list_states(&list_cells, &derived_outputs, &mut list_states, initial_list_states);
+
+                let refresh_outputs = drain_outputs_persistent();
+                if !refresh_outputs.is_empty() {
+                    apply_dd_outputs_for_worker(
+                        config,
+                        refresh_outputs,
+                        &list_cells,
+                        &mut list_states,
+                        &mut new_states,
+                        &initial_by_id,
+                        &mut outputs,
+                    );
+                }
+            }
         }
 
         (outputs, current_time, new_states, list_states)
@@ -3270,6 +3824,20 @@ impl Worker {
                     Some(item_text),
                     &mut config.initial_collections,
                 );
+                dd_log!(
+                    "[Worker] Pre-instantiated link_mappings count={} for new item key={:?}",
+                    instantiated.link_mappings.len(),
+                    instantiated.identity_link_id
+                );
+                for mapping in &instantiated.link_mappings {
+                    dd_log!(
+                        "[Worker]   item mapping link='{}' cell='{}' action={:?} key_filter={:?}",
+                        mapping.link_id.name(),
+                        mapping.cell_id.name(),
+                        mapping.action,
+                        mapping.key_filter
+                    );
+                }
 
                 let mut config_changed = false;
                 // Register dynamic cell configs for new item holds (pure DD).
@@ -3290,6 +3858,16 @@ impl Worker {
                 }
 
                 // Remap template link mappings to this item's fresh IDs.
+                let mapped_from_template = config
+                    .link_mappings
+                    .iter()
+                    .filter(|mapping| instantiated.link_id_map.contains_key(mapping.link_id.name()))
+                    .count();
+                dd_log!(
+                    "[Worker] Template remap candidates: link_keys={} matched_mappings={}",
+                    instantiated.link_id_map.len(),
+                    mapped_from_template
+                );
                 let mut new_mappings = remap_link_mappings_for_item(
                     &config.link_mappings,
                     &instantiated.link_id_map,

@@ -920,6 +920,40 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
     if name == "boon_launch_browser" {
         let headless = args.get("headless").and_then(|v| v.as_bool()).unwrap_or(false);
 
+        // Reuse existing connected extension session if available.
+        if let Ok(Response::Status { connected, api_ready, page_url }) =
+            ws_server::send_command_to_server(ws_port, Command::GetStatus).await
+        {
+            if connected && api_ready {
+                return Ok(format!(
+                    "Reusing existing browser session.\nConnected: true\nPage URL: {}",
+                    page_url.unwrap_or_else(|| "unknown".to_string())
+                ));
+            }
+        }
+
+        // If automation Chromium is already running, prefer reconnect over launching a new instance.
+        if browser::has_running_automation_browser() {
+            let timeout = std::time::Duration::from_secs(25);
+            match browser::wait_for_extension_connection(ws_port, timeout).await {
+                Ok(()) => {
+                    let pids = browser::running_automation_pids();
+                    return Ok(format!(
+                        "Reused existing Chromium session (PID(s): {:?}).\nExtension connected and ready.",
+                        pids
+                    ));
+                }
+                Err(e) => {
+                    let pids = browser::running_automation_pids();
+                    return Err(format!(
+                        "Automation Chromium already running (PID(s): {:?}) but extension did not reconnect: {}.\n\
+                        Refusing to launch a second browser instance.",
+                        pids, e
+                    ));
+                }
+            }
+        }
+
         let opts = browser::LaunchOptions {
             playground_port: 8083,
             ws_port,
@@ -1039,9 +1073,7 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
         _ => return Err(format!("Unknown tool: {}", name)),
     };
 
-    let response = ws_server::send_command_to_server(ws_port, command)
-        .await
-        .map_err(|e| e.to_string())?;
+    let response = send_ws_command_with_reconnect(ws_port, command).await?;
 
     match response {
         Response::Console { messages } => {
@@ -1226,6 +1258,39 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
 
         Response::Error { message } => Err(message),
     }
+}
+
+/// Send a WS command and, if extension is temporarily disconnected while browser is running,
+/// wait for reconnect and retry once.
+async fn send_ws_command_with_reconnect(ws_port: u16, command: Command) -> Result<Response, String> {
+    let first = ws_server::send_command_to_server(ws_port, command.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let is_no_extension = matches!(
+        &first,
+        Response::Error { message } if message.contains("No extension connected")
+    );
+
+    if !is_no_extension {
+        return Ok(first);
+    }
+
+    if !browser::has_running_automation_browser() {
+        return Ok(first);
+    }
+
+    let timeout = std::time::Duration::from_secs(25);
+    if let Err(e) = browser::wait_for_extension_connection(ws_port, timeout).await {
+        return Err(format!(
+            "No extension connected (automation browser is running), reconnect failed: {}",
+            e
+        ));
+    }
+
+    ws_server::send_command_to_server(ws_port, command)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Check if the playground dev server is running and healthy

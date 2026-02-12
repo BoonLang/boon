@@ -350,6 +350,10 @@ enum ExecAction {
         /// Path to examples directory (default: auto-detect)
         #[arg(long)]
         examples_dir: Option<PathBuf>,
+
+        /// Never launch browser automatically; require an existing connected extension
+        #[arg(long)]
+        no_launch: bool,
     },
 
     /// Smoke-run all built-in playground examples from EXAMPLE_DATAS
@@ -357,6 +361,10 @@ enum ExecAction {
         /// Only run built-in examples matching pattern (e.g., "todo", "list_")
         #[arg(short, long)]
         filter: Option<String>,
+
+        /// Never launch browser automatically; require an existing connected extension
+        #[arg(long)]
+        no_launch: bool,
     },
 
     /// Get localStorage entries (for debugging persistence)
@@ -862,6 +870,7 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
             screenshot_on_fail,
             verbose,
             examples_dir,
+            no_launch,
         } => {
             use commands::test_examples::{run_tests, TestOptions};
 
@@ -872,6 +881,7 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
                 screenshot_on_fail,
                 verbose,
                 examples_dir,
+                no_launch,
             };
 
             let results = run_tests(opts).await?;
@@ -883,12 +893,13 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
             }
         }
 
-        ExecAction::SmokeExamples { filter } => {
+        ExecAction::SmokeExamples { filter, no_launch } => {
             use commands::test_examples::{run_builtin_smoke, SmokeOptions};
 
             let opts = SmokeOptions {
                 port,
                 filter,
+                no_launch,
             };
 
             let results = run_builtin_smoke(opts).await?;

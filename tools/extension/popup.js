@@ -6,6 +6,7 @@ async function updateStatus() {
   const apiDot = document.getElementById('api-dot');
   const apiStatus = document.getElementById('api-status');
   const pageUrl = document.getElementById('page-url');
+  const engineInfo = document.getElementById('engine-info');
 
   // Check WebSocket connection by trying to send a message
   try {
@@ -44,14 +45,41 @@ async function updateStatus() {
         if (apiReady) {
           apiDot.className = 'status-dot connected';
           apiStatus.textContent = 'API Ready';
+
+          // If API is ready, show current engine.
+          try {
+            const engineResults = await chrome.scripting.executeScript({
+              target: { tabId: tab.id },
+              world: 'MAIN',
+              func: () => {
+                if (typeof window.boonPlayground !== 'undefined' &&
+                    typeof window.boonPlayground.getEngine === 'function') {
+                  return window.boonPlayground.getEngine();
+                }
+                return null;
+              }
+            });
+            const info = engineResults && engineResults[0] && engineResults[0].result;
+            if (info && info.engine) {
+              engineInfo.textContent = info.switchable
+                ? `${info.engine} (switchable)`
+                : info.engine;
+            } else {
+              engineInfo.textContent = 'Unknown';
+            }
+          } catch (_) {
+            engineInfo.textContent = 'Unknown';
+          }
         } else {
           apiDot.className = 'status-dot pending';
           apiStatus.textContent = 'API Not Ready';
+          engineInfo.textContent = 'Unknown';
         }
       }
     } catch (e) {
       apiDot.className = 'status-dot disconnected';
       apiStatus.textContent = 'Cannot access page';
+      engineInfo.textContent = 'Unknown';
     }
 
     // We can't directly check WebSocket status from popup
@@ -63,6 +91,7 @@ async function updateStatus() {
     console.error('Status check error:', e);
     wsDot.className = 'status-dot disconnected';
     wsStatus.textContent = 'Error: ' + e.message;
+    engineInfo.textContent = 'Unknown';
   }
 }
 

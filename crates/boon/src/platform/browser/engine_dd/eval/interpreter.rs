@@ -27,6 +27,7 @@ use super::super::dd_log;
 use super::evaluator::BoonDdRuntime;
 use super::super::core::value::{CollectionHandle, Value};
 use super::super::core::{Worker, DataflowConfig, CellConfig, CellId, LinkId, EventFilter, StateTransform, reconstruct_persisted_item, instantiate_fresh_item, remap_link_mappings_for_item, LinkAction, LinkCellMapping, Key, ITEM_KEY_FIELD, get_link_ref_at_path, ROUTE_CHANGE_LINK_ID};
+use super::super::core::dataflow::shutdown_persistent_worker;
 use super::super::io::{
     EventInjector, set_global_dispatcher, clear_global_dispatcher,
     set_task_handle, clear_task_handle, clear_output_listener_handle,
@@ -119,6 +120,7 @@ pub fn run_dd_reactive_with_persistence(
 
     // Clean up any existing components from previous runs
     // This ensures old timers/workers stop before new ones start
+    shutdown_persistent_worker();
     clear_timer_handle();
     clear_output_listener_handle();
     clear_task_handle();
@@ -224,6 +226,16 @@ pub fn run_dd_reactive_with_persistence(
     for (i, cell) in evaluator_config.cells.iter().enumerate() {
         dd_log!("[DD Interpreter]   [{}] id={}, transform={:?}, timer={}ms",
             i, cell.id.name(), cell.transform, cell.timer_interval_ms);
+    }
+    for (i, mapping) in evaluator_config.link_mappings.iter().enumerate() {
+        dd_log!(
+            "[DD Interpreter]   [mapping {}] link={} cell={} action={:?} key_filter={:?}",
+            i,
+            mapping.link_id,
+            mapping.cell_id,
+            mapping.action,
+            mapping.key_filter,
+        );
     }
 
     // Initialize route cells (if Router/route() was used) in the interpreter, not evaluator.
@@ -830,4 +842,3 @@ mod tests {
         assert!(result.document.is_some());
     }
 }
-

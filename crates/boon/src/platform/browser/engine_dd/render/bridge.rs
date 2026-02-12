@@ -6,27 +6,30 @@
 
 use std::sync::Arc;
 
+use super::super::core::types::{BoolTag, ElementTag, Key as DdKey};
+use super::super::core::value::{Value, WhileArm};
 #[allow(unused_imports)]
 use super::super::dd_log;
 use super::super::eval::interpreter::DdResult;
-use super::super::core::types::{BoolTag, ElementTag, Key as DdKey};
-use super::super::core::value::{Value, WhileArm};
 use zoon::*;
 
-use super::super::io::{fire_global_link, fire_global_link_with_text, fire_global_link_with_bool, fire_global_key_down, cell_signal, list_signal_vec, is_list_cell, get_cell_value};
+use super::super::io::{
+    cell_signal, fire_global_item_key_down, fire_global_item_link, fire_global_item_link_with_bool,
+    fire_global_item_link_with_text, fire_global_key_down, fire_global_link,
+    fire_global_link_with_bool, fire_global_link_with_text, get_cell_value, is_list_cell,
+    list_signal_vec,
+};
 
 /// Convert DD Number (f64) to u32 with bounds checking.
 fn f64_to_u32(n: &ordered_float::OrderedFloat<f64>) -> u32 {
-    u32::try_from(n.0 as i64).unwrap_or_else(|_| {
-        panic!("[DD render] Number {} out of u32 range", n.0)
-    })
+    u32::try_from(n.0 as i64)
+        .unwrap_or_else(|_| panic!("[DD render] Number {} out of u32 range", n.0))
 }
 
 /// Convert DD Number (f64) to i32 with bounds checking.
 fn f64_to_i32(n: &ordered_float::OrderedFloat<f64>) -> i32 {
-    i32::try_from(n.0 as i64).unwrap_or_else(|_| {
-        panic!("[DD render] Number {} out of i32 range", n.0)
-    })
+    i32::try_from(n.0 as i64)
+        .unwrap_or_else(|_| panic!("[DD render] Number {} out of i32 range", n.0))
 }
 
 /// Resolve a Value to a display string, handling __text_template__ by reading CellRef values.
@@ -39,14 +42,15 @@ fn resolve_display_string(value: &Value) -> String {
                 parts.push(v);
                 i += 1;
             }
-            parts.iter().map(|part| match part {
-                Value::CellRef(id) => {
-                    get_cell_value(&id.to_string())
+            parts
+                .iter()
+                .map(|part| match part {
+                    Value::CellRef(id) => get_cell_value(&id.to_string())
                         .map(|v| v.to_display_string())
-                        .unwrap_or_default()
-                }
-                v => v.to_display_string(),
-            }).collect()
+                        .unwrap_or_default(),
+                    v => v.to_display_string(),
+                })
+                .collect()
         }
         v => v.to_display_string(),
     }
@@ -69,8 +73,83 @@ fn get_dd_text_input_value() -> String {
             );
         });
     let value = input.value();
-    dd_log!("[DD TextInput] get_dd_text_input_value: active_tag={}, value='{}'", active_tag, value);
+    dd_log!(
+        "[DD TextInput] get_dd_text_input_value: active_tag={}, value='{}'",
+        active_tag,
+        value
+    );
     value
+}
+
+fn extract_item_key(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Option<String> {
+    fields.get("__key").and_then(|value| match value {
+        Value::Text(key) => Some(key.to_string()),
+        _ => None,
+    })
+}
+
+fn dynamic_item_key(item_key: Option<&str>) -> Option<&str> {
+    match item_key {
+        Some(key) if key.starts_with("link:dynamic_link_") => Some(key),
+        _ => None,
+    }
+}
+
+fn should_use_item_scope(item_key: Option<&str>, link_id: &str) -> bool {
+    dynamic_item_key(item_key).is_some() && link_id.starts_with("dynamic_link_")
+}
+
+fn dispatch_link_unit(item_key: Option<&str>, link_id: &str) {
+    if should_use_item_scope(item_key, link_id) {
+        let item_key = dynamic_item_key(item_key).expect("item key checked");
+        fire_global_item_link(item_key, link_id);
+    } else {
+        fire_global_link(link_id);
+    }
+}
+
+fn dispatch_link_text(item_key: Option<&str>, link_id: &str, text: String) {
+    if should_use_item_scope(item_key, link_id) {
+        let item_key = dynamic_item_key(item_key).expect("item key checked");
+        fire_global_item_link_with_text(item_key, link_id, text);
+    } else {
+        fire_global_link_with_text(link_id, text);
+    }
+}
+
+fn dispatch_link_bool(item_key: Option<&str>, link_id: &str, value: bool) {
+    if should_use_item_scope(item_key, link_id) {
+        let item_key = dynamic_item_key(item_key).expect("item key checked");
+        fire_global_item_link_with_bool(item_key, link_id, value);
+    } else {
+        fire_global_link_with_bool(link_id, value);
+    }
+}
+
+fn dispatch_key_down(item_key: Option<&str>, link_id: &str, key: DdKey, text: Option<String>) {
+    if should_use_item_scope(item_key, link_id) {
+        let item_key = dynamic_item_key(item_key).expect("item key checked");
+        fire_global_item_key_down(item_key, link_id, key, text);
+    } else {
+        fire_global_key_down(link_id, key, text);
+    }
+}
+
+/// Get text from the event target for key_down, when available.
+/// This is more reliable than document.activeElement for synthetic test events.
+#[cfg(target_arch = "wasm32")]
+fn get_dd_text_input_value_from_key_event(event: &KeyboardEvent) -> Option<String> {
+    match &event.raw_event {
+        RawKeyboardEvent::KeyDown(raw_event) => {
+            if let Some(input) = raw_event.dyn_target::<web_sys::HtmlInputElement>() {
+                return Some(input.value());
+            }
+            if let Some(text_area) = raw_event.dyn_target::<web_sys::HtmlTextAreaElement>() {
+                return Some(text_area.value());
+            }
+            None
+        }
+    }
 }
 
 // REMOVED: get_dynamic_item_edit_value - dead code (render_dynamic_item was removed)
@@ -86,21 +165,47 @@ fn dd_oklch_to_css(value: &Value) -> Option<String> {
         Value::Tagged { tag, fields } if tag.as_ref() == "Oklch" => {
             // Only handle Number values - DD computes reactive colors.
             // Return None if fields aren't resolved yet (forward refs, CellRefs).
-            let lightness = fields.get("lightness")
-                .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })?;
-            let chroma = fields.get("chroma")
-                .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })?;
-            let hue = fields.get("hue")
-                .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None })?;
-            let alpha = fields.get("alpha")
-                .and_then(|v| if let Value::Number(n) = v { Some(n.0) } else { None });
+            let lightness = fields.get("lightness").and_then(|v| {
+                if let Value::Number(n) = v {
+                    Some(n.0)
+                } else {
+                    None
+                }
+            })?;
+            let chroma = fields.get("chroma").and_then(|v| {
+                if let Value::Number(n) = v {
+                    Some(n.0)
+                } else {
+                    None
+                }
+            })?;
+            let hue = fields.get("hue").and_then(|v| {
+                if let Value::Number(n) = v {
+                    Some(n.0)
+                } else {
+                    None
+                }
+            })?;
+            let alpha = fields.get("alpha").and_then(|v| {
+                if let Value::Number(n) = v {
+                    Some(n.0)
+                } else {
+                    None
+                }
+            });
 
             // oklch(lightness% chroma hue / alpha)
             if let Some(a) = alpha {
                 if a == 0.0 {
-                    None  // alpha=0 means invisible
+                    None // alpha=0 means invisible
                 } else {
-                    Some(format!("oklch({}% {} {} / {})", lightness * 100.0, chroma, hue, a))
+                    Some(format!(
+                        "oklch({}% {} {} / {})",
+                        lightness * 100.0,
+                        chroma,
+                        hue,
+                        a
+                    ))
                 }
             } else {
                 Some(format!("oklch({}% {} {})", lightness * 100.0, chroma, hue))
@@ -119,9 +224,7 @@ fn dd_oklch_to_css(value: &Value) -> Option<String> {
 /// # Returns
 ///
 /// A Zoon element representing the document.
-pub fn render_dd_document_reactive_signal(
-    document: Value,
-) -> impl Element {
+pub fn render_dd_document_reactive_signal(document: Value) -> impl Element {
     render_dd_value(&document)
 }
 
@@ -134,9 +237,7 @@ pub fn render_dd_document_reactive_signal(
 /// # Returns
 ///
 /// A Zoon element representing the result.
-pub fn render_dd_result_reactive_signal(
-    result: DdResult,
-) -> impl Element {
+pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
     match result.document {
         Some(doc) => render_dd_value(&doc).unify(),
         None => panic!("[DD Render] No document produced"),
@@ -164,19 +265,17 @@ fn render_dd_value(value: &Value) -> RawElOrText {
             Text::new(text).unify()
         }
 
-        Value::Text(s) => {
-            Text::new(s.to_string()).unify()
-        }
+        Value::Text(s) => Text::new(s.to_string()).unify(),
 
         Value::List(handle) => {
-            let cell_id = handle.cell_id
+            let cell_id = handle
+                .cell_id
                 .as_deref()
                 .map(str::to_string)
                 .unwrap_or_else(|| handle.id.to_string());
             Column::new()
                 .items_signal_vec(
-                    list_signal_vec(cell_id.to_string())
-                        .map(|item| render_dd_value(&item))
+                    list_signal_vec(cell_id.to_string()).map(|item| render_dd_value(&item)),
                 )
                 .unify()
         }
@@ -187,17 +286,14 @@ fn render_dd_value(value: &Value) -> RawElOrText {
             let default = config.default.clone();
             let cell_id_for_signal = cell_id.clone();
             El::new()
-                .child_signal(
-                    cell_signal(cell_id)
-                        .map(move |value| {
-                            let Some(value) = value else {
-                                // Cell cleared during re-initialization; transient state.
-                                return El::new().unify();
-                            };
-                            let selected = select_while_arm(&value, &arms, &default);
-                            render_dd_value(&selected)
-                        })
-                )
+                .child_signal(cell_signal(cell_id).map(move |value| {
+                    let Some(value) = value else {
+                        // Cell cleared during re-initialization; transient state.
+                        return El::new().unify();
+                    };
+                    let selected = select_while_arm(&value, &arms, &default);
+                    render_dd_value(&selected)
+                }))
                 .unify()
         }
         Value::PlaceholderWhile(_) => {
@@ -215,7 +311,6 @@ fn render_dd_value(value: &Value) -> RawElOrText {
         }
 
         // DD produces Text values directly - interpolation is computed in DD, not at render time
-
         Value::Tagged { tag, fields } if tag.as_ref() == "__text_template__" => {
             // Text template with CellRef parts — render as reactive label
             let mut tt_parts: Vec<Value> = Vec::new();
@@ -225,24 +320,26 @@ fn render_dd_value(value: &Value) -> RawElOrText {
                 i += 1;
             }
             let first_cellref = tt_parts.iter().find_map(|v| {
-                if let Value::CellRef(id) = v { Some(id.to_string()) } else { None }
+                if let Value::CellRef(id) = v {
+                    Some(id.to_string())
+                } else {
+                    None
+                }
             });
             if let Some(cell_id) = first_cellref {
                 El::new()
-                    .child_signal(
-                        cell_signal(cell_id)
-                            .map(move |_trigger| {
-                                let text: String = tt_parts.iter().map(|part| match part {
-                                    Value::CellRef(id) => {
-                                        get_cell_value(&id.to_string())
-                                            .map(|v| v.to_display_string())
-                                            .unwrap_or_default()
-                                    }
-                                    v => v.to_display_string(),
-                                }).collect();
-                                Text::new(text).unify()
+                    .child_signal(cell_signal(cell_id).map(move |_trigger| {
+                        let text: String = tt_parts
+                            .iter()
+                            .map(|part| match part {
+                                Value::CellRef(id) => get_cell_value(&id.to_string())
+                                    .map(|v| v.to_display_string())
+                                    .unwrap_or_default(),
+                                v => v.to_display_string(),
                             })
-                    )
+                            .collect();
+                        Text::new(text).unify()
+                    }))
                     .unify()
             } else {
                 let text: String = tt_parts.iter().map(|v| v.to_display_string()).collect();
@@ -251,7 +348,11 @@ fn render_dd_value(value: &Value) -> RawElOrText {
         }
 
         Value::Tagged { tag, fields } => {
-            dd_log!("[DD render_dd_value] Tagged(tag='{}', fields={:?})", tag, fields.keys().collect::<Vec<_>>());
+            dd_log!(
+                "[DD render_dd_value] Tagged(tag='{}', fields={:?})",
+                tag,
+                fields.keys().collect::<Vec<_>>()
+            );
             render_tagged_element(tag.as_ref(), fields)
         }
 
@@ -267,8 +368,8 @@ fn render_dd_value(value: &Value) -> RawElOrText {
                 // children_signal_vec() only updates changed elements (O(delta))
                 Column::new()
                     .items_signal_vec(
-                        list_signal_vec(cell_id)  // Pass owned String
-                            .map(|item| render_dd_value(&item))
+                        list_signal_vec(cell_id) // Pass owned String
+                            .map(|item| render_dd_value(&item)),
                     )
                     .unify()
             } else {
@@ -276,13 +377,13 @@ fn render_dd_value(value: &Value) -> RawElOrText {
                 let cell_id_for_signal = cell_id.clone();
                 El::new()
                     .child_signal(
-                        cell_signal(cell_id)  // Pass owned String
+                        cell_signal(cell_id) // Pass owned String
                             .map(move |value| {
                                 let Some(value) = value else {
                                     return Text::new("");
                                 };
                                 Text::new(value.to_display_string())
-                            })
+                            }),
                     )
                     .unify()
             }
@@ -304,13 +405,13 @@ fn render_dd_value(value: &Value) -> RawElOrText {
             let cell_id_for_signal = cell_id.clone();
             El::new()
                 .child_signal(
-                    cell_signal(cell_id)  // Pass owned String
+                    cell_signal(cell_id) // Pass owned String
                         .map(move |value| {
                             let Some(value) = value else {
                                 return Text::new("");
                             };
                             Text::new(value.to_display_string())
-                        })
+                        }),
                 )
                 .unify()
         }
@@ -318,7 +419,6 @@ fn render_dd_value(value: &Value) -> RawElOrText {
         // Pure DD: All computation happens in DD dataflow, not at render time.
         // Lists are rendered as Collection with children_signal_vec().
         // Reactive values flow through DD output streams.
-
         Value::Placeholder => {
             panic!("[DD Render] Placeholder reached render; DD map substitution failed");
         }
@@ -332,8 +432,15 @@ fn render_dd_value(value: &Value) -> RawElOrText {
 }
 
 /// Render a tagged object as a Zoon element.
-fn render_tagged_element(tag: &str, fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    dd_log!("[DD render_tagged] tag='{}', fields={:?}", tag, fields.keys().collect::<Vec<_>>());
+fn render_tagged_element(
+    tag: &str,
+    fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>,
+) -> RawElOrText {
+    dd_log!(
+        "[DD render_tagged] tag='{}', fields={:?}",
+        tag,
+        fields.keys().collect::<Vec<_>>()
+    );
     if BoolTag::is_bool_tag(tag) {
         return Text::new(tag).unify();
     }
@@ -358,7 +465,11 @@ fn render_element(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> 
             panic!("[DD render_element] Missing required '_element_type' field");
         });
 
-    dd_log!("[DD render_element] type='{}', all_fields={:?}", element_type, fields.keys().collect::<Vec<_>>());
+    dd_log!(
+        "[DD render_element] type='{}', all_fields={:?}",
+        element_type,
+        fields.keys().collect::<Vec<_>>()
+    );
 
     match element_type {
         "button" => render_button(fields),
@@ -380,88 +491,74 @@ fn render_element(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> 
         "paragraph" => render_paragraph(fields),
         "link" => render_link(fields),
         _ => {
-            panic!("[DD render_element] Unknown element type '{}'", element_type);
+            panic!(
+                "[DD render_element] Unknown element type '{}'",
+                element_type
+            );
         }
     }
 }
 
 /// Render a button element.
 fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    let label_value = fields
-        .get("label")
-        .unwrap_or_else(|| {
-            panic!("[DD render_button] Missing required 'label' field");
-        });
+    let label_value = fields.get("label").unwrap_or_else(|| {
+        panic!("[DD render_button] Missing required 'label' field");
+    });
 
     // Extract LinkRef from element.event.press if present
     let element_value = fields.get("element");
     let event_value = element_value.and_then(|e| e.get("event"));
     let press_value = event_value.and_then(|e| e.get("press"));
-    dd_log!("[DD render_button] label={:?} element={:?} event={:?} press={:?}",
+    dd_log!(
+        "[DD render_button] label={:?} element={:?} event={:?} press={:?}",
         label_value,
-        element_value.map(|v| format!("{:?}", v)).unwrap_or_else(|| "None".to_string()),
-        event_value.map(|v| format!("{:?}", v)).unwrap_or_else(|| "None".to_string()),
-        press_value.map(|v| format!("{:?}", v)).unwrap_or_else(|| "None".to_string()));
-    let link_id = press_value
-        .and_then(|v| match v {
-            Value::LinkRef(id) => Some(id.to_string()),
-            _ => None,
-        });
+        element_value
+            .map(|v| format!("{:?}", v))
+            .unwrap_or_else(|| "None".to_string()),
+        event_value
+            .map(|v| format!("{:?}", v))
+            .unwrap_or_else(|| "None".to_string()),
+        press_value
+            .map(|v| format!("{:?}", v))
+            .unwrap_or_else(|| "None".to_string())
+    );
+    let link_id = press_value.and_then(|v| match v {
+        Value::LinkRef(id) => Some(id.to_string()),
+        _ => None,
+    });
+    let item_key = extract_item_key(fields);
     dd_log!("[DD render_button] Extracted link_id={:?}", link_id);
 
-    // TODO(todo_mvc test): The "All" filter button doesn't get a visible outline at startup.
-    // The test expects outline on the active route button, but gets outlineWidth="0px".
-    // The outline value likely depends on the current_route cell matching "/" — check if
-    // the evaluator computes a WHILE/WHEN on the route that produces an outline Object
-    // vs NoOutline, and whether the initial value resolves correctly here.
-    //
     // Extract outline from style.outline
     // DD computes reactive styling - bridge receives final values
     let style_value = fields.get("style");
     let outline_value = style_value.and_then(|s| s.get("outline"));
 
-    // Resolve WhileConfig in outline (e.g., hover-dependent outline) to its initial value.
+    let outline_while_config = match outline_value {
+        Some(Value::WhileConfig(config)) => Some(config.clone()),
+        _ => None,
+    };
+
+    // Resolve WhileConfig in outline to a concrete value using the current cell state.
+    // This fixes startup style for route/filter-driven outlines (todo_mvc "All" button).
     let outline_resolved = outline_value.map(|v| match v {
         Value::WhileConfig(config) => {
-            // Use default arm (typically False = not hovered) as initial value.
-            select_while_arm(&Value::Bool(false), &config.arms, &config.default)
+            let cell_id = config.cell_id.name();
+            let selector_value =
+                get_cell_value(&cell_id).unwrap_or_else(|| config.default.as_ref().clone());
+            select_while_arm(&selector_value, &config.arms, &config.default)
         }
-        other => other.clone()
+        other => other.clone(),
     });
-    let outline_ref = outline_resolved.as_ref();
-    let outline_opt: Option<Outline> = match outline_ref {
-        None => None,
-        Some(Value::Tagged { tag, .. }) if tag.as_ref() == "NoOutline" => None,
-        Some(Value::Object(obj)) => {
-            let color = obj.get("color").and_then(|c| dd_oklch_to_css(c)).unwrap_or_else(|| {
-                panic!("[DD render_button] outline.color must be Oklch");
-            });
-            let is_inner = match obj.get("side") {
-                None => false,
-                Some(Value::Tagged { tag, .. }) if tag.as_ref() == "Inner" => true,
-                Some(Value::Tagged { tag, .. }) if tag.as_ref() == "Outer" => false,
-                Some(other) => {
-                    panic!("[DD render_button] outline.side must be Inner/Outer, found {:?}", other);
-                }
-            };
-            let width = match obj.get("width") {
-                None => 1,
-                Some(Value::Number(n)) => f64_to_u32(n),
-                Some(other) => {
-                    panic!("[DD render_button] outline.width must be Number, found {:?}", other);
-                }
-            };
-            let outline = if is_inner {
-                Outline::inner().width(width).solid().color(color)
-            } else {
-                Outline::outer().width(width).solid().color(color)
-            };
-            Some(outline)
-        }
-        Some(other) => {
-            panic!("[DD render_button] outline must be NoOutline or object, found {:?}", other);
-        }
-    };
+    let outline_opt: Option<ButtonOutlineCss> = outline_resolved
+        .as_ref()
+        .map(parse_button_outline)
+        .unwrap_or(None);
+    dd_log!(
+        "[DD render_button] outline_value={:?} outline_resolved={:?}",
+        outline_value,
+        outline_resolved
+    );
 
     // Extract font styling from style.font
     let font_color_css = style_value
@@ -471,12 +568,124 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
     let font_size = style_value
         .and_then(|s| s.get("font"))
         .and_then(|f| f.get("size"))
-        .and_then(|v| if let Value::Number(n) = v { Some(f64_to_u32(n)) } else { None });
+        .and_then(|v| {
+            if let Value::Number(n) = v {
+                Some(f64_to_u32(n))
+            } else {
+                None
+            }
+        });
 
-    // Build button with optional outline and font styling
+    let label_value = label_value.clone();
+
+    if let Some(config) = outline_while_config {
+        let selector_cell_id = config.cell_id.name().to_string();
+        let label_value_for_signal = label_value.clone();
+        let font_color_css_for_signal = font_color_css.clone();
+        let link_id_for_signal = link_id.clone();
+        let item_key_for_signal = item_key.clone();
+
+        El::new()
+            .child_signal(cell_signal(selector_cell_id).map(move |selector_value| {
+                let selector_value =
+                    selector_value.unwrap_or_else(|| config.default.as_ref().clone());
+                let resolved_outline =
+                    select_while_arm(&selector_value, &config.arms, &config.default);
+                dd_log!(
+                    "[DD render_button] reactive selector={:?} resolved_outline={:?}",
+                    selector_value,
+                    resolved_outline
+                );
+                let outline_opt = parse_button_outline(&resolved_outline);
+                build_button_with_style(
+                    label_value_for_signal.clone(),
+                    font_color_css_for_signal.clone(),
+                    font_size,
+                    outline_opt,
+                    link_id_for_signal.clone(),
+                    item_key_for_signal.clone(),
+                )
+            }))
+            .unify()
+    } else {
+        build_button_with_style(
+            label_value,
+            font_color_css,
+            font_size,
+            outline_opt,
+            link_id,
+            item_key,
+        )
+    }
+}
+
+#[derive(Clone)]
+struct ButtonOutlineCss {
+    color: String,
+    width: u32,
+    is_inner: bool,
+}
+
+fn parse_button_outline(value: &Value) -> Option<ButtonOutlineCss> {
+    match value {
+        Value::Tagged { tag, .. } if tag.as_ref() == "NoOutline" => None,
+        Value::Object(obj) => {
+            let color = obj
+                .get("color")
+                .and_then(|c| dd_oklch_to_css(c))
+                .unwrap_or_else(|| {
+                    panic!("[DD render_button] outline.color must be Oklch");
+                });
+            let is_inner = match obj.get("side") {
+                None => false,
+                Some(Value::Tagged { tag, .. }) if tag.as_ref() == "Inner" => true,
+                Some(Value::Tagged { tag, .. }) if tag.as_ref() == "Outer" => false,
+                Some(other) => {
+                    panic!(
+                        "[DD render_button] outline.side must be Inner/Outer, found {:?}",
+                        other
+                    );
+                }
+            };
+            let width = match obj.get("width") {
+                None => 1,
+                Some(Value::Number(n)) => f64_to_u32(n),
+                Some(other) => {
+                    panic!(
+                        "[DD render_button] outline.width must be Number, found {:?}",
+                        other
+                    );
+                }
+            };
+            Some(ButtonOutlineCss {
+                color,
+                width,
+                is_inner,
+            })
+        }
+        other => {
+            panic!(
+                "[DD render_button] outline must be NoOutline or object, found {:?}",
+                other
+            );
+        }
+    }
+}
+
+fn build_button_with_style(
+    label_value: Value,
+    font_color_css: Option<String>,
+    font_size: Option<u32>,
+    outline_opt: Option<ButtonOutlineCss>,
+    link_id: Option<String>,
+    item_key: Option<String>,
+) -> RawElOrText {
     // Check if label is a reactive __text_template__ with CellRef parts
-    let mut button = match label_value {
-        Value::Tagged { tag, fields: label_fields } if tag.as_ref() == "__text_template__" => {
+    let mut button = match &label_value {
+        Value::Tagged {
+            tag,
+            fields: label_fields,
+        } if tag.as_ref() == "__text_template__" => {
             let mut tt_parts: Vec<Value> = Vec::new();
             let mut i = 0;
             while let Some(v) = label_fields.get(i.to_string().as_str()) {
@@ -484,22 +693,24 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
                 i += 1;
             }
             let first_cellref = tt_parts.iter().find_map(|v| {
-                if let Value::CellRef(id) = v { Some(id.to_string()) } else { None }
+                if let Value::CellRef(id) = v {
+                    Some(id.to_string())
+                } else {
+                    None
+                }
             });
             if let Some(cell_id) = first_cellref {
-                Button::new().label_signal(
-                    cell_signal(cell_id)
-                        .map(move |_trigger| {
-                            tt_parts.iter().map(|part| match part {
-                                Value::CellRef(id) => {
-                                    get_cell_value(&id.to_string())
-                                        .map(|v| v.to_display_string())
-                                        .unwrap_or_default()
-                                }
-                                v => v.to_display_string(),
-                            }).collect::<String>()
+                Button::new().label_signal(cell_signal(cell_id).map(move |_trigger| {
+                    tt_parts
+                        .iter()
+                        .map(|part| match part {
+                            Value::CellRef(id) => get_cell_value(&id.to_string())
+                                .map(|v| v.to_display_string())
+                                .unwrap_or_default(),
+                            v => v.to_display_string(),
                         })
-                )
+                        .collect::<String>()
+                }))
             } else {
                 let text: String = tt_parts.iter().map(|v| v.to_display_string()).collect();
                 Button::new().label(text)
@@ -507,16 +718,13 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
         }
         Value::CellRef(id) => {
             let cell_id = id.to_string();
-            Button::new().label_signal(
-                cell_signal(cell_id.clone())
-                    .map(move |_trigger| {
-                        get_cell_value(&cell_id)
-                            .map(|v| v.to_display_string())
-                            .unwrap_or_default()
-                    })
-            )
+            Button::new().label_signal(cell_signal(cell_id.clone()).map(move |_trigger| {
+                get_cell_value(&cell_id)
+                    .map(|v| v.to_display_string())
+                    .unwrap_or_default()
+            }))
         }
-        v => Button::new().label(resolve_display_string(v)),
+        _ => Button::new().label(resolve_display_string(&label_value)),
     };
 
     // Apply font styling
@@ -530,14 +738,27 @@ fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
     button = button.s(font);
 
     if let Some(outline) = outline_opt {
-        button = button.s(outline);
+        button = button.update_raw_el(move |raw_el| {
+            let outline_width = format!("{}px", outline.width);
+            let raw_el = raw_el
+                .style("outline-style", "solid")
+                .style("outline-width", &outline_width)
+                .style("outline-color", &outline.color);
+            if outline.is_inner {
+                let outline_offset = format!("-{}px", outline.width);
+                raw_el.style("outline-offset", &outline_offset)
+            } else {
+                raw_el
+            }
+        });
     }
 
     if let Some(link_id) = link_id {
+        let item_key = item_key.clone();
         // Wire button to fire the link event via global dispatcher
         button
             .on_press(move || {
-                fire_global_link(&link_id);
+                dispatch_link_unit(item_key.as_deref(), &link_id);
             })
             .unify()
     } else {
@@ -553,7 +774,10 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
             Value::Tagged { tag, .. } => tag.as_ref().to_string(),
             Value::Text(s) => s.to_string(),
             other => {
-                panic!("[DD render_stripe] direction must be Text or Tag, found {:?}", other);
+                panic!(
+                    "[DD render_stripe] direction must be Text or Tag, found {:?}",
+                    other
+                );
             }
         })
         .unwrap_or_else(|| {
@@ -576,6 +800,7 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
             Value::LinkRef(id) => Some(id.to_string()),
             _ => None,
         });
+    let item_key = extract_item_key(fields);
 
     let items_value = fields.get("items");
 
@@ -587,10 +812,11 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
     let items_hold_ref = fields.get("items").and_then(|v| match v {
         Value::CellRef(cell_id) => Some(cell_id.name().to_string()),
         Value::List(handle) => Some(
-            handle.cell_id
+            handle
+                .cell_id
                 .as_deref()
                 .map(str::to_string)
-                .unwrap_or_else(|| handle.id.to_string())
+                .unwrap_or_else(|| handle.id.to_string()),
         ),
         _ => None,
     });
@@ -646,31 +872,49 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
     // Macro to build Row or Column with shared style application
     macro_rules! build_stripe {
         ($Container:ident, $gap_axis:ident, $cell_id:expr) => {{
-            dd_log!("[DD render_stripe] {} with reactive items from {}", stringify!($Container), $cell_id);
+            dd_log!(
+                "[DD render_stripe] {} with reactive items from {}",
+                stringify!($Container),
+                $cell_id
+            );
             let mut el = $Container::new()
                 .s(Gap::new().$gap_axis(gap))
                 .items_signal_vec(
-                    list_signal_vec($cell_id.clone())
-                        .map(|item| render_dd_value(&item))
+                    list_signal_vec($cell_id.clone()).map(|item| render_dd_value(&item)),
                 );
-            if width_fill { el = el.s(zoon::Width::fill()); }
-            if let Some(color) = bg_color { el = el.s(zoon::Background::new().color(color)); }
+            if width_fill {
+                el = el.s(zoon::Width::fill());
+            }
+            if let Some(color) = bg_color {
+                el = el.s(zoon::Background::new().color(color));
+            }
             if font_size.is_some() || font_color.is_some() {
                 let mut font = zoon::Font::new();
-                if let Some(size) = font_size { font = font.size(size); }
-                if let Some(ref color) = font_color { font = font.color(color.clone()); }
+                if let Some(size) = font_size {
+                    font = font.size(size);
+                }
+                if let Some(ref color) = font_color {
+                    font = font.color(color.clone());
+                }
                 el = el.s(font);
             }
             if padding_x.is_some() || padding_y.is_some() {
                 let mut padding = zoon::Padding::new();
-                if let Some(x) = padding_x { padding = padding.x(x); }
-                if let Some(y) = padding_y { padding = padding.y(y); }
+                if let Some(x) = padding_x {
+                    padding = padding.x(x);
+                }
+                if let Some(y) = padding_y {
+                    padding = padding.y(y);
+                }
                 el = el.s(padding);
             }
             if let Some(link_id) = hovered_link_id {
-                return el.on_hovered_change(move |is_hovered| {
-                    fire_global_link_with_bool(&link_id, is_hovered);
-                }).unify();
+                let item_key = item_key.clone();
+                return el
+                    .on_hovered_change(move |is_hovered| {
+                        dispatch_link_bool(item_key.as_deref(), &link_id, is_hovered);
+                    })
+                    .unify();
             }
             el.unify()
         }};
@@ -683,10 +927,12 @@ fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> R
     match direction.as_str() {
         "Row" => build_stripe!(Row, x, cell_id),
         "Column" => build_stripe!(Column, y, cell_id),
-        other => panic!("[DD render_stripe] direction must be Row/Column, found '{}'", other),
+        other => panic!(
+            "[DD render_stripe] direction must be Row/Column, found '{}'",
+            other
+        ),
     }
 }
-
 
 /// Render a stack (layered elements).
 /// CellRef support for reactive layers via layers_signal_vec.
@@ -696,10 +942,11 @@ fn render_stack(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
         let reactive_cell_id = match value {
             Value::CellRef(cell_id) => Some(cell_id.name().to_string()),
             Value::List(handle) => Some(
-                handle.cell_id
+                handle
+                    .cell_id
                     .as_deref()
                     .map(str::to_string)
-                    .unwrap_or_else(|| handle.id.to_string())
+                    .unwrap_or_else(|| handle.id.to_string()),
             ),
             _ => None,
         };
@@ -708,31 +955,30 @@ fn render_stack(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
 
             let style = fields.get("style");
 
-            let width_opt = style
-                .and_then(|s| s.get("width"))
-                .and_then(|v| match v {
-                    Value::Number(n) => Some(f64_to_u32(n)),
-                    _ => None,
-                });
-            let height_opt = style
-                .and_then(|s| s.get("height"))
-                .and_then(|v| match v {
-                    Value::Number(n) => Some(f64_to_u32(n)),
-                    _ => None,
-                });
+            let width_opt = style.and_then(|s| s.get("width")).and_then(|v| match v {
+                Value::Number(n) => Some(f64_to_u32(n)),
+                _ => None,
+            });
+            let height_opt = style.and_then(|s| s.get("height")).and_then(|v| match v {
+                Value::Number(n) => Some(f64_to_u32(n)),
+                _ => None,
+            });
             let bg_color = style
                 .and_then(|s| s.get("background"))
                 .and_then(|bg| bg.get("color"))
                 .and_then(|c| dd_oklch_to_css(c));
 
             let mut el = Stack::new()
-                .layers_signal_vec(
-                    list_signal_vec(cell_id_str)
-                        .map(|item| render_dd_value(&item))
-                );
-            if let Some(w) = width_opt { el = el.s(Width::exact(w)); }
-            if let Some(h) = height_opt { el = el.s(Height::exact(h)); }
-            if let Some(color) = bg_color { el = el.s(Background::new().color(color)); }
+                .layers_signal_vec(list_signal_vec(cell_id_str).map(|item| render_dd_value(&item)));
+            if let Some(w) = width_opt {
+                el = el.s(Width::exact(w));
+            }
+            if let Some(h) = height_opt {
+                el = el.s(Height::exact(h));
+            }
+            if let Some(color) = bg_color {
+                el = el.s(Background::new().color(color));
+            }
             return el.unify();
         }
     }
@@ -748,20 +994,16 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
     let style = fields.get("style");
 
     // Get size (sets both width and height)
-    let size_opt = style
-        .and_then(|s| s.get("size"))
-        .and_then(|v| match v {
-            Value::Number(n) => Some(f64_to_u32(n)),
-            _ => None,
-        });
+    let size_opt = style.and_then(|s| s.get("size")).and_then(|v| match v {
+        Value::Number(n) => Some(f64_to_u32(n)),
+        _ => None,
+    });
 
     // Get standalone width
-    let width_opt = style
-        .and_then(|s| s.get("width"))
-        .and_then(|v| match v {
-            Value::Number(n) => Some(f64_to_u32(n)),
-            _ => None,
-        });
+    let width_opt = style.and_then(|s| s.get("width")).and_then(|v| match v {
+        Value::Number(n) => Some(f64_to_u32(n)),
+        _ => None,
+    });
 
     // Get background URL
     let bg_url_opt = style
@@ -794,7 +1036,10 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
 
     // Debug: log what font_color_value we got
     if font_color_value.is_some() {
-        dd_log!("[DD render_container] font_color_value: {:?}", font_color_value);
+        dd_log!(
+            "[DD render_container] font_color_value: {:?}",
+            font_color_value
+        );
     }
 
     // Font color is computed by DD - bridge receives final values
@@ -812,9 +1057,13 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
     let base = match size_opt {
         Some(size) => base.s(Width::exact(size)).s(Height::exact(size)),
         None => {
-            let b = if let Some(w) = width_opt { base.s(Width::exact(w)) } else { base };
+            let b = if let Some(w) = width_opt {
+                base.s(Width::exact(w))
+            } else {
+                base
+            };
             b
-        },
+        }
     };
     let base = match (&bg_url_opt, &bg_color) {
         (Some(url), _) => base.s(Background::new().url(url.clone())),
@@ -897,8 +1146,13 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
                     _ => None,
                 });
 
-            if padding_row.is_some() || padding_column.is_some() || padding_left.is_some()
-                || padding_right.is_some() || padding_top.is_some() || padding_bottom.is_some() {
+            if padding_row.is_some()
+                || padding_column.is_some()
+                || padding_left.is_some()
+                || padding_right.is_some()
+                || padding_top.is_some()
+                || padding_bottom.is_some()
+            {
                 let mut padding = Padding::new();
                 if let Some(x) = padding_row {
                     padding = padding.x(x);
@@ -927,12 +1181,10 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
 
     // Apply height
     let base = {
-        let height_opt = style
-            .and_then(|s| s.get("height"))
-            .and_then(|v| match v {
-                Value::Number(n) => Some(f64_to_u32(n)),
-                _ => None,
-            });
+        let height_opt = style.and_then(|s| s.get("height")).and_then(|v| match v {
+            Value::Number(n) => Some(f64_to_u32(n)),
+            _ => None,
+        });
 
         if let Some(height) = height_opt {
             base.s(Height::exact(height))
@@ -950,12 +1202,13 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
                 Value::Number(n) => Some(f64_to_i32(n)),
                 _ => None,
             });
-        let move_right_opt = transform_obj
-            .and_then(|t| t.get("move_right"))
-            .and_then(|v| match v {
-                Value::Number(n) => Some(f64_to_i32(n)),
-                _ => None,
-            });
+        let move_right_opt =
+            transform_obj
+                .and_then(|t| t.get("move_right"))
+                .and_then(|v| match v {
+                    Value::Number(n) => Some(f64_to_i32(n)),
+                    _ => None,
+                });
         let move_down_opt = transform_obj
             .and_then(|t| t.get("move_down"))
             .and_then(|v| match v {
@@ -965,9 +1218,15 @@ fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
 
         if rotate_opt.is_some() || move_right_opt.is_some() || move_down_opt.is_some() {
             let mut t = Transform::new();
-            if let Some(rotate) = rotate_opt { t = t.rotate(rotate); }
-            if let Some(x) = move_right_opt { t = t.move_right(x); }
-            if let Some(y) = move_down_opt { t = t.move_down(y); }
+            if let Some(rotate) = rotate_opt {
+                t = t.rotate(rotate);
+            }
+            if let Some(x) = move_right_opt {
+                t = t.move_right(x);
+            }
+            if let Some(y) = move_down_opt {
+                t = t.move_down(y);
+            }
             base.s(t)
         } else {
             base
@@ -992,21 +1251,31 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
         Value::Unit => None,
         Value::Text(text) => Some(text.as_ref().to_string()),
         Value::Object(obj) => {
-            let text_value = obj.get("text").unwrap_or_else(|| {
-                panic!("[DD TextInput] placeholder object must contain 'text'");
-            });
-            match text_value {
-                Value::Text(text) => Some(text.as_ref().to_string()),
-                Value::CellRef(cell_id) => {
-                    panic!("[DD TextInput] placeholder must be static text, found CellRef({})", cell_id);
+            if let Some(text_value) = obj.get("text") {
+                match text_value {
+                    Value::Text(text) => Some(text.as_ref().to_string()),
+                    Value::CellRef(cell_id) => {
+                        panic!(
+                            "[DD TextInput] placeholder must be static text, found CellRef({})",
+                            cell_id
+                        );
+                    }
+                    other => {
+                        panic!(
+                            "[DD TextInput] placeholder.text must be Text, found {:?}",
+                            other
+                        );
+                    }
                 }
-                other => {
-                    panic!("[DD TextInput] placeholder.text must be Text, found {:?}", other);
-                }
+            } else {
+                None
             }
         }
         other => {
-            panic!("[DD TextInput] placeholder must be Text, Unit, or object with text, found {:?}", other);
+            panic!(
+                "[DD TextInput] placeholder must be Text, Unit, or object with text, found {:?}",
+                other
+            );
         }
     };
 
@@ -1019,7 +1288,10 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
         Value::CellRef(cell_id) => Some(cell_id.to_string()),
         Value::Text(_) => None,
         other => {
-            panic!("[DD TextInput] text must be Text or CellRef, found {:?}", other);
+            panic!(
+                "[DD TextInput] text must be Text or CellRef, found {:?}",
+                other
+            );
         }
     };
     let text = match text_field {
@@ -1029,7 +1301,10 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
         }
         Value::Text(text) => text.as_ref().to_string(),
         other => {
-            panic!("[DD TextInput] text must be Text or CellRef, found {:?}", other);
+            panic!(
+                "[DD TextInput] text must be Text or CellRef, found {:?}",
+                other
+            );
         }
     };
 
@@ -1038,10 +1313,15 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
         panic!("[DD TextInput] Missing required 'focus' field");
     });
     let should_focus = match focus_value {
-        Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => BoolTag::is_true(tag.as_ref()),
+        Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => {
+            BoolTag::is_true(tag.as_ref())
+        }
         Value::Bool(b) => *b,
         other => {
-            panic!("[DD TextInput] focus must be Bool or BoolTag, found {:?}", other);
+            panic!(
+                "[DD TextInput] focus must be Bool or BoolTag, found {:?}",
+                other
+            );
         }
     };
 
@@ -1053,7 +1333,10 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
         .map(|v| match v {
             Value::LinkRef(id) => id.to_string(),
             other => {
-                panic!("[DD TextInput] element.event.key_down must be LinkRef, found {:?}", other);
+                panic!(
+                    "[DD TextInput] element.event.key_down must be LinkRef, found {:?}",
+                    other
+                );
             }
         });
 
@@ -1072,7 +1355,10 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
         .map(|v| match v {
             Value::LinkRef(id) => id.to_string(),
             other => {
-                panic!("[DD TextInput] element.event.change must be LinkRef, found {:?}", other);
+                panic!(
+                    "[DD TextInput] element.event.change must be LinkRef, found {:?}",
+                    other
+                );
             }
         });
 
@@ -1084,11 +1370,15 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
         .map(|v| match v {
             Value::LinkRef(id) => id.to_string(),
             other => {
-                panic!("[DD TextInput] element.event.blur must be LinkRef, found {:?}", other);
+                panic!(
+                    "[DD TextInput] element.event.blur must be LinkRef, found {:?}",
+                    other
+                );
             }
         });
 
     let is_editing_input = blur_link_id.is_some();
+    let item_key = extract_item_key(fields);
 
     if text_cell_id.is_some() && change_link_id.is_none() {
         panic!("[DD TextInput] text CellRef requires element.event.change LinkRef");
@@ -1106,68 +1396,76 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
                 let cell_id_for_signal = cell_id.clone();
                 TextInput::new()
                     .id("dd_text_input")
-                    .text_signal(
-                        cell_signal(cell_id.clone())
-                            .map(move |value| {
-                                let Some(value) = value else {
-                                    return String::new();
-                                };
-                                value.to_display_string()
-                            })
-                    )
+                    .text_signal(cell_signal(cell_id.clone()).map(move |value| {
+                        let Some(value) = value else {
+                            return String::new();
+                        };
+                        value.to_display_string()
+                    }))
             } else {
-                TextInput::new()
-                    .id("dd_text_input")
-                    .text(text.clone())
+                TextInput::new().id("dd_text_input").text(text.clone())
             };
             let input = input.placeholder(Placeholder::new(placeholder_text.clone()));
 
             let do_focus = should_focus;
             let do_double_focus = is_editing_input;
-            input
-                .focus(should_focus)
-                .update_raw_el(move |raw_el| {
-                    let raw_el = raw_el.attr("autocomplete", "off");
-                    if do_focus {
-                        raw_el.after_insert(move |el| {
-                            #[cfg(target_arch = "wasm32")]
-                            {
-                                use zoon::wasm_bindgen::closure::Closure;
-                                use zoon::wasm_bindgen::JsCast;
-                                let el_clone = el.clone();
-                                if do_double_focus {
-                                    let inner_closure = Closure::once(move || {
-                                        let _ = el_clone.focus();
-                                    });
-                                    let outer_closure = Closure::once(move || {
-                                        if let Some(window) = zoon::web_sys::window() {
-                                            let _ = window.request_animation_frame(inner_closure.as_ref().unchecked_ref());
-                                        }
-                                        inner_closure.forget();
-                                    });
+            input.focus(should_focus).update_raw_el(move |raw_el| {
+                let raw_el = raw_el.attr("autocomplete", "off");
+                if do_focus {
+                    raw_el.after_insert(move |el| {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            use zoon::wasm_bindgen::closure::Closure;
+                            use zoon::wasm_bindgen::JsCast;
+                            let el_clone = el.clone();
+                            if do_double_focus {
+                                let inner_closure = Closure::once(move || {
+                                    let _ = el_clone.focus();
+                                });
+                                let outer_closure = Closure::once(move || {
                                     if let Some(window) = zoon::web_sys::window() {
-                                        let _ = window.request_animation_frame(outer_closure.as_ref().unchecked_ref());
+                                        let _ = window.request_animation_frame(
+                                            inner_closure.as_ref().unchecked_ref(),
+                                        );
                                     }
-                                    outer_closure.forget();
-                                } else {
-                                    let closure = Closure::once(move || {
-                                        let _ = el_clone.focus();
-                                    });
-                                    if let Some(window) = zoon::web_sys::window() {
-                                        let _ = window.request_animation_frame(closure.as_ref().unchecked_ref());
-                                    }
-                                    closure.forget();
+                                    inner_closure.forget();
+                                });
+                                if let Some(window) = zoon::web_sys::window() {
+                                    let _ = window.request_animation_frame(
+                                        outer_closure.as_ref().unchecked_ref(),
+                                    );
                                 }
+                                outer_closure.forget();
+                            } else {
+                                let closure = Closure::once(move || {
+                                    if let Some(window) = zoon::web_sys::window() {
+                                        if let Some(document) = window.document() {
+                                            if let Some(active) = document.active_element() {
+                                                let tag = active.tag_name();
+                                                if !tag.eq_ignore_ascii_case("body") {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let _ = el_clone.focus();
+                                });
+                                if let Some(window) = zoon::web_sys::window() {
+                                    let _ = window
+                                        .request_animation_frame(closure.as_ref().unchecked_ref());
+                                }
+                                closure.forget();
                             }
-                            #[cfg(not(target_arch = "wasm32"))]
-                            {
-                                let _ = el.focus();
-                            }
-                        })
-                    } else {
-                        raw_el
-                    }
-                })
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            let _ = el.focus();
+                        }
+                    })
+                } else {
+                    raw_el
+                }
+            })
         }
     };
 
@@ -1175,6 +1473,8 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
     // for different combinations of event handlers
     match (key_down_link_id, change_link_id) {
         (Some(key_link), Some(change_link)) => {
+            let item_key_for_key = item_key.clone();
+            let item_key_for_change = item_key.clone();
             let input = build_input()
                 .on_key_down_event(move |event| {
                     dd_log!("[DD on_key_down_event] INPUT fired! key_link={}", key_link);
@@ -1183,60 +1483,111 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
                             dd_log!("[DD on_key_down_event] Enter pressed");
                             #[cfg(target_arch = "wasm32")]
                             {
-                                let input_text = get_dd_text_input_value();
-                                dd_log!("[DD on_key_down_event] Enter text captured: '{}'", input_text);
-                                fire_global_key_down(&key_link, DdKey::Enter, Some(input_text));
+                                let input_text = get_dd_text_input_value_from_key_event(&event)
+                                    .unwrap_or_else(get_dd_text_input_value);
+                                dd_log!(
+                                    "[DD on_key_down_event] Enter text captured: '{}'",
+                                    input_text
+                                );
+                                dispatch_key_down(
+                                    item_key_for_key.as_deref(),
+                                    &key_link,
+                                    DdKey::Enter,
+                                    Some(input_text),
+                                );
                             }
                             #[cfg(not(target_arch = "wasm32"))]
                             {
-                                fire_global_key_down(&key_link, DdKey::Enter, Some(String::new()));
+                                dispatch_key_down(
+                                    item_key_for_key.as_deref(),
+                                    &key_link,
+                                    DdKey::Enter,
+                                    Some(String::new()),
+                                );
                             }
                             return;
                         }
                         Key::Escape => {
-                            fire_global_key_down(&key_link, DdKey::Escape, None);
+                            dispatch_key_down(
+                                item_key_for_key.as_deref(),
+                                &key_link,
+                                DdKey::Escape,
+                                None,
+                            );
                         }
                         Key::Other(k) => {
-                            fire_global_key_down(&key_link, DdKey::from(k.as_str()), None);
+                            dispatch_key_down(
+                                item_key_for_key.as_deref(),
+                                &key_link,
+                                DdKey::from(k.as_str()),
+                                None,
+                            );
                         }
                     }
                 })
                 .on_change(move |new_text| {
-                    fire_global_link_with_text(&change_link, new_text);
+                    dispatch_link_text(item_key_for_change.as_deref(), &change_link, new_text);
                 });
             // Add blur handler if blur_link_id is set (for editing inputs)
             if let Some(blur_link) = blur_link_id.clone() {
+                let item_key_for_blur = item_key.clone();
                 input
                     .on_blur(move || {
-                        fire_global_link(&blur_link);
-                    }).unify()
+                        dispatch_link_unit(item_key_for_blur.as_deref(), &blur_link);
+                    })
+                    .unify()
             } else {
                 input.unify()
             }
         }
         (Some(key_link), None) => {
+            let item_key_for_key = item_key.clone();
             build_input()
                 .on_key_down_event(move |event| {
-                    dd_log!("[DD on_key_down_event] SIMPLE INPUT fired! key_link={}", key_link);
+                    dd_log!(
+                        "[DD on_key_down_event] SIMPLE INPUT fired! key_link={}",
+                        key_link
+                    );
                     match event.key() {
                         Key::Enter => {
                             dd_log!("[DD on_key_down_event] Enter pressed in SIMPLE input");
                             #[cfg(target_arch = "wasm32")]
                             {
-                                let input_text = get_dd_text_input_value();
-                                fire_global_key_down(&key_link, DdKey::Enter, Some(input_text));
+                                let input_text = get_dd_text_input_value_from_key_event(&event)
+                                    .unwrap_or_else(get_dd_text_input_value);
+                                dispatch_key_down(
+                                    item_key_for_key.as_deref(),
+                                    &key_link,
+                                    DdKey::Enter,
+                                    Some(input_text),
+                                );
                             }
                             #[cfg(not(target_arch = "wasm32"))]
                             {
-                                fire_global_key_down(&key_link, DdKey::Enter, Some(String::new()));
+                                dispatch_key_down(
+                                    item_key_for_key.as_deref(),
+                                    &key_link,
+                                    DdKey::Enter,
+                                    Some(String::new()),
+                                );
                             }
                             return;
                         }
                         Key::Escape => {
-                            fire_global_key_down(&key_link, DdKey::Escape, None);
+                            dispatch_key_down(
+                                item_key_for_key.as_deref(),
+                                &key_link,
+                                DdKey::Escape,
+                                None,
+                            );
                         }
                         Key::Other(k) => {
-                            fire_global_key_down(&key_link, DdKey::from(k.as_str()), None);
+                            dispatch_key_down(
+                                item_key_for_key.as_deref(),
+                                &key_link,
+                                DdKey::from(k.as_str()),
+                                None,
+                            );
                         }
                     }
                 })
@@ -1244,17 +1595,14 @@ fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) 
                 .unify()
         }
         (None, Some(change_link)) => {
+            let item_key_for_change = item_key.clone();
             build_input()
                 .on_change(move |new_text| {
-                    fire_global_link_with_text(&change_link, new_text);
+                    dispatch_link_text(item_key_for_change.as_deref(), &change_link, new_text);
                 })
                 .unify()
         }
-        (None, None) => {
-            build_input()
-                .on_change(|_| {})
-                .unify()
-        }
+        (None, None) => build_input().on_change(|_| {}).unify(),
     }
 }
 
@@ -1266,7 +1614,10 @@ const CHECKED_SVG: &str = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//
 // DEAD CODE DELETED: render_default_checkbox_icon() - was never called
 
 fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    dd_log!("[DD render_checkbox] CALLED with fields={:?}", fields.keys().collect::<Vec<_>>());
+    dd_log!(
+        "[DD render_checkbox] CALLED with fields={:?}",
+        fields.keys().collect::<Vec<_>>()
+    );
     // Extract checked value - can be Bool, Tagged, or CellRef (reactive)
     let checked_value = fields
         .get("checked")
@@ -1285,6 +1636,7 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
             Value::LinkRef(id) => Some(id.to_string()),
             _ => None,
         });
+    let item_key = extract_item_key(fields);
 
     // Use Checkbox component for proper role="checkbox" accessibility
     // with custom 40x40 SVG icon for visual consistency
@@ -1301,17 +1653,22 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
         let checkbox = Checkbox::new()
             .label_hidden("checkbox")
             .checked_signal(
-                cell_signal(cell_id_for_signal)  // Pass owned String
+                cell_signal(cell_id_for_signal) // Pass owned String
                     .map(move |value| {
                         let Some(value) = value else {
                             return false;
                         };
                         match value {
                             Value::Bool(b) => b,
-                            Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => BoolTag::is_true(tag.as_ref()),
-                            other => panic!("[DD Checkbox] Expected Bool for '{}', found {:?}", cell_id_for_checked, other),
+                            Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => {
+                                BoolTag::is_true(tag.as_ref())
+                            }
+                            other => panic!(
+                                "[DD Checkbox] Expected Bool for '{}', found {:?}",
+                                cell_id_for_checked, other
+                            ),
                         }
-                    })
+                    }),
             )
             .icon({
                 // Use granular cell_signal() for icon - only updates when this cell changes
@@ -1321,18 +1678,29 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
                         .s(zoon::Height::exact(40))
                         .update_raw_el(|raw_el| raw_el.style("pointer-events", "none"))
                         .s(zoon::Background::new().url_signal(
-                            cell_signal(cell_id_for_icon.clone())  // Clone and pass owned
+                            cell_signal(cell_id_for_icon.clone()) // Clone and pass owned
                                 .map(move |value| {
                                     let Some(value) = value else {
                                         return UNCHECKED_SVG;
                                     };
                                     let checked = match value {
                                         Value::Bool(b) => b,
-                                        Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => BoolTag::is_true(tag.as_ref()),
-                                        other => panic!("[DD Checkbox] Expected Bool for '{}', found {:?}", cell_id_for_icon_checked, other),
+                                        Value::Tagged { tag, .. }
+                                            if BoolTag::is_bool_tag(tag.as_ref()) =>
+                                        {
+                                            BoolTag::is_true(tag.as_ref())
+                                        }
+                                        other => panic!(
+                                            "[DD Checkbox] Expected Bool for '{}', found {:?}",
+                                            cell_id_for_icon_checked, other
+                                        ),
                                     };
-                                    if checked { CHECKED_SVG } else { UNCHECKED_SVG }
-                                })
+                                    if checked {
+                                        CHECKED_SVG
+                                    } else {
+                                        UNCHECKED_SVG
+                                    }
+                                }),
                         ))
                 }
             });
@@ -1343,21 +1711,47 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
         // because DD link mappings handle BoolToggle.
         let cell_id_for_toggle = cell_id.to_string();
         if let Some(ref link_id) = click_link_id {
-            dd_log!("[DD render_checkbox] RETURNING reactive checkbox with link_id={}", link_id);
+            dd_log!(
+                "[DD render_checkbox] RETURNING reactive checkbox with link_id={}",
+                link_id
+            );
             let link_id_owned = link_id.clone();
+            let cell_id_for_event = cell_id_for_toggle.clone();
+            let item_key_for_event = item_key.clone();
             // Use raw DOM event listener to bypass potential Zoon event handling issues
             return checkbox
                 .update_raw_el(move |raw_el| {
                     let link_id = link_id_owned.clone();
+                    let cell_id = cell_id_for_event.clone();
+                    let item_key = item_key_for_event.clone();
                     raw_el.event_handler(move |_: zoon::events::Click| {
-                        dd_log!("[DD CHECKBOX CLICK] RAW event handler invoked! link_id={}", link_id);
-                        // Only fire link - DD link mappings handle the toggle
-                        fire_global_link(&link_id);
+                        dd_log!(
+                            "[DD CHECKBOX CLICK] RAW event handler invoked! link_id={}",
+                            link_id
+                        );
+                        // Send target checked state with the click event.
+                        // BoolToggle actions ignore it; state-setting actions consume it.
+                        let next_checked = get_cell_value(&cell_id)
+                            .map(|value| match value {
+                                Value::Bool(b) => !b,
+                                Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => {
+                                    !BoolTag::is_true(tag.as_ref())
+                                }
+                                other => panic!(
+                                    "[DD CHECKBOX CLICK] Expected Bool for '{}', found {:?}",
+                                    cell_id, other
+                                ),
+                            })
+                            .unwrap_or(true);
+                        dispatch_link_bool(item_key.as_deref(), &link_id, next_checked);
                     })
                 })
                 .unify();
         } else {
-            panic!("[DD render_checkbox] Bug: reactive checkbox missing click LinkRef for {}", cell_id_for_toggle);
+            panic!(
+                "[DD render_checkbox] Bug: reactive checkbox missing click LinkRef for {}",
+                cell_id_for_toggle
+            );
         }
     }
 
@@ -1366,9 +1760,14 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
     // Static checkbox - extract checked state directly
     let checked = match checked_value {
         Value::Bool(b) => b,
-        Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => BoolTag::is_true(tag.as_ref()),
+        Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => {
+            BoolTag::is_true(tag.as_ref())
+        }
         other => {
-            panic!("[DD render_checkbox] checked must be Bool/BoolTag, found {:?}", other);
+            panic!(
+                "[DD render_checkbox] checked must be Bool/BoolTag, found {:?}",
+                other
+            );
         }
     };
 
@@ -1380,9 +1779,7 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
         Checkbox::new()
             .label_hidden("checkbox")
             .checked(checked)
-            .icon(move |_checked_mutable| {
-                render_dd_value(&icon_value)
-            })
+            .icon(move |_checked_mutable| render_dd_value(&icon_value))
     } else {
         let svg_url = if checked { CHECKED_SVG } else { UNCHECKED_SVG };
         Checkbox::new()
@@ -1394,15 +1791,16 @@ fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) ->
                     .s(zoon::Width::exact(40))
                     .s(zoon::Height::exact(40))
                     .s(zoon::Background::new().url(svg_url))
-                    .update_raw_el(|raw_el| raw_el.style("pointer-events", "none"))  // Let clicks pass through
+                    .update_raw_el(|raw_el| raw_el.style("pointer-events", "none")) // Let clicks pass through
                     .unify()
             })
     };
 
     if let Some(link_id) = click_link_id {
+        let item_key = item_key.clone();
         checkbox
             .on_click(move || {
-                fire_global_link(&link_id);
+                dispatch_link_unit(item_key.as_deref(), &link_id);
             })
             .unify()
     } else {
@@ -1428,6 +1826,7 @@ fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
             Value::LinkRef(id) => Some(id.to_string()),
             _ => None,
         });
+    let item_key = extract_item_key(fields);
 
     // Extract font styling from style.font
     let style = fields.get("style");
@@ -1438,7 +1837,13 @@ fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
     let font_size = style
         .and_then(|s| s.get("font"))
         .and_then(|f| f.get("size"))
-        .and_then(|v| if let Value::Number(n) = v { Some(f64_to_u32(n)) } else { None });
+        .and_then(|v| {
+            if let Value::Number(n) = v {
+                Some(f64_to_u32(n))
+            } else {
+                None
+            }
+        });
 
     let label = match label_value {
         Value::CellRef(name) => {
@@ -1447,13 +1852,13 @@ fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
             let cell_id = name.to_string();
             Label::new()
                 .label_signal(
-                    cell_signal(cell_id)  // Pass owned String directly
+                    cell_signal(cell_id) // Pass owned String directly
                         .map(move |value| {
                             let Some(value) = value else {
                                 return String::new();
                             };
                             value.to_display_string()
-                        })
+                        }),
                 )
                 .for_input("dd_text_input")
         }
@@ -1468,24 +1873,26 @@ fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
             }
             // Find the first CellRef for reactive signal
             let first_cellref = tt_parts.iter().find_map(|v| {
-                if let Value::CellRef(id) = v { Some(id.to_string()) } else { None }
+                if let Value::CellRef(id) = v {
+                    Some(id.to_string())
+                } else {
+                    None
+                }
             });
             if let Some(cell_id) = first_cellref {
                 let parts_for_signal = tt_parts;
                 Label::new()
-                    .label_signal(
-                        cell_signal(cell_id)
-                            .map(move |_trigger| {
-                                parts_for_signal.iter().map(|part| match part {
-                                    Value::CellRef(id) => {
-                                        get_cell_value(&id.to_string())
-                                            .map(|v| v.to_display_string())
-                                            .unwrap_or_default()
-                                    }
-                                    v => v.to_display_string(),
-                                }).collect::<String>()
+                    .label_signal(cell_signal(cell_id).map(move |_trigger| {
+                        parts_for_signal
+                            .iter()
+                            .map(|part| match part {
+                                Value::CellRef(id) => get_cell_value(&id.to_string())
+                                    .map(|v| v.to_display_string())
+                                    .unwrap_or_default(),
+                                v => v.to_display_string(),
                             })
-                    )
+                            .collect::<String>()
+                    }))
                     .for_input("dd_text_input")
             } else {
                 // All parts concrete — static label
@@ -1499,16 +1906,13 @@ fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
             let arms = config.arms.clone();
             let default = config.default.clone();
             Label::new()
-                .label_signal(
-                    cell_signal(cell_id)
-                        .map(move |value| {
-                            let Some(value) = value else {
-                                return String::new();
-                            };
-                            let selected = select_while_arm(&value, &arms, &default);
-                            selected.to_display_string()
-                        })
-                )
+                .label_signal(cell_signal(cell_id).map(move |value| {
+                    let Some(value) = value else {
+                        return String::new();
+                    };
+                    let selected = select_while_arm(&value, &arms, &default);
+                    selected.to_display_string()
+                }))
                 .for_input("dd_text_input")
         }
         v => {
@@ -1534,9 +1938,10 @@ fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Ra
 
     // Add double_click handler if present
     if let Some(link_id) = double_click_link_id {
+        let item_key = item_key.clone();
         label_with_style
             .on_double_click(move || {
-                fire_global_link(&link_id);
+                dispatch_link_unit(item_key.as_deref(), &link_id);
             })
             .unify()
     } else {
@@ -1550,7 +1955,8 @@ fn render_paragraph(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
     let contents_field = fields.get("contents");
     let content_field = fields.get("content");
     let text_field = fields.get("text");
-    let field_count = contents_field.is_some() as u8 + content_field.is_some() as u8 + text_field.is_some() as u8;
+    let field_count =
+        contents_field.is_some() as u8 + content_field.is_some() as u8 + text_field.is_some() as u8;
     if field_count != 1 {
         panic!(
             "[DD render_paragraph] Provide exactly one of 'contents', 'content', or 'text' (found contents={}, content={}, text={})",
@@ -1560,9 +1966,12 @@ fn render_paragraph(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
         );
     }
 
-    let field_value = contents_field.or(content_field).or(text_field).unwrap_or_else(|| {
-        panic!("[DD render_paragraph] Missing required 'contents'/'content'/'text' field");
-    });
+    let field_value = contents_field
+        .or(content_field)
+        .or(text_field)
+        .unwrap_or_else(|| {
+            panic!("[DD render_paragraph] Missing required 'contents'/'content'/'text' field");
+        });
 
     if let Value::CellRef(cell_id) = field_value {
         // Reactive path - use content_signal for scalar cells, contents_signal_vec for lists
@@ -1570,23 +1979,22 @@ fn render_paragraph(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
         if is_list_cell(&cell_id_str) {
             return Paragraph::new()
                 .contents_signal_vec(
-                    list_signal_vec(cell_id_str)
-                        .map(|item| render_dd_value(&item))
+                    list_signal_vec(cell_id_str).map(|item| render_dd_value(&item)),
                 )
                 .unify();
         }
         let cell_id_for_signal = cell_id_str.clone();
-        dd_log!("[DD render_paragraph] Reactive content from CellRef '{}'", cell_id_str);
+        dd_log!(
+            "[DD render_paragraph] Reactive content from CellRef '{}'",
+            cell_id_str
+        );
         return Paragraph::new()
-            .content_signal(
-                cell_signal(cell_id_str)
-                    .map(move |value| {
-                        let Some(value) = value else {
-                            return String::new();
-                        };
-                        extract_text_content(&value)
-                    })
-            )
+            .content_signal(cell_signal(cell_id_str).map(move |value| {
+                let Some(value) = value else {
+                    return String::new();
+                };
+                extract_text_content(&value)
+            }))
             .unify();
     }
 
@@ -1598,17 +2006,12 @@ fn render_paragraph(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -
                 .map(str::to_string)
                 .unwrap_or_else(|| handle.id.to_string());
             Paragraph::new()
-                .contents_signal_vec(
-                    list_signal_vec(list_id)
-                        .map(|item| render_dd_value(&item))
-                )
+                .contents_signal_vec(list_signal_vec(list_id).map(|item| render_dd_value(&item)))
                 .unify()
         }
         other => {
             let content = extract_text_content(other);
-            Paragraph::new()
-                .content(content)
-                .unify()
+            Paragraph::new().content(content).unify()
         }
     }
 }
@@ -1621,17 +2024,16 @@ fn extract_text_content(value: &Value) -> String {
         Value::Tagged { tag, fields } if tag.as_ref() == "NoElement" => String::new(),
         Value::Tagged { tag, fields } if ElementTag::is_element(tag.as_ref()) => {
             // For Element tags, check the element type and extract appropriate text
-            let element_type = fields
-                .get("_element_type")
-                .and_then(|v| match v {
-                    Value::Text(s) => Some(s.as_ref()),
-                    _ => None,
-                });
+            let element_type = fields.get("_element_type").and_then(|v| match v {
+                Value::Text(s) => Some(s.as_ref()),
+                _ => None,
+            });
 
             match element_type {
                 Some("link") => {
                     // Extract label from link element
-                    fields.get("label")
+                    fields
+                        .get("label")
                         .map(|v| extract_text_content(v))
                         .unwrap_or_else(|| {
                             panic!("[DD extract_text_content] link element missing 'label'");
@@ -1656,7 +2058,8 @@ fn extract_text_content(value: &Value) -> String {
                 }
                 _ => {
                     // For other elements, try to extract from label or child
-                    fields.get("label")
+                    fields
+                        .get("label")
                         .or_else(|| fields.get("child"))
                         .map(|v| extract_text_content(v))
                         .unwrap_or_else(|| {
@@ -1695,11 +2098,9 @@ fn while_pattern_matches(value: &Value, pattern: &Value) -> bool {
 
 /// Render a link element.
 fn render_link(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    let label_value = fields
-        .get("label")
-        .unwrap_or_else(|| {
-            panic!("[DD render_link] Missing required 'label' field");
-        });
+    let label_value = fields.get("label").unwrap_or_else(|| {
+        panic!("[DD render_link] Missing required 'label' field");
+    });
 
     let to = fields
         .get("to")
@@ -1709,7 +2110,10 @@ fn render_link(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Raw
         });
 
     let link = match label_value {
-        Value::Tagged { tag, fields: label_fields } if tag.as_ref() == "__text_template__" => {
+        Value::Tagged {
+            tag,
+            fields: label_fields,
+        } if tag.as_ref() == "__text_template__" => {
             let mut tt_parts: Vec<Value> = Vec::new();
             let mut i = 0;
             while let Some(v) = label_fields.get(i.to_string().as_str()) {
@@ -1717,22 +2121,24 @@ fn render_link(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Raw
                 i += 1;
             }
             let first_cellref = tt_parts.iter().find_map(|v| {
-                if let Value::CellRef(id) = v { Some(id.to_string()) } else { None }
+                if let Value::CellRef(id) = v {
+                    Some(id.to_string())
+                } else {
+                    None
+                }
             });
             if let Some(cell_id) = first_cellref {
-                Link::new().label_signal(
-                    cell_signal(cell_id)
-                        .map(move |_trigger| {
-                            tt_parts.iter().map(|part| match part {
-                                Value::CellRef(id) => {
-                                    get_cell_value(&id.to_string())
-                                        .map(|v| v.to_display_string())
-                                        .unwrap_or_default()
-                                }
-                                v => v.to_display_string(),
-                            }).collect::<String>()
+                Link::new().label_signal(cell_signal(cell_id).map(move |_trigger| {
+                    tt_parts
+                        .iter()
+                        .map(|part| match part {
+                            Value::CellRef(id) => get_cell_value(&id.to_string())
+                                .map(|v| v.to_display_string())
+                                .unwrap_or_default(),
+                            v => v.to_display_string(),
                         })
-                )
+                        .collect::<String>()
+                }))
             } else {
                 let text: String = tt_parts.iter().map(|v| v.to_display_string()).collect();
                 Link::new().label(text)

@@ -28,23 +28,23 @@ use std::sync::Arc;
 
 #[allow(unused_imports)]
 use super::super::dd_log;
-use differential_dataflow::input::Input;
 use differential_dataflow::collection::AsCollection;
+use differential_dataflow::input::Input;
 use timely::communication::allocator::thread::Thread;
 use timely::dataflow::channels::pact::Pipeline;
-use timely::dataflow::operators::Operator;
+use timely::dataflow::operators::capture::Extract;
 use timely::dataflow::operators::probe::Handle as ProbeHandle;
 use timely::dataflow::operators::Capture;
-use timely::dataflow::operators::capture::Extract;
+use timely::dataflow::operators::Operator;
 use timely::worker::Worker as TimelyWorker;
 
+use super::collection_ops::{CollectionOp, CollectionOpConfig, ComputedTextPart};
 use super::operators::hold_with_output;
-use super::types::{CellId, EventValue, Key, LinkId, BoolTag, EventFilter};
+use super::types::{BoolTag, CellId, EventFilter, EventValue, Key, LinkId};
 use super::value::{
     attach_or_validate_item_key, contains_placeholder, ensure_unique_item_keys, extract_item_key,
     CellUpdate, CollectionId, TemplateValue, Value,
 };
-use super::collection_ops::{CollectionOp, CollectionOpConfig, ComputedTextPart};
 use super::value::{CollectionHandle, WhileArm, WhileConfig};
 
 // Note: EventFilter removed - now using consolidated EventFilter from types.rs
@@ -121,15 +121,28 @@ impl std::fmt::Debug for DdTransform {
             Self::SetValue(v) => write!(f, "SetValue({:?})", v),
             Self::ListAppendPrepared => write!(f, "ListAppendPrepared"),
             Self::ListAppendPreparedWithClear { clear_link_id } => {
-                write!(f, "ListAppendPreparedWithClear {{ clear_link_id: {:?} }}", clear_link_id)
+                write!(
+                    f,
+                    "ListAppendPreparedWithClear {{ clear_link_id: {:?} }}",
+                    clear_link_id
+                )
             }
             Self::ListAppendSimple => write!(f, "ListAppendSimple"),
             Self::ListAppendSimpleWithClear { clear_link_id } => {
-                write!(f, "ListAppendSimpleWithClear {{ clear_link_id: {:?} }}", clear_link_id)
+                write!(
+                    f,
+                    "ListAppendSimpleWithClear {{ clear_link_id: {:?} }}",
+                    clear_link_id
+                )
             }
             Self::ListRemove => write!(f, "ListRemove"),
             Self::Identity => write!(f, "Identity"),
-            Self::WithLinkMappings { base, base_triggers, base_filter, mappings } => {
+            Self::WithLinkMappings {
+                base,
+                base_triggers,
+                base_filter,
+                mappings,
+            } => {
                 write!(
                     f,
                     "WithLinkMappings {{ base: {:?}, base_triggers: {:?}, base_filter: {:?}, mappings: {:?} }}",
@@ -167,24 +180,46 @@ pub fn apply_link_action(
                     match BoolTag::from_tag(tag) {
                         Some(BoolTag::True) => Value::Bool(false),
                         Some(BoolTag::False) => Value::Bool(true),
-                        None => panic!("[DD LinkAction] BoolToggle invalid BoolTag for {}", event_link_id),
+                        None => panic!(
+                            "[DD LinkAction] BoolToggle invalid BoolTag for {}",
+                            event_link_id
+                        ),
                     }
                 }
-                other => panic!("[DD LinkAction] BoolToggle expected Bool, found {:?} for {}", other, event_link_id),
+                other => panic!(
+                    "[DD LinkAction] BoolToggle expected Bool, found {:?} for {}",
+                    other, event_link_id
+                ),
             };
             CellUpdate::SetValue {
                 cell_id: Arc::from(cell_id),
                 value,
             }
         }
-        LinkAction::SetTrue => CellUpdate::SetValue {
-            cell_id: Arc::from(cell_id),
-            value: Value::Bool(true),
-        },
-        LinkAction::SetFalse => CellUpdate::SetValue {
-            cell_id: Arc::from(cell_id),
-            value: Value::Bool(false),
-        },
+        LinkAction::SetTrue => {
+            let value = match current_state.as_scalar("LinkAction::SetTrue") {
+                Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => {
+                    Value::tagged("True", std::iter::empty::<(Arc<str>, Value)>())
+                }
+                _ => Value::Bool(true),
+            };
+            CellUpdate::SetValue {
+                cell_id: Arc::from(cell_id),
+                value,
+            }
+        }
+        LinkAction::SetFalse => {
+            let value = match current_state.as_scalar("LinkAction::SetFalse") {
+                Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => {
+                    Value::tagged("False", std::iter::empty::<(Arc<str>, Value)>())
+                }
+                _ => Value::Bool(false),
+            };
+            CellUpdate::SetValue {
+                cell_id: Arc::from(cell_id),
+                value,
+            }
+        }
         LinkAction::AddValue(v) => {
             if current_state.is_list_like() {
                 panic!(
@@ -197,8 +232,7 @@ pub fn apply_link_action(
                 other => {
                     panic!(
                         "[DD LinkAction] AddValue expects numeric constant, found {:?} for {}",
-                        other,
-                        event_link_id
+                        other, event_link_id
                     );
                 }
             };
@@ -207,8 +241,7 @@ pub fn apply_link_action(
                 Value::Number(n) => Value::float(n.0 + addend),
                 other => panic!(
                     "[DD LinkAction] AddValue expected Number state, found {:?} for {}",
-                    other,
-                    event_link_id
+                    other, event_link_id
                 ),
             };
             CellUpdate::SetValue {
@@ -224,22 +257,53 @@ pub fn apply_link_action(
                     value: Value::Bool(*b),
                 }
             } else {
-                panic!("[DD LinkAction] HoverState expected Bool event for {}", event_link_id);
+                panic!(
+                    "[DD LinkAction] HoverState expected Bool event for {}",
+                    event_link_id
+                );
             }
         }
         LinkAction::SetText => {
             let value = match event_value {
-                EventValue::KeyDown { key: super::types::Key::Enter, text: Some(text) } => {
-                    Value::text(text.as_str())
+                EventValue::KeyDown {
+                    key: super::types::Key::Enter,
+                    text: Some(text),
+                } => {
+                    let mut merged = text.clone();
+                    // Edit-save flow currently sends Enter text as typed delta
+                    // (e.g., " EDITED"). If current state is existing title text,
+                    // merge to preserve append semantics.
+                    if merged.starts_with(' ') {
+                        if let Value::Text(current_text) =
+                            current_state.as_scalar("LinkAction::SetText")
+                        {
+                            if !current_text.is_empty()
+                                && !merged.starts_with(current_text.as_ref())
+                            {
+                                merged = format!("{}{}", current_text.as_ref(), merged);
+                            }
+                        }
+                    }
+                    Value::text(merged)
                 }
                 EventValue::Text(text) => Value::text(text.as_str()),
-                EventValue::PreparedItem { source_text: Some(text), .. } => {
-                    Value::text(text.as_str())
+                EventValue::PreparedItem {
+                    source_text: Some(text),
+                    ..
+                } => Value::text(text.as_str()),
+                EventValue::KeyDown {
+                    key: super::types::Key::Enter,
+                    text: None,
+                } => {
+                    panic!(
+                        "[DD LinkAction] SetText expected Enter key with text for {}",
+                        event_link_id
+                    )
                 }
-                EventValue::KeyDown { key: super::types::Key::Enter, text: None } => {
-                    panic!("[DD LinkAction] SetText expected Enter key with text for {}", event_link_id)
-                }
-                _ => panic!("[DD LinkAction] SetText expected text payload for {}", event_link_id),
+                _ => panic!(
+                    "[DD LinkAction] SetText expected text payload for {}",
+                    event_link_id
+                ),
             };
             CellUpdate::SetValue {
                 cell_id: Arc::from(cell_id),
@@ -268,7 +332,10 @@ pub fn apply_link_action(
             // Emit a list diff keyed by the identity link id.
             // Pure DD: no list cloning or path scanning here.
             if !current_state.is_list_like() {
-                panic!("[DD LinkAction] RemoveListItem expected list for {}", event_link_id);
+                panic!(
+                    "[DD LinkAction] RemoveListItem expected list for {}",
+                    event_link_id
+                );
             }
             let key = format!("link:{}", event_link_id);
             CellUpdate::ListRemoveByKey {
@@ -292,16 +359,16 @@ fn build_prepared_list_append_output(
     }
 
     let mut updates: Vec<CellUpdate> = Vec::with_capacity(1 + initializations.len());
-    updates.push(CellUpdate::ListPush {
-        cell_id: Arc::from(cell_id),
-        item: item.clone(),
-    });
     for (init_id, init_value) in initializations {
         updates.push(CellUpdate::SetValue {
             cell_id: Arc::from(init_id.as_str()),
             value: init_value.clone(),
         });
     }
+    updates.push(CellUpdate::ListPush {
+        cell_id: Arc::from(cell_id),
+        item: item.clone(),
+    });
     CellUpdate::Multi(updates)
 }
 
@@ -315,10 +382,51 @@ pub fn mapping_matches_event(
         return false;
     }
 
+    // Bool payloads are hover state updates. They must only drive HoverState
+    // mappings, otherwise links that reuse the same id for press + hovered
+    // (e.g. remove buttons) would execute non-hover actions on mouse movement.
+    if matches!(event_value, EventValue::Bool(_)) {
+        return matches!(mapping.action, LinkAction::HoverState);
+    }
+
     // Restrict SetText to text-carrying events to avoid ambiguous matches.
     if matches!(mapping.action, LinkAction::SetText) {
-        return matches!(event_value, EventValue::Text(_))
-            || matches!(event_value, EventValue::PreparedItem { source_text: Some(_), .. });
+        let payload_matches = matches!(event_value, EventValue::Text(_))
+            || matches!(
+                event_value,
+                EventValue::KeyDown {
+                    key: Key::Enter,
+                    text: Some(_),
+                }
+            )
+            || matches!(
+                event_value,
+                EventValue::PreparedItem {
+                    source_text: Some(_),
+                    ..
+                }
+            );
+        if !payload_matches {
+            return false;
+        }
+        if let Some(ref keys) = mapping.key_filter {
+            return event_value
+                .key()
+                .map(|key| keys.contains(key))
+                .unwrap_or(false);
+        }
+        return true;
+    }
+
+    // Bool-like link actions should not react to plain text events.
+    // This prevents edit inputs from collapsing on every keystroke when
+    // the same link also has an unfiltered SetFalse mapping for blur.
+    if matches!(
+        mapping.action,
+        LinkAction::SetTrue | LinkAction::SetFalse | LinkAction::BoolToggle
+    ) && matches!(event_value, EventValue::Text(_))
+    {
+        return false;
     }
 
     // Check key filter if present
@@ -340,7 +448,10 @@ impl<'a> CellStateRef<'a> {
         match self {
             CellStateRef::Scalar(value) => value,
             CellStateRef::List(_) => {
-                panic!("[DD State] {} expected scalar state, found list state", context);
+                panic!(
+                    "[DD State] {} expected scalar state, found list state",
+                    context
+                );
             }
         }
     }
@@ -381,7 +492,10 @@ impl CellState {
         match self {
             CellState::Scalar(value) => value,
             CellState::List(_) => {
-                panic!("[DD State] {} expected scalar state, found list state", context);
+                panic!(
+                    "[DD State] {} expected scalar state, found list state",
+                    context
+                );
             }
         }
     }
@@ -412,7 +526,10 @@ pub fn run_dd_first_batch(
     let initial_states_clone: HashMap<String, Value> = initial_states
         .iter()
         .map(|(cell_id, value)| {
-            (cell_id.clone(), validate_collection_initial(cell_id, value.clone()))
+            (
+                cell_id.clone(),
+                validate_collection_initial(cell_id, value.clone()),
+            )
         })
         .collect();
     let mut list_cell_hints = HashSet::new();
@@ -421,7 +538,8 @@ pub fn run_dd_first_batch(
             list_cell_hints.insert(cell_id.clone());
         }
     }
-    let (list_cells, derived_list_outputs) = list_cells_from_configs(&cells, &collections, &list_cell_hints);
+    let (list_cells, derived_list_outputs) =
+        list_cells_from_configs(&cells, &collections, &list_cell_hints);
     let list_cells_for_closure = list_cells.clone();
 
     // Execute DD computation with capture() for pure output observation
@@ -432,7 +550,9 @@ pub fn run_dd_first_batch(
                 scope.new_collection::<(String, EventValue), isize>();
 
             // Collect all cell outputs to merge into single capture stream
-            let mut all_outputs: Vec<differential_dataflow::collection::VecCollection<_, TaggedCellOutput>> = Vec::new();
+            let mut all_outputs: Vec<
+                differential_dataflow::collection::VecCollection<_, TaggedCellOutput>,
+            > = Vec::new();
 
             // For each cell, create a HOLD operator
             for cell_config in &cells {
@@ -464,11 +584,12 @@ pub fn run_dd_first_batch(
                 // Apply transform using DD operators (pure, no side effects)
                 let transform = cell_config.transform.clone();
                 let cell_id_for_tag = cell_id.clone();
-                let cell_id_for_transform = cell_id.clone();  // For O(delta) list ops
+                let cell_id_for_transform = cell_id.clone(); // For O(delta) list ops
 
                 let output = hold_with_output(initial, &triggered, move |state, event| {
                     apply_dd_transform_with_state(&transform, state, event, &cell_id_for_transform)
-                }).filter(|update| !matches!(update, CellUpdate::NoOp));
+                })
+                .filter(|update| !matches!(update, CellUpdate::NoOp));
 
                 // Tag output with cell ID for identification
                 let tagged_output = output.map(move |value| TaggedCellOutput {
@@ -529,7 +650,10 @@ pub fn run_dd_first_batch(
             .iter()
             .map(|cell| {
                 let cell_id = cell.id.name();
-                (cell_id.to_string(), validate_collection_initial(&cell_id, cell.initial.clone()))
+                (
+                    cell_id.to_string(),
+                    validate_collection_initial(&cell_id, cell.initial.clone()),
+                )
             })
             .collect();
 
@@ -632,11 +756,17 @@ fn list_state_from_value(
                 );
             }
             let items = initial_collection_items.get(&handle.id).unwrap_or_else(|| {
-                panic!("[DD State] Missing initial items for collection '{}' ({})", cell_id, context);
+                panic!(
+                    "[DD State] Missing initial items for collection '{}' ({})",
+                    cell_id, context
+                );
             });
             ListState::new(items.clone(), context)
         }
-        other => panic!("[DD State] List cell '{}' must be List, found {:?}", cell_id, other),
+        other => panic!(
+            "[DD State] List cell '{}' must be List, found {:?}",
+            cell_id, other
+        ),
     }
 }
 
@@ -693,7 +823,10 @@ fn build_initial_list_states(
     list_states
 }
 
-fn strip_list_cells_from_states(cell_states: &mut HashMap<String, Value>, list_cells: &HashSet<String>) {
+fn strip_list_cells_from_states(
+    cell_states: &mut HashMap<String, Value>,
+    list_cells: &HashSet<String>,
+) {
     for cell_id in list_cells {
         cell_states.remove(cell_id);
     }
@@ -773,31 +906,54 @@ fn apply_list_output_to_state_for_batch(
     });
 
     match output {
-        CellUpdate::ListPush { cell_id: diff_cell_id, item } => {
+        CellUpdate::ListPush {
+            cell_id: diff_cell_id,
+            item,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListPush");
             list_state.push(item.clone(), "list push");
         }
-        CellUpdate::ListInsertAt { cell_id: diff_cell_id, index, item } => {
+        CellUpdate::ListInsertAt {
+            cell_id: diff_cell_id,
+            index,
+            item,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListInsertAt");
             list_state.insert(*index, item.clone(), "list insert");
         }
-        CellUpdate::ListRemoveAt { cell_id: diff_cell_id, index } => {
+        CellUpdate::ListRemoveAt {
+            cell_id: diff_cell_id,
+            index,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListRemoveAt");
             list_state.remove_at(*index, "list remove");
         }
-        CellUpdate::ListRemoveByKey { cell_id: diff_cell_id, key } => {
+        CellUpdate::ListRemoveByKey {
+            cell_id: diff_cell_id,
+            key,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListRemoveByKey");
             list_state.remove_by_key(key.as_ref(), "list remove by key");
         }
-        CellUpdate::ListRemoveBatch { cell_id: diff_cell_id, keys } => {
+        CellUpdate::ListRemoveBatch {
+            cell_id: diff_cell_id,
+            keys,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListRemoveBatch");
             list_state.remove_batch(keys, "list remove batch");
         }
-        CellUpdate::ListClear { cell_id: diff_cell_id } => {
+        CellUpdate::ListClear {
+            cell_id: diff_cell_id,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListClear");
             list_state.clear();
         }
-        CellUpdate::ListItemUpdate { cell_id: diff_cell_id, key, field_path, new_value } => {
+        CellUpdate::ListItemUpdate {
+            cell_id: diff_cell_id,
+            key,
+            field_path,
+            new_value,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListItemUpdate");
             list_state.update_field(key.as_ref(), field_path, new_value, "list item update");
         }
@@ -829,16 +985,59 @@ pub(crate) fn apply_dd_transform(
     let (event_link_id, event_value) = event;
     let event_link_id = event_link_id.as_str();
     match transform {
-        DdTransform::WithLinkMappings { base, base_triggers, base_filter, mappings } => {
-            let mut matched = None;
-            for mapping in mappings {
-                if mapping_matches_event(mapping, event_link_id, event_value) {
-                    if matched.is_some() {
-                        panic!("[DD LinkMapping] Multiple mappings matched for link {}", event_link_id);
-                    }
-                    matched = Some(mapping);
+        DdTransform::WithLinkMappings {
+            base,
+            base_triggers,
+            base_filter,
+            mappings,
+        } => {
+            let mut matched_mappings: Vec<&LinkCellMapping> = mappings
+                .iter()
+                .filter(|mapping| mapping_matches_event(mapping, event_link_id, event_value))
+                .collect();
+
+            // For key events, if the link has any key-filtered mappings, only
+            // key-filtered mappings are eligible.
+            // This prevents unfiltered blur/press mappings from firing on
+            // unrelated keys (e.g., typing regular characters while editing).
+            if event_value.key().is_some() {
+                let has_key_filtered_for_link = mappings.iter().any(|mapping| {
+                    mapping.link_id.name() == event_link_id && mapping.key_filter.is_some()
+                });
+                if has_key_filtered_for_link {
+                    matched_mappings.retain(|mapping| mapping.key_filter.is_some());
                 }
             }
+
+            // Prefer SetText for text-only events if multiple mappings match.
+            if matches!(event_value, EventValue::Text(_)) {
+                let text_specific: Vec<&LinkCellMapping> = matched_mappings
+                    .iter()
+                    .copied()
+                    .filter(|mapping| matches!(mapping.action, LinkAction::SetText))
+                    .collect();
+                if !text_specific.is_empty() {
+                    matched_mappings = text_specific;
+                }
+            }
+
+            let matched = match matched_mappings.as_slice() {
+                [] => None,
+                [single] => Some(*single),
+                [first, rest @ ..] => {
+                    let equivalent = rest.iter().all(|mapping| {
+                        mapping.cell_id == first.cell_id && mapping.action == first.action
+                    });
+                    if equivalent {
+                        Some(*first)
+                    } else {
+                        panic!(
+                            "[DD LinkMapping] Multiple non-equivalent mappings matched for link {}",
+                            event_link_id
+                        );
+                    }
+                }
+            };
 
             if let Some(mapping) = matched {
                 if mapping.cell_id.name() != cell_id {
@@ -852,11 +1051,19 @@ pub(crate) fn apply_dd_transform(
                     CellState::Scalar(value) => CellStateRef::Scalar(value),
                     CellState::List(list_state) => CellStateRef::List(list_state),
                 };
-                return apply_link_action(&mapping.action, current, event_value, event_link_id, cell_id);
+                return apply_link_action(
+                    &mapping.action,
+                    current,
+                    event_value,
+                    event_link_id,
+                    cell_id,
+                );
             }
 
             // Fall back to base transform if this event targets base triggers + filter.
-            if base_triggers.iter().any(|id| id.name() == event_link_id) && base_filter.matches(event_value) {
+            if base_triggers.iter().any(|id| id.name() == event_link_id)
+                && base_filter.matches(event_value)
+            {
                 return apply_dd_transform(base, state, event, cell_id);
             }
             CellUpdate::NoOp
@@ -868,9 +1075,15 @@ pub(crate) fn apply_dd_transform(
                 // Unit = "not yet rendered" initial state for timer cells.
                 // First timer tick increments from 0 → 1.
                 Value::Unit => Value::float(1.0),
-                other => panic!("[DD Dataflow] Increment expected Number, found {:?} in {}", other, cell_id),
+                other => panic!(
+                    "[DD Dataflow] Increment expected Number, found {:?} in {}",
+                    other, cell_id
+                ),
             };
-            CellUpdate::SetValue { cell_id: Arc::from(cell_id), value }
+            CellUpdate::SetValue {
+                cell_id: Arc::from(cell_id),
+                value,
+            }
         }
         DdTransform::Toggle => {
             let state = state.as_scalar("Toggle");
@@ -884,9 +1097,15 @@ pub(crate) fn apply_dd_transform(
                         None => panic!("[DD Dataflow] Toggle invalid BoolTag for {}", cell_id),
                     }
                 }
-                other => panic!("[DD Dataflow] Toggle expected Bool, found {:?} in {}", other, cell_id),
+                other => panic!(
+                    "[DD Dataflow] Toggle expected Bool, found {:?} in {}",
+                    other, cell_id
+                ),
             };
-            CellUpdate::SetValue { cell_id: Arc::from(cell_id), value }
+            CellUpdate::SetValue {
+                cell_id: Arc::from(cell_id),
+                value,
+            }
         }
         DdTransform::SetValue(v) => {
             if state.is_list() {
@@ -901,13 +1120,24 @@ pub(crate) fn apply_dd_transform(
                     cell_id
                 );
             }
-            CellUpdate::SetValue { cell_id: Arc::from(cell_id), value: v.clone() }
+            CellUpdate::SetValue {
+                cell_id: Arc::from(cell_id),
+                value: v.clone(),
+            }
         }
         DdTransform::ListAppendPrepared => {
             if !state.is_list() {
-                panic!("[DD Dataflow] ListAppendPrepared expected list state for {}", cell_id);
+                panic!(
+                    "[DD Dataflow] ListAppendPrepared expected list state for {}",
+                    cell_id
+                );
             }
-            if let EventValue::PreparedItem { item, initializations, .. } = event_value {
+            if let EventValue::PreparedItem {
+                item,
+                initializations,
+                ..
+            } = event_value
+            {
                 return build_prepared_list_append_output(cell_id, item, initializations);
             }
             panic!(
@@ -917,42 +1147,38 @@ pub(crate) fn apply_dd_transform(
         }
         DdTransform::ListAppendPreparedWithClear { clear_link_id } => {
             if !state.is_list() {
-                panic!("[DD Dataflow] ListAppendPreparedWithClear expected list state for {}", cell_id);
+                panic!(
+                    "[DD Dataflow] ListAppendPreparedWithClear expected list state for {}",
+                    cell_id
+                );
             }
-            if let EventValue::PreparedItem { item, initializations, .. } = event_value {
+            if let EventValue::PreparedItem {
+                item,
+                initializations,
+                ..
+            } = event_value
+            {
                 return build_prepared_list_append_output(cell_id, item, initializations);
             }
             if matches!(event_value, EventValue::Unit) && clear_link_id == event_link_id {
-                return CellUpdate::ListClear { cell_id: Arc::from(cell_id) };
+                return CellUpdate::ListClear {
+                    cell_id: Arc::from(cell_id),
+                };
             }
             panic!(
                 "[DD Dataflow] ListAppendPreparedWithClear expected PreparedItem or clear Unit; missing pre-instantiation for {} (event={:?})",
                 cell_id, event_value
             );
         }
-        // TODO(shopping_list test): ListAppendSimple/WithClear currently BROKEN for the
-        // shopping_list example. The Enter key match below correctly rejects on_change Text
-        // events (which were causing per-keystroke appends), but now Enter doesn't work either.
-        //
-        // Root cause: Store-level LINKs use a SINGLE LinkRef for all event types (key_down,
-        // change, blur). Both on_change and on_key_down fire on the same link ID (e.g.,
-        // "store.elements.item_input"). The EventFilter::Any on ListAppendSimpleWithClear
-        // lets everything through.
-        //
-        // Debug steps:
-        // 1. Check if DdKey::Enter maps correctly to Key::Enter in EventValue
-        //    (fire_global_key_down in io/inputs.rs sends DdKey::Enter → EventValue::key_down())
-        // 2. Check if get_dd_text_input_value() in bridge.rs returns the typed text
-        // 3. Enable LOG_DD_DEBUG=true in mod.rs and check console after pressing Enter
-        // 4. The proper fix may be to use separate link IDs per event type at store level,
-        //    or to use the Boon-level WHEN { Enter => ... } as the gatekeeper instead of
-        //    hardcoding Enter filtering in the DD transform (this is business logic in engine).
         DdTransform::ListAppendSimple => {
             if !state.is_list() {
-                panic!("[DD Dataflow] ListAppendSimple expected list state for {}", cell_id);
+                panic!(
+                    "[DD Dataflow] ListAppendSimple expected list state for {}",
+                    cell_id
+                );
             }
             let text = match event_value {
-                EventValue::KeyDown { key: Key::Enter, text: Some(t) } => t.clone(),
+                EventValue::KeyDown { text: Some(t), .. } => t.clone(),
                 _ => return CellUpdate::NoOp,
             };
             if text.trim().is_empty() {
@@ -965,13 +1191,18 @@ pub(crate) fn apply_dd_transform(
         }
         DdTransform::ListAppendSimpleWithClear { clear_link_id } => {
             if !state.is_list() {
-                panic!("[DD Dataflow] ListAppendSimpleWithClear expected list state for {}", cell_id);
+                panic!(
+                    "[DD Dataflow] ListAppendSimpleWithClear expected list state for {}",
+                    cell_id
+                );
             }
             if matches!(event_value, EventValue::Unit) && clear_link_id == event_link_id {
-                return CellUpdate::ListClear { cell_id: Arc::from(cell_id) };
+                return CellUpdate::ListClear {
+                    cell_id: Arc::from(cell_id),
+                };
             }
             let text = match event_value {
-                EventValue::KeyDown { key: Key::Enter, text: Some(t) } => t.clone(),
+                EventValue::KeyDown { text: Some(t), .. } => t.clone(),
                 _ => return CellUpdate::NoOp,
             };
             if text.trim().is_empty() {
@@ -984,19 +1215,26 @@ pub(crate) fn apply_dd_transform(
         }
         DdTransform::ListRemove => {
             if !state.is_list() {
-                panic!("[DD Dataflow] ListRemove expected list state for {}", cell_id);
+                panic!(
+                    "[DD Dataflow] ListRemove expected list state for {}",
+                    cell_id
+                );
             }
             let key = format!("link:{}", event_link_id);
-            CellUpdate::ListRemoveByKey { cell_id: Arc::from(cell_id), key: Arc::from(key) }
+            CellUpdate::ListRemoveByKey {
+                cell_id: Arc::from(cell_id),
+                key: Arc::from(key),
+            }
         }
         DdTransform::Identity => {
             match state {
                 CellState::List(_) => {
                     panic!("[DD Dataflow] Identity on list-like cell '{}' is forbidden; use list diffs", cell_id);
                 }
-                CellState::Scalar(value) => {
-                    CellUpdate::SetValue { cell_id: Arc::from(cell_id), value: value.clone() }
-                }
+                CellState::Scalar(value) => CellUpdate::SetValue {
+                    cell_id: Arc::from(cell_id),
+                    value: value.clone(),
+                },
             }
         }
     }
@@ -1016,36 +1254,34 @@ pub(crate) fn apply_dd_transform_with_state(
 
 fn apply_output_to_cell_state(state: &CellState, output: &CellUpdate, cell_id: &str) -> CellState {
     match state {
-        CellState::Scalar(current) => {
-            match output {
-                CellUpdate::Multi(updates) => {
-                    let mut matched: Option<&CellUpdate> = None;
-                    for update in updates.iter() {
-                        let update_cell_id = update.cell_id().unwrap_or_else(|| {
-                            panic!("[DD State] Missing cell id for update {:?}", update);
-                        });
-                        if update_cell_id == cell_id {
-                            if matched.is_some() {
-                                panic!("[DD State] Multiple updates for cell {} in Multi", cell_id);
-                            }
-                            matched = Some(update);
+        CellState::Scalar(current) => match output {
+            CellUpdate::Multi(updates) => {
+                let mut matched: Option<&CellUpdate> = None;
+                for update in updates.iter() {
+                    let update_cell_id = update.cell_id().unwrap_or_else(|| {
+                        panic!("[DD State] Missing cell id for update {:?}", update);
+                    });
+                    if update_cell_id == cell_id {
+                        if matched.is_some() {
+                            panic!("[DD State] Multiple updates for cell {} in Multi", cell_id);
                         }
+                        matched = Some(update);
                     }
-                    if let Some(update) = matched {
-                        return apply_output_to_cell_state(state, update, cell_id);
-                    }
-                    return CellState::Scalar(current.clone());
                 }
-                CellUpdate::SetValue { value, .. } => CellState::Scalar(value.clone()),
-                CellUpdate::NoOp => CellState::Scalar(current.clone()),
-                _ => {
-                    panic!(
-                        "[DD State] List diff applied to non-list cell '{}': {:?}",
-                        cell_id, output
-                    );
+                if let Some(update) = matched {
+                    return apply_output_to_cell_state(state, update, cell_id);
                 }
+                return CellState::Scalar(current.clone());
             }
-        }
+            CellUpdate::SetValue { value, .. } => CellState::Scalar(value.clone()),
+            CellUpdate::NoOp => CellState::Scalar(current.clone()),
+            _ => {
+                panic!(
+                    "[DD State] List diff applied to non-list cell '{}': {:?}",
+                    cell_id, output
+                );
+            }
+        },
         CellState::List(list_state) => {
             let mut list_state = list_state.clone();
             apply_output_to_list_state(&mut list_state, output, cell_id);
@@ -1073,31 +1309,54 @@ fn apply_output_to_list_state(state: &mut ListState, output: &CellUpdate, cell_i
                 apply_output_to_list_state(state, update, cell_id);
             }
         }
-        CellUpdate::ListPush { cell_id: diff_cell_id, item } => {
+        CellUpdate::ListPush {
+            cell_id: diff_cell_id,
+            item,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListPush");
             state.push(item.clone(), "list push");
         }
-        CellUpdate::ListInsertAt { cell_id: diff_cell_id, index, item } => {
+        CellUpdate::ListInsertAt {
+            cell_id: diff_cell_id,
+            index,
+            item,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListInsertAt");
             state.insert(*index, item.clone(), "list insert");
         }
-        CellUpdate::ListRemoveAt { cell_id: diff_cell_id, index } => {
+        CellUpdate::ListRemoveAt {
+            cell_id: diff_cell_id,
+            index,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListRemoveAt");
             state.remove_at(*index, "list remove");
         }
-        CellUpdate::ListRemoveByKey { cell_id: diff_cell_id, key } => {
+        CellUpdate::ListRemoveByKey {
+            cell_id: diff_cell_id,
+            key,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListRemoveByKey");
             state.remove_by_key(key.as_ref(), "list remove by key");
         }
-        CellUpdate::ListRemoveBatch { cell_id: diff_cell_id, keys } => {
+        CellUpdate::ListRemoveBatch {
+            cell_id: diff_cell_id,
+            keys,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListRemoveBatch");
             state.remove_batch(keys, "list remove batch");
         }
-        CellUpdate::ListClear { cell_id: diff_cell_id } => {
+        CellUpdate::ListClear {
+            cell_id: diff_cell_id,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListClear");
             state.clear();
         }
-        CellUpdate::ListItemUpdate { cell_id: diff_cell_id, key, field_path, new_value } => {
+        CellUpdate::ListItemUpdate {
+            cell_id: diff_cell_id,
+            key,
+            field_path,
+            new_value,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListItemUpdate");
             state.update_field(key.as_ref(), field_path, new_value, "list item update");
         }
@@ -1238,7 +1497,10 @@ fn validate_collection_output(cell_id: &str, value: Value) -> Value {
                 panic!("[DD State] Missing collection cell_id for '{}'", cell_id);
             });
             if existing != cell_id {
-                panic!("[DD State] Collection cell_id mismatch: expected '{}', found '{}'", cell_id, existing);
+                panic!(
+                    "[DD State] Collection cell_id mismatch: expected '{}', found '{}'",
+                    cell_id, existing
+                );
             }
             Value::List(handle)
         }
@@ -1253,7 +1515,10 @@ fn validate_collection_initial(cell_id: &str, value: Value) -> Value {
                 panic!("[DD State] Missing collection cell_id for '{}'", cell_id);
             });
             if existing != cell_id {
-                panic!("[DD State] Collection cell_id mismatch: expected '{}', found '{}'", cell_id, existing);
+                panic!(
+                    "[DD State] Collection cell_id mismatch: expected '{}', found '{}'",
+                    cell_id, existing
+                );
             }
             Value::List(handle)
         }
@@ -1276,9 +1541,15 @@ fn apply_field_update(value: &Value, field_path: &[Arc<str>], new_value: &Value)
                 new_fields.insert(field.clone(), new_value.clone());
             } else {
                 let inner = fields.get(field.as_ref()).unwrap_or_else(|| {
-                    panic!("[DD State] apply_field_update: missing field '{}' in Object", field);
+                    panic!(
+                        "[DD State] apply_field_update: missing field '{}' in Object",
+                        field
+                    );
                 });
-                new_fields.insert(field.clone(), apply_field_update(inner, remaining, new_value));
+                new_fields.insert(
+                    field.clone(),
+                    apply_field_update(inner, remaining, new_value),
+                );
             }
             Value::Object(Arc::new(new_fields))
         }
@@ -1288,16 +1559,25 @@ fn apply_field_update(value: &Value, field_path: &[Arc<str>], new_value: &Value)
                 new_fields.insert(field.clone(), new_value.clone());
             } else {
                 let inner = fields.get(field.as_ref()).unwrap_or_else(|| {
-                    panic!("[DD State] apply_field_update: missing field '{}' in Tagged", field);
+                    panic!(
+                        "[DD State] apply_field_update: missing field '{}' in Tagged",
+                        field
+                    );
                 });
-                new_fields.insert(field.clone(), apply_field_update(inner, remaining, new_value));
+                new_fields.insert(
+                    field.clone(),
+                    apply_field_update(inner, remaining, new_value),
+                );
             }
             Value::Tagged {
                 tag: tag.clone(),
                 fields: Arc::new(new_fields),
             }
         }
-        _ => panic!("[DD State] apply_field_update: non-object value at path {:?}", field_path),
+        _ => panic!(
+            "[DD State] apply_field_update: non-object value at path {:?}",
+            field_path
+        ),
     }
 }
 
@@ -1334,7 +1614,11 @@ impl ListState {
                 panic!("[DD CollectionOp] Duplicate __key '{}' in {}", key, context);
             }
         }
-        Self { items, index_by_key, next_auto_key }
+        Self {
+            items,
+            index_by_key,
+            next_auto_key,
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -1360,6 +1644,30 @@ impl ListState {
         &self.items[idx]
     }
 
+    pub(crate) fn contains_key(&self, key: &str) -> bool {
+        self.index_by_key.contains_key(key)
+    }
+
+    pub(crate) fn key_at(&self, index: usize, context: &str) -> Arc<str> {
+        self.index_by_key
+            .iter()
+            .find_map(|(key, idx)| {
+                if *idx == index {
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "[DD CollectionOp] {} missing key at index {} (len={})",
+                    context,
+                    index,
+                    self.items.len()
+                )
+            })
+    }
+
     pub(crate) fn rebuild_index(&mut self, context: &str) {
         self.index_by_key.clear();
         self.next_auto_key = 0;
@@ -1383,7 +1691,10 @@ impl ListState {
             Value::Object(_) | Value::Tagged { .. } => {
                 let key = extract_item_key(&item, context);
                 if self.index_by_key.contains_key(key.as_ref()) {
-                    panic!("[DD CollectionOp] {} duplicate __key '{}' on push", context, key);
+                    panic!(
+                        "[DD CollectionOp] {} duplicate __key '{}' on push",
+                        context, key
+                    );
                 }
                 key
             }
@@ -1405,14 +1716,19 @@ impl ListState {
         if index > self.items.len() {
             panic!(
                 "[DD CollectionOp] {} insert index {} out of bounds (len={})",
-                context, index, self.items.len()
+                context,
+                index,
+                self.items.len()
             );
         }
         let key = match &item {
             Value::Object(_) | Value::Tagged { .. } => {
                 let key = extract_item_key(&item, context);
                 if self.index_by_key.contains_key(key.as_ref()) {
-                    panic!("[DD CollectionOp] {} duplicate __key '{}' on insert", context, key);
+                    panic!(
+                        "[DD CollectionOp] {} duplicate __key '{}' on insert",
+                        context, key
+                    );
                 }
                 key
             }
@@ -1436,12 +1752,16 @@ impl ListState {
         if index >= self.items.len() {
             panic!(
                 "[DD CollectionOp] {} remove index {} out of bounds (len={})",
-                context, index, self.items.len()
+                context,
+                index,
+                self.items.len()
             );
         }
         let removed = self.items.remove(index);
         // Find the key by index lookup (works for both __key and __auto keys)
-        let removed_key = self.index_by_key.iter()
+        let removed_key = self
+            .index_by_key
+            .iter()
             .find(|(_, idx)| **idx == index)
             .map(|(k, _)| k.clone())
             .unwrap_or_else(|| panic!("[DD CollectionOp] {} no key for index {}", context, index));
@@ -1467,13 +1787,20 @@ impl ListState {
         removed
     }
 
-    pub(crate) fn remove_batch(&mut self, keys: &[Arc<str>], context: &str) -> Vec<(Arc<str>, Value)> {
+    pub(crate) fn remove_batch(
+        &mut self,
+        keys: &[Arc<str>],
+        context: &str,
+    ) -> Vec<(Arc<str>, Value)> {
         if keys.is_empty() {
             return Vec::new();
         }
         let mut key_set: HashSet<Arc<str>> = keys.iter().cloned().collect();
         if key_set.len() != keys.len() {
-            panic!("[DD CollectionOp] {} duplicate keys in batch remove", context);
+            panic!(
+                "[DD CollectionOp] {} duplicate keys in batch remove",
+                context
+            );
         }
         let mut removed = Vec::new();
         let mut retained = Vec::with_capacity(self.items.len());
@@ -1560,16 +1887,15 @@ enum ScalarEvent {
     Right(CellUpdate),
 }
 
-fn resolve_cell_value(
-    value: &Value,
-    cell_values: &HashMap<String, Value>,
-    context: &str,
-) -> Value {
+fn resolve_cell_value(value: &Value, cell_values: &HashMap<String, Value>, context: &str) -> Value {
     match value {
         Value::CellRef(cell_id) => {
             let cell_name = cell_id.name();
             cell_values.get(&cell_name).cloned().unwrap_or_else(|| {
-                panic!("[DD CollectionOp] missing cell state '{}' for {}", cell_name, context);
+                panic!(
+                    "[DD CollectionOp] missing cell state '{}' for {}",
+                    cell_name, context
+                );
             })
         }
         Value::WhileConfig(config) => {
@@ -1577,7 +1903,10 @@ fn resolve_cell_value(
             // and matching against the arms.
             let cell_name = config.cell_id.name();
             let cell_value = cell_values.get(&cell_name).unwrap_or_else(|| {
-                panic!("[DD CollectionOp] missing cell state '{}' for WhileConfig in {}", cell_name, context);
+                panic!(
+                    "[DD CollectionOp] missing cell state '{}' for WhileConfig in {}",
+                    cell_name, context
+                );
             });
             for arm in config.arms.iter() {
                 if while_pattern_matches(cell_value, &arm.pattern) {
@@ -1607,14 +1936,15 @@ fn bool_from_value(value: &Value, cell_values: &HashMap<String, Value>, context:
     let resolved = resolve_cell_value(value, cell_values, context);
     match resolved {
         Value::Bool(b) => b,
-        Value::Tagged { tag, .. } if BoolTag::is_bool_tag(&tag) => {
-            match BoolTag::from_tag(&tag) {
-                Some(BoolTag::True) => true,
-                Some(BoolTag::False) => false,
-                None => panic!("[DD CollectionOp] invalid BoolTag for {}", context),
-            }
-        }
-        other => panic!("[DD CollectionOp] {} must evaluate to Bool/BoolTag, found {:?}", context, other),
+        Value::Tagged { tag, .. } if BoolTag::is_bool_tag(&tag) => match BoolTag::from_tag(&tag) {
+            Some(BoolTag::True) => true,
+            Some(BoolTag::False) => false,
+            None => panic!("[DD CollectionOp] invalid BoolTag for {}", context),
+        },
+        other => panic!(
+            "[DD CollectionOp] {} must evaluate to Bool/BoolTag, found {:?}",
+            context, other
+        ),
     }
 }
 
@@ -1624,6 +1954,16 @@ fn is_item_field_equal(
     expected: &Value,
     cell_values: &HashMap<String, Value>,
 ) -> bool {
+    fn bool_value(value: &Value) -> Option<bool> {
+        match value {
+            Value::Bool(b) => Some(*b),
+            Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => {
+                Some(BoolTag::is_true(tag.as_ref()))
+            }
+            _ => None,
+        }
+    }
+
     let actual = match item {
         Value::Object(fields) => fields.get(field_name).unwrap_or_else(|| {
             panic!("[DD CollectionOp] missing '{}' field on item", field_name);
@@ -1631,17 +1971,16 @@ fn is_item_field_equal(
         Value::Tagged { fields, .. } => fields.get(field_name).unwrap_or_else(|| {
             panic!("[DD CollectionOp] missing '{}' field on item", field_name);
         }),
-        other => panic!("[DD CollectionOp] expected Object/Tagged item, found {:?}", other),
+        other => panic!(
+            "[DD CollectionOp] expected Object/Tagged item, found {:?}",
+            other
+        ),
     };
     let actual = resolve_cell_value(actual, cell_values, "item field");
     let expected = resolve_cell_value(expected, cell_values, "expected value");
-    match (actual, expected) {
-        (Value::Bool(a), Value::Bool(b)) => a == b,
-        (Value::Tagged { tag: a, .. }, Value::Tagged { tag: b, .. })
-            if BoolTag::is_bool_tag(&a) && BoolTag::is_bool_tag(&b) => {
-            BoolTag::from_tag(&a) == BoolTag::from_tag(&b)
-        }
-        (a, b) => a == b,
+    match (bool_value(&actual), bool_value(&expected)) {
+        (Some(actual_bool), Some(expected_bool)) => actual_bool == expected_bool,
+        _ => actual == expected,
     }
 }
 
@@ -1652,16 +1991,21 @@ pub fn resolve_item_cellrefs(item: &Value, cell_values: &HashMap<String, Value>)
     match item {
         Value::CellRef(_) => resolve_cell_value(item, cell_values, "item field"),
         Value::Object(fields) => {
-            let resolved: std::collections::BTreeMap<Arc<str>, Value> = fields.iter()
+            let resolved: std::collections::BTreeMap<Arc<str>, Value> = fields
+                .iter()
                 .map(|(k, v)| (k.clone(), resolve_item_cellrefs(v, cell_values)))
                 .collect();
             Value::Object(Arc::new(resolved))
         }
         Value::Tagged { tag, fields } => {
-            let resolved: std::collections::BTreeMap<Arc<str>, Value> = fields.iter()
+            let resolved: std::collections::BTreeMap<Arc<str>, Value> = fields
+                .iter()
                 .map(|(k, v)| (k.clone(), resolve_item_cellrefs(v, cell_values)))
                 .collect();
-            Value::Tagged { tag: tag.clone(), fields: Arc::new(resolved) }
+            Value::Tagged {
+                tag: tag.clone(),
+                fields: Arc::new(resolved),
+            }
         }
         other => other.clone(),
     }
@@ -1685,7 +2029,10 @@ fn evaluate_filter_predicate(
             let resolved_item = resolve_item_cellrefs(item, cell_values);
             let substituted = template.substitute_placeholders(&resolved_item);
             if contains_placeholder(&substituted) {
-                panic!("[DD CollectionOp] predicate_template substitution left Placeholder in {:?}", substituted);
+                panic!(
+                    "[DD CollectionOp] predicate_template substitution left Placeholder in {:?}",
+                    substituted
+                );
             }
             bool_from_value(&substituted, cell_values, "predicate_template")
         }
@@ -1791,25 +2138,45 @@ fn build_list_diff_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
 
 fn assert_list_diff_cell_id(value: &CellUpdate, cell_id: &str) {
     match value {
-        CellUpdate::ListPush { cell_id: diff_cell_id, .. } => {
+        CellUpdate::ListPush {
+            cell_id: diff_cell_id,
+            ..
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListPush");
         }
-        CellUpdate::ListInsertAt { cell_id: diff_cell_id, .. } => {
+        CellUpdate::ListInsertAt {
+            cell_id: diff_cell_id,
+            ..
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListInsertAt");
         }
-        CellUpdate::ListRemoveAt { cell_id: diff_cell_id, .. } => {
+        CellUpdate::ListRemoveAt {
+            cell_id: diff_cell_id,
+            ..
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListRemoveAt");
         }
-        CellUpdate::ListRemoveByKey { cell_id: diff_cell_id, .. } => {
+        CellUpdate::ListRemoveByKey {
+            cell_id: diff_cell_id,
+            ..
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListRemoveByKey");
         }
-        CellUpdate::ListRemoveBatch { cell_id: diff_cell_id, .. } => {
+        CellUpdate::ListRemoveBatch {
+            cell_id: diff_cell_id,
+            ..
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListRemoveBatch");
         }
-        CellUpdate::ListClear { cell_id: diff_cell_id } => {
+        CellUpdate::ListClear {
+            cell_id: diff_cell_id,
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListClear");
         }
-        CellUpdate::ListItemUpdate { cell_id: diff_cell_id, .. } => {
+        CellUpdate::ListItemUpdate {
+            cell_id: diff_cell_id,
+            ..
+        } => {
             ensure_same_cell(diff_cell_id, cell_id, "ListItemUpdate");
         }
         _ => {}
@@ -1839,6 +2206,10 @@ fn build_cell_update_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
                     for update in updates {
                         match update {
                             CellUpdate::SetValue { cell_id, value } => {
+                                dd_log!(
+                                    "[DD CellUpdates] emit cell='{}'",
+                                    cell_id
+                                );
                                 session.give(((cell_id.as_ref().to_string(), value), time.time().clone(), 1isize));
                             }
                             CellUpdate::NoOp => {}
@@ -1887,124 +2258,245 @@ fn build_filter_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
     let predicate_template = predicate_template.clone();
 
     let list_events = source.clone().map(CollectionEvent::ListDiff);
-    let cell_events = cell_updates.clone().map(|(cell_id, value)| CollectionEvent::CellUpdate { cell_id, value });
+    let cell_events = cell_updates
+        .clone()
+        .map(|(cell_id, value)| CollectionEvent::CellUpdate { cell_id, value });
     let init_events = init_events.clone().map(|_| CollectionEvent::Init);
     let events = list_events.concat(&cell_events).concat(&init_events);
 
-    let stream = events.inner.unary(Pipeline, "CollectionFilter", move |_cap, _info| {
-        let mut cell_values = initial_cells.clone();
-        let mut source_state = source_state.clone();
-        let mut output_state = output_state.clone();
-        let output_cell_id = output_cell_id.clone();
-        let field_filter = field_filter.clone();
-        let predicate_template = predicate_template.clone();
+    let stream = events
+        .inner
+        .unary(Pipeline, "CollectionFilter", move |_cap, _info| {
+            let mut cell_values = initial_cells.clone();
+            let mut source_state = source_state.clone();
+            let mut output_state = output_state.clone();
+            let output_cell_id = output_cell_id.clone();
+            let field_filter = field_filter.clone();
+            let predicate_template = predicate_template.clone();
 
-        move |input, output| {
-            input.for_each(|time, data| {
-                let mut session = output.session(&time);
-                for (event, _t, diff) in data.iter() {
-                    if *diff <= 0 {
-                        continue;
-                    }
+            move |input, output| {
+                input.for_each(|time, data| {
+                    let mut session = output.session(&time);
+                    for (event, _t, diff) in data.iter() {
+                        if *diff <= 0 {
+                            continue;
+                        }
 
-                    let mut emit: Vec<CellUpdate> = Vec::new();
-                    match event {
-                        CollectionEvent::Init => {
-                            let new_items: Vec<Value> = source_state.items()
-                                .iter()
-                                .filter(|item| {
-                                    evaluate_filter_predicate(item, &field_filter, &predicate_template, &cell_values)
-                                })
-                                .cloned()
-                                .collect();
-                            if new_items.is_empty() && output_state.is_empty() {
-                                emit.push(CellUpdate::list_clear(output_cell_id.as_ref()));
-                            } else {
-                                emit.extend(rebuild_output_list(
+                        let mut emit: Vec<CellUpdate> = Vec::new();
+                        match event {
+                            CollectionEvent::Init => {
+                                let new_items: Vec<Value> = source_state
+                                    .items()
+                                    .iter()
+                                    .filter(|item| {
+                                        evaluate_filter_predicate(
+                                            item,
+                                            &field_filter,
+                                            &predicate_template,
+                                            &cell_values,
+                                        )
+                                    })
+                                    .cloned()
+                                    .collect();
+                                if new_items.is_empty() && output_state.is_empty() {
+                                    emit.push(CellUpdate::list_clear(output_cell_id.as_ref()));
+                                } else {
+                                    emit.extend(rebuild_output_list(
+                                        &mut output_state,
+                                        new_items,
+                                        &output_cell_id,
+                                        "Filter init",
+                                    ));
+                                }
+                            }
+                            CollectionEvent::CellUpdate { cell_id, value } => {
+                                cell_values.insert(cell_id.clone(), value.clone());
+                                if output_cell_id.as_ref() == "collection_69" {
+                                    if let Some(first_item) = source_state.items().first() {
+                                        let completed_field = match first_item {
+                                            Value::Object(obj) => obj.get("completed"),
+                                            Value::Tagged { fields, .. } => fields.get("completed"),
+                                            _ => None,
+                                        };
+                                        if let Some(field_value) = completed_field {
+                                            let resolved_completed = resolve_cell_value(
+                                                field_value,
+                                                &cell_values,
+                                                "collection_69 debug completed",
+                                            );
+                                            dd_log!(
+                                                "[DD CollectionFilter Debug] output='{}' first_completed_field={:?} resolved_completed={:?}",
+                                                output_cell_id,
+                                                field_value,
+                                                resolved_completed
+                                            );
+                                        }
+                                    }
+                                }
+                                let new_items: Vec<Value> = source_state
+                                    .items()
+                                    .iter()
+                                    .filter(|item| {
+                                        evaluate_filter_predicate(
+                                            item,
+                                            &field_filter,
+                                            &predicate_template,
+                                            &cell_values,
+                                        )
+                                    })
+                                    .cloned()
+                                    .collect();
+                                let mut rebuilt = rebuild_output_list(
                                     &mut output_state,
                                     new_items,
                                     &output_cell_id,
-                                    "Filter init",
-                                ));
+                                    "Filter rebuild",
+                                );
+                                dd_log!(
+                                    "[DD CollectionFilter] output='{}' cell_update='{}' source_len={} matched_len={} rebuilt_diffs={}",
+                                    output_cell_id,
+                                    cell_id,
+                                    source_state.len(),
+                                    output_state.items().len(),
+                                    rebuilt.len()
+                                );
+                                emit.append(&mut rebuilt);
                             }
-                        }
-                        CollectionEvent::CellUpdate { cell_id, value } => {
-                            cell_values.insert(cell_id.clone(), value.clone());
-                            let new_items: Vec<Value> = source_state.items()
-                                .iter()
-                                .filter(|item| {
-                                    evaluate_filter_predicate(item, &field_filter, &predicate_template, &cell_values)
-                                })
-                                .cloned()
-                                .collect();
-                            emit.extend(rebuild_output_list(
-                                &mut output_state,
-                                new_items,
-                                &output_cell_id,
-                                "Filter rebuild",
-                            ));
-                        }
-                        CollectionEvent::ListDiff(diff) => {
-                            match diff {
+                            CollectionEvent::ListDiff(diff) => match diff {
                                 CellUpdate::ListPush { item, .. } => {
-                                    let index = source_state.push(item.clone(), "Filter source push");
-                                    let matches = evaluate_filter_predicate(item, &field_filter, &predicate_template, &cell_values);
+                                    let index =
+                                        source_state.push(item.clone(), "Filter source push");
+                                    let matches = evaluate_filter_predicate(
+                                        item,
+                                        &field_filter,
+                                        &predicate_template,
+                                        &cell_values,
+                                    );
                                     if matches {
-                                        let output_index = source_state.items()
+                                        let output_index = source_state
+                                            .items()
                                             .iter()
                                             .take(index)
                                             .filter(|item| {
-                                                evaluate_filter_predicate(item, &field_filter, &predicate_template, &cell_values)
+                                                evaluate_filter_predicate(
+                                                    item,
+                                                    &field_filter,
+                                                    &predicate_template,
+                                                    &cell_values,
+                                                )
                                             })
                                             .count();
-                                        output_state.insert(output_index, item.clone(), "Filter output insert");
-                                        emit.push(CellUpdate::list_insert_at(output_cell_id.as_ref(), output_index, item.clone()));
+                                        output_state.insert(
+                                            output_index,
+                                            item.clone(),
+                                            "Filter output insert",
+                                        );
+                                        emit.push(CellUpdate::list_insert_at(
+                                            output_cell_id.as_ref(),
+                                            output_index,
+                                            item.clone(),
+                                        ));
                                     }
                                 }
                                 CellUpdate::ListInsertAt { index, item, .. } => {
-                                    source_state.insert(*index, item.clone(), "Filter source insert");
-                                    let matches = evaluate_filter_predicate(item, &field_filter, &predicate_template, &cell_values);
+                                    source_state.insert(
+                                        *index,
+                                        item.clone(),
+                                        "Filter source insert",
+                                    );
+                                    let matches = evaluate_filter_predicate(
+                                        item,
+                                        &field_filter,
+                                        &predicate_template,
+                                        &cell_values,
+                                    );
                                     if matches {
-                                        let output_index = source_state.items()
+                                        let output_index = source_state
+                                            .items()
                                             .iter()
                                             .take(*index)
                                             .filter(|item| {
-                                                evaluate_filter_predicate(item, &field_filter, &predicate_template, &cell_values)
+                                                evaluate_filter_predicate(
+                                                    item,
+                                                    &field_filter,
+                                                    &predicate_template,
+                                                    &cell_values,
+                                                )
                                             })
                                             .count();
-                                        output_state.insert(output_index, item.clone(), "Filter output insert");
-                                        emit.push(CellUpdate::list_insert_at(output_cell_id.as_ref(), output_index, item.clone()));
+                                        output_state.insert(
+                                            output_index,
+                                            item.clone(),
+                                            "Filter output insert",
+                                        );
+                                        emit.push(CellUpdate::list_insert_at(
+                                            output_cell_id.as_ref(),
+                                            output_index,
+                                            item.clone(),
+                                        ));
                                     }
                                 }
                                 CellUpdate::ListRemoveAt { index, .. } => {
-                                    let removed = source_state.remove_at(*index, "Filter source remove");
-                                    let matches = evaluate_filter_predicate(&removed, &field_filter, &predicate_template, &cell_values);
+                                    let removed =
+                                        source_state.remove_at(*index, "Filter source remove");
+                                    let matches = evaluate_filter_predicate(
+                                        &removed,
+                                        &field_filter,
+                                        &predicate_template,
+                                        &cell_values,
+                                    );
                                     if matches {
                                         let key = extract_item_key(&removed, "Filter remove");
-                                        output_state.remove_by_key(key.as_ref(), "Filter output remove");
-                                        emit.push(CellUpdate::list_remove_by_key(output_cell_id.as_ref(), key));
+                                        output_state
+                                            .remove_by_key(key.as_ref(), "Filter output remove");
+                                        emit.push(CellUpdate::list_remove_by_key(
+                                            output_cell_id.as_ref(),
+                                            key,
+                                        ));
                                     }
                                 }
                                 CellUpdate::ListRemoveByKey { key, .. } => {
-                                    let removed = source_state.remove_by_key(key.as_ref(), "Filter source remove");
-                                    let matches = evaluate_filter_predicate(&removed, &field_filter, &predicate_template, &cell_values);
+                                    let removed = source_state
+                                        .remove_by_key(key.as_ref(), "Filter source remove");
+                                    let matches = evaluate_filter_predicate(
+                                        &removed,
+                                        &field_filter,
+                                        &predicate_template,
+                                        &cell_values,
+                                    );
                                     if matches {
-                                        output_state.remove_by_key(key.as_ref(), "Filter output remove");
-                                        emit.push(CellUpdate::list_remove_by_key(output_cell_id.as_ref(), key.clone()));
+                                        output_state
+                                            .remove_by_key(key.as_ref(), "Filter output remove");
+                                        emit.push(CellUpdate::list_remove_by_key(
+                                            output_cell_id.as_ref(),
+                                            key.clone(),
+                                        ));
                                     }
                                 }
                                 CellUpdate::ListRemoveBatch { keys, .. } => {
-                                    let removed = source_state.remove_batch(keys, "Filter source batch remove");
+                                    let removed = source_state
+                                        .remove_batch(keys, "Filter source batch remove");
                                     let mut removed_keys: Vec<Arc<str>> = Vec::new();
                                     for (key, item) in removed {
-                                        let matches = evaluate_filter_predicate(&item, &field_filter, &predicate_template, &cell_values);
+                                        let matches = evaluate_filter_predicate(
+                                            &item,
+                                            &field_filter,
+                                            &predicate_template,
+                                            &cell_values,
+                                        );
                                         if matches {
-                                            output_state.remove_by_key(key.as_ref(), "Filter output remove");
+                                            output_state.remove_by_key(
+                                                key.as_ref(),
+                                                "Filter output remove",
+                                            );
                                             removed_keys.push(key);
                                         }
                                     }
                                     if !removed_keys.is_empty() {
-                                        emit.push(CellUpdate::list_remove_batch(output_cell_id.as_ref(), removed_keys));
+                                        emit.push(CellUpdate::list_remove_batch(
+                                            output_cell_id.as_ref(),
+                                            removed_keys,
+                                        ));
                                     }
                                 }
                                 CellUpdate::ListClear { .. } => {
@@ -2014,15 +2506,30 @@ fn build_filter_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
                                         emit.push(CellUpdate::list_clear(output_cell_id.as_ref()));
                                     }
                                 }
-                                CellUpdate::ListItemUpdate { key, field_path, new_value, .. } => {
+                                CellUpdate::ListItemUpdate {
+                                    key,
+                                    field_path,
+                                    new_value,
+                                    ..
+                                } => {
                                     let (old_item, new_item) = source_state.update_field(
                                         key.as_ref(),
                                         field_path.as_ref(),
                                         new_value,
                                         "Filter source update",
                                     );
-                                    let old_match = evaluate_filter_predicate(&old_item, &field_filter, &predicate_template, &cell_values);
-                                    let new_match = evaluate_filter_predicate(&new_item, &field_filter, &predicate_template, &cell_values);
+                                    let old_match = evaluate_filter_predicate(
+                                        &old_item,
+                                        &field_filter,
+                                        &predicate_template,
+                                        &cell_values,
+                                    );
+                                    let new_match = evaluate_filter_predicate(
+                                        &new_item,
+                                        &field_filter,
+                                        &predicate_template,
+                                        &cell_values,
+                                    );
                                     match (old_match, new_match) {
                                         (true, true) => {
                                             output_state.update_field(
@@ -2039,20 +2546,41 @@ fn build_filter_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
                                             ));
                                         }
                                         (true, false) => {
-                                            output_state.remove_by_key(key.as_ref(), "Filter output remove");
-                                            emit.push(CellUpdate::list_remove_by_key(output_cell_id.as_ref(), key.clone()));
+                                            output_state.remove_by_key(
+                                                key.as_ref(),
+                                                "Filter output remove",
+                                            );
+                                            emit.push(CellUpdate::list_remove_by_key(
+                                                output_cell_id.as_ref(),
+                                                key.clone(),
+                                            ));
                                         }
                                         (false, true) => {
-                                            let index = source_state.index_of(key.as_ref(), "Filter source index");
-                                            let output_index = source_state.items()
+                                            let index = source_state
+                                                .index_of(key.as_ref(), "Filter source index");
+                                            let output_index = source_state
+                                                .items()
                                                 .iter()
                                                 .take(index)
                                                 .filter(|item| {
-                                                    evaluate_filter_predicate(item, &field_filter, &predicate_template, &cell_values)
+                                                    evaluate_filter_predicate(
+                                                        item,
+                                                        &field_filter,
+                                                        &predicate_template,
+                                                        &cell_values,
+                                                    )
                                                 })
                                                 .count();
-                                            output_state.insert(output_index, new_item.clone(), "Filter output insert");
-                                            emit.push(CellUpdate::list_insert_at(output_cell_id.as_ref(), output_index, new_item));
+                                            output_state.insert(
+                                                output_index,
+                                                new_item.clone(),
+                                                "Filter output insert",
+                                            );
+                                            emit.push(CellUpdate::list_insert_at(
+                                                output_cell_id.as_ref(),
+                                                output_index,
+                                                new_item,
+                                            ));
                                         }
                                         (false, false) => {}
                                     }
@@ -2065,19 +2593,21 @@ fn build_filter_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
                                 }
                                 CellUpdate::NoOp => {}
                                 other => {
-                                    panic!("[DD CollectionOp] Filter received non-list diff {:?}", other);
+                                    panic!(
+                                        "[DD CollectionOp] Filter received non-list diff {:?}",
+                                        other
+                                    );
                                 }
-                            }
+                            },
+                        }
+
+                        for out in emit {
+                            session.give((out, time.time().clone(), 1isize));
                         }
                     }
-
-                    for out in emit {
-                        session.give((out, time.time().clone(), 1isize));
-                    }
-                }
-            });
-        }
-    });
+                });
+            }
+        });
 
     stream.as_collection()
 }
@@ -2101,20 +2631,20 @@ fn resolve_nested_list_templates(
                 if original_items.iter().any(|item| contains_placeholder(item)) {
                     // Create per-item substituted copies
                     let new_id = CollectionId::new();
-                    let new_items: Vec<Value> = original_items.iter()
+                    let new_items: Vec<Value> = original_items
+                        .iter()
                         .map(|item| {
                             let substituted = item.substitute_placeholders(source_item);
                             // Recursively resolve any further nested lists
                             resolve_nested_list_templates(
-                                substituted, source_item, initial_collections,
+                                substituted,
+                                source_item,
+                                initial_collections,
                             )
                         })
                         .collect();
                     // Sync directly to LIST_SIGNAL_VECS so the bridge can render them
-                    super::super::io::sync_list_state_from_dd(
-                        new_id.to_string(),
-                        new_items,
-                    );
+                    super::super::io::sync_list_state_from_dd(new_id.to_string(), new_items);
                     Value::List(CollectionHandle::new_with_id(new_id))
                 } else {
                     value
@@ -2124,25 +2654,39 @@ fn resolve_nested_list_templates(
             }
         }
         Value::Object(fields) => {
-            let new_fields: std::collections::BTreeMap<Arc<str>, Value> = fields.iter()
-                .map(|(k, v)| (k.clone(), resolve_nested_list_templates(
-                    v.clone(), source_item, initial_collections,
-                )))
+            let new_fields: std::collections::BTreeMap<Arc<str>, Value> = fields
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        resolve_nested_list_templates(v.clone(), source_item, initial_collections),
+                    )
+                })
                 .collect();
             Value::Object(Arc::new(new_fields))
         }
-        Value::Tagged { ref tag, ref fields } if tag.as_ref() == "__text_template__" => {
+        Value::Tagged {
+            ref tag,
+            ref fields,
+        } if tag.as_ref() == "__text_template__" => {
             // Text template from Map context — resolve nested lists in parts,
             // then flatten to Value::Text if all parts are concrete (no CellRef).
-            let new_fields: std::collections::BTreeMap<Arc<str>, Value> = fields.iter()
-                .map(|(k, v)| (k.clone(), resolve_nested_list_templates(
-                    v.clone(), source_item, initial_collections,
-                )))
+            let new_fields: std::collections::BTreeMap<Arc<str>, Value> = fields
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        resolve_nested_list_templates(v.clone(), source_item, initial_collections),
+                    )
+                })
                 .collect();
             let has_cellref = new_fields.values().any(|v| matches!(v, Value::CellRef(_)));
             if has_cellref {
                 // Keep as template — bridge will create reactive signal
-                Value::Tagged { tag: tag.clone(), fields: Arc::new(new_fields) }
+                Value::Tagged {
+                    tag: tag.clone(),
+                    fields: Arc::new(new_fields),
+                }
             } else {
                 // All parts concrete — flatten to Text
                 let mut parts: Vec<&Value> = Vec::new();
@@ -2156,26 +2700,41 @@ fn resolve_nested_list_templates(
             }
         }
         Value::Tagged { tag, fields } => {
-            let new_fields: std::collections::BTreeMap<Arc<str>, Value> = fields.iter()
-                .map(|(k, v)| (k.clone(), resolve_nested_list_templates(
-                    v.clone(), source_item, initial_collections,
-                )))
+            let new_fields: std::collections::BTreeMap<Arc<str>, Value> = fields
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        resolve_nested_list_templates(v.clone(), source_item, initial_collections),
+                    )
+                })
                 .collect();
-            Value::Tagged { tag, fields: Arc::new(new_fields) }
+            Value::Tagged {
+                tag,
+                fields: Arc::new(new_fields),
+            }
         }
         Value::WhileConfig(config) => {
-            let arms: Vec<WhileArm> = config.arms.iter()
+            let arms: Vec<WhileArm> = config
+                .arms
+                .iter()
                 .map(|arm| WhileArm {
                     pattern: resolve_nested_list_templates(
-                        arm.pattern.clone(), source_item, initial_collections,
+                        arm.pattern.clone(),
+                        source_item,
+                        initial_collections,
                     ),
                     body: resolve_nested_list_templates(
-                        arm.body.clone(), source_item, initial_collections,
+                        arm.body.clone(),
+                        source_item,
+                        initial_collections,
                     ),
                 })
                 .collect();
             let default = resolve_nested_list_templates(
-                (*config.default).clone(), source_item, initial_collections,
+                (*config.default).clone(),
+                source_item,
+                initial_collections,
             );
             Value::WhileConfig(Arc::new(WhileConfig {
                 cell_id: config.cell_id.clone(),
@@ -2229,8 +2788,8 @@ fn build_map_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
                     match event {
                         CollectionEvent::Init => {
                             let mut mapped: Vec<Value> = Vec::with_capacity(source_state.len());
-                            for item in source_state.items() {
-                                let source_key = extract_item_key(item, "Map source item");
+                            for (idx, item) in source_state.items().iter().enumerate() {
+                                let source_key = source_state.key_at(idx, "Map source init key");
                                 let mut mapped_item = element_template.substitute_placeholders(item);
                                 mapped_item = resolve_nested_list_templates(
                                     mapped_item, item, &nested_collections,
@@ -2255,7 +2814,7 @@ fn build_map_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
                         CollectionEvent::ListDiff(diff) => match diff {
                             CellUpdate::ListPush { item, .. } => {
                             let index = source_state.push(item.clone(), "Map source push");
-                            let source_key = extract_item_key(item, "Map source item");
+                            let source_key = source_state.key_at(index, "Map source push key");
                             let mut mapped_item = element_template.substitute_placeholders(item);
                             mapped_item = resolve_nested_list_templates(
                                 mapped_item, item, &nested_collections,
@@ -2274,7 +2833,7 @@ fn build_map_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
                         }
                         CellUpdate::ListInsertAt { index, item, .. } => {
                             source_state.insert(*index, item.clone(), "Map source insert");
-                            let source_key = extract_item_key(item, "Map source item");
+                            let source_key = source_state.key_at(*index, "Map source insert key");
                             let mut mapped_item = element_template.substitute_placeholders(item);
                             mapped_item = resolve_nested_list_templates(
                                 mapped_item, item, &nested_collections,
@@ -2287,8 +2846,8 @@ fn build_map_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
                             emit.push(CellUpdate::list_insert_at(output_cell_id.as_ref(), *index, mapped_item));
                         }
                         CellUpdate::ListRemoveAt { index, .. } => {
-                            let removed = source_state.remove_at(*index, "Map source remove");
-                            let key = extract_item_key(&removed, "Map remove");
+                            let key = source_state.key_at(*index, "Map source remove key");
+                            source_state.remove_at(*index, "Map source remove");
                             output_state.remove_by_key(key.as_ref(), "Map output remove");
                             emit.push(CellUpdate::list_remove_by_key(output_cell_id.as_ref(), key));
                         }
@@ -2382,75 +2941,92 @@ fn build_count_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
     let init_events = init_events.clone().map(|_| CollectionEvent::Init);
     let events = list_events.concat(&init_events);
 
-    let stream = events.inner.unary(Pipeline, "CollectionCount", move |_cap, _info| {
-        let mut source_state = source_state.clone();
-        let mut current_count = current_count;
-        let output_cell_id = output_cell_id.clone();
-        move |input, output| {
-            input.for_each(|time, data| {
-                let mut session = output.session(&time);
-                for (event, _t, diff_count) in data.iter() {
-                    if *diff_count <= 0 {
-                        continue;
-                    }
-                    match event {
-                        CollectionEvent::Init => {}
-                        CollectionEvent::ListDiff(diff) => match diff {
-                            CellUpdate::ListPush { item, .. } => {
-                                source_state.push(item.clone(), "Count source push");
-                            }
-                            CellUpdate::ListInsertAt { index, item, .. } => {
-                                source_state.insert(*index, item.clone(), "Count source insert");
-                            }
-                            CellUpdate::ListRemoveAt { index, .. } => {
-                                source_state.remove_at(*index, "Count source remove");
-                            }
-                            CellUpdate::ListRemoveByKey { key, .. } => {
-                                source_state.remove_by_key(key.as_ref(), "Count source remove");
-                            }
-                            CellUpdate::ListRemoveBatch { keys, .. } => {
-                                source_state.remove_batch(keys, "Count source batch remove");
-                            }
-                            CellUpdate::ListClear { .. } => {
-                                source_state.clear();
-                            }
-                            CellUpdate::ListItemUpdate { key, field_path, new_value, .. } => {
-                                source_state.update_field(
-                                    key.as_ref(),
-                                    field_path.as_ref(),
+    let stream = events
+        .inner
+        .unary(Pipeline, "CollectionCount", move |_cap, _info| {
+            let mut source_state = source_state.clone();
+            let mut current_count = current_count;
+            let output_cell_id = output_cell_id.clone();
+            move |input, output| {
+                input.for_each(|time, data| {
+                    let mut session = output.session(&time);
+                    for (event, _t, diff_count) in data.iter() {
+                        if *diff_count <= 0 {
+                            continue;
+                        }
+                        match event {
+                            CollectionEvent::Init => {}
+                            CollectionEvent::ListDiff(diff) => match diff {
+                                CellUpdate::ListPush { item, .. } => {
+                                    source_state.push(item.clone(), "Count source push");
+                                }
+                                CellUpdate::ListInsertAt { index, item, .. } => {
+                                    source_state.insert(
+                                        *index,
+                                        item.clone(),
+                                        "Count source insert",
+                                    );
+                                }
+                                CellUpdate::ListRemoveAt { index, .. } => {
+                                    source_state.remove_at(*index, "Count source remove");
+                                }
+                                CellUpdate::ListRemoveByKey { key, .. } => {
+                                    source_state.remove_by_key(key.as_ref(), "Count source remove");
+                                }
+                                CellUpdate::ListRemoveBatch { keys, .. } => {
+                                    source_state.remove_batch(keys, "Count source batch remove");
+                                }
+                                CellUpdate::ListClear { .. } => {
+                                    source_state.clear();
+                                }
+                                CellUpdate::ListItemUpdate {
+                                    key,
+                                    field_path,
                                     new_value,
-                                    "Count source update",
-                                );
+                                    ..
+                                } => {
+                                    source_state.update_field(
+                                        key.as_ref(),
+                                        field_path.as_ref(),
+                                        new_value,
+                                        "Count source update",
+                                    );
+                                }
+                                CellUpdate::Multi(_) => {
+                                    panic!("[DD CollectionOp] Count received Multi update");
+                                }
+                                CellUpdate::SetValue { .. } => {
+                                    panic!("[DD CollectionOp] Count received SetValue");
+                                }
+                                CellUpdate::NoOp => {}
+                                other => {
+                                    panic!(
+                                        "[DD CollectionOp] Count received non-list diff {:?}",
+                                        other
+                                    );
+                                }
+                            },
+                            CollectionEvent::CellUpdate { .. } => {
+                                panic!("[DD CollectionOp] Count received CellUpdate");
                             }
-                            CellUpdate::Multi(_) => {
-                                panic!("[DD CollectionOp] Count received Multi update");
-                            }
-                            CellUpdate::SetValue { .. } => {
-                                panic!("[DD CollectionOp] Count received SetValue");
-                            }
-                            CellUpdate::NoOp => {}
-                            other => {
-                                panic!("[DD CollectionOp] Count received non-list diff {:?}", other);
-                            }
-                        },
-                        CollectionEvent::CellUpdate { .. } => {
-                            panic!("[DD CollectionOp] Count received CellUpdate");
+                        }
+
+                        let new_count = source_state.len() as i64;
+                        if current_count.map_or(true, |current| current != new_count) {
+                            current_count = Some(new_count);
+                            session.give((
+                                CellUpdate::set_value(
+                                    output_cell_id.as_ref(),
+                                    Value::int(new_count),
+                                ),
+                                time.time().clone(),
+                                1isize,
+                            ));
                         }
                     }
-
-                    let new_count = source_state.len() as i64;
-                    if current_count.map_or(true, |current| current != new_count) {
-                        current_count = Some(new_count);
-                        session.give((
-                            CellUpdate::set_value(output_cell_id.as_ref(), Value::int(new_count)),
-                            time.time().clone(),
-                            1isize,
-                        ));
-                    }
-                }
-            });
-        }
-    });
+                });
+            }
+        });
 
     stream.as_collection()
 }
@@ -2478,7 +3054,9 @@ fn build_count_where_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
     let filter_value = filter_value.clone();
 
     let list_events = source.clone().map(CollectionEvent::ListDiff);
-    let cell_events = cell_updates.clone().map(|(cell_id, value)| CollectionEvent::CellUpdate { cell_id, value });
+    let cell_events = cell_updates
+        .clone()
+        .map(|(cell_id, value)| CollectionEvent::CellUpdate { cell_id, value });
     let init_events = init_events.clone().map(|_| CollectionEvent::Init);
     let events = list_events.concat(&cell_events).concat(&init_events);
 
@@ -2521,6 +3099,12 @@ fn build_count_where_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
                                 .iter()
                                 .filter(|item| is_item_field_equal(item, filter_field.as_ref(), &filter_value, &cell_values))
                                 .count() as i64;
+                            dd_log!(
+                                "[DD CollectionCountWhere] output='{}' cell_update='{}' new_count={}",
+                                output_cell_id,
+                                cell_id,
+                                new_count
+                            );
                             if current_count.map_or(true, |current| current != new_count) {
                                 current_count = Some(new_count);
                                 session.give((
@@ -2657,75 +3241,93 @@ fn build_is_empty_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
     let init_events = init_events.clone().map(|_| CollectionEvent::Init);
     let events = list_events.concat(&init_events);
 
-    let stream = events.inner.unary(Pipeline, "CollectionIsEmpty", move |_cap, _info| {
-        let mut source_state = source_state.clone();
-        let mut current_empty = current_empty;
-        let output_cell_id = output_cell_id.clone();
-        move |input, output| {
-            input.for_each(|time, data| {
-                let mut session = output.session(&time);
-                for (event, _t, diff_count) in data.iter() {
-                    if *diff_count <= 0 {
-                        continue;
-                    }
-                    match event {
-                        CollectionEvent::Init => {}
-                        CollectionEvent::ListDiff(diff) => match diff {
-                            CellUpdate::ListPush { item, .. } => {
-                                source_state.push(item.clone(), "IsEmpty source push");
-                            }
-                            CellUpdate::ListInsertAt { index, item, .. } => {
-                                source_state.insert(*index, item.clone(), "IsEmpty source insert");
-                            }
-                            CellUpdate::ListRemoveAt { index, .. } => {
-                                source_state.remove_at(*index, "IsEmpty source remove");
-                            }
-                            CellUpdate::ListRemoveByKey { key, .. } => {
-                                source_state.remove_by_key(key.as_ref(), "IsEmpty source remove");
-                            }
-                            CellUpdate::ListRemoveBatch { keys, .. } => {
-                                source_state.remove_batch(keys, "IsEmpty source batch remove");
-                            }
-                            CellUpdate::ListClear { .. } => {
-                                source_state.clear();
-                            }
-                            CellUpdate::ListItemUpdate { key, field_path, new_value, .. } => {
-                                source_state.update_field(
-                                    key.as_ref(),
-                                    field_path.as_ref(),
+    let stream = events
+        .inner
+        .unary(Pipeline, "CollectionIsEmpty", move |_cap, _info| {
+            let mut source_state = source_state.clone();
+            let mut current_empty = current_empty;
+            let output_cell_id = output_cell_id.clone();
+            move |input, output| {
+                input.for_each(|time, data| {
+                    let mut session = output.session(&time);
+                    for (event, _t, diff_count) in data.iter() {
+                        if *diff_count <= 0 {
+                            continue;
+                        }
+                        match event {
+                            CollectionEvent::Init => {}
+                            CollectionEvent::ListDiff(diff) => match diff {
+                                CellUpdate::ListPush { item, .. } => {
+                                    source_state.push(item.clone(), "IsEmpty source push");
+                                }
+                                CellUpdate::ListInsertAt { index, item, .. } => {
+                                    source_state.insert(
+                                        *index,
+                                        item.clone(),
+                                        "IsEmpty source insert",
+                                    );
+                                }
+                                CellUpdate::ListRemoveAt { index, .. } => {
+                                    source_state.remove_at(*index, "IsEmpty source remove");
+                                }
+                                CellUpdate::ListRemoveByKey { key, .. } => {
+                                    source_state
+                                        .remove_by_key(key.as_ref(), "IsEmpty source remove");
+                                }
+                                CellUpdate::ListRemoveBatch { keys, .. } => {
+                                    source_state.remove_batch(keys, "IsEmpty source batch remove");
+                                }
+                                CellUpdate::ListClear { .. } => {
+                                    source_state.clear();
+                                }
+                                CellUpdate::ListItemUpdate {
+                                    key,
+                                    field_path,
                                     new_value,
-                                    "IsEmpty source update",
-                                );
+                                    ..
+                                } => {
+                                    source_state.update_field(
+                                        key.as_ref(),
+                                        field_path.as_ref(),
+                                        new_value,
+                                        "IsEmpty source update",
+                                    );
+                                }
+                                CellUpdate::Multi(_) => {
+                                    panic!("[DD CollectionOp] IsEmpty received Multi update");
+                                }
+                                CellUpdate::SetValue { .. } => {
+                                    panic!("[DD CollectionOp] IsEmpty received SetValue");
+                                }
+                                CellUpdate::NoOp => {}
+                                other => {
+                                    panic!(
+                                        "[DD CollectionOp] IsEmpty received non-list diff {:?}",
+                                        other
+                                    );
+                                }
+                            },
+                            CollectionEvent::CellUpdate { .. } => {
+                                panic!("[DD CollectionOp] IsEmpty received CellUpdate");
                             }
-                            CellUpdate::Multi(_) => {
-                                panic!("[DD CollectionOp] IsEmpty received Multi update");
-                            }
-                            CellUpdate::SetValue { .. } => {
-                                panic!("[DD CollectionOp] IsEmpty received SetValue");
-                            }
-                            CellUpdate::NoOp => {}
-                            other => {
-                                panic!("[DD CollectionOp] IsEmpty received non-list diff {:?}", other);
-                            }
-                        },
-                        CollectionEvent::CellUpdate { .. } => {
-                            panic!("[DD CollectionOp] IsEmpty received CellUpdate");
+                        }
+
+                        let new_empty = source_state.is_empty();
+                        if current_empty.map_or(true, |current| current != new_empty) {
+                            current_empty = Some(new_empty);
+                            session.give((
+                                CellUpdate::set_value(
+                                    output_cell_id.as_ref(),
+                                    Value::Bool(new_empty),
+                                ),
+                                time.time().clone(),
+                                1isize,
+                            ));
                         }
                     }
-
-                    let new_empty = source_state.is_empty();
-                    if current_empty.map_or(true, |current| current != new_empty) {
-                        current_empty = Some(new_empty);
-                        session.give((
-                            CellUpdate::set_value(output_cell_id.as_ref(), Value::Bool(new_empty)),
-                            time.time().clone(),
-                            1isize,
-                        ));
-                    }
-                }
-            });
-        }
-    });
+                });
+            }
+        });
 
     stream.as_collection()
 }
@@ -2964,55 +3566,76 @@ fn build_subtract_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
     let right_events = right.clone().map(ScalarEvent::Right);
     let events = left_events.concat(&right_events);
 
-    let stream = events.inner.unary(Pipeline, "CollectionSubtract", move |_cap, _info| {
-        let mut left_value = left_value.clone();
-        let mut right_value = right_value.clone();
-        let mut current_output = current_output.clone();
-        let output_cell_id = output_cell_id.clone();
-        move |input, output| {
-            input.for_each(|time, data| {
-                let mut session = output.session(&time);
-                for (event, _t, diff_count) in data.iter() {
-                    if *diff_count <= 0 {
-                        continue;
+    let stream = events
+        .inner
+        .unary(Pipeline, "CollectionSubtract", move |_cap, _info| {
+            let mut left_value = left_value.clone();
+            let mut right_value = right_value.clone();
+            let mut current_output = current_output.clone();
+            let output_cell_id = output_cell_id.clone();
+            move |input, output| {
+                input.for_each(|time, data| {
+                    let mut session = output.session(&time);
+                    for (event, _t, diff_count) in data.iter() {
+                        if *diff_count <= 0 {
+                            continue;
+                        }
+                        match event {
+                            ScalarEvent::Left(update) => match update {
+                                CellUpdate::SetValue { value, .. } => {
+                                    left_value = Some(value.clone())
+                                }
+                                CellUpdate::NoOp => continue,
+                                other => panic!(
+                                    "[DD CollectionOp] Subtract left expects SetValue, found {:?}",
+                                    other
+                                ),
+                            },
+                            ScalarEvent::Right(update) => match update {
+                                CellUpdate::SetValue { value, .. } => {
+                                    right_value = Some(value.clone())
+                                }
+                                CellUpdate::NoOp => continue,
+                                other => panic!(
+                                    "[DD CollectionOp] Subtract right expects SetValue, found {:?}",
+                                    other
+                                ),
+                            },
+                        }
+                        let (left_value, right_value) = match (&left_value, &right_value) {
+                            (Some(left), Some(right)) => (left, right),
+                            _ => continue,
+                        };
+                        let left_num = match left_value {
+                            Value::Number(n) => n.0,
+                            other => panic!(
+                                "[DD CollectionOp] Subtract expects Number, found {:?}",
+                                other
+                            ),
+                        };
+                        let right_num = match right_value {
+                            Value::Number(n) => n.0,
+                            other => panic!(
+                                "[DD CollectionOp] Subtract expects Number, found {:?}",
+                                other
+                            ),
+                        };
+                        let new_output = Value::float(left_num - right_num);
+                        if current_output
+                            .as_ref()
+                            .map_or(true, |current| current != &new_output)
+                        {
+                            current_output = Some(new_output.clone());
+                            session.give((
+                                CellUpdate::set_value(output_cell_id.as_ref(), new_output),
+                                time.time().clone(),
+                                1isize,
+                            ));
+                        }
                     }
-                    match event {
-                        ScalarEvent::Left(update) => match update {
-                            CellUpdate::SetValue { value, .. } => left_value = Some(value.clone()),
-                            CellUpdate::NoOp => continue,
-                            other => panic!("[DD CollectionOp] Subtract left expects SetValue, found {:?}", other),
-                        },
-                        ScalarEvent::Right(update) => match update {
-                            CellUpdate::SetValue { value, .. } => right_value = Some(value.clone()),
-                            CellUpdate::NoOp => continue,
-                            other => panic!("[DD CollectionOp] Subtract right expects SetValue, found {:?}", other),
-                        },
-                    }
-                    let (left_value, right_value) = match (&left_value, &right_value) {
-                        (Some(left), Some(right)) => (left, right),
-                        _ => continue,
-                    };
-                    let left_num = match left_value {
-                        Value::Number(n) => n.0,
-                        other => panic!("[DD CollectionOp] Subtract expects Number, found {:?}", other),
-                    };
-                    let right_num = match right_value {
-                        Value::Number(n) => n.0,
-                        other => panic!("[DD CollectionOp] Subtract expects Number, found {:?}", other),
-                    };
-                    let new_output = Value::float(left_num - right_num);
-                    if current_output.as_ref().map_or(true, |current| current != &new_output) {
-                        current_output = Some(new_output.clone());
-                        session.give((
-                            CellUpdate::set_value(output_cell_id.as_ref(), new_output),
-                            time.time().clone(),
-                            1isize,
-                        ));
-                    }
-                }
-            });
-        }
-    });
+                });
+            }
+        });
 
     stream.as_collection()
 }
@@ -3021,37 +3644,48 @@ fn build_greater_than_zero_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
     source: &differential_dataflow::collection::VecCollection<G, CellUpdate>,
     output_cell_id: Arc<str>,
 ) -> differential_dataflow::collection::VecCollection<G, CellUpdate> {
-    let stream = source.inner.unary(Pipeline, "CollectionGreaterThanZero", move |_cap, _info| {
-        let mut current_output: Option<Value> = None;
-        let output_cell_id = output_cell_id.clone();
-        move |input, output| {
-            input.for_each(|time, data| {
-                let mut session = output.session(&time);
-                for (value, _t, diff_count) in data.iter() {
-                    if *diff_count <= 0 {
-                        continue;
+    let stream = source
+        .inner
+        .unary(Pipeline, "CollectionGreaterThanZero", move |_cap, _info| {
+            let mut current_output: Option<Value> = None;
+            let output_cell_id = output_cell_id.clone();
+            move |input, output| {
+                input.for_each(|time, data| {
+                    let mut session = output.session(&time);
+                    for (value, _t, diff_count) in data.iter() {
+                        if *diff_count <= 0 {
+                            continue;
+                        }
+                        let num = match value {
+                            CellUpdate::SetValue { value, .. } => match value {
+                                Value::Number(n) => n.0,
+                                other => panic!(
+                                    "[DD CollectionOp] GreaterThanZero expects Number, found {:?}",
+                                    other
+                                ),
+                            },
+                            CellUpdate::NoOp => continue,
+                            other => panic!(
+                                "[DD CollectionOp] GreaterThanZero expects SetValue, found {:?}",
+                                other
+                            ),
+                        };
+                        let new_output = Value::Bool(num > 0.0);
+                        if current_output
+                            .as_ref()
+                            .map_or(true, |current| current != &new_output)
+                        {
+                            current_output = Some(new_output.clone());
+                            session.give((
+                                CellUpdate::set_value(output_cell_id.as_ref(), new_output),
+                                time.time().clone(),
+                                1isize,
+                            ));
+                        }
                     }
-                    let num = match value {
-                        CellUpdate::SetValue { value, .. } => match value {
-                            Value::Number(n) => n.0,
-                            other => panic!("[DD CollectionOp] GreaterThanZero expects Number, found {:?}", other),
-                        },
-                        CellUpdate::NoOp => continue,
-                        other => panic!("[DD CollectionOp] GreaterThanZero expects SetValue, found {:?}", other),
-                    };
-                    let new_output = Value::Bool(num > 0.0);
-                    if current_output.as_ref().map_or(true, |current| current != &new_output) {
-                        current_output = Some(new_output.clone());
-                        session.give((
-                            CellUpdate::set_value(output_cell_id.as_ref(), new_output),
-                            time.time().clone(),
-                            1isize,
-                        ));
-                    }
-                }
-            });
-        }
-    });
+                });
+            }
+        });
 
     stream.as_collection()
 }
@@ -3069,47 +3703,62 @@ fn build_equal_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
     let right_events = right.clone().map(ScalarEvent::Right);
     let events = left_events.concat(&right_events);
 
-    let stream = events.inner.unary(Pipeline, "CollectionEqual", move |_cap, _info| {
-        let mut left_value = left_value.clone();
-        let mut right_value = right_value.clone();
-        let mut current_output = current_output.clone();
-        let output_cell_id = output_cell_id.clone();
-        move |input, output| {
-            input.for_each(|time, data| {
-                let mut session = output.session(&time);
-                for (event, _t, diff_count) in data.iter() {
-                    if *diff_count <= 0 {
-                        continue;
+    let stream = events
+        .inner
+        .unary(Pipeline, "CollectionEqual", move |_cap, _info| {
+            let mut left_value = left_value.clone();
+            let mut right_value = right_value.clone();
+            let mut current_output = current_output.clone();
+            let output_cell_id = output_cell_id.clone();
+            move |input, output| {
+                input.for_each(|time, data| {
+                    let mut session = output.session(&time);
+                    for (event, _t, diff_count) in data.iter() {
+                        if *diff_count <= 0 {
+                            continue;
+                        }
+                        match event {
+                            ScalarEvent::Left(update) => match update {
+                                CellUpdate::SetValue { value, .. } => {
+                                    left_value = Some(value.clone())
+                                }
+                                CellUpdate::NoOp => continue,
+                                other => panic!(
+                                    "[DD CollectionOp] Equal left expects SetValue, found {:?}",
+                                    other
+                                ),
+                            },
+                            ScalarEvent::Right(update) => match update {
+                                CellUpdate::SetValue { value, .. } => {
+                                    right_value = Some(value.clone())
+                                }
+                                CellUpdate::NoOp => continue,
+                                other => panic!(
+                                    "[DD CollectionOp] Equal right expects SetValue, found {:?}",
+                                    other
+                                ),
+                            },
+                        }
+                        let (left_value, right_value) = match (&left_value, &right_value) {
+                            (Some(left), Some(right)) => (left, right),
+                            _ => continue,
+                        };
+                        let new_output = Value::Bool(left_value == right_value);
+                        if current_output
+                            .as_ref()
+                            .map_or(true, |current| current != &new_output)
+                        {
+                            current_output = Some(new_output.clone());
+                            session.give((
+                                CellUpdate::set_value(output_cell_id.as_ref(), new_output),
+                                time.time().clone(),
+                                1isize,
+                            ));
+                        }
                     }
-                    match event {
-                        ScalarEvent::Left(update) => match update {
-                            CellUpdate::SetValue { value, .. } => left_value = Some(value.clone()),
-                            CellUpdate::NoOp => continue,
-                            other => panic!("[DD CollectionOp] Equal left expects SetValue, found {:?}", other),
-                        },
-                        ScalarEvent::Right(update) => match update {
-                            CellUpdate::SetValue { value, .. } => right_value = Some(value.clone()),
-                            CellUpdate::NoOp => continue,
-                            other => panic!("[DD CollectionOp] Equal right expects SetValue, found {:?}", other),
-                        },
-                    }
-                    let (left_value, right_value) = match (&left_value, &right_value) {
-                        (Some(left), Some(right)) => (left, right),
-                        _ => continue,
-                    };
-                    let new_output = Value::Bool(left_value == right_value);
-                    if current_output.as_ref().map_or(true, |current| current != &new_output) {
-                        current_output = Some(new_output.clone());
-                        session.give((
-                            CellUpdate::set_value(output_cell_id.as_ref(), new_output),
-                            time.time().clone(),
-                            1isize,
-                        ));
-                    }
-                }
-            });
-        }
-    });
+                });
+            }
+        });
 
     stream.as_collection()
 }
@@ -3120,36 +3769,41 @@ fn build_scalar_when_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
     arms: Vec<(Value, Value)>,
     default: Value,
 ) -> differential_dataflow::collection::VecCollection<G, CellUpdate> {
-    let stream = source.inner.unary(Pipeline, "ScalarWhen", move |_cap, _info| {
-        let mut current_output: Option<Value> = None;
-        let output_cell_id = output_cell_id.clone();
-        let arms = arms.clone();
-        let default = default.clone();
-        move |input, output| {
-            input.for_each(|time, data| {
-                let mut session = output.session(&time);
-                for (value, _t, diff_count) in data.iter() {
-                    if *diff_count <= 0 {
-                        continue;
+    let stream = source
+        .inner
+        .unary(Pipeline, "ScalarWhen", move |_cap, _info| {
+            let mut current_output: Option<Value> = None;
+            let output_cell_id = output_cell_id.clone();
+            let arms = arms.clone();
+            let default = default.clone();
+            move |input, output| {
+                input.for_each(|time, data| {
+                    let mut session = output.session(&time);
+                    for (value, _t, diff_count) in data.iter() {
+                        if *diff_count <= 0 {
+                            continue;
+                        }
+                        let source_value = match value {
+                            CellUpdate::SetValue { value, .. } => value,
+                            CellUpdate::NoOp => continue,
+                            other => panic!("[DD ScalarWhen] Expected SetValue, found {:?}", other),
+                        };
+                        let new_output = scalar_when_select(source_value, &arms, &default);
+                        if current_output
+                            .as_ref()
+                            .map_or(true, |current| current != &new_output)
+                        {
+                            current_output = Some(new_output.clone());
+                            session.give((
+                                CellUpdate::set_value(output_cell_id.as_ref(), new_output),
+                                time.time().clone(),
+                                1isize,
+                            ));
+                        }
                     }
-                    let source_value = match value {
-                        CellUpdate::SetValue { value, .. } => value,
-                        CellUpdate::NoOp => continue,
-                        other => panic!("[DD ScalarWhen] Expected SetValue, found {:?}", other),
-                    };
-                    let new_output = scalar_when_select(source_value, &arms, &default);
-                    if current_output.as_ref().map_or(true, |current| current != &new_output) {
-                        current_output = Some(new_output.clone());
-                        session.give((
-                            CellUpdate::set_value(output_cell_id.as_ref(), new_output),
-                            time.time().clone(),
-                            1isize,
-                        ));
-                    }
-                }
-            });
-        }
-    });
+                });
+            }
+        });
     stream.as_collection()
 }
 
@@ -3191,50 +3845,57 @@ fn build_computed_text_stream<G: timely::dataflow::Scope<Timestamp = u64>>(
         combined = combined.concat(stream);
     }
 
-    let stream = combined.inner.unary(Pipeline, "ComputedText", move |_cap, _info| {
-        let mut cell_values: Vec<Option<Value>> = vec![None; num_sources];
-        let mut current_output: Option<Value> = None;
-        let output_cell_id = output_cell_id.clone();
-        let parts = parts.clone();
-        move |input, output| {
-            input.for_each(|time, data| {
-                let mut session = output.session(&time);
-                for ((idx, update), _t, diff_count) in data.iter() {
-                    if *diff_count <= 0 {
-                        continue;
-                    }
-                    match update {
-                        CellUpdate::SetValue { value, .. } => {
-                            cell_values[*idx] = Some(value.clone());
+    let stream = combined
+        .inner
+        .unary(Pipeline, "ComputedText", move |_cap, _info| {
+            let mut cell_values: Vec<Option<Value>> = vec![None; num_sources];
+            let mut current_output: Option<Value> = None;
+            let output_cell_id = output_cell_id.clone();
+            let parts = parts.clone();
+            move |input, output| {
+                input.for_each(|time, data| {
+                    let mut session = output.session(&time);
+                    for ((idx, update), _t, diff_count) in data.iter() {
+                        if *diff_count <= 0 {
+                            continue;
                         }
-                        CellUpdate::NoOp => continue,
-                        other => panic!("[DD ComputedText] Expected SetValue, found {:?}", other),
-                    }
-                    // Only emit when all sources have values
-                    if cell_values.iter().all(|v| v.is_some()) {
-                        let formatted: String = parts
-                            .iter()
-                            .map(|part| match part {
-                                ComputedTextPart::Static(s) => s.to_string(),
-                                ComputedTextPart::CellSource(i) => {
-                                    cell_values[*i].as_ref().unwrap().to_display_string()
-                                }
-                            })
-                            .collect();
-                        let new_output = Value::text(formatted);
-                        if current_output.as_ref().map_or(true, |current| current != &new_output) {
-                            current_output = Some(new_output.clone());
-                            session.give((
-                                CellUpdate::set_value(output_cell_id.as_ref(), new_output),
-                                time.time().clone(),
-                                1isize,
-                            ));
+                        match update {
+                            CellUpdate::SetValue { value, .. } => {
+                                cell_values[*idx] = Some(value.clone());
+                            }
+                            CellUpdate::NoOp => continue,
+                            other => {
+                                panic!("[DD ComputedText] Expected SetValue, found {:?}", other)
+                            }
+                        }
+                        // Only emit when all sources have values
+                        if cell_values.iter().all(|v| v.is_some()) {
+                            let formatted: String = parts
+                                .iter()
+                                .map(|part| match part {
+                                    ComputedTextPart::Static(s) => s.to_string(),
+                                    ComputedTextPart::CellSource(i) => {
+                                        cell_values[*i].as_ref().unwrap().to_display_string()
+                                    }
+                                })
+                                .collect();
+                            let new_output = Value::text(formatted);
+                            if current_output
+                                .as_ref()
+                                .map_or(true, |current| current != &new_output)
+                            {
+                                current_output = Some(new_output.clone());
+                                session.give((
+                                    CellUpdate::set_value(output_cell_id.as_ref(), new_output),
+                                    time.time().clone(),
+                                    1isize,
+                                ));
+                            }
                         }
                     }
-                }
-            });
-        }
-    });
+                });
+            }
+        });
     stream.as_collection()
 }
 
@@ -3251,7 +3912,10 @@ pub(crate) fn build_collection_op_outputs<G: timely::dataflow::Scope<Timestamp =
 
     let mut sources_by_cell: HashMap<String, CollectionId> = HashMap::new();
     for (collection_id, cell_id) in &collections.collection_sources {
-        if sources_by_cell.insert(cell_id.clone(), collection_id.clone()).is_some() {
+        if sources_by_cell
+            .insert(cell_id.clone(), collection_id.clone())
+            .is_some()
+        {
             panic!(
                 "[DD CollectionOp] Conflicting collection sources for cell '{}'",
                 cell_id
@@ -3274,7 +3938,10 @@ pub(crate) fn build_collection_op_outputs<G: timely::dataflow::Scope<Timestamp =
 
     let empty_collection = scope.new_collection::<CellUpdate, isize>().1;
 
-    let mut streams: HashMap<CollectionId, differential_dataflow::collection::VecCollection<G, CellUpdate>> = HashMap::new();
+    let mut streams: HashMap<
+        CollectionId,
+        differential_dataflow::collection::VecCollection<G, CellUpdate>,
+    > = HashMap::new();
     for collection_id in collections.initial_collections.keys() {
         if collections.collection_sources.contains_key(collection_id) {
             let cid = collection_id.clone();
@@ -3287,14 +3954,29 @@ pub(crate) fn build_collection_op_outputs<G: timely::dataflow::Scope<Timestamp =
         }
     }
 
-    let mut tagged_outputs: Vec<differential_dataflow::collection::VecCollection<G, TaggedCellOutput>> = Vec::new();
+    let mut tagged_outputs: Vec<
+        differential_dataflow::collection::VecCollection<G, TaggedCellOutput>,
+    > = Vec::new();
 
     for op in &collections.ops {
         let output_cell_id: Arc<str> = Arc::from(op.output_id.to_string());
         let output_stream = match &op.op {
-            CollectionOp::Filter { field_filter, predicate_template } => {
+            CollectionOp::Filter {
+                field_filter,
+                predicate_template,
+            } => {
+                dd_log!(
+                    "[DD CollectionOp::Filter] output='{}' source={:?} field_filter={:?} predicate_template={:?}",
+                    output_cell_id,
+                    op.source_id,
+                    field_filter,
+                    predicate_template
+                );
                 let source = streams.get(&op.source_id).unwrap_or_else(|| {
-                    panic!("[DD CollectionOp] Missing source collection {:?}", op.source_id);
+                    panic!(
+                        "[DD CollectionOp] Missing source collection {:?}",
+                        op.source_id
+                    );
                 });
                 build_filter_stream(
                     source,
@@ -3310,7 +3992,10 @@ pub(crate) fn build_collection_op_outputs<G: timely::dataflow::Scope<Timestamp =
             }
             CollectionOp::Map { element_template } => {
                 let source = streams.get(&op.source_id).unwrap_or_else(|| {
-                    panic!("[DD CollectionOp] Missing source collection {:?}", op.source_id);
+                    panic!(
+                        "[DD CollectionOp] Missing source collection {:?}",
+                        op.source_id
+                    );
                 });
                 build_map_stream(
                     source,
@@ -3323,7 +4008,10 @@ pub(crate) fn build_collection_op_outputs<G: timely::dataflow::Scope<Timestamp =
             }
             CollectionOp::Count => {
                 let source = streams.get(&op.source_id).unwrap_or_else(|| {
-                    panic!("[DD CollectionOp] Missing source collection {:?}", op.source_id);
+                    panic!(
+                        "[DD CollectionOp] Missing source collection {:?}",
+                        op.source_id
+                    );
                 });
                 build_count_stream(
                     source,
@@ -3333,9 +4021,15 @@ pub(crate) fn build_collection_op_outputs<G: timely::dataflow::Scope<Timestamp =
                     &op.source_id,
                 )
             }
-            CollectionOp::CountWhere { filter_field, filter_value } => {
+            CollectionOp::CountWhere {
+                filter_field,
+                filter_value,
+            } => {
                 let source = streams.get(&op.source_id).unwrap_or_else(|| {
-                    panic!("[DD CollectionOp] Missing source collection {:?}", op.source_id);
+                    panic!(
+                        "[DD CollectionOp] Missing source collection {:?}",
+                        op.source_id
+                    );
                 });
                 build_count_where_stream(
                     source,
@@ -3351,7 +4045,10 @@ pub(crate) fn build_collection_op_outputs<G: timely::dataflow::Scope<Timestamp =
             }
             CollectionOp::IsEmpty => {
                 let source = streams.get(&op.source_id).unwrap_or_else(|| {
-                    panic!("[DD CollectionOp] Missing source collection {:?}", op.source_id);
+                    panic!(
+                        "[DD CollectionOp] Missing source collection {:?}",
+                        op.source_id
+                    );
                 });
                 build_is_empty_stream(
                     source,
@@ -3385,20 +4082,16 @@ pub(crate) fn build_collection_op_outputs<G: timely::dataflow::Scope<Timestamp =
                 let right = streams.get(right_source).unwrap_or_else(|| {
                     panic!("[DD CollectionOp] Missing right source {:?}", right_source);
                 });
-                build_subtract_stream(
-                    left,
-                    right,
-                    output_cell_id.clone(),
-                )
+                build_subtract_stream(left, right, output_cell_id.clone())
             }
             CollectionOp::GreaterThanZero => {
                 let source = streams.get(&op.source_id).unwrap_or_else(|| {
-                    panic!("[DD CollectionOp] Missing source collection {:?}", op.source_id);
+                    panic!(
+                        "[DD CollectionOp] Missing source collection {:?}",
+                        op.source_id
+                    );
                 });
-                build_greater_than_zero_stream(
-                    source,
-                    output_cell_id.clone(),
-                )
+                build_greater_than_zero_stream(source, output_cell_id.clone())
             }
             CollectionOp::Equal { right_source } => {
                 let left = streams.get(&op.source_id).unwrap_or_else(|| {
@@ -3407,15 +4100,14 @@ pub(crate) fn build_collection_op_outputs<G: timely::dataflow::Scope<Timestamp =
                 let right = streams.get(right_source).unwrap_or_else(|| {
                     panic!("[DD CollectionOp] Missing right source {:?}", right_source);
                 });
-                build_equal_stream(
-                    left,
-                    right,
-                    output_cell_id.clone(),
-                )
+                build_equal_stream(left, right, output_cell_id.clone())
             }
             CollectionOp::ScalarWhen { arms, default } => {
                 let source = streams.get(&op.source_id).unwrap_or_else(|| {
-                    panic!("[DD CollectionOp] Missing source {:?} for ScalarWhen", op.source_id);
+                    panic!(
+                        "[DD CollectionOp] Missing source {:?} for ScalarWhen",
+                        op.source_id
+                    );
                 });
                 build_scalar_when_stream(
                     source,
@@ -3424,22 +4116,25 @@ pub(crate) fn build_collection_op_outputs<G: timely::dataflow::Scope<Timestamp =
                     default.clone(),
                 )
             }
-            CollectionOp::ComputedText { parts, extra_sources } => {
-                let mut source_streams = vec![
-                    streams.get(&op.source_id).unwrap_or_else(|| {
-                        panic!("[DD CollectionOp] Missing source {:?} for ComputedText", op.source_id);
-                    })
-                ];
+            CollectionOp::ComputedText {
+                parts,
+                extra_sources,
+            } => {
+                let mut source_streams = vec![streams.get(&op.source_id).unwrap_or_else(|| {
+                    panic!(
+                        "[DD CollectionOp] Missing source {:?} for ComputedText",
+                        op.source_id
+                    );
+                })];
                 for extra in extra_sources {
                     source_streams.push(streams.get(extra).unwrap_or_else(|| {
-                        panic!("[DD CollectionOp] Missing extra source {:?} for ComputedText", extra);
+                        panic!(
+                            "[DD CollectionOp] Missing extra source {:?} for ComputedText",
+                            extra
+                        );
                     }));
                 }
-                build_computed_text_stream(
-                    &source_streams,
-                    output_cell_id.clone(),
-                    parts.clone(),
-                )
+                build_computed_text_stream(&source_streams, output_cell_id.clone(), parts.clone())
             }
         };
 
@@ -3482,15 +4177,20 @@ where
 /// Collection/stream LATEST is handled in the evaluator via Concat ops.
 pub fn merge_latest(values: &[Value]) -> Value {
     // For scalar LATEST, take the last non-undefined value
-    values.iter().rev().find(|v| !v.is_undefined()).cloned().unwrap_or(Value::Unit)
+    values
+        .iter()
+        .rev()
+        .find(|v| !v.is_undefined())
+        .cloned()
+        .unwrap_or(Value::Unit)
 }
 
 // ============================================================================
 // PERSISTENT DD WORKER
 // ============================================================================
 
-use std::cell::RefCell;
 use differential_dataflow::input::InputSession;
+use std::cell::RefCell;
 
 thread_local! {
     /// Global persistent DD worker (browser is single-threaded, so no race conditions)
@@ -3615,95 +4315,105 @@ impl PersistentDdWorker {
         let mut worker = TimelyWorker::new(timely::WorkerConfig::default(), alloc, None);
 
         // Build the dataflow graph - returns (input_handle, probe, outputs_receiver)
-        let (mut event_input, probe, outputs_receiver) = worker.dataflow::<u64, _, _>(move |scope| {
-            use differential_dataflow::input::Input;
-            use super::operators::hold;
+        let (mut event_input, probe, outputs_receiver) =
+            worker.dataflow::<u64, _, _>(move |scope| {
+                use super::operators::hold;
+                use differential_dataflow::input::Input;
 
-            // Create input collection for events
-            let (event_handle, events_collection) =
-                scope.new_collection::<(String, EventValue), isize>();
+                // Create input collection for events
+                let (event_handle, events_collection) =
+                    scope.new_collection::<(String, EventValue), isize>();
 
-            // Collect all cell outputs to merge into single capture stream
-            let mut all_outputs: Vec<differential_dataflow::collection::VecCollection<_, TaggedCellOutput>> = Vec::new();
+                // Collect all cell outputs to merge into single capture stream
+                let mut all_outputs: Vec<
+                    differential_dataflow::collection::VecCollection<_, TaggedCellOutput>,
+                > = Vec::new();
 
-            // For each cell, create a HOLD operator
-            for cell_config in &cells_clone {
-                let cell_id = cell_config.id.name().to_string();
-                let initial = if list_cells_for_closure.contains(&cell_id) {
-                    let list_state = initial_list_states_clone.get(&cell_id).unwrap_or_else(|| {
-                        panic!("[DD Persistent] Missing list state for '{}'", cell_id);
+                // For each cell, create a HOLD operator
+                for cell_config in &cells_clone {
+                    let cell_id = cell_config.id.name().to_string();
+                    let initial = if list_cells_for_closure.contains(&cell_id) {
+                        let list_state =
+                            initial_list_states_clone.get(&cell_id).unwrap_or_else(|| {
+                                panic!("[DD Persistent] Missing list state for '{}'", cell_id);
+                            });
+                        CellState::List(list_state.clone())
+                    } else {
+                        let initial_value = initial_states_clone
+                            .get(&cell_id)
+                            .cloned()
+                            .unwrap_or_else(|| cell_config.initial.clone());
+                        let initial_value = validate_collection_initial(&cell_id, initial_value);
+                        cell_state_from_value(
+                            &cell_id,
+                            initial_value,
+                            &list_cells_for_closure,
+                            &initial_collection_items_clone,
+                        )
+                    };
+
+                    let trigger_ids: Vec<String> = cell_config
+                        .triggers
+                        .iter()
+                        .map(|l| l.name().to_string())
+                        .collect();
+                    let event_filter = cell_config.filter.clone();
+
+                    // Filter events to those that trigger this cell AND match the event filter
+                    let triggered = events_collection.filter(move |(link_id, event_value)| {
+                        trigger_ids.contains(link_id) && event_filter.matches(event_value)
                     });
-                    CellState::List(list_state.clone())
+
+                    // Apply transform using DD operators
+                    let transform = cell_config.transform.clone();
+                    let cell_id_for_tag = cell_id.clone();
+                    let cell_id_for_transform = cell_id.clone(); // For O(delta) list ops
+
+                    let output = hold_with_output(initial, &triggered, move |state, event| {
+                        apply_dd_transform_with_state(
+                            &transform,
+                            state,
+                            event,
+                            &cell_id_for_transform,
+                        )
+                    })
+                    .filter(|update| !matches!(update, CellUpdate::NoOp));
+
+                    // Tag output with cell ID for identification
+                    let tagged_output = output.map(move |value| TaggedCellOutput {
+                        cell_id: cell_id_for_tag.clone(),
+                        value,
+                    });
+
+                    all_outputs.push(tagged_output);
+                }
+
+                // Merge all outputs from HOLD cells
+                let merged = if all_outputs.is_empty() {
+                    scope.new_collection::<TaggedCellOutput, isize>().1
                 } else {
-                    let initial_value = initial_states_clone
-                        .get(&cell_id)
-                        .cloned()
-                        .unwrap_or_else(|| cell_config.initial.clone());
-                    let initial_value = validate_collection_initial(&cell_id, initial_value);
-                    cell_state_from_value(
-                        &cell_id,
-                        initial_value,
-                        &list_cells_for_closure,
-                        &initial_collection_items_clone,
-                    )
+                    let first = all_outputs.remove(0);
+                    all_outputs.into_iter().fold(first, |acc, c| acc.concat(&c))
                 };
 
-                let trigger_ids: Vec<String> = cell_config
-                    .triggers
-                    .iter()
-                    .map(|l| l.name().to_string())
-                    .collect();
-                let event_filter = cell_config.filter.clone();
+                // Attach DD-native collection ops
+                let collection_outputs = build_collection_op_outputs(
+                    scope,
+                    &merged,
+                    &collections_clone,
+                    &initial_collection_items_clone,
+                    &initial_states_clone,
+                );
 
-                // Filter events to those that trigger this cell AND match the event filter
-                let triggered = events_collection.filter(move |(link_id, event_value)| {
-                    trigger_ids.contains(link_id) && event_filter.matches(event_value)
-                });
+                let merged = merged.concat(&collection_outputs);
 
-                // Apply transform using DD operators
-                let transform = cell_config.transform.clone();
-                let cell_id_for_tag = cell_id.clone();
-                let cell_id_for_transform = cell_id.clone();  // For O(delta) list ops
+                // Use capture() for pure output observation - NO Mutex, NO side effects!
+                let outputs_rx = merged.inner.capture();
 
-                let output = hold_with_output(initial, &triggered, move |state, event| {
-                    apply_dd_transform_with_state(&transform, state, event, &cell_id_for_transform)
-                }).filter(|update| !matches!(update, CellUpdate::NoOp));
-
-                // Tag output with cell ID for identification
-                let tagged_output = output.map(move |value| TaggedCellOutput {
-                    cell_id: cell_id_for_tag.clone(),
-                    value,
-                });
-
-                all_outputs.push(tagged_output);
-            }
-
-            // Merge all outputs from HOLD cells
-            let merged = if all_outputs.is_empty() {
-                scope.new_collection::<TaggedCellOutput, isize>().1
-            } else {
-                let first = all_outputs.remove(0);
-                all_outputs.into_iter().fold(first, |acc, c| acc.concat(&c))
-            };
-
-            // Attach DD-native collection ops
-            let collection_outputs = build_collection_op_outputs(
-                scope,
-                &merged,
-                &collections_clone,
-                &initial_collection_items_clone,
-                &initial_states_clone,
-            );
-
-            let merged = merged.concat(&collection_outputs);
-
-            // Use capture() for pure output observation - NO Mutex, NO side effects!
-            let outputs_rx = merged.inner.capture();
-
-            // Create probe for progress tracking
-            let probe = events_collection.probe();
-            (event_handle, probe, outputs_rx)
-        });
+                // Create probe for progress tracking
+                let probe = events_collection.probe();
+                (event_handle, probe, outputs_rx)
+            });
 
         // Process init-only sources at time 0 by advancing the input frontier to 1.
         // This closes time 0 so the probe can advance, allowing probe-based stepping
@@ -3744,6 +4454,11 @@ impl PersistentDdWorker {
         // Step until event is processed
         while self.probe.less_than(&self.current_time) {
             self.worker.step();
+        }
+        for _ in 0..64 {
+            if !self.worker.step() {
+                break;
+            }
         }
     }
 
@@ -3800,21 +4515,23 @@ pub fn init_persistent_worker(
             initial_collection_items,
         )); // ALLOWED: DD execution context
     });
-    dd_log!("[DD Persistent] Worker initialized with {} cells", num_cells);
+    dd_log!(
+        "[DD Persistent] Worker initialized with {} cells",
+        num_cells
+    );
 }
 
 /// Check if persistent worker is initialized.
 pub fn has_persistent_worker() -> bool {
-    PERSISTENT_WORKER.with(|worker| {
-        worker.borrow().is_some()
-    }) // ALLOWED: DD execution context
+    PERSISTENT_WORKER.with(|worker| worker.borrow().is_some()) // ALLOWED: DD execution context
 }
 
 /// Inject an event into the persistent worker.
 pub fn inject_event_persistent(link_id: &LinkId, value: EventValue) -> Vec<DdOutput> {
     PERSISTENT_WORKER.with(|worker| {
         let mut guard = worker.borrow_mut();
-        if let Some(w) = guard.as_mut() { // ALLOWED: DD execution context
+        if let Some(w) = guard.as_mut() {
+            // ALLOWED: DD execution context
             w.inject_event(link_id, value);
             w.drain_outputs()
         } else {
@@ -3827,7 +4544,8 @@ pub fn inject_event_persistent(link_id: &LinkId, value: EventValue) -> Vec<DdOut
 pub fn drain_outputs_persistent() -> Vec<DdOutput> {
     PERSISTENT_WORKER.with(|worker| {
         let mut guard = worker.borrow_mut();
-        if let Some(w) = guard.as_mut() { // ALLOWED: DD execution context
+        if let Some(w) = guard.as_mut() {
+            // ALLOWED: DD execution context
             w.drain_outputs()
         } else {
             panic!("[DD Persistent] Worker not initialized");
@@ -3849,7 +4567,8 @@ pub fn config_matches(cells: &[DdCellConfig], collections: &DdCollectionConfig) 
     let new_signature = compute_config_signature(cells, collections);
     PERSISTENT_WORKER.with(|worker| {
         let guard = worker.borrow();
-        if let Some(w) = guard.as_ref() { // ALLOWED: DD execution context
+        if let Some(w) = guard.as_ref() {
+            // ALLOWED: DD execution context
             w.config_signature() == new_signature
         } else {
             false
@@ -3886,8 +4605,8 @@ pub fn reinit_if_config_changed(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::value::CollectionHandle;
+    use super::*;
     use ordered_float::OrderedFloat;
 
     #[test]
@@ -3913,7 +4632,13 @@ mod tests {
             collection_sources: HashMap::new(),
         };
         let initial_collection_items = HashMap::new();
-        let result = run_dd_first_batch(cells, collections, events, &initial, &initial_collection_items);
+        let result = run_dd_first_batch(
+            cells,
+            collections,
+            events,
+            &initial,
+            &initial_collection_items,
+        );
 
         assert_eq!(
             result.scalar_states.get("count"),
@@ -3943,10 +4668,19 @@ mod tests {
             collection_sources: HashMap::new(),
         };
         let initial_collection_items = HashMap::new();
-        let result = run_dd_first_batch(cells, collections, events, &initial, &initial_collection_items);
+        let result = run_dd_first_batch(
+            cells,
+            collections,
+            events,
+            &initial,
+            &initial_collection_items,
+        );
 
         // Toggle twice: false -> true -> false
-        assert_eq!(result.scalar_states.get("enabled"), Some(&Value::Bool(false)));
+        assert_eq!(
+            result.scalar_states.get("enabled"),
+            Some(&Value::Bool(false))
+        );
     }
 
     #[test]
@@ -3970,8 +4704,14 @@ mod tests {
         ]);
 
         let events = vec![
-            (LinkId::new("add"), EventValue::prepared_item(item1, Vec::new())),
-            (LinkId::new("add"), EventValue::prepared_item(item2, Vec::new())),
+            (
+                LinkId::new("add"),
+                EventValue::prepared_item(item1, Vec::new()),
+            ),
+            (
+                LinkId::new("add"),
+                EventValue::prepared_item(item2, Vec::new()),
+            ),
         ];
 
         let initial = HashMap::new();
@@ -3982,7 +4722,13 @@ mod tests {
         };
         let mut initial_collection_items = HashMap::new();
         initial_collection_items.insert(collection_id, Vec::new());
-        let result = run_dd_first_batch(cells, collections, events, &initial, &initial_collection_items);
+        let result = run_dd_first_batch(
+            cells,
+            collections,
+            events,
+            &initial,
+            &initial_collection_items,
+        );
 
         let list_state = result.list_states.get("items").unwrap_or_else(|| {
             panic!("Expected list state for items");
@@ -4005,7 +4751,10 @@ mod tests {
             ("__key", Value::text("item-1")),
             ("title", Value::text("item1")),
         ]);
-        let events = vec![(LinkId::new("add"), EventValue::prepared_item(item, Vec::new()))];
+        let events = vec![(
+            LinkId::new("add"),
+            EventValue::prepared_item(item, Vec::new()),
+        )];
 
         let initial = HashMap::new();
         let collections = DdCollectionConfig {
@@ -4014,7 +4763,13 @@ mod tests {
             collection_sources: HashMap::new(),
         };
         let initial_collection_items = HashMap::new();
-        let _ = run_dd_first_batch(cells, collections, events, &initial, &initial_collection_items);
+        let _ = run_dd_first_batch(
+            cells,
+            collections,
+            events,
+            &initial,
+            &initial_collection_items,
+        );
     }
 
     #[test]
@@ -4043,7 +4798,13 @@ mod tests {
         let initial_collection_items = initial_collections;
         let initial = HashMap::new();
 
-        let _ = run_dd_first_batch(Vec::new(), collections, Vec::new(), &initial, &initial_collection_items);
+        let _ = run_dd_first_batch(
+            Vec::new(),
+            collections,
+            Vec::new(),
+            &initial,
+            &initial_collection_items,
+        );
     }
 
     #[test]
@@ -4051,10 +4812,7 @@ mod tests {
     fn test_filter_predicate_template_substitution_requires_full_resolution() {
         let source_id = CollectionId::new();
         let output_id = CollectionId::new();
-        let item = Value::object([
-            ("__key", Value::text("a")),
-            ("flag", Value::Bool(true)),
-        ]);
+        let item = Value::object([("__key", Value::text("a")), ("flag", Value::Bool(true))]);
 
         let predicate_template = Value::object([
             ("flag", Value::Placeholder),
@@ -4080,7 +4838,13 @@ mod tests {
         let initial_collection_items = initial_collections;
         let initial = HashMap::new();
 
-        let _ = run_dd_first_batch(Vec::new(), collections, Vec::new(), &initial, &initial_collection_items);
+        let _ = run_dd_first_batch(
+            Vec::new(),
+            collections,
+            Vec::new(),
+            &initial,
+            &initial_collection_items,
+        );
     }
 
     #[test]
@@ -4212,9 +4976,10 @@ mod tests {
         let mut states: HashMap<String, Value> = HashMap::new();
         states.insert("count".to_string(), Value::int(0));
         let initial_by_id = states.clone();
-        let output = CellUpdate::multi(vec![
-            CellUpdate::set_value("count", Value::list_with_cell("items")),
-        ]);
+        let output = CellUpdate::multi(vec![CellUpdate::set_value(
+            "count",
+            Value::list_with_cell("items"),
+        )]);
         apply_output_to_states(&mut states, &output, &initial_by_id);
     }
 

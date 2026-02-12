@@ -89,6 +89,33 @@ fn create_persistent_profile() -> Result<PathBuf> {
     Ok(profile_dir)
 }
 
+/// Return PIDs of Chromium processes using Boon's persistent automation profile.
+#[cfg(target_os = "linux")]
+pub fn running_automation_pids() -> Vec<u32> {
+    let output = Command::new("pgrep")
+        .args(["-f", "tools/.chrome-profile"])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Return PIDs of Chromium processes using Boon's persistent automation profile.
+#[cfg(not(target_os = "linux"))]
+pub fn running_automation_pids() -> Vec<u32> {
+    Vec::new()
+}
+
+/// True when a Boon automation browser instance is already running.
+pub fn has_running_automation_browser() -> bool {
+    !running_automation_pids().is_empty()
+}
+
 /// Options for launching the browser
 #[allow(dead_code)]
 pub struct LaunchOptions {
@@ -113,6 +140,14 @@ impl Default for LaunchOptions {
 
 /// Launch Chromium with the Boon extension pre-loaded
 pub fn launch_browser(opts: LaunchOptions) -> Result<Child> {
+    if has_running_automation_browser() {
+        let pids = running_automation_pids();
+        return Err(anyhow!(
+            "Boon automation Chromium already running (PID(s): {:?}). Reuse existing session instead of launching a new instance.",
+            pids
+        ));
+    }
+
     let extension_path = find_extension_path()?;
     let user_data_dir = create_persistent_profile()?;
     let browser = opts
@@ -220,7 +255,7 @@ pub fn kill_browser_instances() -> Result<()> {
         // Find and kill Chromium processes with our profile
         // Note: we don't delete the profile directory to preserve developer mode settings
         let output = Command::new("pkill")
-            .args(["-f", "boon-chromium"])
+            .args(["-f", "tools/.chrome-profile"])
             .output();
 
         match output {
