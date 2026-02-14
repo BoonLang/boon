@@ -5,9 +5,9 @@
     "cl"
   ],
   "store_prompts": null,
-  "supervisor_prompt": "Continue implementing DD v2 - run ~/repos/boon-dd-v2/tools/verify_dd_v2.sh to see what's left.",
+  "supervisor_prompt": "Continue implementing and testing DD v2 - run ~/repos/boon-dd-v2/tools/verify_dd_v2.sh to see what's left (make sure it contains also script call to test examples in playground (minimal, hello_world, interval, interval_hold, counter, counter_hold, fibonacci, layers, shopping list, pages, todo_mvc).)",
   "completion_condition": "+completed+",
-  "completion_command": "~/repos/boon-dd-v2/tools/verify_dd_v2.sh",
+  "completion_command": "~/repos/boon-dd-v2/tools/verify_dd_v2.sh --strict",
   "protected_patterns": [
     "tools/**/*.rs",
     "crates/boon-cli/tests/*.bn.test",

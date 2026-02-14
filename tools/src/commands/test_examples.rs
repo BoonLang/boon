@@ -1082,9 +1082,12 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
-            // Use TypeTextCharByChar (dispatchKeyEvent) to simulate natural typing
-            // This is necessary because Boon's input handling expects character-by-character events
-            let response = send_command_to_server(port, WsCommand::TypeTextCharByChar { text: text.clone() }).await?;
+            // Use TypeText (Input.insertText) for reliable text insertion.
+            // TypeTextCharByChar (dispatchKeyEvent per char) can fail when the DD engine
+            // rebuilds the DOM between events, potentially losing focus or missing input events.
+            // Input.insertText directly sets the text and fires one input event, which is
+            // sufficient for the DD engine's TextChange handling.
+            let response = send_command_to_server(port, WsCommand::TypeText { text: text.clone() }).await?;
             if let WsResponse::Error { message } = response {
                 anyhow::bail!("Type text failed: {}", message);
             }

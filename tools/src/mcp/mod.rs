@@ -1408,77 +1408,53 @@ async fn click_element_by_text(text: &str, exact: bool, ws_port: u16) -> Result<
 
 /// Double-click an element by its text content
 async fn dblclick_element_by_text(text: &str, exact: bool, ws_port: u16) -> Result<String, String> {
-    // First get preview elements
-    let response = ws_server::send_command_to_server(ws_port, Command::GetPreviewElements)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Use DoubleClickByText command which dispatches directly on the element
+    // (avoids viewport/scroll issues with coordinate-based CDP clicking)
+    let response = ws_server::send_command_to_server(
+        ws_port,
+        Command::DoubleClickByText { text: text.to_string(), exact },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     match response {
-        Response::PreviewElements { data } => {
-            if let Some((x, y, width, height)) = find_element_bounds_by_text(&data, text, exact) {
-                let click_x = x + width / 2;
-                let click_y = y + height / 2;
-
-                // Double-click at the center of the element
-                let response = ws_server::send_command_to_server(
-                    ws_port,
-                    Command::DoubleClickAt { x: click_x, y: click_y },
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-
-                match response {
-                    Response::Success { .. } => Ok(format!(
-                        "Double-clicked '{}' at ({}, {})",
-                        text, click_x, click_y
-                    )),
-                    Response::Error { message } => Err(format!("Double-click failed: {}", message)),
-                    other => Err(format!("Double-click failed: unexpected response type: {:?}", other)),
-                }
+        Response::Success { data } => {
+            if let Some(d) = data {
+                let x = d.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+                let y = d.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+                Ok(format!("Double-clicked '{}' at ({}, {})", text, x, y))
             } else {
-                Err(format!("No element found containing text '{}'", text))
+                Ok(format!("Double-clicked '{}'", text))
             }
         }
-        Response::Error { message } => Err(format!("Failed to get elements: {}", message)),
-        _ => Err("Unexpected response from GetPreviewElements".to_string()),
+        Response::Error { message } => Err(format!("Double-click failed: {}", message)),
+        other => Err(format!("Double-click failed: unexpected response type: {:?}", other)),
     }
 }
 
 /// Hover over an element by its text content
 async fn hover_element_by_text(text: &str, exact: bool, ws_port: u16) -> Result<String, String> {
-    // First get preview elements
-    let response = ws_server::send_command_to_server(ws_port, Command::GetPreviewElements)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Use HoverByText command which dispatches directly on the element
+    // (avoids viewport/scroll issues with coordinate-based CDP hovering)
+    let response = ws_server::send_command_to_server(
+        ws_port,
+        Command::HoverByText { text: text.to_string(), exact },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     match response {
-        Response::PreviewElements { data } => {
-            if let Some((x, y, width, height)) = find_element_bounds_by_text(&data, text, exact) {
-                let hover_x = x + width / 2;
-                let hover_y = y + height / 2;
-
-                // Hover at the center of the element
-                let response = ws_server::send_command_to_server(
-                    ws_port,
-                    Command::HoverAt { x: hover_x, y: hover_y },
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-
-                match response {
-                    Response::Success { .. } => Ok(format!(
-                        "Hovered over '{}' at ({}, {})",
-                        text, hover_x, hover_y
-                    )),
-                    Response::Error { message } => Err(format!("Hover failed: {}", message)),
-                    other => Err(format!("Hover failed: unexpected response type: {:?}", other)),
-                }
+        Response::Success { data } => {
+            if let Some(d) = data {
+                let x = d.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+                let y = d.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+                Ok(format!("Hovered over '{}' at ({}, {})", text, x, y))
             } else {
-                Err(format!("No element found containing text '{}'", text))
+                Ok(format!("Hovered over '{}'", text))
             }
         }
-        Response::Error { message } => Err(format!("Failed to get elements: {}", message)),
-        _ => Err("Unexpected response from GetPreviewElements".to_string()),
+        Response::Error { message } => Err(format!("Hover failed: {}", message)),
+        other => Err(format!("Hover failed: unexpected response type: {:?}", other)),
     }
 }
 

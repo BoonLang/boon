@@ -448,6 +448,8 @@ async function cdpPressKey(tabId, key, modifiers = 0) {
     'Escape': { key: 'Escape', code: 'Escape', keyCode: 27, windowsVirtualKeyCode: 27 },
     'Backspace': { key: 'Backspace', code: 'Backspace', keyCode: 8, windowsVirtualKeyCode: 8 },
     'Delete': { key: 'Delete', code: 'Delete', keyCode: 46, windowsVirtualKeyCode: 46 },
+    'End': { key: 'End', code: 'End', keyCode: 35, windowsVirtualKeyCode: 35 },
+    'Home': { key: 'Home', code: 'Home', keyCode: 36, windowsVirtualKeyCode: 36 },
     'a': { key: 'a', code: 'KeyA', keyCode: 65, windowsVirtualKeyCode: 65 },
   };
 
@@ -1999,6 +2001,8 @@ async function handleCommand(id, command) {
 
       case 'doubleClickByText':
         // Double-click an element by its text content
+        // IMPORTANT: Dispatch dblclick directly on the found element (like clickByText)
+        // to avoid viewport/scroll issues with CDP coordinate-based clicking
         try {
           const searchText = command.text;
           const exact = command.exact || false;
@@ -2012,6 +2016,7 @@ async function handleCommand(id, command) {
 
               const allElements = preview.querySelectorAll('*');
               let bestMatch = null;
+              let bestMatchElement = null;
               let bestMatchSize = Infinity;
 
               allElements.forEach((el) => {
@@ -2035,19 +2040,40 @@ async function handleCommand(id, command) {
                   const size = rect.width * rect.height;
                   if (size < bestMatchSize) {
                     bestMatchSize = size;
+                    bestMatchElement = el;
                     bestMatch = {
                       text: directText,
-                      centerX: Math.round(rect.x + rect.width / 2),
-                      centerY: Math.round(rect.y + rect.height / 2)
+                      x: Math.round(rect.x),
+                      y: Math.round(rect.y),
+                      width: Math.round(rect.width),
+                      height: Math.round(rect.height)
                     };
                   }
                 }
               });
 
-              if (bestMatch) {
-                return { found: true, element: bestMatch };
+              if (!bestMatchElement) {
+                return { found: false, error: 'No element found with text: ' + searchText };
               }
-              return { found: false, error: 'No element found with text: ' + searchText };
+
+              // Dispatch dblclick directly on the element (works even when off-screen)
+              const rect = bestMatchElement.getBoundingClientRect();
+              const centerX = rect.x + rect.width / 2;
+              const centerY = rect.y + rect.height / 2;
+
+              bestMatchElement.dispatchEvent(new MouseEvent('dblclick', {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                clientX: centerX,
+                clientY: centerY,
+                detail: 2
+              }));
+
+              console.log('[Boon] doubleClickByText: dblclick dispatched on', bestMatch.text, 'at', Math.round(centerX), Math.round(centerY));
+              bestMatch.centerX = Math.round(centerX);
+              bestMatch.centerY = Math.round(centerY);
+              return { found: true, element: bestMatch };
             })()
           `);
 
@@ -2055,15 +2081,14 @@ async function handleCommand(id, command) {
             return { type: 'error', message: result.error || 'Element not found' };
           }
 
-          const element = result.element;
-          await cdpDoubleClickAt(tab.id, element.centerX, element.centerY);
-          return { type: 'success', data: { text: element.text, x: element.centerX, y: element.centerY } };
+          return { type: 'success', data: { text: result.element.text, x: result.element.centerX, y: result.element.centerY } };
         } catch (e) {
           return { type: 'error', message: `Double-click by text failed: ${e.message}` };
         }
 
       case 'hoverByText':
         // Hover over an element by its text content
+        // Uses scrollIntoView + CDP hover for real pointer events (Zoon needs real mouse events)
         try {
           const searchText = command.text;
           const exact = command.exact || false;
@@ -2077,6 +2102,7 @@ async function handleCommand(id, command) {
 
               const allElements = preview.querySelectorAll('*');
               let bestMatch = null;
+              let bestMatchElement = null;
               let bestMatchSize = Infinity;
 
               allElements.forEach((el) => {
@@ -2100,19 +2126,22 @@ async function handleCommand(id, command) {
                   const size = rect.width * rect.height;
                   if (size < bestMatchSize) {
                     bestMatchSize = size;
-                    bestMatch = {
-                      text: directText,
-                      centerX: Math.round(rect.x + rect.width / 2),
-                      centerY: Math.round(rect.y + rect.height / 2)
-                    };
+                    bestMatchElement = el;
+                    bestMatch = { text: directText };
                   }
                 }
               });
 
-              if (bestMatch) {
-                return { found: true, element: bestMatch };
+              if (!bestMatchElement) {
+                return { found: false, error: 'No element found with text: ' + searchText };
               }
-              return { found: false, error: 'No element found with text: ' + searchText };
+
+              // Scroll into view, then get viewport coordinates for CDP hover
+              bestMatchElement.scrollIntoView({ block: 'center', behavior: 'instant' });
+              const rect = bestMatchElement.getBoundingClientRect();
+              bestMatch.centerX = Math.round(rect.x + rect.width / 2);
+              bestMatch.centerY = Math.round(rect.y + rect.height / 2);
+              return { found: true, element: bestMatch };
             })()
           `);
 
@@ -2121,6 +2150,8 @@ async function handleCommand(id, command) {
           }
 
           const element = result.element;
+          // Small delay after scroll for layout to settle
+          await new Promise(r => setTimeout(r, 50));
           await cdpHoverAt(tab.id, element.centerX, element.centerY);
           return { type: 'success', data: { text: element.text, x: element.centerX, y: element.centerY } };
         } catch (e) {

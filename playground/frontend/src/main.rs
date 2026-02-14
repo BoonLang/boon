@@ -18,7 +18,7 @@ use boon::platform::browser::{
 // DD engine imports (feature-gated)
 #[cfg(feature = "engine-dd")]
 use boon::platform::browser::engine_dd::{
-    render_dd_document_reactive_signal, render_dd_result_reactive_signal,
+    render_dd_result_reactive_signal,
     run_dd_reactive_with_persistence,
     clear_dd_persisted_states,
 };
@@ -2005,18 +2005,9 @@ impl Playground {
                 if let Some(document) = dd_result.document.clone() {
                     println!("[DD Engine] Document rendered successfully");
 
-                    // Use simple rendering for examples with timers or sum accumulators
-                    // (re-evaluation breaks timers and accumulator IDs are unstable)
-                    // Use re-evaluation for HOLD-only examples (needed for derived values)
-                    let has_timers = !dd_result.context.get_timers().is_empty();
-                    let has_accumulators = dd_result.context.has_sum_accumulators();
-                    if has_timers || has_accumulators {
-                        return render_dd_document_reactive_signal(document, dd_result.context)
-                            .unify();
-                    } else {
-                        return render_dd_result_reactive_signal(dd_result)
-                            .unify();
-                    }
+                    // Always use full rendering (handles all element types, events, timers)
+                    return render_dd_result_reactive_signal(dd_result)
+                        .unify();
                 }
             }
 

@@ -582,11 +582,12 @@ dependencies = [
 
 [[package]]
 name = "columnation"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21ca68e419cae36821f2e1c9d62a25de900aad72e96b79c6f76eb47c65816d25"
+checksum = "b90b1614014f6958477dcdb77a2d489555db48ca61efe94c5cde2b0446933ed1"
 dependencies = [
  "paste",
+ "smallvec 1.15.1",
 ]
 
 [[package]]
@@ -686,15 +687,16 @@ dependencies = [
 
 [[package]]
 name = "differential-dataflow"
-version = "0.18.0"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ea9e6cf6184fcd6680ae65c9efcf212ac5bc7c1d9b0d05153e78a6e61a5aaf8"
+checksum = "8e19833bd83e8ecec2a2606f4e91f89a9acb466ba08e1454244a58f8dc2b3820"
 dependencies = [
  "columnar",
  "columnation",
  "fnv",
  "paste",
  "serde",
+ "smallvec 1.15.1",
  "timely",
 ]
 
@@ -1625,6 +1627,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
 dependencies = [
  "num-traits",
+ "rand 0.8.5",
+ "serde",
 ]
 
 [[package]]
@@ -1840,6 +1844,7 @@ dependencies = [
  "libc",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
+ "serde",
 ]
 
 [[package]]
@@ -1895,6 +1900,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.15",
+ "serde",
 ]
 
 [[package]]
@@ -2391,9 +2397,9 @@ dependencies = [
 
 [[package]]
 name = "timely"
-version = "0.25.1"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c60fbe7e39e5f8322db7d4844b37846a9bfd68a0c75e0fa7eef3aac86ffcada0"
+checksum = "d46321a5f1bdd49447ec08a3ccc09a68ae8dd83e7d88278c25196757e0af71e1"
 dependencies = [
  "bincode",
  "byteorder",
@@ -2411,15 +2417,15 @@ dependencies = [
 
 [[package]]
 name = "timely_bytes"
-version = "0.25.1"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b1398c9c349eda8194af39d4c806e4af9e257bb547fd128f8a34182a6010cd4"
+checksum = "c8c4aca5912988627c2db96e6b025ff1a6790c00b2c959649297be27c90467b6"
 
 [[package]]
 name = "timely_communication"
-version = "0.25.1"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c97d454c0ebf977fe8182aa69cd84b86eb36b51b66b7b107ba36ce29f1711daf"
+checksum = "8b38fe4db7b0d33a453ee393b9d601952326b4d8ccac234c626532b6519ec25a"
 dependencies = [
  "byteorder",
  "columnar",
@@ -2432,15 +2438,15 @@ dependencies = [
 
 [[package]]
 name = "timely_container"
-version = "0.25.1"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64eee71a0877a51423a617f09fc503b9586e8baa5599f209d28c41600c16474d"
+checksum = "488605939ebea7c87934c7c513579014c9a143c5cbf2ac30fdd14a16f37e0abf"
 
 [[package]]
 name = "timely_logging"
-version = "0.25.1"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8762e1082b824ab97818e241fc8f8bb5c97ec70cc0222c5f0b75abbcfff38b0"
+checksum = "8475926f1f9aa8eb59e6c4bfbd7f4db7fa0f65457ef3db4535c5645afac05839"
 dependencies = [
  "timely_container",
 ]
@@ -2557,9 +2563,9 @@ checksum = "1dccffe3ce07af9386bfd29e80c0ab1a8205a2fc34e4bcd40364df902cfa8f3f"
 
 [[package]]
 name = "ulid"
-version = "1.2.0"
+version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab82fc73182c29b02e2926a6df32f2241dbadb5cfc111fd595515b3598f46bb3"
+checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
 dependencies = [
  "rand 0.9.0",
  "serde",
