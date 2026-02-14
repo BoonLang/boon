@@ -1081,40 +1081,14 @@ async function handleCommand(id, command) {
         }
 
       case 'selectExample':
-        // Select an example by name (e.g., "todo_mvc.bn", "counter.bn")
-        // Uses CDP trusted clicks (Input.dispatchMouseEvent) for proper Zoon event handling
+        // Call the WASM-exported selectExample(name) which does the same as clicking the example tab
         try {
-          const exampleName = command.name;
-          // First, find the example tab and get its coordinates
-          const result = await cdpEvaluate(tab.id, `
-            (function() {
-              // Find all example tabs in the header
-              const tabs = document.querySelectorAll('[role="button"], button');
-              for (const tab of tabs) {
-                const text = (tab.textContent || '').trim();
-                if (text === '${exampleName}' || text === '${exampleName.replace('.bn', '')}') {
-                  // Found the tab - return its center coordinates (page coords)
-                  const rect = tab.getBoundingClientRect();
-                  return {
-                    found: true,
-                    text: text,
-                    x: rect.left + rect.width / 2 + window.scrollX,
-                    y: rect.top + rect.height / 2 + window.scrollY
-                  };
-                }
-              }
-              return { found: false, available: Array.from(tabs).map(t => (t.textContent || '').trim()).filter(t => t.endsWith('.bn')) };
-            })()
-          `);
-
-          if (result && result.found) {
-            // Use CDP trusted click (same as cdpClickAt) for proper event handling
-            await cdpClickAt(tab.id, result.x, result.y);
-            return { type: 'success', data: { selected: result.text } };
-          } else {
-            const available = result?.available?.join(', ') || 'unknown';
-            return { type: 'error', message: `Example '${exampleName}' not found. Available: ${available}` };
+          const exampleName = command.name.replace('.bn', '');
+          const found = await cdpEvaluate(tab.id, `window.boonPlayground.selectExample(${JSON.stringify(exampleName)})`);
+          if (!found) {
+            return { type: 'error', message: `Example '${exampleName}' not found` };
           }
+          return { type: 'success', data: { v: 2, selected: exampleName + '.bn' } };
         } catch (e) {
           return { type: 'error', message: e.message };
         }

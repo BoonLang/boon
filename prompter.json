@@ -1,13 +1,13 @@
 {
   "instance_label": "boon",
-  "port": 4567,
+  "port": 9632,
   "command": [
     "cl"
   ],
   "store_prompts": null,
-  "supervisor_prompt": "Don't stop until all phases of pure_dd.md are done. Verify with a subagent. Ignore time estimations - continue until done, pure DD everywhere. No fallbacks or transitive code to make code compile before the migration is done. Resolving compilation errors and warning should be done when all others steps are done to not accidentally reintroduce non-pure DD hacks or business logic to the engine (also verify such problems with subagents). ",
+  "supervisor_prompt": "Continue implementing DD v2 - run ~/repos/boon-dd-v2/tools/verify_dd_v2.sh to see what's left.",
   "completion_condition": "+completed+",
-  "completion_command": null,
+  "completion_command": "~/repos/boon-dd-v2/tools/verify_dd_v2.sh",
   "protected_patterns": [
     "tools/**/*.rs",
     "crates/boon-cli/tests/*.bn.test",

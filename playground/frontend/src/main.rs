@@ -457,8 +457,13 @@ impl Playground {
         }));
 
         // Load engine type: URL param > localStorage > default
+        // Validate that loaded engine is actually available in this build
         let engine_type_value = get_engine_from_url()
             .or_else(load_engine_from_storage)
+            .filter(|engine| match engine {
+                EngineType::Actors => cfg!(feature = "engine-actors"),
+                EngineType::DifferentialDataflow => cfg!(feature = "engine-dd"),
+            })
             .unwrap_or_else(default_engine);
         let engine_type = Mutable::new(engine_type_value);
 
@@ -571,6 +576,9 @@ impl Playground {
                 let run_command = self.run_command.clone();
                 let source_code = self.source_code.clone();
                 let current_file = self.current_file.clone();
+                let files = self.files.clone();
+                let custom_examples = self.custom_examples.clone();
+                let selected_custom_example = self.selected_custom_example.clone();
                 let forced_preview_size = self.forced_preview_size.clone();
                 let panel_layout = self.panel_layout.clone();
                 let engine_type = self.engine_type.clone();
@@ -761,6 +769,65 @@ impl Playground {
                     }) as Box<dyn Fn(String) -> JsValue>);
                     js_sys::Reflect::set(&api, &"setEngine".into(), set_engine.as_ref()).ok();
                     set_engine.forget();
+
+                    // selectExample(name) - select a built-in example (same as clicking its tab button)
+                    let files_for_select = files.clone();
+                    let current_file_for_select = current_file.clone();
+                    let source_code_for_select = source_code.clone();
+                    let run_command_for_select = run_command.clone();
+                    let custom_examples_for_select = custom_examples.clone();
+                    let selected_custom_example_for_select = selected_custom_example.clone();
+                    let engine_type_for_select = engine_type.clone();
+                    let select_example = Closure::wrap(Box::new(move |name: String| -> bool {
+                        let Some(example_data) = find_example_by_name(&name) else {
+                            return false;
+                        };
+
+                        let is_same_example = *current_file_for_select.lock_ref() == example_data.filename;
+
+                        // Save current code to previously selected custom example before switching
+                        let prev_selected_id = selected_custom_example_for_select.lock_ref().clone();
+                        if let Some(prev_id) = prev_selected_id {
+                            let current_code = source_code_for_select.lock_ref().to_string();
+                            let mut examples = (**custom_examples_for_select.lock_ref()).clone();
+                            if let Some((_, _, code)) = examples.iter_mut().find(|(id, _, _)| id == &prev_id) {
+                                *code = current_code;
+                            }
+                            custom_examples_for_select.set(Rc::new(examples));
+                        }
+
+                        // Clear custom example selection
+                        selected_custom_example_for_select.set(None);
+
+                        if !is_same_example {
+                            local_storage().remove(STATES_STORAGE_KEY);
+                            local_storage().remove(OLD_SOURCE_CODE_STORAGE_KEY);
+                            local_storage().remove(OLD_SPAN_ID_PAIRS_STORAGE_KEY);
+                            clear_prefixed_storage_keys(&["list_calls:", "list_removed:"]);
+
+                            #[cfg(feature = "engine-dd")]
+                            if engine_type_for_select.get() == EngineType::DifferentialDataflow {
+                                clear_dd_persisted_states();
+                            }
+                        }
+
+                        set_example_in_url(example_data.filename.trim_end_matches(".bn"));
+
+                        let mut new_files = BTreeMap::new();
+                        new_files.insert(
+                            example_data.filename.to_string(),
+                            example_data.source_code.to_string(),
+                        );
+                        files_for_select.set(Rc::new(new_files));
+                        current_file_for_select.set(example_data.filename.to_string());
+                        source_code_for_select.set_neq(Rc::new(Cow::from(example_data.source_code)));
+                        run_command_for_select.set(Some(RunCommand {
+                            filename: Some(example_data.filename),
+                        }));
+                        true
+                    }) as Box<dyn Fn(String) -> bool>);
+                    js_sys::Reflect::set(&api, &"selectExample".into(), select_example.as_ref()).ok();
+                    select_example.forget();
 
                     // Set window.boonPlayground
                     js_sys::Reflect::set(&window, &"boonPlayground".into(), &api).ok();

@@ -10,7 +10,7 @@ ulid = { version = "1.2.0", features = ["serde"] }
 
 [features]
 # Enable both engines by default for runtime switching
-default = ["engine-both"]
+default = ["engine-actors"]
 
 # Engine feature passthrough - these enable the corresponding boon engine features
 engine-actors = ["boon/engine-actors"]
