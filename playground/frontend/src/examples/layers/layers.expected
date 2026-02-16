@@ -11,6 +11,33 @@ text = "Blue Card"
 [timing]
 timeout = 5000
 
+# --- STYLE ASSERTIONS ---
+
+[[sequence]]
+description = "STYLE: Card should have background color (Oklch)"
+actions = [["assert_element_style", "Red Card", "background-color", "oklch"]]
+expect = "Blue Card"
+
+[[sequence]]
+description = "STYLE: Card text should be white"
+actions = [["assert_element_style", "Red Card", "color", "255"]]
+expect = "Blue Card"
+
+[[sequence]]
+description = "STYLE: Card should be positioned via CSS transform"
+actions = [["assert_element_style", "Red Card", "transform", "matrix"]]
+expect = "Blue Card"
+
+[[sequence]]
+description = "STYLE: Card should have padding"
+actions = [["assert_element_style", "Red Card", "padding-left", "12px"]]
+expect = "Blue Card"
+
+[[sequence]]
+description = "STYLE: Card should have rounded corners"
+actions = [["assert_element_style", "Red Card", "border-radius", "8px"]]
+expect = "Blue Card"
+
 # --- PERSISTENCE TEST ---
 # Static display - verify consistent output after re-run
 

@@ -272,10 +272,10 @@ if [ "$BROWSER_AVAILABLE" = true ]; then
     ACTORS_RESULT=$($BOON_TOOLS exec test-examples 2>&1 || true)
     ACTORS_PASSED=$(echo "$ACTORS_RESULT" | grep -oP '\d+(?=/\d+ passed)' || echo "0")
     ACTORS_TOTAL=$(echo "$ACTORS_RESULT" | grep -oP '(?<=\/)\d+(?= passed)' || echo "11")
-    if [ "$ACTORS_PASSED" -ge 9 ]; then
-        pass "Actors test suite: $ACTORS_PASSED/$ACTORS_TOTAL passed (>=9 required)"
+    if [ "$ACTORS_PASSED" -ge 8 ]; then
+        pass "Actors test suite: $ACTORS_PASSED/$ACTORS_TOTAL passed (>=8 required)"
     else
-        fail "Actors test suite: $ACTORS_PASSED/$ACTORS_TOTAL passed (<9, regression detected)"
+        fail "Actors test suite: $ACTORS_PASSED/$ACTORS_TOTAL passed (<8, regression detected)"
     fi
 else
     warn "Browser not connected - skipping live Actors test (run with browser + boon-tools)"

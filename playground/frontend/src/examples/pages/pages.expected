@@ -21,6 +21,18 @@ text = "Home"
 timeout = 8000
 poll_interval = 200
 
+# --- STYLE ASSERTIONS ---
+
+[[sequence]]
+description = "STYLE: Active nav button 'Home' should be bold (font-weight: 700)"
+actions = [["assert_element_style", "Home", "font-weight", "700"]]
+expect = "Home"
+
+[[sequence]]
+description = "STYLE: Nav bar should have dark background"
+actions = [["assert_element_style", "Home", "background-color", "oklch"]]
+expect = "Home"
+
 # --- NAVIGATION WITH URL VERIFICATION ---
 
 [[sequence]]

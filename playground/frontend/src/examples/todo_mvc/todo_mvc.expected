@@ -33,6 +33,20 @@ timeout = 15000
 poll_interval = 200
 
 # ============================================
+# SECTION 0: STYLE ASSERTIONS
+# ============================================
+
+[[sequence]]
+description = "STYLE: Header 'todos' should have ExtraLight font weight (200)"
+actions = [["assert_element_style", "todos", "font-weight", "200"]]
+expect = "2 items left"
+
+[[sequence]]
+description = "STYLE: Header 'todos' should have centered text"
+actions = [["assert_element_style", "todos", "text-align", "center"]]
+expect = "2 items left"
+
+# ============================================
 # SECTION 1: INPUT READY
 # ============================================
 

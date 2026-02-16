@@ -179,6 +179,14 @@ pub enum Command {
         hidpi: Option<bool>,
     },
 
+    /// Get computed CSS styles of an element found by text content
+    GetElementStyle {
+        /// Text content to find the element
+        text: String,
+        /// CSS property names to retrieve (e.g., ["font-weight", "color", "background-color"])
+        properties: Vec<String>,
+    },
+
     /// Get the currently selected engine type
     GetEngine,
 
@@ -310,6 +318,18 @@ pub enum Response {
         found: bool,
         /// Whether the checkbox is checked
         checked: bool,
+    },
+
+    /// Computed CSS styles for an element
+    ElementStyle {
+        /// Whether the element was found
+        found: bool,
+        /// Map of property name → computed value
+        #[serde(skip_serializing_if = "Option::is_none")]
+        styles: Option<std::collections::HashMap<String, String>>,
+        /// Error message if lookup failed
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 
     /// Engine info response

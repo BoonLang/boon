@@ -54,6 +54,12 @@ store: [
                         |> WHEN { True => [], False => SKIP }
                 }
         )
+    new_todo_focused: True |> HOLD state {
+        LATEST {
+            elements.new_todo_title_text_input.event.focus |> THEN { True }
+            elements.new_todo_title_text_input.event.blur |> THEN { False }
+        }
+    }
     todos_count: todos |> List/count()
     completed_todos_count:
         todos
@@ -143,6 +149,8 @@ FUNCTION root_element() {
                     SansSerif
                 }
             ]
+            line_height: 1.4
+            font_smoothing: Antialiased
             background: [color: Oklch[lightness: 0.97]]
         ]
         items: LIST { content_element() }
@@ -179,13 +187,13 @@ FUNCTION header() {
             align: [row: Center]
             height: 130
             font: [
-                size: 100
+                size: 80
                 color: Oklch[
-                    lightness: 0.50
-                    chroma: 0.14
-                    hue: 22
+                    lightness: 0.54
+                    chroma: 0.156
+                    hue: 21.2
                 ]
-                weight: Hairline
+                weight: ExtraLight
             ]
         ]
         child: Element/container(
@@ -216,13 +224,17 @@ FUNCTION main_panel() {
                 gap: 0
                 style: [
                     width: Fill
-                    outline: [
-                        color: Oklch[
-                            lightness: 0.50
-                            chroma: 0.14
-                            hue: 22
+                    outline: PASSED.store.new_todo_focused |> WHILE {
+                        True => [
+                            side: Inner
+                            color: Oklch[
+                                lightness: 0.50
+                                chroma: 0.14
+                                hue: 22
+                            ]
                         ]
-                    ]
+                        False => NoOutline
+                    }
                 ]
                 items: LIST {
                     PASSED.store.todos |> List/is_empty() |> WHILE {
@@ -259,11 +271,13 @@ FUNCTION new_todo_title_text_input() {
             event: [
                 change: LINK
                 key_down: LINK
+                blur: LINK
+                focus: LINK
             ]
         ]
         style: [
             width: Fill
-            padding: [column: 19, left: 16, right: 16]
+            padding: [column: 19, left: 6, right: 16]
             font: [size: 24, color: Oklch[lightness: 0.42]]
             background: [color: Oklch[alpha: 0.003]]
             shadows: LIST {
@@ -301,12 +315,12 @@ FUNCTION todo_item(todo) {
     Element/stripe(
         element: [hovered: LINK]
         direction: Row
-        gap: 5
+        gap: 10
         style: [
             width: Fill
             background: [color: Oklch[lightness: 1]]
             font: [size: 24]
-            padding: [row: 15, column: 10]
+            padding: [row: 5, column: 10]
         ]
         items: LIST {
             todo_checkbox(todo: todo)
@@ -354,7 +368,10 @@ FUNCTION todo_item(todo) {
                         width: Fill
                         font: [
                             size: 24
-                            color: Oklch[lightness: 0.42]
+                            color: todo.completed |> WHILE {
+                                True => Oklch[lightness: 0.647]
+                                False => Oklch[lightness: 0.42]
+                            }
                             line: [strikethrough: todo.completed]
                         ]
                     ]
@@ -400,20 +417,19 @@ FUNCTION toggle_all_checkbox() {
         all_completed: PASSED.store.all_completed
         Element/checkbox(
             element: [event: [click: LINK]]
-            style: [width: 60, height: Fill]
+            style: [width: 45, height: Fill, padding: [left: 18, right: 12], align: [column: Center]]
             label: Hidden[text: TEXT { Toggle all }]
             checked: all_completed
             icon: Element/container(
                 element: []
                 style: [
                     height: 34
-                    padding: [row: 27, column: 6]
                     font: [
                         size: 22
                         color: Oklch[
                             lightness: all_completed |> WHEN {
                                 True => 0.40
-                                False => 0.75
+                                False => 0.667
                             }
                         ]
                     ]
@@ -427,8 +443,8 @@ FUNCTION toggle_all_checkbox() {
 
 FUNCTION todo_checkbox(todo) {
     BLOCK {
-        icon_completed: TEXT { data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23bddad5%22%20stroke-width%3D%223%22/%3E%3Cpath%20fill%3D%22%235dc2af%22%20d%3D%22M72%2025L42%2071%2027%2056l-4%204%2020%2020%2034-52z%22/%3E%3C/svg%3E }
-        icon_active: TEXT { data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23ededed%22%20stroke-width%3D%223%22/%3E%3C/svg%3E }
+        icon_completed: TEXT { data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%2359A193%22%20stroke-width%3D%223%22/%3E%3Cpath%20fill%3D%22%233EA390%22%20d%3D%22M72%2025L42%2071%2027%2056l-4%204%2020%2020%2034-52z%22/%3E%3C/svg%3E }
+        icon_active: TEXT { data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23949494%22%20stroke-width%3D%223%22/%3E%3C/svg%3E }
         Element/checkbox(
             element: [event: [click: LINK]]
             style: []
@@ -459,6 +475,7 @@ FUNCTION remove_todo_button() {
             hovered: LINK
         ]
         style: [
+            align: Right
             size: 40
             font: [
                 size: 30
@@ -489,7 +506,7 @@ FUNCTION panel_footer() {
         style: [
             width: Fill
             padding: [row: 15, column: 10]
-            font: [color: Oklch[lightness: 0.57]]
+            font: [size: 15, color: Oklch[lightness: 0.178]]
             borders: [top: [color: Oklch[lightness: 0.925]]]
             shadows: LIST {
                 [y: 1, blur: 1, color: Oklch[alpha: 0.2]]
@@ -573,24 +590,18 @@ FUNCTION filter_button(filter) {
             rounded_corners: 3
             outline: BLOCK {
                 selected: PASSED.store.selected_filter == filter
-                alpha: selected |> WHILE {
-                    True => 0.2
-                    False => element.hovered |> WHILE {
-                        True => 0.1
-                        False => 0
-                    }
-                }
-                selected |> Bool/or(that: element.hovered) |> WHILE {
+                selected |> WHILE {
                     True => [
                         side: Inner
-                        color: Oklch[
-                            lightness: 0.5
-                            chroma: 0.165
-                            hue: 25.36
-                            alpha: alpha
-                        ]
+                        color: Oklch[lightness: 0.585, chroma: 0.172, hue: 24.1]
                     ]
-                    False => NoOutline
+                    False => element.hovered |> WHILE {
+                        True => [
+                            side: Inner
+                            color: Oklch[lightness: 0.679, chroma: 0.126, hue: 20.9]
+                        ]
+                        False => NoOutline
+                    }
                 }
             }
         ]
@@ -622,10 +633,11 @@ FUNCTION footer() {
         gap: 9
         style: [
             font: [
-                size: 10
+                size: 11
                 align: Center
-                color: Oklch[lightness: 0.805]
+                color: Oklch[lightness: 0.42]
             ]
+            text_shadow: [y: 1, color: Oklch[lightness: 1, alpha: 0.5]]
         ]
         items: LIST {
             Element/paragraph(
@@ -668,11 +680,6 @@ FUNCTION footer_link(label, to) {
         element: [hovered: LINK]
         style: [
             font: [
-                color: Oklch[
-                    lightness: 0.50
-                    chroma: 0.14
-                    hue: 22
-                ]
                 line: [underline: element.hovered]
             ]
         ]

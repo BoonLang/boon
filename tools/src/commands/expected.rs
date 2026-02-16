@@ -324,6 +324,24 @@ impl Action {
                             .context("assert_checkbox_clickable requires checkbox index")?;
                         Ok(ParsedAction::AssertCheckboxClickable { index: index as u32 })
                     }
+                    "assert_element_style" => {
+                        let target = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .context("assert_element_style requires target text")?
+                            .to_string();
+                        let property = arr
+                            .get(2)
+                            .and_then(|v| v.as_str())
+                            .context("assert_element_style requires CSS property name")?
+                            .to_string();
+                        let expected = arr
+                            .get(3)
+                            .and_then(|v| v.as_str())
+                            .context("assert_element_style requires expected value substring")?
+                            .to_string();
+                        Ok(ParsedAction::AssertElementStyle { target, property, expected })
+                    }
                     _ => anyhow::bail!("Unknown action type: {}", cmd),
                 }
             }
@@ -362,6 +380,7 @@ pub enum ParsedAction {
     AssertInputEmpty { index: u32 },  // Assert input value is empty
     AssertContains { text: String },  // Assert preview contains text
     AssertCheckboxClickable { index: u32 },  // Assert checkbox is clickable by real user (not obscured)
+    AssertElementStyle { target: String, property: String, expected: String },  // Assert computed CSS style on element found by text
 }
 
 #[derive(Debug, Clone, Deserialize)]

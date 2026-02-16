@@ -438,10 +438,12 @@ impl Playground {
                 })
         }));
 
-        // Load panel layout from storage (default: Normal)
+        // Load panel layout from storage (default: Normal).
+        // PreviewOnly is only for temporary screenshot use and should not persist.
         let panel_layout_value = local_storage()
             .get::<PanelLayout>(PANEL_LAYOUT_STORAGE_KEY)
             .and_then(Result::ok)
+            .filter(|layout| !matches!(layout, PanelLayout::PreviewOnly))
             .unwrap_or(PanelLayout::Normal);
         let panel_layout = Mutable::new(panel_layout_value);
 

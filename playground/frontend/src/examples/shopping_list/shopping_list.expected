@@ -14,6 +14,13 @@ text = "0 items"
 timeout = 10000
 poll_interval = 200
 
+# --- STYLE ASSERTIONS ---
+
+[[sequence]]
+description = "STYLE: Header 'Shopping List' should be bold (font-weight: 700)"
+actions = [["assert_element_style", "Shopping List", "font-weight", "700"]]
+expect = "0 items"
+
 # --- INPUT VERIFICATION ---
 
 [[sequence]]

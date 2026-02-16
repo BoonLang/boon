@@ -1224,6 +1224,19 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
             Ok(result)
         }
 
+        Response::ElementStyle { found, styles, error } => {
+            if !found {
+                Ok(format!("Element not found: {}", error.unwrap_or_default()))
+            } else if let Some(styles) = styles {
+                let formatted: Vec<String> = styles.iter()
+                    .map(|(k, v)| format!("  {}: {}", k, v))
+                    .collect();
+                Ok(format!("Element styles:\n{}", formatted.join("\n")))
+            } else {
+                Ok("Element found but no styles returned".to_string())
+            }
+        }
+
         Response::Error { message } => Err(message),
     }
 }

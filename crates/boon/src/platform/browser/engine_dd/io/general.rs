@@ -186,6 +186,7 @@ pub enum Event {
     KeyDown { link_path: String, key: String },
     TextChange { link_path: String, text: String },
     Blur { link_path: String },
+    Focus { link_path: String },
     DoubleClick { link_path: String },
     HoverChange { link_path: String, hovered: bool },
     TimerTick { var_name: String },
@@ -404,6 +405,12 @@ impl GeneralInner {
                     .fired_events
                     .insert(format!("{}.event.blur", link_path), Value::Unit);
             }
+            Event::Focus { link_path } => {
+                self.last_blur_path = None;
+                self.state
+                    .fired_events
+                    .insert(format!("{}.event.focus", link_path), Value::Unit);
+            }
             Event::DoubleClick { link_path } => {
                 self.state
                     .fired_events
@@ -413,14 +420,11 @@ impl GeneralInner {
                 self.state
                     .hovered
                     .insert(link_path.clone(), *hovered);
-                // Skip hover re-render when a text input has focus or during editing.
-                // Re-rendering replaces the input element, causing blur which:
-                // 1. During editing: exits editing mode and loses in-progress text
-                // 2. With focused input: triggers blur → hover → blur infinite loop
-                // The hover state is stored and will be picked up on the next meaningful re-render.
-                if has_focused_input() || self.has_editing_hold() {
-                    return;
-                }
+                // Note: The old full-rebuild approach skipped hover re-render when a text
+                // input had focus or during editing, to prevent blur→hover→blur loops.
+                // With the retained tree, DOM elements are NOT replaced — only Mutables
+                // are updated — so the text input stays in the DOM and keeps focus.
+                // No guard needed.
             }
             Event::TimerTick { var_name } => {
                 self.state
@@ -438,7 +442,6 @@ impl GeneralInner {
 
         // Re-evaluate document (fired_events still available for LATEST detection)
         let doc = self.evaluator.evaluate_document(&self.state);
-
         self.output.set(doc);
 
         // Clear fired events AFTER document rendering

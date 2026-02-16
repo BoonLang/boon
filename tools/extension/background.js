@@ -2665,6 +2665,89 @@ async function handleCommand(id, command) {
           return { type: 'error', message: 'SetEngine failed: ' + e.message };
         }
 
+      case 'getElementStyle':
+        // Get computed CSS styles of an element found by text content
+        try {
+          const result = await cdpEvaluate(tab.id, `
+            (function() {
+              const searchText = ${JSON.stringify(command.text)};
+              const properties = ${JSON.stringify(command.properties)};
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { found: false, error: 'Preview panel not found' };
+
+              // Find element by text content (prefer smallest/most specific match)
+              const allElements = preview.querySelectorAll('*');
+              let bestMatch = null;
+              let bestMatchSize = Infinity;
+
+              allElements.forEach((el) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return;
+
+                let directText = '';
+                for (const node of el.childNodes) {
+                  if (node.nodeType === Node.TEXT_NODE) {
+                    directText += node.textContent;
+                  }
+                }
+                directText = directText.trim();
+
+                if (directText.includes(searchText)) {
+                  const size = rect.width * rect.height;
+                  if (size < bestMatchSize) {
+                    bestMatchSize = size;
+                    bestMatch = el;
+                  }
+                }
+              });
+
+              if (!bestMatch) {
+                return { found: false, error: 'No element found with text: ' + searchText };
+              }
+
+              // Get computed styles for requested properties
+              // For non-inherited properties (background-color, transform, etc.),
+              // walk up the ancestor chain to find the nearest styled element.
+              const NON_INHERITED_DEFAULTS = {
+                'background-color': ['rgba(0, 0, 0, 0)', 'transparent'],
+                'transform': ['none'],
+                'box-shadow': ['none'],
+                'border-top': ['none'],
+                'border-bottom': ['none'],
+                'border-left': ['none'],
+                'border-right': ['none'],
+                'padding': ['0px'],
+                'padding-top': ['0px'],
+                'padding-bottom': ['0px'],
+                'padding-left': ['0px'],
+                'padding-right': ['0px'],
+                'border-radius': ['0px'],
+              };
+              const styles = {};
+              for (const prop of properties) {
+                let el = bestMatch;
+                let value = window.getComputedStyle(el).getPropertyValue(prop);
+                const defaults = NON_INHERITED_DEFAULTS[prop];
+                if (defaults) {
+                  while (defaults.includes(value) && el.parentElement && el.parentElement !== preview) {
+                    el = el.parentElement;
+                    value = window.getComputedStyle(el).getPropertyValue(prop);
+                  }
+                }
+                styles[prop] = value;
+              }
+              return { found: true, styles: styles };
+            })()
+          `);
+
+          if (!result.found) {
+            return { type: 'elementStyle', found: false, error: result.error || 'Element not found' };
+          }
+          return { type: 'elementStyle', found: true, styles: result.styles };
+        } catch (e) {
+          return { type: 'elementStyle', found: false, error: 'GetElementStyle failed: ' + e.message };
+        }
+
       default:
         return { type: 'error', message: `Unknown command: ${type}` };
     }

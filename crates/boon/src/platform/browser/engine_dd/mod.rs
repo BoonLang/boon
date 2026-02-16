@@ -259,6 +259,10 @@ pub fn render_dd_document_reactive_signal(
 ///
 /// Builds the complete UI from the document Value descriptor,
 /// wiring LINK event handlers to the DD worker or general handler.
+///
+/// For General programs, builds a retained element tree once and updates
+/// only changed Mutables on state changes (efficient incremental DOM updates).
+/// For Worker/Static programs, rebuilds the element tree on each change.
 pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
     zoon::println!("[DD v2] render_dd_result_reactive_signal called");
     let worker = result.worker_handle;
@@ -267,15 +271,74 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
 
     match document {
         Some(doc) => {
-            El::new().child_signal(doc.value.signal_cloned().map(move |value| {
-                if let Some(ref w) = worker {
-                    render::bridge::render_value(&value, w)
-                } else if let Some(ref g) = general {
-                    render::bridge::render_value_general(&value, g)
-                } else {
-                    render::bridge::render_value_static(&value)
-                }
-            }))
+            if let Some(handle) = general {
+                // General programs: retained tree for efficient updates.
+                // Build the element tree once, then diff-update only changed Mutables.
+                let ready = Mutable::new(false);
+                let root_cell: std::rc::Rc<
+                    std::cell::RefCell<Option<RawElOrText>>,
+                > = Default::default();
+                let retained: std::rc::Rc<
+                    std::cell::RefCell<Option<render::bridge::RetainedTree>>,
+                > = Default::default();
+
+                // Use Task::start_droppable so the async loop is cancelled
+                // when the element is removed from the DOM (example switch, re-run).
+                let _task_handle = Task::start_droppable({
+                    let ready = ready.clone();
+                    let root_cell = root_cell.clone();
+                    let retained = retained.clone();
+                    async move {
+                        let stream = doc.value.signal_cloned().to_stream();
+                        futures_util::pin_mut!(stream);
+                        while let Some(value) = stream.next().await {
+                            if matches!(&value, Value::Unit) {
+                                continue;
+                            }
+                            let mut ret = retained.borrow_mut();
+                            if let Some(tree) = ret.as_mut() {
+                                tree.update(&value, &handle);
+                            } else {
+                                zoon::println!("[DD v2] Building retained tree");
+                                let (element, tree) =
+                                    render::bridge::build_retained_tree(&value, &handle);
+                                *root_cell.borrow_mut() = Some(element);
+                                *ret = Some(tree);
+                                drop(ret);
+                                ready.set_neq(true);
+                            }
+                        }
+                    }
+                });
+
+                // Store the task handle on the element so dropping the element
+                // cancels the async loop and cleans up the retained tree + timers.
+                El::new()
+                    .s(Width::fill())
+                    .s(Height::fill())
+                    .update_raw_el(move |raw_el| {
+                        raw_el.after_remove(move |_| drop(_task_handle))
+                    })
+                    .child_signal(ready.signal().map({
+                        let root_cell = root_cell.clone();
+                        move |is_ready| {
+                            if is_ready {
+                                root_cell.borrow_mut().take()
+                            } else {
+                                None
+                            }
+                        }
+                    }))
+            } else {
+                // Worker/Static: rebuild on every change
+                El::new().child_signal(doc.value.signal_cloned().map(move |value| {
+                    if let Some(ref w) = worker {
+                        render::bridge::render_value(&value, w)
+                    } else {
+                        render::bridge::render_value_static(&value)
+                    }
+                }))
+            }
         }
         None => El::new().child("DD Engine: No document"),
     }

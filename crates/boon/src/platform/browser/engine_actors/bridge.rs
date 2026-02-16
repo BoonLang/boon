@@ -1415,6 +1415,16 @@ fn element_stripe(
                             1
                         };
 
+                        // Parse side: Inner or Outer (default: Outer)
+                        let is_inner = if let Some(side_var) = obj.variable("side") {
+                            match side_var.value_actor().value().await {
+                                Ok(Value::Tag(tag, _)) => tag.tag() == "Inner",
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        };
+
                         // Parse line_style: solid (default), dashed, dotted
                         let line_style = if let Some(style_var) = obj.variable("line_style") {
                             match style_var.value_actor().value().await {
@@ -1434,7 +1444,12 @@ fn element_stripe(
                             if let Ok(color_value) = color_var.value_actor().value().await {
                                 if let Some(css_color) = oklch_to_css(color_value).await {
                                     // Build typed Outline value
-                                    let mut outline = zoon::Outline::outer().width(thickness).color(css_color);
+                                    let mut outline = if is_inner {
+                                        zoon::Outline::inner()
+                                    } else {
+                                        zoon::Outline::outer()
+                                    };
+                                    outline = outline.width(thickness).color(css_color);
                                     outline = match line_style {
                                         "dashed" => outline.dashed(),
                                         "dotted" => outline.dotted(),
@@ -1597,6 +1612,120 @@ fn element_stripe(
         }
     );
 
+    // Raw CSS properties (no Zoon typed equivalent) — line-height, font-smoothing, text-shadow
+    let sv_line_height = tagged_object.expect_variable("settings");
+    let line_height_css_signal = signal::from_stream({
+        let style_stream = switch_map(
+            sv_line_height.stream(),
+            |value| value.expect_object().expect_variable("style").stream()
+        );
+        switch_map(
+            style_stream,
+            |value| {
+                let obj = value.expect_object();
+                match obj.variable("line_height") {
+                    Some(var) => var.stream().left_stream(),
+                    None => stream::empty().right_stream(),
+                }
+            }
+        )
+        .filter_map(|value| future::ready(match value {
+            Value::Number(n, _) => Some(format!("{}", n.number())),
+            _ => None,
+        }))
+        .boxed_local()
+    });
+
+    let sv_font_smoothing = tagged_object.expect_variable("settings");
+    let font_smoothing_css_signal = signal::from_stream({
+        let style_stream = switch_map(
+            sv_font_smoothing.stream(),
+            |value| value.expect_object().expect_variable("style").stream()
+        );
+        switch_map(
+            style_stream,
+            |value| {
+                let obj = value.expect_object();
+                match obj.variable("font_smoothing") {
+                    Some(var) => var.stream().left_stream(),
+                    None => stream::empty().right_stream(),
+                }
+            }
+        )
+        .filter_map(|value| future::ready(match &value {
+            Value::Tag(tag, _) if tag.tag() == "Antialiased" => Some("antialiased".to_string()),
+            _ => None,
+        }))
+        .boxed_local()
+    });
+
+    let sv_text_shadow = tagged_object.expect_variable("settings");
+    let text_shadow_css_signal = signal::from_stream({
+        let style_stream = switch_map(
+            sv_text_shadow.stream(),
+            |value| value.expect_object().expect_variable("style").stream()
+        );
+        switch_map(
+            style_stream,
+            |value| {
+                let obj = value.expect_object();
+                match obj.variable("text_shadow") {
+                    Some(var) => var.stream().left_stream(),
+                    None => stream::empty().right_stream(),
+                }
+            }
+        )
+        .filter_map(|value| async move {
+            if let Value::Object(obj, _) = &value {
+                async fn get_num(obj: &Object, name: &str) -> f64 {
+                    if let Some(v) = obj.variable(name) {
+                        match v.value_actor().current_value().await {
+                            Ok(Value::Number(n, _)) => n.number(),
+                            _ => 0.0,
+                        }
+                    } else {
+                        0.0
+                    }
+                }
+                let x = get_num(obj, "x").await;
+                let y = get_num(obj, "y").await;
+                let blur = get_num(obj, "blur").await;
+                let color_css = if let Some(color_var) = obj.variable("color") {
+                    match color_var.value_actor().current_value().await {
+                        Ok(Value::TaggedObject(tagged, _)) if tagged.tag() == "Oklch" => {
+                            async fn get_oklch(tagged: &TaggedObject, name: &str, default: f64) -> f64 {
+                                if let Some(v) = tagged.variable(name) {
+                                    match v.value_actor().value().await {
+                                        Ok(Value::Number(n, _)) => n.number(),
+                                        _ => default,
+                                    }
+                                } else {
+                                    default
+                                }
+                            }
+                            let l = get_oklch(&tagged, "lightness", 0.5).await;
+                            let c = get_oklch(&tagged, "chroma", 0.0).await;
+                            let h = get_oklch(&tagged, "hue", 0.0).await;
+                            let a = get_oklch(&tagged, "alpha", 1.0).await;
+                            if a < 1.0 {
+                                format!("oklch({}% {} {} / {})", l * 100.0, c, h, a)
+                            } else {
+                                format!("oklch({}% {} {})", l * 100.0, c, h)
+                            }
+                        }
+                        _ => "rgba(0,0,0,0.5)".to_string(),
+                    }
+                } else {
+                    "rgba(0,0,0,0.5)".to_string()
+                };
+                Some(format!("{}px {}px {}px {}", x, y, blur, color_css))
+            } else {
+                None
+            }
+        })
+        .boxed_local()
+    });
+
     Stripe::new()
         .direction_signal(signal::from_stream(direction_stream).map(Option::unwrap_or_default))
         .items_signal_vec(VecDiffStreamSignalVec(items_vec_diff_stream).map_signal(
@@ -1632,6 +1761,13 @@ fn element_stripe(
         .s(Borders::new().top_signal(border_top_typed_signal))
         .s(Outline::with_signal_self(outline_signal.map(|opt| opt.flatten())))
         .s(AlignContent::with_signal_self(combined_content_align_signal))
+        // Raw CSS properties without Zoon typed equivalents
+        .update_raw_el(move |raw_el| {
+            raw_el
+                .style_signal("line-height", line_height_css_signal)
+                .style_signal("-webkit-font-smoothing", font_smoothing_css_signal)
+                .style_signal("text-shadow", text_shadow_css_signal)
+        })
         // Keep tagged_object alive for the lifetime of this element
         .after_remove(move |_| {
             drop(tagged_object);
@@ -2424,6 +2560,40 @@ fn element_button(
         .boxed_local()
     });
 
+    // Align signal - self-alignment within parent container
+    let sv_align = settings_variable.clone();
+    let align_signal = signal::from_stream({
+        let style_stream = switch_map(
+            sv_align.stream(),
+            |value| value.expect_object().expect_variable("style").stream()
+        );
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("align") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .map(|value| {
+            match &value {
+                Value::Tag(tag, _) => {
+                    let mut align = zoon::Align::new();
+                    match tag.tag() {
+                        "Right" => { align = align.right(); }
+                        "Left" => { align = align.left(); }
+                        "Top" => { align = align.top(); }
+                        "Bottom" => { align = align.bottom(); }
+                        "Center" => { align = align.center_x().center_y(); }
+                        _ => {}
+                    }
+                    Some(align)
+                }
+                _ => None,
+            }
+        })
+        .boxed_local()
+    });
+
     // Background color signal
     // CRITICAL: Use nested switch_map (not flat_map) because variable streams are infinite.
     // oklch_to_css_stream subscribes to Oklch internal variables (lightness, chroma, hue)
@@ -2511,6 +2681,16 @@ fn element_button(
                             1
                         };
 
+                        // Parse side: Inner or Outer (default: Outer)
+                        let is_inner = if let Some(side_var) = obj.variable("side") {
+                            match side_var.value_actor().value().await {
+                                Ok(Value::Tag(tag, _)) => tag.tag() == "Inner",
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        };
+
                         // Parse line_style: solid (default), dashed, dotted
                         let line_style = if let Some(style_var) = obj.variable("line_style") {
                             match style_var.value_actor().value().await {
@@ -2529,9 +2709,14 @@ fn element_button(
                         if let Some(color_var) = obj.variable("color") {
                             if let Ok(color_value) = color_var.value_actor().value().await {
                                 if let Some(css_color) = oklch_to_css(color_value).await {
-                                    if LOG_DEBUG { zoon::println!("[OUTLINE] Generated typed Outline: width={}, style={}, color={}", thickness, line_style, css_color); }
+                                    if LOG_DEBUG { zoon::println!("[OUTLINE] Generated typed Outline: width={}, style={}, color={}, inner={}", thickness, line_style, css_color, is_inner); }
                                     // Build typed Outline value
-                                    let mut outline = zoon::Outline::outer().width(thickness).color(css_color);
+                                    let mut outline = if is_inner {
+                                        zoon::Outline::inner()
+                                    } else {
+                                        zoon::Outline::outer()
+                                    };
+                                    outline = outline.width(thickness).color(css_color);
                                     outline = match line_style {
                                         "dashed" => outline.dashed(),
                                         "dotted" => outline.dotted(),
@@ -2592,6 +2777,7 @@ fn element_button(
             .bottom_signal(padding_bottom_signal)
             .left_signal(padding_left_signal))
         .s(Font::with_signal_self(font_align_font_signal))
+        .s(Align::with_signal_self(align_signal.map(|opt| opt.flatten())))
         .after_remove(move |_| {
             drop(event_handler_loop);
             drop(tagged_object);
@@ -2609,6 +2795,7 @@ fn element_text_input(
     let (change_event_sender, mut change_event_receiver) = NamedChannel::<TimestampedEvent<String>>::new("text_input.change", 16);
     let (key_down_event_sender, mut key_down_event_receiver) = NamedChannel::<TimestampedEvent<String>>::new("text_input.key_down", 32);
     let (blur_event_sender, mut blur_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("text_input.blur", 8);
+    let (focus_event_sender, mut focus_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("text_input.focus", 8);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -2643,11 +2830,24 @@ fn element_text_input(
 
     let mut blur_stream = switch_map(
         element_variable
+            .clone()
             .stream()
             .filter_map(|value| future::ready(value.expect_object().variable("event"))),
         |variable| variable.stream()
     )
         .filter_map(|value| future::ready(value.expect_object().variable("blur")))
+        .map(move |variable| variable.expect_link_value_sender())
+        .chain(stream::pending())
+        .fuse();
+
+    let mut focus_stream = switch_map(
+        element_variable
+            .clone()
+            .stream()
+            .filter_map(|value| future::ready(value.expect_object().variable("event"))),
+        |variable| variable.stream()
+    )
+        .filter_map(|value| future::ready(value.expect_object().variable("focus")))
         .map(move |variable| variable.expect_link_value_sender())
         .chain(stream::pending())
         .fuse();
@@ -2720,6 +2920,7 @@ fn element_text_input(
             let mut change_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut key_down_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut blur_link_value_sender: Option<NamedChannel<Value>> = None;
+            let mut focus_link_value_sender: Option<NamedChannel<Value>> = None;
 
             // RACE CONDITION FIX: Buffer events that arrive before sender is ready.
             // When switching examples quickly, DOM events can arrive before the Boon
@@ -2727,6 +2928,7 @@ fn element_text_input(
             let mut pending_change_events: Vec<TimestampedEvent<String>> = Vec::new();
             let mut pending_key_down_events: Vec<TimestampedEvent<String>> = Vec::new();
             let mut pending_blur_events: Vec<TimestampedEvent<()>> = Vec::new();
+            let mut pending_focus_events: Vec<TimestampedEvent<()>> = Vec::new();
 
             loop {
                 select! {
@@ -2772,6 +2974,39 @@ fn element_text_input(
                             blur_link_value_sender = Some(sender);
                         }
                     }
+                    result = focus_stream.next() => {
+                        if let Some(sender) = result {
+                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] focus_link_value_sender READY"); }
+                            // Flush any buffered events first
+                            for buffered_event in pending_focus_events.drain(..) {
+                                if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Flushing buffered focus event: lamport={}", buffered_event.lamport_time); }
+                                let event_value = Object::new_value_with_lamport_time(
+                                    ConstructInfo::new("text_input::focus_event", None, "TextInput focus event"),
+                                    construct_context.clone(),
+                                    ValueIdempotencyKey::new(),
+                                    buffered_event.lamport_time,
+                                    [],
+                                );
+                                sender.send_or_drop(event_value);
+                            }
+                            focus_link_value_sender = Some(sender);
+                        }
+                    }
+                    event = focus_event_receiver.select_next_some() => {
+                        if let Some(sender) = focus_link_value_sender.as_ref() {
+                            let event_value = Object::new_value_with_lamport_time(
+                                ConstructInfo::new("text_input::focus_event", None, "TextInput focus event"),
+                                construct_context.clone(),
+                                ValueIdempotencyKey::new(),
+                                event.lamport_time,
+                                [],
+                            );
+                            sender.send_or_drop(event_value);
+                        } else {
+                            if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering focus event (sender not ready)"); }
+                            pending_focus_events.push(event);
+                        }
+                    }
                     // TimestampedEvent carries Lamport time captured at DOM callback
                     // This ensures correct ordering even when select! processes events out of order
                     event = change_event_receiver.select_next_some() => {
@@ -2805,13 +3040,14 @@ fn element_text_input(
                         }
                     }
                     event = blur_event_receiver.select_next_some() => {
-                        if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LOOP received blur: lamport={}, sender_ready={}", event.lamport_time, blur_link_value_sender.is_some()); }
+                        let blur_lamport = event.lamport_time;
+                        if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LOOP received blur: lamport={}, sender_ready={}", blur_lamport, blur_link_value_sender.is_some()); }
                         if let Some(sender) = blur_link_value_sender.as_ref() {
                             let event_value = Object::new_value_with_lamport_time(
                                 ConstructInfo::new("text_input::blur_event", None, "TextInput blur event"),
                                 construct_context.clone(),
                                 ValueIdempotencyKey::new(),
-                                event.lamport_time,
+                                blur_lamport,
                                 [],
                             );
                             sender.send_or_drop(event_value);
@@ -3111,6 +3347,16 @@ fn element_text_input(
                 sender.send_or_drop(event);
             }
         })
+        .update_raw_el({
+            let sender = focus_event_sender.clone();
+            move |raw_el| {
+                raw_el.event_handler(move |_: events::Focus| {
+                    let event = TimestampedEvent::now(());
+                    if LOG_DEBUG { zoon::println!("[EVENT:TextInput] on_focus fired: lamport={}", event.lamport_time); }
+                    sender.send_or_drop(event);
+                })
+            }
+        })
         .focus_signal(focus_signal)
         .s(Background::new().color_signal(background_color_signal))
         .s(Font::new()
@@ -3207,6 +3453,7 @@ fn element_checkbox(
     });
 
     let settings_variable = tagged_object.expect_variable("settings");
+    let sv_padding = tagged_object.expect_variable("settings");
 
     // CRITICAL: Use switch_map (not flat_map) because variable streams are infinite.
     let checked_stream = switch_map(
@@ -3227,12 +3474,88 @@ fn element_checkbox(
     )
     .map(move |value| value_to_element(value, construct_context.clone()));
 
+    // Padding support for checkbox element
+    let padding_tuple_signal = signal::from_stream({
+        let style_stream = switch_map(
+            sv_padding.stream(),
+            |value| value.expect_object().expect_variable("style").stream()
+        );
+        switch_map(
+            style_stream,
+            |value| {
+                let obj = value.expect_object();
+                match obj.variable("padding") {
+                    Some(var) => var.stream().left_stream(),
+                    None => stream::empty().right_stream(),
+                }
+            }
+        )
+        .filter_map(|value| async move {
+            match value {
+                Value::Number(n, _) => {
+                    let all = n.number() as u32;
+                    Some((all, all, all, all))
+                },
+                Value::Object(obj, _) => {
+                    let top = if let Some(v) = obj.variable("top") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else { 0 }
+                    } else if let Some(v) = obj.variable("column") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else { 0 }
+                    } else { 0 };
+                    let right = if let Some(v) = obj.variable("right") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else { 0 }
+                    } else if let Some(v) = obj.variable("row") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else { 0 }
+                    } else { 0 };
+                    let bottom = if let Some(v) = obj.variable("bottom") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else { 0 }
+                    } else if let Some(v) = obj.variable("column") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else { 0 }
+                    } else { 0 };
+                    let left = if let Some(v) = obj.variable("left") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else { 0 }
+                    } else if let Some(v) = obj.variable("row") {
+                        if let Ok(Value::Number(n, _)) = v.value_actor().current_value().await {
+                            n.number() as u32
+                        } else { 0 }
+                    } else { 0 };
+                    Some((top, right, bottom, left))
+                }
+                _ => None,
+            }
+        })
+        .boxed_local()
+    }).broadcast();
+    let padding_top_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(t, _, _, _)| t));
+    let padding_right_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, r, _, _)| r));
+    let padding_bottom_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, _, b, _)| b));
+    let padding_left_signal = padding_tuple_signal.signal_ref(|opt| opt.map(|(_, _, _, l)| l));
+
     Checkbox::new()
         .label_hidden("checkbox")
         .checked_signal(signal::from_stream(checked_stream).map(|c| c.unwrap_or(false)))
         .icon(move |_checked_mutable| {
             El::new().child_signal(signal::from_stream(icon_stream))
         })
+        .s(Padding::new()
+            .top_signal(padding_top_signal)
+            .right_signal(padding_right_signal)
+            .bottom_signal(padding_bottom_signal)
+            .left_signal(padding_left_signal))
         .on_click({
             let sender = click_event_sender.clone();
             move || {
@@ -3468,7 +3791,32 @@ fn element_label(
         .boxed_local()
     });
 
+    // Width signal (supports Fill or exact number)
+    let sv_width = tagged_object.expect_variable("settings");
+    let width_typed_signal = signal::from_stream({
+        let style_stream = switch_map(
+            sv_width.stream(),
+            |value| value.expect_object().expect_variable("style").stream()
+        );
+        switch_map(style_stream, |value| {
+            let obj = value.expect_object();
+            match obj.variable("width") {
+                Some(var) => var.stream().left_stream(),
+                None => stream::empty().right_stream(),
+            }
+        })
+        .filter_map(|value| {
+            let result = match value {
+                Value::Number(n, _) => Some(Width::exact(n.number() as u32)),
+                Value::Tag(tag, _) if tag.tag() == "Fill" => Some(Width::fill()),
+                _ => None,
+            };
+            future::ready(result)
+        })
+    });
+
     Label::new()
+        .s(Width::with_signal_self(width_typed_signal))
         .s(Font::new()
             .size_signal(font_size_signal)
             .color_signal(font_color_signal)

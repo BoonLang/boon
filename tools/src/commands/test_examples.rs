@@ -601,50 +601,28 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
         });
     }
 
-    // Read example code
-    let code = std::fs::read_to_string(&example.bn_path)
-        .with_context(|| format!("Failed to read {}", example.bn_path.display()))?;
-
-    // Clear states, reset URL to root, and refresh page before each test to ensure clean slate
-    let _ = send_command_to_server(opts.port, WsCommand::ClearStates).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    // Navigate to root route - critical for Router/route() based apps like todo_mvc
+    // Navigate to root route first - critical for Router/route() based apps like todo_mvc
     let _ = send_command_to_server(opts.port, WsCommand::NavigateTo { path: "/".to_string() }).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let _ = send_command_to_server(opts.port, WsCommand::Refresh).await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    // Inject code with filename for persistence
-    let filename = format!("{}.bn", example.name);
-    let response = send_command_to_server(opts.port, WsCommand::InjectCode { code, filename: Some(filename) }).await?;
+    // Use SelectExample to properly switch examples (clears state, updates file context, triggers run)
+    // This matches the manual UI behavior and ensures the previous example's DOM is fully cleaned up
+    let response = send_command_to_server(opts.port, WsCommand::SelectExample { name: example.name.clone() }).await?;
     if let WsResponse::Error { message } = response {
         return Ok(TestResult {
             name: example.name.clone(),
             passed: false,
             skipped: None,
             duration: start.elapsed(),
-            error: Some(format!("Inject failed: {}", message)),
+            error: Some(format!("SelectExample failed: {}", message)),
             actual_output: None,
             expected_output: None,
             steps,
         });
     }
 
-    // Trigger run
+    // Wait for the example to render
     tokio::time::sleep(Duration::from_millis(spec.timing.initial_delay)).await;
-    let response = send_command_to_server(opts.port, WsCommand::TriggerRun).await?;
-    if let WsResponse::Error { message } = response {
-        return Ok(TestResult {
-            name: example.name.clone(),
-            passed: false,
-            skipped: None,
-            duration: start.elapsed(),
-            error: Some(format!("Run failed: {}", message)),
-            actual_output: None,
-            expected_output: None,
-            steps,
-        });
-    }
 
     // Wait for initial output with smart waiting
     let initial_result = wait_for_output(
@@ -1428,6 +1406,38 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                     anyhow::bail!("Assert checkbox clickable failed: {}", message);
                 }
                 _ => anyhow::bail!("Unexpected response for AssertCheckboxClickable"),
+            }
+        }
+        ParsedAction::AssertElementStyle { target, property, expected } => {
+            // Verify computed CSS style on an element found by text content
+            let response = send_command_to_server(port, WsCommand::GetElementStyle {
+                text: target.clone(),
+                properties: vec![property.clone()],
+            }).await?;
+            match response {
+                WsResponse::ElementStyle { found, styles, error } => {
+                    if !found {
+                        anyhow::bail!(
+                            "Assert element style failed: element with text '{}' not found. {}",
+                            target, error.unwrap_or_default()
+                        );
+                    }
+                    let actual = styles
+                        .as_ref()
+                        .and_then(|s| s.get(property.as_str()))
+                        .cloned()
+                        .unwrap_or_default();
+                    if !actual.contains(expected.as_str()) {
+                        anyhow::bail!(
+                            "Assert element style failed: for element '{}', CSS '{}' = '{}' does not contain '{}'",
+                            target, property, actual, expected
+                        );
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert element style failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for GetElementStyle"),
             }
         }
     }
