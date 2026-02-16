@@ -321,6 +321,28 @@ variant would eliminate the DD framework overhead entirely.
 overhead for fixed-rate dataflow graphs. For Boon's UI case, most cells fire exactly
 once per event -- a trivial SDF schedule.
 
+> `★ Insight ─────────────────────────────────────`
+>
+> **A compiled Boon could be FASTER than hand-written Rust for static subgraphs.**
+>
+> MIT's [StreamIt](https://groups.csail.mit.edu/cag/streamit/) proved this is not
+> theoretical: it achieved 1-2x *better* than hand-coded C on 4/6 benchmarks, and
+> 11.2x mean speedup from 1 to 16 cores. The reason: when the compiler can see the
+> entire dataflow graph (production rates, consumption rates, communication patterns),
+> it simultaneously applies fusion, fission, scheduling, unrolling, and cache-aware
+> tiling -- optimizations a human might do one at a time but never all at once.
+>
+> Boon's pipe chains (`a |> b |> c`) are StreamIt Pipelines. `LATEST { a, b }` is a
+> SplitJoin. `HOLD` is a FeedbackLoop. The DD engine's `compile.rs` already analyzes
+> these patterns. Extending it with StreamIt-style rate analysis and operator fusion
+> would let the compiler find optimizations that a Rust programmer writing imperative
+> code simply cannot -- because the dataflow structure is invisible in imperative code.
+>
+> The path: `compile.rs` rate analysis -> static schedule -> operator fusion ->
+> WASM emission -> **faster than hand-written Rust for static reactive subgraphs**.
+>
+> `─────────────────────────────────────────────────`
+
 ### Layer 3: In-Place State Mutation
 
 **Option A -- Uniqueness types (Futhark style):**
