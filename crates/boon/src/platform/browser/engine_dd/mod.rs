@@ -8,7 +8,7 @@
 //!
 //! - `core/` — Pure DD computation. NO Zoon, web_sys, Mutable, RefCell.
 //! - `io/` — Bridges DD ↔ browser. Mutable<T> allowed here.
-//! - `render/` — Value descriptors → Zoon elements.
+//! - `render/` — Value descriptors → Zoon UI elements.
 
 pub mod core;
 pub mod io;
@@ -19,16 +19,66 @@ pub use core::types::{InputId, LinkId, ListKey, VarId};
 pub use core::value::Value;
 
 use std::cell::Cell;
+use std::cell::RefCell;
+use wasm_bindgen::JsCast;
 use zoon::*;
 
 use core::compile::{self, CompiledProgram};
 
 thread_local! {
-    /// When true, the DD general interpreter skips saving state to localStorage.
+    /// When true, the DD engine skips saving state to localStorage.
     /// Set by `clear_dd_persisted_states()` to prevent the running program from
     /// re-persisting its in-memory state after localStorage has been cleared.
     /// Reset when a new program starts.
     static SAVE_DISABLED: Cell<bool> = const { Cell::new(false) };
+    /// Active JS interval IDs. Cleared when a new program starts.
+    static ACTIVE_INTERVALS: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+    /// Last filename used for DD compilation. Used to detect example switches.
+    static LAST_FILENAME: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Clear all active DD engine JS intervals.
+/// Uses a JS global (`window.__boon_dd_intervals`) to track interval IDs
+/// across WASM hot-reloads (thread_locals are reset on hot-reload).
+fn clear_active_intervals() {
+    if let Some(window) = web_sys::window() {
+        let key = wasm_bindgen::JsValue::from_str("__boon_dd_intervals");
+        if let Ok(arr_val) = js_sys::Reflect::get(&window, &key) {
+            if let Some(arr) = arr_val.dyn_ref::<js_sys::Array>() {
+                let count = arr.length();
+                for i in 0..count {
+                    if let Some(id) = arr.get(i).as_f64() {
+                        window.clear_interval_with_handle(id as i32);
+                    }
+                }
+                if count > 0 {
+                    zoon::println!("[DD v2] Cleared {} intervals", count);
+                }
+            }
+        }
+        // Reset to empty array
+        let _ = js_sys::Reflect::set(&window, &key, &js_sys::Array::new());
+    }
+    // Also clear the WASM-side tracking
+    ACTIVE_INTERVALS.with(|ids| ids.borrow_mut().clear());
+}
+
+/// Register a JS interval ID for cleanup (both JS global and WASM-side).
+fn register_interval(id: i32) {
+    ACTIVE_INTERVALS.with(|ids| ids.borrow_mut().push(id));
+    // Also store in JS global (survives WASM hot-reload)
+    if let Some(window) = web_sys::window() {
+        let key = wasm_bindgen::JsValue::from_str("__boon_dd_intervals");
+        let arr = match js_sys::Reflect::get(&window, &key) {
+            Ok(v) if v.is_instance_of::<js_sys::Array>() => v.unchecked_into::<js_sys::Array>(),
+            _ => {
+                let a = js_sys::Array::new();
+                let _ = js_sys::Reflect::set(&window, &key, &a);
+                a
+            }
+        };
+        arr.push(&wasm_bindgen::JsValue::from(id));
+    }
 }
 
 /// Check if state saving is currently disabled.
@@ -46,7 +96,6 @@ pub struct DdResult {
     pub document: Option<DdDocument>,
     pub context: DdContext,
     worker_handle: Option<io::worker::DdWorkerHandle>,
-    general_handle: Option<io::general::GeneralHandle>,
 }
 
 /// A rendered DD document with reactive output.
@@ -63,7 +112,6 @@ pub struct DdContext {
 
 impl DdContext {
     pub fn get_timers(&self) -> &[()] {
-        // Return non-empty slice if has_timers to trigger timer rendering path
         if self.has_timers {
             &[()]
         } else {
@@ -80,16 +128,41 @@ impl DdContext {
 /// Parses the source, compiles it, builds a DD dataflow if needed,
 /// and returns the result with reactive document output.
 pub fn run_dd_reactive_with_persistence(
-    _filename: &str,
+    filename: &str,
     source_code: &str,
     states_storage_key: Option<&str>,
 ) -> Option<DdResult> {
-    // Re-enable saving for the new program
+    // Clean up from previous program
     reset_save_disabled();
+    clear_active_intervals();
+
+    // Clear persisted state when switching to a different example file.
+    // Different examples share the same storage key, so we must clear
+    // stale state to prevent one example's hold data from corrupting another.
+    // Only clear if we previously ran a different file (not on first run after page load,
+    // since that would break persistence across page reloads).
+    let switched_example = LAST_FILENAME.with(|f| {
+        let prev = f.borrow().clone();
+        let switched = !prev.is_empty() && prev != filename;
+        *f.borrow_mut() = filename.to_string();
+        switched
+    });
+    if switched_example {
+        clear_dd_persisted_states();
+        // Re-enable saving after the clear (clear_dd_persisted_states sets SAVE_DISABLED=true)
+        reset_save_disabled();
+    }
 
     zoon::println!("[DD v2] Compiling...");
 
-    let compiled = match compile::compile(source_code) {
+    // Load persisted hold values from localStorage
+    let persisted_holds = if let Some(key) = states_storage_key {
+        io::persistence::load_holds_map(key)
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let compiled = match compile::compile(source_code, states_storage_key, &persisted_holds) {
         Ok(program) => program,
         Err(e) => {
             zoon::eprintln!("[DD v2] Compilation error: {}", e);
@@ -105,140 +178,93 @@ pub fn run_dd_reactive_with_persistence(
                 document: Some(DdDocument { value: output }),
                 context: DdContext { has_timers: false },
                 worker_handle: None,
-                general_handle: None,
             })
         }
 
-        CompiledProgram::SingleHold {
-            initial_value,
-            hold_transform,
-            build_document,
-            link_bindings,
-        } => {
-            zoon::println!("[DD v2] Reactive program (SingleHold)");
+        CompiledProgram::Dataflow { graph } => {
+            zoon::println!("[DD v2] Dataflow program ({} collections, {} inputs)",
+                graph.collections.len(), graph.inputs.len());
 
-            // Load persisted state if available
-            let actual_initial = if let Some(key) = states_storage_key {
-                load_hold_state(key, "counter").unwrap_or(initial_value.clone())
-            } else {
-                initial_value.clone()
-            };
-
-            let initial_doc = build_document(&actual_initial);
-            let output = Mutable::new(initial_doc);
-            let output_for_callback = output.clone();
-            let build_doc = build_document.clone();
-            let storage_key = states_storage_key.map(|s| s.to_string());
-
-            let worker_handle =
-                io::worker::DdWorkerHandle::new_single_hold(
-                    actual_initial,
-                    hold_transform,
-                    &link_bindings,
-                    move |value| {
-                        let doc = build_doc(value);
-                        output_for_callback.set(doc);
-                        // Persist state
-                        if let Some(ref key) = storage_key {
-                            save_hold_state(key, "counter", value);
-                        }
-                    },
-                );
-
-            Some(DdResult {
-                document: Some(DdDocument { value: output }),
-                context: DdContext { has_timers: false },
-                worker_handle: Some(worker_handle),
-                general_handle: None,
-            })
-        }
-
-        CompiledProgram::LatestSum {
-            build_document,
-            link_bindings,
-        } => {
-            zoon::println!("[DD v2] Reactive program (LatestSum)");
-
-            // Load persisted state if available
-            let actual_initial = if let Some(key) = states_storage_key {
-                load_hold_state(key, "counter")
-                    .and_then(|v| v.as_number().map(Value::number))
-                    .unwrap_or_else(|| Value::number(0.0))
-            } else {
-                Value::number(0.0)
-            };
-
-            let initial_doc = build_document(&actual_initial);
-            let output = Mutable::new(initial_doc);
-            let output_for_callback = output.clone();
-            let build_doc = build_document.clone();
-            let storage_key = states_storage_key.map(|s| s.to_string());
-
-            let initial_sum = actual_initial.as_number().unwrap_or(0.0);
-            let worker_handle =
-                io::worker::DdWorkerHandle::new_latest_sum(
-                    initial_sum,
-                    &link_bindings,
-                    move |value| {
-                        let doc = build_doc(value);
-                        output_for_callback.set(doc);
-                        // Persist state
-                        if let Some(ref key) = storage_key {
-                            save_hold_state(key, "counter", value);
-                        }
-                    },
-                );
-
-            Some(DdResult {
-                document: Some(DdDocument { value: output }),
-                context: DdContext { has_timers: false },
-                worker_handle: Some(worker_handle),
-                general_handle: None,
-            })
-        }
-
-        CompiledProgram::General {
-            variables,
-            functions,
-        } => {
-            zoon::println!("[DD v2] General reactive program");
-
-            let has_timers = variables.iter().any(|(_, expr)| {
-                contains_timer(expr)
+            let has_timers = graph.inputs.iter().any(|i| {
+                i.kind == core::types::InputKind::Timer
             });
 
+            let has_router = graph.inputs.iter().any(|i| {
+                i.kind == core::types::InputKind::Router
+            });
+
+            // Collect timer specifications before moving graph into worker
+            let timer_specs: Vec<(String, f64)> = graph
+                .inputs
+                .iter()
+                .filter(|i| i.kind == core::types::InputKind::Timer)
+                .filter_map(|i| {
+                    let path = i.link_path.clone()?;
+                    let secs = i.timer_interval_secs?;
+                    Some((path, secs))
+                })
+                .collect();
+
             let output = Mutable::new(Value::Unit);
-            let general_handle = io::general::GeneralHandle::new(
-                variables,
-                functions,
-                output.clone(),
-                states_storage_key,
+            let output_for_callback = output.clone();
+
+            let worker_handle = io::worker::DdWorkerHandle::new_from_graph(
+                graph,
+                move |value| {
+                    output_for_callback.set(value.clone());
+                },
             );
+
+            // Set up JavaScript intervals for timer inputs
+            for (var_name, secs) in &timer_specs {
+                let handle = worker_handle.clone();
+                let name = var_name.clone();
+                let millis = (*secs * 1000.0) as i32;
+                let closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                    handle.inject_dd_event(io::worker::Event::TimerTick {
+                        var_name: name.clone(),
+                    });
+                });
+                if let Ok(id) = web_sys::window()
+                    .unwrap()
+                    .set_interval_with_callback_and_timeout_and_arguments_0(
+                        closure.as_ref().unchecked_ref(),
+                        millis,
+                    )
+                {
+                    register_interval(id);
+                }
+                closure.forget(); // Closure must outlive the interval
+            }
+
+            // Set up popstate listener for browser back/forward navigation
+            if has_router {
+                let handle_for_popstate = worker_handle.clone();
+                let popstate_closure =
+                    wasm_bindgen::closure::Closure::<dyn Fn(web_sys::Event)>::new(
+                        move |_event: web_sys::Event| {
+                            let path = web_sys::window()
+                                .and_then(|w| w.location().pathname().ok())
+                                .unwrap_or_else(|| "/".to_string());
+                            handle_for_popstate
+                                .inject_dd_event(io::worker::Event::RouterChange { path });
+                        },
+                    );
+                let _ = web_sys::window()
+                    .unwrap()
+                    .add_event_listener_with_callback(
+                        "popstate",
+                        popstate_closure.as_ref().unchecked_ref(),
+                    );
+                popstate_closure.forget(); // Listener lives until page unload
+            }
 
             Some(DdResult {
                 document: Some(DdDocument { value: output }),
                 context: DdContext { has_timers },
-                worker_handle: None,
-                general_handle: Some(general_handle),
+                worker_handle: Some(worker_handle),
             })
         }
-    }
-}
-
-fn contains_timer(expr: &crate::parser::static_expression::Spanned<crate::parser::static_expression::Expression>) -> bool {
-    use crate::parser::static_expression::Expression;
-    match &expr.node {
-        Expression::FunctionCall { path, .. } => {
-            let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-            path_strs.as_slice() == &["Timer", "interval"]
-        }
-        Expression::Pipe { from, to } => contains_timer(from) || contains_timer(to),
-        Expression::Variable(var) => contains_timer(&var.value),
-        Expression::Object(obj) => obj.variables.iter().any(|v| contains_timer(&v.node.value)),
-        Expression::Block { variables, output, .. } => {
-            variables.iter().any(|v| contains_timer(&v.node.value)) || contains_timer(output)
-        }
-        _ => false,
     }
 }
 
@@ -258,22 +284,19 @@ pub fn render_dd_document_reactive_signal(
 /// Render full DD result as a reactive Zoon element.
 ///
 /// Builds the complete UI from the document Value descriptor,
-/// wiring LINK event handlers to the DD worker or general handler.
+/// wiring LINK event handlers to the DD worker.
 ///
-/// For General programs, builds a retained element tree once and updates
-/// only changed Mutables on state changes (efficient incremental DOM updates).
-/// For Worker/Static programs, rebuilds the element tree on each change.
+/// For all reactive programs, uses the worker rendering path:
+/// rebuilds the element tree on each output change.
 pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
     zoon::println!("[DD v2] render_dd_result_reactive_signal called");
     let worker = result.worker_handle;
-    let general = result.general_handle;
     let document = result.document;
 
     match document {
         Some(doc) => {
-            if let Some(handle) = general {
-                // General programs: retained tree for efficient updates.
-                // Build the element tree once, then diff-update only changed Mutables.
+            if let Some(ref w) = worker {
+                // Dataflow programs: retained tree for efficient updates.
                 let ready = Mutable::new(false);
                 let root_cell: std::rc::Rc<
                     std::cell::RefCell<Option<RawElOrText>>,
@@ -281,9 +304,8 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
                 let retained: std::rc::Rc<
                     std::cell::RefCell<Option<render::bridge::RetainedTree>>,
                 > = Default::default();
+                let handle = w.clone();
 
-                // Use Task::start_droppable so the async loop is cancelled
-                // when the element is removed from the DOM (example switch, re-run).
                 let _task_handle = Task::start_droppable({
                     let ready = ready.clone();
                     let root_cell = root_cell.clone();
@@ -311,8 +333,6 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
                     }
                 });
 
-                // Store the task handle on the element so dropping the element
-                // cancels the async loop and cleans up the retained tree + timers.
                 El::new()
                     .s(Width::fill())
                     .s(Height::fill())
@@ -330,13 +350,9 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
                         }
                     }))
             } else {
-                // Worker/Static: rebuild on every change
-                El::new().child_signal(doc.value.signal_cloned().map(move |value| {
-                    if let Some(ref w) = worker {
-                        render::bridge::render_value(&value, w)
-                    } else {
-                        render::bridge::render_value_static(&value)
-                    }
+                // Static: single render
+                El::new().child_signal(doc.value.signal_cloned().map(|value| {
+                    render::bridge::render_value_static(&value)
                 }))
             }
         }
@@ -347,11 +363,9 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
 /// Clear persisted DD states (localStorage).
 /// Also disables saving so the running program doesn't re-persist its in-memory state.
 pub fn clear_dd_persisted_states() {
-    // Disable saving first so in-flight events don't re-persist
     SAVE_DISABLED.with(|f| f.set(true));
 
     if let Ok(Some(storage)) = web_sys::window().unwrap().local_storage() {
-        // Clear all dd_ prefixed keys
         let len = storage.length().unwrap_or(0);
         let mut keys_to_remove = Vec::new();
         for i in 0..len {
@@ -369,25 +383,6 @@ pub fn clear_dd_persisted_states() {
 
 /// Clear in-memory cell states.
 pub fn clear_cells_memory() {
-    // General interpreter state is dropped when the program is re-run
+    // State is dropped when the program is re-run
 }
 
-// ---------------------------------------------------------------------------
-// Persistence helpers
-// ---------------------------------------------------------------------------
-
-fn save_hold_state(storage_key: &str, hold_name: &str, value: &Value) {
-    if let Ok(Some(storage)) = web_sys::window().unwrap().local_storage() {
-        if let Ok(json) = serde_json::to_string(value) {
-            let key = format!("dd_{}_{}", storage_key, hold_name);
-            let _ = storage.set_item(&key, &json);
-        }
-    }
-}
-
-fn load_hold_state(storage_key: &str, hold_name: &str) -> Option<Value> {
-    let storage = web_sys::window()?.local_storage().ok()??;
-    let key = format!("dd_{}_{}", storage_key, hold_name);
-    let json = storage.get_item(&key).ok()??;
-    serde_json::from_str(&json).ok()
-}

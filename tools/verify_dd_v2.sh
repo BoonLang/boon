@@ -35,8 +35,48 @@ echo -e "${BLUE}  DD v2 Engine Verification${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════${NC}"
 echo ""
 
+# ─── CHECK 0: DD3 Structural Checks ───
+echo -e "${BLUE}[0/9] DD3 Structural: no imperative interpreter, real DD architecture${NC}"
+
+# general.rs must NOT exist
+if [ -f "$ENGINE_DD/io/general.rs" ]; then
+    fail "io/general.rs exists — imperative interpreter not deleted"
+else
+    pass "io/general.rs does not exist"
+fi
+
+# CompiledProgram::General must NOT exist in compile.rs
+if grep -q 'General\s*{' "$ENGINE_DD/core/compile.rs" 2>/dev/null; then
+    fail "CompiledProgram::General variant still exists in compile.rs"
+else
+    pass "No CompiledProgram::General variant"
+fi
+
+# core/runtime.rs must exist and use timely::execute_directly or Worker::new
+if [ -f "$ENGINE_DD/core/runtime.rs" ]; then
+    pass "core/runtime.rs exists"
+else
+    fail "core/runtime.rs does not exist — no DD materialization"
+fi
+
+# DataflowGraph must exist in core/
+if grep -rq 'DataflowGraph' "$ENGINE_DD/core/" --include='*.rs' 2>/dev/null; then
+    pass "DataflowGraph exists in core/"
+else
+    fail "DataflowGraph not found in core/"
+fi
+
+# CollectionSpec must exist in core/
+if grep -rq 'CollectionSpec' "$ENGINE_DD/core/" --include='*.rs' 2>/dev/null; then
+    pass "CollectionSpec exists in core/"
+else
+    fail "CollectionSpec not found in core/"
+fi
+
+echo ""
+
 # ─── CHECK 1: Anti-Cheat (core/ module purity) ───
-echo -e "${BLUE}[1/8] Anti-Cheat: core/ module purity${NC}"
+echo -e "${BLUE}[1/9] Anti-Cheat: core/ module purity${NC}"
 CORE_DIR="$ENGINE_DD/core"
 if [ -d "$CORE_DIR" ]; then
     for pattern in 'RefCell' 'Mutable<' 'thread_local' 'use zoon' 'use web_sys' \
@@ -64,7 +104,7 @@ fi
 echo ""
 
 # ─── CHECK 2: DD Operator Usage ───
-echo -e "${BLUE}[2/8] DD Operator Usage: verify real DD operators${NC}"
+echo -e "${BLUE}[2/9] DD Operator Usage: verify real DD operators${NC}"
 if [ -d "$ENGINE_DD" ]; then
     for op in 'join' 'arrange' 'concat' 'filter' 'map(' 'flat_map' 'reduce' 'count'; do
         count=$(grep -r "\.$op" "$ENGINE_DD" --include='*.rs' 2>/dev/null | wc -l)
@@ -75,8 +115,8 @@ if [ -d "$ENGINE_DD" ]; then
         fi
     done
     # Anti-pattern: Vec<Value> with to_vec() (DD v1 failure mode)
-    # Exclude local_scope.to_vec() (compile-time scope copies, not DD collection materialization)
-    count=$(grep -r 'to_vec()' "$ENGINE_DD" --include='*.rs' 2>/dev/null | grep -v 'local_scope' | grep -v 'fn_scope' | grep -v 'scope\.to_vec' | grep -v 'loop_scope' | grep -v 'new_scope' | grep -v 'item_scope' | wc -l)
+    # Exclude scope copies and slice-to-vec for closure captures (not DD collection materialization)
+    count=$(grep -r 'to_vec()' "$ENGINE_DD" --include='*.rs' 2>/dev/null | grep -v 'local_scope' | grep -v 'fn_scope' | grep -v 'scope\.to_vec' | grep -v 'loop_scope' | grep -v 'new_scope' | grep -v 'item_scope' | grep -v 'dep_names' | wc -l)
     if [ "$count" -gt 0 ]; then
         fail "Found to_vec() in engine_dd/ ($count) - DD v1 anti-pattern!"
     else
@@ -94,7 +134,7 @@ fi
 echo ""
 
 # ─── CHECK 3: Compilation ───
-echo -e "${BLUE}[3/8] Compilation: cargo check with engine-dd feature${NC}"
+echo -e "${BLUE}[3/9] Compilation: cargo check with engine-dd feature${NC}"
 cd "$REPO_ROOT"
 if cargo check -p boon --features engine-dd --message-format=short 2>&1 | tail -5; then
     pass "engine-dd compiles"
@@ -104,7 +144,7 @@ fi
 echo ""
 
 # ─── CHECK 4: Actor engine regression ───
-echo -e "${BLUE}[4/8] Regression: actor engine still compiles${NC}"
+echo -e "${BLUE}[4/9] Regression: actor engine still compiles${NC}"
 if cargo check -p boon --features engine-actors --message-format=short 2>&1 | tail -5; then
     pass "engine-actors compiles"
 else
@@ -113,7 +153,7 @@ fi
 echo ""
 
 # ─── CHECK 5: Construct coverage ───
-echo -e "${BLUE}[5/8] Construct Coverage: TodoMVC constructs supported${NC}"
+echo -e "${BLUE}[5/9] Construct Coverage: TodoMVC constructs supported${NC}"
 CONSTRUCTS=(
     "LATEST:hold_latest"
     "HOLD:hold_state"
@@ -155,7 +195,7 @@ fi
 echo ""
 
 # ─── CHECK 6: Live browser test (DD engine) ───
-echo -e "${BLUE}[6/8] Live Browser: DD engine counter_hold${NC}"
+echo -e "${BLUE}[6/9] Live Browser: DD engine counter_hold${NC}"
 BROWSER_AVAILABLE=false
 if [ -x "$BOON_TOOLS" ]; then
     # Check if browser extension is connected
@@ -212,7 +252,7 @@ fi
 echo ""
 
 # ─── CHECK 7: DD test-examples suite ───
-echo -e "${BLUE}[7/8] Live Browser: DD engine test-examples${NC}"
+echo -e "${BLUE}[7/9] Live Browser: DD engine test-examples${NC}"
 if [ "$BROWSER_AVAILABLE" = true ]; then
     # Switch to DD engine and run the full test suite
     $BOON_TOOLS exec set-engine DD >/dev/null 2>&1
@@ -244,7 +284,7 @@ fi
 echo ""
 
 # ─── CHECK 8: Live browser test (Actors engine regression) ───
-echo -e "${BLUE}[8/8] Live Browser: Actors engine regression${NC}"
+echo -e "${BLUE}[8/9] Live Browser: Actors engine regression${NC}"
 if [ "$BROWSER_AVAILABLE" = true ]; then
     # Select counter_hold on Actors engine
     $BOON_TOOLS exec select counter_hold >/dev/null 2>&1

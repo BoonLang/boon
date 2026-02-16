@@ -412,6 +412,8 @@ dependencies = [
  "differential-dataflow",
  "futures-channel",
  "getrandom 0.3.1",
+ "indexmap",
+ "js-sys",
  "ordered-float",
  "pin-project",
  "serde",

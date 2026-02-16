@@ -116,6 +116,128 @@ impl Value {
         }
     }
 
+    // ----- List helpers -----
+
+    /// Create an empty list value.
+    pub fn empty_list() -> Self {
+        Value::Tagged {
+            tag: Arc::from("List"),
+            fields: Arc::new(BTreeMap::new()),
+        }
+    }
+
+    /// Get the number of items in a list.
+    pub fn list_count(&self) -> usize {
+        if let Value::Tagged { tag, fields } = self {
+            if tag.as_ref() == "List" {
+                return fields.len();
+            }
+        }
+        0
+    }
+
+    /// Check if a list is empty.
+    pub fn list_is_empty(&self) -> bool {
+        self.list_count() == 0
+    }
+
+    /// Get list items as a Vec.
+    pub fn list_items(&self) -> Vec<&Value> {
+        if let Value::Tagged { tag, fields } = self {
+            if tag.as_ref() == "List" {
+                return fields.values().collect();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Append an item to a list, using the given index as key.
+    /// Remove a list item by key.
+    pub fn list_remove_by_key(&self, key: &str) -> Self {
+        if let Value::Tagged { tag, fields } = self {
+            if tag.as_ref() == "List" {
+                let mut new_fields = (**fields).clone();
+                new_fields.remove(key);
+                return Value::Tagged {
+                    tag: tag.clone(),
+                    fields: Arc::new(new_fields),
+                };
+            }
+        }
+        self.clone()
+    }
+
+    pub fn list_append(&self, item: Value, index: usize) -> Self {
+        if let Value::Tagged { tag, fields } = self {
+            if tag.as_ref() == "List" {
+                let mut new_fields = (**fields).clone();
+                new_fields.insert(Arc::from(format!("{:04}", index)), item);
+                return Value::Tagged {
+                    tag: tag.clone(),
+                    fields: Arc::new(new_fields),
+                };
+            }
+        }
+        self.clone()
+    }
+
+    /// Map a function over list items.
+    pub fn list_map(&self, f: impl Fn(&Value) -> Value) -> Self {
+        if let Value::Tagged { tag, fields } = self {
+            if tag.as_ref() == "List" {
+                let new_fields: BTreeMap<Arc<str>, Value> = fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), f(v)))
+                    .collect();
+                return Value::Tagged {
+                    tag: tag.clone(),
+                    fields: Arc::new(new_fields),
+                };
+            }
+        }
+        self.clone()
+    }
+
+    /// Retain only list items matching a predicate.
+    pub fn list_retain(&self, f: impl Fn(&Value) -> bool) -> Self {
+        if let Value::Tagged { tag, fields } = self {
+            if tag.as_ref() == "List" {
+                let new_fields: BTreeMap<Arc<str>, Value> = fields
+                    .iter()
+                    .filter(|(_, v)| f(v))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                return Value::Tagged {
+                    tag: tag.clone(),
+                    fields: Arc::new(new_fields),
+                };
+            }
+        }
+        self.clone()
+    }
+
+    // ----- Object/field helpers -----
+
+    /// Return a new value with one field updated (works on Object and Tagged).
+    pub fn update_field(&self, name: &str, val: Value) -> Self {
+        match self {
+            Value::Object(fields) => {
+                let mut new_fields = (**fields).clone();
+                new_fields.insert(Arc::from(name), val);
+                Value::Object(Arc::new(new_fields))
+            }
+            Value::Tagged { tag, fields } => {
+                let mut new_fields = (**fields).clone();
+                new_fields.insert(Arc::from(name), val);
+                Value::Tagged {
+                    tag: tag.clone(),
+                    fields: Arc::new(new_fields),
+                }
+            }
+            _ => self.clone(),
+        }
+    }
+
     /// Convert to user-visible display string.
     pub fn to_display_string(&self) -> String {
         match self {

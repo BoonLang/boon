@@ -23,8 +23,7 @@ use zoon::*;
 
 use super::super::core::types::LinkId;
 use super::super::core::value::Value;
-use super::super::io::general::{Event, GeneralHandle};
-use super::super::io::worker::DdWorkerHandle;
+use super::super::io::worker::{DdWorkerHandle, Event};
 
 type Fields = BTreeMap<Arc<str>, Value>;
 
@@ -160,7 +159,16 @@ fn extract_effective_link(fields: &Fields, parent_link_path: &str) -> String {
 
 /// Extract hover link path from element's `element: [hovered: LINK]` field.
 fn extract_hover_link_path(fields: &Fields, parent_link_path: &str) -> Option<String> {
-    // First check __link_path__ (set by |> LINK { alias } pipe)
+    // First check __hover_path__ (injected by DD compiler for per-item hover)
+    if let Some(path) = fields
+        .get("__hover_path__" as &str)
+        .and_then(|v| v.as_text())
+    {
+        if !path.is_empty() {
+            return Some(path.to_string());
+        }
+    }
+    // Then check __link_path__ (set by |> LINK { alias } pipe)
     if let Some(path) = fields
         .get("__link_path__" as &str)
         .and_then(|v| v.as_text())
@@ -973,14 +981,14 @@ impl RetainedNode {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Build a retained tree from a document Value.
-pub fn build_retained_tree(value: &Value, handle: &GeneralHandle) -> (RawElOrText, RetainedTree) {
+pub fn build_retained_tree(value: &Value, handle: &DdWorkerHandle) -> (RawElOrText, RetainedTree) {
     let (element, root) = build_retained_node(value, handle, "");
     (element, RetainedTree { root })
 }
 
 fn build_retained_node(
     value: &Value,
-    handle: &GeneralHandle,
+    handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
     match value {
@@ -1014,7 +1022,7 @@ fn build_retained_tagged(
     tag: &str,
     fields: &Arc<Fields>,
     full_value: &Value,
-    handle: &GeneralHandle,
+    handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
     match tag {
@@ -1054,7 +1062,7 @@ fn build_retained_tagged(
 fn build_retained_button(
     fields: &Fields,
     full_value: &Value,
-    handle: &GeneralHandle,
+    handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
@@ -1064,11 +1072,10 @@ fn build_retained_button(
     let el = Button::new()
         .update_raw_el(|raw_el| raw_el.attr("role", "button"))
         .label_signal(vm.signal_cloned().map(|v| {
-            let label = get_fields(&v)
+            get_fields(&v)
                 .and_then(|f| f.get("label" as &str))
                 .map(|l| l.to_display_string())
-                .unwrap_or_default();
-            El::new().child(label)
+                .unwrap_or_default()
         }))
         .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
         .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_align_font(&v))))
@@ -1114,7 +1121,7 @@ fn build_retained_button(
             move || {
                 let path = lp.borrow().clone();
                 if !path.is_empty() {
-                    handle_ref.inject_event(Event::LinkPress { link_path: path });
+                    handle_ref.inject_dd_event(Event::LinkPress { link_path: path });
                 }
             }
         })
@@ -1124,7 +1131,7 @@ fn build_retained_button(
             move |hovered| {
                 let path = lp.borrow().clone();
                 if !path.is_empty() {
-                    handle_ref.inject_event(Event::HoverChange { link_path: path, hovered });
+                    handle_ref.inject_dd_event(Event::HoverChange { link_path: path, hovered });
                 }
             }
         });
@@ -1141,7 +1148,7 @@ fn build_retained_button(
 fn build_retained_stripe(
     fields: &Fields,
     full_value: &Value,
-    handle: &GeneralHandle,
+    handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
@@ -1236,7 +1243,7 @@ fn build_retained_stripe(
                 let handle_in = handle_hover_in.clone_ref();
                 let enter_closure =
                     wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                        handle_in.inject_event(Event::HoverChange {
+                        handle_in.inject_dd_event(Event::HoverChange {
                             link_path: link_in.clone(),
                             hovered: true,
                         });
@@ -1252,7 +1259,7 @@ fn build_retained_stripe(
                 let handle_out = handle_hover_out.clone_ref();
                 let leave_closure =
                     wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                        handle_out.inject_event(Event::HoverChange {
+                        handle_out.inject_dd_event(Event::HoverChange {
                             link_path: link_out.clone(),
                             hovered: false,
                         });
@@ -1283,7 +1290,7 @@ fn build_retained_stripe(
 fn build_retained_stack(
     fields: &Fields,
     full_value: &Value,
-    handle: &GeneralHandle,
+    handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
@@ -1334,7 +1341,7 @@ fn build_retained_stack(
 fn build_retained_container(
     fields: &Fields,
     full_value: &Value,
-    handle: &GeneralHandle,
+    handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
@@ -1402,7 +1409,7 @@ fn build_retained_container(
 fn build_retained_label(
     fields: &Fields,
     full_value: &Value,
-    handle: &GeneralHandle,
+    handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
@@ -1462,7 +1469,7 @@ fn build_retained_label(
             move || {
                 let path = lp.borrow().clone();
                 if !path.is_empty() {
-                    handle_ref.inject_event(Event::DoubleClick { link_path: path });
+                    handle_ref.inject_dd_event(Event::DoubleClick { link_path: path });
                 }
             }
         })
@@ -1472,7 +1479,7 @@ fn build_retained_label(
             move |hovered| {
                 let path = lp.borrow().clone();
                 if !path.is_empty() {
-                    handle_ref.inject_event(Event::HoverChange { link_path: path, hovered });
+                    handle_ref.inject_dd_event(Event::HoverChange { link_path: path, hovered });
                 }
             }
         });
@@ -1489,7 +1496,7 @@ fn build_retained_label(
 fn build_retained_text_input(
     fields: &Fields,
     full_value: &Value,
-    handle: &GeneralHandle,
+    handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
@@ -1568,14 +1575,15 @@ fn build_retained_text_input(
             let handle_ref = handle.clone_ref();
             let lp = link_ref.clone();
             move |event| {
-                let path = lp.borrow().clone();
-                if !path.is_empty() {
+                let base = lp.borrow().clone();
+                if !base.is_empty() {
                     let key = match event.key() {
                         Key::Enter => "Enter".to_string(),
                         Key::Escape => "Escape".to_string(),
                         Key::Other(k) => k.clone(),
                     };
-                    handle_ref.inject_event(Event::KeyDown { link_path: path, key });
+                    let path = format!("{}.event.key_down", base);
+                    handle_ref.inject_dd_event(Event::KeyDown { link_path: path, key });
                 }
             }
         })
@@ -1583,9 +1591,10 @@ fn build_retained_text_input(
             let handle_ref = handle.clone_ref();
             let lp = link_ref.clone();
             move |text| {
-                let path = lp.borrow().clone();
-                if !path.is_empty() {
-                    handle_ref.inject_event(Event::TextChange { link_path: path, text });
+                let base = lp.borrow().clone();
+                if !base.is_empty() {
+                    let path = format!("{}.event.change", base);
+                    handle_ref.inject_dd_event(Event::TextChange { link_path: path, text });
                 }
             }
         })
@@ -1593,9 +1602,10 @@ fn build_retained_text_input(
             let handle_ref = handle.clone_ref();
             let lp = link_ref.clone();
             move || {
-                let path = lp.borrow().clone();
-                if !path.is_empty() {
-                    handle_ref.inject_event(Event::Blur { link_path: path });
+                let base = lp.borrow().clone();
+                if !base.is_empty() {
+                    let path = format!("{}.event.blur", base);
+                    handle_ref.inject_dd_event(Event::Blur { link_path: path });
                 }
             }
         })
@@ -1604,9 +1614,10 @@ fn build_retained_text_input(
             let lp = link_ref.clone();
             move |raw_el| {
                 raw_el.event_handler(move |_: events::Focus| {
-                    let path = lp.borrow().clone();
-                    if !path.is_empty() {
-                        handle_ref.inject_event(Event::Focus { link_path: path });
+                    let base = lp.borrow().clone();
+                    if !base.is_empty() {
+                        let path = format!("{}.event.focus", base);
+                        handle_ref.inject_dd_event(Event::Focus { link_path: path });
                     }
                 })
             }
@@ -1625,7 +1636,7 @@ fn build_retained_text_input(
 fn build_retained_checkbox(
     fields: &Fields,
     full_value: &Value,
-    handle: &GeneralHandle,
+    handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
@@ -1695,7 +1706,7 @@ fn build_retained_checkbox(
             el.update_raw_el(move |raw_el| {
                 raw_el.after_insert(move |el: web_sys::HtmlElement| {
                     let closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                        handle_ref.inject_event(Event::LinkClick {
+                        handle_ref.inject_dd_event(Event::LinkClick {
                             link_path: lp.borrow().clone(),
                         });
                     });
@@ -1727,7 +1738,7 @@ fn build_retained_checkbox(
             checkbox.update_raw_el(move |raw_el| {
                 raw_el.after_insert(move |el: web_sys::HtmlDivElement| {
                     let closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                        handle_ref.inject_event(Event::LinkClick {
+                        handle_ref.inject_dd_event(Event::LinkClick {
                             link_path: lp.borrow().clone(),
                         });
                     });
@@ -1755,7 +1766,7 @@ fn build_retained_checkbox(
 fn build_retained_paragraph(
     fields: &Fields,
     full_value: &Value,
-    handle: &GeneralHandle,
+    handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
@@ -1800,7 +1811,7 @@ fn build_retained_paragraph(
 fn build_retained_link(
     fields: &Fields,
     full_value: &Value,
-    handle: &GeneralHandle,
+    handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
@@ -1842,7 +1853,7 @@ fn build_retained_link(
                 let handle_in = handle_hover_in.clone_ref();
                 let enter_closure =
                     wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                        handle_in.inject_event(Event::HoverChange {
+                        handle_in.inject_dd_event(Event::HoverChange {
                             link_path: link_in.clone(),
                             hovered: true,
                         });
@@ -1858,7 +1869,7 @@ fn build_retained_link(
                 let handle_out = handle_hover_out.clone_ref();
                 let leave_closure =
                     wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                        handle_out.inject_event(Event::HoverChange {
+                        handle_out.inject_dd_event(Event::HoverChange {
                             link_path: link_out.clone(),
                             hovered: false,
                         });
@@ -1885,13 +1896,13 @@ fn build_retained_link(
 impl RetainedTree {
     /// Update the retained tree with a new document Value.
     /// Only changed elements' Mutables are updated; Zoon handles DOM diffs.
-    pub fn update(&mut self, new_value: &Value, handle: &GeneralHandle) {
+    pub fn update(&mut self, new_value: &Value, handle: &DdWorkerHandle) {
         self.root.update(new_value, handle, "");
     }
 }
 
 impl RetainedNode {
-    fn update(&mut self, new_value: &Value, handle: &GeneralHandle, link_path: &str) {
+    fn update(&mut self, new_value: &Value, handle: &DdWorkerHandle, link_path: &str) {
         match self {
             RetainedNode::Primitive { text } => {
                 let new_text = match new_value {
@@ -2117,7 +2128,7 @@ fn diff_children(
     retained: &mut Vec<RetainedNode>,
     tx: &mpsc::UnboundedSender<VecDiff<RawElOrText>>,
     new_items: &[Value],
-    handle: &GeneralHandle,
+    handle: &DdWorkerHandle,
     link_path: &str,
     field_name: &str,
 ) {

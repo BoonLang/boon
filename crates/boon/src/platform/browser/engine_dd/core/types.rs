@@ -3,6 +3,10 @@
 
 use std::sync::Arc;
 
+use indexmap::IndexMap;
+
+use super::value::Value;
+
 /// Identifies a variable / collection in the DD dataflow graph.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct VarId(pub Arc<str>);
@@ -41,13 +45,6 @@ impl LinkId {
     }
 }
 
-/// Specification for an external input source.
-#[derive(Clone, Debug)]
-pub struct InputSpec {
-    pub id: InputId,
-    pub link_id: LinkId,
-}
-
 /// Key for list elements in DD collections.
 ///
 /// Lists are DD collections of `(ListKey, Value)` pairs.
@@ -69,4 +66,207 @@ impl std::fmt::Display for ListKey {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+// ===========================================================================
+// DataflowGraph — the compiled representation of a reactive Boon program
+// ===========================================================================
+
+/// A complete DD dataflow specification compiled from Boon source.
+///
+/// Contains all input specifications, collection definitions in topological
+/// order, and the root document output variable.
+pub struct DataflowGraph {
+    /// External input sources (LINK events, timers, router).
+    pub inputs: Vec<InputSpec>,
+    /// Collection definitions in topological order.
+    /// Each entry maps a VarId to its CollectionSpec.
+    pub collections: IndexMap<VarId, CollectionSpec>,
+    /// The VarId of the root document output.
+    pub document: VarId,
+    /// Storage key for localStorage persistence (e.g., "counter_hold").
+    /// When set, HOLD state changes are persisted and restored on re-run.
+    pub storage_key: Option<String>,
+}
+
+/// Specification for an external input source.
+#[derive(Clone, Debug)]
+pub struct InputSpec {
+    pub id: InputId,
+    pub kind: InputKind,
+    /// LINK path for link-based events (e.g., "increment_button.event.press").
+    /// For timers, this is the variable name (e.g., "tick").
+    pub link_path: Option<String>,
+    /// For Timer inputs: the interval duration in seconds.
+    pub timer_interval_secs: Option<f64>,
+}
+
+/// Kind of external input.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InputKind {
+    LinkPress,
+    LinkClick,
+    KeyDown,
+    TextChange,
+    Blur,
+    Focus,
+    DoubleClick,
+    HoverChange,
+    Timer,
+    Router,
+}
+
+/// Closure types for DD operators.
+/// These are `Arc`-wrapped so they can be shared across DD operator closures.
+pub type TransformFn = Arc<dyn Fn(&Value) -> Value + 'static>;
+pub type CombineFn = Arc<dyn Fn(&Value, &Value) -> Value + 'static>;
+pub type FlatMapFn = Arc<dyn Fn(Value) -> Option<Value> + 'static>;
+pub type HoldTransformFn = Arc<dyn Fn(&Value, &Value) -> Value + 'static>;
+pub type ClassifyFn = Arc<dyn Fn(&Value) -> Option<(ListKey, Value)> + 'static>;
+pub type BroadcastHandlerFn = Arc<
+    dyn Fn(
+            &std::collections::HashMap<ListKey, Value>,
+            &Value,
+        ) -> Vec<(ListKey, Option<Value>)>
+        + 'static,
+>;
+
+/// Specification of a single collection in the dataflow.
+///
+/// Each variant corresponds to a DD operator or input source.
+/// The compiler emits these, and `runtime::materialize()` turns them
+/// into live DD collections.
+pub enum CollectionSpec {
+    /// Constant value — a single-element collection.
+    Literal(Value),
+
+    /// Constant keyed list — a multi-element keyed collection.
+    LiteralList(Vec<(ListKey, Value)>),
+
+    /// External input source.
+    Input(InputId),
+
+    /// LATEST: concat multiple sources, keep only the most recently changed.
+    HoldLatest(Vec<VarId>),
+
+    /// HOLD state: stateful accumulator.
+    /// initial + events → new state via transform(old_state, event).
+    HoldState {
+        initial: VarId,
+        events: VarId,
+        initial_value: Value,
+        transform: HoldTransformFn,
+    },
+
+    /// THEN: event-triggered map (positive diffs only).
+    Then {
+        source: VarId,
+        body: TransformFn,
+    },
+
+    /// Pure transform on a single source.
+    Map {
+        source: VarId,
+        f: TransformFn,
+    },
+
+    /// Pattern matching (WHEN): 0 or 1 output per input.
+    FlatMap {
+        source: VarId,
+        f: FlatMapFn,
+    },
+
+    /// Reactive join of two scalar collections.
+    /// Used for WHILE, reactive TEXT, reactive arithmetic.
+    Join {
+        left: VarId,
+        right: VarId,
+        combine: CombineFn,
+    },
+
+    /// Concatenate multiple collections.
+    Concat(Vec<VarId>),
+
+    /// List element count (scalar output).
+    ListCount(VarId),
+
+    /// List retain with static predicate.
+    ListRetain {
+        source: VarId,
+        predicate: Arc<dyn Fn(&Value) -> bool + 'static>,
+    },
+
+    /// List retain with reactive predicate (join list × filter state).
+    ListRetainReactive {
+        list: VarId,
+        filter_state: VarId,
+        predicate: Arc<dyn Fn(&Value, &Value) -> bool + 'static>,
+    },
+
+    /// Transform each list item.
+    ListMap {
+        source: VarId,
+        f: TransformFn,
+    },
+
+    /// Append items to a list (concat).
+    ListAppend {
+        list: VarId,
+        new_items: VarId,
+    },
+
+    /// Remove items from a list by key.
+    ListRemove {
+        list: VarId,
+        remove_keys: VarId,
+    },
+
+    /// Per-item stateful accumulator for keyed list elements.
+    KeyedHoldState {
+        initial: VarId,
+        events: VarId,
+        transform: HoldTransformFn,
+        /// Optional scalar broadcast events (toggle_all, remove_completed).
+        broadcasts: Option<VarId>,
+        /// Handler called with (all_items, broadcast_event) → per-item updates.
+        broadcast_handler: Option<BroadcastHandlerFn>,
+    },
+
+    /// Scalar event → keyed pairs (for wildcard event demuxing).
+    MapToKeyed {
+        source: VarId,
+        classify: ClassifyFn,
+    },
+
+    /// Scalar trigger → new keyed item with auto-incrementing key.
+    AppendNewKeyed {
+        source: VarId,
+        f: TransformFn,
+        initial_counter: usize,
+    },
+
+    /// Keyed → scalar list Value::Tagged("List", BTreeMap).
+    AssembleList(VarId),
+
+    /// Concat multiple keyed collections.
+    KeyedConcat(Vec<VarId>),
+
+    /// Skip first N positive diffs from a collection.
+    Skip {
+        source: VarId,
+        count: usize,
+    },
+
+    /// Side effect (e.g., localStorage persistence).
+    SideEffect {
+        source: VarId,
+        effect: SideEffectKind,
+    },
+}
+
+/// Kinds of side effects.
+#[derive(Clone, Debug)]
+pub enum SideEffectKind {
+    PersistHold { key: String, hold_name: String },
+    RouterGoTo,
 }

@@ -5,5 +5,6 @@
 
 pub mod compile;
 pub mod operators;
+pub mod runtime;
 pub mod types;
 pub mod value;

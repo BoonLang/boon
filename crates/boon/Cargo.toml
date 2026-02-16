@@ -34,6 +34,8 @@ futures-channel = { version = "0.3", features = ["sink"] }
 # timely 0.26 removes deprecated InputSession, fixes progress tracking
 # differential-dataflow 0.19 updated for timely 0.26
 ordered-float = { version = "4", optional = true, features = ["serde"] }
+indexmap = { version = "2", optional = true }
+js-sys = { version = "0.3", optional = true }
 timely = { version = "0.26", optional = true }
 differential-dataflow = { version = "0.19", optional = true }
 
@@ -45,7 +47,7 @@ default = ["debug-channels", "engine-actors"]
 # Use engine-dd for the differential dataflow engine
 # Use engine-both to enable runtime engine switching
 engine-actors = []
-engine-dd = ["dep:ordered-float", "dep:timely", "dep:differential-dataflow"]
+engine-dd = ["dep:ordered-float", "dep:indexmap", "dep:js-sys", "dep:timely", "dep:differential-dataflow"]
 engine-both = ["engine-actors", "engine-dd"]
 
 # Enable debug logging and timeouts for channel operations.
