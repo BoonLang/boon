@@ -221,6 +221,56 @@ When debugging visual differences between renders and reference images:
 
 See `docs/VISUAL_DEBUGGING.md` for the complete workflow guide.
 
+### Parallel Workspaces (jj)
+
+To work on multiple features simultaneously (each with its own mzoon + browser), create jj workspaces with unique ports.
+
+**Port allocation:**
+
+| Workspace | Playground | WebSocket |
+|-----------|-----------|-----------|
+| default (~/repos/boon) | 8083 | 9224 |
+| next workspace | 8084 | 9225 |
+| next after that | 8085 | 9226 |
+| ... | +1 | +1 |
+
+**Steps:**
+
+1. **Create the workspace** from the main repo:
+   ```bash
+   cd ~/repos/boon
+   jj workspace add ~/repos/boon_workspaces/<name> --name <name>
+   ```
+
+2. **Update ports** in the new workspace (4 files):
+   - `playground/MoonZoon.toml` — change `port` (lines 1 and 8)
+   - `tools/extension/background.js` — change `WS_URL` port (line 4) and all `localhost:8083` references
+   - `tools/extension/popup.js` — change `localhost:8083` reference
+   - `tools/extension/manifest.json` — change `localhost:8083` in `host_permissions` and `matches`
+
+3. **Commit the port changes** so they don't pollute feature work:
+   ```bash
+   cd ~/repos/boon_workspaces/<name>
+   jj commit -m "Configure workspace ports: playground <port>, WS <ws-port>"
+   ```
+
+4. **Launch the workspace:**
+   ```bash
+   # Terminal 1: mzoon
+   cd ~/repos/boon_workspaces/<name>/playground && makers mzoon start &
+
+   # Terminal 2: WS server
+   cd ~/repos/boon_workspaces/<name>/tools && cargo run --release -- server start --port <ws-port> --watch ./extension
+
+   # Terminal 3: browser
+   cd ~/repos/boon_workspaces/<name>/tools && cargo run --release -- browser launch --playground-port <port>
+   ```
+
+**Notes:**
+- Chrome profiles are per-workspace automatically (resolved relative to repo root)
+- All workspaces share the same jj repo — `jj log` from any workspace shows all commits
+- The default workspace at `~/repos/boon` stays on ports 8083/9224
+
 ## Architecture
 
 ### Parser (`crates/boon/src/parser/`)
