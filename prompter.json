@@ -1,13 +1,13 @@
 {
   "instance_label": "boon",
-  "port": 4567,
+  "port": 9632,
   "command": [
     "cl"
   ],
   "store_prompts": null,
   "supervisor_prompt": "Don't stop until all examples work with pure DD engine.",
   "completion_condition": "+completed+",
-  "completion_command": null,
+  "completion_command": "~/repos/boon-dd-v2/tools/verify_dd_v2.sh --strict",
   "protected_patterns": [
     "tools/**/*.rs",
     "crates/boon-cli/tests/*.bn.test",

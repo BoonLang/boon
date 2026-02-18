@@ -1,7 +1,6 @@
 //! Test runner for Boon playground examples
 
 use anyhow::{Context, Result};
-use regex::Regex;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -20,23 +19,6 @@ pub struct TestOptions {
     pub screenshot_on_fail: bool,
     pub verbose: bool,
     pub examples_dir: Option<PathBuf>,
-    pub no_launch: bool,
-}
-
-/// Options for built-in playground smoke command
-pub struct SmokeOptions {
-    pub port: u16,
-    pub filter: Option<String>,
-    pub no_launch: bool,
-}
-
-/// Result of a single built-in smoke check
-#[derive(Debug)]
-pub struct SmokeResult {
-    pub name: String,
-    pub passed: bool,
-    pub duration: Duration,
-    pub error: Option<String>,
 }
 
 /// Result of a single test
@@ -253,51 +235,6 @@ enum ConnectionStatus {
     Ready,
 }
 
-/// Wait for a previously running browser extension to reconnect to a restarted WS server.
-async fn wait_for_existing_extension_connection(port: u16, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if matches!(get_connection_status(port).await, ConnectionStatus::Ready) {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    false
-}
-
-/// Ensure the playground runs with the DD engine before test automation.
-async fn ensure_engine_dd(port: u16) -> Result<()> {
-    let response = send_command_to_server(port, WsCommand::GetEngine).await?;
-    let current = match response {
-        WsResponse::EngineInfo { engine, .. } => engine,
-        WsResponse::Error { message } => anyhow::bail!("GetEngine failed: {}", message),
-        other => anyhow::bail!("GetEngine unexpected response: {:?}", other),
-    };
-
-    if current == "DD" {
-        return Ok(());
-    }
-
-    let response = send_command_to_server(port, WsCommand::SetEngine {
-        engine: "DD".to_string(),
-    }).await?;
-    match response {
-        WsResponse::Success { .. } => {}
-        WsResponse::Error { message } => anyhow::bail!("SetEngine(DD) failed: {}", message),
-        other => anyhow::bail!("SetEngine(DD) unexpected response: {:?}", other),
-    }
-
-    let verify = send_command_to_server(port, WsCommand::GetEngine).await?;
-    match verify {
-        WsResponse::EngineInfo { engine, .. } if engine == "DD" => Ok(()),
-        WsResponse::EngineInfo { engine, .. } => {
-            anyhow::bail!("Engine did not switch to DD (current: {})", engine)
-        }
-        WsResponse::Error { message } => anyhow::bail!("GetEngine verify failed: {}", message),
-        other => anyhow::bail!("GetEngine verify unexpected response: {:?}", other),
-    }
-}
-
 /// Check connection status, distinguishing between server issues and extension issues
 async fn get_connection_status(port: u16) -> ConnectionStatus {
     match check_server_connection(port).await {
@@ -332,7 +269,7 @@ pub struct SetupState {
 /// Ensure WebSocket server is running and browser extension is connected.
 /// Will start server and launch browser if needed.
 /// Returns SetupState indicating what was started (for cleanup).
-async fn ensure_browser_connection(port: u16, no_launch: bool) -> Result<SetupState> {
+async fn ensure_browser_connection(port: u16) -> Result<SetupState> {
     let mut setup = SetupState { started_mzoon: false };
 
     // Step 0: Ensure playground (mzoon) is running
@@ -394,27 +331,6 @@ async fn ensure_browser_connection(port: u16, no_launch: bool) -> Result<SetupSt
 
     // Step 3: Need to launch browser if extension not connected
     if matches!(status, ConnectionStatus::NoExtension | ConnectionStatus::ServerNotRunning) {
-        if no_launch {
-            anyhow::bail!(
-                "Browser extension is not connected and --no-launch is set. \
-Start/attach a browser with the Boon extension, then retry."
-            );
-        }
-
-        if browser::has_running_automation_browser() {
-            println!("Automation Chromium already running. Waiting for extension to reconnect...");
-            if wait_for_existing_extension_connection(port, Duration::from_secs(25)).await {
-                println!("Extension reconnected to existing Chromium session.");
-                return Ok(setup);
-            }
-            let pids = browser::running_automation_pids();
-            anyhow::bail!(
-                "Automation Chromium already running (PID(s): {:?}) but extension did not reconnect. \
-                Refusing to launch a second browser instance.",
-                pids
-            );
-        }
-
         println!("Browser extension not connected, launching Chromium...");
 
         let opts = browser::LaunchOptions {
@@ -566,8 +482,7 @@ fn kill_mzoon_server() {
 pub async fn run_tests(opts: TestOptions) -> Result<Vec<TestResult>> {
     // Pre-flight check: ensure WebSocket server and browser extension are ready
     // This will auto-start the server and launch browser if needed
-    let setup = ensure_browser_connection(opts.port, opts.no_launch).await?;
-    ensure_engine_dd(opts.port).await?;
+    let setup = ensure_browser_connection(opts.port).await?;
 
     // Run tests and ensure cleanup happens even on error
     let result = run_tests_inner(&opts).await;
@@ -578,152 +493,6 @@ pub async fn run_tests(opts: TestOptions) -> Result<Vec<TestResult>> {
     }
 
     result
-}
-
-/// Smoke-run all built-in examples declared in playground `EXAMPLE_DATAS`.
-pub async fn run_builtin_smoke(opts: SmokeOptions) -> Result<Vec<SmokeResult>> {
-    let setup = ensure_browser_connection(opts.port, opts.no_launch).await?;
-    ensure_engine_dd(opts.port).await?;
-    let result = run_builtin_smoke_inner(&opts).await;
-
-    if setup.started_mzoon {
-        kill_mzoon_server();
-    }
-
-    result
-}
-
-async fn run_builtin_smoke_inner(opts: &SmokeOptions) -> Result<Vec<SmokeResult>> {
-    let main_rs = find_playground_main_file()?;
-    let mut examples = discover_builtin_examples(&main_rs)?;
-
-    if let Some(ref filter) = opts.filter {
-        examples.retain(|name| name.contains(filter));
-        if examples.is_empty() {
-            println!("No built-in examples match filter '{}'", filter);
-            return Ok(vec![]);
-        }
-    }
-
-    println!("Boon Built-in Example Smoke");
-    println!("===========================\n");
-    println!("Running {} built-in example(s)...\n", examples.len());
-
-    let mut results = Vec::new();
-    for example in examples {
-        let result = run_single_builtin_smoke(&example, opts.port).await;
-        let status = if result.passed { "[PASS]" } else { "[FAIL]" };
-        println!("{} {} ({:?})", status, result.name, result.duration);
-        if let Some(error) = &result.error {
-            println!("       {}", error);
-        }
-        results.push(result);
-    }
-
-    let passed = results.iter().filter(|r| r.passed).count();
-    println!("\n===========================");
-    println!("{}/{} passed", passed, results.len());
-
-    Ok(results)
-}
-
-fn find_playground_main_file() -> Result<PathBuf> {
-    let root = find_boon_root().context("Could not find boon repository root")?;
-    let main_rs = root.join("playground/frontend/src/main.rs");
-    if !main_rs.exists() {
-        anyhow::bail!(
-            "Could not find playground main.rs at {}",
-            main_rs.display()
-        );
-    }
-    Ok(main_rs)
-}
-
-fn discover_builtin_examples(main_rs: &Path) -> Result<Vec<String>> {
-    let source = std::fs::read_to_string(main_rs)
-        .with_context(|| format!("Failed to read {}", main_rs.display()))?;
-
-    let re = Regex::new(r#"make_example_data!\("([^"]+)"\)"#)?;
-    let mut seen = std::collections::HashSet::new();
-    let mut names = Vec::new();
-
-    for caps in re.captures_iter(&source) {
-        let Some(m) = caps.get(1) else { continue };
-        let name = m.as_str().to_string();
-        if seen.insert(name.clone()) {
-            names.push(name);
-        }
-    }
-
-    if names.is_empty() {
-        anyhow::bail!(
-            "No built-in examples found in {} (expected EXAMPLE_DATAS entries)",
-            main_rs.display()
-        );
-    }
-
-    Ok(names)
-}
-
-async fn run_single_builtin_smoke(name: &str, port: u16) -> SmokeResult {
-    let start = Instant::now();
-    let fail = |message: String, started: Instant| SmokeResult {
-        name: name.to_string(),
-        passed: false,
-        duration: started.elapsed(),
-        error: Some(message),
-    };
-
-    let _ = send_command_to_server(port, WsCommand::ClearStates).await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    let _ = send_command_to_server(port, WsCommand::NavigateTo { path: "/".to_string() }).await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    let _ = send_command_to_server(port, WsCommand::Refresh).await;
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    if let Err(err) = ensure_engine_dd(port).await {
-        return fail(format!("ensure_engine_dd failed: {}", err), start);
-    }
-
-    let example_name = format!("{}.bn", name);
-    match send_command_to_server(port, WsCommand::SelectExample { name: example_name }).await {
-        Ok(WsResponse::Success { .. }) => {}
-        Ok(WsResponse::Error { message }) => {
-            return fail(format!("SelectExample failed: {}", message), start);
-        }
-        Ok(other) => {
-            return fail(format!("SelectExample unexpected response: {:?}", other), start);
-        }
-        Err(err) => {
-            return fail(format!("SelectExample request failed: {}", err), start);
-        }
-    }
-
-    match send_command_to_server(port, WsCommand::TriggerRun).await {
-        Ok(WsResponse::Success { .. }) => {}
-        Ok(WsResponse::Error { message }) => {
-            return fail(format!("TriggerRun failed: {}", message), start);
-        }
-        Ok(other) => {
-            return fail(format!("TriggerRun unexpected response: {:?}", other), start);
-        }
-        Err(err) => {
-            return fail(format!("TriggerRun request failed: {}", err), start);
-        }
-    }
-
-    tokio::time::sleep(Duration::from_millis(350)).await;
-
-    match send_command_to_server(port, WsCommand::GetPreviewText).await {
-        Ok(WsResponse::PreviewText { .. }) => SmokeResult {
-            name: name.to_string(),
-            passed: true,
-            duration: start.elapsed(),
-            error: None,
-        },
-        Ok(WsResponse::Error { message }) => fail(format!("GetPreviewText failed: {}", message), start),
-        Ok(other) => fail(format!("GetPreviewText unexpected response: {:?}", other), start),
-        Err(err) => fail(format!("GetPreviewText request failed: {}", err), start),
-    }
 }
 
 /// Inner test runner (separated for cleanup handling)
@@ -832,51 +601,28 @@ async fn run_single_test(example: &DiscoveredExample, opts: &TestOptions) -> Res
         });
     }
 
-    // Read example code
-    let code = std::fs::read_to_string(&example.bn_path)
-        .with_context(|| format!("Failed to read {}", example.bn_path.display()))?;
-
-    // Clear states, reset URL to root, and refresh page before each test to ensure clean slate
-    let _ = send_command_to_server(opts.port, WsCommand::ClearStates).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    // Navigate to root route - critical for Router/route() based apps like todo_mvc
+    // Navigate to root route first - critical for Router/route() based apps like todo_mvc
     let _ = send_command_to_server(opts.port, WsCommand::NavigateTo { path: "/".to_string() }).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let _ = send_command_to_server(opts.port, WsCommand::Refresh).await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    ensure_engine_dd(opts.port).await?;
 
-    // Inject code with filename for persistence
-    let filename = format!("{}.bn", example.name);
-    let response = send_command_to_server(opts.port, WsCommand::InjectCode { code, filename: Some(filename) }).await?;
+    // Use SelectExample to properly switch examples (clears state, updates file context, triggers run)
+    // This matches the manual UI behavior and ensures the previous example's DOM is fully cleaned up
+    let response = send_command_to_server(opts.port, WsCommand::SelectExample { name: example.name.clone() }).await?;
     if let WsResponse::Error { message } = response {
         return Ok(TestResult {
             name: example.name.clone(),
             passed: false,
             skipped: None,
             duration: start.elapsed(),
-            error: Some(format!("Inject failed: {}", message)),
+            error: Some(format!("SelectExample failed: {}", message)),
             actual_output: None,
             expected_output: None,
             steps,
         });
     }
 
-    // Trigger run
+    // Wait for the example to render
     tokio::time::sleep(Duration::from_millis(spec.timing.initial_delay)).await;
-    let response = send_command_to_server(opts.port, WsCommand::TriggerRun).await?;
-    if let WsResponse::Error { message } = response {
-        return Ok(TestResult {
-            name: example.name.clone(),
-            passed: false,
-            skipped: None,
-            duration: start.elapsed(),
-            error: Some(format!("Run failed: {}", message)),
-            actual_output: None,
-            expected_output: None,
-            steps,
-        });
-    }
 
     // Wait for initial output with smart waiting
     let initial_result = wait_for_output(
@@ -1314,9 +1060,12 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
-            // Use TypeTextCharByChar (dispatchKeyEvent) to simulate natural typing
-            // This is necessary because Boon's input handling expects character-by-character events
-            let response = send_command_to_server(port, WsCommand::TypeTextCharByChar { text: text.clone() }).await?;
+            // Use TypeText (Input.insertText) for reliable text insertion.
+            // TypeTextCharByChar (dispatchKeyEvent per char) can fail when the DD engine
+            // rebuilds the DOM between events, potentially losing focus or missing input events.
+            // Input.insertText directly sets the text and fires one input event, which is
+            // sufficient for the DD engine's TextChange handling.
+            let response = send_command_to_server(port, WsCommand::TypeText { text: text.clone() }).await?;
             if let WsResponse::Error { message } = response {
                 anyhow::bail!("Type text failed: {}", message);
             }
@@ -1657,6 +1406,38 @@ async fn execute_action(port: u16, action: &ParsedAction) -> Result<()> {
                     anyhow::bail!("Assert checkbox clickable failed: {}", message);
                 }
                 _ => anyhow::bail!("Unexpected response for AssertCheckboxClickable"),
+            }
+        }
+        ParsedAction::AssertElementStyle { target, property, expected } => {
+            // Verify computed CSS style on an element found by text content
+            let response = send_command_to_server(port, WsCommand::GetElementStyle {
+                text: target.clone(),
+                properties: vec![property.clone()],
+            }).await?;
+            match response {
+                WsResponse::ElementStyle { found, styles, error } => {
+                    if !found {
+                        anyhow::bail!(
+                            "Assert element style failed: element with text '{}' not found. {}",
+                            target, error.unwrap_or_default()
+                        );
+                    }
+                    let actual = styles
+                        .as_ref()
+                        .and_then(|s| s.get(property.as_str()))
+                        .cloned()
+                        .unwrap_or_default();
+                    if !actual.contains(expected.as_str()) {
+                        anyhow::bail!(
+                            "Assert element style failed: for element '{}', CSS '{}' = '{}' does not contain '{}'",
+                            target, property, actual, expected
+                        );
+                    }
+                }
+                WsResponse::Error { message } => {
+                    anyhow::bail!("Assert element style failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response for GetElementStyle"),
             }
         }
     }

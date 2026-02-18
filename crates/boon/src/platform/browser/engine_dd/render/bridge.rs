@@ -1,2151 +1,2346 @@
-//! DD Bridge - Converts DD values to Zoon elements.
+//! Value → Zoon element conversion.
 //!
-//! This module provides functions to render `Value` as Zoon elements.
-//! Currently implements static rendering; reactive rendering will use
-//! Output streams in a future phase.
+//! Takes DD Value descriptors (Element/button, Element/stripe, etc.)
+//! and creates corresponding Zoon UI elements.
+//!
+//! ## Architecture
+//!
+//! Three rendering paths:
+//! - **Retained tree** (General programs): Build element tree once with `Mutable<Value>`
+//!   per element. On state changes, diff old vs new Value tree and update only changed
+//!   Mutables. Zoon's signal system handles granular DOM updates.
+//! - **Worker** (SingleHold/LatestSum): Full rebuild per state change (simple programs).
+//! - **Static**: Single render, no signals needed.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
-use super::super::core::types::{BoolTag, ElementTag, Key as DdKey};
-use super::super::core::value::{Value, WhileArm};
-#[allow(unused_imports)]
-use super::super::dd_log;
-use super::super::eval::interpreter::DdResult;
+use indexmap::IndexMap;
+
+use futures_channel::mpsc;
+use pin_project::pin_project;
 use zoon::*;
 
-use super::super::io::{
-    cell_signal, fire_global_item_key_down, fire_global_item_link, fire_global_item_link_with_bool,
-    fire_global_item_link_with_text, fire_global_key_down, fire_global_link,
-    fire_global_link_with_bool, fire_global_link_with_text, get_cell_value, is_list_cell,
-    list_signal_vec,
-};
+use super::super::core::types::{KeyedDiff, LIST_TAG, LINK_PATH_FIELD, HOVER_PATH_FIELD};
+use super::super::core::value::Value;
+use super::super::io::worker::{DdWorkerHandle, Event};
 
-/// Convert DD Number (f64) to u32 with bounds checking.
-fn f64_to_u32(n: &ordered_float::OrderedFloat<f64>) -> u32 {
-    u32::try_from(n.0 as i64)
-        .unwrap_or_else(|_| panic!("[DD render] Number {} out of u32 range", n.0))
+type Fields = BTreeMap<Arc<str>, Value>;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VecDiffStreamSignalVec adapter
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Wraps a `Stream<Item = VecDiff<T>>` as a `SignalVec` for Zoon's
+/// `items_signal_vec` / `layers_signal_vec` / `contents_signal_vec` APIs.
+#[pin_project]
+#[must_use = "SignalVecs do nothing unless polled"]
+struct VecDiffStreamSignalVec<A>(#[pin] A);
+
+impl<A, T> SignalVec for VecDiffStreamSignalVec<A>
+where
+    A: Stream<Item = VecDiff<T>>,
+{
+    type Item = T;
+
+    #[inline]
+    fn poll_vec_change(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context,
+    ) -> std::task::Poll<Option<VecDiff<Self::Item>>> {
+        self.project().0.poll_next(cx)
+    }
 }
 
-/// Convert DD Number (f64) to i32 with bounds checking.
-fn f64_to_i32(n: &ordered_float::OrderedFloat<f64>) -> i32 {
-    i32::try_from(n.0 as i64)
-        .unwrap_or_else(|_| panic!("[DD render] Number {} out of i32 range", n.0))
+// ═══════════════════════════════════════════════════════════════════════════
+// Color helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Convert an Oklch tagged value to a CSS `oklch()` string.
+fn oklch_to_css(fields: &Fields) -> Option<String> {
+    let l = fields.get("lightness").and_then(|v| v.as_number()).unwrap_or(0.0);
+    let c = fields
+        .get("chroma")
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
+    let h = fields
+        .get("hue")
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
+    let a = fields.get("alpha").and_then(|v| v.as_number());
+
+    if let Some(alpha) = a {
+        Some(format!("oklch({} {} {} / {})", l, c, h, alpha))
+    } else {
+        Some(format!("oklch({} {} {})", l, c, h))
+    }
 }
 
-/// Resolve a Value to a display string, handling __text_template__ by reading CellRef values.
-fn resolve_display_string(value: &Value) -> String {
+/// Convert a color Value to a CSS color string.
+/// Handles Oklch[...] tagged objects AND named color tags (White, Black, etc.)
+fn value_to_css_color(value: &Value) -> Option<String> {
     match value {
-        Value::Tagged { tag, fields } if tag.as_ref() == "__text_template__" => {
-            let mut parts: Vec<&Value> = Vec::new();
-            let mut i = 0;
-            while let Some(v) = fields.get(i.to_string().as_str()) {
-                parts.push(v);
-                i += 1;
-            }
-            parts
-                .iter()
-                .map(|part| match part {
-                    Value::CellRef(id) => get_cell_value(&id.to_string())
-                        .map(|v| v.to_display_string())
-                        .unwrap_or_default(),
-                    v => v.to_display_string(),
-                })
-                .collect()
-        }
-        v => v.to_display_string(),
-    }
-}
-
-/// Get the current value of the focused text input via DOM access.
-/// This is used when Enter is pressed to capture the input text.
-/// Pure DD: fail fast if there is no active input element.
-#[cfg(target_arch = "wasm32")]
-fn get_dd_text_input_value() -> String {
-    use zoon::*;
-
-    let active = document().active_element();
-    let active_tag = active.as_ref().map(|el| el.tag_name()).unwrap_or_default();
-    let input = active.and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
-        .unwrap_or_else(|| {
-            panic!(
-                "[DD TextInput] Unable to read input value: active element is not an input (tag='{}')",
-                active_tag
-            );
-        });
-    let value = input.value();
-    dd_log!(
-        "[DD TextInput] get_dd_text_input_value: active_tag={}, value='{}'",
-        active_tag,
-        value
-    );
-    value
-}
-
-fn extract_item_key(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> Option<String> {
-    fields.get("__key").and_then(|value| match value {
-        Value::Text(key) => Some(key.to_string()),
-        _ => None,
-    })
-}
-
-fn dynamic_item_key(item_key: Option<&str>) -> Option<&str> {
-    match item_key {
-        Some(key) if key.starts_with("link:dynamic_link_") => Some(key),
-        _ => None,
-    }
-}
-
-fn should_use_item_scope(item_key: Option<&str>, link_id: &str) -> bool {
-    dynamic_item_key(item_key).is_some() && link_id.starts_with("dynamic_link_")
-}
-
-fn dispatch_link_unit(item_key: Option<&str>, link_id: &str) {
-    if should_use_item_scope(item_key, link_id) {
-        let item_key = dynamic_item_key(item_key).expect("item key checked");
-        fire_global_item_link(item_key, link_id);
-    } else {
-        fire_global_link(link_id);
-    }
-}
-
-fn dispatch_link_text(item_key: Option<&str>, link_id: &str, text: String) {
-    if should_use_item_scope(item_key, link_id) {
-        let item_key = dynamic_item_key(item_key).expect("item key checked");
-        fire_global_item_link_with_text(item_key, link_id, text);
-    } else {
-        fire_global_link_with_text(link_id, text);
-    }
-}
-
-fn dispatch_link_bool(item_key: Option<&str>, link_id: &str, value: bool) {
-    if should_use_item_scope(item_key, link_id) {
-        let item_key = dynamic_item_key(item_key).expect("item key checked");
-        fire_global_item_link_with_bool(item_key, link_id, value);
-    } else {
-        fire_global_link_with_bool(link_id, value);
-    }
-}
-
-fn dispatch_key_down(item_key: Option<&str>, link_id: &str, key: DdKey, text: Option<String>) {
-    if should_use_item_scope(item_key, link_id) {
-        let item_key = dynamic_item_key(item_key).expect("item key checked");
-        fire_global_item_key_down(item_key, link_id, key, text);
-    } else {
-        fire_global_key_down(link_id, key, text);
-    }
-}
-
-/// Get text from the event target for key_down, when available.
-/// This is more reliable than document.activeElement for synthetic test events.
-#[cfg(target_arch = "wasm32")]
-fn get_dd_text_input_value_from_key_event(event: &KeyboardEvent) -> Option<String> {
-    match &event.raw_event {
-        RawKeyboardEvent::KeyDown(raw_event) => {
-            if let Some(input) = raw_event.dyn_target::<web_sys::HtmlInputElement>() {
-                return Some(input.value());
-            }
-            if let Some(text_area) = raw_event.dyn_target::<web_sys::HtmlTextAreaElement>() {
-                return Some(text_area.value());
-            }
-            None
-        }
-    }
-}
-
-// REMOVED: get_dynamic_item_edit_value - dead code (render_dynamic_item was removed)
-
-// All computation happens in DD dataflow, not at render time.
-// The bridge only renders pure data values from DD output streams.
-
-/// Convert a Value Oklch color to CSS color string.
-/// Pure DD - only handles Number values, no WhileRef evaluation.
-/// Reactive color changes come from DD output streams, not render-time evaluation.
-fn dd_oklch_to_css(value: &Value) -> Option<String> {
-    match value {
-        Value::Tagged { tag, fields } if tag.as_ref() == "Oklch" => {
-            // Only handle Number values - DD computes reactive colors.
-            // Return None if fields aren't resolved yet (forward refs, CellRefs).
-            let lightness = fields.get("lightness").and_then(|v| {
-                if let Value::Number(n) = v {
-                    Some(n.0)
-                } else {
-                    None
-                }
-            })?;
-            let chroma = fields.get("chroma").and_then(|v| {
-                if let Value::Number(n) = v {
-                    Some(n.0)
-                } else {
-                    None
-                }
-            })?;
-            let hue = fields.get("hue").and_then(|v| {
-                if let Value::Number(n) = v {
-                    Some(n.0)
-                } else {
-                    None
-                }
-            })?;
-            let alpha = fields.get("alpha").and_then(|v| {
-                if let Value::Number(n) = v {
-                    Some(n.0)
-                } else {
-                    None
-                }
-            });
-
-            // oklch(lightness% chroma hue / alpha)
-            if let Some(a) = alpha {
-                if a == 0.0 {
-                    None // alpha=0 means invisible
-                } else {
-                    Some(format!(
-                        "oklch({}% {} {} / {})",
-                        lightness * 100.0,
-                        chroma,
-                        hue,
-                        a
-                    ))
-                }
-            } else {
-                Some(format!("oklch({}% {} {})", lightness * 100.0, chroma, hue))
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Render a DD document as a Zoon element.
-///
-/// # Arguments
-///
-/// * `document` - The document value from DD evaluation
-///
-/// # Returns
-///
-/// A Zoon element representing the document.
-pub fn render_dd_document_reactive_signal(document: Value) -> impl Element {
-    render_dd_value(&document)
-}
-
-/// Render a DD result as a Zoon element.
-///
-/// # Arguments
-///
-/// * `result` - The full DD result including the document
-///
-/// # Returns
-///
-/// A Zoon element representing the result.
-pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
-    match result.document {
-        Some(doc) => render_dd_value(&doc).unify(),
-        None => panic!("[DD Render] No document produced"),
-    }
-}
-
-/// Render a Value as a Zoon element.
-fn render_dd_value(value: &Value) -> RawElOrText {
-    match value {
-        Value::Unit => El::new().unify(),
-
-        Value::Bool(b) => Text::new(if *b { "true" } else { "false" }).unify(),
-
-        Value::Number(n) => {
-            // Format number nicely (no trailing .0 for integers)
-            let num = n.0;
-            let text = if num.fract() == 0.0 && num.abs() < i64::MAX as f64 {
-                // Safe: bounds checked above, fract()==0 guarantees integer
-                #[allow(clippy::cast_possible_truncation)]
-                let int_val = num as i64;
-                format!("{}", int_val)
-            } else {
-                format!("{}", num)
+        Value::Tagged { tag, fields } if tag.as_ref() == "Oklch" => oklch_to_css(fields),
+        Value::Tag(tag) => {
+            let css = match tag.as_ref() {
+                "White" => "white",
+                "Black" => "black",
+                "Red" => "red",
+                "Green" => "green",
+                "Blue" => "blue",
+                "Yellow" => "yellow",
+                "Cyan" => "cyan",
+                "Magenta" => "magenta",
+                "Orange" => "orange",
+                "Purple" => "purple",
+                "Pink" => "pink",
+                "Brown" => "brown",
+                "Gray" | "Grey" => "gray",
+                "Transparent" => "transparent",
+                _ => return None,
             };
-            Text::new(text).unify()
+            Some(css.to_string())
         }
-
-        Value::Text(s) => Text::new(s.to_string()).unify(),
-
-        Value::List(handle) => {
-            let cell_id = handle
-                .cell_id
-                .as_deref()
-                .map(str::to_string)
-                .unwrap_or_else(|| handle.id.to_string());
-            Column::new()
-                .items_signal_vec(
-                    list_signal_vec(cell_id.to_string()).map(|item| render_dd_value(&item)),
-                )
-                .unify()
-        }
-
-        Value::WhileConfig(config) => {
-            let cell_id = config.cell_id.name().to_string();
-            let arms = config.arms.clone();
-            let default = config.default.clone();
-            let cell_id_for_signal = cell_id.clone();
-            El::new()
-                .child_signal(cell_signal(cell_id).map(move |value| {
-                    let Some(value) = value else {
-                        // Cell cleared during re-initialization; transient state.
-                        return El::new().unify();
-                    };
-                    let selected = select_while_arm(&value, &arms, &default);
-                    render_dd_value(&selected)
-                }))
-                .unify()
-        }
-        Value::PlaceholderWhile(_) => {
-            panic!("[DD Render] Placeholder WHILE reached render; template substitution failed");
-        }
-        Value::Object(fields) => {
-            // Render object as debug representation
-            let debug = fields
-                .iter()
-                .filter(|(k, _)| k.as_ref() != "__key")
-                .map(|(k, v)| format!("{}: {:?}", k, v))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Text::new(format!("[{}]", debug)).unify()
-        }
-
-        // DD produces Text values directly - interpolation is computed in DD, not at render time
-        Value::Tagged { tag, fields } if tag.as_ref() == "__text_template__" => {
-            // Text template with CellRef parts — render as reactive label
-            let mut tt_parts: Vec<Value> = Vec::new();
-            let mut i = 0;
-            while let Some(v) = fields.get(i.to_string().as_str()) {
-                tt_parts.push(v.clone());
-                i += 1;
-            }
-            let first_cellref = tt_parts.iter().find_map(|v| {
-                if let Value::CellRef(id) = v {
-                    Some(id.to_string())
-                } else {
-                    None
-                }
-            });
-            if let Some(cell_id) = first_cellref {
-                El::new()
-                    .child_signal(cell_signal(cell_id).map(move |_trigger| {
-                        let text: String = tt_parts
-                            .iter()
-                            .map(|part| match part {
-                                Value::CellRef(id) => get_cell_value(&id.to_string())
-                                    .map(|v| v.to_display_string())
-                                    .unwrap_or_default(),
-                                v => v.to_display_string(),
-                            })
-                            .collect();
-                        Text::new(text).unify()
-                    }))
-                    .unify()
-            } else {
-                let text: String = tt_parts.iter().map(|v| v.to_display_string()).collect();
-                Text::new(text).unify()
-            }
-        }
-
-        Value::Tagged { tag, fields } => {
-            dd_log!(
-                "[DD render_dd_value] Tagged(tag='{}', fields={:?})",
-                tag,
-                fields.keys().collect::<Vec<_>>()
-            );
-            render_tagged_element(tag.as_ref(), fields)
-        }
-
-        Value::CellRef(name) => {
-            // CellRef is a reactive reference to a HOLD value
-            // Use granular cell_signal() instead of coarse cell_states_signal()
-            // This only fires when THIS specific cell changes, not when ANY cell changes
-            let cell_id = name.to_string();
-
-            // Check if this cell contains a list for incremental rendering
-            if is_list_cell(&cell_id) {
-                // Use incremental list rendering via VecDiff
-                // children_signal_vec() only updates changed elements (O(delta))
-                Column::new()
-                    .items_signal_vec(
-                        list_signal_vec(cell_id) // Pass owned String
-                            .map(|item| render_dd_value(&item)),
-                    )
-                    .unify()
-            } else {
-                // Use scalar rendering for non-list cells
-                let cell_id_for_signal = cell_id.clone();
-                El::new()
-                    .child_signal(
-                        cell_signal(cell_id) // Pass owned String
-                            .map(move |value| {
-                                let Some(value) = value else {
-                                    return Text::new("");
-                                };
-                                Text::new(value.to_display_string())
-                            }),
-                    )
-                    .unify()
-            }
-        }
-
-        Value::LinkRef(link_id) => {
-            // LinkRef is a placeholder for an event source
-            // In static rendering, show as unit (events are wired at button level)
-            El::new().unify()
-        }
-
-        Value::TimerRef { id, interval_ms: _ } => {
-            // TimerRef represents a timer-driven HOLD accumulator
-            // The `id` is the HOLD id - render its reactive value
-            // Use granular cell_signal() - only fires when this timer's cell changes
-            let cell_id = id.to_string();
-
-            // Create reactive element that updates only when this timer cell changes
-            let cell_id_for_signal = cell_id.clone();
-            El::new()
-                .child_signal(
-                    cell_signal(cell_id) // Pass owned String
-                        .map(move |value| {
-                            let Some(value) = value else {
-                                return Text::new("");
-                            };
-                            Text::new(value.to_display_string())
-                        }),
-                )
-                .unify()
-        }
-
-        // Pure DD: All computation happens in DD dataflow, not at render time.
-        // Lists are rendered as Collection with children_signal_vec().
-        // Reactive values flow through DD output streams.
-        Value::Placeholder => {
-            panic!("[DD Render] Placeholder reached render; DD map substitution failed");
-        }
-        Value::PlaceholderField(_) | Value::PlaceholderBoolNot(_) => {
-            panic!("[DD Render] PlaceholderField reached render; template substitution failed");
-        }
-        Value::Flushed(_) => {
-            panic!("[DD Render] Flushed value reached render; missing FLUSH handler");
-        }
+        _ => None,
     }
 }
 
-/// Render a tagged object as a Zoon element.
-fn render_tagged_element(
-    tag: &str,
-    fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>,
-) -> RawElOrText {
-    dd_log!(
-        "[DD render_tagged] tag='{}', fields={:?}",
+// ═══════════════════════════════════════════════════════════════════════════
+// Data extraction helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Get the style sub-object from element fields.
+fn get_style_obj(fields: &Fields) -> Option<&Fields> {
+    match fields.get("style") {
+        Some(Value::Object(obj)) => Some(obj.as_ref()),
+        _ => None,
+    }
+}
+
+/// Get fields from a Value (works for Object and Tagged).
+fn get_fields(value: &Value) -> Option<&Fields> {
+    match value {
+        Value::Object(f) => Some(f.as_ref()),
+        Value::Tagged { fields, .. } => Some(fields.as_ref()),
+        _ => None,
+    }
+}
+
+/// Extract sorted list items from a "List" tagged field.
+fn extract_sorted_list_items(fields: &Fields, field_name: &str) -> Vec<Value> {
+    if let Some(Value::Tagged {
         tag,
-        fields.keys().collect::<Vec<_>>()
-    );
-    if BoolTag::is_bool_tag(tag) {
-        return Text::new(tag).unify();
-    }
-    match tag {
-        "Element" => render_element(fields),
-        "NoElement" => El::new().unify(),
-        _ => {
-            panic!("[DD render_tagged] Unknown tag '{}'", tag);
+        fields: list_fields,
+    }) = fields.get(field_name)
+    {
+        if tag.as_ref() == LIST_TAG {
+            // BTreeMap iteration is already sorted by key
+            return list_fields.values().cloned().collect();
         }
     }
+    Vec::new()
 }
 
-/// Render an Element tagged object.
-fn render_element(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    let element_type = fields
-        .get("_element_type")
-        .and_then(|v| match v {
-            Value::Text(s) => Some(s.as_ref()),
-            _ => None,
+
+/// Extract effective link path for event handlers.
+fn extract_effective_link(fields: &Fields, parent_link_path: &str) -> String {
+    fields
+        .get("press_link")
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            fields
+                .get(LINK_PATH_FIELD)
+                .and_then(|v| v.as_text())
+                .map(|s| s.to_string())
         })
-        .unwrap_or_else(|| {
-            panic!("[DD render_element] Missing required '_element_type' field");
-        });
-
-    dd_log!(
-        "[DD render_element] type='{}', all_fields={:?}",
-        element_type,
-        fields.keys().collect::<Vec<_>>()
-    );
-
-    match element_type {
-        "button" => render_button(fields),
-        "stripe" => {
-            dd_log!("[DD render_element] -> render_stripe()");
-            render_stripe(fields)
-        }
-        "stack" => render_stack(fields),
-        "container" => render_container(fields),
-        "text_input" => render_text_input(fields),
-        "checkbox" => {
-            dd_log!("[DD render_element] -> render_checkbox()");
-            render_checkbox(fields)
-        }
-        "label" => {
-            dd_log!("[DD render_element] -> render_label()");
-            render_label(fields)
-        }
-        "paragraph" => render_paragraph(fields),
-        "link" => render_link(fields),
-        _ => {
-            panic!(
-                "[DD render_element] Unknown element type '{}'",
-                element_type
-            );
-        }
-    }
+        .unwrap_or_else(|| parent_link_path.to_string())
 }
 
-/// Render a button element.
-fn render_button(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    let label_value = fields.get("label").unwrap_or_else(|| {
-        panic!("[DD render_button] Missing required 'label' field");
-    });
-
-    // Extract LinkRef from element.event.press if present
-    let element_value = fields.get("element");
-    let event_value = element_value.and_then(|e| e.get("event"));
-    let press_value = event_value.and_then(|e| e.get("press"));
-    dd_log!(
-        "[DD render_button] label={:?} element={:?} event={:?} press={:?}",
-        label_value,
-        element_value
-            .map(|v| format!("{:?}", v))
-            .unwrap_or_else(|| "None".to_string()),
-        event_value
-            .map(|v| format!("{:?}", v))
-            .unwrap_or_else(|| "None".to_string()),
-        press_value
-            .map(|v| format!("{:?}", v))
-            .unwrap_or_else(|| "None".to_string())
-    );
-    let link_id = press_value.and_then(|v| match v {
-        Value::LinkRef(id) => Some(id.to_string()),
-        _ => None,
-    });
-    let item_key = extract_item_key(fields);
-    dd_log!("[DD render_button] Extracted link_id={:?}", link_id);
-
-    // Extract outline from style.outline
-    // DD computes reactive styling - bridge receives final values
-    let style_value = fields.get("style");
-    let outline_value = style_value.and_then(|s| s.get("outline"));
-
-    let outline_while_config = match outline_value {
-        Some(Value::WhileConfig(config)) => Some(config.clone()),
-        _ => None,
-    };
-
-    // Resolve WhileConfig in outline to a concrete value using the current cell state.
-    // This fixes startup style for route/filter-driven outlines (todo_mvc "All" button).
-    let outline_resolved = outline_value.map(|v| match v {
-        Value::WhileConfig(config) => {
-            let cell_id = config.cell_id.name();
-            let selector_value =
-                get_cell_value(&cell_id).unwrap_or_else(|| config.default.as_ref().clone());
-            select_while_arm(&selector_value, &config.arms, &config.default)
-        }
-        other => other.clone(),
-    });
-    let outline_opt: Option<ButtonOutlineCss> = outline_resolved
-        .as_ref()
-        .map(parse_button_outline)
-        .unwrap_or(None);
-    dd_log!(
-        "[DD render_button] outline_value={:?} outline_resolved={:?}",
-        outline_value,
-        outline_resolved
-    );
-
-    // Extract font styling from style.font
-    let font_color_css = style_value
-        .and_then(|s| s.get("font"))
-        .and_then(|f| f.get("color"))
-        .and_then(|c| dd_oklch_to_css(c));
-    let font_size = style_value
-        .and_then(|s| s.get("font"))
-        .and_then(|f| f.get("size"))
-        .and_then(|v| {
-            if let Value::Number(n) = v {
-                Some(f64_to_u32(n))
-            } else {
-                None
-            }
-        });
-
-    let label_value = label_value.clone();
-
-    if let Some(config) = outline_while_config {
-        let selector_cell_id = config.cell_id.name().to_string();
-        let label_value_for_signal = label_value.clone();
-        let font_color_css_for_signal = font_color_css.clone();
-        let link_id_for_signal = link_id.clone();
-        let item_key_for_signal = item_key.clone();
-
-        El::new()
-            .child_signal(cell_signal(selector_cell_id).map(move |selector_value| {
-                let selector_value =
-                    selector_value.unwrap_or_else(|| config.default.as_ref().clone());
-                let resolved_outline =
-                    select_while_arm(&selector_value, &config.arms, &config.default);
-                dd_log!(
-                    "[DD render_button] reactive selector={:?} resolved_outline={:?}",
-                    selector_value,
-                    resolved_outline
-                );
-                let outline_opt = parse_button_outline(&resolved_outline);
-                build_button_with_style(
-                    label_value_for_signal.clone(),
-                    font_color_css_for_signal.clone(),
-                    font_size,
-                    outline_opt,
-                    link_id_for_signal.clone(),
-                    item_key_for_signal.clone(),
-                )
-            }))
-            .unify()
-    } else {
-        build_button_with_style(
-            label_value,
-            font_color_css,
-            font_size,
-            outline_opt,
-            link_id,
-            item_key,
-        )
-    }
-}
-
-#[derive(Clone)]
-struct ButtonOutlineCss {
-    color: String,
-    width: u32,
-    is_inner: bool,
-}
-
-fn parse_button_outline(value: &Value) -> Option<ButtonOutlineCss> {
-    match value {
-        Value::Tagged { tag, .. } if tag.as_ref() == "NoOutline" => None,
-        Value::Object(obj) => {
-            let color = obj
-                .get("color")
-                .and_then(|c| dd_oklch_to_css(c))
-                .unwrap_or_else(|| {
-                    panic!("[DD render_button] outline.color must be Oklch");
-                });
-            let is_inner = match obj.get("side") {
-                None => false,
-                Some(Value::Tagged { tag, .. }) if tag.as_ref() == "Inner" => true,
-                Some(Value::Tagged { tag, .. }) if tag.as_ref() == "Outer" => false,
-                Some(other) => {
-                    panic!(
-                        "[DD render_button] outline.side must be Inner/Outer, found {:?}",
-                        other
-                    );
-                }
-            };
-            let width = match obj.get("width") {
-                None => 1,
-                Some(Value::Number(n)) => f64_to_u32(n),
-                Some(other) => {
-                    panic!(
-                        "[DD render_button] outline.width must be Number, found {:?}",
-                        other
-                    );
-                }
-            };
-            Some(ButtonOutlineCss {
-                color,
-                width,
-                is_inner,
-            })
-        }
-        other => {
-            panic!(
-                "[DD render_button] outline must be NoOutline or object, found {:?}",
-                other
-            );
+/// Extract hover link path from element's `element: [hovered: LINK]` field.
+fn extract_hover_link_path(fields: &Fields, parent_link_path: &str) -> Option<String> {
+    // First check __hover_path__ (injected by DD compiler for per-item hover)
+    if let Some(path) = fields
+        .get(HOVER_PATH_FIELD)
+        .and_then(|v| v.as_text())
+    {
+        if !path.is_empty() {
+            return Some(path.to_string());
         }
     }
-}
-
-fn build_button_with_style(
-    label_value: Value,
-    font_color_css: Option<String>,
-    font_size: Option<u32>,
-    outline_opt: Option<ButtonOutlineCss>,
-    link_id: Option<String>,
-    item_key: Option<String>,
-) -> RawElOrText {
-    // Check if label is a reactive __text_template__ with CellRef parts
-    let mut button = match &label_value {
-        Value::Tagged {
-            tag,
-            fields: label_fields,
-        } if tag.as_ref() == "__text_template__" => {
-            let mut tt_parts: Vec<Value> = Vec::new();
-            let mut i = 0;
-            while let Some(v) = label_fields.get(i.to_string().as_str()) {
-                tt_parts.push(v.clone());
-                i += 1;
-            }
-            let first_cellref = tt_parts.iter().find_map(|v| {
-                if let Value::CellRef(id) = v {
-                    Some(id.to_string())
-                } else {
-                    None
-                }
-            });
-            if let Some(cell_id) = first_cellref {
-                Button::new().label_signal(cell_signal(cell_id).map(move |_trigger| {
-                    tt_parts
-                        .iter()
-                        .map(|part| match part {
-                            Value::CellRef(id) => get_cell_value(&id.to_string())
-                                .map(|v| v.to_display_string())
-                                .unwrap_or_default(),
-                            v => v.to_display_string(),
-                        })
-                        .collect::<String>()
-                }))
-            } else {
-                let text: String = tt_parts.iter().map(|v| v.to_display_string()).collect();
-                Button::new().label(text)
-            }
+    // Then check __link_path__ (set by |> LINK { alias } pipe)
+    if let Some(path) = fields
+        .get(LINK_PATH_FIELD)
+        .and_then(|v| v.as_text())
+    {
+        if !path.is_empty() {
+            return Some(path.to_string());
         }
-        Value::CellRef(id) => {
-            let cell_id = id.to_string();
-            Button::new().label_signal(cell_signal(cell_id.clone()).map(move |_trigger| {
-                get_cell_value(&cell_id)
-                    .map(|v| v.to_display_string())
-                    .unwrap_or_default()
-            }))
-        }
-        _ => Button::new().label(resolve_display_string(&label_value)),
-    };
-
-    // Apply font styling
-    let mut font = Font::new();
-    if let Some(color) = font_color_css {
-        font = font.color(color);
     }
-    if let Some(size) = font_size {
-        font = font.size(size);
-    }
-    button = button.s(font);
-
-    if let Some(outline) = outline_opt {
-        button = button.update_raw_el(move |raw_el| {
-            let outline_width = format!("{}px", outline.width);
-            let raw_el = raw_el
-                .style("outline-style", "solid")
-                .style("outline-width", &outline_width)
-                .style("outline-color", &outline.color);
-            if outline.is_inner {
-                let outline_offset = format!("-{}px", outline.width);
-                raw_el.style("outline-offset", &outline_offset)
-            } else {
-                raw_el
-            }
-        });
-    }
-
-    if let Some(link_id) = link_id {
-        let item_key = item_key.clone();
-        // Wire button to fire the link event via global dispatcher
-        button
-            .on_press(move || {
-                dispatch_link_unit(item_key.as_deref(), &link_id);
-            })
-            .unify()
-    } else {
-        button.unify()
-    }
-}
-
-/// Render a stripe (vertical/horizontal layout).
-fn render_stripe(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    let direction = fields
-        .get("direction")
-        .map(|v| match v {
-            Value::Tagged { tag, .. } => tag.as_ref().to_string(),
-            Value::Text(s) => s.to_string(),
-            other => {
-                panic!(
-                    "[DD render_stripe] direction must be Text or Tag, found {:?}",
-                    other
-                );
-            }
-        })
-        .unwrap_or_else(|| {
-            panic!("[DD render_stripe] Missing required 'direction' field");
-        });
-
-    let gap = fields
-        .get("gap")
-        .map(|v| match v {
-            Value::Number(n) => f64_to_u32(n),
-            other => panic!("[DD render_stripe] gap must be Number, found {:?}", other),
-        })
-        .unwrap_or(0);
-
-    // Extract hovered LinkRef from element.hovered if present
-    let hovered_link_id = fields
-        .get("element")
-        .and_then(|e| e.get("hovered"))
-        .and_then(|v| match v {
-            Value::LinkRef(id) => Some(id.to_string()),
-            _ => None,
-        });
-    let item_key = extract_item_key(fields);
-
-    let items_value = fields.get("items");
-
-    // Pure DD: List rendering uses Collection + children_signal_vec().
-    // Filtering and mapping happen in DD operators.
-    // The bridge renders pre-computed Collection values.
-
-    // Check if items is a CellRef/Collection (list-backed) for reactive rendering
-    let items_hold_ref = fields.get("items").and_then(|v| match v {
-        Value::CellRef(cell_id) => Some(cell_id.name().to_string()),
-        Value::List(handle) => Some(
-            handle
-                .cell_id
-                .as_deref()
-                .map(str::to_string)
-                .unwrap_or_else(|| handle.id.to_string()),
-        ),
-        _ => None,
-    });
-
-    if items_hold_ref.is_none() {
-        panic!("[DD render_stripe] 'items' must be CellRef or Collection");
-    }
-
-    // Extract style properties (like render_container does)
-    let style = fields.get("style");
-
-    // Width: Fill or exact value
-    let width_fill = style
-        .and_then(|s| s.get("width"))
-        .map(|v| matches!(v, Value::Tagged { tag, .. } if tag.as_ref() == "Fill"))
-        .unwrap_or(false);
-
-    // Background color (Oklch)
-    let bg_color = style
-        .and_then(|s| s.get("background"))
-        .and_then(|bg| bg.get("color"))
-        .and_then(|c| dd_oklch_to_css(c));
-
-    // Font size and color
-    let font_size = style
-        .and_then(|s| s.get("font"))
-        .and_then(|f| f.get("size"))
-        .and_then(|v| match v {
-            Value::Number(n) => Some(f64_to_u32(n)),
-            _ => None,
-        });
-    let font_color = style
-        .and_then(|s| s.get("font"))
-        .and_then(|f| f.get("color"))
-        .and_then(|c| dd_oklch_to_css(c));
-
-    // Padding: row is y (vertical), column is x (horizontal) in Boon terminology
-    let padding_y = style
-        .and_then(|s| s.get("padding"))
-        .and_then(|p| p.get("row"))
-        .and_then(|v| match v {
-            Value::Number(n) => Some(f64_to_u32(n)),
-            _ => None,
-        });
-    let padding_x = style
-        .and_then(|s| s.get("padding"))
-        .and_then(|p| p.get("column"))
-        .and_then(|v| match v {
-            Value::Number(n) => Some(f64_to_u32(n)),
-            _ => None,
-        });
-
-    // Macro to build Row or Column with shared style application
-    macro_rules! build_stripe {
-        ($Container:ident, $gap_axis:ident, $cell_id:expr) => {{
-            dd_log!(
-                "[DD render_stripe] {} with reactive items from {}",
-                stringify!($Container),
-                $cell_id
-            );
-            let mut el = $Container::new()
-                .s(Gap::new().$gap_axis(gap))
-                .items_signal_vec(
-                    list_signal_vec($cell_id.clone()).map(|item| render_dd_value(&item)),
-                );
-            if width_fill {
-                el = el.s(zoon::Width::fill());
-            }
-            if let Some(color) = bg_color {
-                el = el.s(zoon::Background::new().color(color));
-            }
-            if font_size.is_some() || font_color.is_some() {
-                let mut font = zoon::Font::new();
-                if let Some(size) = font_size {
-                    font = font.size(size);
-                }
-                if let Some(ref color) = font_color {
-                    font = font.color(color.clone());
-                }
-                el = el.s(font);
-            }
-            if padding_x.is_some() || padding_y.is_some() {
-                let mut padding = zoon::Padding::new();
-                if let Some(x) = padding_x {
-                    padding = padding.x(x);
-                }
-                if let Some(y) = padding_y {
-                    padding = padding.y(y);
-                }
-                el = el.s(padding);
-            }
-            if let Some(link_id) = hovered_link_id {
-                let item_key = item_key.clone();
-                return el
-                    .on_hovered_change(move |is_hovered| {
-                        dispatch_link_bool(item_key.as_deref(), &link_id, is_hovered);
-                    })
-                    .unify();
-            }
-            el.unify()
-        }};
-    }
-
-    let cell_id = items_hold_ref.as_ref().unwrap_or_else(|| {
-        panic!("[DD render_stripe] 'items' must be CellRef or Collection");
-    });
-
-    match direction.as_str() {
-        "Row" => build_stripe!(Row, x, cell_id),
-        "Column" => build_stripe!(Column, y, cell_id),
-        other => panic!(
-            "[DD render_stripe] direction must be Row/Column, found '{}'",
-            other
-        ),
-    }
-}
-
-/// Render a stack (layered elements).
-/// CellRef support for reactive layers via layers_signal_vec.
-fn render_stack(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    // Check if layers is a CellRef/Collection for reactive rendering
-    if let Some(value) = fields.get("layers") {
-        let reactive_cell_id = match value {
-            Value::CellRef(cell_id) => Some(cell_id.name().to_string()),
-            Value::List(handle) => Some(
-                handle
-                    .cell_id
-                    .as_deref()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| handle.id.to_string()),
-            ),
+    // Then check element.hovered.__path__ (set by element: [hovered: LINK])
+    if let Some(element_val) = fields.get("element") {
+        let hovered_val = match element_val {
+            Value::Object(obj) => obj.get("hovered"),
             _ => None,
         };
-        if let Some(cell_id_str) = reactive_cell_id {
-            dd_log!("[DD render_stack] Reactive layers from '{}'", cell_id_str);
-
-            let style = fields.get("style");
-
-            let width_opt = style.and_then(|s| s.get("width")).and_then(|v| match v {
-                Value::Number(n) => Some(f64_to_u32(n)),
-                _ => None,
-            });
-            let height_opt = style.and_then(|s| s.get("height")).and_then(|v| match v {
-                Value::Number(n) => Some(f64_to_u32(n)),
-                _ => None,
-            });
-            let bg_color = style
-                .and_then(|s| s.get("background"))
-                .and_then(|bg| bg.get("color"))
-                .and_then(|c| dd_oklch_to_css(c));
-
-            let mut el = Stack::new()
-                .layers_signal_vec(list_signal_vec(cell_id_str).map(|item| render_dd_value(&item)));
-            if let Some(w) = width_opt {
-                el = el.s(Width::exact(w));
+        if let Some(Value::Tagged {
+            tag,
+            fields: link_fields,
+        }) = hovered_val
+        {
+            if tag.as_ref() == "LINK" {
+                if let Some(path) = link_fields
+                    .get("__path__")
+                    .and_then(|v| v.as_text())
+                {
+                    if !path.is_empty() {
+                        // Strip ".hovered" suffix — the interpreter stores hover state
+                        // under the base element prefix, not the field-qualified path
+                        let base_path = path.strip_suffix(".hovered").unwrap_or(path);
+                        return Some(base_path.to_string());
+                    }
+                }
             }
-            if let Some(h) = height_opt {
-                el = el.s(Height::exact(h));
-            }
-            if let Some(color) = bg_color {
-                el = el.s(Background::new().color(color));
-            }
-            return el.unify();
         }
     }
-
-    panic!("[DD render_stack] 'layers' must be CellRef or Collection");
+    if !parent_link_path.is_empty() {
+        Some(parent_link_path.to_string())
+    } else {
+        None
+    }
 }
 
-/// Render a container element.
-fn render_container(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    let child = fields.get("child").or_else(|| fields.get("element"));
+// ═══════════════════════════════════════════════════════════════════════════
+// Zoon style extractors (from Value fields → Zoon typed styles)
+// ═══════════════════════════════════════════════════════════════════════════
 
-    // Extract style properties
-    let style = fields.get("style");
-
-    // Get size (sets both width and height)
-    let size_opt = style.and_then(|s| s.get("size")).and_then(|v| match v {
-        Value::Number(n) => Some(f64_to_u32(n)),
-        _ => None,
-    });
-
-    // Get standalone width
-    let width_opt = style.and_then(|s| s.get("width")).and_then(|v| match v {
-        Value::Number(n) => Some(f64_to_u32(n)),
-        _ => None,
-    });
-
-    // Get background URL
-    let bg_url_opt = style
-        .and_then(|s| s.get("background"))
-        .and_then(|bg| bg.get("url"))
-        .and_then(|v| match v {
-            Value::Text(s) => Some(s.to_string()),
-            _ => None,
-        });
-
-    // Get background color (Oklch)
-    let bg_color = style
-        .and_then(|s| s.get("background"))
-        .and_then(|bg| bg.get("color"))
-        .and_then(|c| dd_oklch_to_css(c));
-
-    // Get rounded corners
-    let rounded_corners_opt = style
-        .and_then(|s| s.get("rounded_corners"))
-        .and_then(|v| match v {
-            Value::Number(n) => Some(f64_to_u32(n)),
-            _ => None,
-        });
-
-    // Get font color value for checking if it's reactive
-    let font_color_value = style
-        .and_then(|s| s.get("font"))
-        .and_then(|f| f.get("color"))
-        .cloned();
-
-    // Debug: log what font_color_value we got
-    if font_color_value.is_some() {
-        dd_log!(
-            "[DD render_container] font_color_value: {:?}",
-            font_color_value
-        );
+/// Extract Font from element fields' style.font sub-object.
+fn extract_font_from_fields(fields: &Fields) -> Option<Font<'static>> {
+    let style = get_style_obj(fields)?;
+    let font_obj = match style.get("font") {
+        Some(Value::Object(f)) => f,
+        _ => return None,
+    };
+    let mut font = Font::new();
+    if let Some(size) = font_obj.get("size").and_then(|v| v.as_number()) {
+        font = font.size(size as u32);
     }
-
-    // Font color is computed by DD - bridge receives final values
-    // Get font size
-    let font_size = style
-        .and_then(|s| s.get("font"))
-        .and_then(|f| f.get("size"))
-        .and_then(|v| match v {
-            Value::Number(n) => Some(f64_to_u32(n)),
-            _ => None,
-        });
-
-    // Build base element with styles (before adding child due to typestate)
-    let base = El::new();
-    let base = match size_opt {
-        Some(size) => base.s(Width::exact(size)).s(Height::exact(size)),
-        None => {
-            let b = if let Some(w) = width_opt {
-                base.s(Width::exact(w))
-            } else {
-                base
+    if let Some(color_val) = font_obj.get("color") {
+        if let Some(css) = value_to_css_color(color_val) {
+            font = font.color(css);
+        }
+    }
+    if let Some(weight_val) = font_obj.get("weight") {
+        if let Some(tag) = weight_val.as_tag() {
+            let w = match tag {
+                "Hairline" => Some(FontWeight::Hairline),
+                "ExtraLight" | "UltraLight" => Some(FontWeight::ExtraLight),
+                "Light" => Some(FontWeight::Light),
+                "Regular" | "Normal" => Some(FontWeight::Regular),
+                "Medium" => Some(FontWeight::Medium),
+                "SemiBold" | "DemiBold" => Some(FontWeight::SemiBold),
+                "Bold" => Some(FontWeight::Bold),
+                "ExtraBold" | "UltraBold" => Some(FontWeight::ExtraBold),
+                "Black" | "Heavy" => Some(FontWeight::Heavy),
+                _ => None,
             };
-            b
+            if let Some(w) = w {
+                font = font.weight(w);
+            }
+        } else if let Some(n) = weight_val.as_number() {
+            font = font.weight(FontWeight::Number(n as u32));
         }
-    };
-    let base = match (&bg_url_opt, &bg_color) {
-        (Some(url), _) => base.s(Background::new().url(url.clone())),
-        (None, Some(color)) => base.s(Background::new().color(color.clone())),
-        _ => base,
-    };
-    let base = if let Some(radius) = rounded_corners_opt {
-        base.s(RoundedCorners::all(radius))
-    } else {
-        base
-    };
-
-    // Apply font styling (pure DD - no reactive WhileRef evaluation)
-    let font_color_css = font_color_value.as_ref().and_then(|c| dd_oklch_to_css(c));
-    let base = if font_size.is_some() || font_color_css.is_some() {
-        let mut font = Font::new();
-        if let Some(size) = font_size {
-            font = font.size(size);
+    }
+    if let Some(align_val) = font_obj.get("align") {
+        if let Some(tag) = align_val.as_tag() {
+            font = match tag {
+                "Center" => font.center(),
+                "Left" => font.left(),
+                "Right" => font.right(),
+                "Justify" => font.justify(),
+                _ => font,
+            };
         }
-        if let Some(color) = font_color_css {
-            font = font.color(color);
-        }
-        base.s(font)
-    } else {
-        base
-    };
-
-    // Apply padding
-    let base = {
-        let padding_value = style.and_then(|s| s.get("padding"));
-
-        // Check if padding is a single number (applies to all sides)
-        let padding_all = padding_value.and_then(|p| match p {
-            Value::Number(n) => Some(f64_to_u32(n)),
-            _ => None,
-        });
-
-        if let Some(all) = padding_all {
-            // Single value applies to all sides
-            base.s(Padding::all(all))
-        } else {
-            // Padding is an Object with specific values (row, column, left, right, top, bottom)
-            let padding_obj = padding_value;
-
-            // Get padding values (row = horizontal/x, column = vertical/y)
-            let padding_row = padding_obj
-                .and_then(|p| p.get("row"))
-                .and_then(|v| match v {
-                    Value::Number(n) => Some(f64_to_u32(n)),
-                    _ => None,
-                });
-            let padding_column = padding_obj
-                .and_then(|p| p.get("column"))
-                .and_then(|v| match v {
-                    Value::Number(n) => Some(f64_to_u32(n)),
-                    _ => None,
-                });
-            let padding_left = padding_obj
-                .and_then(|p| p.get("left"))
-                .and_then(|v| match v {
-                    Value::Number(n) => Some(f64_to_u32(n)),
-                    _ => None,
-                });
-            let padding_right = padding_obj
-                .and_then(|p| p.get("right"))
-                .and_then(|v| match v {
-                    Value::Number(n) => Some(f64_to_u32(n)),
-                    _ => None,
-                });
-            let padding_top = padding_obj
-                .and_then(|p| p.get("top"))
-                .and_then(|v| match v {
-                    Value::Number(n) => Some(f64_to_u32(n)),
-                    _ => None,
-                });
-            let padding_bottom = padding_obj
-                .and_then(|p| p.get("bottom"))
-                .and_then(|v| match v {
-                    Value::Number(n) => Some(f64_to_u32(n)),
-                    _ => None,
-                });
-
-            if padding_row.is_some()
-                || padding_column.is_some()
-                || padding_left.is_some()
-                || padding_right.is_some()
-                || padding_top.is_some()
-                || padding_bottom.is_some()
-            {
-                let mut padding = Padding::new();
-                if let Some(x) = padding_row {
-                    padding = padding.x(x);
+    }
+    if font_obj.get("style").and_then(|v| v.as_tag()) == Some("Italic") {
+        font = font.italic();
+    }
+    if let Some(Value::Tagged {
+        tag,
+        fields: list_fields,
+    }) = font_obj.get("family")
+    {
+        if tag.as_ref() == LIST_TAG {
+            let mut families = Vec::new();
+            // BTreeMap iteration is already sorted by key
+            for item in list_fields.values() {
+                match item {
+                    Value::Text(name) => families.push(FontFamily::new(name.to_string())),
+                    Value::Tag(t) => match t.as_ref() {
+                        "SansSerif" => families.push(FontFamily::SansSerif),
+                        "Serif" => families.push(FontFamily::Serif),
+                        "Monospace" => families.push(FontFamily::Monospace),
+                        _ => {}
+                    },
+                    _ => {}
                 }
-                if let Some(y) = padding_column {
-                    padding = padding.y(y);
-                }
-                if let Some(left) = padding_left {
-                    padding = padding.left(left);
-                }
-                if let Some(right) = padding_right {
-                    padding = padding.right(right);
-                }
-                if let Some(top) = padding_top {
-                    padding = padding.top(top);
-                }
-                if let Some(bottom) = padding_bottom {
-                    padding = padding.bottom(bottom);
-                }
-                base.s(padding)
-            } else {
-                base
+            }
+            if !families.is_empty() {
+                font = font.family(families);
             }
         }
-    };
-
-    // Apply height
-    let base = {
-        let height_opt = style.and_then(|s| s.get("height")).and_then(|v| match v {
-            Value::Number(n) => Some(f64_to_u32(n)),
-            _ => None,
-        });
-
-        if let Some(height) = height_opt {
-            base.s(Height::exact(height))
-        } else {
-            base
+    }
+    if let Some(Value::Object(line)) = font_obj.get("line") {
+        let strike = line
+            .get("strikethrough")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let underline = line
+            .get("underline")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if strike || underline {
+            let mut fl = FontLine::new();
+            if strike { fl = fl.strike(); }
+            if underline { fl = fl.underline(); }
+            font = font.line(fl);
         }
-    };
+    }
+    Some(font)
+}
 
-    // Apply transform (rotation, move_right, move_down)
-    let base = {
-        let transform_obj = style.and_then(|s| s.get("transform"));
-        let rotate_opt = transform_obj
-            .and_then(|t| t.get("rotate"))
-            .and_then(|v| match v {
-                Value::Number(n) => Some(f64_to_i32(n)),
+/// Extract Font from a full Value.
+fn extract_font(value: &Value) -> Option<Font<'static>> {
+    extract_font_from_fields(get_fields(value)?)
+}
+
+/// Also check align.row for text alignment (used when font.align is not set).
+fn extract_align_font_from_fields(fields: &Fields) -> Option<Font<'static>> {
+    let style = get_style_obj(fields)?;
+    if let Some(Value::Object(align)) = style.get("align") {
+        if let Some(tag) = align.get("row").and_then(|v| v.as_tag()) {
+            return match tag {
+                "Center" => Some(Font::new().center()),
+                "Start" | "Left" => Some(Font::new().left()),
+                "End" | "Right" => Some(Font::new().right()),
                 _ => None,
-            });
-        let move_right_opt =
-            transform_obj
-                .and_then(|t| t.get("move_right"))
-                .and_then(|v| match v {
-                    Value::Number(n) => Some(f64_to_i32(n)),
-                    _ => None,
-                });
-        let move_down_opt = transform_obj
-            .and_then(|t| t.get("move_down"))
-            .and_then(|v| match v {
-                Value::Number(n) => Some(f64_to_i32(n)),
-                _ => None,
-            });
-
-        if rotate_opt.is_some() || move_right_opt.is_some() || move_down_opt.is_some() {
-            let mut t = Transform::new();
-            if let Some(rotate) = rotate_opt {
-                t = t.rotate(rotate);
-            }
-            if let Some(x) = move_right_opt {
-                t = t.move_right(x);
-            }
-            if let Some(y) = move_down_opt {
-                t = t.move_down(y);
-            }
-            base.s(t)
-        } else {
-            base
+            };
         }
-    };
+    }
+    None
+}
 
-    // Add child (changes typestate, so must be last)
-    match child {
-        Some(c) => base.child(render_dd_value(c)).unify(),
-        None => base.unify(),
+fn extract_align_font(value: &Value) -> Option<Font<'static>> {
+    extract_align_font_from_fields(get_fields(value)?)
+}
+
+/// Extract Width from element fields' style.
+fn extract_width_from_fields(fields: &Fields) -> Option<Width<'static>> {
+    let style = get_style_obj(fields)?;
+    // Size field sets both width and height
+    if let Some(size) = style.get("size").and_then(|v| v.as_number()) {
+        return Some(Width::exact(size as u32));
+    }
+    let w = style.get("width")?;
+    if let Some(n) = w.as_number() {
+        Some(Width::exact(n as u32))
+    } else if w.as_tag() == Some("Fill") {
+        Some(Width::fill())
+    } else {
+        None
     }
 }
 
-/// Render a text input element.
-fn render_text_input(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    // Placeholder can be a simple string or an object with a "text" field
-    // e.g., placeholder: [text: TEXT { Type and press Enter... }]
-    let placeholder_value = fields.get("placeholder").unwrap_or_else(|| {
-        panic!("[DD TextInput] Missing required 'placeholder' field");
-    });
-    let placeholder = match placeholder_value {
-        Value::Unit => None,
-        Value::Text(text) => Some(text.as_ref().to_string()),
+fn extract_width(value: &Value) -> Option<Width<'static>> {
+    extract_width_from_fields(get_fields(value)?)
+}
+
+/// Extract Height from element fields' style.
+fn extract_height_from_fields(fields: &Fields) -> Option<Height<'static>> {
+    let style = get_style_obj(fields)?;
+    if let Some(size) = style.get("size").and_then(|v| v.as_number()) {
+        return Some(Height::exact(size as u32));
+    }
+    let h = style.get("height")?;
+    if let Some(n) = h.as_number() {
+        Some(Height::exact(n as u32))
+    } else if h.as_tag() == Some("Fill") {
+        Some(Height::fill())
+    } else {
+        None
+    }
+}
+
+fn extract_height(value: &Value) -> Option<Height<'static>> {
+    extract_height_from_fields(get_fields(value)?)
+}
+
+/// Extract Padding from element fields' style.
+fn extract_padding_from_fields(fields: &Fields) -> Option<Padding<'static>> {
+    let style = get_style_obj(fields)?;
+    let padding_val = style.get("padding")?;
+    match padding_val {
+        Value::Number(n) => Some(Padding::all(n.0 as u32)),
+        Value::Object(padding) => {
+            let row = padding
+                .get("row")
+                .and_then(|v| v.as_number())
+                .unwrap_or(0.0);
+            let col = padding
+                .get("column")
+                .and_then(|v| v.as_number())
+                .unwrap_or(0.0);
+            let top = padding
+                .get("top")
+                .and_then(|v| v.as_number())
+                .unwrap_or(col) as u32;
+            let bottom = padding
+                .get("bottom")
+                .and_then(|v| v.as_number())
+                .unwrap_or(col) as u32;
+            let left = padding
+                .get("left")
+                .and_then(|v| v.as_number())
+                .unwrap_or(row) as u32;
+            let right = padding
+                .get("right")
+                .and_then(|v| v.as_number())
+                .unwrap_or(row) as u32;
+            Some(Padding::new().top(top).right(right).bottom(bottom).left(left))
+        }
+        _ => None,
+    }
+}
+
+/// Extract Background from element fields' style.
+fn extract_background_from_fields(fields: &Fields) -> Option<Background<'static>> {
+    let style = get_style_obj(fields)?;
+    let bg = match style.get("background") {
+        Some(Value::Object(bg)) => bg,
+        _ => return None,
+    };
+    let mut background = Background::new();
+    let mut has_any = false;
+    if let Some(color_css) = bg.get("color").and_then(value_to_css_color) {
+        background = background.color(color_css);
+        has_any = true;
+    }
+    if let Some(url) = bg.get("url").and_then(|v| v.as_text()) {
+        background = background.url(url.to_string());
+        has_any = true;
+    }
+    if has_any {
+        Some(background)
+    } else {
+        None
+    }
+}
+
+/// Extract background color from a Value (for signal closures).
+fn extract_bg_color(value: &Value) -> Option<String> {
+    let fields = get_fields(value)?;
+    let style = get_style_obj(fields)?;
+    let bg = match style.get("background") {
+        Some(Value::Object(bg)) => bg,
+        _ => return None,
+    };
+    bg.get("color").and_then(value_to_css_color)
+}
+
+/// Extract background URL from a Value (for signal closures).
+fn extract_bg_url(value: &Value) -> Option<String> {
+    let fields = get_fields(value)?;
+    let style = get_style_obj(fields)?;
+    let bg = match style.get("background") {
+        Some(Value::Object(bg)) => bg,
+        _ => return None,
+    };
+    bg.get("url").and_then(|v| v.as_text()).map(|s| s.to_string())
+}
+
+/// Extract RoundedCorners from element fields' style.
+fn extract_rounded_corners_from_fields(fields: &Fields) -> Option<RoundedCorners> {
+    let style = get_style_obj(fields)?;
+    style
+        .get("rounded_corners")
+        .and_then(|v| v.as_number())
+        .map(|n| RoundedCorners::all(n as u32))
+}
+
+/// Extract Transform from element fields' style.
+fn extract_transform_from_fields(fields: &Fields) -> Option<Transform> {
+    let style = get_style_obj(fields)?;
+    let transform = match style.get("transform") {
+        Some(Value::Object(t)) => t,
+        _ => return None,
+    };
+    let move_right = transform
+        .get("move_right")
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
+    let move_down = transform
+        .get("move_down")
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
+    let move_left = transform
+        .get("move_left")
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
+    let move_up = transform
+        .get("move_up")
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
+    let rotate = transform
+        .get("rotate")
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
+    let has_transform =
+        move_right != 0.0 || move_down != 0.0 || move_left != 0.0 || move_up != 0.0 || rotate != 0.0;
+    if !has_transform {
+        return None;
+    }
+    let mut t = Transform::new();
+    if move_right != 0.0 {
+        t = t.move_right(move_right);
+    }
+    if move_left != 0.0 {
+        t = t.move_left(move_left);
+    }
+    if move_down != 0.0 {
+        t = t.move_down(move_down);
+    }
+    if move_up != 0.0 {
+        t = t.move_up(move_up);
+    }
+    if rotate != 0.0 {
+        t = t.rotate(rotate);
+    }
+    Some(t)
+}
+
+fn extract_transform(value: &Value) -> Option<Transform> {
+    extract_transform_from_fields(get_fields(value)?)
+}
+
+/// Extract Outline from element fields' style.
+fn extract_outline_from_fields(fields: &Fields) -> Option<Outline> {
+    let style = get_style_obj(fields)?;
+    let outline = style.get("outline")?;
+    match outline {
+        Value::Tag(t) if t.as_ref() == "NoOutline" => None,
         Value::Object(obj) => {
-            if let Some(text_value) = obj.get("text") {
-                match text_value {
-                    Value::Text(text) => Some(text.as_ref().to_string()),
-                    Value::CellRef(cell_id) => {
-                        panic!(
-                            "[DD TextInput] placeholder must be static text, found CellRef({})",
-                            cell_id
-                        );
+            let color_css = obj.get("color").and_then(value_to_css_color)?;
+            let side = obj
+                .get("side")
+                .and_then(|v| v.as_tag())
+                .unwrap_or("Outer");
+            let mut o = if side == "Inner" {
+                Outline::inner()
+            } else {
+                Outline::outer()
+            };
+            o = o.color(color_css);
+            Some(o)
+        }
+        _ => None,
+    }
+}
+
+fn extract_outline(value: &Value) -> Option<Outline> {
+    extract_outline_from_fields(get_fields(value)?)
+}
+
+/// Extract Borders from element fields' style.
+fn extract_border_side(side_obj: &Fields) -> Option<Border> {
+    let width = side_obj
+        .get("width")
+        .and_then(|v| v.as_number())
+        .unwrap_or(1.0) as u32;
+    let color_css = side_obj.get("color").and_then(value_to_css_color)?;
+    Some(Border::new().width(width).color(color_css))
+}
+
+fn extract_borders_from_fields(fields: &Fields) -> Option<Borders<'static>> {
+    let style = get_style_obj(fields)?;
+    let borders = match style.get("borders") {
+        Some(Value::Object(b)) => b,
+        _ => return None,
+    };
+    let mut result = Borders::new();
+    let mut has_any = false;
+    if let Some(Value::Object(top)) = borders.get("top") {
+        if let Some(b) = extract_border_side(top) {
+            result = result.top(b);
+            has_any = true;
+        }
+    }
+    if let Some(Value::Object(bottom)) = borders.get("bottom") {
+        if let Some(b) = extract_border_side(bottom) {
+            result = result.bottom(b);
+            has_any = true;
+        }
+    }
+    if let Some(Value::Object(left)) = borders.get("left") {
+        if let Some(b) = extract_border_side(left) {
+            result = result.left(b);
+            has_any = true;
+        }
+    }
+    if let Some(Value::Object(right)) = borders.get("right") {
+        if let Some(b) = extract_border_side(right) {
+            result = result.right(b);
+            has_any = true;
+        }
+    }
+    if has_any {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+/// Extract AlignContent from element fields' style.
+fn extract_align_content_from_fields(fields: &Fields) -> Option<AlignContent> {
+    let style = get_style_obj(fields)?;
+    let align = match style.get("align") {
+        Some(Value::Object(a)) => a,
+        _ => return None,
+    };
+    let mut result = AlignContent::new();
+    let mut has_any = false;
+    if let Some(tag) = align.get("row").and_then(|v| v.as_tag()) {
+        result = match tag {
+            "Center" => result.center_x(),
+            "Start" | "Left" => result.left(),
+            "End" | "Right" => result.right(),
+            _ => result,
+        };
+        has_any = true;
+    }
+    if let Some(tag) = align.get("column").and_then(|v| v.as_tag()) {
+        result = match tag {
+            "Center" => result.center_y(),
+            "Top" | "Start" => result.top(),
+            "Bottom" | "End" => result.bottom(),
+            _ => result,
+        };
+        has_any = true;
+    }
+    if has_any {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+fn extract_align_content(value: &Value) -> Option<AlignContent> {
+    extract_align_content_from_fields(get_fields(value)?)
+}
+
+/// Extract self-alignment (Align) from style.align when it's a simple Tag (e.g., Right, Center).
+/// This differs from AlignContent which positions content INSIDE the element;
+/// Align positions the element ITSELF within its parent (margin-left: auto, etc.).
+fn extract_self_align(value: &Value) -> Option<Align> {
+    let fields = get_fields(value)?;
+    let style = get_style_obj(fields)?;
+    match style.get("align") {
+        Some(Value::Tag(tag)) => match tag.as_ref() {
+            "Right" | "End" => Some(Align::new().right()),
+            "Left" | "Start" => Some(Align::new().left()),
+            "Center" => Some(Align::new().center_x()),
+            "Top" => Some(Align::new().top()),
+            "Bottom" => Some(Align::new().bottom()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Apply all Zoon typed style signals from a Mutable<Value> to any element.
+/// Returns a closure suitable for `update_raw_el`.
+fn apply_zoon_style_signals<T: RawEl>(
+    raw_el: T,
+    vm: &Mutable<Arc<Value>>,
+) -> T {
+    raw_el
+        .style_signal("padding", vm.signal_cloned().map(|v| {
+            let fields = get_fields(&v)?;
+            let style = get_style_obj(fields)?;
+            let padding_val = style.get("padding")?;
+            match padding_val {
+                Value::Number(n) => Some(format!("{}px", n.0)),
+                Value::Object(padding) => {
+                    let row = padding.get("row").and_then(|v| v.as_number()).unwrap_or(0.0);
+                    let col = padding.get("column").and_then(|v| v.as_number()).unwrap_or(0.0);
+                    let top = padding.get("top").and_then(|v| v.as_number()).unwrap_or(col);
+                    let bottom = padding.get("bottom").and_then(|v| v.as_number()).unwrap_or(col);
+                    let left = padding.get("left").and_then(|v| v.as_number()).unwrap_or(row);
+                    let right = padding.get("right").and_then(|v| v.as_number()).unwrap_or(row);
+                    Some(format!("{}px {}px {}px {}px", top, right, bottom, left))
+                }
+                _ => None,
+            }
+        }))
+        .style_signal("box-shadow", vm.signal_cloned().map(|v| {
+            let fields = get_fields(&v)?;
+            let style = get_style_obj(fields)?;
+            if let Some(Value::Tagged {
+                tag,
+                fields: list_fields,
+            }) = style.get("shadows")
+            {
+                if tag.as_ref() == LIST_TAG {
+                    let mut shadow_parts = Vec::new();
+                    for item in list_fields.values() {
+                        if let Value::Object(shadow_obj) = item {
+                            let x = shadow_obj
+                                .get("x")
+                                .and_then(|v| v.as_number())
+                                .unwrap_or(0.0);
+                            let y = shadow_obj
+                                .get("y")
+                                .and_then(|v| v.as_number())
+                                .unwrap_or(0.0);
+                            let blur = shadow_obj
+                                .get("blur")
+                                .and_then(|v| v.as_number())
+                                .unwrap_or(0.0);
+                            let spread = shadow_obj
+                                .get("spread")
+                                .and_then(|v| v.as_number())
+                                .unwrap_or(0.0);
+                            let inset = shadow_obj
+                                .get("direction")
+                                .and_then(|v| v.as_tag())
+                                .map(|t| t == "Inwards")
+                                .unwrap_or(false);
+                            let color_css = shadow_obj
+                                .get("color")
+                                .and_then(value_to_css_color)
+                                .unwrap_or_else(|| "rgba(0,0,0,0.5)".to_string());
+                            let inset_str = if inset { "inset " } else { "" };
+                            shadow_parts.push(format!(
+                                "{}{}px {}px {}px {}px {}",
+                                inset_str, x, y, blur, spread, color_css
+                            ));
+                        }
                     }
-                    other => {
-                        panic!(
-                            "[DD TextInput] placeholder.text must be Text, found {:?}",
-                            other
-                        );
+                    if !shadow_parts.is_empty() {
+                        return Some(shadow_parts.join(", "));
                     }
                 }
-            } else {
-                None
             }
-        }
-        other => {
-            panic!(
-                "[DD TextInput] placeholder must be Text, Unit, or object with text, found {:?}",
-                other
-            );
-        }
-    };
-
-    let text_field = fields.get("text").unwrap_or_else(|| {
-        panic!("[DD TextInput] Missing required 'text' field");
-    });
-    dd_log!("[DD TextInput] text field value: {:?}", text_field);
-
-    let text_cell_id = match text_field {
-        Value::CellRef(cell_id) => Some(cell_id.to_string()),
-        Value::Text(_) => None,
-        other => {
-            panic!(
-                "[DD TextInput] text must be Text or CellRef, found {:?}",
-                other
-            );
-        }
-    };
-    let text = match text_field {
-        Value::CellRef(cell_id) => {
-            dd_log!("[DD TextInput] text field is CellRef({})", cell_id);
-            String::new()
-        }
-        Value::Text(text) => text.as_ref().to_string(),
-        other => {
-            panic!(
-                "[DD TextInput] text must be Text or CellRef, found {:?}",
-                other
-            );
-        }
-    };
-
-    // Check for focus: True tag
-    let focus_value = fields.get("focus").unwrap_or_else(|| {
-        panic!("[DD TextInput] Missing required 'focus' field");
-    });
-    let should_focus = match focus_value {
-        Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => {
-            BoolTag::is_true(tag.as_ref())
-        }
-        Value::Bool(b) => *b,
-        other => {
-            panic!(
-                "[DD TextInput] focus must be Bool or BoolTag, found {:?}",
-                other
-            );
-        }
-    };
-
-    // Extract key_down LinkRef from element.event.key_down
-    let key_down_link_id = fields
-        .get("element")
-        .and_then(|e| e.get("event"))
-        .and_then(|e| e.get("key_down"))
-        .map(|v| match v {
-            Value::LinkRef(id) => id.to_string(),
-            other => {
-                panic!(
-                    "[DD TextInput] element.event.key_down must be LinkRef, found {:?}",
-                    other
-                );
-            }
-        });
-
-    // DEBUG: Log text_input rendering info
-    let element_field = fields.get("element");
-    let event_field = element_field.and_then(|e| e.get("event"));
-    let key_down_field = event_field.and_then(|e| e.get("key_down"));
-    dd_log!("[DD TextInput] render_text_input: key_down_link_id={:?}, element={:?}, event={:?}, key_down={:?}, focus={}",
-        key_down_link_id, element_field.is_some(), event_field.is_some(), key_down_field, should_focus);
-
-    // Extract change LinkRef from element.event.change
-    let change_link_id = fields
-        .get("element")
-        .and_then(|e| e.get("event"))
-        .and_then(|e| e.get("change"))
-        .map(|v| match v {
-            Value::LinkRef(id) => id.to_string(),
-            other => {
-                panic!(
-                    "[DD TextInput] element.event.change must be LinkRef, found {:?}",
-                    other
-                );
-            }
-        });
-
-    // Extract blur LinkRef separately (for editing inputs)
-    let blur_link_id = fields
-        .get("element")
-        .and_then(|e| e.get("event"))
-        .and_then(|e| e.get("blur"))
-        .map(|v| match v {
-            Value::LinkRef(id) => id.to_string(),
-            other => {
-                panic!(
-                    "[DD TextInput] element.event.blur must be LinkRef, found {:?}",
-                    other
-                );
-            }
-        });
-
-    let is_editing_input = blur_link_id.is_some();
-    let item_key = extract_item_key(fields);
-
-    if text_cell_id.is_some() && change_link_id.is_none() {
-        panic!("[DD TextInput] text CellRef requires element.event.change LinkRef");
-    }
-    if text_cell_id.is_none() && change_link_id.is_some() {
-        panic!("[DD TextInput] element.event.change requires text CellRef");
-    }
-
-    let build_input = {
-        let placeholder_text = placeholder.clone().unwrap_or_default();
-        let text = text.clone();
-        let text_cell_id = text_cell_id.clone();
-        move || {
-            let input = if let Some(cell_id) = &text_cell_id {
-                let cell_id_for_signal = cell_id.clone();
-                TextInput::new()
-                    .id("dd_text_input")
-                    .text_signal(cell_signal(cell_id.clone()).map(move |value| {
-                        let Some(value) = value else {
-                            return String::new();
-                        };
-                        value.to_display_string()
-                    }))
-            } else {
-                TextInput::new().id("dd_text_input").text(text.clone())
+            None
+        }))
+        .style_signal("border-top", vm.signal_cloned().map(|v| css_border_side(&v, "top")))
+        .style_signal("border-bottom", vm.signal_cloned().map(|v| css_border_side(&v, "bottom")))
+        .style_signal("border-left", vm.signal_cloned().map(|v| css_border_side(&v, "left")))
+        .style_signal("border-right", vm.signal_cloned().map(|v| css_border_side(&v, "right")))
+        .style_signal("line-height", vm.signal_cloned().map(|v| {
+            let style = get_style_obj(get_fields(&v)?)?;
+            let lh = style.get("line_height")?.as_number()?;
+            Some(format!("{}", lh))
+        }))
+        .style_signal("text-shadow", vm.signal_cloned().map(|v| {
+            let style = get_style_obj(get_fields(&v)?)?;
+            let shadow = match style.get("text_shadow")? {
+                Value::Object(obj) => obj,
+                _ => return None,
             };
-            let input = input.placeholder(Placeholder::new(placeholder_text.clone()));
+            let x = shadow.get("x").and_then(|v| v.as_number()).unwrap_or(0.0);
+            let y = shadow.get("y").and_then(|v| v.as_number()).unwrap_or(0.0);
+            let blur = shadow.get("blur").and_then(|v| v.as_number()).unwrap_or(0.0);
+            let color_css = shadow.get("color")
+                .and_then(value_to_css_color)
+                .unwrap_or_else(|| "rgba(0,0,0,0.5)".to_string());
+            Some(format!("{}px {}px {}px {}", x, y, blur, color_css))
+        }))
+        .style_signal("-webkit-font-smoothing", vm.signal_cloned().map(|v| {
+            let style = get_style_obj(get_fields(&v)?)?;
+            let val = style.get("font_smoothing")?;
+            match val.as_tag()? {
+                "Antialiased" => Some("antialiased".to_string()),
+                _ => None,
+            }
+        }))
+        .style_signal("text-decoration", vm.signal_cloned().map(|v| {
+            let style = get_style_obj(get_fields(&v)?)?;
+            let font = match style.get("font")? {
+                Value::Object(f) => f.as_ref(),
+                Value::Tagged { fields, .. } => fields.as_ref(),
+                _ => return None,
+            };
+            let line = match font.get("line")? {
+                Value::Object(l) => l.as_ref(),
+                _ => return None,
+            };
+            let strike = line.get("strikethrough").and_then(|v| v.as_bool()).unwrap_or(false);
+            let underline = line.get("underline").and_then(|v| v.as_bool()).unwrap_or(false);
+            match (strike, underline) {
+                (true, true) => Some("line-through underline".to_string()),
+                (true, false) => Some("line-through".to_string()),
+                (false, true) => Some("underline".to_string()),
+                (false, false) => Some("none".to_string()),
+            }
+        }))
+}
 
-            let do_focus = should_focus;
-            let do_double_focus = is_editing_input;
-            input.focus(should_focus).update_raw_el(move |raw_el| {
-                let raw_el = raw_el.attr("autocomplete", "off");
-                if do_focus {
-                    raw_el.after_insert(move |el| {
-                        #[cfg(target_arch = "wasm32")]
-                        {
-                            use zoon::wasm_bindgen::closure::Closure;
-                            use zoon::wasm_bindgen::JsCast;
-                            let el_clone = el.clone();
-                            if do_double_focus {
-                                let inner_closure = Closure::once(move || {
-                                    let _ = el_clone.focus();
-                                });
-                                let outer_closure = Closure::once(move || {
-                                    if let Some(window) = zoon::web_sys::window() {
-                                        let _ = window.request_animation_frame(
-                                            inner_closure.as_ref().unchecked_ref(),
-                                        );
-                                    }
-                                    inner_closure.forget();
-                                });
-                                if let Some(window) = zoon::web_sys::window() {
-                                    let _ = window.request_animation_frame(
-                                        outer_closure.as_ref().unchecked_ref(),
-                                    );
-                                }
-                                outer_closure.forget();
-                            } else {
-                                let closure = Closure::once(move || {
-                                    if let Some(window) = zoon::web_sys::window() {
-                                        if let Some(document) = window.document() {
-                                            if let Some(active) = document.active_element() {
-                                                let tag = active.tag_name();
-                                                if !tag.eq_ignore_ascii_case("body") {
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    let _ = el_clone.focus();
-                                });
-                                if let Some(window) = zoon::web_sys::window() {
-                                    let _ = window
-                                        .request_animation_frame(closure.as_ref().unchecked_ref());
-                                }
-                                closure.forget();
-                            }
-                        }
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            let _ = el.focus();
-                        }
-                    })
+/// CSS border-side extractor (kept for raw CSS signal use in retained tree).
+fn css_border_side(value: &Value, side: &str) -> Option<String> {
+    let style = get_style_obj(get_fields(value)?)?;
+    let borders = match style.get("borders") {
+        Some(Value::Object(b)) => b,
+        _ => return None,
+    };
+    let side_obj = match borders.get(side) {
+        Some(Value::Object(s)) => s,
+        _ => return None,
+    };
+    let width = side_obj
+        .get("width")
+        .and_then(|v| v.as_number())
+        .unwrap_or(1.0);
+    let color_css = side_obj
+        .get("color")
+        .and_then(value_to_css_color)
+        .unwrap_or_else(|| "currentColor".to_string());
+    Some(format!("{}px solid {}", width, color_css))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Retained tree types
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Keyed items for O(1) per-item updates in Stripes with keyed list display.
+///
+/// Items are ordered by ListKey (sorted). Updates from keyed diffs
+/// target individual items by key without scanning the entire list.
+/// Uses IndexMap for O(1) key lookup with O(1) position queries.
+struct KeyedItems {
+    /// Items ordered by key, with O(1) key→index lookup via IndexMap.
+    items: IndexMap<Arc<str>, RetainedNode>,
+}
+
+impl KeyedItems {
+    fn new() -> Self {
+        KeyedItems {
+            items: IndexMap::new(),
+        }
+    }
+
+    /// Apply keyed diffs to the retained items.
+    fn apply(
+        &mut self,
+        diffs: &[KeyedDiff],
+        tx: &mpsc::UnboundedSender<VecDiff<RawElOrText>>,
+        handle: &DdWorkerHandle,
+        stripe_link_path: &str,
+    ) {
+        for diff in diffs {
+            match diff {
+                KeyedDiff::Upsert { key, value } => {
+                    let key_str = key.0.clone();
+                    if let Some(node) = self.items.get_mut(&key_str) {
+                        // Update existing item in place (O(1) — IndexMap lookup + Mutable set)
+                        let child_lp = Self::child_link_path(value, stripe_link_path, &key_str);
+                        node.update(value, handle, &child_lp);
+                    } else {
+                        // New item — find sorted insertion position via binary search on keys
+                        let insert_pos = self.items.keys()
+                            .position(|k| k.as_ref() > key_str.as_ref())
+                            .unwrap_or(self.items.len());
+                        let child_lp = Self::child_link_path(value, stripe_link_path, &key_str);
+                        let (el, node) = build_retained_node(value, handle, &child_lp);
+                        self.items.shift_insert(insert_pos, key_str, node);
+                        tx.unbounded_send(VecDiff::InsertAt {
+                            index: insert_pos,
+                            value: el,
+                        }).ok();
+                    }
+                }
+                KeyedDiff::Remove { key } => {
+                    let key_str = key.0.clone();
+                    if let Some(idx) = self.items.get_index_of(&key_str) {
+                        self.items.shift_remove_index(idx);
+                        tx.unbounded_send(VecDiff::RemoveAt { index: idx }).ok();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Extract link path from item's __link_path__ field, or construct from key.
+    fn child_link_path(value: &Value, stripe_link_path: &str, key: &str) -> String {
+        get_fields(value)
+            .and_then(|f| f.get(LINK_PATH_FIELD))
+            .and_then(|v| v.as_text())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{}.items.{}", stripe_link_path, key))
+    }
+}
+
+/// A retained element tree for efficient incremental DOM updates.
+///
+/// Built once from the initial Value. On state changes, `update()` diffs
+/// old vs new Value tree and updates only changed Mutables.
+pub struct RetainedTree {
+    root: RetainedNode,
+}
+
+enum RetainedNode {
+    /// Plain text / number / tag / bool
+    Primitive {
+        text: Mutable<String>,
+    },
+    Button {
+        value: Mutable<Arc<Value>>,
+        link_path: Rc<RefCell<String>>,
+    },
+    Stripe {
+        value: Mutable<Arc<Value>>,
+        items: Vec<RetainedNode>,
+        items_tx: mpsc::UnboundedSender<VecDiff<RawElOrText>>,
+        link_path: Rc<RefCell<String>>,
+        /// Keyed items for O(1) updates (Some when display pipeline is active).
+        keyed_items: Option<KeyedItems>,
+    },
+    Stack {
+        value: Mutable<Arc<Value>>,
+        layers: Vec<RetainedNode>,
+        layers_tx: mpsc::UnboundedSender<VecDiff<RawElOrText>>,
+    },
+    Container {
+        value: Mutable<Arc<Value>>,
+        child: Option<Box<RetainedNode>>,
+        child_tx: mpsc::UnboundedSender<VecDiff<RawElOrText>>,
+    },
+    TextInput {
+        value: Mutable<Arc<Value>>,
+        link_path: Rc<RefCell<String>>,
+        dom_element: Rc<RefCell<Option<web_sys::HtmlInputElement>>>,
+    },
+    Checkbox {
+        value: Mutable<Arc<Value>>,
+        link_path: Rc<RefCell<String>>,
+    },
+    Label {
+        value: Mutable<Arc<Value>>,
+        link_path: Rc<RefCell<String>>,
+    },
+    Paragraph {
+        value: Mutable<Arc<Value>>,
+        contents: Vec<RetainedNode>,
+        contents_tx: mpsc::UnboundedSender<VecDiff<RawElOrText>>,
+    },
+    Link {
+        value: Mutable<Arc<Value>>,
+        link_path: Rc<RefCell<String>>,
+    },
+    Document {
+        child: Option<Box<RetainedNode>>,
+        child_tx: mpsc::UnboundedSender<VecDiff<RawElOrText>>,
+    },
+    Empty,
+}
+
+impl RetainedNode {
+    /// Check if this retained node can handle an update from the given value
+    /// without needing to be replaced.
+    fn matches_value_type(&self, value: &Value) -> bool {
+        match (self, value) {
+            (RetainedNode::Primitive { .. }, Value::Number(_))
+            | (RetainedNode::Primitive { .. }, Value::Text(_))
+            | (RetainedNode::Primitive { .. }, Value::Bool(_))
+            | (RetainedNode::Primitive { .. }, Value::Unit) => true,
+            (RetainedNode::Primitive { .. }, Value::Tag(_)) => true,
+            (RetainedNode::Button { .. }, Value::Tagged { tag, .. }) => {
+                tag.as_ref() == "ElementButton"
+            }
+            (RetainedNode::Stripe { .. }, Value::Tagged { tag, .. }) => {
+                tag.as_ref() == "ElementStripe"
+            }
+            (RetainedNode::Stack { .. }, Value::Tagged { tag, .. }) => {
+                tag.as_ref() == "ElementStack"
+            }
+            (RetainedNode::Container { .. }, Value::Tagged { tag, .. }) => {
+                tag.as_ref() == "ElementContainer"
+            }
+            (RetainedNode::TextInput { .. }, Value::Tagged { tag, .. }) => {
+                tag.as_ref() == "ElementTextInput"
+            }
+            (RetainedNode::Checkbox { .. }, Value::Tagged { tag, .. }) => {
+                tag.as_ref() == "ElementCheckbox"
+            }
+            (RetainedNode::Label { .. }, Value::Tagged { tag, .. }) => {
+                tag.as_ref() == "ElementLabel"
+            }
+            (RetainedNode::Paragraph { .. }, Value::Tagged { tag, .. }) => {
+                tag.as_ref() == "ElementParagraph"
+            }
+            (RetainedNode::Link { .. }, Value::Tagged { tag, .. }) => {
+                tag.as_ref() == "ElementLink"
+            }
+            (RetainedNode::Document { .. }, Value::Tagged { tag, .. }) => {
+                tag.as_ref() == "DocumentNew"
+            }
+            (RetainedNode::Empty, _) => false,
+            _ => false,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Build functions — create the initial retained tree from a Value
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Build a retained tree from a document Value.
+pub fn build_retained_tree(value: &Value, handle: &DdWorkerHandle) -> (RawElOrText, RetainedTree) {
+    let (element, root) = build_retained_node(value, handle, "");
+    (element, RetainedTree { root })
+}
+
+fn build_retained_node(
+    value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+) -> (RawElOrText, RetainedNode) {
+    match value {
+        Value::Number(_) | Value::Text(_) | Value::Tag(_) | Value::Bool(_) | Value::Unit => {
+            build_retained_primitive(value)
+        }
+        Value::Tagged { tag, fields } => {
+            build_retained_tagged(tag, fields, value, handle, link_path)
+        }
+        Value::Object(_) => build_retained_primitive(value),
+    }
+}
+
+fn build_retained_primitive(value: &Value) -> (RawElOrText, RetainedNode) {
+    let text_str = match value {
+        Value::Tag(s) if s.as_ref() == "NoElement" || s.as_ref() == "SKIP" => String::new(),
+        _ => value.to_display_string(),
+    };
+    let text_mutable = Mutable::new(text_str);
+    let el = El::new().child_signal(text_mutable.signal_cloned().map(|t| {
+        if t.is_empty() {
+            None
+        } else {
+            Some(zoon::Text::with_signal(always(t)))
+        }
+    }));
+    (el.unify(), RetainedNode::Primitive { text: text_mutable })
+}
+
+fn build_retained_tagged(
+    tag: &str,
+    fields: &Arc<Fields>,
+    full_value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+) -> (RawElOrText, RetainedNode) {
+    match tag {
+        "ElementButton" => build_retained_button(fields, full_value, handle, link_path),
+        "ElementStripe" => build_retained_stripe(fields, full_value, handle, link_path),
+        "ElementStack" => build_retained_stack(fields, full_value, handle, link_path),
+        "ElementContainer" => build_retained_container(fields, full_value, handle, link_path),
+        "ElementLabel" => build_retained_label(fields, full_value, handle, link_path),
+        "ElementTextInput" => build_retained_text_input(fields, full_value, handle, link_path),
+        "ElementCheckbox" => build_retained_checkbox(fields, full_value, handle, link_path),
+        "ElementParagraph" => build_retained_paragraph(fields, full_value, handle, link_path),
+        "ElementLink" => build_retained_link(fields, full_value, handle, link_path),
+        "DocumentNew" => {
+            let (child_tx, child_rx) = mpsc::unbounded();
+            let (child_opt, initial_elements) =
+                if let Some(root) = fields.get("root") {
+                    let (el, child) = build_retained_node(root, handle, link_path);
+                    (Some(Box::new(child)), vec![el])
                 } else {
-                    raw_el
+                    (None, vec![])
+                };
+            child_tx
+                .unbounded_send(VecDiff::Replace { values: initial_elements })
+                .ok();
+            let el = El::new()
+                .s(Width::fill())
+                .s(Height::fill())
+                .update_raw_el(|raw_el| {
+                    raw_el.children_signal_vec(VecDiffStreamSignalVec(child_rx))
+                });
+            (el.unify(), RetainedNode::Document { child: child_opt, child_tx })
+        }
+        _ => build_retained_primitive(&Value::text(format!("{}[...]", tag))),
+    }
+}
+
+/// Create a hover change handler for Zoon's `.on_hovered_change()`.
+fn make_hover_handler(handle_ref: DdWorkerHandle, hover_link: Option<String>) -> impl FnMut(bool) {
+    move |hovered| {
+        if let Some(ref path) = hover_link {
+            if !path.is_empty() {
+                handle_ref.inject_dd_event(Event::HoverChange { link_path: path.clone(), hovered });
+            }
+        }
+    }
+}
+
+fn build_retained_button(
+    fields: &Fields,
+    full_value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+) -> (RawElOrText, RetainedNode) {
+    let vm = Mutable::new(Arc::new(full_value.clone()));
+    let effective_link = extract_effective_link(fields, link_path);
+    let link_ref = Rc::new(RefCell::new(effective_link.clone()));
+    let hover_link = extract_hover_link_path(fields, link_path);
+
+    let el = Button::new()
+        .update_raw_el(|raw_el| raw_el.attr("role", "button"))
+        .label_signal(vm.signal_cloned().map(|v| {
+            get_fields(&v)
+                .and_then(|f| f.get("label"))
+                .map(|l| l.to_display_string())
+                .unwrap_or_default()
+        }))
+        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
+        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_align_font(&v))))
+        .s(Align::with_signal_self(vm.signal_cloned().map(|v| extract_self_align(&v))))
+        .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
+        .s(Height::with_signal_self(vm.signal_cloned().map(|v| extract_height(&v))))
+        .s(Background::new()
+            .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v)))
+            .url_signal(vm.signal_cloned().map(|v| extract_bg_url(&v))))
+        .s(RoundedCorners::all_signal(vm.signal_cloned().map(|v| {
+            get_fields(&v)
+                .and_then(|f| get_style_obj(f))
+                .and_then(|s| s.get("rounded_corners"))
+                .and_then(|v| v.as_number())
+                .map(|n| n as u32)
+        })))
+        .s(Transform::with_signal_self(vm.signal_cloned().map(|v| extract_transform(&v))))
+        .s(Outline::with_signal_self(vm.signal_cloned().map(|v| extract_outline(&v))))
+        .s(AlignContent::with_signal_self(vm.signal_cloned().map(|v| extract_align_content(&v))))
+        .update_raw_el({
+            let vm = vm.clone();
+            move |raw_el| apply_zoon_style_signals(raw_el, &vm)
+        })
+        .on_press({
+            let handle_ref = handle.clone_ref();
+            let lp = link_ref.clone();
+            move || {
+                let path = lp.borrow().clone();
+                if !path.is_empty() {
+                    handle_ref.inject_dd_event(Event::LinkPress { link_path: path });
+                }
+            }
+        })
+        .on_hovered_change(make_hover_handler(handle.clone_ref(), hover_link.clone()));
+
+    (
+        el.unify(),
+        RetainedNode::Button {
+            value: vm,
+            link_path: link_ref,
+        },
+    )
+}
+
+fn build_retained_stripe(
+    fields: &Fields,
+    full_value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+) -> (RawElOrText, RetainedNode) {
+    let vm = Mutable::new(Arc::new(full_value.clone()));
+    let (items_tx, items_rx) = mpsc::unbounded();
+    let effective_link = extract_effective_link(fields, link_path);
+    let link_ref = Rc::new(RefCell::new(effective_link));
+
+    // Build initial items
+    let item_values = extract_sorted_list_items(fields, "items");
+
+    // Detect keyed Stripe by matching element tag from compiler.
+    let keyed_mode = if let Some(keyed_tag) = handle.keyed_stripe_element_tag() {
+        let el_tag = fields.get("element")
+            .and_then(|e| e.get_field("tag"))
+            .and_then(|t| t.as_tag());
+        el_tag == Some(keyed_tag)
+    } else {
+        false
+    };
+
+    let mut retained_items = Vec::new();
+    let mut keyed_items_init: Option<KeyedItems> = None;
+
+    if keyed_mode {
+        // Keyed Stripe: items arrive via keyed diffs, not from the document closure.
+        // The document closure provides a stub list (correct count, placeholder values)
+        // for structural checks like List/is_empty(). Skip building items here.
+        keyed_items_init = Some(KeyedItems::new());
+    } else {
+        // Non-keyed: build items from the document value.
+        let mut initial_elements = Vec::new();
+        for (i, item) in item_values.iter().enumerate() {
+            let child_lp = format!("{}.items.{}", link_path, i);
+            let (el, node) = build_retained_node(item, handle, &child_lp);
+            retained_items.push(node);
+            initial_elements.push(el);
+        }
+        items_tx
+            .unbounded_send(VecDiff::Replace {
+                values: initial_elements,
+            })
+            .ok();
+    }
+
+    let el = Stripe::new()
+        .direction_signal(vm.signal_cloned().map(|v| {
+            let dir = get_fields(&v)
+                .and_then(|f| f.get("direction"))
+                .and_then(|v| v.as_tag());
+            match dir {
+                Some("Row") => Direction::Row,
+                _ => Direction::Column,
+            }
+        }))
+        .s(Gap::both_signal(vm.signal_cloned().map(|v| {
+            get_fields(&v)
+                .and_then(|f| f.get("gap"))
+                .and_then(|v| v.as_number())
+                .filter(|g| *g > 0.0)
+                .map(|g| g as u32)
+        })))
+        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
+        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_align_font(&v))))
+        .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
+        .s(Height::with_signal_self(vm.signal_cloned().map(|v| extract_height(&v))))
+        .s(Background::new()
+            .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v)))
+            .url_signal(vm.signal_cloned().map(|v| extract_bg_url(&v))))
+        .s(RoundedCorners::all_signal(vm.signal_cloned().map(|v| {
+            get_fields(&v)
+                .and_then(|f| get_style_obj(f))
+                .and_then(|s| s.get("rounded_corners"))
+                .and_then(|v| v.as_number())
+                .map(|n| n as u32)
+        })))
+        .s(Transform::with_signal_self(vm.signal_cloned().map(|v| extract_transform(&v))))
+        .s(Outline::with_signal_self(vm.signal_cloned().map(|v| extract_outline(&v))))
+        .s(AlignContent::with_signal_self(vm.signal_cloned().map(|v| extract_align_content(&v))))
+        .update_raw_el({
+            let vm = vm.clone();
+            move |raw_el| apply_zoon_style_signals(raw_el, &vm)
+        })
+        .items_signal_vec(VecDiffStreamSignalVec(items_rx));
+
+    // Wire hover handlers via raw JS (same as current approach — see MEMORY.md)
+    let hover_link = extract_hover_link_path(fields, link_path);
+    let el = if let Some(hover_link) = hover_link {
+        let handle_hover_in = handle.clone_ref();
+        let link_hover_in = hover_link.clone();
+        let handle_hover_out = handle.clone_ref();
+        let link_hover_out = hover_link;
+        el.update_raw_el(move |raw_el| {
+            raw_el.after_insert(move |el: web_sys::HtmlElement| {
+                let link_in = link_hover_in.clone();
+                let handle_in = handle_hover_in.clone_ref();
+                let enter_closure =
+                    wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                        handle_in.inject_dd_event(Event::HoverChange {
+                            link_path: link_in.clone(),
+                            hovered: true,
+                        });
+                    });
+                el.add_event_listener_with_callback(
+                    "mouseenter",
+                    enter_closure.as_ref().unchecked_ref(),
+                )
+                .ok();
+                enter_closure.forget();
+
+                let link_out = link_hover_out.clone();
+                let handle_out = handle_hover_out.clone_ref();
+                let leave_closure =
+                    wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                        handle_out.inject_dd_event(Event::HoverChange {
+                            link_path: link_out.clone(),
+                            hovered: false,
+                        });
+                    });
+                el.add_event_listener_with_callback(
+                    "mouseleave",
+                    leave_closure.as_ref().unchecked_ref(),
+                )
+                .ok();
+                leave_closure.forget();
+            })
+        })
+    } else {
+        el
+    };
+
+    (
+        el.unify(),
+        RetainedNode::Stripe {
+            value: vm,
+            items: retained_items,
+            items_tx,
+            link_path: link_ref,
+            keyed_items: keyed_items_init,
+        },
+    )
+}
+
+fn build_retained_stack(
+    fields: &Fields,
+    full_value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+) -> (RawElOrText, RetainedNode) {
+    let vm = Mutable::new(Arc::new(full_value.clone()));
+    let (layers_tx, layers_rx) = mpsc::unbounded();
+
+    let layer_values = extract_sorted_list_items(fields, "layers");
+    let mut retained_layers = Vec::new();
+    let mut initial_elements = Vec::new();
+
+    for (i, layer) in layer_values.iter().enumerate() {
+        let child_lp = format!("{}.layers.{}", link_path, i);
+        let (el, node) = build_retained_node(layer, handle, &child_lp);
+        retained_layers.push(node);
+        initial_elements.push(el);
+    }
+
+    layers_tx
+        .unbounded_send(VecDiff::Replace {
+            values: initial_elements,
+        })
+        .ok();
+
+    let el = Stack::new()
+        .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
+        .s(Height::with_signal_self(vm.signal_cloned().map(|v| extract_height(&v))))
+        .s(Background::new()
+            .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v))))
+        .layers_signal_vec(VecDiffStreamSignalVec(layers_rx));
+
+    (
+        el.unify(),
+        RetainedNode::Stack {
+            value: vm,
+            layers: retained_layers,
+            layers_tx,
+        },
+    )
+}
+
+fn build_retained_container(
+    fields: &Fields,
+    full_value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+) -> (RawElOrText, RetainedNode) {
+    let vm = Mutable::new(Arc::new(full_value.clone()));
+    let (child_tx, child_rx) = mpsc::unbounded();
+
+    let mut retained_child = None;
+    let mut initial_elements = Vec::new();
+
+    if let Some(child_val) = fields.get("child") {
+        let (el, node) = build_retained_node(child_val, handle, link_path);
+        retained_child = Some(Box::new(node));
+        initial_elements.push(el);
+    }
+
+    child_tx
+        .unbounded_send(VecDiff::Replace {
+            values: initial_elements,
+        })
+        .ok();
+
+    let el = El::new()
+        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
+        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_align_font(&v))))
+        .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
+        .s(Height::with_signal_self(vm.signal_cloned().map(|v| extract_height(&v))))
+        .s(Background::new()
+            .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v))))
+        .s(RoundedCorners::all_signal(vm.signal_cloned().map(|v| {
+            get_fields(&v)
+                .and_then(|f| get_style_obj(f))
+                .and_then(|s| s.get("rounded_corners"))
+                .and_then(|v| v.as_number())
+                .map(|n| n as u32)
+        })))
+        .s(Transform::with_signal_self(vm.signal_cloned().map(|v| extract_transform(&v))))
+        .s(Outline::with_signal_self(vm.signal_cloned().map(|v| extract_outline(&v))))
+        .s(AlignContent::with_signal_self(vm.signal_cloned().map(|v| extract_align_content(&v))))
+        .update_raw_el({
+            let vm = vm.clone();
+            let child_rx = child_rx;
+            move |raw_el| {
+                let raw_el = apply_zoon_style_signals(raw_el, &vm);
+                raw_el.children_signal_vec(VecDiffStreamSignalVec(child_rx))
+            }
+        });
+
+    (
+        el.unify(),
+        RetainedNode::Container {
+            value: vm,
+            child: retained_child,
+            child_tx,
+        },
+    )
+}
+
+fn build_retained_label(
+    fields: &Fields,
+    full_value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+) -> (RawElOrText, RetainedNode) {
+    let vm = Mutable::new(Arc::new(full_value.clone()));
+    let effective_link = fields
+        .get(LINK_PATH_FIELD)
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| link_path.to_string());
+    let link_ref = Rc::new(RefCell::new(effective_link.clone()));
+    let hover_link = extract_hover_link_path(fields, link_path);
+
+    let el = Label::new()
+        .label_signal(vm.signal_cloned().map(|v| {
+            let fields = get_fields(&v);
+            let label = fields
+                .and_then(|f| f.get("label"))
+                .map(|l| l.to_display_string())
+                .unwrap_or_default();
+            // Extract text-decoration from font.line (strikethrough/underline)
+            // Must be applied to inner El because CSS text-decoration doesn't propagate to block children
+            let text_decoration = fields
+                .and_then(|f| get_style_obj(f))
+                .and_then(|s| match s.get("font")? {
+                    Value::Object(f) => Some(f.as_ref()),
+                    Value::Tagged { fields, .. } => Some(fields.as_ref()),
+                    _ => None,
+                })
+                .and_then(|f| match f.get("line")? {
+                    Value::Object(l) => Some(l.as_ref()),
+                    _ => None,
+                })
+                .map(|line| {
+                    let strike = line.get("strikethrough").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let underline = line.get("underline").and_then(|v| v.as_bool()).unwrap_or(false);
+                    match (strike, underline) {
+                        (true, true) => "line-through underline",
+                        (true, false) => "line-through",
+                        (false, true) => "underline",
+                        _ => "none",
+                    }
+                });
+            let el = El::new().child(label);
+            if let Some(td) = text_decoration {
+                el.update_raw_el(|raw_el| raw_el.style("text-decoration", td))
+            } else {
+                el
+            }
+        }))
+        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
+        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_align_font(&v))))
+        .update_raw_el({
+            let vm = vm.clone();
+            move |raw_el| apply_zoon_style_signals(raw_el, &vm)
+        })
+        .on_double_click({
+            let handle_ref = handle.clone_ref();
+            let lp = link_ref.clone();
+            move || {
+                let path = lp.borrow().clone();
+                if !path.is_empty() {
+                    handle_ref.inject_dd_event(Event::DoubleClick { link_path: path });
+                }
+            }
+        })
+        .on_hovered_change(make_hover_handler(handle.clone_ref(), hover_link.clone()));
+
+    (
+        el.unify(),
+        RetainedNode::Label {
+            value: vm,
+            link_path: link_ref,
+        },
+    )
+}
+
+fn build_retained_text_input(
+    fields: &Fields,
+    full_value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+) -> (RawElOrText, RetainedNode) {
+    let vm = Mutable::new(Arc::new(full_value.clone()));
+    let effective_link = fields
+        .get(LINK_PATH_FIELD)
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| link_path.to_string());
+    let link_ref = Rc::new(RefCell::new(effective_link.clone()));
+    let dom_el: Rc<RefCell<Option<web_sys::HtmlInputElement>>> = Default::default();
+
+    let text = fields
+        .get("text")
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    let focus = fields
+        .get("focus")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let input = TextInput::new()
+        .label_hidden("text input")
+        .focus_signal(vm.signal_cloned().map(|v| {
+            get_fields(&v)
+                .and_then(|f| f.get("focus"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        }))
+        .text_signal(vm.signal_cloned().map(|v| {
+            get_fields(&v)
+                .and_then(|f| f.get("text"))
+                .and_then(|v| v.as_text())
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        }))
+        .placeholder(Placeholder::with_signal(vm.signal_cloned().map(|v| {
+            get_fields(&v)
+                .and_then(|f| f.get("placeholder"))
+                .and_then(|v| v.get_field("text"))
+                .and_then(|v| v.as_text())
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        })).s(Font::new().italic()))
+        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
+        .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
+        .s(Background::new()
+            .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v))))
+        .update_raw_el({
+            let dom_el_ref = dom_el.clone();
+            let initial_text = text.clone();
+            let initial_focus = focus;
+            let vm = vm.clone();
+            move |raw_el| {
+                let raw_el = apply_zoon_style_signals(raw_el, &vm);
+                raw_el.after_insert(move |input_el: web_sys::HtmlInputElement| {
+                    if initial_focus {
+                        input_el.set_value(&initial_text);
+                        let text_len: u32 = initial_text.len().try_into().unwrap_or(0);
+                        input_el.set_selection_range(text_len, text_len).ok();
+                    }
+                    *dom_el_ref.borrow_mut() = Some(input_el);
+                })
+            }
+        })
+        .on_key_down_event({
+            let handle_ref = handle.clone_ref();
+            let lp = link_ref.clone();
+            move |event| {
+                let base = lp.borrow().clone();
+                if !base.is_empty() {
+                    let key = match event.key() {
+                        Key::Enter => "Enter".to_string(),
+                        Key::Escape => "Escape".to_string(),
+                        Key::Other(k) => k.clone(),
+                    };
+                    let path = format!("{}.event.key_down", base);
+                    handle_ref.inject_dd_event(Event::KeyDown { link_path: path, key });
+                }
+            }
+        })
+        .on_change({
+            let handle_ref = handle.clone_ref();
+            let lp = link_ref.clone();
+            move |text| {
+                let base = lp.borrow().clone();
+                if !base.is_empty() {
+                    let path = format!("{}.event.change", base);
+                    handle_ref.inject_dd_event(Event::TextChange { link_path: path, text });
+                }
+            }
+        })
+        .on_blur({
+            let handle_ref = handle.clone_ref();
+            let lp = link_ref.clone();
+            move || {
+                let base = lp.borrow().clone();
+                if !base.is_empty() {
+                    let path = format!("{}.event.blur", base);
+                    handle_ref.inject_dd_event(Event::Blur { link_path: path });
+                }
+            }
+        })
+        .update_raw_el({
+            let handle_ref = handle.clone_ref();
+            let lp = link_ref.clone();
+            move |raw_el| {
+                raw_el.event_handler(move |_: events::Focus| {
+                    let base = lp.borrow().clone();
+                    if !base.is_empty() {
+                        let path = format!("{}.event.focus", base);
+                        handle_ref.inject_dd_event(Event::Focus { link_path: path });
+                    }
+                })
+            }
+        });
+
+    (
+        input.unify(),
+        RetainedNode::TextInput {
+            value: vm,
+            link_path: link_ref,
+            dom_element: dom_el,
+        },
+    )
+}
+
+fn build_retained_checkbox(
+    fields: &Fields,
+    full_value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+) -> (RawElOrText, RetainedNode) {
+    let vm = Mutable::new(Arc::new(full_value.clone()));
+    let effective_link = fields
+        .get(LINK_PATH_FIELD)
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| link_path.to_string());
+    let link_ref = Rc::new(RefCell::new(effective_link.clone()));
+
+    let has_icon = fields.get("icon").is_some()
+        && !matches!(fields.get("icon"), Some(Value::Tag(t)) if t.as_ref() == "NoElement");
+
+    let el = if has_icon {
+        // Icon checkbox — render as El with role="checkbox"
+        let el = El::new()
+            .update_raw_el(|raw_el| raw_el.attr("role", "checkbox"))
+            .update_raw_el({
+                let vm = vm.clone();
+                move |raw_el| {
+                    raw_el.attr_signal(
+                        "aria-checked",
+                        vm.signal_cloned().map(|v| {
+                            let checked = get_fields(&v)
+                                .and_then(|f| f.get("checked"))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            Some(if checked {
+                                "true".to_string()
+                            } else {
+                                "false".to_string()
+                            })
+                        }),
+                    )
                 }
             })
-        }
-    };
+            .child_signal(vm.signal_cloned().map(move |v| {
+                let icon = get_fields(&v).and_then(|f| f.get("icon"))?;
+                if matches!(icon, Value::Tag(t) if t.as_ref() == "NoElement") {
+                    return None;
+                }
+                Some(render_value_static(icon))
+            }));
 
-    // TextInput builder uses typestate, so we need separate code paths
-    // for different combinations of event handlers
-    match (key_down_link_id, change_link_id) {
-        (Some(key_link), Some(change_link)) => {
-            let item_key_for_key = item_key.clone();
-            let item_key_for_change = item_key.clone();
-            let input = build_input()
-                .on_key_down_event(move |event| {
-                    dd_log!("[DD on_key_down_event] INPUT fired! key_link={}", key_link);
-                    match event.key() {
-                        Key::Enter => {
-                            dd_log!("[DD on_key_down_event] Enter pressed");
-                            #[cfg(target_arch = "wasm32")]
-                            {
-                                let input_text = get_dd_text_input_value_from_key_event(&event)
-                                    .unwrap_or_else(get_dd_text_input_value);
-                                dd_log!(
-                                    "[DD on_key_down_event] Enter text captured: '{}'",
-                                    input_text
-                                );
-                                dispatch_key_down(
-                                    item_key_for_key.as_deref(),
-                                    &key_link,
-                                    DdKey::Enter,
-                                    Some(input_text),
-                                );
-                            }
-                            #[cfg(not(target_arch = "wasm32"))]
-                            {
-                                dispatch_key_down(
-                                    item_key_for_key.as_deref(),
-                                    &key_link,
-                                    DdKey::Enter,
-                                    Some(String::new()),
-                                );
-                            }
-                            return;
-                        }
-                        Key::Escape => {
-                            dispatch_key_down(
-                                item_key_for_key.as_deref(),
-                                &key_link,
-                                DdKey::Escape,
-                                None,
-                            );
-                        }
-                        Key::Other(k) => {
-                            dispatch_key_down(
-                                item_key_for_key.as_deref(),
-                                &key_link,
-                                DdKey::from(k.as_str()),
-                                None,
-                            );
-                        }
-                    }
+        let el = el
+            .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
+            .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
+            .s(Height::with_signal_self(vm.signal_cloned().map(|v| extract_height(&v))))
+            .s(RoundedCorners::all_signal(vm.signal_cloned().map(|v| {
+                get_fields(&v)
+                    .and_then(|f| get_style_obj(f))
+                    .and_then(|s| s.get("rounded_corners"))
+                    .and_then(|v| v.as_number())
+                    .map(|n| n as u32)
+            })))
+            .s(Transform::with_signal_self(vm.signal_cloned().map(|v| extract_transform(&v))))
+            .s(Outline::with_signal_self(vm.signal_cloned().map(|v| extract_outline(&v))))
+            .s(AlignContent::with_signal_self(vm.signal_cloned().map(|v| extract_align_content(&v))))
+            .update_raw_el({
+                let vm = vm.clone();
+                move |raw_el| apply_zoon_style_signals(raw_el, &vm)
+            });
+
+        if !effective_link.is_empty() {
+            let handle_ref = handle.clone_ref();
+            let lp = link_ref.clone();
+            el.update_raw_el(move |raw_el| {
+                raw_el.after_insert(move |el: web_sys::HtmlElement| {
+                    let closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                        handle_ref.inject_dd_event(Event::LinkClick {
+                            link_path: lp.borrow().clone(),
+                        });
+                    });
+                    el.add_event_listener_with_callback(
+                        "click",
+                        closure.as_ref().unchecked_ref(),
+                    ).ok();
+                    closure.forget();
                 })
-                .on_change(move |new_text| {
-                    dispatch_link_text(item_key_for_change.as_deref(), &change_link, new_text);
-                });
-            // Add blur handler if blur_link_id is set (for editing inputs)
-            if let Some(blur_link) = blur_link_id.clone() {
-                let item_key_for_blur = item_key.clone();
-                input
-                    .on_blur(move || {
-                        dispatch_link_unit(item_key_for_blur.as_deref(), &blur_link);
-                    })
-                    .unify()
-            } else {
-                input.unify()
-            }
+            }).unify()
+        } else {
+            el.unify()
         }
-        (Some(key_link), None) => {
-            let item_key_for_key = item_key.clone();
-            build_input()
-                .on_key_down_event(move |event| {
-                    dd_log!(
-                        "[DD on_key_down_event] SIMPLE INPUT fired! key_link={}",
-                        key_link
-                    );
-                    match event.key() {
-                        Key::Enter => {
-                            dd_log!("[DD on_key_down_event] Enter pressed in SIMPLE input");
-                            #[cfg(target_arch = "wasm32")]
-                            {
-                                let input_text = get_dd_text_input_value_from_key_event(&event)
-                                    .unwrap_or_else(get_dd_text_input_value);
-                                dispatch_key_down(
-                                    item_key_for_key.as_deref(),
-                                    &key_link,
-                                    DdKey::Enter,
-                                    Some(input_text),
-                                );
-                            }
-                            #[cfg(not(target_arch = "wasm32"))]
-                            {
-                                dispatch_key_down(
-                                    item_key_for_key.as_deref(),
-                                    &key_link,
-                                    DdKey::Enter,
-                                    Some(String::new()),
-                                );
-                            }
-                            return;
-                        }
-                        Key::Escape => {
-                            dispatch_key_down(
-                                item_key_for_key.as_deref(),
-                                &key_link,
-                                DdKey::Escape,
-                                None,
-                            );
-                        }
-                        Key::Other(k) => {
-                            dispatch_key_down(
-                                item_key_for_key.as_deref(),
-                                &key_link,
-                                DdKey::from(k.as_str()),
-                                None,
-                            );
-                        }
-                    }
-                })
-                .on_change(|_| {})
-                .unify()
-        }
-        (None, Some(change_link)) => {
-            let item_key_for_change = item_key.clone();
-            build_input()
-                .on_change(move |new_text| {
-                    dispatch_link_text(item_key_for_change.as_deref(), &change_link, new_text);
-                })
-                .unify()
-        }
-        (None, None) => build_input().on_change(|_| {}).unify(),
-    }
-}
-
-/// Render a checkbox element.
-// Default checkbox SVG icons (same as dynamic items for visual consistency)
-const UNCHECKED_SVG: &str = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23ededed%22%20stroke-width%3D%223%22/%3E%3C/svg%3E";
-const CHECKED_SVG: &str = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20width%3D%2240%22%20height%3D%2240%22%20viewBox%3D%22-10%20-18%20100%20135%22%3E%3Ccircle%20cx%3D%2250%22%20cy%3D%2250%22%20r%3D%2250%22%20fill%3D%22none%22%20stroke%3D%22%23bddad5%22%20stroke-width%3D%223%22/%3E%3Cpath%20fill%3D%22%235dc2af%22%20d%3D%22M72%2025L42%2071%2027%2056l-4%204%2020%2020%2034-52z%22/%3E%3C/svg%3E";
-
-// DEAD CODE DELETED: render_default_checkbox_icon() - was never called
-
-fn render_checkbox(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    dd_log!(
-        "[DD render_checkbox] CALLED with fields={:?}",
-        fields.keys().collect::<Vec<_>>()
-    );
-    // Extract checked value - can be Bool, Tagged, or CellRef (reactive)
-    let checked_value = fields
-        .get("checked")
-        .unwrap_or_else(|| {
-            panic!("[DD render_checkbox] Missing required 'checked' field");
-        })
-        .clone();
-    dd_log!("[DD render_checkbox] checked_value={:?}", checked_value);
-
-    // Extract click LinkRef from element.event.click if present
-    let click_link_id = fields
-        .get("element")
-        .and_then(|e| e.get("event"))
-        .and_then(|e| e.get("click"))
-        .and_then(|v| match v {
-            Value::LinkRef(id) => Some(id.to_string()),
-            _ => None,
-        });
-    let item_key = extract_item_key(fields);
-
-    // Use Checkbox component for proper role="checkbox" accessibility
-    // with custom 40x40 SVG icon for visual consistency
-
-    // Check if checked is a CellRef (reactive checkbox)
-    if let Value::CellRef(cell_id) = &checked_value {
-        // Reactive checkbox - observe HOLD state changes
-        let cell_id_for_signal = cell_id.to_string();
-        let cell_id_for_checked = cell_id_for_signal.clone();
-        let cell_id_for_icon = cell_id.to_string();
-        let cell_id_for_icon_checked = cell_id_for_icon.clone();
-
-        // Use granular cell_signal() for checkbox - only updates when this cell changes
+    } else {
+        // Standard checkbox — Zoon typed Checkbox
         let checkbox = Checkbox::new()
             .label_hidden("checkbox")
-            .checked_signal(
-                cell_signal(cell_id_for_signal) // Pass owned String
-                    .map(move |value| {
-                        let Some(value) = value else {
-                            return false;
-                        };
-                        match value {
-                            Value::Bool(b) => b,
-                            Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => {
-                                BoolTag::is_true(tag.as_ref())
-                            }
-                            other => panic!(
-                                "[DD Checkbox] Expected Bool for '{}', found {:?}",
-                                cell_id_for_checked, other
-                            ),
-                        }
-                    }),
-            )
-            .icon({
-                // Use granular cell_signal() for icon - only updates when this cell changes
-                move |_checked_mutable| {
-                    El::new()
-                        .s(zoon::Width::exact(40))
-                        .s(zoon::Height::exact(40))
-                        .update_raw_el(|raw_el| raw_el.style("pointer-events", "none"))
-                        .s(zoon::Background::new().url_signal(
-                            cell_signal(cell_id_for_icon.clone()) // Clone and pass owned
-                                .map(move |value| {
-                                    let Some(value) = value else {
-                                        return UNCHECKED_SVG;
-                                    };
-                                    let checked = match value {
-                                        Value::Bool(b) => b,
-                                        Value::Tagged { tag, .. }
-                                            if BoolTag::is_bool_tag(tag.as_ref()) =>
-                                        {
-                                            BoolTag::is_true(tag.as_ref())
-                                        }
-                                        other => panic!(
-                                            "[DD Checkbox] Expected Bool for '{}', found {:?}",
-                                            cell_id_for_icon_checked, other
-                                        ),
-                                    };
-                                    if checked {
-                                        CHECKED_SVG
-                                    } else {
-                                        UNCHECKED_SVG
-                                    }
-                                }),
-                        ))
-                }
-            });
-
-        // For reactive checkboxes with a CellRef, toggle the HOLD value directly
-        // Fire the link event - LinkCellMapping::BoolToggle handles the actual toggle
-        // NOTE: Don't call toggle_cell_bool directly here! That would cause a double toggle
-        // because DD link mappings handle BoolToggle.
-        let cell_id_for_toggle = cell_id.to_string();
-        if let Some(ref link_id) = click_link_id {
-            dd_log!(
-                "[DD render_checkbox] RETURNING reactive checkbox with link_id={}",
-                link_id
-            );
-            let link_id_owned = link_id.clone();
-            let cell_id_for_event = cell_id_for_toggle.clone();
-            let item_key_for_event = item_key.clone();
-            // Use raw DOM event listener to bypass potential Zoon event handling issues
-            return checkbox
-                .update_raw_el(move |raw_el| {
-                    let link_id = link_id_owned.clone();
-                    let cell_id = cell_id_for_event.clone();
-                    let item_key = item_key_for_event.clone();
-                    raw_el.event_handler(move |_: zoon::events::Click| {
-                        dd_log!(
-                            "[DD CHECKBOX CLICK] RAW event handler invoked! link_id={}",
-                            link_id
-                        );
-                        // Send target checked state with the click event.
-                        // BoolToggle actions ignore it; state-setting actions consume it.
-                        let next_checked = get_cell_value(&cell_id)
-                            .map(|value| match value {
-                                Value::Bool(b) => !b,
-                                Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => {
-                                    !BoolTag::is_true(tag.as_ref())
-                                }
-                                other => panic!(
-                                    "[DD CHECKBOX CLICK] Expected Bool for '{}', found {:?}",
-                                    cell_id, other
-                                ),
-                            })
-                            .unwrap_or(true);
-                        dispatch_link_bool(item_key.as_deref(), &link_id, next_checked);
-                    })
-                })
-                .unify();
-        } else {
-            panic!(
-                "[DD render_checkbox] Bug: reactive checkbox missing click LinkRef for {}",
-                cell_id_for_toggle
-            );
-        }
-    }
-
-    // DD computes checkbox state directly - bridge receives final Bool values
-
-    // Static checkbox - extract checked state directly
-    let checked = match checked_value {
-        Value::Bool(b) => b,
-        Value::Tagged { tag, .. } if BoolTag::is_bool_tag(tag.as_ref()) => {
-            BoolTag::is_true(tag.as_ref())
-        }
-        other => {
-            panic!(
-                "[DD render_checkbox] checked must be Bool/BoolTag, found {:?}",
-                other
-            );
-        }
-    };
-
-    // Check for custom icon (static case)
-    let custom_icon = fields.get("icon").cloned();
-
-    // Build Checkbox with either custom or default icon
-    let checkbox = if let Some(icon_value) = custom_icon {
-        Checkbox::new()
-            .label_hidden("checkbox")
-            .checked(checked)
-            .icon(move |_checked_mutable| render_dd_value(&icon_value))
-    } else {
-        let svg_url = if checked { CHECKED_SVG } else { UNCHECKED_SVG };
-        Checkbox::new()
-            .label_hidden("checkbox")
-            .checked(checked)
-            .icon(move |_checked_mutable| {
-                // CRITICAL: Use pointer_events_none() so clicks pass through to checkbox parent
-                El::new()
-                    .s(zoon::Width::exact(40))
-                    .s(zoon::Height::exact(40))
-                    .s(zoon::Background::new().url(svg_url))
-                    .update_raw_el(|raw_el| raw_el.style("pointer-events", "none")) // Let clicks pass through
-                    .unify()
-            })
-    };
-
-    if let Some(link_id) = click_link_id {
-        let item_key = item_key.clone();
-        checkbox
-            .on_click(move || {
-                dispatch_link_unit(item_key.as_deref(), &link_id);
-            })
-            .unify()
-    } else {
-        checkbox.unify()
-    }
-}
-
-/// Render a label element.
-fn render_label(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    let label_value = fields
-        .get("label")
-        .or_else(|| fields.get("text"))
-        .unwrap_or_else(|| {
-            panic!("[DD render_label] Missing required 'label'/'text' field");
-        });
-
-    // Extract double_click LinkRef from element.event.double_click if present
-    let double_click_link_id = fields
-        .get("element")
-        .and_then(|e| e.get("event"))
-        .and_then(|e| e.get("double_click"))
-        .and_then(|v| match v {
-            Value::LinkRef(id) => Some(id.to_string()),
-            _ => None,
-        });
-    let item_key = extract_item_key(fields);
-
-    // Extract font styling from style.font
-    let style = fields.get("style");
-    let font_color_css = style
-        .and_then(|s| s.get("font"))
-        .and_then(|f| f.get("color"))
-        .and_then(|c| dd_oklch_to_css(c));
-    let font_size = style
-        .and_then(|s| s.get("font"))
-        .and_then(|f| f.get("size"))
-        .and_then(|v| {
-            if let Value::Number(n) = v {
-                Some(f64_to_u32(n))
-            } else {
-                None
-            }
-        });
-
-    let label = match label_value {
-        Value::CellRef(name) => {
-            // Reactive label - update when HOLD state changes
-            // Use granular cell_signal() for label - only updates when this cell changes
-            let cell_id = name.to_string();
-            Label::new()
-                .label_signal(
-                    cell_signal(cell_id) // Pass owned String directly
-                        .map(move |value| {
-                            let Some(value) = value else {
-                                return String::new();
-                            };
-                            value.to_display_string()
-                        }),
-                )
-                .for_input("dd_text_input")
-        }
-        Value::Tagged { tag, fields } if tag.as_ref() == "__text_template__" => {
-            // Text template from Map context — parts are numbered "0", "1", ...
-            // After substitute_placeholders, PlaceholderField parts become CellRef or concrete.
-            let mut tt_parts: Vec<Value> = Vec::new();
-            let mut i = 0;
-            while let Some(v) = fields.get(i.to_string().as_str()) {
-                tt_parts.push(v.clone());
-                i += 1;
-            }
-            // Find the first CellRef for reactive signal
-            let first_cellref = tt_parts.iter().find_map(|v| {
-                if let Value::CellRef(id) = v {
-                    Some(id.to_string())
-                } else {
-                    None
-                }
-            });
-            if let Some(cell_id) = first_cellref {
-                let parts_for_signal = tt_parts;
-                Label::new()
-                    .label_signal(cell_signal(cell_id).map(move |_trigger| {
-                        parts_for_signal
-                            .iter()
-                            .map(|part| match part {
-                                Value::CellRef(id) => get_cell_value(&id.to_string())
-                                    .map(|v| v.to_display_string())
-                                    .unwrap_or_default(),
-                                v => v.to_display_string(),
-                            })
-                            .collect::<String>()
-                    }))
-                    .for_input("dd_text_input")
-            } else {
-                // All parts concrete — static label
-                let text: String = tt_parts.iter().map(|v| v.to_display_string()).collect();
-                Label::new().label(text).for_input("dd_text_input")
-            }
-        }
-        Value::WhileConfig(config) => {
-            // Reactive conditional label — watch cell and pick matching arm
-            let cell_id = config.cell_id.name().to_string();
-            let arms = config.arms.clone();
-            let default = config.default.clone();
-            Label::new()
-                .label_signal(cell_signal(cell_id).map(move |value| {
-                    let Some(value) = value else {
-                        return String::new();
-                    };
-                    let selected = select_while_arm(&value, &arms, &default);
-                    selected.to_display_string()
-                }))
-                .for_input("dd_text_input")
-        }
-        v => {
-            // Static label
-            Label::new()
-                .label(v.to_display_string())
-                .for_input("dd_text_input")
-        }
-    };
-
-    // Build font style
-    let mut font = Font::new();
-    if let Some(color) = font_color_css {
-        font = font.color(color);
-    }
-    if let Some(size) = font_size {
-        font = font.size(size);
-    }
-
-    // If strikethrough is tied to a CellRef (reactive completed state), we need a signal
-    // For now, apply static styling and let the parent handle reactive strikethrough
-    let label_with_style = label.s(font);
-
-    // Add double_click handler if present
-    if let Some(link_id) = double_click_link_id {
-        let item_key = item_key.clone();
-        label_with_style
-            .on_double_click(move || {
-                dispatch_link_unit(item_key.as_deref(), &link_id);
-            })
-            .unify()
-    } else {
-        label_with_style.unify()
-    }
-}
-
-/// Render a paragraph element.
-/// CellRef support for reactive text via content_signal.
-fn render_paragraph(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    let contents_field = fields.get("contents");
-    let content_field = fields.get("content");
-    let text_field = fields.get("text");
-    let field_count =
-        contents_field.is_some() as u8 + content_field.is_some() as u8 + text_field.is_some() as u8;
-    if field_count != 1 {
-        panic!(
-            "[DD render_paragraph] Provide exactly one of 'contents', 'content', or 'text' (found contents={}, content={}, text={})",
-            contents_field.is_some(),
-            content_field.is_some(),
-            text_field.is_some()
-        );
-    }
-
-    let field_value = contents_field
-        .or(content_field)
-        .or(text_field)
-        .unwrap_or_else(|| {
-            panic!("[DD render_paragraph] Missing required 'contents'/'content'/'text' field");
-        });
-
-    if let Value::CellRef(cell_id) = field_value {
-        // Reactive path - use content_signal for scalar cells, contents_signal_vec for lists
-        let cell_id_str = cell_id.name().to_string();
-        if is_list_cell(&cell_id_str) {
-            return Paragraph::new()
-                .contents_signal_vec(
-                    list_signal_vec(cell_id_str).map(|item| render_dd_value(&item)),
-                )
-                .unify();
-        }
-        let cell_id_for_signal = cell_id_str.clone();
-        dd_log!(
-            "[DD render_paragraph] Reactive content from CellRef '{}'",
-            cell_id_str
-        );
-        return Paragraph::new()
-            .content_signal(cell_signal(cell_id_str).map(move |value| {
-                let Some(value) = value else {
-                    return String::new();
-                };
-                extract_text_content(&value)
+            .checked_signal(vm.signal_cloned().map(|v| {
+                get_fields(&v)
+                    .and_then(|f| f.get("checked"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
             }))
-            .unify();
+            .icon(|_| El::new());
+
+        if !effective_link.is_empty() {
+            let handle_ref = handle.clone_ref();
+            let lp = link_ref.clone();
+            checkbox.update_raw_el(move |raw_el| {
+                raw_el.after_insert(move |el: web_sys::HtmlDivElement| {
+                    let closure = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                        handle_ref.inject_dd_event(Event::LinkClick {
+                            link_path: lp.borrow().clone(),
+                        });
+                    });
+                    el.add_event_listener_with_callback(
+                        "click",
+                        closure.as_ref().unchecked_ref(),
+                    ).ok();
+                    closure.forget();
+                })
+            }).unify()
+        } else {
+            checkbox.unify()
+        }
+    };
+
+    (
+        el,
+        RetainedNode::Checkbox {
+            value: vm,
+            link_path: link_ref,
+        },
+    )
+}
+
+fn build_retained_paragraph(
+    fields: &Fields,
+    full_value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+) -> (RawElOrText, RetainedNode) {
+    let vm = Mutable::new(Arc::new(full_value.clone()));
+    let (contents_tx, contents_rx) = mpsc::unbounded();
+
+    let content_values = extract_sorted_list_items(fields, "contents");
+    let mut retained_contents = Vec::new();
+    let mut initial_elements = Vec::new();
+
+    for (i, item) in content_values.iter().enumerate() {
+        let child_lp = format!("{}.contents.{}", link_path, i);
+        let (el, node) = build_retained_node(item, handle, &child_lp);
+        retained_contents.push(node);
+        initial_elements.push(el);
     }
 
-    match field_value {
-        Value::List(handle) => {
-            let list_id = handle
-                .cell_id
-                .as_deref()
-                .map(str::to_string)
-                .unwrap_or_else(|| handle.id.to_string());
-            Paragraph::new()
-                .contents_signal_vec(list_signal_vec(list_id).map(|item| render_dd_value(&item)))
-                .unify()
-        }
-        other => {
-            let content = extract_text_content(other);
-            Paragraph::new().content(content).unify()
-        }
+    contents_tx
+        .unbounded_send(VecDiff::Replace {
+            values: initial_elements,
+        })
+        .ok();
+
+    let el = Paragraph::new()
+        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
+        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_align_font(&v))))
+        .update_raw_el({
+            let vm = vm.clone();
+            move |raw_el| apply_zoon_style_signals(raw_el, &vm)
+        })
+        .contents_signal_vec(VecDiffStreamSignalVec(contents_rx));
+
+    (
+        el.unify(),
+        RetainedNode::Paragraph {
+            value: vm,
+            contents: retained_contents,
+            contents_tx,
+        },
+    )
+}
+
+fn build_retained_link(
+    fields: &Fields,
+    full_value: &Value,
+    handle: &DdWorkerHandle,
+    link_path: &str,
+) -> (RawElOrText, RetainedNode) {
+    let vm = Mutable::new(Arc::new(full_value.clone()));
+    let effective_link = extract_effective_link(fields, link_path);
+    let link_ref = Rc::new(RefCell::new(effective_link));
+
+    let el = Link::new()
+        .label_signal(vm.signal_cloned().map(|v| {
+            let label = get_fields(&v)
+                .and_then(|f| f.get("label"))
+                .map(|l| l.to_display_string())
+                .unwrap_or_default();
+            El::new().child(label)
+        }))
+        .to_signal(vm.signal_cloned().map(|v| {
+            get_fields(&v)
+                .and_then(|f| f.get("to"))
+                .and_then(|v| v.as_text())
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        }))
+        .new_tab(NewTab::new())
+        .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
+        .update_raw_el({
+            let vm = vm.clone();
+            move |raw_el| apply_zoon_style_signals(raw_el, &vm)
+        });
+
+    // Wire hover events for element.hovered LINK
+    let hover_link = extract_hover_link_path(fields, link_path);
+    let el = if let Some(hover_link) = hover_link {
+        let handle_hover_in = handle.clone_ref();
+        let link_hover_in = hover_link.clone();
+        let handle_hover_out = handle.clone_ref();
+        let link_hover_out = hover_link;
+        el.update_raw_el(move |raw_el| {
+            raw_el.after_insert(move |el: web_sys::HtmlAnchorElement| {
+                let link_in = link_hover_in.clone();
+                let handle_in = handle_hover_in.clone_ref();
+                let enter_closure =
+                    wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                        handle_in.inject_dd_event(Event::HoverChange {
+                            link_path: link_in.clone(),
+                            hovered: true,
+                        });
+                    });
+                el.add_event_listener_with_callback(
+                    "mouseenter",
+                    enter_closure.as_ref().unchecked_ref(),
+                )
+                .ok();
+                enter_closure.forget();
+
+                let link_out = link_hover_out.clone();
+                let handle_out = handle_hover_out.clone_ref();
+                let leave_closure =
+                    wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                        handle_out.inject_dd_event(Event::HoverChange {
+                            link_path: link_out.clone(),
+                            hovered: false,
+                        });
+                    });
+                el.add_event_listener_with_callback(
+                    "mouseleave",
+                    leave_closure.as_ref().unchecked_ref(),
+                )
+                .ok();
+                leave_closure.forget();
+            })
+        })
+    } else {
+        el
+    };
+
+    (el.unify(), RetainedNode::Link { value: vm, link_path: link_ref })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Update functions — diff old vs new Value tree
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl RetainedTree {
+    /// Apply keyed diffs to the keyed Stripe in this tree.
+    /// Walks the tree to find the Stripe with keyed_items and applies diffs to it.
+    pub fn apply_keyed_diffs(&mut self, diffs: &[KeyedDiff], handle: &DdWorkerHandle) {
+        self.root.apply_keyed_diffs(diffs, handle);
+    }
+
+    /// Update the retained tree with a new document Value.
+    /// Only changed elements' Mutables are updated; Zoon handles DOM diffs.
+    pub fn update(&mut self, new_value: &Value, handle: &DdWorkerHandle) {
+        self.root.update(new_value, handle, "");
     }
 }
 
-/// Extract display text from a Value, handling nested elements like links.
-fn extract_text_content(value: &Value) -> String {
-    match value {
-        Value::Text(s) => s.to_string(),
-        Value::Unit => " ".to_string(), // Text/space() renders as Unit
-        Value::Tagged { tag, fields } if tag.as_ref() == "NoElement" => String::new(),
-        Value::Tagged { tag, fields } if ElementTag::is_element(tag.as_ref()) => {
-            // For Element tags, check the element type and extract appropriate text
-            let element_type = fields.get("_element_type").and_then(|v| match v {
-                Value::Text(s) => Some(s.as_ref()),
-                _ => None,
-            });
+impl RetainedNode {
+    fn update(&mut self, new_value: &Value, handle: &DdWorkerHandle, link_path: &str) {
+        match self {
+            RetainedNode::Primitive { text } => {
+                let new_text = match new_value {
+                    Value::Tag(s) if s.as_ref() == "NoElement" || s.as_ref() == "SKIP" => {
+                        String::new()
+                    }
+                    _ => new_value.to_display_string(),
+                };
+                text.set_neq(new_text);
+            }
 
-            match element_type {
-                Some("link") => {
-                    // Extract label from link element
-                    fields
-                        .get("label")
-                        .map(|v| extract_text_content(v))
-                        .unwrap_or_else(|| {
-                            panic!("[DD extract_text_content] link element missing 'label'");
-                        })
+            RetainedNode::Button { value, link_path: lp } => {
+                value.set_neq(Arc::new(new_value.clone()));
+                if let Some(fields) = get_fields(new_value) {
+                    *lp.borrow_mut() = extract_effective_link(fields, link_path);
                 }
-                Some("paragraph") => {
-                    // Recursively extract from paragraph contents
-                    if let Some(contents) = fields.get("contents") {
-                        match contents {
-                            Value::List(_) => {
-                                panic!("[DD extract_text_content] paragraph contents cannot be Collection");
+            }
+
+            RetainedNode::Stripe {
+                value,
+                items,
+                items_tx,
+                link_path: lp,
+                keyed_items,
+            } => {
+                value.set_neq(Arc::new(new_value.clone()));
+                if let Some(fields) = get_fields(new_value) {
+                    *lp.borrow_mut() = extract_effective_link(fields, link_path);
+                    // Keyed Stripes: items come via apply_keyed_diffs, skip positional diff.
+                    // Non-keyed Stripes: use positional diff as before.
+                    if keyed_items.is_none() {
+                        let new_items = extract_sorted_list_items(fields, "items");
+                        diff_children(items, items_tx, &new_items, handle, link_path, "items");
+                    }
+                }
+            }
+
+            RetainedNode::Stack {
+                value,
+                layers,
+                layers_tx,
+            } => {
+                value.set_neq(Arc::new(new_value.clone()));
+                if let Some(fields) = get_fields(new_value) {
+                    let new_layers = extract_sorted_list_items(fields, "layers");
+                    diff_children(layers, layers_tx, &new_layers, handle, link_path, "layers");
+                }
+            }
+
+            RetainedNode::Container {
+                value,
+                child,
+                child_tx,
+            } => {
+                value.set_neq(Arc::new(new_value.clone()));
+                if let Some(fields) = get_fields(new_value) {
+                    let new_child = fields.get("child");
+                    match (child.as_mut(), new_child) {
+                        (Some(existing), Some(new_val)) => {
+                            if existing.matches_value_type(new_val) {
+                                existing.update(new_val, handle, link_path);
+                            } else {
+                                let (el, node) =
+                                    build_retained_node(new_val, handle, link_path);
+                                *child = Some(Box::new(node));
+                                child_tx.unbounded_send(VecDiff::RemoveAt { index: 0 }).ok();
+                                child_tx
+                                    .unbounded_send(VecDiff::InsertAt {
+                                        index: 0,
+                                        value: el,
+                                    })
+                                    .ok();
                             }
-                            _ => {}
+                        }
+                        (None, Some(new_val)) => {
+                            let (el, node) = build_retained_node(new_val, handle, link_path);
+                            *child = Some(Box::new(node));
+                            child_tx.unbounded_send(VecDiff::Push { value: el }).ok();
+                        }
+                        (Some(_), None) => {
+                            *child = None;
+                            child_tx.unbounded_send(VecDiff::Pop {}).ok();
+                        }
+                        (None, None) => {}
+                    }
+                }
+            }
+
+            RetainedNode::TextInput {
+                value,
+                link_path: lp,
+                dom_element,
+            } => {
+                // Detect focus change for manual focus handling
+                let old_focus = get_fields(&value.get_cloned())
+                    .and_then(|f| f.get("focus"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let new_focus = get_fields(new_value)
+                    .and_then(|f| f.get("focus"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let new_text = get_fields(new_value)
+                    .and_then(|f| f.get("text"))
+                    .and_then(|v| v.as_text())
+                    .unwrap_or("")
+                    .to_string();
+
+                value.set_neq(Arc::new(new_value.clone()));
+
+                if let Some(fields) = get_fields(new_value) {
+                    *lp.borrow_mut() = fields
+                        .get(LINK_PATH_FIELD)
+                        .and_then(|v| v.as_text())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| link_path.to_string());
+                }
+
+                if let Some(input_el) = dom_element.borrow().as_ref() {
+                    // Always sync DOM input value to match Boon state.
+                    let dom_value = input_el.value();
+                    if dom_value != new_text {
+                        input_el.set_value(&new_text);
+                    }
+
+                    // Handle focus change: manually focus + set cursor position
+                    if !old_focus && new_focus {
+                        let text_len: u32 = new_text.len().try_into().unwrap_or(0);
+                        input_el.set_selection_range(text_len, text_len).ok();
+                        input_el.focus().ok();
+                    }
+                }
+            }
+
+            RetainedNode::Checkbox {
+                value,
+                link_path: lp,
+            } => {
+                value.set_neq(Arc::new(new_value.clone()));
+                if let Some(fields) = get_fields(new_value) {
+                    *lp.borrow_mut() = fields
+                        .get(LINK_PATH_FIELD)
+                        .and_then(|v| v.as_text())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| link_path.to_string());
+                }
+            }
+
+            RetainedNode::Label {
+                value,
+                link_path: lp,
+            } => {
+                value.set_neq(Arc::new(new_value.clone()));
+                if let Some(fields) = get_fields(new_value) {
+                    *lp.borrow_mut() = fields
+                        .get(LINK_PATH_FIELD)
+                        .and_then(|v| v.as_text())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| link_path.to_string());
+                }
+            }
+
+            RetainedNode::Paragraph {
+                value,
+                contents,
+                contents_tx,
+            } => {
+                value.set_neq(Arc::new(new_value.clone()));
+                if let Some(fields) = get_fields(new_value) {
+                    let new_contents = extract_sorted_list_items(fields, "contents");
+                    diff_children(
+                        contents,
+                        contents_tx,
+                        &new_contents,
+                        handle,
+                        link_path,
+                        "contents",
+                    );
+                }
+            }
+
+            RetainedNode::Link { value, link_path: lp } => {
+                value.set_neq(Arc::new(new_value.clone()));
+                if let Some(fields) = get_fields(new_value) {
+                    *lp.borrow_mut() = extract_effective_link(fields, link_path);
+                }
+            }
+
+            RetainedNode::Document { child, child_tx } => {
+                let new_root = get_fields(new_value).and_then(|f| f.get("root"));
+                match (child.as_mut(), new_root) {
+                    (Some(existing), Some(new_val)) => {
+                        if existing.matches_value_type(new_val) {
+                            existing.update(new_val, handle, link_path);
+                        } else {
+                            let (el, node) = build_retained_node(new_val, handle, link_path);
+                            *child = Some(Box::new(node));
+                            child_tx.unbounded_send(VecDiff::RemoveAt { index: 0 }).ok();
+                            child_tx
+                                .unbounded_send(VecDiff::InsertAt {
+                                    index: 0,
+                                    value: el,
+                                })
+                                .ok();
                         }
                     }
-                    fields.get("content")
-                        .or_else(|| fields.get("text"))
-                        .map(|v| extract_text_content(v))
-                        .unwrap_or_else(|| {
-                            panic!("[DD extract_text_content] paragraph element missing 'contents'/'content'/'text'");
-                        })
-                }
-                _ => {
-                    // For other elements, try to extract from label or child
-                    fields
-                        .get("label")
-                        .or_else(|| fields.get("child"))
-                        .map(|v| extract_text_content(v))
-                        .unwrap_or_else(|| {
-                            panic!("[DD extract_text_content] element missing 'label' or 'child'");
-                        })
+                    (None, Some(new_val)) => {
+                        let (el, node) = build_retained_node(new_val, handle, link_path);
+                        *child = Some(Box::new(node));
+                        child_tx.unbounded_send(VecDiff::Push { value: el }).ok();
+                    }
+                    (Some(_), None) => {
+                        *child = None;
+                        child_tx.unbounded_send(VecDiff::Pop {}).ok();
+                    }
+                    (None, None) => {}
                 }
             }
-        }
-        Value::List(_) => {
-            panic!("[DD extract_text_content] Collection is not valid text content");
-        }
-        _ => value.to_display_string(),
-    }
-}
 
-fn select_while_arm(value: &Value, arms: &Arc<Vec<WhileArm>>, default: &Value) -> Value {
-    for arm in arms.iter() {
-        if while_pattern_matches(value, &arm.pattern) {
-            return arm.body.clone();
+            RetainedNode::Empty => {}
         }
     }
-    if !matches!(default, Value::Unit) {
-        return default.clone();
-    }
-    Value::Unit
-}
 
-fn while_pattern_matches(value: &Value, pattern: &Value) -> bool {
-    match (value, pattern) {
-        (Value::Bool(b), Value::Tagged { tag, .. }) if BoolTag::is_bool_tag(tag.as_ref()) => {
-            BoolTag::matches_bool(tag.as_ref(), *b)
-        }
-        _ => value == pattern,
-    }
-}
-
-/// Render a link element.
-fn render_link(fields: &Arc<std::collections::BTreeMap<Arc<str>, Value>>) -> RawElOrText {
-    let label_value = fields.get("label").unwrap_or_else(|| {
-        panic!("[DD render_link] Missing required 'label' field");
-    });
-
-    let to = fields
-        .get("to")
-        .map(|v| v.to_display_string())
-        .unwrap_or_else(|| {
-            panic!("[DD render_link] Missing required 'to' field");
-        });
-
-    let link = match label_value {
-        Value::Tagged {
-            tag,
-            fields: label_fields,
-        } if tag.as_ref() == "__text_template__" => {
-            let mut tt_parts: Vec<Value> = Vec::new();
-            let mut i = 0;
-            while let Some(v) = label_fields.get(i.to_string().as_str()) {
-                tt_parts.push(v.clone());
-                i += 1;
+    /// Walk the tree to find the keyed Stripe and apply diffs.
+    fn apply_keyed_diffs(&mut self, diffs: &[KeyedDiff], handle: &DdWorkerHandle) {
+        match self {
+            RetainedNode::Stripe {
+                items_tx,
+                link_path: lp,
+                keyed_items: Some(ki),
+                ..
+            } => {
+                let stripe_lp = lp.borrow().clone();
+                ki.apply(diffs, items_tx, handle, &stripe_lp);
             }
-            let first_cellref = tt_parts.iter().find_map(|v| {
-                if let Value::CellRef(id) = v {
-                    Some(id.to_string())
-                } else {
-                    None
+            RetainedNode::Document { child: Some(c), .. } => {
+                c.apply_keyed_diffs(diffs, handle);
+            }
+            RetainedNode::Container { child: Some(c), .. } => {
+                c.apply_keyed_diffs(diffs, handle);
+            }
+            RetainedNode::Stripe { items, keyed_items: None, .. } => {
+                for item in items {
+                    item.apply_keyed_diffs(diffs, handle);
                 }
-            });
-            if let Some(cell_id) = first_cellref {
-                Link::new().label_signal(cell_signal(cell_id).map(move |_trigger| {
-                    tt_parts
-                        .iter()
-                        .map(|part| match part {
-                            Value::CellRef(id) => get_cell_value(&id.to_string())
-                                .map(|v| v.to_display_string())
-                                .unwrap_or_default(),
-                            v => v.to_display_string(),
-                        })
-                        .collect::<String>()
-                }))
+            }
+            RetainedNode::Stack { layers, .. } => {
+                for layer in layers {
+                    layer.apply_keyed_diffs(diffs, handle);
+                }
+            }
+            RetainedNode::Paragraph { contents, .. } => {
+                for content in contents {
+                    content.apply_keyed_diffs(diffs, handle);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Positional diff for list children (Stripe items, Paragraph contents, Stack layers).
+fn diff_children(
+    retained: &mut Vec<RetainedNode>,
+    tx: &mpsc::UnboundedSender<VecDiff<RawElOrText>>,
+    new_items: &[Value],
+    handle: &DdWorkerHandle,
+    link_path: &str,
+    field_name: &str,
+) {
+    let old_len = retained.len();
+    let new_len = new_items.len();
+    let common = old_len.min(new_len);
+
+    for i in 0..common {
+        let child_lp = format!("{}.{}.{}", link_path, field_name, i);
+        if retained[i].matches_value_type(&new_items[i]) {
+            retained[i].update(&new_items[i], handle, &child_lp);
+        } else {
+            let (el, node) = build_retained_node(&new_items[i], handle, &child_lp);
+            retained[i] = node;
+            tx.unbounded_send(VecDiff::RemoveAt { index: i }).ok();
+            tx.unbounded_send(VecDiff::InsertAt { index: i, value: el })
+                .ok();
+        }
+    }
+
+    for i in old_len..new_len {
+        let child_lp = format!("{}.{}.{}", link_path, field_name, i);
+        let (el, node) = build_retained_node(&new_items[i], handle, &child_lp);
+        retained.push(node);
+        tx.unbounded_send(VecDiff::Push { value: el }).ok();
+    }
+
+    for _ in new_len..old_len {
+        retained.pop();
+        tx.unbounded_send(VecDiff::Pop {}).ok();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Static rendering (no event handlers, no signals)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn render_value_static(value: &Value) -> RawElOrText {
+    match value {
+        Value::Number(n) => {
+            let text = if n.0 == n.0.floor() && n.0.is_finite() {
+                format!("{}", n.0 as i64)
             } else {
-                let text: String = tt_parts.iter().map(|v| v.to_display_string()).collect();
-                Link::new().label(text)
+                format!("{}", n.0)
+            };
+            zoon::Text::new(text).unify()
+        }
+        Value::Text(s) => zoon::Text::new(s.to_string()).unify(),
+        Value::Tag(s) => {
+            if s.as_ref() == "NoElement" {
+                return El::new().unify();
+            }
+            zoon::Text::new(s.to_string()).unify()
+        }
+        Value::Bool(b) => {
+            let text = if *b { "True" } else { "False" };
+            zoon::Text::new(text).unify()
+        }
+        Value::Tagged { tag, fields } => render_tagged_static(tag, fields),
+        Value::Object(_) => zoon::Text::new(value.to_display_string()).unify(),
+        Value::Unit => El::new().unify(),
+    }
+}
+
+fn render_tagged_static(
+    tag: &str,
+    fields: &Arc<Fields>,
+) -> RawElOrText {
+    match tag {
+        "ElementButton" => {
+            let label = fields
+                .get("label")
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            let mut el = Button::new()
+                .update_raw_el(|raw_el| raw_el.attr("role", "button"))
+                .label(El::new().child(label));
+            if let Some(font) = extract_font_from_fields(fields) { el = el.s(font); }
+            if let Some(width) = extract_width_from_fields(fields) { el = el.s(width); }
+            if let Some(height) = extract_height_from_fields(fields) { el = el.s(height); }
+            if let Some(padding) = extract_padding_from_fields(fields) { el = el.s(padding); }
+            if let Some(background) = extract_background_from_fields(fields) { el = el.s(background); }
+            if let Some(rc) = extract_rounded_corners_from_fields(fields) { el = el.s(rc); }
+            if let Some(transform) = extract_transform_from_fields(fields) { el = el.s(transform); }
+            if let Some(outline) = extract_outline_from_fields(fields) { el = el.s(outline); }
+            if let Some(borders) = extract_borders_from_fields(fields) { el = el.s(borders); }
+            if let Some(align) = extract_align_content_from_fields(fields) { el = el.s(align); }
+            el.unify()
+        }
+        "ElementStripe" => render_stripe_static(fields),
+        "ElementStack" => render_stack_static(fields),
+        "ElementContainer" => render_container_static(fields),
+        "ElementLabel" => {
+            let label = fields
+                .get("label")
+                .map(|v| v.to_display_string())
+                .unwrap_or_default();
+            let mut el = Label::new().label(El::new().child(label));
+            if let Some(font) = extract_font_from_fields(fields) { el = el.s(font); }
+            if let Some(padding) = extract_padding_from_fields(fields) { el = el.s(padding); }
+            el.unify()
+        }
+        "ElementParagraph" => {
+            let mut el = Paragraph::new();
+            if let Some(font) = extract_font_from_fields(fields) { el = el.s(font); }
+            let rendered: Vec<RawElOrText> = extract_sorted_list_items(fields, "contents")
+                .iter()
+                .map(|item| render_value_static(item))
+                .collect();
+            let (tx, rx) = mpsc::unbounded();
+            tx.unbounded_send(VecDiff::Replace { values: rendered }).ok();
+            el.contents_signal_vec(VecDiffStreamSignalVec(rx)).unify()
+        }
+        "DocumentNew" => {
+            if let Some(root) = fields.get("root") {
+                render_value_static(root)
+            } else {
+                El::new().child("Empty document").unify()
             }
         }
-        v => Link::new().label(resolve_display_string(v)),
-    };
+        _ => zoon::Text::new(format!("{}[...]", tag)).unify(),
+    }
+}
 
-    link.to(to).unify()
+fn render_stripe_static(fields: &Fields) -> RawElOrText {
+    let direction = fields
+        .get("direction")
+        .and_then(|v| v.as_tag())
+        .unwrap_or("Column");
+
+    let mut el = Stripe::new()
+        .direction(if direction == "Row" { Direction::Row } else { Direction::Column });
+
+    if let Some(gap) = fields.get("gap").and_then(|v| v.as_number()) {
+        if gap > 0.0 {
+            el = el.s(Gap::both(gap as u32));
+        }
+    }
+
+    if let Some(font) = extract_font_from_fields(fields) { el = el.s(font); }
+    if let Some(width) = extract_width_from_fields(fields) { el = el.s(width); }
+    if let Some(height) = extract_height_from_fields(fields) { el = el.s(height); }
+    if let Some(padding) = extract_padding_from_fields(fields) { el = el.s(padding); }
+    if let Some(background) = extract_background_from_fields(fields) { el = el.s(background); }
+    if let Some(rc) = extract_rounded_corners_from_fields(fields) { el = el.s(rc); }
+    if let Some(transform) = extract_transform_from_fields(fields) { el = el.s(transform); }
+    if let Some(outline) = extract_outline_from_fields(fields) { el = el.s(outline); }
+    if let Some(borders) = extract_borders_from_fields(fields) { el = el.s(borders); }
+    if let Some(align) = extract_align_content_from_fields(fields) { el = el.s(align); }
+
+    let rendered_items: Vec<RawElOrText> = extract_sorted_list_items(fields, "items")
+        .iter()
+        .map(|item| render_value_static(item))
+        .collect();
+    let (tx, rx) = mpsc::unbounded();
+    tx.unbounded_send(VecDiff::Replace { values: rendered_items }).ok();
+    el.items_signal_vec(VecDiffStreamSignalVec(rx)).unify()
+}
+
+fn render_stack_static(fields: &Fields) -> RawElOrText {
+    let mut el = Stack::new();
+    if let Some(width) = extract_width_from_fields(fields) { el = el.s(width); }
+    if let Some(height) = extract_height_from_fields(fields) { el = el.s(height); }
+    if let Some(background) = extract_background_from_fields(fields) { el = el.s(background); }
+
+    let rendered_layers: Vec<RawElOrText> = extract_sorted_list_items(fields, "layers")
+        .iter()
+        .map(|item| render_value_static(item))
+        .collect();
+    let (tx, rx) = mpsc::unbounded();
+    tx.unbounded_send(VecDiff::Replace { values: rendered_layers }).ok();
+    el.layers_signal_vec(VecDiffStreamSignalVec(rx)).unify()
+}
+
+fn render_container_static(fields: &Fields) -> RawElOrText {
+    let mut el = El::new();
+    if let Some(font) = extract_font_from_fields(fields) { el = el.s(font); }
+    if let Some(width) = extract_width_from_fields(fields) { el = el.s(width); }
+    if let Some(height) = extract_height_from_fields(fields) { el = el.s(height); }
+    if let Some(padding) = extract_padding_from_fields(fields) { el = el.s(padding); }
+    if let Some(background) = extract_background_from_fields(fields) { el = el.s(background); }
+    if let Some(rc) = extract_rounded_corners_from_fields(fields) { el = el.s(rc); }
+    if let Some(transform) = extract_transform_from_fields(fields) { el = el.s(transform); }
+    if let Some(outline) = extract_outline_from_fields(fields) { el = el.s(outline); }
+    if let Some(borders) = extract_borders_from_fields(fields) { el = el.s(borders); }
+    if let Some(align) = extract_align_content_from_fields(fields) { el = el.s(align); }
+
+    if let Some(child) = fields.get("child") {
+        el.child(render_value_static(child)).unify()
+    } else {
+        el.unify()
+    }
 }

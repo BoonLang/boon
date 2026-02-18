@@ -1,12 +1,5 @@
-//! Rendering layer for the DD engine.
+//! Render layer — converts DD Value descriptors to Zoon elements.
 //!
-//! This module handles rendering DD values to Zoon UI elements.
-//!
-//! # Module Structure
-//!
-//! - `bridge` - Converts DD Value types to Zoon UI elements
-//! - `list_adapter` - (removed) diff adapter was unused in bridge
+//! Reads from io/ signals only. Does NOT access DD collections directly.
 
 pub mod bridge;
-
-pub use bridge::*;

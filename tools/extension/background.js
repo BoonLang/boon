@@ -2322,6 +2322,56 @@ async function handleCommand(id, command) {
           return { type: 'error', message: `Assert button has outline failed: ${e.message}` };
         }
 
+      case 'getElementStyle':
+        // Get computed style property of an element found by text content
+        try {
+          const styleResult = await cdpEvaluate(tab.id, `
+            (function() {
+              const preview = document.querySelector('[data-boon-panel="preview"]');
+              if (!preview) return { found: false, value: '', error: 'Preview panel not found' };
+
+              const searchText = ${JSON.stringify(command.text)};
+              const property = ${JSON.stringify(command.property)};
+
+              // Find deepest element containing the text
+              const allElements = preview.querySelectorAll('*');
+              let bestMatch = null;
+              for (const el of allElements) {
+                let directText = '';
+                for (const node of el.childNodes) {
+                  if (node.nodeType === Node.TEXT_NODE) {
+                    directText += node.textContent;
+                  }
+                }
+                if (directText.trim() === searchText) {
+                  bestMatch = el;
+                }
+              }
+
+              if (!bestMatch) {
+                // Fallback: check textContent contains
+                for (const el of allElements) {
+                  if (el.textContent.trim() === searchText && el.children.length === 0) {
+                    bestMatch = el;
+                    break;
+                  }
+                }
+              }
+
+              if (!bestMatch) {
+                return { found: false, value: '', error: 'Element with text "' + searchText + '" not found' };
+              }
+
+              const style = window.getComputedStyle(bestMatch);
+              return { found: true, value: style.getPropertyValue(property) };
+            })()
+          `);
+
+          return { type: 'elementStyle', found: styleResult.found, value: styleResult.value || '' };
+        } catch (e) {
+          return { type: 'error', message: 'Get element style failed: ' + e.message };
+        }
+
       case 'assertToggleAllDarker':
         // Check if the toggle all checkbox icon is dark (all todos completed)
         // The icon should have Oklch lightness ~0.40 when dark, ~0.75 when light
