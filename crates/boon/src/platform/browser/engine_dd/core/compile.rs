@@ -23,7 +23,7 @@ use crate::parser::{
 use super::types::{
     BroadcastHandlerFn, CollectionSpec, DataflowGraph, InputId, InputKind, InputSpec,
     KeyedListOutput, ListKey, SideEffectKind, VarId,
-    LIST_TAG, LINK_PATH_FIELD, HOVER_PATH_FIELD, HOVERED_FIELD, ROUTER_INPUT, PASSED_VAR,
+    LIST_TAG, LINK_PATH_FIELD, HOVER_PATH_FIELD, HOVERED_FIELD, ROUTER_INPUT, PASSED_VAR, DEP_FIELD_PREFIX,
 };
 use super::value::Value;
 
@@ -3014,7 +3014,7 @@ impl<'a> GraphBuilder<'a> {
                     source: dep_var,
                     f: Arc::new(move |v: &Value| {
                         let mut combined = BTreeMap::new();
-                        combined.insert(Arc::from("__dep_0"), v.clone());
+                        combined.insert(Arc::from(format!("{DEP_FIELD_PREFIX}0")), v.clone());
                         doc_closure(&Value::Object(Arc::new(combined)))
                     }),
                 },
@@ -3033,7 +3033,7 @@ impl<'a> GraphBuilder<'a> {
                 left: first_var,
                 right: second_var,
                 combine: Arc::new(move |a: &Value, b: &Value| {
-                    Value::object([("__dep_0", a.clone()), ("__dep_1", b.clone())])
+                    Value::object([(format!("{DEP_FIELD_PREFIX}0"), a.clone()), (format!("{DEP_FIELD_PREFIX}1"), b.clone())])
                 }),
             },
         );
@@ -3049,7 +3049,7 @@ impl<'a> GraphBuilder<'a> {
                     left: prev,
                     right: dep_var,
                     combine: Arc::new(move |combined: &Value, new_dep: &Value| {
-                        let key = format!("__dep_{}", idx);
+                        let key = format!("{DEP_FIELD_PREFIX}{idx}");
                         combined.update_field(&key, new_dep.clone())
                     }),
                 },
@@ -3129,7 +3129,7 @@ impl<'a> GraphBuilder<'a> {
             let mut store_fields: BTreeMap<Arc<str>, Value> = BTreeMap::new();
 
             for (i, name) in dep_names.iter().enumerate() {
-                let dep_key = format!("__dep_{}", i);
+                let dep_key = format!("{DEP_FIELD_PREFIX}{i}");
                 let val = combined.get_field(&dep_key).cloned().unwrap_or(Value::Unit);
 
                 // Parse dotted names: "store.items" → insert into store.items

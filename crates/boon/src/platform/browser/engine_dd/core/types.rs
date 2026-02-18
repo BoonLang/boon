@@ -86,6 +86,8 @@ pub const HOVERED_FIELD: &str = "__hovered";
 pub const ROUTER_INPUT: &str = "__router";
 /// Scope variable name for PASS/PASSED context propagation.
 pub const PASSED_VAR: &str = "__passed";
+/// Field name prefix for multi-dependency document closures (e.g., "__dep_0", "__dep_1").
+pub const DEP_FIELD_PREFIX: &str = "__dep_";
 
 // ===========================================================================
 // KeyedDiff — incremental diffs from DD keyed collections

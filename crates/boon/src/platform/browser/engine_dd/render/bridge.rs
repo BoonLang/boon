@@ -21,7 +21,7 @@ use futures_channel::mpsc;
 use pin_project::pin_project;
 use zoon::*;
 
-use super::super::core::types::{KeyedDiff, LinkId, LIST_TAG, LINK_PATH_FIELD, HOVER_PATH_FIELD};
+use super::super::core::types::{KeyedDiff, LIST_TAG, LINK_PATH_FIELD, HOVER_PATH_FIELD};
 use super::super::core::value::Value;
 use super::super::io::worker::{DdWorkerHandle, Event};
 
@@ -58,16 +58,16 @@ where
 
 /// Convert an Oklch tagged value to a CSS `oklch()` string.
 fn oklch_to_css(fields: &Fields) -> Option<String> {
-    let l = fields.get("lightness" as &str).and_then(|v| v.as_number()).unwrap_or(0.0);
+    let l = fields.get("lightness").and_then(|v| v.as_number()).unwrap_or(0.0);
     let c = fields
-        .get("chroma" as &str)
+        .get("chroma")
         .and_then(|v| v.as_number())
         .unwrap_or(0.0);
     let h = fields
-        .get("hue" as &str)
+        .get("hue")
         .and_then(|v| v.as_number())
         .unwrap_or(0.0);
-    let a = fields.get("alpha" as &str).and_then(|v| v.as_number());
+    let a = fields.get("alpha").and_then(|v| v.as_number());
 
     if let Some(alpha) = a {
         Some(format!("oklch({} {} {} / {})", l, c, h, alpha))
@@ -111,7 +111,7 @@ fn value_to_css_color(value: &Value) -> Option<String> {
 
 /// Get the style sub-object from element fields.
 fn get_style_obj(fields: &Fields) -> Option<&Fields> {
-    match fields.get("style" as &str) {
+    match fields.get("style") {
         Some(Value::Object(obj)) => Some(obj.as_ref()),
         _ => None,
     }
@@ -131,7 +131,7 @@ fn extract_sorted_list_items(fields: &Fields, field_name: &str) -> Vec<Value> {
     if let Some(Value::Tagged {
         tag,
         fields: list_fields,
-    }) = fields.get(field_name as &str)
+    }) = fields.get(field_name)
     {
         if tag.as_ref() == LIST_TAG {
             // BTreeMap iteration is already sorted by key
@@ -145,12 +145,12 @@ fn extract_sorted_list_items(fields: &Fields, field_name: &str) -> Vec<Value> {
 /// Extract effective link path for event handlers.
 fn extract_effective_link(fields: &Fields, parent_link_path: &str) -> String {
     fields
-        .get("press_link" as &str)
+        .get("press_link")
         .and_then(|v| v.as_text())
         .map(|s| s.to_string())
         .or_else(|| {
             fields
-                .get(LINK_PATH_FIELD as &str)
+                .get(LINK_PATH_FIELD)
                 .and_then(|v| v.as_text())
                 .map(|s| s.to_string())
         })
@@ -161,7 +161,7 @@ fn extract_effective_link(fields: &Fields, parent_link_path: &str) -> String {
 fn extract_hover_link_path(fields: &Fields, parent_link_path: &str) -> Option<String> {
     // First check __hover_path__ (injected by DD compiler for per-item hover)
     if let Some(path) = fields
-        .get(HOVER_PATH_FIELD as &str)
+        .get(HOVER_PATH_FIELD)
         .and_then(|v| v.as_text())
     {
         if !path.is_empty() {
@@ -170,7 +170,7 @@ fn extract_hover_link_path(fields: &Fields, parent_link_path: &str) -> Option<St
     }
     // Then check __link_path__ (set by |> LINK { alias } pipe)
     if let Some(path) = fields
-        .get(LINK_PATH_FIELD as &str)
+        .get(LINK_PATH_FIELD)
         .and_then(|v| v.as_text())
     {
         if !path.is_empty() {
@@ -178,9 +178,9 @@ fn extract_hover_link_path(fields: &Fields, parent_link_path: &str) -> Option<St
         }
     }
     // Then check element.hovered.__path__ (set by element: [hovered: LINK])
-    if let Some(element_val) = fields.get("element" as &str) {
+    if let Some(element_val) = fields.get("element") {
         let hovered_val = match element_val {
-            Value::Object(obj) => obj.get("hovered" as &str),
+            Value::Object(obj) => obj.get("hovered"),
             _ => None,
         };
         if let Some(Value::Tagged {
@@ -190,7 +190,7 @@ fn extract_hover_link_path(fields: &Fields, parent_link_path: &str) -> Option<St
         {
             if tag.as_ref() == "LINK" {
                 if let Some(path) = link_fields
-                    .get("__path__" as &str)
+                    .get("__path__")
                     .and_then(|v| v.as_text())
                 {
                     if !path.is_empty() {
@@ -217,20 +217,20 @@ fn extract_hover_link_path(fields: &Fields, parent_link_path: &str) -> Option<St
 /// Extract Font from element fields' style.font sub-object.
 fn extract_font_from_fields(fields: &Fields) -> Option<Font<'static>> {
     let style = get_style_obj(fields)?;
-    let font_obj = match style.get("font" as &str) {
+    let font_obj = match style.get("font") {
         Some(Value::Object(f)) => f,
         _ => return None,
     };
     let mut font = Font::new();
-    if let Some(size) = font_obj.get("size" as &str).and_then(|v| v.as_number()) {
+    if let Some(size) = font_obj.get("size").and_then(|v| v.as_number()) {
         font = font.size(size as u32);
     }
-    if let Some(color_val) = font_obj.get("color" as &str) {
+    if let Some(color_val) = font_obj.get("color") {
         if let Some(css) = value_to_css_color(color_val) {
             font = font.color(css);
         }
     }
-    if let Some(weight_val) = font_obj.get("weight" as &str) {
+    if let Some(weight_val) = font_obj.get("weight") {
         if let Some(tag) = weight_val.as_tag() {
             let w = match tag {
                 "Hairline" => Some(FontWeight::Hairline),
@@ -251,7 +251,7 @@ fn extract_font_from_fields(fields: &Fields) -> Option<Font<'static>> {
             font = font.weight(FontWeight::Number(n as u32));
         }
     }
-    if let Some(align_val) = font_obj.get("align" as &str) {
+    if let Some(align_val) = font_obj.get("align") {
         if let Some(tag) = align_val.as_tag() {
             font = match tag {
                 "Center" => font.center(),
@@ -262,13 +262,13 @@ fn extract_font_from_fields(fields: &Fields) -> Option<Font<'static>> {
             };
         }
     }
-    if font_obj.get("style" as &str).and_then(|v| v.as_tag()) == Some("Italic") {
+    if font_obj.get("style").and_then(|v| v.as_tag()) == Some("Italic") {
         font = font.italic();
     }
     if let Some(Value::Tagged {
         tag,
         fields: list_fields,
-    }) = font_obj.get("family" as &str)
+    }) = font_obj.get("family")
     {
         if tag.as_ref() == LIST_TAG {
             let mut families = Vec::new();
@@ -290,13 +290,13 @@ fn extract_font_from_fields(fields: &Fields) -> Option<Font<'static>> {
             }
         }
     }
-    if let Some(Value::Object(line)) = font_obj.get("line" as &str) {
+    if let Some(Value::Object(line)) = font_obj.get("line") {
         let strike = line
-            .get("strikethrough" as &str)
+            .get("strikethrough")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let underline = line
-            .get("underline" as &str)
+            .get("underline")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if strike || underline {
@@ -317,8 +317,8 @@ fn extract_font(value: &Value) -> Option<Font<'static>> {
 /// Also check align.row for text alignment (used when font.align is not set).
 fn extract_align_font_from_fields(fields: &Fields) -> Option<Font<'static>> {
     let style = get_style_obj(fields)?;
-    if let Some(Value::Object(align)) = style.get("align" as &str) {
-        if let Some(tag) = align.get("row" as &str).and_then(|v| v.as_tag()) {
+    if let Some(Value::Object(align)) = style.get("align") {
+        if let Some(tag) = align.get("row").and_then(|v| v.as_tag()) {
             return match tag {
                 "Center" => Some(Font::new().center()),
                 "Start" | "Left" => Some(Font::new().left()),
@@ -338,10 +338,10 @@ fn extract_align_font(value: &Value) -> Option<Font<'static>> {
 fn extract_width_from_fields(fields: &Fields) -> Option<Width<'static>> {
     let style = get_style_obj(fields)?;
     // Size field sets both width and height
-    if let Some(size) = style.get("size" as &str).and_then(|v| v.as_number()) {
+    if let Some(size) = style.get("size").and_then(|v| v.as_number()) {
         return Some(Width::exact(size as u32));
     }
-    let w = style.get("width" as &str)?;
+    let w = style.get("width")?;
     if let Some(n) = w.as_number() {
         Some(Width::exact(n as u32))
     } else if w.as_tag() == Some("Fill") {
@@ -358,10 +358,10 @@ fn extract_width(value: &Value) -> Option<Width<'static>> {
 /// Extract Height from element fields' style.
 fn extract_height_from_fields(fields: &Fields) -> Option<Height<'static>> {
     let style = get_style_obj(fields)?;
-    if let Some(size) = style.get("size" as &str).and_then(|v| v.as_number()) {
+    if let Some(size) = style.get("size").and_then(|v| v.as_number()) {
         return Some(Height::exact(size as u32));
     }
-    let h = style.get("height" as &str)?;
+    let h = style.get("height")?;
     if let Some(n) = h.as_number() {
         Some(Height::exact(n as u32))
     } else if h.as_tag() == Some("Fill") {
@@ -378,32 +378,32 @@ fn extract_height(value: &Value) -> Option<Height<'static>> {
 /// Extract Padding from element fields' style.
 fn extract_padding_from_fields(fields: &Fields) -> Option<Padding<'static>> {
     let style = get_style_obj(fields)?;
-    let padding_val = style.get("padding" as &str)?;
+    let padding_val = style.get("padding")?;
     match padding_val {
         Value::Number(n) => Some(Padding::all(n.0 as u32)),
         Value::Object(padding) => {
             let row = padding
-                .get("row" as &str)
+                .get("row")
                 .and_then(|v| v.as_number())
                 .unwrap_or(0.0);
             let col = padding
-                .get("column" as &str)
+                .get("column")
                 .and_then(|v| v.as_number())
                 .unwrap_or(0.0);
             let top = padding
-                .get("top" as &str)
+                .get("top")
                 .and_then(|v| v.as_number())
                 .unwrap_or(col) as u32;
             let bottom = padding
-                .get("bottom" as &str)
+                .get("bottom")
                 .and_then(|v| v.as_number())
                 .unwrap_or(col) as u32;
             let left = padding
-                .get("left" as &str)
+                .get("left")
                 .and_then(|v| v.as_number())
                 .unwrap_or(row) as u32;
             let right = padding
-                .get("right" as &str)
+                .get("right")
                 .and_then(|v| v.as_number())
                 .unwrap_or(row) as u32;
             Some(Padding::new().top(top).right(right).bottom(bottom).left(left))
@@ -419,17 +419,17 @@ fn extract_padding(value: &Value) -> Option<Padding<'static>> {
 /// Extract Background from element fields' style.
 fn extract_background_from_fields(fields: &Fields) -> Option<Background<'static>> {
     let style = get_style_obj(fields)?;
-    let bg = match style.get("background" as &str) {
+    let bg = match style.get("background") {
         Some(Value::Object(bg)) => bg,
         _ => return None,
     };
     let mut background = Background::new();
     let mut has_any = false;
-    if let Some(color_css) = bg.get("color" as &str).and_then(value_to_css_color) {
+    if let Some(color_css) = bg.get("color").and_then(value_to_css_color) {
         background = background.color(color_css);
         has_any = true;
     }
-    if let Some(url) = bg.get("url" as &str).and_then(|v| v.as_text()) {
+    if let Some(url) = bg.get("url").and_then(|v| v.as_text()) {
         background = background.url(url.to_string());
         has_any = true;
     }
@@ -448,7 +448,7 @@ fn extract_background(value: &Value) -> Option<Background<'static>> {
 fn extract_rounded_corners_from_fields(fields: &Fields) -> Option<RoundedCorners> {
     let style = get_style_obj(fields)?;
     style
-        .get("rounded_corners" as &str)
+        .get("rounded_corners")
         .and_then(|v| v.as_number())
         .map(|n| RoundedCorners::all(n as u32))
 }
@@ -460,28 +460,28 @@ fn extract_rounded_corners(value: &Value) -> Option<RoundedCorners> {
 /// Extract Transform from element fields' style.
 fn extract_transform_from_fields(fields: &Fields) -> Option<Transform> {
     let style = get_style_obj(fields)?;
-    let transform = match style.get("transform" as &str) {
+    let transform = match style.get("transform") {
         Some(Value::Object(t)) => t,
         _ => return None,
     };
     let move_right = transform
-        .get("move_right" as &str)
+        .get("move_right")
         .and_then(|v| v.as_number())
         .unwrap_or(0.0);
     let move_down = transform
-        .get("move_down" as &str)
+        .get("move_down")
         .and_then(|v| v.as_number())
         .unwrap_or(0.0);
     let move_left = transform
-        .get("move_left" as &str)
+        .get("move_left")
         .and_then(|v| v.as_number())
         .unwrap_or(0.0);
     let move_up = transform
-        .get("move_up" as &str)
+        .get("move_up")
         .and_then(|v| v.as_number())
         .unwrap_or(0.0);
     let rotate = transform
-        .get("rotate" as &str)
+        .get("rotate")
         .and_then(|v| v.as_number())
         .unwrap_or(0.0);
     let has_transform =
@@ -515,13 +515,13 @@ fn extract_transform(value: &Value) -> Option<Transform> {
 /// Extract Outline from element fields' style.
 fn extract_outline_from_fields(fields: &Fields) -> Option<Outline> {
     let style = get_style_obj(fields)?;
-    let outline = style.get("outline" as &str)?;
+    let outline = style.get("outline")?;
     match outline {
         Value::Tag(t) if t.as_ref() == "NoOutline" => None,
         Value::Object(obj) => {
-            let color_css = obj.get("color" as &str).and_then(value_to_css_color)?;
+            let color_css = obj.get("color").and_then(value_to_css_color)?;
             let side = obj
-                .get("side" as &str)
+                .get("side")
                 .and_then(|v| v.as_tag())
                 .unwrap_or("Outer");
             let mut o = if side == "Inner" {
@@ -546,35 +546,35 @@ fn extract_shadows_from_fields(fields: &Fields) -> Option<Vec<Shadow>> {
     if let Some(Value::Tagged {
         tag,
         fields: list_fields,
-    }) = style.get("shadows" as &str)
+    }) = style.get("shadows")
     {
         if tag.as_ref() == LIST_TAG {
             let mut shadows = Vec::new();
             for item in list_fields.values() {
                 if let Value::Object(shadow_obj) = item {
                     let x = shadow_obj
-                        .get("x" as &str)
+                        .get("x")
                         .and_then(|v| v.as_number())
                         .unwrap_or(0.0) as i32;
                     let y = shadow_obj
-                        .get("y" as &str)
+                        .get("y")
                         .and_then(|v| v.as_number())
                         .unwrap_or(0.0) as i32;
                     let blur = shadow_obj
-                        .get("blur" as &str)
+                        .get("blur")
                         .and_then(|v| v.as_number())
                         .unwrap_or(0.0) as u32;
                     let spread = shadow_obj
-                        .get("spread" as &str)
+                        .get("spread")
                         .and_then(|v| v.as_number())
                         .unwrap_or(0.0) as i32;
                     let inset = shadow_obj
-                        .get("direction" as &str)
+                        .get("direction")
                         .and_then(|v| v.as_tag())
                         .map(|t| t == "Inwards")
                         .unwrap_or(false);
                     let color_css = shadow_obj
-                        .get("color" as &str)
+                        .get("color")
                         .and_then(value_to_css_color);
                     let mut shadow = Shadow::new().x(x).y(y).blur(blur).spread(spread);
                     if inset {
@@ -601,40 +601,40 @@ fn extract_shadows(value: &Value) -> Option<Vec<Shadow>> {
 /// Extract Borders from element fields' style.
 fn extract_border_side(side_obj: &Fields) -> Option<Border> {
     let width = side_obj
-        .get("width" as &str)
+        .get("width")
         .and_then(|v| v.as_number())
         .unwrap_or(1.0) as u32;
-    let color_css = side_obj.get("color" as &str).and_then(value_to_css_color)?;
+    let color_css = side_obj.get("color").and_then(value_to_css_color)?;
     Some(Border::new().width(width).color(color_css))
 }
 
 fn extract_borders_from_fields(fields: &Fields) -> Option<Borders<'static>> {
     let style = get_style_obj(fields)?;
-    let borders = match style.get("borders" as &str) {
+    let borders = match style.get("borders") {
         Some(Value::Object(b)) => b,
         _ => return None,
     };
     let mut result = Borders::new();
     let mut has_any = false;
-    if let Some(Value::Object(top)) = borders.get("top" as &str) {
+    if let Some(Value::Object(top)) = borders.get("top") {
         if let Some(b) = extract_border_side(top) {
             result = result.top(b);
             has_any = true;
         }
     }
-    if let Some(Value::Object(bottom)) = borders.get("bottom" as &str) {
+    if let Some(Value::Object(bottom)) = borders.get("bottom") {
         if let Some(b) = extract_border_side(bottom) {
             result = result.bottom(b);
             has_any = true;
         }
     }
-    if let Some(Value::Object(left)) = borders.get("left" as &str) {
+    if let Some(Value::Object(left)) = borders.get("left") {
         if let Some(b) = extract_border_side(left) {
             result = result.left(b);
             has_any = true;
         }
     }
-    if let Some(Value::Object(right)) = borders.get("right" as &str) {
+    if let Some(Value::Object(right)) = borders.get("right") {
         if let Some(b) = extract_border_side(right) {
             result = result.right(b);
             has_any = true;
@@ -654,13 +654,13 @@ fn extract_borders(value: &Value) -> Option<Borders<'static>> {
 /// Extract AlignContent from element fields' style.
 fn extract_align_content_from_fields(fields: &Fields) -> Option<AlignContent> {
     let style = get_style_obj(fields)?;
-    let align = match style.get("align" as &str) {
+    let align = match style.get("align") {
         Some(Value::Object(a)) => a,
         _ => return None,
     };
     let mut result = AlignContent::new();
     let mut has_any = false;
-    if let Some(tag) = align.get("row" as &str).and_then(|v| v.as_tag()) {
+    if let Some(tag) = align.get("row").and_then(|v| v.as_tag()) {
         result = match tag {
             "Center" => result.center_x(),
             "Start" | "Left" => result.left(),
@@ -669,7 +669,7 @@ fn extract_align_content_from_fields(fields: &Fields) -> Option<AlignContent> {
         };
         has_any = true;
     }
-    if let Some(tag) = align.get("column" as &str).and_then(|v| v.as_tag()) {
+    if let Some(tag) = align.get("column").and_then(|v| v.as_tag()) {
         result = match tag {
             "Center" => result.center_y(),
             "Top" | "Start" => result.top(),
@@ -695,7 +695,7 @@ fn extract_align_content(value: &Value) -> Option<AlignContent> {
 fn extract_self_align(value: &Value) -> Option<Align> {
     let fields = get_fields(value)?;
     let style = get_style_obj(fields)?;
-    match style.get("align" as &str) {
+    match style.get("align") {
         Some(Value::Tag(tag)) => match tag.as_ref() {
             "Right" | "End" => Some(Align::new().right()),
             "Left" | "Start" => Some(Align::new().left()),
@@ -718,16 +718,16 @@ fn apply_zoon_style_signals<T: RawEl>(
         .style_signal("padding", vm.signal_cloned().map(|v| {
             let fields = get_fields(&v)?;
             let style = get_style_obj(fields)?;
-            let padding_val = style.get("padding" as &str)?;
+            let padding_val = style.get("padding")?;
             match padding_val {
                 Value::Number(n) => Some(format!("{}px", n.0)),
                 Value::Object(padding) => {
-                    let row = padding.get("row" as &str).and_then(|v| v.as_number()).unwrap_or(0.0);
-                    let col = padding.get("column" as &str).and_then(|v| v.as_number()).unwrap_or(0.0);
-                    let top = padding.get("top" as &str).and_then(|v| v.as_number()).unwrap_or(col);
-                    let bottom = padding.get("bottom" as &str).and_then(|v| v.as_number()).unwrap_or(col);
-                    let left = padding.get("left" as &str).and_then(|v| v.as_number()).unwrap_or(row);
-                    let right = padding.get("right" as &str).and_then(|v| v.as_number()).unwrap_or(row);
+                    let row = padding.get("row").and_then(|v| v.as_number()).unwrap_or(0.0);
+                    let col = padding.get("column").and_then(|v| v.as_number()).unwrap_or(0.0);
+                    let top = padding.get("top").and_then(|v| v.as_number()).unwrap_or(col);
+                    let bottom = padding.get("bottom").and_then(|v| v.as_number()).unwrap_or(col);
+                    let left = padding.get("left").and_then(|v| v.as_number()).unwrap_or(row);
+                    let right = padding.get("right").and_then(|v| v.as_number()).unwrap_or(row);
                     Some(format!("{}px {}px {}px {}px", top, right, bottom, left))
                 }
                 _ => None,
@@ -739,35 +739,35 @@ fn apply_zoon_style_signals<T: RawEl>(
             if let Some(Value::Tagged {
                 tag,
                 fields: list_fields,
-            }) = style.get("shadows" as &str)
+            }) = style.get("shadows")
             {
                 if tag.as_ref() == LIST_TAG {
                     let mut shadow_parts = Vec::new();
                     for item in list_fields.values() {
                         if let Value::Object(shadow_obj) = item {
                             let x = shadow_obj
-                                .get("x" as &str)
+                                .get("x")
                                 .and_then(|v| v.as_number())
                                 .unwrap_or(0.0);
                             let y = shadow_obj
-                                .get("y" as &str)
+                                .get("y")
                                 .and_then(|v| v.as_number())
                                 .unwrap_or(0.0);
                             let blur = shadow_obj
-                                .get("blur" as &str)
+                                .get("blur")
                                 .and_then(|v| v.as_number())
                                 .unwrap_or(0.0);
                             let spread = shadow_obj
-                                .get("spread" as &str)
+                                .get("spread")
                                 .and_then(|v| v.as_number())
                                 .unwrap_or(0.0);
                             let inset = shadow_obj
-                                .get("direction" as &str)
+                                .get("direction")
                                 .and_then(|v| v.as_tag())
                                 .map(|t| t == "Inwards")
                                 .unwrap_or(false);
                             let color_css = shadow_obj
-                                .get("color" as &str)
+                                .get("color")
                                 .and_then(value_to_css_color)
                                 .unwrap_or_else(|| "rgba(0,0,0,0.5)".to_string());
                             let inset_str = if inset { "inset " } else { "" };
@@ -790,26 +790,26 @@ fn apply_zoon_style_signals<T: RawEl>(
         .style_signal("border-right", vm.signal_cloned().map(|v| css_border_side(&v, "right")))
         .style_signal("line-height", vm.signal_cloned().map(|v| {
             let style = get_style_obj(get_fields(&v)?)?;
-            let lh = style.get("line_height" as &str)?.as_number()?;
+            let lh = style.get("line_height")?.as_number()?;
             Some(format!("{}", lh))
         }))
         .style_signal("text-shadow", vm.signal_cloned().map(|v| {
             let style = get_style_obj(get_fields(&v)?)?;
-            let shadow = match style.get("text_shadow" as &str)? {
+            let shadow = match style.get("text_shadow")? {
                 Value::Object(obj) => obj,
                 _ => return None,
             };
-            let x = shadow.get("x" as &str).and_then(|v| v.as_number()).unwrap_or(0.0);
-            let y = shadow.get("y" as &str).and_then(|v| v.as_number()).unwrap_or(0.0);
-            let blur = shadow.get("blur" as &str).and_then(|v| v.as_number()).unwrap_or(0.0);
-            let color_css = shadow.get("color" as &str)
+            let x = shadow.get("x").and_then(|v| v.as_number()).unwrap_or(0.0);
+            let y = shadow.get("y").and_then(|v| v.as_number()).unwrap_or(0.0);
+            let blur = shadow.get("blur").and_then(|v| v.as_number()).unwrap_or(0.0);
+            let color_css = shadow.get("color")
                 .and_then(value_to_css_color)
                 .unwrap_or_else(|| "rgba(0,0,0,0.5)".to_string());
             Some(format!("{}px {}px {}px {}", x, y, blur, color_css))
         }))
         .style_signal("-webkit-font-smoothing", vm.signal_cloned().map(|v| {
             let style = get_style_obj(get_fields(&v)?)?;
-            let val = style.get("font_smoothing" as &str)?;
+            let val = style.get("font_smoothing")?;
             match val.as_tag()? {
                 "Antialiased" => Some("antialiased".to_string()),
                 _ => None,
@@ -817,17 +817,17 @@ fn apply_zoon_style_signals<T: RawEl>(
         }))
         .style_signal("text-decoration", vm.signal_cloned().map(|v| {
             let style = get_style_obj(get_fields(&v)?)?;
-            let font = match style.get("font" as &str)? {
+            let font = match style.get("font")? {
                 Value::Object(f) => f.as_ref(),
                 Value::Tagged { fields, .. } => fields.as_ref(),
                 _ => return None,
             };
-            let line = match font.get("line" as &str)? {
+            let line = match font.get("line")? {
                 Value::Object(l) => l.as_ref(),
                 _ => return None,
             };
-            let strike = line.get("strikethrough" as &str).and_then(|v| v.as_bool()).unwrap_or(false);
-            let underline = line.get("underline" as &str).and_then(|v| v.as_bool()).unwrap_or(false);
+            let strike = line.get("strikethrough").and_then(|v| v.as_bool()).unwrap_or(false);
+            let underline = line.get("underline").and_then(|v| v.as_bool()).unwrap_or(false);
             match (strike, underline) {
                 (true, true) => Some("line-through underline".to_string()),
                 (true, false) => Some("line-through".to_string()),
@@ -840,20 +840,20 @@ fn apply_zoon_style_signals<T: RawEl>(
 /// CSS border-side extractor (kept for raw CSS signal use in retained tree).
 fn css_border_side(value: &Value, side: &str) -> Option<String> {
     let style = get_style_obj(get_fields(value)?)?;
-    let borders = match style.get("borders" as &str) {
+    let borders = match style.get("borders") {
         Some(Value::Object(b)) => b,
         _ => return None,
     };
-    let side_obj = match borders.get(side as &str) {
+    let side_obj = match borders.get(side) {
         Some(Value::Object(s)) => s,
         _ => return None,
     };
     let width = side_obj
-        .get("width" as &str)
+        .get("width")
         .and_then(|v| v.as_number())
         .unwrap_or(1.0);
     let color_css = side_obj
-        .get("color" as &str)
+        .get("color")
         .and_then(value_to_css_color)
         .unwrap_or_else(|| "currentColor".to_string());
     Some(format!("{}px solid {}", width, color_css))
@@ -905,8 +905,12 @@ impl KeyedItems {
                             .unwrap_or(self.items.len());
                         let child_lp = self.child_link_path(value, stripe_link_path, &key_str);
                         let (el, node) = build_retained_node(value, handle, &child_lp);
+                        // Increment indices of items shifted right by the insert
+                        for (_, idx) in self.key_to_index.iter_mut() {
+                            if *idx >= insert_pos { *idx += 1; }
+                        }
+                        self.key_to_index.insert(key_str.clone(), insert_pos);
                         self.items.insert(insert_pos, (key_str, node));
-                        self.rebuild_index();
                         tx.unbounded_send(VecDiff::InsertAt {
                             index: insert_pos,
                             value: el,
@@ -917,7 +921,11 @@ impl KeyedItems {
                     let key_str = key.0.clone();
                     if let Some(&idx) = self.key_to_index.get(&key_str) {
                         self.items.remove(idx);
-                        self.rebuild_index();
+                        self.key_to_index.remove(&key_str);
+                        // Decrement indices of items shifted left by the removal
+                        for (_, i) in self.key_to_index.iter_mut() {
+                            if *i > idx { *i -= 1; }
+                        }
                         tx.unbounded_send(VecDiff::RemoveAt { index: idx }).ok();
                     }
                 }
@@ -929,18 +937,10 @@ impl KeyedItems {
         self.key_to_index.get(key).copied()
     }
 
-    /// Rebuild the key → index HashMap after structural changes (insert/remove).
-    fn rebuild_index(&mut self) {
-        self.key_to_index.clear();
-        for (i, (k, _)) in self.items.iter().enumerate() {
-            self.key_to_index.insert(k.clone(), i);
-        }
-    }
-
     /// Extract link path from item's __link_path__ field, or construct from key.
     fn child_link_path(&self, value: &Value, stripe_link_path: &str, key: &str) -> String {
         get_fields(value)
-            .and_then(|f| f.get(LINK_PATH_FIELD as &str))
+            .and_then(|f| f.get(LINK_PATH_FIELD))
             .and_then(|v| v.as_text())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("{}.items.{}", stripe_link_path, key))
@@ -1119,7 +1119,7 @@ fn build_retained_tagged(
         "DocumentNew" => {
             let (child_tx, child_rx) = mpsc::unbounded();
             let (child_opt, initial_elements) =
-                if let Some(root) = fields.get("root" as &str) {
+                if let Some(root) = fields.get("root") {
                     let (el, child) = build_retained_node(root, handle, link_path);
                     (Some(Box::new(child)), vec![el])
                 } else {
@@ -1155,7 +1155,7 @@ fn build_retained_button(
         .update_raw_el(|raw_el| raw_el.attr("role", "button"))
         .label_signal(vm.signal_cloned().map(|v| {
             get_fields(&v)
-                .and_then(|f| f.get("label" as &str))
+                .and_then(|f| f.get("label"))
                 .map(|l| l.to_display_string())
                 .unwrap_or_default()
         }))
@@ -1168,25 +1168,25 @@ fn build_retained_button(
             .color_signal(vm.signal_cloned().map(|v| {
                 let fields = get_fields(&v)?;
                 let style = get_style_obj(fields)?;
-                let bg = match style.get("background" as &str) {
+                let bg = match style.get("background") {
                     Some(Value::Object(bg)) => bg,
                     _ => return None,
                 };
-                bg.get("color" as &str).and_then(value_to_css_color)
+                bg.get("color").and_then(value_to_css_color)
             }))
             .url_signal(vm.signal_cloned().map(|v| {
                 let fields = get_fields(&v)?;
                 let style = get_style_obj(fields)?;
-                let bg = match style.get("background" as &str) {
+                let bg = match style.get("background") {
                     Some(Value::Object(bg)) => bg,
                     _ => return None,
                 };
-                bg.get("url" as &str).and_then(|v| v.as_text()).map(|s| s.to_string())
+                bg.get("url").and_then(|v| v.as_text()).map(|s| s.to_string())
             })))
         .s(RoundedCorners::all_signal(vm.signal_cloned().map(|v| {
             get_fields(&v)
                 .and_then(|f| get_style_obj(f))
-                .and_then(|s| s.get("rounded_corners" as &str))
+                .and_then(|s| s.get("rounded_corners"))
                 .and_then(|v| v.as_number())
                 .map(|n| n as u32)
         })))
@@ -1244,7 +1244,7 @@ fn build_retained_stripe(
 
     // Detect keyed Stripe by matching element tag from compiler.
     let keyed_mode = if let Some(keyed_tag) = handle.keyed_stripe_element_tag() {
-        let el_tag = fields.get("element" as &str)
+        let el_tag = fields.get("element")
             .and_then(|e| e.get_field("tag"))
             .and_then(|t| t.as_tag());
         el_tag == Some(keyed_tag)
@@ -1279,7 +1279,7 @@ fn build_retained_stripe(
     let el = Stripe::new()
         .direction_signal(vm.signal_cloned().map(|v| {
             let dir = get_fields(&v)
-                .and_then(|f| f.get("direction" as &str))
+                .and_then(|f| f.get("direction"))
                 .and_then(|v| v.as_tag());
             match dir {
                 Some("Row") => Direction::Row,
@@ -1288,7 +1288,7 @@ fn build_retained_stripe(
         }))
         .s(Gap::both_signal(vm.signal_cloned().map(|v| {
             get_fields(&v)
-                .and_then(|f| f.get("gap" as &str))
+                .and_then(|f| f.get("gap"))
                 .and_then(|v| v.as_number())
                 .filter(|g| *g > 0.0)
                 .map(|g| g as u32)
@@ -1301,25 +1301,25 @@ fn build_retained_stripe(
             .color_signal(vm.signal_cloned().map(|v| {
                 let fields = get_fields(&v)?;
                 let style = get_style_obj(fields)?;
-                let bg = match style.get("background" as &str) {
+                let bg = match style.get("background") {
                     Some(Value::Object(bg)) => bg,
                     _ => return None,
                 };
-                bg.get("color" as &str).and_then(value_to_css_color)
+                bg.get("color").and_then(value_to_css_color)
             }))
             .url_signal(vm.signal_cloned().map(|v| {
                 let fields = get_fields(&v)?;
                 let style = get_style_obj(fields)?;
-                let bg = match style.get("background" as &str) {
+                let bg = match style.get("background") {
                     Some(Value::Object(bg)) => bg,
                     _ => return None,
                 };
-                bg.get("url" as &str).and_then(|v| v.as_text()).map(|s| s.to_string())
+                bg.get("url").and_then(|v| v.as_text()).map(|s| s.to_string())
             })))
         .s(RoundedCorners::all_signal(vm.signal_cloned().map(|v| {
             get_fields(&v)
                 .and_then(|f| get_style_obj(f))
-                .and_then(|s| s.get("rounded_corners" as &str))
+                .and_then(|s| s.get("rounded_corners"))
                 .and_then(|v| v.as_number())
                 .map(|n| n as u32)
         })))
@@ -1423,11 +1423,11 @@ fn build_retained_stack(
             .color_signal(vm.signal_cloned().map(|v| {
                 let fields = get_fields(&v)?;
                 let style = get_style_obj(fields)?;
-                let bg = match style.get("background" as &str) {
+                let bg = match style.get("background") {
                     Some(Value::Object(bg)) => bg,
                     _ => return None,
                 };
-                bg.get("color" as &str).and_then(value_to_css_color)
+                bg.get("color").and_then(value_to_css_color)
             })))
         .layers_signal_vec(VecDiffStreamSignalVec(layers_rx));
 
@@ -1453,7 +1453,7 @@ fn build_retained_container(
     let mut retained_child = None;
     let mut initial_elements = Vec::new();
 
-    if let Some(child_val) = fields.get("child" as &str) {
+    if let Some(child_val) = fields.get("child") {
         let (el, node) = build_retained_node(child_val, handle, link_path);
         retained_child = Some(Box::new(node));
         initial_elements.push(el);
@@ -1474,16 +1474,16 @@ fn build_retained_container(
             .color_signal(vm.signal_cloned().map(|v| {
                 let fields = get_fields(&v)?;
                 let style = get_style_obj(fields)?;
-                let bg = match style.get("background" as &str) {
+                let bg = match style.get("background") {
                     Some(Value::Object(bg)) => bg,
                     _ => return None,
                 };
-                bg.get("color" as &str).and_then(value_to_css_color)
+                bg.get("color").and_then(value_to_css_color)
             })))
         .s(RoundedCorners::all_signal(vm.signal_cloned().map(|v| {
             get_fields(&v)
                 .and_then(|f| get_style_obj(f))
-                .and_then(|s| s.get("rounded_corners" as &str))
+                .and_then(|s| s.get("rounded_corners"))
                 .and_then(|v| v.as_number())
                 .map(|n| n as u32)
         })))
@@ -1517,7 +1517,7 @@ fn build_retained_label(
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
     let effective_link = fields
-        .get(LINK_PATH_FIELD as &str)
+        .get(LINK_PATH_FIELD)
         .and_then(|v| v.as_text())
         .map(|s| s.to_string())
         .unwrap_or_else(|| link_path.to_string());
@@ -1528,25 +1528,25 @@ fn build_retained_label(
         .label_signal(vm.signal_cloned().map(|v| {
             let fields = get_fields(&v);
             let label = fields
-                .and_then(|f| f.get("label" as &str))
+                .and_then(|f| f.get("label"))
                 .map(|l| l.to_display_string())
                 .unwrap_or_default();
             // Extract text-decoration from font.line (strikethrough/underline)
             // Must be applied to inner El because CSS text-decoration doesn't propagate to block children
             let text_decoration = fields
                 .and_then(|f| get_style_obj(f))
-                .and_then(|s| match s.get("font" as &str)? {
+                .and_then(|s| match s.get("font")? {
                     Value::Object(f) => Some(f.as_ref()),
                     Value::Tagged { fields, .. } => Some(fields.as_ref()),
                     _ => None,
                 })
-                .and_then(|f| match f.get("line" as &str)? {
+                .and_then(|f| match f.get("line")? {
                     Value::Object(l) => Some(l.as_ref()),
                     _ => None,
                 })
                 .map(|line| {
-                    let strike = line.get("strikethrough" as &str).and_then(|v| v.as_bool()).unwrap_or(false);
-                    let underline = line.get("underline" as &str).and_then(|v| v.as_bool()).unwrap_or(false);
+                    let strike = line.get("strikethrough").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let underline = line.get("underline").and_then(|v| v.as_bool()).unwrap_or(false);
                     match (strike, underline) {
                         (true, true) => "line-through underline",
                         (true, false) => "line-through",
@@ -1606,7 +1606,7 @@ fn build_retained_text_input(
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
     let effective_link = fields
-        .get(LINK_PATH_FIELD as &str)
+        .get(LINK_PATH_FIELD)
         .and_then(|v| v.as_text())
         .map(|s| s.to_string())
         .unwrap_or_else(|| link_path.to_string());
@@ -1614,13 +1614,13 @@ fn build_retained_text_input(
     let dom_el: Rc<RefCell<Option<web_sys::HtmlInputElement>>> = Default::default();
 
     let text = fields
-        .get("text" as &str)
+        .get("text")
         .and_then(|v| v.as_text())
         .map(|s| s.to_string())
         .unwrap_or_default();
 
     let focus = fields
-        .get("focus" as &str)
+        .get("focus")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
@@ -1628,20 +1628,20 @@ fn build_retained_text_input(
         .label_hidden("text input")
         .focus_signal(vm.signal_cloned().map(|v| {
             get_fields(&v)
-                .and_then(|f| f.get("focus" as &str))
+                .and_then(|f| f.get("focus"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
         }))
         .text_signal(vm.signal_cloned().map(|v| {
             get_fields(&v)
-                .and_then(|f| f.get("text" as &str))
+                .and_then(|f| f.get("text"))
                 .and_then(|v| v.as_text())
                 .map(|s| s.to_string())
                 .unwrap_or_default()
         }))
         .placeholder(Placeholder::with_signal(vm.signal_cloned().map(|v| {
             get_fields(&v)
-                .and_then(|f| f.get("placeholder" as &str))
+                .and_then(|f| f.get("placeholder"))
                 .and_then(|v| v.get_field("text"))
                 .and_then(|v| v.as_text())
                 .map(|s| s.to_string())
@@ -1653,11 +1653,11 @@ fn build_retained_text_input(
             .color_signal(vm.signal_cloned().map(|v| {
                 let fields = get_fields(&v)?;
                 let style = get_style_obj(fields)?;
-                let bg = match style.get("background" as &str) {
+                let bg = match style.get("background") {
                     Some(Value::Object(bg)) => bg,
                     _ => return None,
                 };
-                bg.get("color" as &str).and_then(value_to_css_color)
+                bg.get("color").and_then(value_to_css_color)
             })))
         .update_raw_el({
             let dom_el_ref = dom_el.clone();
@@ -1746,14 +1746,14 @@ fn build_retained_checkbox(
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
     let effective_link = fields
-        .get(LINK_PATH_FIELD as &str)
+        .get(LINK_PATH_FIELD)
         .and_then(|v| v.as_text())
         .map(|s| s.to_string())
         .unwrap_or_else(|| link_path.to_string());
     let link_ref = Rc::new(RefCell::new(effective_link.clone()));
 
-    let has_icon = fields.get("icon" as &str).is_some()
-        && !matches!(fields.get("icon" as &str), Some(Value::Tag(t)) if t.as_ref() == "NoElement");
+    let has_icon = fields.get("icon").is_some()
+        && !matches!(fields.get("icon"), Some(Value::Tag(t)) if t.as_ref() == "NoElement");
 
     let el = if has_icon {
         // Icon checkbox — render as El with role="checkbox"
@@ -1766,7 +1766,7 @@ fn build_retained_checkbox(
                         "aria-checked",
                         vm.signal_cloned().map(|v| {
                             let checked = get_fields(&v)
-                                .and_then(|f| f.get("checked" as &str))
+                                .and_then(|f| f.get("checked"))
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
                             Some(if checked {
@@ -1779,7 +1779,7 @@ fn build_retained_checkbox(
                 }
             })
             .child_signal(vm.signal_cloned().map(move |v| {
-                let icon = get_fields(&v).and_then(|f| f.get("icon" as &str))?;
+                let icon = get_fields(&v).and_then(|f| f.get("icon"))?;
                 if matches!(icon, Value::Tag(t) if t.as_ref() == "NoElement") {
                     return None;
                 }
@@ -1793,7 +1793,7 @@ fn build_retained_checkbox(
             .s(RoundedCorners::all_signal(vm.signal_cloned().map(|v| {
                 get_fields(&v)
                     .and_then(|f| get_style_obj(f))
-                    .and_then(|s| s.get("rounded_corners" as &str))
+                    .and_then(|s| s.get("rounded_corners"))
                     .and_then(|v| v.as_number())
                     .map(|n| n as u32)
             })))
@@ -1831,7 +1831,7 @@ fn build_retained_checkbox(
             .label_hidden("checkbox")
             .checked_signal(vm.signal_cloned().map(|v| {
                 get_fields(&v)
-                    .and_then(|f| f.get("checked" as &str))
+                    .and_then(|f| f.get("checked"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false)
             }))
@@ -1926,14 +1926,14 @@ fn build_retained_link(
     let el = Link::new()
         .label_signal(vm.signal_cloned().map(|v| {
             let label = get_fields(&v)
-                .and_then(|f| f.get("label" as &str))
+                .and_then(|f| f.get("label"))
                 .map(|l| l.to_display_string())
                 .unwrap_or_default();
             El::new().child(label)
         }))
         .to_signal(vm.signal_cloned().map(|v| {
             get_fields(&v)
-                .and_then(|f| f.get("to" as &str))
+                .and_then(|f| f.get("to"))
                 .and_then(|v| v.as_text())
                 .map(|s| s.to_string())
                 .unwrap_or_default()
@@ -2070,7 +2070,7 @@ impl RetainedNode {
             } => {
                 value.set_neq(new_value.clone());
                 if let Some(fields) = get_fields(new_value) {
-                    let new_child = fields.get("child" as &str);
+                    let new_child = fields.get("child");
                     match (child.as_mut(), new_child) {
                         (Some(existing), Some(new_val)) => {
                             if existing.matches_value_type(new_val) {
@@ -2109,16 +2109,16 @@ impl RetainedNode {
             } => {
                 // Detect focus change for manual focus handling
                 let old_focus = get_fields(&value.get_cloned())
-                    .and_then(|f| f.get("focus" as &str))
+                    .and_then(|f| f.get("focus"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 let new_focus = get_fields(new_value)
-                    .and_then(|f| f.get("focus" as &str))
+                    .and_then(|f| f.get("focus"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
                 let new_text = get_fields(new_value)
-                    .and_then(|f| f.get("text" as &str))
+                    .and_then(|f| f.get("text"))
                     .and_then(|v| v.as_text())
                     .unwrap_or("")
                     .to_string();
@@ -2127,7 +2127,7 @@ impl RetainedNode {
 
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = fields
-                        .get(LINK_PATH_FIELD as &str)
+                        .get(LINK_PATH_FIELD)
                         .and_then(|v| v.as_text())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| link_path.to_string());
@@ -2156,7 +2156,7 @@ impl RetainedNode {
                 value.set_neq(new_value.clone());
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = fields
-                        .get(LINK_PATH_FIELD as &str)
+                        .get(LINK_PATH_FIELD)
                         .and_then(|v| v.as_text())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| link_path.to_string());
@@ -2170,7 +2170,7 @@ impl RetainedNode {
                 value.set_neq(new_value.clone());
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = fields
-                        .get(LINK_PATH_FIELD as &str)
+                        .get(LINK_PATH_FIELD)
                         .and_then(|v| v.as_text())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| link_path.to_string());
@@ -2204,7 +2204,7 @@ impl RetainedNode {
             }
 
             RetainedNode::Document { child, child_tx } => {
-                let new_root = get_fields(new_value).and_then(|f| f.get("root" as &str));
+                let new_root = get_fields(new_value).and_then(|f| f.get("root"));
                 match (child.as_mut(), new_root) {
                     (Some(existing), Some(new_val)) => {
                         if existing.matches_value_type(new_val) {
@@ -2316,137 +2316,6 @@ fn diff_children(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Rendering with DD worker (SingleHold/LatestSum programs)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Render a DD document value as a Zoon element.
-pub fn render_value(value: &Value, worker: &DdWorkerHandle) -> RawElOrText {
-    match value {
-        Value::Number(n) => {
-            let text = if n.0 == n.0.floor() && n.0.is_finite() {
-                format!("{}", n.0 as i64)
-            } else {
-                format!("{}", n.0)
-            };
-            zoon::Text::new(text).unify()
-        }
-        Value::Text(s) => zoon::Text::new(s.to_string()).unify(),
-        Value::Tag(s) => {
-            if s.as_ref() == "NoElement" {
-                return El::new().unify();
-            }
-            zoon::Text::new(s.to_string()).unify()
-        }
-        Value::Bool(b) => {
-            let text = if *b { "True" } else { "False" };
-            zoon::Text::new(text).unify()
-        }
-        Value::Tagged { tag, fields } => render_tagged_worker(tag, fields, worker),
-        Value::Object(fields) => zoon::Text::new(value.to_display_string()).unify(),
-        Value::Unit => El::new().unify(),
-    }
-}
-
-fn render_tagged_worker(
-    tag: &str,
-    fields: &Arc<Fields>,
-    worker: &DdWorkerHandle,
-) -> RawElOrText {
-    match tag {
-        "ElementButton" => render_button_worker(fields, worker),
-        "ElementStripe" => render_stripe_worker(fields, worker),
-        "DocumentNew" => {
-            if let Some(root) = fields.get("root" as &str) {
-                render_value(root, worker)
-            } else {
-                El::new().child("Empty document").unify()
-            }
-        }
-        _ => {
-            let text = format!("{}[...]", tag);
-            zoon::Text::new(text).unify()
-        }
-    }
-}
-
-fn render_button_worker(
-    fields: &Fields,
-    worker: &DdWorkerHandle,
-) -> RawElOrText {
-    let label = fields
-        .get("label" as &str)
-        .map(|v| v.to_display_string())
-        .unwrap_or_default();
-
-    let link_id = fields
-        .get("press_link" as &str)
-        .and_then(|v| v.as_text())
-        .map(|s| LinkId::new(s.to_string()));
-
-    let mut el = Button::new()
-        .update_raw_el(|raw_el| raw_el.attr("role", "button"))
-        .label(El::new().child(label));
-
-    if let Some(font) = extract_font_from_fields(fields) { el = el.s(font); }
-    if let Some(width) = extract_width_from_fields(fields) { el = el.s(width); }
-    if let Some(height) = extract_height_from_fields(fields) { el = el.s(height); }
-    if let Some(padding) = extract_padding_from_fields(fields) { el = el.s(padding); }
-    if let Some(background) = extract_background_from_fields(fields) { el = el.s(background); }
-    if let Some(rc) = extract_rounded_corners_from_fields(fields) { el = el.s(rc); }
-    if let Some(transform) = extract_transform_from_fields(fields) { el = el.s(transform); }
-    if let Some(outline) = extract_outline_from_fields(fields) { el = el.s(outline); }
-    if let Some(borders) = extract_borders_from_fields(fields) { el = el.s(borders); }
-    if let Some(align) = extract_align_content_from_fields(fields) { el = el.s(align); }
-
-    if let Some(link_id) = link_id {
-        let worker_ref = worker.clone_ref();
-        el.on_press(move || {
-            worker_ref.inject_event(&link_id, Value::Unit);
-        }).unify()
-    } else {
-        el.unify()
-    }
-}
-
-fn render_stripe_worker(
-    fields: &Fields,
-    worker: &DdWorkerHandle,
-) -> RawElOrText {
-    let direction = fields
-        .get("direction" as &str)
-        .and_then(|v| v.as_tag())
-        .unwrap_or("Column");
-
-    let mut el = Stripe::new()
-        .direction(if direction == "Row" { Direction::Row } else { Direction::Column });
-
-    if let Some(gap) = fields.get("gap" as &str).and_then(|v| v.as_number()) {
-        if gap > 0.0 {
-            el = el.s(Gap::both(gap as u32));
-        }
-    }
-
-    if let Some(font) = extract_font_from_fields(fields) { el = el.s(font); }
-    if let Some(width) = extract_width_from_fields(fields) { el = el.s(width); }
-    if let Some(height) = extract_height_from_fields(fields) { el = el.s(height); }
-    if let Some(padding) = extract_padding_from_fields(fields) { el = el.s(padding); }
-    if let Some(background) = extract_background_from_fields(fields) { el = el.s(background); }
-    if let Some(rc) = extract_rounded_corners_from_fields(fields) { el = el.s(rc); }
-    if let Some(transform) = extract_transform_from_fields(fields) { el = el.s(transform); }
-    if let Some(outline) = extract_outline_from_fields(fields) { el = el.s(outline); }
-    if let Some(borders) = extract_borders_from_fields(fields) { el = el.s(borders); }
-    if let Some(align) = extract_align_content_from_fields(fields) { el = el.s(align); }
-
-    let rendered_items: Vec<RawElOrText> = extract_sorted_list_items(fields, "items")
-        .iter()
-        .map(|item| render_value(item, worker))
-        .collect();
-    let (tx, rx) = mpsc::unbounded();
-    tx.unbounded_send(VecDiff::Replace { values: rendered_items }).ok();
-    el.items_signal_vec(VecDiffStreamSignalVec(rx)).unify()
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // Static rendering (no event handlers, no signals)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2484,7 +2353,7 @@ fn render_tagged_static(
     match tag {
         "ElementButton" => {
             let label = fields
-                .get("label" as &str)
+                .get("label")
                 .map(|v| v.to_display_string())
                 .unwrap_or_default();
             let mut el = Button::new()
@@ -2507,7 +2376,7 @@ fn render_tagged_static(
         "ElementContainer" => render_container_static(fields),
         "ElementLabel" => {
             let label = fields
-                .get("label" as &str)
+                .get("label")
                 .map(|v| v.to_display_string())
                 .unwrap_or_default();
             let mut el = Label::new().label(El::new().child(label));
@@ -2527,7 +2396,7 @@ fn render_tagged_static(
             el.contents_signal_vec(VecDiffStreamSignalVec(rx)).unify()
         }
         "DocumentNew" => {
-            if let Some(root) = fields.get("root" as &str) {
+            if let Some(root) = fields.get("root") {
                 render_value_static(root)
             } else {
                 El::new().child("Empty document").unify()
@@ -2539,14 +2408,14 @@ fn render_tagged_static(
 
 fn render_stripe_static(fields: &Fields) -> RawElOrText {
     let direction = fields
-        .get("direction" as &str)
+        .get("direction")
         .and_then(|v| v.as_tag())
         .unwrap_or("Column");
 
     let mut el = Stripe::new()
         .direction(if direction == "Row" { Direction::Row } else { Direction::Column });
 
-    if let Some(gap) = fields.get("gap" as &str).and_then(|v| v.as_number()) {
+    if let Some(gap) = fields.get("gap").and_then(|v| v.as_number()) {
         if gap > 0.0 {
             el = el.s(Gap::both(gap as u32));
         }
@@ -2600,7 +2469,7 @@ fn render_container_static(fields: &Fields) -> RawElOrText {
     if let Some(borders) = extract_borders_from_fields(fields) { el = el.s(borders); }
     if let Some(align) = extract_align_content_from_fields(fields) { el = el.s(align); }
 
-    if let Some(child) = fields.get("child" as &str) {
+    if let Some(child) = fields.get("child") {
         el.child(render_value_static(child)).unify()
     } else {
         el.unify()

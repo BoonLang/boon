@@ -308,48 +308,49 @@ where
                 move |input, output| {
                     input.for_each(|time, data| {
                         let mut session = output.session(&time);
-                        // Sort by tag: items (0) first, then filter (1)
-                        let mut batch: Vec<_> = data.drain(..).collect();
-                        batch.sort_by_key(|((_, (tag, _)), _, _)| *tag);
+                        // Partition by tag: items (0) first, then filter (1).
+                        // Two-bucket partition is O(N) vs O(N log N) sort.
+                        let mut list_diffs = Vec::new();
+                        let mut filter_diffs = Vec::new();
+                        for item in data.drain(..) {
+                            if (item.0).1.0 == 0 { list_diffs.push(item) } else { filter_diffs.push(item) }
+                        }
 
                         let mut filter_changed = false;
 
-                        for ((key, (tag, value)), ts, diff) in batch {
-                            match tag {
-                                0 => {
-                                    // List item
-                                    let value_clone = value.clone();
-                                    if diff > 0 {
-                                        items.insert(key.clone(), value);
+                        // Process list items first
+                        for ((key, (_, value)), ts, diff) in list_diffs {
+                            let value_clone = value.clone();
+                            if diff > 0 {
+                                items.insert(key.clone(), value);
+                            } else {
+                                items.remove(&key);
+                            }
+                            // Emit/retract based on current filter
+                            if let Some(ref fv) = current_filter {
+                                let was_emitted = last_emitted.get(&key).copied().unwrap_or(false);
+                                if diff > 0 {
+                                    let item = items.get(&key).unwrap();
+                                    let passes = predicate(item, fv);
+                                    if passes {
+                                        session.give(((key.clone(), item.clone()), ts, 1));
+                                        last_emitted.insert(key, true);
                                     } else {
-                                        items.remove(&key);
+                                        last_emitted.insert(key, false);
                                     }
-                                    // Emit/retract based on current filter
-                                    if let Some(ref fv) = current_filter {
-                                        let was_emitted = last_emitted.get(&key).copied().unwrap_or(false);
-                                        if diff > 0 {
-                                            let passes = predicate(items.get(&key).unwrap(), fv);
-                                            if passes {
-                                                session.give(((key.clone(), items.get(&key).unwrap().clone()), ts, 1));
-                                                last_emitted.insert(key, true);
-                                            } else {
-                                                last_emitted.insert(key, false);
-                                            }
-                                        } else if was_emitted {
-                                            // Item removed — retract old emitted value
-                                            session.give(((key.clone(), value_clone), ts, -1));
-                                            last_emitted.remove(&key);
-                                        }
-                                    }
+                                } else if was_emitted {
+                                    // Item removed — retract old emitted value
+                                    session.give(((key.clone(), value_clone), ts, -1));
+                                    last_emitted.remove(&key);
                                 }
-                                1 => {
-                                    // Filter state change
-                                    if diff > 0 {
-                                        current_filter = Some(value);
-                                        filter_changed = true;
-                                    }
-                                }
-                                _ => {}
+                            }
+                        }
+
+                        // Then process filter state changes
+                        for ((_, (_, value)), _, diff) in filter_diffs {
+                            if diff > 0 {
+                                current_filter = Some(value);
+                                filter_changed = true;
                             }
                         }
 
@@ -530,65 +531,71 @@ where
                 move |input, output| {
                     input.for_each(|time, data| {
                         let mut session = output.session(&time);
-                        // Collect and sort by tag: initials (0) < events (1) < broadcasts (2)
-                        let mut items: Vec<_> = data.drain(..).collect();
-                        items.sort_by_key(|((_, (tag, _)), _, _)| *tag);
+                        // Three-bucket partition: initials (0), events (1), broadcasts (2).
+                        // O(N) single pass vs O(N log N) sort.
+                        let mut initials = Vec::new();
+                        let mut events = Vec::new();
+                        let mut broadcasts = Vec::new();
+                        for item in data.drain(..) {
+                            match (item.0).1.0 {
+                                0 => initials.push(item),
+                                1 => events.push(item),
+                                _ => broadcasts.push(item),
+                            }
+                        }
 
-                        for ((key, (tag, value)), ts, diff) in items {
-                            match tag {
-                                0 => {
-                                    // Initial
-                                    if diff > 0 {
-                                        states.insert(key.clone(), value.clone());
-                                        session.give(((key, value), ts, 1isize));
-                                    } else if let Some(old) = states.remove(&key) {
+                        // Process initials first
+                        for ((key, (_, value)), ts, diff) in initials {
+                            if diff > 0 {
+                                states.insert(key.clone(), value.clone());
+                                session.give(((key, value), ts, 1isize));
+                            } else if let Some(old) = states.remove(&key) {
+                                session.give(((key, old), ts, -1isize));
+                            }
+                        }
+
+                        // Then per-key events
+                        for ((key, (_, value)), ts, diff) in events {
+                            if diff > 0 {
+                                if let Some(current) = states.get(&key) {
+                                    let old = current.clone();
+                                    let new_val = transform(&old, &value);
+                                    if new_val == Value::Unit {
+                                        states.remove(&key);
                                         session.give(((key, old), ts, -1isize));
+                                    } else if new_val != old {
+                                        session.give(((key.clone(), old), ts, -1isize));
+                                        session.give(((key.clone(), new_val.clone()), ts, 1isize));
+                                        states.insert(key, new_val);
                                     }
                                 }
-                                1 => {
-                                    // Per-key event
-                                    if diff > 0 {
-                                        if let Some(current) = states.get(&key) {
-                                            let old = current.clone();
-                                            let new_val = transform(&old, &value);
-                                            if new_val == Value::Unit {
-                                                states.remove(&key);
-                                                session.give(((key, old), ts, -1isize));
-                                            } else if new_val != old {
-                                                session.give(((key.clone(), old), ts, -1isize));
-                                                session.give(((key.clone(), new_val.clone()), ts, 1isize));
-                                                states.insert(key, new_val);
+                            }
+                        }
+
+                        // Finally broadcasts
+                        for ((_, (_, value)), ts, diff) in broadcasts {
+                            if diff > 0 {
+                                if let Some(ref handler) = broadcast_handler {
+                                    let results = handler(&states, &value);
+                                    for (bk, maybe_new) in results {
+                                        match maybe_new {
+                                            Some(new_val) => {
+                                                if let Some(old) = states.get(&bk) {
+                                                    if *old != new_val {
+                                                        session.give(((bk.clone(), old.clone()), ts, -1isize));
+                                                        session.give(((bk.clone(), new_val.clone()), ts, 1isize));
+                                                        states.insert(bk, new_val);
+                                                    }
+                                                }
                                             }
-                                        }
-                                    }
-                                }
-                                2 => {
-                                    // Broadcast event
-                                    if diff > 0 {
-                                        if let Some(ref handler) = broadcast_handler {
-                                            let results = handler(&states, &value);
-                                            for (bk, maybe_new) in results {
-                                                match maybe_new {
-                                                    Some(new_val) => {
-                                                        if let Some(old) = states.get(&bk) {
-                                                            if *old != new_val {
-                                                                session.give(((bk.clone(), old.clone()), ts, -1isize));
-                                                                session.give(((bk.clone(), new_val.clone()), ts, 1isize));
-                                                                states.insert(bk, new_val);
-                                                            }
-                                                        }
-                                                    }
-                                                    None => {
-                                                        if let Some(old) = states.remove(&bk) {
-                                                            session.give(((bk, old), ts, -1isize));
-                                                        }
-                                                    }
+                                            None => {
+                                                if let Some(old) = states.remove(&bk) {
+                                                    session.give(((bk, old), ts, -1isize));
                                                 }
                                             }
                                         }
                                     }
                                 }
-                                _ => {}
                             }
                         }
                     });

@@ -154,21 +154,6 @@ impl Value {
     }
 
     /// Append an item to a list, using the given index as key.
-    /// Remove a list item by key.
-    pub fn list_remove_by_key(&self, key: &str) -> Self {
-        if let Value::Tagged { tag, fields } = self {
-            if tag.as_ref() == LIST_TAG {
-                let mut new_fields = (**fields).clone();
-                new_fields.remove(key);
-                return Value::Tagged {
-                    tag: tag.clone(),
-                    fields: Arc::new(new_fields),
-                };
-            }
-        }
-        self.clone()
-    }
-
     pub fn list_append(&self, item: Value, index: usize) -> Self {
         if let Value::Tagged { tag, fields } = self {
             if tag.as_ref() == LIST_TAG {

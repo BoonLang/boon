@@ -293,7 +293,7 @@ impl DdWorkerHandle {
             inner: Rc::new(RefCell::new(inner)),
             side_effect_buffer,
             keyed_diff_buffer,
-            keyed_persist_buffer: keyed_persist_buffer,
+            keyed_persist_buffer,
             keyed_persistence,
             has_keyed_output,
             keyed_stripe_element_tag,
@@ -483,7 +483,6 @@ impl DdWorkerHandle {
     }
 
     /// Inject an event for a LINK by LinkId and step the DD worker.
-    /// (Legacy API used by bridge.rs render_value path)
     pub fn inject_event(&self, link_id: &LinkId, event_value: Value) {
         let link_path = link_id.as_str().to_string();
         {
