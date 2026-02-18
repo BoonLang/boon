@@ -89,33 +89,182 @@ If any step fails, report failure in preview and logs. Do not execute DD or Acto
 
 ## 5. Operator Lowering Strategy (Boon -> IR -> Wasm)
 
-- **`THEN`**
-  - Lower to trigger-bound compute node.
-  - Executes only on trigger event.
+Each operator maps to an IR pattern, which then lowers to WASM. The IR design is
+sketched in `boon_as_systems_language.md` §5.6.
 
-- **`LATEST`**
-  - Lower to one target cell with multiple trigger arms.
-  - Optional default arm executes in `init`.
-  - Last event wins by deterministic event queue order.
+### `THEN` — Trigger-Bound Compute Node
 
-- **`WHEN`**
-  - Lower to frozen pattern-match node.
-  - Triggered only by source value updates.
-  - Wasm uses typed comparisons (`if` / `br_table`).
+Executes body only when trigger event fires. No-op on other events.
 
-- **`WHILE`**
-  - Lower to flowing dependency match node.
-  - Trigger set includes source and dependent cells.
-  - Re-evaluates on any dependency change.
+```boon
+button.press |> THEN { value + 1 }
+```
+```
+IR:  Then { trigger: LinkId("button.press"), body: BinOp(Add, CellRead("value"), Const(1)) }
+```
+```wasm
+;; In on_event dispatcher:
+(if (i32.eq (local.get $event_id) (i32.const BUTTON_PRESS))
+  (then
+    ;; evaluate body and store result
+    (global.set $result (f64.add (global.get $value) (f64.const 1)))
+    (call $emit_patch ...)
+  )
+)
+```
 
-- **`HOLD`**
-  - Lower to mutable cell + generated update function.
-  - Runtime stores typed state slots (bool/int/float/object refs).
+### `LATEST` — Multi-Arm Cell with Last-Event-Wins
 
-- **`FLUSH`**
-  - Lower to hidden internal `Flushed(T)` representation.
-  - Generated pipeline functions start with flushed bypass check.
-  - List loops short-circuit on first flushed value (fail-fast).
+One target cell, multiple trigger sources. Each event updates the target from its arm.
+
+```boon
+LATEST { increment_button.press |> THEN { count + 1 }, reset_button.press |> THEN { 0 } }
+```
+```
+IR:  Latest {
+       target: CellId("count"),
+       arms: [
+         LatestArm { trigger: "increment.press", body: BinOp(Add, CellRead("count"), Const(1)) },
+         LatestArm { trigger: "reset.press",     body: Const(0) },
+       ]
+     }
+```
+```wasm
+;; Dispatches to whichever event fired; both update same cell
+(if (i32.eq (local.get $event_id) (i32.const INCREMENT_PRESS))
+  (then (global.set $count (f64.add (global.get $count) (f64.const 1))))
+)
+(if (i32.eq (local.get $event_id) (i32.const RESET_PRESS))
+  (then (global.set $count (f64.const 0)))
+)
+```
+
+### `WHEN` — Frozen Pattern Match (Triggered by Source Update)
+
+Pattern-matches on source cell value. Only fires when source changes, not when
+dependencies change.
+
+```boon
+route |> WHEN { "/" => "all", "/active" => "active", "/completed" => "completed" }
+```
+```
+IR:  When {
+       source: CellId("route"),
+       arms: [
+         (Pattern::Text("/"),          Const("all")),
+         (Pattern::Text("/active"),    Const("active")),
+         (Pattern::Text("/completed"), Const("completed")),
+       ]
+     }
+```
+```wasm
+;; When route cell changes, evaluate pattern match
+;; Uses br_table for integer patterns, if-chains for text
+(call $str_eq (global.get $route) (i32.const STR_SLASH))
+(if (then (call $set_text_cell (i32.const FILTER) (i32.const STR_ALL))))
+;; ... more arms
+```
+
+### `WHILE` — Flowing Dependency Match (Re-evaluates on ANY Dependency Change)
+
+Like WHEN but also re-evaluates when dependency cells change (not just source).
+
+```boon
+selected_filter |> WHILE { "all" => all_todos, "active" => active_todos }
+```
+```
+IR:  While {
+       source: CellId("selected_filter"),
+       deps: [CellId("all_todos"), CellId("active_todos")],
+       arms: [
+         (Pattern::Text("all"),    CellRead("all_todos")),
+         (Pattern::Text("active"), CellRead("active_todos")),
+       ]
+     }
+```
+```wasm
+;; Triggered by changes to selected_filter OR all_todos OR active_todos
+;; Re-evaluates currently-matched arm
+(call $str_eq (global.get $selected_filter) (i32.const STR_ALL))
+(if (then
+  ;; output = all_todos (re-read on every trigger)
+  (call $set_list_cell (i32.const VISIBLE_TODOS) (global.get $all_todos))
+))
+;; ... more arms
+```
+
+### `HOLD` — Mutable Cell + Update Function
+
+State cell with initial value. Update function reads previous state and computes next.
+
+```boon
+0 |> HOLD state { button.press |> THEN { state + 1 } }
+```
+```
+IR:  Hold {
+       cell: CellId("count"),
+       init: Const(0),
+       body: Then { trigger: "button.press", body: BinOp(Add, CellRead("count"), Const(1)) },
+       triggers: ["button.press"],
+     }
+```
+```wasm
+(global $count (mut f64) (f64.const 0))
+;; On button press: read previous count, add 1, store
+(global.set $count (f64.add (global.get $count) (f64.const 1)))
+```
+
+### `FLUSH` — Sentinel Value with Bypass Check
+
+Error propagation. Every transform checks flushed bit first.
+
+```
+IR:  No dedicated FLUSH node — flushed state is a per-cell bit flag.
+     Transforms receive (value, flushed) pairs and propagate flushed downstream.
+```
+```wasm
+;; At start of every generated transform function:
+(if (local.get $flushed) (then (return (local.get $input) (i32.const 1))))
+;; Normal body follows...
+```
+
+### 5.5 Host Callback ABI
+
+The WASM module imports host functions for side effects. The host provides:
+
+```wasm
+;; === Patch emission (WASM → Host) ===
+(import "boon" "emit_set_cell" (func $emit_set_cell (param i32 f64)))      ;; (cell_id, number_value)
+(import "boon" "emit_set_text" (func $emit_set_text (param i32 i32 i32)))  ;; (cell_id, str_ptr, str_len)
+(import "boon" "emit_list_push" (func $emit_list_push (param i32 i32)))    ;; (list_id, item_ptr)
+(import "boon" "emit_list_remove" (func $emit_list_remove (param i32 i32)));; (list_id, key)
+(import "boon" "emit_list_clear" (func $emit_list_clear (param i32)))      ;; (list_id)
+
+;; === Timer management ===
+(import "boon" "timer_start" (func $timer_start (param i32 f64) (result i32))) ;; (timer_id, interval_ms) -> handle
+(import "boon" "timer_cancel" (func $timer_cancel (param i32)))                ;; (handle)
+
+;; === Persistence ===
+(import "boon" "persist_write" (func $persist_write (param i32 i32 i32)))  ;; (key_ptr, val_ptr, val_len)
+(import "boon" "persist_read" (func $persist_read (param i32 i32) (result i32 i32))) ;; (key_ptr, key_len) -> (val_ptr, val_len)
+
+;; === Text input ===
+(import "boon" "clear_text_input" (func $clear_text_input (param i32)))    ;; (input_id)
+(import "boon" "focus_element" (func $focus_element (param i32)))          ;; (element_id)
+```
+
+The host calls the WASM module's exported `$on_event` function:
+```wasm
+(export "on_event" (func $on_event))  ;; (event_id: i32, payload_ptr: i32, payload_len: i32)
+(export "init" (func $init))          ;; () -> void, called once at startup
+(export "memory" (memory $mem))       ;; shared linear memory for string/struct passing
+```
+
+Event payload encoding in linear memory:
+- `KeyDown`: `{ key: u8, text_ptr: u32, text_len: u32 }` (12 bytes)
+- `Change`: `{ text_ptr: u32, text_len: u32 }` (8 bytes)
+- `Press/Click/Blur`: no payload (event_id sufficient)
+- `Route`: `{ path_ptr: u32, path_len: u32 }` (8 bytes)
 
 ---
 
@@ -343,6 +492,41 @@ Required runtime checks:
 
 ---
 
-## 14. Execution Note
+## 14. Open Questions (Unresolved Design Decisions)
+
+1. **IR Design**: What are the reactive IR node types? How are HOLD cycles (back-edges)
+   represented? How do dynamic lists map to IR nodes? No IR has been sketched yet —
+   this is the #1 technical risk.
+
+2. **Memory Management**: How does compiled Boon manage memory? Options: WASM GC
+   (managed types), manual reference counting in linear memory, region-based allocation,
+   or uniqueness types. This decision affects ABI design, list runtime, and codegen.
+
+3. **Host Callback ABI**: How does the WASM module call back to the host for DOM
+   operations, timer setup/cancel, persistence read/write? The plan mentions
+   "patch-buffer accessors" but doesn't define imported host functions.
+
+4. **Event Serialization**: How are events passed from host to WASM? Struct layout
+   in linear memory? Function parameters? What's the encoding for complex events
+   like `KeyDown { key: Enter, text: "Milk" }`?
+
+5. **GC for List Items**: When a list item is removed, who frees its memory? If using
+   linear memory, how is fragmentation handled? If using WASM GC, how do list items
+   interact with host-side DOM references?
+
+6. **Dynamic WHILE Arms**: `WHILE { pattern => body }` can have runtime-dependent
+   patterns. How does ahead-of-time compilation handle this? Compile all possible
+   arms and branch? Fall back to interpretation?
+
+7. **Error Semantics**: What happens when compiled Boon encounters a runtime error
+   (type mismatch, division by zero, FLUSH)? WASM trap? Return error code? Use
+   WASM exception handling proposal?
+
+8. **Patch Buffer Sizing**: How large is the patch buffer? Fixed? Growable? What
+   happens on overflow (multiple patches from a single event)?
+
+---
+
+## 15. Execution Note
 
 This is a planning artifact only. Implementation is intentionally deferred.

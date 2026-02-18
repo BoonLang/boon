@@ -263,9 +263,8 @@ fallback still interprets the full AST.
 
 **Affects: DD engine (partially addressed), Actors engine (not affected).**
 
-The DD engine's `compile.rs` pre-computes link bindings per `CompiledProgram` variant,
-reducing runtime routing for specialized programs. The General fallback still scans
-mappings.
+The DD engine pre-computes link bindings per `CompiledProgram` variant, reducing
+runtime routing for specialized programs. The General fallback still scans mappings.
 
 The Actors engine avoids this entirely -- each actor subscribes to its specific sources
 via channels (O(1) dispatch).
@@ -289,7 +288,7 @@ Spark on 128 cores. The framework overhead can exceed the parallelism benefit.
 
 ## 5. What's Needed: The Compilation Design
 
-### Layer 1: Type Inference + Specialization
+### Layer 1: Type Inference + Specialization [PROJECTED — algorithm unspecified]
 
 Infer concrete types for cells:
 ```
@@ -305,7 +304,14 @@ inference pass would extend this to all cells.
 **Evidence**: Lustre/SCADE generates equivalent C with zero overhead. StreamIt achieves
 1-2x *better* than hand-written C by exposing communication patterns to the compiler.
 
-### Layer 2: Static Scheduling
+**Open challenges:**
+- Type inference algorithm not yet chosen (constraint-based? flow-sensitive? bidirectional?)
+- Dynamic lists allow heterogeneous item types — requires row polymorphism or union types
+- HOLD cycles create circular type dependencies (state feeds back into body expression)
+- Objects can change shape across WHEN branches — needs structural typing or tagged unions
+- Layer 4 (fusion) depends on this layer — types must be resolved before operations can fuse
+
+### Layer 2: Static Scheduling [PROJECTED — depends on Layer 1]
 
 Analyze the dataflow graph topology:
 1. Compute dependency order (topological sort)
@@ -313,9 +319,9 @@ Analyze the dataflow graph topology:
 3. Build direct dispatch table: event -> affected cells in order
 4. Generate a single `step()` function
 
-The DD engine's `compile.rs` is the foundation for this -- it already analyzes programs
-into specialized variants. Extending it to generate a static schedule for the General
-variant would eliminate the DD framework overhead entirely.
+The DD engine already analyzes programs into specialized variants. A standalone WASM
+engine could apply similar analysis to generate a static schedule, eliminating
+framework overhead entirely.
 
 **Evidence**: SDF (Synchronous Dataflow) scheduling eliminates all runtime scheduling
 overhead for fixed-rate dataflow graphs. For Boon's UI case, most cells fire exactly
@@ -324,6 +330,7 @@ once per event -- a trivial SDF schedule.
 > `★ Insight ─────────────────────────────────────`
 >
 > **A compiled Boon could be FASTER than hand-written Rust for static subgraphs.**
+> [PROJECTED — extrapolated from StreamIt's DSP results to Boon's UI domain]
 >
 > MIT's [StreamIt](https://groups.csail.mit.edu/cag/streamit/) proved this is not
 > theoretical: it achieved 1-2x *better* than hand-coded C on 4/6 benchmarks, and
@@ -333,17 +340,27 @@ once per event -- a trivial SDF schedule.
 > tiling -- optimizations a human might do one at a time but never all at once.
 >
 > Boon's pipe chains (`a |> b |> c`) are StreamIt Pipelines. `LATEST { a, b }` is a
-> SplitJoin. `HOLD` is a FeedbackLoop. The DD engine's `compile.rs` already analyzes
-> these patterns. Extending it with StreamIt-style rate analysis and operator fusion
-> would let the compiler find optimizations that a Rust programmer writing imperative
-> code simply cannot -- because the dataflow structure is invisible in imperative code.
+> SplitJoin. `HOLD` is a FeedbackLoop. The DD engine already analyzes these patterns
+> into specialized variants. A WASM engine with StreamIt-style rate analysis and
+> operator fusion could find optimizations that a Rust programmer writing imperative
+> code simply cannot — because the dataflow structure is invisible in imperative code.
 >
-> The path: `compile.rs` rate analysis -> static schedule -> operator fusion ->
+> **Important qualification:** StreamIt's results are for SDF (Synchronous Dataflow)
+> graphs with fixed production/consumption rates — DSP filters, codecs, etc. Boon's
+> UI workloads are *event-driven* with irregular rates: a user may type 5 characters
+> per second or 0. The fusion wins apply to **static subgraphs only** — portions of
+> the dataflow graph with no dynamic lists, no runtime-dependent branching, and
+> deterministic propagation patterns. In a typical Boon UI program, perhaps 30-60%
+> of the graph qualifies as "static" (constants, pure transforms, fixed LATEST
+> combinators). The remaining dynamic portions (list operations, WHEN with runtime
+> patterns) would still benefit from compilation but not from StreamIt-style fusion.
+>
+> The path: program analysis -> rate analysis -> static schedule -> operator fusion ->
 > WASM emission -> **faster than hand-written Rust for static reactive subgraphs**.
 >
 > `─────────────────────────────────────────────────`
 
-### Layer 3: In-Place State Mutation
+### Layer 3: In-Place State Mutation [SPECULATIVE — requires type system from Layer 1]
 
 **Option A -- Uniqueness types (Futhark style):**
 HOLD state has a single owner. `state.count + 1` compiles to in-place mutation.
@@ -359,7 +376,7 @@ cells with a single owner.
 **Evidence**: Pony achieves C-like performance with actors via `iso` (isolated) reference
 capability -- zero-copy message passing proven at the type level.
 
-### Layer 4: Pipeline Fusion
+### Layer 4: Pipeline Fusion [SPECULATIVE — depends on Layers 1+2, novel for event-driven dataflow]
 
 Chains like `value |> THEN { x + 1 } |> THEN { x * 2 }` should fuse into
 `|x| (x + 1) * 2` with zero intermediate `Value` allocations.
@@ -368,7 +385,7 @@ Chains like `value |> THEN { x + 1 } |> THEN { x * 2 }` should fuse into
 the entire fused pipeline runs without allocations. Generates code matching hand-written
 state machines.
 
-### Layer 5: Selective Dynamism
+### Layer 5: Selective Dynamism [PROJECTED — DD engine variants prove the pattern]
 
 Not everything can be compiled statically. Dynamic list items, user input, and hot reload
 are inherently runtime operations.
@@ -380,11 +397,271 @@ would extend this pattern to generate native code for the fast paths.
 **Evidence**: CAL (MPEG actor language) classifies subgraphs as static vs dynamic,
 compiles static parts fully, uses lightweight runtime only for dynamic parts.
 
+### Layer Dependencies
+
+> **Note:** The five layers above are NOT independent. Here is the actual dependency graph:
+>
+> ```
+> Layer 1 (Type Inference) ──→ Layer 2 (Static Scheduling)
+>        │                            │
+>        └──→ Layer 3 (In-Place Mutation) ──→ Layer 4 (Pipeline Fusion)
+>                                                      │
+> Layer 5 (Selective Dynamism) ←────────────────────────┘
+> ```
+>
+> - **Layer 1 is prerequisite for all others.** You cannot schedule, fuse, or optimize
+>   in-place without knowing types. This is the critical path item.
+> - **Layer 2 depends on Layer 1.** Static scheduling needs typed nodes to generate
+>   correct dispatch tables.
+> - **Layer 4 depends on Layers 1+2+3.** Fusion requires typed, scheduled, and
+>   uniqueness-annotated operations.
+> - **Layer 5 can proceed independently** as a fallback strategy — but benefits from
+>   Layers 1-4 for the "static" classification.
+>
+> **Recommended implementation order:** 1 → 2 → 5 → 3 → 4
+> (Get basic compilation working before attempting advanced optimizations.)
+
+### 5.6 Reactive IR Design Sketch [SPECULATIVE — first draft, needs validation]
+
+The compilation strategy requires an intermediate representation between AST and WASM.
+This section sketches the core IR types and shows a concrete example.
+
+#### IR Node Types
+
+```
+// Reactive IR — between Boon AST and WASM codegen
+enum IrNode {
+    // === Values ===
+    Constant { value: TypedValue, type: IrType },
+    Cell { id: CellId, type: IrType, init: Option<Box<IrNode>> },
+
+    // === Operators ===
+    Hold {
+        cell: CellId,             // mutable state cell
+        init: Box<IrNode>,        // initial value expression
+        body: Box<IrNode>,        // update expression (may reference `state`)
+        triggers: Vec<LinkId>,    // which events trigger re-evaluation
+    },
+    Latest {
+        target: CellId,           // output cell
+        arms: Vec<LatestArm>,     // each arm: (trigger, body)
+    },
+    Then {
+        trigger: LinkId,          // event that triggers evaluation
+        body: Box<IrNode>,        // expression to evaluate
+    },
+    When {
+        source: CellId,           // cell to pattern-match on
+        arms: Vec<(Pattern, Box<IrNode>)>,
+    },
+    While {
+        source: CellId,           // cell to pattern-match on
+        deps: Vec<CellId>,        // additional dependency cells
+        arms: Vec<(Pattern, Box<IrNode>)>,
+    },
+
+    // === Collections ===
+    ListNew { item_template: Box<IrTemplate> },
+    ListPush { list: CellId, value: Box<IrNode> },
+    ListRemoveByKey { list: CellId, key: Box<IrNode> },
+    ListMap { list: CellId, transform: Box<IrTemplate> },
+    ListRetain { list: CellId, predicate: Box<IrTemplate> },
+
+    // === References ===
+    CellRead { cell: CellId },
+    FieldAccess { object: Box<IrNode>, field: String },
+    FunctionCall { func: FuncId, args: Vec<IrNode> },
+
+    // === Arithmetic/Logic ===
+    BinOp { op: BinOp, lhs: Box<IrNode>, rhs: Box<IrNode> },
+    UnaryOp { op: UnaryOp, operand: Box<IrNode> },
+}
+
+// Template: parameterized IR for list item instantiation
+struct IrTemplate {
+    params: Vec<(String, IrType)>,  // e.g., [("item", Object{...}), ("index", Number)]
+    body: Vec<IrNode>,              // nodes to instantiate per item
+}
+
+// Types (inferred by Layer 1, consumed by Layers 2-4)
+enum IrType {
+    Number,               // f64
+    Text,                 // string ref
+    Bool,                 // i32 (0/1)
+    Object(Vec<(String, IrType)>),  // struct with named typed fields
+    List(Box<IrType>),    // homogeneous list
+    Union(Vec<IrType>),   // tagged union (for WHEN branches with different shapes)
+    Link,                 // event reference
+    Void,                 // no value (side-effect only)
+}
+```
+
+#### Handling HOLD Cycles
+
+HOLD creates a cycle: `state` is both input to and output of the body expression.
+In the IR, this is represented as a **back-edge with delay semantics**:
+
+```
+Hold {
+    cell: CellId("count"),         // ← this cell is both read and written
+    init: Constant(0),
+    body: BinOp(Add,
+        CellRead(CellId("count")), // ← reads previous value (delay of 1 event)
+        Constant(1)
+    ),
+    triggers: [LinkId("button_press")],
+}
+```
+
+The key invariant: `CellRead` inside a `Hold.body` reads the **previous** value of
+the cell (before this event's update), not the current value being computed. This is
+the "delay" semantics that breaks the cycle and makes static scheduling possible.
+
+#### Concrete Example: `counter.bn` → IR → WASM
+
+```boon
+// counter.bn
+count: 0 |> HOLD state {
+    button.press |> THEN { state + 1 }
+}
+button: Element/button("Increment")
+document: TEXT { Count: {count} } |> Document/new()
+```
+
+**IR:**
+```
+Cell("count", Number, init=Constant(0))
+Cell("button_link", Link)
+
+Hold {
+    cell: "count",
+    init: Constant(0.0),
+    body: Then {
+        trigger: LinkId("button_link.press"),
+        body: BinOp(Add, CellRead("count"), Constant(1.0))
+    },
+    triggers: ["button_link.press"],
+}
+
+// Rendering nodes (compiled to patch ops, not WASM compute)
+TextTemplate("Count: ", CellRead("count"))
+ElementButton("Increment", link: "button_link")
+```
+
+**WASM output (simplified):**
+```wasm
+;; State: one f64 cell for "count"
+(global $count (mut f64) (f64.const 0))
+
+;; Event handler: on_event(event_id: i32)
+(func $on_event (param $event_id i32)
+  ;; if event_id == BUTTON_PRESS
+  (if (i32.eq (local.get $event_id) (i32.const 1))
+    (then
+      ;; count = count + 1
+      (global.set $count
+        (f64.add (global.get $count) (f64.const 1)))
+      ;; emit patch: SetCell("count", count)
+      (call $emit_patch_set_cell (i32.const 0) (global.get $count))
+    )
+  )
+)
+```
+
+### 5.7 Memory Management Strategy [SPECULATIVE — three options, recommendation given]
+
+Compiled Boon must manage memory for: cell values, list items, text strings, and
+objects. The current engines use `Arc<Value>` (reference counting). Compiled code
+needs a different approach.
+
+#### Option A: WASM GC (Managed Types)
+
+Use WASM GC proposal (shipped Sept 2025) for structs and arrays:
+- List items become GC-managed structs
+- Strings use GC string arrays
+- No manual memory management needed
+- V8/SpiderMonkey handle collection
+
+**Pros:** Simplest codegen, no fragmentation, integrates with JS GC.
+**Cons:** WASM GC is new and runtime support varies; performance characteristics
+not well-established; creates dependency on advanced WASM feature.
+
+#### Option B: Manual Reference Counting in Linear Memory
+
+Emit explicit `rc_retain()` / `rc_release()` calls:
+- Each allocated object has a reference count header
+- List removal decrements refcount; free on zero
+- Circular references impossible in Boon's DAG model (HOLD is a delay, not a cycle)
+
+**Pros:** Works with WASM 1.0, predictable performance, no GC pauses.
+**Cons:** Codegen complexity, fragmentation in linear memory, need a simple allocator.
+
+#### Option C: Region-Based Allocation (MLKit Style)
+
+Each reactive scope gets a memory region:
+- List items allocated in the list's region
+- HOLD state in the hold's region
+- Region freed in O(1) when scope is destroyed
+
+**Pros:** O(1) deallocation, no fragmentation within region, no refcount overhead.
+**Cons:** Over-allocation if items have different lifetimes within a scope; complex
+for cross-scope references (e.g., list item referenced by multiple derived lists).
+
+#### Recommendation
+
+**Start with Option B (manual refcount)** for the initial compiler:
+- Works with WASM 1.0 (maximum compatibility)
+- Boon's dataflow graph is a DAG (no circular references), so refcount is correct
+- Simple bump allocator + free list is sufficient for MVP
+- Can migrate to WASM GC later as runtime support matures
+
+**Note:** Boon's HOLD semantics guarantee that `state` references are **not** circular —
+the body reads the *previous* state value, so ownership flows linearly. This means
+reference counting is always correct (no leak risk from cycles).
+
+### 5.8 Error Handling in Compiled Code [SPECULATIVE]
+
+Boon's FLUSH construct propagates errors through the dataflow graph. Compiled code
+must handle three error sources:
+
+1. **Explicit FLUSH**: User writes `FLUSH` to signal an error condition
+2. **Runtime type errors**: Unlikely if type inference succeeds, but dynamic code
+   paths may encounter type mismatches
+3. **Arithmetic errors**: Division by zero, integer overflow
+
+#### Proposed Approach
+
+Use a **sentinel value** strategy (not WASM traps, not exceptions):
+- Each typed cell has a "flushed" bit flag
+- When FLUSH occurs, set the flushed bit and propagate downstream
+- Pipeline functions check the flushed bit first and short-circuit
+- This matches the current DD engine's `Value::Flushed(inner)` pattern
+
+```wasm
+;; Flushed check at start of every transform
+(func $transform_count (param $input f64) (param $flushed i32) (result f64 i32)
+  ;; If input is flushed, propagate flushed
+  (if (local.get $flushed)
+    (then (return (local.get $input) (i32.const 1)))
+  )
+  ;; Normal computation
+  (f64.add (local.get $input) (f64.const 1))
+  (i32.const 0)  ;; not flushed
+)
+```
+
+**Why not WASM traps?** Traps terminate execution — Boon's FLUSH is meant to
+propagate and be caught, not crash the program.
+
+**Why not WASM exceptions?** The exception handling proposal is available but adds
+complexity. Sentinel values are simpler, and the overhead (one branch per transform)
+is negligible compared to the computation cost.
+
 ---
 
 ## 6. Speed Comparison: Boon vs Rust
 
-### Current State
+### Current State [ESTIMATED — not profiled]
 
 | Operation           | DD Engine       | Actors          | Equiv Rust | Overhead Ratio |
 |---------------------|-----------------|-----------------|-----------|----------------|
@@ -392,28 +669,42 @@ compiles static parts fully, uses lightweight runtime only for dynamic parts.
 | List item toggle    | ~5-50us         | ~10-100us       | ~5ns      | 1K-20Kx        |
 | Object field update | ~0.5-5us        | ~1-5us          | ~1ns      | 500-5Kx        |
 
+> **Note:** These are order-of-magnitude estimates from code analysis, not measured
+> benchmarks. Actual numbers may differ significantly. The overhead ratios measure
+> only the **computation phase** of each reactive update — in real UI workloads,
+> DOM operations typically dominate (~80-95% of frame time), so the user-perceived
+> end-to-end improvement from compilation would be **10-100x** rather than 1K-20Kx.
+
 The DD engine's incremental design provides efficient list operations via DD collections.
 The Actors engine uses channel-based message passing with per-message allocation.
 
 ### After Full Compilation (Theoretical)
 
-| Approach                                               | Overhead vs Rust | Evidence |
-|-------------------------------------------------------|-----------------|----------|
-| Lustre-style (synchronous, typed, static schedule)    | **~0%**         | Lustre/SCADE generates equivalent C |
-| StreamIt-style (streaming, fused)                     | **0.5-2x faster** | Compiler optimizations humans miss |
-| Pony-style (actors, zero-copy)                        | **~1-2x**       | Actor scheduling + routing cost |
-| Futhark-style (data-parallel, fused)                  | **~1x**         | Matches hand-written GPU code |
-| Rust async overhead only                              | **~3.4x without I/O, ~1.09x with I/O** | 243ns per operation |
+| Approach                                               | Overhead vs Rust | Evidence | Confidence |
+|-------------------------------------------------------|-----------------|----------|------------|
+| Lustre-style (synchronous, typed, static schedule)    | **~0%**         | Lustre/SCADE generates equivalent C | PROVEN (avionics) |
+| StreamIt-style (streaming, fused)                     | **0.5-2x faster** | Compiler optimizations humans miss | PROVEN (DSP only) |
+| Pony-style (actors, zero-copy)                        | **~1-2x**       | Actor scheduling + routing cost | PROVEN |
+| Futhark-style (data-parallel, fused)                  | **~1x**         | Matches hand-written GPU code | PROVEN (GPU only) |
+| Rust async overhead only                              | **~3.4x without I/O, ~1.09x with I/O** | 243ns per operation | PROVEN |
 
-### Realistic Target for Compiled Boon
+> **Important caveat:** The PROVEN labels above apply to *those specific systems in
+> their specific domains*. Applying these results to Boon requires extrapolation:
+> Boon programs are event-driven with irregular rates (not fixed-rate SDF like StreamIt),
+> have dynamic lists (not static like Lustre), and run in WASM (not native like Pony).
+> The realistic Boon target below accounts for these differences.
 
-**~1.5-3x slower than equivalent Rust**, with overhead from:
+### Realistic Target for Compiled Boon [PROJECTED]
+
+**~1.5-3x slower than equivalent Rust** for the computation phase, with overhead from:
 - Actor/cell scheduling: ~100-500ns per dispatch
 - Message passing: ~0ns (uniqueness types) to ~30-60ns (small value copy)
 - Dataflow propagation: ~10-50ns per node if statically scheduled
 - Dynamic subgraphs: interpretive overhead only where needed
 
-This is **5,000-50,000x faster** than the current interpreted engines.
+This is **5,000-50,000x faster** than the current interpreted engines for per-operation
+computation. For end-to-end UI responsiveness (including DOM operations), expect
+**10-100x improvement** — still transformative, but honest about where time is spent.
 
 ---
 
@@ -569,8 +860,11 @@ A code generator for Boon's core language could be **under 2,000 lines**.
 ```
 Phase 0: TODAY
   Boon compiler = Rust (parser + evaluator + engine)
-  Engines: Actors (legacy, /repos/boon) + DD (/repos/boon-dd-v2)
+  Engines: Actors (/repos/boon) + DD (/repos/boon-dd-v2)
   Target: WASM via Rust/wasm-bindgen/mzoon
+  Note: Both engines are active. Actors has a detailed optimization plan
+  (actor_engine_performance_plan.md). DD is default for playground.
+  Strategic role of each engine to be resolved in Phase 1.
 
 Phase 1: BOON-TO-WASM COMPILER (in Rust)
   Write a new backend emitting WASM directly via wasm-encoder
@@ -606,16 +900,22 @@ Zig proved this exact approach works at scale:
 - Memory usage dropped from 9.6GB to 2.8GB
 - Build speed improved 1.5-3.75x
 
-### Expected Compilation Speed
+### Expected Compilation Speed [PROJECTED]
 
-| Compiler       | Speed (lines/sec) | Notes                       |
-|----------------|-------------------|-----------------------------|
-| TCC            | 880K              | Single-pass, no optimization |
-| Jai            | 250K              | Multi-threaded, naive codegen |
-| Zig (custom)   | ~125K             | Incremental, in-place patching |
-| Go             | ~40K              | Package-level parallelism    |
-| Rust (LLVM)    | ~15K              | Full optimization            |
-| **Boon->WASM** | **100-300K**      | No register alloc, no linking, one target |
+| Compiler       | Speed (lines/sec) | Notes                       | Confidence |
+|----------------|-------------------|-----------------------------|------------|
+| TCC            | 880K              | Single-pass, no optimization | PROVEN |
+| Jai            | 250K              | Multi-threaded, naive codegen | PROVEN |
+| Zig (custom)   | ~125K             | Incremental, in-place patching | PROVEN |
+| Go             | ~40K              | Package-level parallelism    | PROVEN |
+| Rust (LLVM)    | ~15K              | Full optimization            | PROVEN |
+| **Boon->WASM** | **100-300K**      | No register alloc, no linking, one target | PROJECTED |
+
+> **Note:** The 100-300K estimate assumes WASM's stack machine eliminates register
+> allocation (true) and linking (true), but doesn't account for type inference cost
+> (unknown), dataflow analysis (unknown), or potential fusion passes (unknown). A
+> naive Boon->WASM compiler without type inference could be very fast. With full
+> analysis passes, speed depends on algorithm choices not yet made.
 
 ---
 
@@ -632,7 +932,7 @@ Zig proved this exact approach works at scale:
 | `WHILE { pattern => body }` | Repetition ("parse while tokens match")       |
 | Pipes (`\|>`) | Parser pipeline composition                         |
 
-### The Backtracking Challenge
+### The Backtracking Challenge [SPECULATIVE — hardest self-hosting problem, no precedent]
 
 Parsers need pull-based input consumption (demand tokens) while Boon is push-based
 (events push through the graph). Solutions:
@@ -640,6 +940,24 @@ Parsers need pull-based input consumption (demand tokens) while Boon is push-bas
 1. **PEG-style ordered choice**: First match wins. Expressible as ordered `WHEN` arms.
 2. **Pratt parsing** (what chumsky uses for Boon today): Precedence as `HOLD` state.
 3. **Two-phase**: Lex everything first (token list), then pattern-match reactively.
+
+> **Honest assessment:** This is the hardest unsolved problem in the self-hosting
+> story. All three solutions above are sketches, not designs:
+>
+> - **PEG via WHEN**: WHEN arms are unordered in Boon semantics — PEG requires
+>   ordered choice (try first alternative, backtrack, try second). Boon would need
+>   either ordered WHEN or a different construct.
+> - **Pratt via HOLD**: Pratt parsing requires mutable recursion state (binding power
+>   stack) and lookahead. Expressing this in HOLD is plausible but untested — the
+>   recursive descent pattern (function calls itself with different precedence) maps
+>   awkwardly to reactive dataflow.
+> - **Two-phase** is the most promising: lexing is straightforward (WHILE over
+>   characters), then parsing operates on a materialized token list via index-based
+>   access. This breaks the push-based assumption but works within Boon's existing
+>   list operations. **Recommended approach for first attempt.**
+>
+> No reactive or dataflow language has ever self-hosted its parser. This is genuinely
+> novel work, not "straightforward." Budget significant design and experimentation time.
 
 ### Incremental Parsing is Naturally Reactive
 
@@ -745,45 +1063,48 @@ architecturally closer to the hardware.
 (browser bridge), `render/` (output). Four `CompiledProgram` variants.
 
 **Relevance to systems compilation**:
-- **`compile.rs` is the seed of a real compiler**. It already analyzes Boon programs
-  into specialized variants (Static, SingleHold, LatestSum, General). Extending this
-  to emit WASM instead of configuring a DD runtime is the natural next step.
+- **Program analysis patterns are transferable**. The DD engine analyzes Boon programs
+  into specialized variants (Static, SingleHold, LatestSum, General). A standalone
+  WASM engine can learn from these classification patterns without depending on DD code.
 - The pure `core/` layer (no Mutable, no RefCell, no side effects) could be transplanted
   to a non-browser target with minimal changes.
 - The 6-operator model (hold_state, hold_latest, when_match, skip, while_reactive,
   latest) maps cleanly to WASM codegen patterns.
 
-**The compilation path from the DD engine**:
+**How the WASM engine relates to the DD engine**:
+
+The DD engine demonstrated that Boon programs can be classified by complexity:
+- Static (pure constants, no runtime needed)
+- SingleHold (one mutable cell, simple transforms)
+- LatestSum (accumulator pattern)
+- General (full dataflow graph)
+
+The WASM engine (`engine_wasm/`) applies similar analysis but from scratch:
 
 ```
-DD Engine Today                      DD Engine Compiled
-───────────────                      ──────────────────
-compile.rs analyzes AST              compile.rs analyzes AST
- -> CompiledProgram::SingleHold       -> WasmModule::SingleHold
- -> runs on Timely DD runtime         -> emits wasm step() function
-                                       -> no DD framework needed
-
-CompiledProgram::General             WasmModule::General
- -> full DD dataflow graph            -> statically scheduled node graph
- -> Timely manages operator order     -> topological-sort step() function
+Shared Parser                        WASM Engine (standalone)
+─────────────                        ──────────────────────
+Boon source → AST                    AST → reactive IR (analysis/)
+                                     IR → WASM binary (codegen/)
+                                     Host-side event dispatch (runtime/)
 ```
 
-The DD engine's `CompiledProgram::Static` variant already evaluates at "compile time" (no
-runtime needed). Adding `CompiledProgram::SingleHold` WASM emission would cover
-counters, simple state machines, and basic reactive UIs.
+The WASM engine does NOT depend on DD engine code. It consumes the same
+parser AST that DD and Actors engines consume.
 
 > `★ Insight ─────────────────────────────────────`
 >
-> The DD engine's `compile.rs` (1,312 lines) is architecturally positioned as the foundation
-> of a Boon compiler. It already does program analysis, specialization into variants,
-> and optimization (Static programs need zero runtime). Changing its output from
-> "DD runtime configuration" to "WASM bytecode" is the core transformation needed
-> for Boon-as-a-systems-language.
+> The DD engine's program analysis (classifying programs into Static, SingleHold,
+> LatestSum, General variants) demonstrates that Boon programs CAN be statically
+> analyzed for compilation. The WASM engine should learn from these classification
+> patterns, but must be a standalone `engine_wasm/` module — not coupled to DD
+> internals. The WASM engine consumes the shared parser AST directly and builds
+> its own reactive IR and codegen pipeline.
 >
-> The DD engine's three-layer architecture (`core/` = pure computation logic, `io/` = platform
-> bridge, `render/` = output) already separates concerns in the right way. A compiled
-> Boon would keep `core/`'s logic, replace `io/` with WASI, and replace `render/` with
-> the target platform's UI framework (or raw framebuffer).
+> The DD engine's three-layer separation (`core/` = computation, `io/` = platform
+> bridge, `render/` = output) is a good architectural model. The WASM engine should
+> follow a similar separation: `analysis/` = AST → IR, `codegen/` = IR → WASM,
+> `runtime/` = host-side event dispatch and patch application.
 >
 > `─────────────────────────────────────────────────`
 
@@ -823,22 +1144,84 @@ counters, simple state machines, and basic reactive UIs.
 >
 > `─────────────────────────────────────────────────`
 
-### Concrete Steps
+### Concrete Steps (with decision gates)
 
-1. **Now**: Finish DD engine (get 11/11 tests passing in `/repos/boon-dd-v2`).
-   The clean three-layer architecture and `compile.rs` specialization are prerequisites.
+**Step 1: Finish DD engine (11/11 tests passing)**
+- Fix remaining 4 failures: shopping_list, todo_mvc, interval, interval_hold
+- This validates the three-layer architecture and program analysis patterns
+- **Decision gate:** If DD cannot reach 11/11, this does NOT block the WASM engine
+  (which is a standalone module), but it reduces confidence in the analysis approach.
 
-2. **Next**: Build a minimal WASM emitter in Rust using `wasm-encoder` (~2-5K lines).
-   Target Boon's core subset: numbers, text, objects, functions, HOLD, LATEST, WHEN,
-   WHILE, THEN. Use the DD engine's `compile.rs` as the analysis frontend.
+**Step 2: Build isolated WASM engine in Rust (~2-5K lines)**
+- New `engine_wasm/` module alongside `engine_actors/` and `engine_dd/`
+- Consumes the shared parser AST output — does NOT depend on DD engine internals
+- Own analysis pass (AST → reactive IR), own codegen (IR → WASM via `wasm-encoder`)
+- Target Boon's core subset: numbers, text, objects, functions, HOLD, LATEST, WHEN,
+  WHILE, THEN
+- **Milestone:** counter.bn compiles to WASM and runs in playground
+- **Decision gate:** After counter works, evaluate if the IR design (§5.6) is
+  sufficient or needs redesign before tackling lists
 
-3. **Then**: Port the parser to Boon (using WHEN/HOLD/WHILE). This is the first
-   "dogfooding" -- Boon parsing Boon.
+**Step 3: Extend to lists and TodoMVC**
+- Add list runtime in WASM linear memory (see `wasm_todomvc_parity_plan.md`)
+- Implement template instantiation for per-item state
+- **Milestone:** todo_mvc.bn compiles and passes expected tests in WASM mode
+- **Decision gate:** Performance comparison against DD engine. If WASM is not
+  measurably faster for list operations, the compilation story is weaker.
 
-4. **Then**: Port type inference and codegen to Boon. Type inference via reactive
-   constraint propagation is the natural showcase.
+**Step 4: Port parser to Boon (self-hosting begins)** [SPECULATIVE]
+- Requires solving the backtracking challenge (§10)
+- Start with two-phase approach: lex to token list, then WHEN-match
+- This is the first "dogfooding" — Boon parsing Boon
+- **Decision gate:** If the parser cannot be written naturally in Boon, consider
+  whether Boon needs language extensions (ordered WHEN, pull-based iteration, etc.)
 
-5. **Finally**: Self-compile. Commit the .wasm artifact. Bootstrap from any platform.
+**Step 5: Port type inference and codegen to Boon** [SPECULATIVE]
+- Type inference via reactive constraint propagation
+- **Decision gate:** Does the Boon-written compiler produce correct WASM for itself?
+
+**Step 6: Self-compile and bootstrap** [SPECULATIVE]
+- boon-compiler.wasm compiles its own source → boon-compiler-v2.wasm
+- Reproducibility check: v2 compiles source → must match v2
+- Commit .wasm artifact to git
+- Bootstrap from any platform via tiny WASI interpreter
+
+### Engine Lifecycle Strategy
+
+> **The strategic question:** Boon currently has two engines (Actors, DD) and plans
+> a third (WASM). What role does each play going forward?
+
+| Engine | Current Role | Future Role | Sunset Condition |
+|--------|-------------|-------------|------------------|
+| **Actors** | Production engine, active optimization | Production use during compilation development | When WASM engine reaches TodoMVC parity |
+| **DD** | Default playground engine (7/11 passing) | Interpreter engine (may share analysis insights) | When WASM engine supersedes it |
+| **WASM** | Not yet implemented | Ultimate production engine | N/A — this is the target |
+
+**Key principle:** The WASM engine is a **standalone module** (`engine_wasm/`), not
+built on DD internals. It consumes the shared parser AST and has its own analysis +
+codegen pipeline. Lessons from DD's program classification (Static, SingleHold, etc.)
+may inform WASM engine design, but there is no code dependency between them.
+
+### What NOT to Build
+
+Scope control is as important as the roadmap:
+
+1. **Do NOT build a native backend (x86_64/AArch64).** WASM-only. The V8/Wasmtime
+   optimization pipeline provides near-native performance without maintaining
+   architecture-specific codegen.
+
+2. **Do NOT build a JIT.** WASM runtimes already JIT-compile (V8 TurboFan). Boon's
+   compiler is ahead-of-time only.
+
+3. **Do NOT build a custom garbage collector.** Use manual refcounting (§5.7) or WASM
+   GC when available. Boon's DAG structure means refcounting is always correct.
+
+4. **Do NOT build multi-threaded compilation** in the initial compiler. Single-threaded
+   is sufficient for the expected program sizes (< 50K lines). Optimize later if needed.
+
+5. **Do NOT attempt compiler optimizations beyond Layer 2** until the basic compiler
+   works end-to-end. Layers 3-4 (in-place mutation, fusion) are research-level work
+   that depends on the type system being correct first.
 
 ### The Critical Design Tradeoff
 
@@ -854,16 +1237,21 @@ Boon's existing approach in the DD engine -- classify programs into specialized 
 compile what you can, interpret the rest -- is the right strategy. The question is
 extending it from "runtime configuration" to "native code emission."
 
-### Total Compiler Size Estimate
+### Total Compiler Size Estimate [SPECULATIVE]
 
-| Component                    | Estimated Lines | Notes                     |
-|------------------------------|-----------------|---------------------------|
-| Parser (in Boon)             | ~2,000          | WHEN/HOLD/WHILE combinators |
-| Type inference (in Boon)     | ~1,500          | Reactive constraint propagation |
-| Program analysis (compile.rs) | ~2,000         | Extend DD engine's approach |
-| WASM emitter                 | ~2,000          | Tree-walk + wasm-encoder   |
-| Standard library             | ~3,000          | Math, List, Text, Element  |
+| Component                    | Estimated Lines | Notes                     | Confidence |
+|------------------------------|-----------------|---------------------------|------------|
+| Parser (in Boon)             | ~2,000          | WHEN/HOLD/WHILE combinators | SPECULATIVE — no precedent for reactive parser |
+| Type inference (in Boon)     | ~1,500          | Reactive constraint propagation | SPECULATIVE — algorithm undesigned |
+| Program analysis               | ~2,000         | AST → IR classification and lowering | PROJECTED — DD engine's analysis proves feasibility |
+| WASM emitter                 | ~2,000          | Tree-walk + wasm-encoder   | PROJECTED — Schism is <1K lines |
+| Standard library             | ~3,000          | Math, List, Text, Element  | PROJECTED — current API surface known |
 | **Total**                    | **~10-15K**     | Oberon's OS+compiler was 12K |
+
+> **Caveat:** These estimates assume the self-hosted compiler. The initial Rust-based
+> Boon-to-WASM compiler (Phase 1) would be ~5-10K lines of Rust, which is more
+> predictable. The self-hosted size depends heavily on parser design choices and
+> whether Boon needs language extensions for systems-level work.
 
 ---
 

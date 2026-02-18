@@ -8,7 +8,7 @@ Primary goals:
 - Reduce allocations and clone pressure.
 - Reduce Arc-driven ownership complexity and lifetime bugs.
 - Improve interactive latency in real UI workloads (especially `todo_mvc.bn`).
-- Keep architecture compatible with future multithreading/distribution work.
+- Don't preclude future multithreading, but don't over-engineer for it — browser WASM is single-threaded and that's the current target.
 
 This plan is designed for another AI/engineer to execute incrementally.
 
@@ -41,9 +41,9 @@ Hard constraints:
 ### 2.1 Event-path allocation pressure
 
 The bridge allocates heavily for frequent DOM events:
-- Text input event channels and buffering: `bridge.rs:2609`, `bridge.rs:2727`
-- Per-event object/value construction for `change` and `key_down`: `bridge.rs:2656`, `bridge.rs:2686`
-- Hover streams/events in multiple element builders: e.g. `bridge.rs:697`, `bridge.rs:2003`
+- Text input event channels and buffering: `NamedChannel::new("change_event_sender")` in `build_text_input_event_handling()` (`bridge.rs:2609`), `Vec<TimestampedEvent<String>>` pending buffers (`bridge.rs:2727`)
+- Per-event object/value construction for `change` and `key_down`: `create_change_event_value()` builds Object/Variable/ValueActor tree per event (`bridge.rs:2656`), `create_key_down_event_value()` same pattern (`bridge.rs:2686`)
+- Hover streams/events in multiple element builders: `NamedChannel::new("element.hovered")` in `element_stripe()` (`bridge.rs:697`), `NamedChannel::new("button.hovered")` in `element_button()` (`bridge.rs:2003`)
 
 Symptoms:
 - Frequent small allocations
@@ -53,21 +53,21 @@ Symptoms:
 ### 2.2 List fanout clone cost
 
 List subscribers get cloned `Replace` payloads repeatedly:
-- Initial send on subscribe: `engine.rs:6133`
-- Output valve impulse send: `engine.rs:6155`
+- Initial send on subscribe: `ListChange::Replace { items: list.clone() }` in new-subscriber handler (`engine.rs:6133`)
+- Output valve impulse send: `ListChange::Replace` clone in output_valve impulse `.retain()` broadcast loop (`engine.rs:6155`)
 - Replace-heavy combinators (`retain`, `sort_by`) still trigger full payload traffic in many cases
 
 ### 2.3 List combinator incremental gaps
 
 Already optimized (`coalesce`, dedup, transform cache), but gaps remain:
-- `retain` rebuilds merged predicate stream on `Push`: `engine.rs:7575`, `engine.rs:7909`
+- `retain` rebuilds merged predicate stream on `Push`: `predicates.iter().map().collect()` in retain Push handler (`engine.rs:7575`), same full rebuild in retain Replace handler (`engine.rs:7909`)
 - Smart diffing focuses on single-item visibility changes: `engine.rs:7750`
-- `every/any` and `sort_by` still clone state vectors and do broad recomputation: `engine.rs:8453`, `engine.rs:8698`
+- `every/any` and `sort_by` still clone state vectors and do broad recomputation: `future::ready(Some(item_predicates.clone()))` in every/any after ListChange match (`engine.rs:8453`), `future::ready(Some(item_keys.clone()))` in sort_by (`engine.rs:8698`)
 
 ### 2.4 Remove pipeline task explosion
 
 `List/remove` spawns one async task per item to wait for trigger stream:
-- `engine.rs:8158`, `engine.rs:8219`
+- `Task::start_droppable(async { when.stream_from_now()... })` per item in remove Replace handler (`engine.rs:8158`), same per-item task spawn in remove Push handler (`engine.rs:8219`)
 
 Symptoms:
 - Large task count with bigger lists
@@ -75,14 +75,16 @@ Symptoms:
 
 ### 2.5 Evaluator data structure overhead
 
-- Dense slot IDs stored in `HashMap` instead of indexed vec storage: `evaluator.rs:524`
-- Repeated function registry merge/clone for control-flow actors: `evaluator.rs:820`, `evaluator.rs:842`, `evaluator.rs:863`
+- Dense slot IDs stored in `HashMap` instead of indexed vec storage: `results: HashMap<SlotId, Arc<ValueActor>>` in `EvaluationState` struct (`evaluator.rs:524`)
+- Repeated function registry merge/clone for control-flow actors: `ctx.function_registry_snapshot` deep clone + insert merge in `build_then_actor()` (`evaluator.rs:820`) / `build_when_actor()` (`evaluator.rs:842`) / `build_while_actor()` (`evaluator.rs:863`)
 
 ### 2.6 Ownership complexity around Arc
 
-- Core actor APIs and list internals are Arc-heavy (`Arc<ValueActor>` almost everywhere)
-- Input liveness currently managed via `inputs: Vec<Arc<ValueActor>>` keepalive capture: `engine.rs:3725`, `engine.rs:3752`
+- Core actor APIs and list internals are Arc-heavy (`Arc<ValueActor>` ~145 occurrences, 248 total `Arc<` uses in engine.rs)
+- Input liveness managed via `inputs: Vec<Arc<ValueActor>>` parameter in `ValueActor::new_with_inputs()` (`engine.rs:3725`), `let _inputs = inputs.clone()` keepalive capture in `ActorLoop::new()` closure (`engine.rs:3752`)
+- Subscription takes `self: Arc<Self>` and wraps in `PushSubscription { _actor: Arc<ValueActor> }` (`engine.rs:4594`, `engine.rs:1244`) — actor lifetime depends on subscriber lifetime (backwards)
 - Easy to accidentally keep too much alive or drop too early when composing flows
+- Entire debugging infrastructure (`LOG_DROPS_AND_LOOP_ENDS`, `NamedChannel::send_or_drop` logging) exists solely for Arc ownership issues
 
 ---
 
@@ -92,7 +94,7 @@ Use four staged tracks:
 1. **Track A (P0):** low-complexity wins and instrumentation.
 2. **Track B (P1):** list-path algorithmic improvements (largest runtime wins for TodoMVC).
 3. **Track C (P1/P2):** evaluator and value-path allocation reduction.
-4. **Track D (P2):** ownership simplification and Arc reduction while keeping async/await.
+4. **Track D (P2):** scope-based generational arena replacing `Arc<ValueActor>` entirely.
 
 Execution rule:
 - No large structural changes before baseline metrics and P0 wins are landed.
@@ -192,8 +194,8 @@ Current:
 - Smart diffing is strongest for exactly one visibility change.
 
 Implementation:
-1. For small batch changes (e.g. <= 8 or <= 25% list), emit ordered sequence of `InsertAt`/`Remove` operations.
-2. Keep Replace fallback for large/complex changes.
+1. The diffing algorithm must produce correct InsertAt/Remove sequences for ANY number of visibility changes.
+2. No Replace fallback — eliminate Replace from the retain path entirely.
 3. Preserve deterministic order.
 
 ### B3. Incremental predicate stream registry for `retain`
@@ -216,9 +218,9 @@ Implementation:
 ### B5. Incremental updates for `sort_by`
 
 Implementation:
-1. Maintain indexed key table and item order.
-2. On key change, reposition only affected item when possible.
-3. Keep full stable sort fallback for complex multi-change batches.
+1. Maintain a sorted index structure (e.g. `BTreeMap<SortKey, ItemId>`).
+2. On key change, remove old position and insert at new position.
+3. For multi-key batch changes, apply all removals then all insertions. Always incremental — no full re-sort threshold.
 
 ### B6. Remove actor: replace per-item task spawning
 
@@ -276,45 +278,154 @@ Implementation:
 
 ---
 
-## Track D - ownership simplification and Arc reduction (still async)
+## Track D - Scope-based generational arena (replace Arc<ValueActor>)
 
-This track is optional until A/B/C gains are captured, but should be planned now.
+This track replaces `Arc<ValueActor>` (248 occurrences in engine.rs) with a scope-based
+generational arena. This is a single, complete architectural change — not incremental.
 
-### D1. Ownership taxonomy
+### The Root Problem
 
-Define explicit categories:
-1. **Owned runtime state** (single owner: actor loop/list loop/evaluator state)
-2. **Shared immutable data** (Arc acceptable)
-3. **Cross-task references** (prefer IDs + channel handles over raw Arc graph)
+`Arc<ValueActor>` serves two purposes and both are wrong:
+1. **Ownership/keepalive**: `inputs: Vec<Arc<ValueActor>>` captured in async closures prevents premature drop. Creates an invisible ownership graph that's impossible to debug.
+2. **Subscription/sharing**: `stream(self: Arc<Self>)` wraps subscriptions in `PushSubscription { _actor: Arc<ValueActor> }` to keep actors alive. Makes actor lifetime depend on subscriber lifetime — backwards.
 
-### D2. Introduce typed handles for actor references
+The DD engine already proves the alternative works: `CellId` (lightweight enum) + worker-owned state + channel-based observation. 111 `Arc<` total in DD core (mostly `Arc<str>` for strings), vs 248 in actor engine.rs.
 
-Implementation:
-1. Add `ActorId` and registry mapping in runtime context.
-2. Convert selected internal maps/vectors from `Arc<ValueActor>` to `ActorId`.
-3. Keep public API unchanged initially.
+### The Solution: OwnedActor + ActorHandle + Scope Registry
 
-### D3. Replace broad keepalive Arc vectors with keepalive table
+Split `ValueActor` into two types:
 
-Current:
-- `inputs: Vec<Arc<ValueActor>>` captured to keep dependencies alive.
+**OwnedActor** — heavy, lives in registry, never cloned:
+```rust
+struct OwnedActor {
+    actor_loop: ActorLoop,          // Owns the async task (TaskHandle)
+    extra_loops: Vec<ActorLoop>,    // Additional task handles
+    construct_info: Arc<ConstructInfoComplete>,
+    scope_id: ScopeId,
+    list_item_origin: Option<Arc<ListItemOrigin>>,
+}
+```
 
-Implementation:
-1. Replace with scoped keepalive registrations keyed by actor IDs.
-2. Actor loop owns keepalive tokens and releases deterministically.
+**ActorHandle** — lightweight channel senders, freely cloned, passed around everywhere:
+```rust
+#[derive(Clone)]
+pub struct ActorHandle {
+    actor_id: ActorId,
+    subscription_sender: NamedChannel<SubscriptionSetup>,
+    direct_store_sender: NamedChannel<Value>,
+    stored_value_query_sender: NamedChannel<StoredValueQuery>,
+    message_sender: NamedChannel<ActorMessage>,
+    ready_signal: Shared<oneshot::Receiver<()>>,
+    current_version: Arc<AtomicU64>,
+    persistence_id: parser::PersistenceId,
+    lazy_delegate: Option<Box<LazyActorHandle>>,
+}
+```
 
-### D4. Scope-based lifecycle cleanup
+Cloning an ActorHandle does NOT keep the actor alive — the registry does.
+If the OwnedActor is destroyed (scope cleanup), channels close and subscribers see `None`.
 
-Implementation:
-1. Build explicit scope teardown hooks for dynamic list/map instances.
-2. Ensure subscriptions/tasks/channels are removed on scope destruction.
+**ActorId** — generational index, Copy, 8 bytes:
+```rust
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActorId { index: u32, generation: u32 }
+```
 
-### D5. Optional arena-backed actor state (advanced)
+**ScopeId** — same pattern:
+```rust
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScopeId { index: u32, generation: u32 }
+```
 
-If needed after prior phases:
-1. Runtime-owned arena for actor/list state objects.
-2. Async tasks operate on IDs/handles; no custom event loop required.
-3. Keep channel-driven async model intact.
+**ActorRegistry** — central ownership, thread_local in WASM:
+```rust
+pub struct ActorRegistry {
+    actors: Vec<Option<(u32, OwnedActor)>>,  // SlotMap-style
+    free_list: Vec<u32>,
+    next_generation: u32,
+    scopes: Vec<Option<(u32, Scope)>>,
+    scope_free_list: Vec<u32>,
+}
+
+struct Scope {
+    parent: Option<ScopeId>,
+    actors: Vec<ActorId>,
+    children: Vec<ScopeId>,
+}
+
+thread_local! {
+    static REGISTRY: RefCell<ActorRegistry> = RefCell::new(ActorRegistry::new());
+}
+```
+
+### Key API Changes
+
+**Actor creation** (`Arc::new(ValueActor::new(...))` → `create_actor(scope_id, ...)`):
+- Build channels, spawn actor loop, construct OwnedActor + ActorHandle
+- Insert OwnedActor into registry under scope_id, return ActorHandle
+
+**Subscription** (`actor.clone().stream()` → `handle.stream()`):
+```rust
+impl ActorHandle {
+    pub fn stream(&self) -> LocalBoxStream<'static, Value> {
+        let (tx, rx) = mpsc::channel(32);
+        self.subscription_sender.send_or_drop(SubscriptionSetup {
+            sender: tx, starting_version: 0,
+        });
+        rx.boxed_local()  // No PushSubscription wrapper needed
+    }
+}
+```
+
+**Scope destruction** (WHILE branch switch, list item removal, program teardown):
+```rust
+impl ActorRegistry {
+    pub fn destroy_scope(&mut self, scope_id: ScopeId) {
+        if let Some((_, scope)) = self.scopes[scope_id.index as usize].take() {
+            for child_id in scope.children { self.destroy_scope(child_id); }
+            for actor_id in scope.actors {
+                self.remove_actor(actor_id);
+                // OwnedActor drops → ActorLoop drops → task cancelled → channels close
+            }
+        }
+    }
+}
+```
+
+**Evaluator results** (`HashMap<SlotId, Arc<ValueActor>>` → `Vec<Option<ActorHandle>>`).
+
+### Scope Tree Mapping
+
+| Boon Construct | Scope Action |
+|---|---|
+| Program load | Create root scope |
+| Top-level variable | Create actor in root scope |
+| Function call | Create child scope of caller's scope |
+| THEN/WHEN/WHILE body | Create child scope |
+| WHILE branch switch | Destroy old branch scope, create new |
+| List/map item creation | Create child scope per item |
+| List/remove item | Destroy that item's scope |
+| Navigation / program reload | Destroy root scope (cascade) |
+
+### What Gets Eliminated
+
+- `PushSubscription { _actor: Arc<ValueActor> }` wrapper (engine.rs:1244-1262)
+- `inputs: Vec<Arc<ValueActor>>` on ValueActor and all `let _inputs = inputs.clone()` captures
+- `new_with_inputs()`, `new_arc_with_inputs()` constructors
+- `LOG_DROPS_AND_LOOP_ENDS` debugging infrastructure (no longer needed — scope tree is deterministic)
+- All 145 `Arc<ValueActor>` occurrences
+
+### Migration Order
+
+1. Add ActorId, ScopeId, ActorRegistry types to engine.rs. Add thread_local REGISTRY.
+2. Split ValueActor into OwnedActor + ActorHandle. Create compatibility `create_actor() -> ActorHandle`.
+3. Change evaluator.rs: `Arc<ValueActor>` → `ActorHandle` in results and all functions.
+4. Change bridge.rs: `Arc<ValueActor>` → `ActorHandle`, subscription calls `handle.stream()`.
+5. Remove PushSubscription wrapper.
+6. Remove all keepalive patterns (inputs, _inputs, new_with_inputs, new_arc_with_inputs).
+7. Add scope destruction to WHILE switching, List/remove, program teardown.
+
+Each step compiles and examples keep working.
 
 ---
 
@@ -371,15 +482,61 @@ Expected wins by user action:
 
 ## Phase 0 - baseline and guardrails
 
-Deliverables:
-- metrics counters feature flag
-- baseline report for TodoMVC interactions
-- memory/task/subscription leak sanity checks
+### Instrumentation insertion points
+
+Add feature-gated counters (`#[cfg(feature = "actors-metrics")]`) at these specific locations:
+
+**bridge.rs (event path):**
+- `create_change_event_value()` → CHANGE_EVENTS_CONSTRUCTED
+- `create_key_down_event_value()` → KEYDOWN_EVENTS_CONSTRUCTED
+- hover handler in `element_stripe()` / `element_button()` → HOVER_EVENTS_EMITTED
+- pending buffer pushes in `build_text_input_event_handling()` → PENDING_QUEUE_HIGH_WATER
+
+**engine.rs (list path):**
+- `ListChange::Replace` send in subscribe handler → REPLACE_PAYLOADS_SENT + items.len()
+- `ListChange::Replace` in output_valve impulse → REPLACE_FANOUT_SENDS
+- `predicates.iter().map().collect()` in retain → RETAIN_PREDICATE_REBUILDS + predicates.len()
+- `Task::start_droppable` in remove → REMOVE_TASKS_ACTIVE (gauge: +1 spawn, -1 complete)
+- `item_predicates.clone()` in every/any → EVERY_ANY_STATE_CLONES + vec.len()
+
+**engine.rs (actor lifecycle):**
+- `ValueActor::new*` constructors → ACTORS_CREATED
+- ValueActor Drop → ACTORS_DROPPED (leak detection: created - dropped must converge)
+- NamedChannel send_or_drop failure → CHANNEL_DROPS_BY_NAME[name]
+
+**evaluator.rs:**
+- `alloc_slot()` → SLOTS_ALLOCATED
+- registry clone in `build_then/when/while_actor()` → REGISTRY_CLONES + entries.len()
+
+### WASM measurement approach
+
+Browser WASM has no `perf` or `valgrind`. Use:
+1. `web_sys::Performance::now()` for wall-clock timing around key operations
+2. AtomicU64 counters (no contention overhead in single-threaded WASM)
+3. Console dump function: `[actors-metrics] REPLACE_PAYLOADS_SENT=47, ACTORS_CREATED=312, ...`
+4. Browser DevTools Performance tab for visual flame traces (manual, supplements counters)
+
+### Baseline scenarios (TodoMVC with 20 pre-existing items)
+
+Measure counter values for each interaction:
+1. Type character → CHANGE_EVENTS_CONSTRUCTED, KEYDOWN_EVENTS_CONSTRUCTED
+2. Hover across 5 rows → HOVER_EVENTS_EMITTED
+3. Enter to add todo → ACTORS_CREATED delta, REPLACE_PAYLOADS_SENT, RETAIN_PREDICATE_REBUILDS
+4. Toggle single todo → REPLACE_PAYLOADS_SENT, REPLACE_FANOUT_SENDS
+5. Switch filter All→Active→Completed → RETAIN_PREDICATE_REBUILDS, REPLACE_PAYLOADS_SENT
+6. Toggle all → REPLACE_PAYLOADS_SENT
+7. Clear completed (10 items) → REMOVE_TASKS_ACTIVE peak
+
+### Automation
+
+Use MCP tools: `boon_inject` → `boon_run` → `boon_type_text`/`boon_press_key` → `boon_console(pattern="actors-metrics")`.
+Compare counter dumps before/after each optimization.
 
 Checklist:
-- [ ] Add feature-gated counters and logging
-- [ ] Define benchmark scenarios and scripts
-- [ ] Capture baseline JSON/markdown report in docs
+- [ ] Add feature-gated counters at all listed insertion points
+- [ ] Add console dump function triggered by debug key or MCP command
+- [ ] Capture baseline report for all 7 scenarios
+- [ ] Verify actor created/dropped counts converge after repeated add/remove cycles (leak check)
 
 ## Phase 1 - P0 quick wins
 
@@ -417,14 +574,21 @@ Checklist:
 - [ ] C3 persistence write coalescing
 - [ ] C4 restore-path clone reductions
 
-## Phase 4 - ownership simplification (optional but recommended)
+## Phase 4 - scope-based generational arena (replace Arc<ValueActor>)
 
 Checklist:
-- [ ] D1 ownership taxonomy in code comments/types
-- [ ] D2 ActorId handles for selected internals
-- [ ] D3 keepalive table replacing broad Arc vectors
-- [ ] D4 scope lifecycle teardown hooks
-- [ ] D5 arena-backed runtime state prototype (if needed)
+- [ ] Add ActorId, ScopeId, ActorRegistry types + thread_local REGISTRY
+- [ ] Split ValueActor into OwnedActor + ActorHandle
+- [ ] Migrate evaluator.rs from Arc<ValueActor> to ActorHandle
+- [ ] Migrate bridge.rs from Arc<ValueActor> to ActorHandle
+- [ ] Remove PushSubscription wrapper
+- [ ] Remove all keepalive patterns (inputs, _inputs, new_with_inputs, new_arc_with_inputs)
+- [ ] Add scope destruction to WHILE switching, List/remove, program teardown
+
+Exit criteria:
+- zero `Arc<ValueActor>` remaining in codebase
+- scope tree deterministically cleans up all actors
+- no "receiver is gone" errors — replaced by clean channel closure on scope destroy
 
 ---
 
@@ -471,8 +635,9 @@ Use drop/end logs and counters to ensure:
 
 1. Land P0 in small PRs with metrics delta in each PR.
 2. Keep feature flags for risky algorithmic changes (B2/B3/B5/B6) during stabilization.
-3. Preserve fallback paths where necessary (Replace fallback, full sort fallback), but do not add identity fallbacks.
+3. No fallback paths — each optimization is complete or not done. No identity fallbacks.
 4. If a phase regresses correctness, revert that phase only, keep prior gains.
+5. **Baseline gate:** If Phase 0 measurements show that a specific interaction already meets latency targets, skip the corresponding optimization tasks.
 
 ---
 
@@ -483,7 +648,7 @@ This plan is complete when:
 1. TodoMVC interactions are stable and significantly faster in Actors mode.
 2. Allocation hot spots in bridge/list/evaluator are measurably reduced.
 3. No obvious unbounded buffers or task growth patterns remain.
-4. Ownership/lifetime behavior is simpler and less Arc-fragile.
+4. Zero `Arc<ValueActor>` — ownership is scope-based via ActorRegistry with deterministic cleanup.
 5. Documentation and metrics reports are updated for future contributors.
 
 ---
@@ -494,8 +659,71 @@ If implemented by a separate AI, follow this exact order:
 1. Add instrumentation and baseline (Phase 0).
 2. Implement A1, A2, A5 first (fastest wins with low risk).
 3. Implement B1, B2, B3 next (largest list-path wins).
-4. Implement B6 before deep ownership refactors (reduces task complexity early).
+4. Implement B6 before arena migration (reduces task complexity early).
 5. Implement C3 after list-path stabilization (to avoid persistence noise while tuning list logic).
-6. Do D-track only after measurable gains are captured and correctness is stable.
+6. Do D-track (arena migration) after measurable gains are captured and correctness is stable. Follow the 7-step migration order in Track D exactly.
 
 This sequencing minimizes risk and keeps each step measurable.
+
+---
+
+## 11. Future: Multi-Threading and Distribution
+
+This section documents what changes are needed when actors move beyond single-threaded
+browser WASM. The scope-based arena design (Track D) is intentionally compatible with
+these future requirements.
+
+### Phase 1: Web Workers (same machine, separate WASM modules)
+
+Workers have their own WASM heap — memory cannot be shared. Communication is via
+`postMessage()` with structured clone serialization.
+
+What the arena design already provides:
+- ActorId is an opaque Copy handle — naturally serializable across worker boundaries
+- ActorHandle communicates via channels — channels can be abstracted over transport
+- Scope tree is a declarative structure — can be replicated to a coordinator
+
+What needs to change:
+1. **ActorId gains a location field**: `ActorLocation { Local, Worker(WorkerId) }`
+2. **ActorHandle channels become trait-based**: `trait ActorChannel<T> { fn send(&self, T); }`
+   with `LocalChannel` (current mpsc) and `WorkerChannel` (MessagePort + serialization)
+3. **Registry becomes a router**: local lookup for local actors, message forwarding for
+   remote actors via a coordinator
+4. **Scope destruction becomes a protocol**: coordinator sends destroy command to worker,
+   worker destroys local scope, acknowledges back
+5. **Value serialization**: Values crossing worker boundaries need serde support.
+   Most Value variants are already serialization-friendly (Number, Text, Bool, Tagged).
+   ActorId references serialize trivially (Copy, 8 bytes).
+
+### Phase 2: Backend / distributed (cross-network)
+
+Actors on a different machine. Communication over WebSocket, HTTP, or custom protocol.
+
+Additional changes beyond Phase 1:
+1. **ActorId gains network location**: `ActorLocation { Local, Worker(WorkerId), Remote(ServerId) }`
+2. **Network transport for channels**: WorkerChannel generalizes to NetworkChannel with
+   reconnection, buffering, and ordering guarantees
+3. **Subscription becomes a streaming protocol**: Server-Sent Events or WebSocket streams
+   for continuous value updates
+4. **Scope tree partitioning**: Some scopes live on backend, others on frontend. Scope
+   destruction crosses network boundary — needs timeout and failure handling
+5. **Persistence migration**: Currently localStorage-based. Backend actors need server-side
+   persistence (database, file system)
+6. **Latency tolerance**: Subscription streams must handle network delay. The current
+   fire-and-forget pattern (send_or_drop) needs at-least-once delivery for remote actors
+
+### Design invariants to preserve now
+
+These properties of the arena design must not be violated by any optimization work,
+as they're prerequisites for distribution:
+
+1. **All actor interaction goes through ActorHandle, never direct object access.**
+   (Enables transparent remoting — swap channel implementation, same API.)
+2. **ActorId is the only way to reference an actor externally.**
+   (Enables location-transparent addressing.)
+3. **Scope tree is explicit and queryable.**
+   (Enables distributed scope management — coordinator knows which scopes are where.)
+4. **No shared mutable state between actors.**
+   (Already enforced by CLAUDE.md. Enables moving actors to workers without breaking invariants.)
+5. **Channel-based subscription is the only observation mechanism.**
+   (Enables network subscription — replace local channel with network stream.)

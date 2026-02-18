@@ -238,6 +238,32 @@ TodoMVC parity is complete when:
 
 ---
 
-## 12. Deferred Execution Note
+## 12. Open Questions
+
+1. **HOLD Inside Dynamic Lists**: Each todo row has 3 HOLD cells (title, editing,
+   completed). How does the WASM compiler handle per-item state when the list size
+   is unknown at compile time? Options: compile a row template function that's
+   instantiated per item, or compile a generic state-machine parameterized by key.
+
+2. **LATEST Inside List Items**: Row state updates involve LATEST combining multiple
+   LINK events. How is the LATEST combinator compiled for template-instantiated rows?
+   Each row needs its own LATEST instance — is this a runtime allocation or
+   compile-time parameterization?
+
+3. **Persistence Format Compatibility**: Must Wasm-mode persistence be readable by
+   DD/Actors modes? If yes, the serialization format is constrained. If no, Wasm
+   mode can use a more efficient binary format but loses cross-engine state migration.
+
+4. **Edit Focus Lifecycle**: Double-click → edit mode requires DOM focus management.
+   How does the WASM module communicate focus requests to the host? Is this a patch
+   op or a separate host callback?
+
+5. **Hover State**: Row hover reveals the delete button (CSS visibility). Is this
+   purely host-side (CSS :hover) or does the WASM module track hover state? The DD
+   engine uses LINK for this — how does compiled code handle it?
+
+---
+
+## 13. Deferred Execution Note
 
 This document defines the parity plan only. Implementation is deferred.

@@ -208,6 +208,26 @@ Initial timing targets:
 
 ---
 
-## 10. Deferred Execution Note
+## 10. Open Questions
+
+1. **Tier 1 Harness Design**: What runtime hosts the WASM module outside the browser?
+   Wasmtime? wasm3? Custom harness? This affects how events are injected and patches
+   are read. Need a concrete fixture example showing input/output format.
+
+2. **Deterministic Virtual Time**: How is time virtualized in the Tier 1 harness?
+   Does the WASM module import a `now()` function that the harness controls? Or does
+   the harness inject synthetic timer events? Design needed.
+
+3. **Timing Target Justification**: The 60s/3m/12m targets are estimates. After
+   implementing Tier 0+1, measure actual times and adjust. The parity target (12m)
+   may be too generous — if TodoMVC is slow, something is wrong architecturally.
+
+4. **Flaky Test Handling**: Timer-based tests (interval, interval_hold) are inherently
+   timing-sensitive. The virtual time approach in Tier 1 solves this, but Tier 2/3
+   run in a real browser. Need a tolerance/retry policy for browser-based timer tests.
+
+---
+
+## 11. Deferred Execution Note
 
 This is a planning artifact only. Implementation is deferred.
