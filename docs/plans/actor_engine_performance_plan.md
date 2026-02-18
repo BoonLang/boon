@@ -61,7 +61,7 @@ List subscribers get cloned `Replace` payloads repeatedly:
 
 Already optimized (`coalesce`, dedup, transform cache), but gaps remain:
 - `retain` rebuilds merged predicate stream on `Push`: `predicates.iter().map().collect()` in retain Push handler (`engine.rs:7575`), same full rebuild in retain Replace handler (`engine.rs:7909`)
-- Smart diffing focuses on single-item visibility changes: `engine.rs:7750`
+- Smart diffing focuses on single-item visibility changes: `if use_smart_diffing && visibility_changes.len() == 1` in retain predicate path (`engine.rs:7750`)
 - `every/any` and `sort_by` still clone state vectors and do broad recomputation: `future::ready(Some(item_predicates.clone()))` in every/any after ListChange match (`engine.rs:8453`), `future::ready(Some(item_keys.clone()))` in sort_by (`engine.rs:8698`)
 
 ### 2.4 Remove pipeline task explosion
@@ -475,6 +475,11 @@ Expected wins by user action:
 
 8. Edit todo (double click, type, blur/enter)
 - Wins: A1, A2, C1
+
+**Track D (arena) cross-cutting benefit:** Every action above creates actors. The arena
+migration eliminates per-actor `Arc` allocation/deallocation and replaces the invisible
+reference-counted ownership graph with deterministic scope-based cleanup. This reduces
+allocation pressure and improves debuggability across all 8 user actions uniformly.
 
 ---
 
