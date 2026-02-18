@@ -642,14 +642,14 @@ fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "boon_set_engine".to_string(),
-            description: "Set the Boon engine and trigger re-run. Use 'Actors' for the actor-based reactive engine or 'DD' for the Differential Dataflow engine.".to_string(),
+            description: "Set the Boon engine and trigger re-run. Use 'Actors' for the actor-based reactive engine, 'DD' for the Differential Dataflow engine, or 'Wasm' for the WASM compilation engine.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "engine": {
                         "type": "string",
-                        "enum": ["Actors", "DD"],
-                        "description": "Engine to use: 'Actors' (actor-based reactive) or 'DD' (Differential Dataflow)"
+                        "enum": ["Actors", "DD", "Wasm"],
+                        "description": "Engine to use: 'Actors' (actor-based reactive), 'DD' (Differential Dataflow), or 'Wasm' (WASM compilation)"
                     }
                 },
                 "required": ["engine"]
@@ -1064,8 +1064,8 @@ async fn call_ws_tool(name: &str, args: Value, ws_port: u16) -> Result<String, S
                 .ok_or("engine parameter required")?
                 .to_string();
             // Validate engine value
-            if engine != "Actors" && engine != "DD" {
-                return Err(format!("Invalid engine '{}'. Must be 'Actors' or 'DD'", engine));
+            if engine != "Actors" && engine != "DD" && engine != "Wasm" {
+                return Err(format!("Invalid engine '{}'. Must be 'Actors', 'DD', or 'Wasm'", engine));
             }
             Command::SetEngine { engine }
         }

@@ -8,6 +8,9 @@ pub mod engine_actors;
 #[cfg(feature = "engine-dd")]
 pub mod engine_dd;
 
+#[cfg(feature = "engine-wasm")]
+pub mod engine_wasm;
+
 // Actor engine modules (legacy) - api and interpreter depend on actor engine types
 #[cfg(feature = "engine-actors")]
 pub mod api;

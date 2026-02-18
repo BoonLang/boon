@@ -568,7 +568,9 @@ fn set_is_referenced_and_alias_referenceables<'a, 'code>(
                         })
                         .collect();
 
-                    if let Some(referenceable) = reachable_map.get(base_var) {
+                    if base_var == "PASSED" {
+                        // PASSED is resolved at runtime via PASS context — skip validation.
+                    } else if let Some(referenceable) = reachable_map.get(base_var) {
                         // Found the base variable - field access will be resolved at runtime
                         *referenced_span = Some(referenceable.span);
                         all_referenced.insert(*referenceable);

@@ -1,7 +1,7 @@
 # Plan: Direct Boon to Wasm Engine for Playground (No Fallback)
 
-**Status:** Draft (implementation deferred)
-**Date:** 2026-02-18
+**Status:** Complete (M0-M6 all delivered)
+**Date:** 2026-02-18 (plan), 2026-02-19 (completed)
 **Owner:** Boon runtime/compiler team
 
 ---
@@ -14,7 +14,7 @@ Add a third Boon playground engine that:
 - runs the generated Wasm module in the playground preview pipeline,
 - never falls back to Actors or DD when `Wasm` is selected.
 
-This is a planning document only. No implementation is included here.
+Implementation is complete. See `crates/boon/src/platform/browser/engine_wasm/` for source.
 
 ---
 
@@ -529,4 +529,5 @@ Required runtime checks:
 
 ## 15. Execution Note
 
-This is a planning artifact only. Implementation is intentionally deferred.
+Implementation complete. All milestones M0-M6 delivered. See architecture docs at
+`docs/plans/wasm/WASM_ENGINE_ARCHITECTURE.md`.

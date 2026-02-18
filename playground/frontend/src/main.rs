@@ -10,7 +10,7 @@ use ulid::Ulid;
 
 use boon::platform::browser::{
     bridge::object_with_document_to_element_signal,
-    common::{EngineType, default_engine},
+    common::{EngineType, available_engines, default_engine},
     engine::VirtualFilesystem,
     interpreter,
 };
@@ -157,6 +157,7 @@ fn get_engine_from_url() -> Option<EngineType> {
     match params.get("engine").as_deref() {
         Some("actors") => Some(EngineType::Actors),
         Some("dd") => Some(EngineType::DifferentialDataflow),
+        Some("wasm") => Some(EngineType::Wasm),
         _ => None,
     }
 }
@@ -167,6 +168,7 @@ fn load_engine_from_storage() -> Option<EngineType> {
     match stored.as_str() {
         "Actors" => Some(EngineType::Actors),
         "DD" => Some(EngineType::DifferentialDataflow),
+        "Wasm" => Some(EngineType::Wasm),
         _ => None,
     }
 }
@@ -465,6 +467,7 @@ impl Playground {
             .filter(|engine| match engine {
                 EngineType::Actors => cfg!(feature = "engine-actors"),
                 EngineType::DifferentialDataflow => cfg!(feature = "engine-dd"),
+                EngineType::Wasm => cfg!(feature = "engine-wasm"),
             })
             .unwrap_or_else(default_engine);
         let engine_type = Mutable::new(engine_type_value);
@@ -753,8 +756,9 @@ impl Playground {
                         let new_engine = match engine_str.as_str() {
                             "Actors" => EngineType::Actors,
                             "DD" => EngineType::DifferentialDataflow,
+                            "Wasm" => EngineType::Wasm,
                             _ => {
-                                js_sys::Reflect::set(&result, &"error".into(), &format!("Invalid engine '{}'. Use 'Actors' or 'DD'", engine_str).into()).ok();
+                                js_sys::Reflect::set(&result, &"error".into(), &format!("Invalid engine '{}'. Use 'Actors', 'DD', or 'Wasm'", engine_str).into()).ok();
                                 return result.into();
                             }
                         };
@@ -1185,12 +1189,12 @@ impl Playground {
                 let run_command = run_command.clone();
                 move |_| {
                     if is_switchable {
-                        // Toggle engine
-                        let new_engine = match engine_type.get() {
-                            EngineType::Actors => EngineType::DifferentialDataflow,
-                            EngineType::DifferentialDataflow => EngineType::Actors,
-                        };
-                        engine_type.set(new_engine);
+                        // Cycle to next available engine
+                        let engines = available_engines();
+                        let current = engine_type.get();
+                        let current_idx = engines.iter().position(|e| *e == current).unwrap_or(0);
+                        let next_idx = (current_idx + 1) % engines.len();
+                        engine_type.set(engines[next_idx]);
                         // Trigger re-run with new engine
                         run_command.set(Some(RunCommand { filename: None }));
                     }
@@ -1990,6 +1994,14 @@ impl Playground {
         let engine_type = self.engine_type.get();
 
         // Check which engine to use
+        #[cfg(feature = "engine-wasm")]
+        if engine_type == EngineType::Wasm {
+            let element = boon::platform::browser::engine_wasm::run_wasm(&source_code);
+            drop(source_code);
+            drop(files);
+            return element;
+        }
+
         #[cfg(feature = "engine-dd")]
         if engine_type == EngineType::DifferentialDataflow {
             println!("[DD Engine] Running with DD engine");

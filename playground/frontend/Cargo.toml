@@ -9,10 +9,12 @@ boon = { path = "../../crates/boon" }
 ulid = { version = "1.2.0", features = ["serde"] }
 
 [features]
-# Enable both engines by default for runtime switching
-default = ["engine-both"]
+# Enable all engines by default for runtime switching
+default = ["engine-all"]
 
 # Engine feature passthrough - these enable the corresponding boon engine features
 engine-actors = ["boon/engine-actors"]
 engine-dd = ["boon/engine-dd"]
+engine-wasm = ["boon/engine-wasm"]
 engine-both = ["engine-actors", "engine-dd"]
+engine-all = ["engine-actors", "engine-dd", "engine-wasm"]

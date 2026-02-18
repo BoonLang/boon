@@ -9,6 +9,8 @@ pub enum EngineType {
     Actors,
     /// Differential Dataflow engine (pull-based, incremental computation)
     DifferentialDataflow,
+    /// Compiled WASM engine (direct compilation to WebAssembly bytecode)
+    Wasm,
 }
 
 impl EngineType {
@@ -17,6 +19,7 @@ impl EngineType {
         match self {
             Self::Actors => "Actors",
             Self::DifferentialDataflow => "DD",
+            Self::Wasm => "Wasm",
         }
     }
 
@@ -25,6 +28,7 @@ impl EngineType {
         match self {
             Self::Actors => "Actor-based reactive streams",
             Self::DifferentialDataflow => "Differential Dataflow",
+            Self::Wasm => "Compiled WASM",
         }
     }
 }
@@ -35,28 +39,29 @@ impl Default for EngineType {
     }
 }
 
-/// Returns the default engine based on compile-time feature flags.
-pub fn default_engine() -> EngineType {
-    // When both engines are available (either via engine-both or both individual features)
-    #[cfg(all(feature = "engine-actors", feature = "engine-dd"))]
-    {
-        EngineType::Actors // Default to Actors when both are available
-    }
-
-    // Actors-only (DD not available)
-    #[cfg(all(feature = "engine-actors", not(feature = "engine-dd")))]
-    {
-        EngineType::Actors
-    }
-
-    // DD-only (Actors not available)
-    #[cfg(all(feature = "engine-dd", not(feature = "engine-actors")))]
-    {
-        EngineType::DifferentialDataflow
-    }
+/// Returns all engines available in this build, based on compile-time feature flags.
+/// Order: Actors, DD, Wasm (priority order for default selection).
+pub fn available_engines() -> Vec<EngineType> {
+    let mut engines = Vec::new();
+    #[cfg(feature = "engine-actors")]
+    engines.push(EngineType::Actors);
+    #[cfg(feature = "engine-dd")]
+    engines.push(EngineType::DifferentialDataflow);
+    #[cfg(feature = "engine-wasm")]
+    engines.push(EngineType::Wasm);
+    engines
 }
 
-/// Returns true if both engines are available for runtime switching.
+/// Returns the default engine based on compile-time feature flags.
+/// First available engine wins (priority: Actors > DD > Wasm).
+pub fn default_engine() -> EngineType {
+    available_engines()
+        .into_iter()
+        .next()
+        .expect("At least one engine must be enabled via feature flags")
+}
+
+/// Returns true if more than one engine is available for runtime switching.
 pub fn is_engine_switchable() -> bool {
-    cfg!(all(feature = "engine-actors", feature = "engine-dd"))
+    available_engines().len() > 1
 }
