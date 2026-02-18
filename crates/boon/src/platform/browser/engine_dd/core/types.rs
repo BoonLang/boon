@@ -69,6 +69,41 @@ impl std::fmt::Display for ListKey {
 }
 
 // ===========================================================================
+// KeyedDiff — incremental diffs from DD keyed collections
+// ===========================================================================
+
+/// A keyed diff from a DD collection.
+///
+/// Represents an O(1) incremental change to a keyed list.
+/// Produced by inspect callbacks on keyed DD collections.
+#[derive(Clone, Debug)]
+pub enum KeyedDiff {
+    /// Insert or update an item with the given key.
+    Upsert { key: ListKey, value: Value },
+    /// Remove the item with the given key.
+    Remove { key: ListKey },
+}
+
+/// Specification for streaming keyed diffs to the bridge and persistence.
+///
+/// When set on a DataflowGraph, the runtime wires inspect callbacks on the
+/// keyed collections to produce O(1) per-item diffs instead of monolithic
+/// assembled list values.
+pub struct KeyedListOutput {
+    /// Keyed collection of display-ready element Values (post-retain, post-map).
+    pub display_var: VarId,
+    /// Keyed collection of raw data for persistence (pre-display-transform).
+    pub persistence_var: VarId,
+    /// Storage key for localStorage (if persistence is enabled).
+    pub storage_key: Option<String>,
+    /// Hold name for persistence identification.
+    pub hold_name: Option<String>,
+    /// Element tag of the Stripe that displays keyed items (e.g., "Ul").
+    /// Used by the bridge to identify which Stripe receives keyed diffs.
+    pub element_tag: Option<String>,
+}
+
+// ===========================================================================
 // DataflowGraph — the compiled representation of a reactive Boon program
 // ===========================================================================
 
@@ -87,6 +122,10 @@ pub struct DataflowGraph {
     /// Storage key for localStorage persistence (e.g., "counter_hold").
     /// When set, HOLD state changes are persisted and restored on re-run.
     pub storage_key: Option<String>,
+    /// Keyed list output specification for O(1) per-item streaming.
+    /// When set, items flow individually from DD to bridge/persistence,
+    /// bypassing AssembleList entirely.
+    pub keyed_list_output: Option<KeyedListOutput>,
 }
 
 /// Specification for an external input source.
@@ -207,6 +246,13 @@ pub enum CollectionSpec {
     ListMap {
         source: VarId,
         f: TransformFn,
+    },
+
+    /// Transform each list item with access to the item's key.
+    /// Used for injecting per-item link paths (key → link path).
+    ListMapWithKey {
+        source: VarId,
+        f: Arc<dyn Fn(&ListKey, &Value) -> Value + 'static>,
     },
 
     /// Append items to a list (concat).

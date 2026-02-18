@@ -3,10 +3,11 @@
 //! Provides save/load functions for localStorage persistence used by
 //! both the worker (SingleHold/LatestSum) and general interpreter.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use zoon::{web_sys, serde_json};
 
+use super::super::core::types::ListKey;
 use super::super::core::value::Value;
 
 /// Save a single hold state value to localStorage.
@@ -83,6 +84,28 @@ pub fn save_program_state(
             let _ = storage.set_item(&format!("dd_{}_sums", storage_key), &json);
         }
     }
+}
+
+/// Save a keyed list to localStorage from a HashMap of items.
+///
+/// The HashMap is assembled in the IO layer from individual keyed diffs,
+/// then serialized as a Value::Tagged("List", BTreeMap) for compatibility
+/// with the existing persistence format (load_holds_map reads it back).
+pub fn save_keyed_list(storage_key: &str, hold_name: &str, items: &HashMap<ListKey, Value>) {
+    if super::super::is_save_disabled() {
+        return;
+    }
+    // Convert HashMap<ListKey, Value> → Value::Tagged("List", BTreeMap)
+    // to match the format that load_holds_map / the compiler expects.
+    let fields: BTreeMap<std::sync::Arc<str>, Value> = items
+        .iter()
+        .map(|(k, v)| (std::sync::Arc::from(k.0.as_ref()), v.clone()))
+        .collect();
+    let list_value = Value::Tagged {
+        tag: std::sync::Arc::from("List"),
+        fields: std::sync::Arc::new(fields),
+    };
+    save_hold_state(storage_key, hold_name, &list_value);
 }
 
 /// Load full program state from localStorage into the provided maps.

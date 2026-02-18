@@ -7,7 +7,7 @@
 //! Uses the existing Boon parser. The compiler walks the static AST
 //! and evaluates/compiles expressions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -22,7 +22,7 @@ use crate::parser::{
 
 use super::types::{
     BroadcastHandlerFn, CollectionSpec, DataflowGraph, InputId, InputKind, InputSpec,
-    SideEffectKind, VarId,
+    KeyedListOutput, ListKey, SideEffectKind, VarId,
 };
 use super::value::Value;
 
@@ -1659,6 +1659,21 @@ impl Compiler {
 }
 
 // ---------------------------------------------------------------------------
+// Display pipeline info extracted from function bodies
+// ---------------------------------------------------------------------------
+
+/// Information about a display pipeline found in a function body.
+/// Holds the retain arguments and map transform expression.
+struct DisplayPipelineInfo {
+    /// The arguments of the List/retain call (None if no retain, e.g., shopping_list).
+    retain_arguments: Option<Vec<Spanned<Argument>>>,
+    /// The item parameter name from List/map (e.g., "item").
+    map_item_param: String,
+    /// The `new:` expression from List/map (e.g., `todo_item(todo: item)`).
+    map_new_expr: Spanned<Expression>,
+}
+
+// ---------------------------------------------------------------------------
 // GraphBuilder — builds DataflowGraph from AST
 // ---------------------------------------------------------------------------
 
@@ -1670,6 +1685,16 @@ struct GraphBuilder<'a> {
     next_anon_id: usize,
     /// Tracks which variables are reactive (have been added as collections).
     reactive_vars: IndexMap<String, VarId>,
+    /// Tracks keyed hold variables (list name → keyed VarId).
+    /// Keyed vars hold `(ListKey, Value)` pairs from KeyedHoldState.
+    /// Used by compile_list_count and compile_list_retain to use DD-native
+    /// keyed operators (O(1) per item) instead of scalar Map on assembled list.
+    keyed_hold_vars: IndexMap<String, VarId>,
+    /// Tracks VarIds that contain keyed `(ListKey, Value)` collections.
+    /// Populated from keyed_hold_vars and extended by keyed operations
+    /// (ListRetain, ListRetainReactive, ListMap, ListMapWithKey).
+    /// Used by resolve_keyed_source to find keyed results of chained operations.
+    keyed_collection_vars: HashSet<VarId>,
     /// Scope prefix for resolving nested object references.
     /// E.g., when compiling `store.nav_action`, scope_prefix = "store"
     /// so `nav.home.event.press` resolves to `store.nav.home.event.press`.
@@ -1678,6 +1703,11 @@ struct GraphBuilder<'a> {
     storage_key: Option<String>,
     /// Pre-loaded persisted hold values (hold_name → value).
     persisted_holds: &'a std::collections::HashMap<String, Value>,
+    /// Short name of the keyed list whose display pipeline was extracted
+    /// into DD operators. When set, `build_doc_template` will emit an
+    /// empty list for `items:` expressions that reference this list,
+    /// so the bridge can populate items via keyed diffs instead.
+    keyed_display_list_name: Option<String>,
 }
 
 impl<'a> GraphBuilder<'a> {
@@ -1693,9 +1723,12 @@ impl<'a> GraphBuilder<'a> {
             next_input_id: 0,
             next_anon_id: 0,
             reactive_vars: IndexMap::new(),
+            keyed_hold_vars: IndexMap::new(),
+            keyed_collection_vars: HashSet::new(),
             scope_prefix: None,
             storage_key: storage_key.map(|s| s.to_string()),
             persisted_holds,
+            keyed_display_list_name: None,
         }
     }
 
@@ -1749,6 +1782,33 @@ impl<'a> GraphBuilder<'a> {
         }
         self.scope_prefix = None;
 
+        // Between Pass 1 and Pass 2: Build keyed display pipeline.
+        // Scans function bodies for `PASSED.store.<keyed_name> |> List/retain(...) |> List/map(...)`
+        // and compiles keyed DD operators: ListRetainReactive → ListMapWithKey.
+        // The display_var points to the post-retain-post-map keyed collection for O(1) per-item diffs.
+        let keyed_list_output = if let Some((list_name, keyed_var)) = self.keyed_hold_vars.first() {
+            let list_name = list_name.clone();
+            let keyed_var = keyed_var.clone();
+            let short_name = list_name.strip_prefix("store.").unwrap_or(&list_name).to_string();
+            let display_var = self.build_display_pipeline(&list_name, &keyed_var)
+                .unwrap_or_else(|_| keyed_var.clone());
+            // Find the element tag of the Stripe that displays keyed items
+            let element_tag = self.compiler.find_keyed_stripe_element_tag(&short_name);
+            // Record the list name so build_doc_template can emit empty items
+            self.keyed_display_list_name = Some(short_name);
+            Some(KeyedListOutput {
+                display_var,
+                persistence_var: keyed_var,
+                // Persistence uses a separate inspect on persistence_var (raw data).
+                // display_var inspect sends element Values to bridge only.
+                storage_key: self.storage_key.clone(),
+                hold_name: Some(list_name),
+                element_tag,
+            })
+        } else {
+            None
+        };
+
         // Pass 2: Compile the document expression
         let doc_var = self.compile_document_expr(doc_expr)?;
 
@@ -1757,6 +1817,7 @@ impl<'a> GraphBuilder<'a> {
             collections: std::mem::take(&mut self.collections),
             document: doc_var,
             storage_key: self.storage_key.clone(),
+            keyed_list_output,
         })
     }
 
@@ -2711,6 +2772,7 @@ impl<'a> GraphBuilder<'a> {
             .map(|(name, _)| name.clone())
             .collect();
 
+
         if reactive_deps.is_empty() {
             // Static document
             let val = self.compiler.eval_static(expr)
@@ -2771,6 +2833,8 @@ impl<'a> GraphBuilder<'a> {
                 }
 
                 // Build document closure that evaluates with reactive values in scope
+                #[cfg(target_arch = "wasm32")]
+                zoon::println!("[DD v2] compile_document_expr: root-derived path, root={}", root_dep);
                 let compiler_clone = self.compiler.clone();
                 let doc_expr_clone = expr.clone();
                 let root_dep_name = root_dep.clone();
@@ -2887,7 +2951,11 @@ impl<'a> GraphBuilder<'a> {
         reactive_var_name: &str,
         doc_expr: &Spanned<Expression>,
     ) -> Result<Arc<dyn Fn(&Value) -> Value + 'static>, String> {
-        let doc_template = self.compiler.build_doc_template(reactive_var_name, doc_expr)?;
+        let doc_template = self.compiler.build_doc_template_keyed(
+            reactive_var_name,
+            doc_expr,
+            self.keyed_display_list_name.as_deref(),
+        )?;
         Ok(Arc::new(move |reactive_value: &Value| {
             doc_template.instantiate(reactive_value)
         }))
@@ -3640,12 +3708,47 @@ impl<'a> GraphBuilder<'a> {
         Ok(flatmap_var)
     }
 
-    /// Compile `source |> List/count()` as a Map on a scalar Value::List.
+    /// Compile `source |> List/count()`.
+    ///
+    /// Uses keyed DD operators when the source is a keyed collection:
+    /// - Direct keyed source (e.g., `todos |> List/count()`) → direct ListCount
+    /// - Keyed source through retain (e.g., `todos |> List/retain(...) |> List/count()`)
+    ///   → ListCount wrapped in HoldState(initial=0) for empty-safety
     fn compile_list_count(
         &mut self,
         name: &str,
         from: &Spanned<Expression>,
     ) -> Result<VarId, String> {
+        // Case 1: Direct keyed source (e.g., `todos |> List/count()`)
+        // No wrapper needed — the keyed_hold always has initial items from LiteralList,
+        // so ListCount fires at t=0 with the correct initial count.
+        if let Some(keyed_var) = self.resolve_keyed_source(from) {
+            let count_var = VarId::new(name);
+            self.collections.insert(
+                count_var.clone(),
+                CollectionSpec::ListCount(keyed_var),
+            );
+            self.reactive_vars.insert(name.to_string(), count_var.clone());
+            return Ok(count_var);
+        }
+
+        // Case 2: Keyed source through retain pipe
+        // Pattern: `keyed_source |> List/retain(item, if: predicate) |> List/count()`
+        // Uses HoldState(initial=0, events=ListCount) because ListRetain may produce
+        // empty results, and ListCount on empty keyed collection never fires.
+        if let Expression::Pipe { from: inner_from, to: inner_to } = &from.node {
+            if let Expression::FunctionCall { path, arguments } = &inner_to.node {
+                let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                if path_strs.as_slice() == ["List", "retain"] {
+                    if let Some(keyed_var) = self.resolve_keyed_source(inner_from) {
+                        let retain_var = self.compile_inline_keyed_retain(keyed_var, arguments)?;
+                        return self.build_empty_safe_keyed_count(name, retain_var);
+                    }
+                }
+            }
+        }
+
+        // Scalar fallback: compile source and use Map for counting
         let source_var = self.resolve_list_source(from)?;
         let count_var = VarId::new(name);
         self.collections.insert(
@@ -3657,6 +3760,345 @@ impl<'a> GraphBuilder<'a> {
         );
         self.reactive_vars.insert(name.to_string(), count_var.clone());
         Ok(count_var)
+    }
+
+    /// Build a keyed ListCount with HoldState for empty-safety.
+    ///
+    /// Creates: `HoldState(initial=Literal(0), events=ListCount(keyed_var))`.
+    /// - At t=0: HoldState starts with initial_value=0
+    /// - If ListCount fires (non-empty retain result): state updates to actual count
+    /// - If ListCount doesn't fire (empty retain result): state stays at 0
+    fn build_empty_safe_keyed_count(&mut self, name: &str, keyed_var: VarId) -> Result<VarId, String> {
+        // ListCount on the keyed retain result
+        let count_events_var = self.fresh_var(&format!("{}_count_events", name));
+        self.collections.insert(
+            count_events_var.clone(),
+            CollectionSpec::ListCount(keyed_var),
+        );
+
+        // Literal(0) as initial value
+        let zero_var = self.fresh_var(&format!("{}_zero", name));
+        self.collections.insert(
+            zero_var.clone(),
+            CollectionSpec::Literal(Value::number(0.0)),
+        );
+
+        // HoldState: starts at 0, updates to ListCount result when available
+        let count_var = VarId::new(name);
+        self.collections.insert(
+            count_var.clone(),
+            CollectionSpec::HoldState {
+                initial: zero_var,
+                events: count_events_var,
+                initial_value: Value::number(0.0),
+                transform: Arc::new(|_state: &Value, event: &Value| event.clone()),
+            },
+        );
+        self.reactive_vars.insert(name.to_string(), count_var.clone());
+        Ok(count_var)
+    }
+
+    /// Compile a keyed ListRetain inline (not as a named variable).
+    ///
+    /// Used by compile_list_count for `keyed |> List/retain(...) |> List/count()`
+    /// chains. Returns the keyed VarId of the retain result.
+    fn compile_inline_keyed_retain(
+        &mut self,
+        keyed_var: VarId,
+        arguments: &[Spanned<Argument>],
+    ) -> Result<VarId, String> {
+        let item_param: String = arguments.iter()
+            .find(|a| a.node.value.is_none())
+            .map(|a| a.node.name.as_str().to_string())
+            .unwrap_or_else(|| "item".to_string());
+
+        let predicate_expr = arguments.iter()
+            .find(|a| a.node.name.as_str() == "if")
+            .and_then(|a| a.node.value.as_ref())
+            .ok_or_else(|| "List/retain missing 'if' argument".to_string())?;
+
+        let reactive_deps = self.find_reactive_deps_in_expr(predicate_expr);
+
+        let retain_var = self.fresh_var("keyed_retain");
+
+        if reactive_deps.is_empty() {
+            // Static predicate → CollectionSpec::ListRetain
+            let compiler = self.compiler.clone();
+            let pred_expr = predicate_expr.clone();
+            let param_name = item_param;
+
+            self.collections.insert(
+                retain_var.clone(),
+                CollectionSpec::ListRetain {
+                    source: keyed_var,
+                    predicate: Arc::new(move |item: &Value| {
+                        let mut scope = indexmap::IndexMap::new();
+                        scope.insert(param_name.clone(), item.clone());
+                        compiler.eval_static_with_scope(&pred_expr, &scope)
+                            .and_then(|v| Ok(v.as_bool().unwrap_or(false)))
+                            .unwrap_or(false)
+                    }),
+                },
+            );
+        } else {
+            // Reactive predicate → CollectionSpec::ListRetainReactive
+            let reactive_dep = reactive_deps[0].clone();
+            let reactive_var = self.reactive_vars.get(&reactive_dep)
+                .cloned()
+                .ok_or_else(|| format!("List/retain: reactive dep '{}' not found", reactive_dep))?;
+
+            let compiler = self.compiler.clone();
+            let pred_expr = predicate_expr.clone();
+            let param_name = item_param;
+            // Build the path parts for constructing __passed object.
+            // reactive_dep = "store.selected_filter" → parts = ["store", "selected_filter"]
+            let dep_parts: Vec<String> = reactive_dep.split('.').map(|s| s.to_string()).collect();
+
+            // Wrap filter_state in HoldLatest with a default value.
+            // The filter collection may not have data at epoch 0 (e.g., Router-derived).
+            // HoldLatest ensures a default is available for the initial join.
+            let filter_default = self.fresh_var("filter_default");
+            self.collections.insert(
+                filter_default.clone(),
+                CollectionSpec::Literal(Value::tag("All")),
+            );
+            let filter_with_default = self.fresh_var("filter_with_default");
+            self.collections.insert(
+                filter_with_default.clone(),
+                CollectionSpec::HoldLatest(vec![filter_default, reactive_var]),
+            );
+
+            self.collections.insert(
+                retain_var.clone(),
+                CollectionSpec::ListRetainReactive {
+                    list: keyed_var,
+                    filter_state: filter_with_default,
+                    predicate: Arc::new(move |item: &Value, filter: &Value| {
+                        let mut scope = indexmap::IndexMap::new();
+                        scope.insert(param_name.clone(), item.clone());
+                        // Build __passed object: { store: { selected_filter: filter } }
+                        // The predicate expression uses PASSED.store.X which traverses __passed.
+                        let mut passed_val = filter.clone();
+                        for part in dep_parts.iter().rev() {
+                            let mut fields = std::collections::BTreeMap::new();
+                            fields.insert(Arc::from(part.as_str()), passed_val);
+                            passed_val = Value::Object(Arc::new(fields));
+                        }
+                        scope.insert("__passed".to_string(), passed_val);
+                        compiler.eval_static_with_scope(&pred_expr, &scope)
+                            .and_then(|v| Ok(v.as_bool().unwrap_or(false)))
+                            .unwrap_or(false)
+                    }),
+                },
+            );
+        }
+
+        self.keyed_collection_vars.insert(retain_var.clone());
+        Ok(retain_var)
+    }
+
+    /// Build the keyed display pipeline for a list.
+    ///
+    /// Scans function bodies for the pattern:
+    ///   `PASSED.store.<list_name> |> List/retain(...) |> List/map(item, new: ...)`
+    /// and compiles it as keyed DD operators:
+    ///   `keyed_hold_var → ListRetainReactive → ListMapWithKey`
+    ///
+    /// The resulting display_var emits `(ListKey, Value)` pairs where each Value
+    /// is a fully-evaluated element tree (ready for the bridge to render).
+    fn build_display_pipeline(
+        &mut self,
+        list_name: &str,
+        keyed_var: &VarId,
+    ) -> Result<VarId, String> {
+        // Find the display pipeline pattern in function bodies
+        let pipeline = self.find_display_pipeline_in_functions(list_name)
+            .ok_or_else(|| format!("No display pipeline found for '{}'", list_name))?;
+
+        // Build keyed retain (if present) or use raw keyed var
+        let map_source = if let Some(ref retain_args) = pipeline.retain_arguments {
+            self.compile_inline_keyed_retain(keyed_var.clone(), retain_args)?
+        } else {
+            keyed_var.clone()
+        };
+
+        // Build ListMapWithKey (transform items to element Values + inject link paths)
+        let display_var = self.fresh_var("display_pipeline");
+        let compiler = self.compiler.clone();
+        let map_new_expr = pipeline.map_new_expr.clone();
+        let map_item_param = pipeline.map_item_param.clone();
+        let list_path = format!("store.{}", list_name.strip_prefix("store.").unwrap_or(list_name));
+
+        self.collections.insert(
+            display_var.clone(),
+            CollectionSpec::ListMapWithKey {
+                source: map_source,
+                f: Arc::new(move |key: &ListKey, item: &Value| {
+                    // Inject link paths and hover state before evaluating the element template
+                    let item_with_links = inject_item_link_paths_with_key(
+                        item, &list_path, key.0.as_ref(),
+                    );
+                    let mut scope = IndexMap::new();
+                    scope.insert(map_item_param.clone(), item_with_links);
+                    // Use tolerant eval — the map function body may contain
+                    // WHILE, WHEN, LINK patterns that need tolerance
+                    compiler.eval_static_tolerant(&map_new_expr, &scope)
+                }),
+            },
+        );
+        self.keyed_collection_vars.insert(display_var.clone());
+        Ok(display_var)
+    }
+
+    /// Scan function bodies for the display pipeline pattern on a keyed list.
+    ///
+    /// Looks for: `PASSED.store.<list_name> |> List/retain(...) |> List/map(item, new: ...)`
+    /// in `items:` arguments of Element/stripe calls within function bodies.
+    fn find_display_pipeline_in_functions(
+        &self,
+        list_name: &str,
+    ) -> Option<DisplayPipelineInfo> {
+        // The keyed name without "store." prefix for matching PASSED.store.<name>
+        let short_name = list_name.strip_prefix("store.").unwrap_or(list_name);
+
+        for (_fn_name, _params, body) in &self.compiler.functions {
+            if let Some(info) = self.find_display_pipeline_in_expr(body, short_name) {
+                return Some(info);
+            }
+        }
+        None
+    }
+
+    /// Recursively search an expression for the display pipeline pattern.
+    fn find_display_pipeline_in_expr(
+        &self,
+        expr: &Spanned<Expression>,
+        list_short_name: &str,
+    ) -> Option<DisplayPipelineInfo> {
+        match &expr.node {
+            // Check Element/stripe calls for items: argument with the pattern
+            Expression::FunctionCall { path, arguments } => {
+                let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                if matches!(path_strs.as_slice(), ["Element", "stripe"]) {
+                    // Check the items: argument
+                    if let Some(items_arg) = arguments.iter().find(|a| a.node.name.as_str() == "items") {
+                        if let Some(ref items_expr) = items_arg.node.value {
+                            if let Some(info) = self.match_display_pipeline_pattern(items_expr, list_short_name) {
+                                return Some(info);
+                            }
+                        }
+                    }
+                }
+                // Recurse into all argument values
+                for arg in arguments {
+                    if let Some(ref val_expr) = arg.node.value {
+                        if let Some(info) = self.find_display_pipeline_in_expr(val_expr, list_short_name) {
+                            return Some(info);
+                        }
+                    }
+                }
+            }
+            Expression::Pipe { from, to } => {
+                if let Some(info) = self.find_display_pipeline_in_expr(from, list_short_name) {
+                    return Some(info);
+                }
+                if let Some(info) = self.find_display_pipeline_in_expr(to, list_short_name) {
+                    return Some(info);
+                }
+            }
+            Expression::Block { variables, output, .. } => {
+                for var in variables {
+                    if let Some(info) = self.find_display_pipeline_in_expr(&var.node.value, list_short_name) {
+                        return Some(info);
+                    }
+                }
+                if let Some(info) = self.find_display_pipeline_in_expr(output, list_short_name) {
+                    return Some(info);
+                }
+            }
+            Expression::While { arms } | Expression::When { arms } => {
+                for arm in arms {
+                    if let Some(info) = self.find_display_pipeline_in_expr(&arm.body, list_short_name) {
+                        return Some(info);
+                    }
+                }
+            }
+            Expression::List { items } => {
+                for item in items {
+                    if let Some(info) = self.find_display_pipeline_in_expr(item, list_short_name) {
+                        return Some(info);
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Match the specific pattern:
+    ///   `PASSED.store.<list_name> |> List/retain(...) |> List/map(item, new: ...)`
+    ///
+    /// Returns the extracted pipeline info if the pattern matches.
+    fn match_display_pipeline_pattern(
+        &self,
+        expr: &Spanned<Expression>,
+        list_short_name: &str,
+    ) -> Option<DisplayPipelineInfo> {
+        if let Expression::Pipe { from: outer_from, to: outer_to } = &expr.node {
+            // Check outer_to is List/map(...)
+            if let Expression::FunctionCall { path: map_path, arguments: map_args } = &outer_to.node {
+                let map_path_strs: Vec<&str> = map_path.iter().map(|s| s.as_str()).collect();
+                if map_path_strs.as_slice() != ["List", "map"] {
+                    return None;
+                }
+
+                // Extract map info (shared by both patterns)
+                let map_item_param = map_args.iter()
+                    .find(|a| a.node.value.is_none())
+                    .map(|a| a.node.name.as_str().to_string())
+                    .unwrap_or_else(|| "item".to_string());
+
+                let map_new_expr = map_args.iter()
+                    .find(|a| a.node.name.as_str() == "new")
+                    .and_then(|a| a.node.value.as_ref())?
+                    .clone();
+
+                // Pattern 1: PASSED.store.<name> |> List/retain(...) |> List/map(...)
+                if let Expression::Pipe { from: inner_from, to: inner_to } = &outer_from.node {
+                    if self.is_passed_store_alias(inner_from, list_short_name) {
+                        if let Expression::FunctionCall { path: retain_path, arguments: retain_args } = &inner_to.node {
+                            let retain_path_strs: Vec<&str> = retain_path.iter().map(|s| s.as_str()).collect();
+                            if retain_path_strs.as_slice() == ["List", "retain"] {
+                                return Some(DisplayPipelineInfo {
+                                    retain_arguments: Some(retain_args.clone()),
+                                    map_item_param,
+                                    map_new_expr,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Pattern 2: PASSED.store.<name> |> List/map(...) (no retain)
+                if self.is_passed_store_alias(outer_from, list_short_name) {
+                    return Some(DisplayPipelineInfo {
+                        retain_arguments: None,
+                        map_item_param,
+                        map_new_expr,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if an expression is `PASSED.store.<name>`.
+    fn is_passed_store_alias(&self, expr: &Spanned<Expression>, expected_name: &str) -> bool {
+        if let Expression::Alias(Alias::WithPassed { extra_parts }) = &expr.node {
+            let parts: Vec<&str> = extra_parts.iter().map(|s| s.as_str()).collect();
+            return parts == ["store", expected_name];
+        }
+        false
     }
 
     /// Compile `source |> List/retain(item, if: predicate)`.
@@ -3671,8 +4113,6 @@ impl<'a> GraphBuilder<'a> {
         from: &Spanned<Expression>,
         arguments: &[Spanned<Argument>],
     ) -> Result<VarId, String> {
-        let source_var = self.resolve_list_source(from)?;
-
         // Extract the item parameter name (e.g., "n" from `List/retain(n, if: ...)`)
         let item_param: String = arguments.iter()
             .find(|a| a.node.value.is_none())
@@ -3687,6 +4127,13 @@ impl<'a> GraphBuilder<'a> {
 
         // Check if predicate depends on any reactive variables
         let reactive_deps = self.find_reactive_deps_in_expr(predicate_expr);
+
+        // Use scalar approach on assembled list.
+        // Keyed ListRetain/ListRetainReactive will be used later for the bridge
+        // display pipeline (Task 5). For now, retain→count chains must stay scalar
+        // because keyed ListRetain on empty results produces no diffs, which would
+        // block downstream ListCount from emitting.
+        let source_var = self.resolve_list_source(from)?;
 
         if reactive_deps.is_empty() {
             // Static predicate: simple Map that filters items
@@ -4039,7 +4486,7 @@ impl<'a> GraphBuilder<'a> {
         initial_list_expr: &Spanned<Expression>,
         ops: &[ListChainOp],
     ) -> Result<VarId, String> {
-        use super::types::{ClassifyFn, ListKey};
+        use super::types::ClassifyFn;
 
         // Evaluate initial list statically
         let initial_list = self.compiler.eval_static(initial_list_expr)
@@ -4270,6 +4717,9 @@ impl<'a> GraphBuilder<'a> {
 
         // 6. KeyedHoldState: per-item state with self-removal sentinel + broadcast support
         let keyed_hold_var = self.fresh_var("keyed_hold");
+        // Store the keyed var for downstream keyed operators (ListCount, ListRetain)
+        self.keyed_hold_vars.insert(name.to_string(), keyed_hold_var.clone());
+        self.keyed_collection_vars.insert(keyed_hold_var.clone());
         self.collections.insert(
             keyed_hold_var.clone(),
             CollectionSpec::KeyedHoldState {
@@ -4355,29 +4805,49 @@ impl<'a> GraphBuilder<'a> {
             },
         );
 
-        // 7. AssembleList: keyed → scalar for document and other references
+        // 7. Stub list for document closure (Phase 2).
+        // Items render via keyed diffs from the display pipeline — O(1) per item change.
+        // The document closure only needs the list for structural checks like
+        // List/is_empty(). We derive a "stub list" from ListCount on the keyed hold:
+        //   keyed_hold → ListCount → Map(count_to_stub_list) → reactive_var
+        // This is O(1) per add/remove (count changes), NOT O(N) per item change.
+        let count_var = self.fresh_var(&format!("{}_count_for_stub", name));
+        self.collections.insert(
+            count_var.clone(),
+            CollectionSpec::ListCount(keyed_hold_var),
+        );
         let list_var = VarId::new(name);
         self.collections.insert(
             list_var.clone(),
-            CollectionSpec::AssembleList(keyed_hold_var),
+            CollectionSpec::Map {
+                source: count_var,
+                f: Arc::new(|count_val: &Value| {
+                    let count = count_val.as_number().unwrap_or(0.0) as usize;
+                    if count == 0 {
+                        Value::empty_list()
+                    } else {
+                        // Stub list with N placeholder items — just enough for
+                        // List/is_empty() and List/count() to return correct results.
+                        // Actual item rendering flows via keyed diffs.
+                        let mut fields = std::collections::BTreeMap::new();
+                        for i in 0..count {
+                            fields.insert(
+                                Arc::from(format!("{:04}", i).as_str()),
+                                Value::Unit,
+                            );
+                        }
+                        Value::Tagged {
+                            tag: Arc::from("List"),
+                            fields: Arc::new(fields),
+                        }
+                    }
+                }),
+            },
         );
-
         self.reactive_vars.insert(name.to_string(), list_var.clone());
 
-        // 8. Emit persistence side effect
-        if let Some(key) = self.storage_key.clone() {
-            let persist_var = self.fresh_var(&format!("{}_persist", name));
-            self.collections.insert(
-                persist_var,
-                CollectionSpec::SideEffect {
-                    source: list_var.clone(),
-                    effect: SideEffectKind::PersistHold {
-                        key,
-                        hold_name: name.to_string(),
-                    },
-                },
-            );
-        }
+        // 8. Persistence handled by keyed diff path in worker.rs
+        // (KeyedPersistenceState + save_keyed_list). No SideEffect needed.
 
         Ok(list_var)
     }
@@ -4476,6 +4946,41 @@ impl<'a> GraphBuilder<'a> {
         }
     }
 
+    /// Try to resolve a source expression as a keyed collection.
+    ///
+    /// Checks both `keyed_hold_vars` (initial keyed sources) and
+    /// `keyed_collection_vars` (results of keyed operations like ListRetain).
+    /// Only matches direct alias references (not Pipe expressions).
+    /// Handles scope prefix resolution (e.g., `todos` → `store.todos`).
+    fn resolve_keyed_source(&self, expr: &Spanned<Expression>) -> Option<VarId> {
+        if let Expression::Alias(Alias::WithoutPassed { parts, .. }) = &expr.node {
+            let name = parts.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(".");
+            // Direct lookup in keyed_hold_vars
+            if let Some(var) = self.keyed_hold_vars.get(&name) {
+                return Some(var.clone());
+            }
+            // Check keyed_collection_vars
+            let var_id = VarId::new(name.as_str());
+            if self.keyed_collection_vars.contains(&var_id) {
+                return Some(var_id);
+            }
+            // Try with scope prefix (e.g., "todos" → "store.todos")
+            if parts.len() == 1 {
+                if let Some(ref prefix) = self.scope_prefix {
+                    let full_name = format!("{}.{}", prefix, name);
+                    if let Some(var) = self.keyed_hold_vars.get(&full_name) {
+                        return Some(var.clone());
+                    }
+                    let full_var_id = VarId::new(full_name.as_str());
+                    if self.keyed_collection_vars.contains(&full_var_id) {
+                        return Some(full_var_id);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Find reactive variable names referenced in an expression.
     fn find_reactive_deps_in_expr(&self, expr: &Spanned<Expression>) -> Vec<String> {
         let mut deps = Vec::new();
@@ -4507,6 +5012,11 @@ impl<'a> GraphBuilder<'a> {
                     deps.push(full_path);
                 } else if self.reactive_vars.contains_key(&path) {
                     deps.push(path);
+                } else if let Some(without_passed) = path.strip_prefix("PASSED.") {
+                    // PASSED.store.X → store.X in reactive_vars
+                    if self.reactive_vars.contains_key(without_passed) {
+                        deps.push(without_passed.to_string());
+                    }
                 }
             }
             Expression::Pipe { from, to } => {
@@ -4581,6 +5091,7 @@ impl<'a> GraphBuilder<'a> {
                 self.has_initial_value(list) && self.has_initial_value(filter_state)
             }
             Some(CollectionSpec::ListMap { source, .. }) => self.has_initial_value(source),
+            Some(CollectionSpec::ListMapWithKey { source, .. }) => self.has_initial_value(source),
             Some(CollectionSpec::ListAppend { list, .. }) => self.has_initial_value(list),
             Some(CollectionSpec::ListRemove { list, .. }) => self.has_initial_value(list),
             Some(CollectionSpec::MapToKeyed { .. }) => false, // Event stream, no initial value
@@ -4797,7 +5308,6 @@ fn extract_list_item_key_from_path(path: &str) -> Option<String> {
     None
 }
 
-/// Set a nested field in a Value object using dot-separated path.
 fn set_nested_field(obj: &Value, path: &str, value: Value) -> Value {
     let parts: Vec<&str> = path.splitn(2, '.').collect();
     if parts.len() == 1 {
@@ -4904,6 +5414,24 @@ impl Compiler {
         reactive_var_name: &str,
         expr: &Spanned<Expression>,
     ) -> Result<DocTemplate, String> {
+        self.build_doc_template_inner(reactive_var_name, expr, None)
+    }
+
+    fn build_doc_template_keyed(
+        &self,
+        reactive_var_name: &str,
+        expr: &Spanned<Expression>,
+        keyed_list_name: Option<&str>,
+    ) -> Result<DocTemplate, String> {
+        self.build_doc_template_inner(reactive_var_name, expr, keyed_list_name)
+    }
+
+    fn build_doc_template_inner(
+        &self,
+        reactive_var_name: &str,
+        expr: &Spanned<Expression>,
+        keyed_list_name: Option<&str>,
+    ) -> Result<DocTemplate, String> {
         match &expr.node {
             Expression::Alias(Alias::WithoutPassed { parts, .. }) => {
                 let name = parts[0].as_str();
@@ -4911,7 +5439,7 @@ impl Compiler {
                     Ok(DocTemplate::ReactiveRef)
                 } else if parts.len() == 1 {
                     if let Some(var_expr) = self.get_var_expr(name).cloned() {
-                        self.build_doc_template(reactive_var_name, &var_expr)
+                        self.build_doc_template_inner(reactive_var_name, &var_expr, keyed_list_name)
                     } else {
                         let val = self.eval_static(expr)?;
                         Ok(DocTemplate::Static(val))
@@ -4930,9 +5458,10 @@ impl Compiler {
                         for arg in arguments {
                             let name = arg.node.name.as_str().to_string();
                             if let Some(ref val_expr) = arg.node.value {
-                                let tmpl = self.build_doc_template(
+                                let tmpl = self.build_doc_template_inner(
                                     reactive_var_name,
                                     val_expr,
+                                    keyed_list_name,
                                 )?;
                                 field_templates.push((name, tmpl));
                             }
@@ -4948,10 +5477,34 @@ impl Compiler {
                         for arg in arguments {
                             let name = arg.node.name.as_str().to_string();
                             if let Some(ref val_expr) = arg.node.value {
-                                let tmpl = self.build_doc_template(
-                                    reactive_var_name,
-                                    val_expr,
-                                )?;
+                                // For "items:" on a Stripe, check if this expression
+                                // is the keyed display pipeline (PASSED.store.<name> |> ...)
+                                // and emit an empty list so the bridge uses keyed diffs.
+                                let tmpl = if name == "items" && *elem_type == "stripe" {
+                                    if let Some(kln) = keyed_list_name {
+                                        if self.expr_references_passed_store(val_expr, kln) {
+                                            DocTemplate::Static(Value::empty_list())
+                                        } else {
+                                            self.build_doc_template_inner(
+                                                reactive_var_name,
+                                                val_expr,
+                                                keyed_list_name,
+                                            )?
+                                        }
+                                    } else {
+                                        self.build_doc_template_inner(
+                                            reactive_var_name,
+                                            val_expr,
+                                            keyed_list_name,
+                                        )?
+                                    }
+                                } else {
+                                    self.build_doc_template_inner(
+                                        reactive_var_name,
+                                        val_expr,
+                                        keyed_list_name,
+                                    )?
+                                };
                                 // Check for LINK binding and add press_link
                                 if name == "element" {
                                     if self.expr_contains_link(val_expr) {
@@ -4986,7 +5539,7 @@ impl Compiler {
             Expression::Pipe { from, to } => {
                 match &to.node {
                     Expression::FunctionCall { .. } => {
-                        self.build_doc_template(reactive_var_name, to)
+                        self.build_doc_template_inner(reactive_var_name, to, keyed_list_name)
                             .or_else(|_| {
                                 let val = self.eval_static(expr).unwrap_or(Value::Unit);
                                 Ok(DocTemplate::Static(val))
@@ -5002,7 +5555,7 @@ impl Compiler {
             Expression::List { items } => {
                 let mut item_templates = Vec::new();
                 for (i, item) in items.iter().enumerate() {
-                    let tmpl = self.build_doc_template(reactive_var_name, item)?;
+                    let tmpl = self.build_doc_template_inner(reactive_var_name, item, keyed_list_name)?;
                     item_templates.push((format!("{:04}", i), tmpl));
                 }
                 Ok(DocTemplate::Tagged {
@@ -5049,9 +5602,10 @@ impl Compiler {
                 let mut field_templates = Vec::new();
                 for var in &obj.variables {
                     let name = var.node.name.as_str().to_string();
-                    let tmpl = self.build_doc_template(
+                    let tmpl = self.build_doc_template_inner(
                         reactive_var_name,
                         &var.node.value,
+                        keyed_list_name,
                     )?;
                     field_templates.push((name, tmpl));
                 }
@@ -5090,6 +5644,86 @@ impl Compiler {
             }
         }
         None
+    }
+
+    /// Check if an expression (or any sub-expression in a Pipe) references
+    /// `PASSED.store.<name>` for the given short name.
+    fn expr_references_passed_store(&self, expr: &Spanned<Expression>, short_name: &str) -> bool {
+        match &expr.node {
+            Expression::Alias(Alias::WithPassed { extra_parts }) => {
+                let parts: Vec<&str> = extra_parts.iter().map(|s| s.as_str()).collect();
+                parts == ["store", short_name]
+            }
+            Expression::Pipe { from, to } => {
+                self.expr_references_passed_store(from, short_name)
+                    || self.expr_references_passed_store(to, short_name)
+            }
+            _ => false,
+        }
+    }
+
+    /// Find the element tag of the Stripe that displays keyed list items.
+    /// Scans function bodies for `Element/stripe(element: [tag: X], items: PASSED.store.<name> |> ...)`
+    /// and returns the tag X (e.g., "Ul" for todo_mvc's todos_element).
+    fn find_keyed_stripe_element_tag(&self, keyed_list_short_name: &str) -> Option<String> {
+        for (_, _, body) in &self.functions {
+            if let Some(tag) = self.find_keyed_stripe_tag_in_expr(body, keyed_list_short_name) {
+                return Some(tag);
+            }
+        }
+        None
+    }
+
+    fn find_keyed_stripe_tag_in_expr(
+        &self,
+        expr: &Spanned<Expression>,
+        keyed_list_short_name: &str,
+    ) -> Option<String> {
+        match &expr.node {
+            Expression::FunctionCall { path, arguments } => {
+                let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                if let ["Element", "stripe"] = path_strs.as_slice() {
+                    // Check if items: references the keyed list
+                    let has_keyed_items = arguments.iter().any(|arg| {
+                        arg.node.name.as_str() == "items"
+                            && arg.node.value.as_ref().map_or(false, |v| {
+                                self.expr_references_passed_store(v, keyed_list_short_name)
+                            })
+                    });
+                    if has_keyed_items {
+                        // Extract tag from element: [tag: X]
+                        for arg in arguments {
+                            if arg.node.name.as_str() == "element" {
+                                if let Some(ref val_expr) = arg.node.value {
+                                    if let Ok(val) = self.eval_static(val_expr) {
+                                        if let Some(tag) = val.get_field("tag").and_then(|t| t.as_tag()) {
+                                            return Some(tag.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Recurse into arguments
+                for arg in arguments {
+                    if let Some(ref val_expr) = arg.node.value {
+                        if let Some(tag) = self.find_keyed_stripe_tag_in_expr(val_expr, keyed_list_short_name) {
+                            return Some(tag);
+                        }
+                    }
+                }
+                None
+            }
+            Expression::Pipe { from, to } => {
+                self.find_keyed_stripe_tag_in_expr(from, keyed_list_short_name)
+                    .or_else(|| self.find_keyed_stripe_tag_in_expr(to, keyed_list_short_name))
+            }
+            Expression::Block { output, .. } => {
+                self.find_keyed_stripe_tag_in_expr(output, keyed_list_short_name)
+            }
+            _ => None,
+        }
     }
 
     fn expr_contains_link(&self, expr: &Spanned<Expression>) -> bool {

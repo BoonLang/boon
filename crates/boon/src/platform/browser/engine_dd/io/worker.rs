@@ -18,7 +18,7 @@ use zoon::*;
 
 use super::super::core::runtime;
 use super::super::core::types::{
-    DataflowGraph, InputId, InputKind, LinkId, ListKey, SideEffectKind,
+    DataflowGraph, InputId, InputKind, KeyedDiff, LinkId, ListKey, SideEffectKind,
 };
 use super::super::core::value::Value;
 
@@ -59,6 +59,25 @@ pub struct DdWorkerHandle {
     /// Side-effect buffer — separate from inner to avoid borrow conflicts
     /// during worker.step() (inspect callbacks fire while inner is borrowed).
     side_effect_buffer: Rc<RefCell<Vec<(SideEffectKind, Value)>>>,
+    /// Keyed diff buffer for bridge display (element Values from display_var).
+    keyed_diff_buffer: Rc<RefCell<Vec<KeyedDiff>>>,
+    /// Keyed diff buffer for persistence (raw data from persistence_var).
+    keyed_persist_buffer: Rc<RefCell<Vec<KeyedDiff>>>,
+    /// Keyed persistence state — HashMap maintained from persistence diffs.
+    /// Updated after each step, serialized to localStorage.
+    keyed_persistence: Rc<RefCell<Option<KeyedPersistenceState>>>,
+    /// Whether the graph has a keyed list output configured.
+    has_keyed_output: bool,
+    /// Element tag of the Stripe that displays keyed list items (e.g., "Ul").
+    keyed_stripe_element_tag: Option<String>,
+}
+
+/// State for keyed list persistence in the IO layer.
+struct KeyedPersistenceState {
+    items: HashMap<ListKey, Value>,
+    storage_key: String,
+    hold_name: String,
+    dirty: bool,
 }
 
 struct DdWorkerInner {
@@ -80,9 +99,11 @@ struct DdWorkerInner {
 
 impl DdWorkerInner {
     /// Check if output changed after a worker.step() and notify.
-    fn notify_if_changed(&mut self) {
+    /// When `force` is true, notify even if the document value hasn't changed
+    /// (used when keyed diffs arrive without scalar changes).
+    fn notify_if_changed(&mut self, force: bool) {
         let current = self.output_cell.borrow().clone();
-        if current != self.last_notified {
+        if current != self.last_notified || force {
             self.last_notified = current.clone();
             if let Some(ref cb) = self.on_output_change {
                 cb(&current);
@@ -117,6 +138,64 @@ impl DdWorkerHandle {
                     .push((kind.clone(), value.clone()));
             });
 
+        // Keyed diff buffer for bridge display (element Values from display_var)
+        let keyed_diff_buffer: Rc<RefCell<Vec<KeyedDiff>>> =
+            Rc::new(RefCell::new(Vec::new()));
+
+        // Build keyed diff callback for bridge display
+        let has_keyed_output = graph.keyed_list_output.is_some();
+        let keyed_stripe_element_tag = graph.keyed_list_output.as_ref()
+            .and_then(|klo| klo.element_tag.clone());
+        let kd_buffer_for_inspect = keyed_diff_buffer.clone();
+        let on_keyed_diff: Option<Arc<dyn Fn(KeyedDiff) + 'static>> =
+            if has_keyed_output {
+                Some(Arc::new(move |diff: KeyedDiff| {
+                    kd_buffer_for_inspect.borrow_mut().push(diff);
+                }))
+            } else {
+                None
+            };
+
+        // Keyed diff buffer for persistence (raw data from persistence_var)
+        let keyed_persist_buffer: Rc<RefCell<Vec<KeyedDiff>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let kp_buffer_for_inspect = keyed_persist_buffer.clone();
+        let on_keyed_persist: Option<Arc<dyn Fn(KeyedDiff) + 'static>> =
+            if has_keyed_output {
+                Some(Arc::new(move |diff: KeyedDiff| {
+                    kp_buffer_for_inspect.borrow_mut().push(diff);
+                }))
+            } else {
+                None
+            };
+
+        // Set up keyed persistence state if applicable
+        let keyed_persistence: Rc<RefCell<Option<KeyedPersistenceState>>> =
+            Rc::new(RefCell::new(None));
+        if let Some(ref keyed_output) = graph.keyed_list_output {
+            if let (Some(sk), Some(hn)) = (&keyed_output.storage_key, &keyed_output.hold_name) {
+                // Initialize from persisted state (load existing items)
+                let persisted_items = super::persistence::load_hold_state(sk, hn)
+                    .map(|v| {
+                        if let Value::Tagged { ref tag, ref fields } = v {
+                            if tag.as_ref() == "List" {
+                                return fields.iter()
+                                    .map(|(k, v)| (ListKey::new(k.as_ref()), v.clone()))
+                                    .collect();
+                            }
+                        }
+                        HashMap::new()
+                    })
+                    .unwrap_or_default();
+                *keyed_persistence.borrow_mut() = Some(KeyedPersistenceState {
+                    items: persisted_items,
+                    storage_key: sk.clone(),
+                    hold_name: hn.clone(),
+                    dirty: false,
+                });
+            }
+        }
+
         // Build link_path → InputId mapping from graph inputs
         let mut link_path_to_input: HashMap<String, InputId> = HashMap::new();
         let mut has_router_input = false;
@@ -140,6 +219,8 @@ impl DdWorkerHandle {
                     }
                 },
                 on_side_effect,
+                on_keyed_diff,
+                on_keyed_persist,
             )
         });
 
@@ -172,14 +253,9 @@ impl DdWorkerHandle {
             _literal_sessions_keyed: literal_sessions_keyed,
         };
 
-        // Advance event input sessions past initial epoch
-        for session in inner.inputs.values_mut() {
-            session.advance_to(1);
-            session.flush();
-        }
-        inner.epoch = 1;
-
-        // Inject initial route for Router inputs
+        // Inject initial route for Router inputs at epoch 0 (BEFORE advancing).
+        // This ensures Router-derived collections have data at the same timestamp
+        // as LiteralList/KeyedHoldState initial data, so DD joins can match them.
         if has_router_input {
             if let Some(input_id) = inner.link_path_to_input.get("__router") {
                 let path = web_sys::window()
@@ -191,6 +267,13 @@ impl DdWorkerHandle {
                 }
             }
         }
+
+        // Advance event input sessions past initial epoch
+        for session in inner.inputs.values_mut() {
+            session.advance_to(1);
+            session.flush();
+        }
+        inner.epoch = 1;
 
         // Step to propagate initial data through the dataflow chain.
         // Multiple steps may be needed for deeply chained operators.
@@ -208,12 +291,35 @@ impl DdWorkerHandle {
         let handle = DdWorkerHandle {
             inner: Rc::new(RefCell::new(inner)),
             side_effect_buffer,
+            keyed_diff_buffer,
+            keyed_persist_buffer: keyed_persist_buffer,
+            keyed_persistence,
+            has_keyed_output,
+            keyed_stripe_element_tag,
         };
 
         // Process any side effects from the initial step (e.g., persist initial hold values)
         handle.process_side_effects();
+        // Process initial keyed diffs (persist initial list state)
+        handle.process_keyed_persistence();
 
         handle
+    }
+
+    /// Drain keyed diffs accumulated during the last worker.step().
+    /// Returns the diffs for bridge consumption.
+    pub fn drain_keyed_diffs(&self) -> Vec<KeyedDiff> {
+        self.keyed_diff_buffer.borrow_mut().drain(..).collect()
+    }
+
+    /// Check if this worker has a keyed list output configured.
+    pub fn has_keyed_list(&self) -> bool {
+        self.has_keyed_output
+    }
+
+    /// Get the element tag of the Stripe that displays keyed list items.
+    pub fn keyed_stripe_element_tag(&self) -> Option<&str> {
+        self.keyed_stripe_element_tag.as_deref()
     }
 
     /// Inject an event and step the DD worker.
@@ -280,9 +386,11 @@ impl DdWorkerHandle {
                                 session.flush();
                             }
                             inner.worker.step();
-                            inner.notify_if_changed();
+                            let has_keyed = !self.keyed_diff_buffer.borrow().is_empty();
+                            inner.notify_if_changed(has_keyed);
                             drop(inner);
                             self.process_side_effects();
+                            self.process_keyed_persistence();
                             return;
                         }
                         None => {
@@ -302,10 +410,12 @@ impl DdWorkerHandle {
             }
 
             inner.worker.step();
-            inner.notify_if_changed();
+            let has_keyed = !self.keyed_diff_buffer.borrow().is_empty();
+            inner.notify_if_changed(has_keyed);
         }
         // inner borrow released — now process side effects
         self.process_side_effects();
+        self.process_keyed_persistence();
     }
 
     /// Process buffered side effects after a worker.step().
@@ -338,6 +448,39 @@ impl DdWorkerHandle {
         }
     }
 
+    /// Process keyed persistence diffs (raw data from persistence_var).
+    /// Updates the IO-layer HashMap from buffered diffs, then saves to localStorage.
+    fn process_keyed_persistence(&self) {
+        let diffs: Vec<KeyedDiff> = self.keyed_persist_buffer.borrow_mut().drain(..).collect();
+        if diffs.is_empty() {
+            return;
+        }
+
+        let mut persistence = self.keyed_persistence.borrow_mut();
+        if let Some(ref mut state) = *persistence {
+            for diff in &diffs {
+                match diff {
+                    KeyedDiff::Upsert { key, value } => {
+                        state.items.insert(key.clone(), value.clone());
+                        state.dirty = true;
+                    }
+                    KeyedDiff::Remove { key } => {
+                        state.items.remove(key);
+                        state.dirty = true;
+                    }
+                }
+            }
+            if state.dirty {
+                super::persistence::save_keyed_list(
+                    &state.storage_key,
+                    &state.hold_name,
+                    &state.items,
+                );
+                state.dirty = false;
+            }
+        }
+    }
+
     /// Inject an event for a LINK by LinkId and step the DD worker.
     /// (Legacy API used by bridge.rs render_value path)
     pub fn inject_event(&self, link_id: &LinkId, event_value: Value) {
@@ -363,9 +506,11 @@ impl DdWorkerHandle {
             }
 
             inner.worker.step();
-            inner.notify_if_changed();
+            let has_keyed = !self.keyed_diff_buffer.borrow().is_empty();
+            inner.notify_if_changed(has_keyed);
         }
         self.process_side_effects();
+        self.process_keyed_persistence();
     }
 
     /// Get the current output value.

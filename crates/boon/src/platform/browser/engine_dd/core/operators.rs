@@ -313,20 +313,94 @@ pub fn list_retain_reactive<G>(
 where
     G: Scope<Timestamp = u64>,
 {
-    // Key filter state by () for cross-product join with list
-    let keyed_filter = filter_state.map(|v| ((), v));
-    let keyed_list = list.map(|(key, val)| ((), (key, val)));
+    // Tag approach: concat list items (tag=0) and filter state (tag=1),
+    // then use a unary operator to maintain state and emit filtered items.
+    // Avoids DD join which has edge cases with keyed collections.
+    let sentinel_key = ListKey::new("__filter");
+    let tagged_list = list.map(|(key, val)| (key, (0u8, val)));
+    let sk = sentinel_key.clone();
+    let tagged_filter = filter_state.map(move |v| (sk.clone(), (1u8, v)));
+    let combined = tagged_list.concat(&tagged_filter);
 
-    // Join list × filter, then filter by predicate
-    keyed_list
-        .join(&keyed_filter)
-        .flat_map(move |(_unit, ((key, val), filter_val))| {
-            if predicate(&val, &filter_val) {
-                Some((key, val))
-            } else {
-                None
-            }
-        })
+    let mut items: std::collections::HashMap<ListKey, Value> = std::collections::HashMap::new();
+    let mut current_filter: Option<Value> = None;
+    let mut last_emitted: std::collections::HashMap<ListKey, bool> = std::collections::HashMap::new();
+
+    combined
+        .inner
+        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
+            Pipeline,
+            "ListRetainReactive",
+            |_cap, _info| {
+                move |input, output| {
+                    input.for_each(|time, data| {
+                        let mut session = output.session(&time);
+                        // Sort by tag: items (0) first, then filter (1)
+                        let mut batch: Vec<_> = data.drain(..).collect();
+                        batch.sort_by_key(|((_, (tag, _)), _, _)| *tag);
+
+                        let mut filter_changed = false;
+
+                        for ((key, (tag, value)), ts, diff) in batch {
+                            match tag {
+                                0 => {
+                                    // List item
+                                    let value_clone = value.clone();
+                                    if diff > 0 {
+                                        items.insert(key.clone(), value);
+                                    } else {
+                                        items.remove(&key);
+                                    }
+                                    // Emit/retract based on current filter
+                                    if let Some(ref fv) = current_filter {
+                                        let was_emitted = last_emitted.get(&key).copied().unwrap_or(false);
+                                        if diff > 0 {
+                                            let passes = predicate(items.get(&key).unwrap(), fv);
+                                            if passes {
+                                                session.give(((key.clone(), items.get(&key).unwrap().clone()), ts, 1));
+                                                last_emitted.insert(key, true);
+                                            } else {
+                                                last_emitted.insert(key, false);
+                                            }
+                                        } else if was_emitted {
+                                            // Item removed — retract old emitted value
+                                            session.give(((key.clone(), value_clone), ts, -1));
+                                            last_emitted.remove(&key);
+                                        }
+                                    }
+                                }
+                                1 => {
+                                    // Filter state change
+                                    if diff > 0 {
+                                        current_filter = Some(value);
+                                        filter_changed = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        // If filter changed, re-evaluate all items
+                        if filter_changed {
+                            if let Some(ref fv) = current_filter {
+                                for (key, val) in &items {
+                                    let passes = predicate(val, fv);
+                                    let was_emitted = last_emitted.get(key).copied().unwrap_or(false);
+                                    if passes && !was_emitted {
+                                        session.give(((key.clone(), val.clone()), *time.time(), 1));
+                                        last_emitted.insert(key.clone(), true);
+                                    } else if !passes && was_emitted {
+                                        session.give(((key.clone(), val.clone()), *time.time(), -1));
+                                        last_emitted.insert(key.clone(), false);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            },
+        )
+        .as_collection()
 }
 
 /// List/map: transform each list item.
@@ -338,6 +412,21 @@ where
     G: Scope<Timestamp = u64>,
 {
     list.map(move |(key, val)| (key, transform(val)))
+}
+
+/// List/map with key: transform each list item, passing both key and value to the transform.
+/// Used when the transform needs the key (e.g., injecting per-item link paths).
+pub fn list_map_with_key<G>(
+    list: &VecCollection<G, (ListKey, Value), isize>,
+    transform: impl Fn(&ListKey, Value) -> Value + 'static,
+) -> VecCollection<G, (ListKey, Value), isize>
+where
+    G: Scope<Timestamp = u64>,
+{
+    list.map(move |(key, val)| {
+        let new_val = transform(&key, val);
+        (key, new_val)
+    })
 }
 
 /// List/append: add an item to a list (concat with new keyed item).

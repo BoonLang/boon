@@ -21,7 +21,7 @@ use futures_channel::mpsc;
 use pin_project::pin_project;
 use zoon::*;
 
-use super::super::core::types::LinkId;
+use super::super::core::types::{KeyedDiff, LinkId};
 use super::super::core::value::Value;
 use super::super::io::worker::{DdWorkerHandle, Event};
 
@@ -141,6 +141,7 @@ fn extract_sorted_list_items(fields: &Fields, field_name: &str) -> Vec<Value> {
     }
     Vec::new()
 }
+
 
 /// Extract effective link path for event handlers.
 fn extract_effective_link(fields: &Fields, parent_link_path: &str) -> String {
@@ -868,6 +869,75 @@ fn css_border_side(value: &Value, side: &str) -> Option<String> {
 // Retained tree types
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Keyed items for O(1) per-item updates in Stripes with keyed list display.
+///
+/// Items are ordered by ListKey (sorted). Updates from keyed diffs
+/// target individual items by key without scanning the entire list.
+struct KeyedItems {
+    /// Items ordered by key: (key_str, retained_node).
+    items: Vec<(Arc<str>, RetainedNode)>,
+}
+
+impl KeyedItems {
+    fn new() -> Self {
+        KeyedItems { items: Vec::new() }
+    }
+
+    /// Apply keyed diffs to the retained items.
+    fn apply(
+        &mut self,
+        diffs: &[KeyedDiff],
+        tx: &mpsc::UnboundedSender<VecDiff<RawElOrText>>,
+        handle: &DdWorkerHandle,
+        stripe_link_path: &str,
+    ) {
+        for diff in diffs {
+            match diff {
+                KeyedDiff::Upsert { key, value } => {
+                    let key_str = key.0.clone();
+                    if let Some(idx) = self.find_index(&key_str) {
+                        // Update existing item in place (O(1) — just set Mutable)
+                        let child_lp = self.child_link_path(value, stripe_link_path, &key_str);
+                        self.items[idx].1.update(value, handle, &child_lp);
+                    } else {
+                        // New item — insert at sorted position
+                        let insert_pos = self.items.iter()
+                            .position(|(k, _)| k.as_ref() > key_str.as_ref())
+                            .unwrap_or(self.items.len());
+                        let child_lp = self.child_link_path(value, stripe_link_path, &key_str);
+                        let (el, node) = build_retained_node(value, handle, &child_lp);
+                        self.items.insert(insert_pos, (key_str, node));
+                        tx.unbounded_send(VecDiff::InsertAt {
+                            index: insert_pos,
+                            value: el,
+                        }).ok();
+                    }
+                }
+                KeyedDiff::Remove { key } => {
+                    let key_str = key.0.clone();
+                    if let Some(idx) = self.find_index(&key_str) {
+                        self.items.remove(idx);
+                        tx.unbounded_send(VecDiff::RemoveAt { index: idx }).ok();
+                    }
+                }
+            }
+        }
+    }
+
+    fn find_index(&self, key: &str) -> Option<usize> {
+        self.items.iter().position(|(k, _)| k.as_ref() == key)
+    }
+
+    /// Extract link path from item's __link_path__ field, or construct from key.
+    fn child_link_path(&self, value: &Value, stripe_link_path: &str, key: &str) -> String {
+        get_fields(value)
+            .and_then(|f| f.get("__link_path__" as &str))
+            .and_then(|v| v.as_text())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{}.items.{}", stripe_link_path, key))
+    }
+}
+
 /// A retained element tree for efficient incremental DOM updates.
 ///
 /// Built once from the initial Value. On state changes, `update()` diffs
@@ -890,6 +960,8 @@ enum RetainedNode {
         items: Vec<RetainedNode>,
         items_tx: mpsc::UnboundedSender<VecDiff<RawElOrText>>,
         link_path: Rc<RefCell<String>>,
+        /// Keyed items for O(1) updates (Some when display pipeline is active).
+        keyed_items: Option<KeyedItems>,
     },
     Stack {
         value: Mutable<Value>,
@@ -1068,6 +1140,7 @@ fn build_retained_button(
     let vm = Mutable::new(full_value.clone());
     let effective_link = extract_effective_link(fields, link_path);
     let link_ref = Rc::new(RefCell::new(effective_link.clone()));
+    let hover_link = extract_hover_link_path(fields, link_path);
 
     let el = Button::new()
         .update_raw_el(|raw_el| raw_el.attr("role", "button"))
@@ -1127,11 +1200,12 @@ fn build_retained_button(
         })
         .on_hovered_change({
             let handle_ref = handle.clone_ref();
-            let lp = link_ref.clone();
+            let hover_link = hover_link.clone();
             move |hovered| {
-                let path = lp.borrow().clone();
-                if !path.is_empty() {
-                    handle_ref.inject_dd_event(Event::HoverChange { link_path: path, hovered });
+                if let Some(ref path) = hover_link {
+                    if !path.is_empty() {
+                        handle_ref.inject_dd_event(Event::HoverChange { link_path: path.clone(), hovered });
+                    }
                 }
             }
         });
@@ -1158,21 +1232,40 @@ fn build_retained_stripe(
 
     // Build initial items
     let item_values = extract_sorted_list_items(fields, "items");
+
+    // Detect keyed Stripe by matching element tag from compiler.
+    let keyed_mode = if let Some(keyed_tag) = handle.keyed_stripe_element_tag() {
+        let el_tag = fields.get("element" as &str)
+            .and_then(|e| e.get_field("tag"))
+            .and_then(|t| t.as_tag());
+        el_tag == Some(keyed_tag)
+    } else {
+        false
+    };
+
     let mut retained_items = Vec::new();
-    let mut initial_elements = Vec::new();
+    let mut keyed_items_init: Option<KeyedItems> = None;
 
-    for (i, item) in item_values.iter().enumerate() {
-        let child_lp = format!("{}.items.{}", link_path, i);
-        let (el, node) = build_retained_node(item, handle, &child_lp);
-        retained_items.push(node);
-        initial_elements.push(el);
+    if keyed_mode {
+        // Keyed Stripe: items arrive via keyed diffs, not from the document closure.
+        // The document closure provides a stub list (correct count, placeholder values)
+        // for structural checks like List/is_empty(). Skip building items here.
+        keyed_items_init = Some(KeyedItems::new());
+    } else {
+        // Non-keyed: build items from the document value.
+        let mut initial_elements = Vec::new();
+        for (i, item) in item_values.iter().enumerate() {
+            let child_lp = format!("{}.items.{}", link_path, i);
+            let (el, node) = build_retained_node(item, handle, &child_lp);
+            retained_items.push(node);
+            initial_elements.push(el);
+        }
+        items_tx
+            .unbounded_send(VecDiff::Replace {
+                values: initial_elements,
+            })
+            .ok();
     }
-
-    items_tx
-        .unbounded_send(VecDiff::Replace {
-            values: initial_elements,
-        })
-        .ok();
 
     let el = Stripe::new()
         .direction_signal(vm.signal_cloned().map(|v| {
@@ -1283,6 +1376,7 @@ fn build_retained_stripe(
             items: retained_items,
             items_tx,
             link_path: link_ref,
+            keyed_items: keyed_items_init,
         },
     )
 }
@@ -1419,6 +1513,7 @@ fn build_retained_label(
         .map(|s| s.to_string())
         .unwrap_or_else(|| link_path.to_string());
     let link_ref = Rc::new(RefCell::new(effective_link.clone()));
+    let hover_link = extract_hover_link_path(fields, link_path);
 
     let el = Label::new()
         .label_signal(vm.signal_cloned().map(|v| {
@@ -1475,11 +1570,12 @@ fn build_retained_label(
         })
         .on_hovered_change({
             let handle_ref = handle.clone_ref();
-            let lp = link_ref.clone();
+            let hover_link = hover_link.clone();
             move |hovered| {
-                let path = lp.borrow().clone();
-                if !path.is_empty() {
-                    handle_ref.inject_dd_event(Event::HoverChange { link_path: path, hovered });
+                if let Some(ref path) = hover_link {
+                    if !path.is_empty() {
+                        handle_ref.inject_dd_event(Event::HoverChange { link_path: path.clone(), hovered });
+                    }
                 }
             }
         });
@@ -1894,6 +1990,12 @@ fn build_retained_link(
 // ═══════════════════════════════════════════════════════════════════════════
 
 impl RetainedTree {
+    /// Apply keyed diffs to the keyed Stripe in this tree.
+    /// Walks the tree to find the Stripe with keyed_items and applies diffs to it.
+    pub fn apply_keyed_diffs(&mut self, diffs: &[KeyedDiff], handle: &DdWorkerHandle) {
+        self.root.apply_keyed_diffs(diffs, handle);
+    }
+
     /// Update the retained tree with a new document Value.
     /// Only changed elements' Mutables are updated; Zoon handles DOM diffs.
     pub fn update(&mut self, new_value: &Value, handle: &DdWorkerHandle) {
@@ -1926,12 +2028,17 @@ impl RetainedNode {
                 items,
                 items_tx,
                 link_path: lp,
+                keyed_items,
             } => {
                 value.set_neq(new_value.clone());
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = extract_effective_link(fields, link_path);
-                    let new_items = extract_sorted_list_items(fields, "items");
-                    diff_children(items, items_tx, &new_items, handle, link_path, "items");
+                    // Keyed Stripes: items come via apply_keyed_diffs, skip positional diff.
+                    // Non-keyed Stripes: use positional diff as before.
+                    if keyed_items.is_none() {
+                        let new_items = extract_sorted_list_items(fields, "items");
+                        diff_children(items, items_tx, &new_items, handle, link_path, "items");
+                    }
                 }
             }
 
@@ -2119,6 +2226,43 @@ impl RetainedNode {
             }
 
             RetainedNode::Empty => {}
+        }
+    }
+
+    /// Walk the tree to find the keyed Stripe and apply diffs.
+    fn apply_keyed_diffs(&mut self, diffs: &[KeyedDiff], handle: &DdWorkerHandle) {
+        match self {
+            RetainedNode::Stripe {
+                items_tx,
+                link_path: lp,
+                keyed_items: Some(ki),
+                ..
+            } => {
+                let stripe_lp = lp.borrow().clone();
+                ki.apply(diffs, items_tx, handle, &stripe_lp);
+            }
+            RetainedNode::Document { child: Some(c), .. } => {
+                c.apply_keyed_diffs(diffs, handle);
+            }
+            RetainedNode::Container { child: Some(c), .. } => {
+                c.apply_keyed_diffs(diffs, handle);
+            }
+            RetainedNode::Stripe { items, keyed_items: None, .. } => {
+                for item in items {
+                    item.apply_keyed_diffs(diffs, handle);
+                }
+            }
+            RetainedNode::Stack { layers, .. } => {
+                for layer in layers {
+                    layer.apply_keyed_diffs(diffs, handle);
+                }
+            }
+            RetainedNode::Paragraph { contents, .. } => {
+                for content in contents {
+                    content.apply_keyed_diffs(diffs, handle);
+                }
+            }
+            _ => {}
         }
     }
 }

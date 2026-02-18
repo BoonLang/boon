@@ -319,11 +319,21 @@ pub fn render_dd_result_reactive_signal(result: DdResult) -> impl Element {
                             }
                             let mut ret = retained.borrow_mut();
                             if let Some(tree) = ret.as_mut() {
+                                let diffs = handle.drain_keyed_diffs();
+                                // Update tree first — conditional sections may appear/disappear,
+                                // creating or destroying the keyed Stripe.
                                 tree.update(&value, &handle);
+                                // Then apply keyed diffs to the (now existing) keyed Stripe.
+                                if !diffs.is_empty() {
+                                    tree.apply_keyed_diffs(&diffs, &handle);
+                                }
                             } else {
-                                zoon::println!("[DD v2] Building retained tree");
-                                let (element, tree) =
+                                let (element, mut tree) =
                                     render::bridge::build_retained_tree(&value, &handle);
+                                let diffs = handle.drain_keyed_diffs();
+                                if !diffs.is_empty() {
+                                    tree.apply_keyed_diffs(&diffs, &handle);
+                                }
                                 *root_cell.borrow_mut() = Some(element);
                                 *ret = Some(tree);
                                 drop(ret);
@@ -385,4 +395,5 @@ pub fn clear_dd_persisted_states() {
 pub fn clear_cells_memory() {
     // State is dropped when the program is re-run
 }
+
 

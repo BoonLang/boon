@@ -14,7 +14,7 @@ use differential_dataflow::VecCollection;
 use timely::dataflow::Scope;
 
 use super::operators;
-use super::types::{CollectionSpec, DataflowGraph, InputId, ListKey, SideEffectKind, VarId};
+use super::types::{CollectionSpec, DataflowGraph, InputId, KeyedDiff, ListKey, SideEffectKind, VarId};
 use super::value::Value;
 
 /// Result of materializing a DataflowGraph into a live DD dataflow.
@@ -68,6 +68,8 @@ pub fn materialize<G>(
     scope: &mut G,
     on_output: impl Fn(&Value, &u64, &isize) + 'static,
     on_side_effect: Arc<dyn Fn(&SideEffectKind, &Value) + 'static>,
+    on_keyed_diff: Option<Arc<dyn Fn(KeyedDiff) + 'static>>,
+    on_keyed_persist: Option<Arc<dyn Fn(KeyedDiff) + 'static>>,
 ) -> MaterializedGraph
 where
     G: Scope<Timestamp = u64>,
@@ -297,6 +299,15 @@ where
                 AnyCollection::Keyed(operators::list_map(list, move |v| f(&v)))
             }
 
+            CollectionSpec::ListMapWithKey { source, f } => {
+                let list = collections
+                    .get(source)
+                    .expect("ListMapWithKey source not found")
+                    .as_keyed();
+                let f = Arc::clone(f);
+                AnyCollection::Keyed(operators::list_map_with_key(list, move |k, v| f(k, &v)))
+            }
+
             CollectionSpec::ListAppend { list, new_items } => {
                 let list_coll = collections
                     .get(list)
@@ -419,6 +430,46 @@ where
     doc_collection.inspect(move |(value, time, diff)| {
         on_output(value, time, diff);
     });
+
+    // Wire keyed inspect callback on the display collection (post-retain, post-map element Values).
+    // These diffs go to the bridge for O(1) per-item rendering.
+    if let (Some(keyed_output), Some(on_keyed)) = (&graph.keyed_list_output, on_keyed_diff) {
+        let display_coll = collections
+            .get(&keyed_output.display_var)
+            .expect("Keyed display collection not found")
+            .as_keyed();
+        let callback = on_keyed;
+        display_coll.inspect(move |((key, value), _time, diff)| {
+            if *diff > 0 {
+                callback(KeyedDiff::Upsert {
+                    key: key.clone(),
+                    value: value.clone(),
+                });
+            } else if *diff < 0 {
+                callback(KeyedDiff::Remove { key: key.clone() });
+            }
+        });
+    }
+
+    // Wire keyed inspect callback on the persistence collection (raw data, pre-map).
+    // These diffs go to localStorage for persistence across page reloads.
+    if let (Some(keyed_output), Some(on_persist)) = (&graph.keyed_list_output, on_keyed_persist) {
+        let persist_coll = collections
+            .get(&keyed_output.persistence_var)
+            .expect("Keyed persistence collection not found")
+            .as_keyed();
+        let callback = on_persist;
+        persist_coll.inspect(move |((key, value), _time, diff)| {
+            if *diff > 0 {
+                callback(KeyedDiff::Upsert {
+                    key: key.clone(),
+                    value: value.clone(),
+                });
+            } else if *diff < 0 {
+                callback(KeyedDiff::Remove { key: key.clone() });
+            }
+        });
+    }
 
     MaterializedGraph {
         input_sessions,
