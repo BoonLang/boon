@@ -7,7 +7,7 @@
 //! - `.filter()` — SKIP, List/retain (simple predicate)
 //! - `.flat_map()` — WHEN (pattern matching)
 //! - `.concat()` — LATEST (merge sources), List/append
-//! - `.join()` — List/retain reactive, TEXT interpolation (2 deps)
+//! - `.join()` — List/retain reactive
 //! - `.map()` — field access, pure transforms
 //! - `.negate()` — List/remove (retraction)
 //!
@@ -21,7 +21,6 @@
 use super::types::ListKey;
 use super::value::Value;
 use differential_dataflow::collection::AsCollection;
-use differential_dataflow::operators::join::Join;
 use differential_dataflow::VecCollection;
 use timely::container::CapacityContainerBuilder;
 use timely::dataflow::channels::pact::Pipeline;
@@ -66,10 +65,9 @@ where
                         let mut session = output.session(&time);
                         for (event, ts, diff) in data.drain(..) {
                             if diff > 0 {
-                                let old = state.clone();
-                                let new_state = transform(&old, &event);
-                                if new_state != old {
-                                    session.give((old, ts, -1isize));
+                                let new_state = transform(&state, &event);
+                                if new_state != state {
+                                    session.give((state.clone(), ts, -1isize));
                                     session.give((new_state.clone(), ts, 1isize));
                                     state = new_state;
                                 }
@@ -108,21 +106,15 @@ where
                     input.for_each(|time, data| {
                         let mut session = output.session(&time);
 
-                        // Find the last positive insertion in this batch
-                        let mut latest_new: Option<(Value, u64)> = None;
-                        for &(ref value, ref ts, ref diff) in data.iter() {
-                            if *diff > 0 {
-                                latest_new = Some((value.clone(), *ts));
-                            }
-                        }
-
-                        if let Some((new_val, ts)) = latest_new {
+                        // Find the last positive insertion in batch (1 clone, not N)
+                        if let Some((value, ts, _)) = data.iter().rev().find(|(_, _, diff)| *diff > 0) {
+                            let new_val = value.clone();
                             // Retract old value if we had one
                             if let Some(old) = current.take() {
-                                session.give((old, ts, -1isize));
+                                session.give((old, *ts, -1isize));
                             }
                             // Insert new value
-                            session.give((new_val.clone(), ts, 1isize));
+                            session.give((new_val.clone(), *ts, 1isize));
                             current = Some(new_val);
                         }
                     });
@@ -150,25 +142,6 @@ where
     G: Scope<Timestamp = u64>,
 {
     source.flat_map(move |value| match_fn(value))
-}
-
-// ---------------------------------------------------------------------------
-// SKIP — filter out values (uses filter)
-// ---------------------------------------------------------------------------
-
-/// SKIP operator: filter values from a collection.
-///
-/// Keeps only values where `predicate` returns true.
-/// SKIP in a WHEN/THEN arm means "don't emit" — the compiler inverts
-/// the predicate so this filter keeps the non-skipped values.
-pub fn skip_filter<G>(
-    source: &VecCollection<G, Value, isize>,
-    predicate: impl Fn(&Value) -> bool + 'static,
-) -> VecCollection<G, Value, isize>
-where
-    G: Scope<Timestamp = u64>,
-{
-    source.filter(move |value| predicate(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -509,61 +482,6 @@ where
         .as_collection()
 }
 
-/// Assemble keyed list items into a scalar Value::Tagged("List", BTreeMap).
-///
-/// Maintains an internal BTreeMap of current items. When items are added/removed/updated,
-/// retracts the old assembled list and inserts the new one.
-pub fn assemble_list<G>(
-    keyed: &VecCollection<G, (ListKey, Value), isize>,
-) -> VecCollection<G, Value, isize>
-where
-    G: Scope<Timestamp = u64>,
-{
-    let mut items: std::collections::BTreeMap<std::sync::Arc<str>, Value> =
-        std::collections::BTreeMap::new();
-    let mut last_emitted: Option<Value> = None;
-
-    keyed
-        .inner
-        .unary::<CapacityContainerBuilder<Vec<_>>, _, _, _>(
-            Pipeline,
-            "AssembleList",
-            |_cap, _info| {
-                move |input, output| {
-                    input.for_each(|time, data| {
-                        let mut changed = false;
-                        for ((key, value), _ts, diff) in data.drain(..) {
-                            if diff > 0 {
-                                items.insert(std::sync::Arc::from(key.0.as_ref()), value);
-                                changed = true;
-                            } else if diff < 0 {
-                                items.remove(key.0.as_ref());
-                                changed = true;
-                            }
-                        }
-
-                        if changed {
-                            let new_list = Value::Tagged {
-                                tag: std::sync::Arc::from("List"),
-                                fields: std::sync::Arc::new(items.clone()),
-                            };
-
-                            if last_emitted.as_ref() != Some(&new_list) {
-                                let mut session = output.session(&time);
-                                if let Some(old) = last_emitted.take() {
-                                    session.give((old, *time.time(), -1isize));
-                                }
-                                session.give((new_list.clone(), *time.time(), 1isize));
-                                last_emitted = Some(new_list);
-                            }
-                        }
-                    });
-                }
-            },
-        )
-        .as_collection()
-}
-
 /// Keyed HOLD state: per-item stateful accumulator for list elements.
 ///
 /// Maintains a `HashMap<ListKey, Value>` of per-key state. Initial values
@@ -678,41 +596,6 @@ where
             },
         )
         .as_collection()
-}
-
-// ---------------------------------------------------------------------------
-// TEXT interpolation (uses join for reactive dependencies)
-// ---------------------------------------------------------------------------
-
-/// TEXT interpolation with reactive variable.
-///
-/// `TEXT { Count: {counter} }` joins the template with the reactive variable.
-/// When the variable changes, the text is recomputed.
-pub fn text_interpolation<G>(
-    dependency: &VecCollection<G, Value, isize>,
-    template: impl Fn(&Value) -> Value + 'static,
-) -> VecCollection<G, Value, isize>
-where
-    G: Scope<Timestamp = u64>,
-{
-    dependency.map(move |val| template(&val))
-}
-
-/// TEXT interpolation with two reactive dependencies (uses join).
-pub fn text_interpolation_join<G>(
-    dep_a: &VecCollection<G, Value, isize>,
-    dep_b: &VecCollection<G, Value, isize>,
-    template: impl Fn(&Value, &Value) -> Value + 'static,
-) -> VecCollection<G, Value, isize>
-where
-    G: Scope<Timestamp = u64>,
-{
-    let keyed_a = dep_a.map(|v| ((), v));
-    let keyed_b = dep_b.map(|v| ((), v));
-
-    keyed_a
-        .join(&keyed_b)
-        .map(move |(_key, (a, b))| template(&a, &b))
 }
 
 // ---------------------------------------------------------------------------

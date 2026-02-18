@@ -110,18 +110,7 @@ pub struct DdContext {
     has_timers: bool,
 }
 
-impl DdContext {
-    pub fn get_timers(&self) -> &[()] {
-        if self.has_timers {
-            &[()]
-        } else {
-            &[]
-        }
-    }
-    pub fn has_sum_accumulators(&self) -> bool {
-        false
-    }
-}
+impl DdContext {}
 
 /// Run Boon source code with the DD engine.
 ///
@@ -389,11 +378,6 @@ pub fn clear_dd_persisted_states() {
             let _ = storage.remove_item(&key);
         }
     }
-}
-
-/// Clear in-memory cell states.
-pub fn clear_cells_memory() {
-    // State is dropped when the program is re-run
 }
 
 

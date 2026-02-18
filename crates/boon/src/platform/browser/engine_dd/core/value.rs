@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::types::LIST_TAG;
+
 /// A Boon value that lives inside DD collections.
 ///
 /// Every Boon value is represented as a DD collection element.
@@ -121,7 +123,7 @@ impl Value {
     /// Create an empty list value.
     pub fn empty_list() -> Self {
         Value::Tagged {
-            tag: Arc::from("List"),
+            tag: Arc::from(LIST_TAG),
             fields: Arc::new(BTreeMap::new()),
         }
     }
@@ -129,7 +131,7 @@ impl Value {
     /// Get the number of items in a list.
     pub fn list_count(&self) -> usize {
         if let Value::Tagged { tag, fields } = self {
-            if tag.as_ref() == "List" {
+            if tag.as_ref() == LIST_TAG {
                 return fields.len();
             }
         }
@@ -144,7 +146,7 @@ impl Value {
     /// Get list items as a Vec.
     pub fn list_items(&self) -> Vec<&Value> {
         if let Value::Tagged { tag, fields } = self {
-            if tag.as_ref() == "List" {
+            if tag.as_ref() == LIST_TAG {
                 return fields.values().collect();
             }
         }
@@ -155,7 +157,7 @@ impl Value {
     /// Remove a list item by key.
     pub fn list_remove_by_key(&self, key: &str) -> Self {
         if let Value::Tagged { tag, fields } = self {
-            if tag.as_ref() == "List" {
+            if tag.as_ref() == LIST_TAG {
                 let mut new_fields = (**fields).clone();
                 new_fields.remove(key);
                 return Value::Tagged {
@@ -169,7 +171,7 @@ impl Value {
 
     pub fn list_append(&self, item: Value, index: usize) -> Self {
         if let Value::Tagged { tag, fields } = self {
-            if tag.as_ref() == "List" {
+            if tag.as_ref() == LIST_TAG {
                 let mut new_fields = (**fields).clone();
                 new_fields.insert(Arc::from(format!("{:04}", index)), item);
                 return Value::Tagged {
@@ -184,7 +186,7 @@ impl Value {
     /// Map a function over list items.
     pub fn list_map(&self, f: impl Fn(&Value) -> Value) -> Self {
         if let Value::Tagged { tag, fields } = self {
-            if tag.as_ref() == "List" {
+            if tag.as_ref() == LIST_TAG {
                 let new_fields: BTreeMap<Arc<str>, Value> = fields
                     .iter()
                     .map(|(k, v)| (k.clone(), f(v)))
@@ -201,7 +203,7 @@ impl Value {
     /// Retain only list items matching a predicate.
     pub fn list_retain(&self, f: impl Fn(&Value) -> bool) -> Self {
         if let Value::Tagged { tag, fields } = self {
-            if tag.as_ref() == "List" {
+            if tag.as_ref() == LIST_TAG {
                 let new_fields: BTreeMap<Arc<str>, Value> = fields
                     .iter()
                     .filter(|(_, v)| f(v))
@@ -266,7 +268,14 @@ impl Value {
                 format!("[{}]", entries.join(", "))
             }
             Value::Tagged { tag, fields } => {
-                if fields.is_empty() {
+                if tag.as_ref() == LIST_TAG {
+                    // Display lists as values only (keys are internal indices)
+                    let items: Vec<_> = fields
+                        .values()
+                        .map(|v| v.to_display_string())
+                        .collect();
+                    format!("List[{}]", items.join(", "))
+                } else if fields.is_empty() {
                     tag.to_string()
                 } else {
                     let entries: Vec<_> = fields

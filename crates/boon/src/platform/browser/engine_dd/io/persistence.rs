@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use zoon::{web_sys, serde_json};
 
-use super::super::core::types::ListKey;
+use super::super::core::types::{ListKey, LIST_TAG};
 use super::super::core::value::Value;
 
 /// Save a single hold state value to localStorage.
@@ -59,33 +59,6 @@ pub fn load_holds_map(storage_key: &str) -> std::collections::HashMap<String, Va
     result
 }
 
-/// Save full program state (holds, lists, list_counters, sum_accumulators) to localStorage.
-pub fn save_program_state(
-    storage_key: &str,
-    holds: &BTreeMap<String, Value>,
-    lists: &BTreeMap<String, Vec<Value>>,
-    list_counters: &BTreeMap<String, usize>,
-    sum_accumulators: &BTreeMap<String, f64>,
-) {
-    if super::super::is_save_disabled() {
-        return;
-    }
-    if let Ok(Some(storage)) = web_sys::window().unwrap().local_storage() {
-        if let Ok(json) = serde_json::to_string(holds) {
-            let _ = storage.set_item(&format!("dd_{}_holds", storage_key), &json);
-        }
-        if let Ok(json) = serde_json::to_string(lists) {
-            let _ = storage.set_item(&format!("dd_{}_lists", storage_key), &json);
-        }
-        if let Ok(json) = serde_json::to_string(list_counters) {
-            let _ = storage.set_item(&format!("dd_{}_list_counters", storage_key), &json);
-        }
-        if let Ok(json) = serde_json::to_string(sum_accumulators) {
-            let _ = storage.set_item(&format!("dd_{}_sums", storage_key), &json);
-        }
-    }
-}
-
 /// Save a keyed list to localStorage from a HashMap of items.
 ///
 /// The HashMap is assembled in the IO layer from individual keyed diffs,
@@ -102,40 +75,9 @@ pub fn save_keyed_list(storage_key: &str, hold_name: &str, items: &HashMap<ListK
         .map(|(k, v)| (std::sync::Arc::from(k.0.as_ref()), v.clone()))
         .collect();
     let list_value = Value::Tagged {
-        tag: std::sync::Arc::from("List"),
+        tag: std::sync::Arc::from(LIST_TAG),
         fields: std::sync::Arc::new(fields),
     };
     save_hold_state(storage_key, hold_name, &list_value);
 }
 
-/// Load full program state from localStorage into the provided maps.
-pub fn load_program_state(
-    storage_key: &str,
-    holds: &mut BTreeMap<String, Value>,
-    lists: &mut BTreeMap<String, Vec<Value>>,
-    list_counters: &mut BTreeMap<String, usize>,
-    sum_accumulators: &mut BTreeMap<String, f64>,
-) {
-    if let Ok(Some(storage)) = web_sys::window().unwrap().local_storage() {
-        if let Ok(Some(json)) = storage.get_item(&format!("dd_{}_holds", storage_key)) {
-            if let Ok(h) = serde_json::from_str::<BTreeMap<String, Value>>(&json) {
-                *holds = h;
-            }
-        }
-        if let Ok(Some(json)) = storage.get_item(&format!("dd_{}_lists", storage_key)) {
-            if let Ok(l) = serde_json::from_str::<BTreeMap<String, Vec<Value>>>(&json) {
-                *lists = l;
-            }
-        }
-        if let Ok(Some(json)) = storage.get_item(&format!("dd_{}_list_counters", storage_key)) {
-            if let Ok(c) = serde_json::from_str::<BTreeMap<String, usize>>(&json) {
-                *list_counters = c;
-            }
-        }
-        if let Ok(Some(json)) = storage.get_item(&format!("dd_{}_sums", storage_key)) {
-            if let Ok(s) = serde_json::from_str::<BTreeMap<String, f64>>(&json) {
-                *sum_accumulators = s;
-            }
-        }
-    }
-}

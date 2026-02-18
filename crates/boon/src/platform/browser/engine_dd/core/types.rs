@@ -69,6 +69,25 @@ impl std::fmt::Display for ListKey {
 }
 
 // ===========================================================================
+// Cross-module string constants (used in both compile.rs and bridge.rs)
+// ===========================================================================
+
+/// Internal tag for list values (`Value::Tagged { tag: LIST_TAG, .. }`).
+/// Uses `__` prefix so it cannot collide with user-created `List[...]` tagged objects
+/// (the lexer tokenizes `__` as Wildcard, blocking it from identifiers).
+pub const LIST_TAG: &str = "__List";
+/// Field name for injected LINK event paths in element descriptors.
+pub const LINK_PATH_FIELD: &str = "__link_path__";
+/// Field name for injected hover event paths in element descriptors.
+pub const HOVER_PATH_FIELD: &str = "__hover_path__";
+/// Field name for the hovered state flag on elements.
+pub const HOVERED_FIELD: &str = "__hovered";
+/// Variable/input name for the browser router.
+pub const ROUTER_INPUT: &str = "__router";
+/// Scope variable name for PASS/PASSED context propagation.
+pub const PASSED_VAR: &str = "__passed";
+
+// ===========================================================================
 // KeyedDiff — incremental diffs from DD keyed collections
 // ===========================================================================
 
@@ -124,7 +143,7 @@ pub struct DataflowGraph {
     pub storage_key: Option<String>,
     /// Keyed list output specification for O(1) per-item streaming.
     /// When set, items flow individually from DD to bridge/persistence,
-    /// bypassing AssembleList entirely.
+    /// bypassing monolithic list assembly entirely.
     pub keyed_list_output: Option<KeyedListOutput>,
 }
 
@@ -290,12 +309,6 @@ pub enum CollectionSpec {
         f: TransformFn,
         initial_counter: usize,
     },
-
-    /// Keyed → scalar list Value::Tagged("List", BTreeMap).
-    AssembleList(VarId),
-
-    /// Concat multiple keyed collections.
-    KeyedConcat(Vec<VarId>),
 
     /// Skip first N positive diffs from a collection.
     Skip {

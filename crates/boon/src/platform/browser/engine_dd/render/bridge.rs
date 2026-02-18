@@ -13,7 +13,7 @@
 //! - **Static**: Single render, no signals needed.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -21,7 +21,7 @@ use futures_channel::mpsc;
 use pin_project::pin_project;
 use zoon::*;
 
-use super::super::core::types::{KeyedDiff, LinkId};
+use super::super::core::types::{KeyedDiff, LinkId, LIST_TAG, LINK_PATH_FIELD, HOVER_PATH_FIELD};
 use super::super::core::value::Value;
 use super::super::io::worker::{DdWorkerHandle, Event};
 
@@ -133,10 +133,9 @@ fn extract_sorted_list_items(fields: &Fields, field_name: &str) -> Vec<Value> {
         fields: list_fields,
     }) = fields.get(field_name as &str)
     {
-        if tag.as_ref() == "List" {
-            let mut items: Vec<_> = list_fields.iter().collect();
-            items.sort_by_key(|(k, _)| Arc::clone(k));
-            return items.into_iter().map(|(_, v)| v.clone()).collect();
+        if tag.as_ref() == LIST_TAG {
+            // BTreeMap iteration is already sorted by key
+            return list_fields.values().cloned().collect();
         }
     }
     Vec::new()
@@ -151,7 +150,7 @@ fn extract_effective_link(fields: &Fields, parent_link_path: &str) -> String {
         .map(|s| s.to_string())
         .or_else(|| {
             fields
-                .get("__link_path__" as &str)
+                .get(LINK_PATH_FIELD as &str)
                 .and_then(|v| v.as_text())
                 .map(|s| s.to_string())
         })
@@ -162,7 +161,7 @@ fn extract_effective_link(fields: &Fields, parent_link_path: &str) -> String {
 fn extract_hover_link_path(fields: &Fields, parent_link_path: &str) -> Option<String> {
     // First check __hover_path__ (injected by DD compiler for per-item hover)
     if let Some(path) = fields
-        .get("__hover_path__" as &str)
+        .get(HOVER_PATH_FIELD as &str)
         .and_then(|v| v.as_text())
     {
         if !path.is_empty() {
@@ -171,7 +170,7 @@ fn extract_hover_link_path(fields: &Fields, parent_link_path: &str) -> Option<St
     }
     // Then check __link_path__ (set by |> LINK { alias } pipe)
     if let Some(path) = fields
-        .get("__link_path__" as &str)
+        .get(LINK_PATH_FIELD as &str)
         .and_then(|v| v.as_text())
     {
         if !path.is_empty() {
@@ -271,11 +270,10 @@ fn extract_font_from_fields(fields: &Fields) -> Option<Font<'static>> {
         fields: list_fields,
     }) = font_obj.get("family" as &str)
     {
-        if tag.as_ref() == "List" {
+        if tag.as_ref() == LIST_TAG {
             let mut families = Vec::new();
-            let mut items: Vec<_> = list_fields.iter().collect();
-            items.sort_by_key(|(k, _)| Arc::clone(k));
-            for (_, item) in &items {
+            // BTreeMap iteration is already sorted by key
+            for item in list_fields.values() {
                 match item {
                     Value::Text(name) => families.push(FontFamily::new(name.to_string())),
                     Value::Tag(t) => match t.as_ref() {
@@ -550,11 +548,9 @@ fn extract_shadows_from_fields(fields: &Fields) -> Option<Vec<Shadow>> {
         fields: list_fields,
     }) = style.get("shadows" as &str)
     {
-        if tag.as_ref() == "List" {
+        if tag.as_ref() == LIST_TAG {
             let mut shadows = Vec::new();
-            let mut items: Vec<_> = list_fields.iter().collect();
-            items.sort_by_key(|(k, _)| Arc::clone(k));
-            for (_, item) in &items {
+            for item in list_fields.values() {
                 if let Value::Object(shadow_obj) = item {
                     let x = shadow_obj
                         .get("x" as &str)
@@ -745,11 +741,9 @@ fn apply_zoon_style_signals<T: RawEl>(
                 fields: list_fields,
             }) = style.get("shadows" as &str)
             {
-                if tag.as_ref() == "List" {
+                if tag.as_ref() == LIST_TAG {
                     let mut shadow_parts = Vec::new();
-                    let mut items: Vec<_> = list_fields.iter().collect();
-                    items.sort_by_key(|(k, _)| Arc::clone(k));
-                    for (_, item) in &items {
+                    for item in list_fields.values() {
                         if let Value::Object(shadow_obj) = item {
                             let x = shadow_obj
                                 .get("x" as &str)
@@ -876,11 +870,16 @@ fn css_border_side(value: &Value, side: &str) -> Option<String> {
 struct KeyedItems {
     /// Items ordered by key: (key_str, retained_node).
     items: Vec<(Arc<str>, RetainedNode)>,
+    /// O(1) key → index lookup.
+    key_to_index: HashMap<Arc<str>, usize>,
 }
 
 impl KeyedItems {
     fn new() -> Self {
-        KeyedItems { items: Vec::new() }
+        KeyedItems {
+            items: Vec::new(),
+            key_to_index: HashMap::new(),
+        }
     }
 
     /// Apply keyed diffs to the retained items.
@@ -895,8 +894,8 @@ impl KeyedItems {
             match diff {
                 KeyedDiff::Upsert { key, value } => {
                     let key_str = key.0.clone();
-                    if let Some(idx) = self.find_index(&key_str) {
-                        // Update existing item in place (O(1) — just set Mutable)
+                    if let Some(&idx) = self.key_to_index.get(&key_str) {
+                        // Update existing item in place (O(1) — HashMap lookup + Mutable set)
                         let child_lp = self.child_link_path(value, stripe_link_path, &key_str);
                         self.items[idx].1.update(value, handle, &child_lp);
                     } else {
@@ -907,6 +906,7 @@ impl KeyedItems {
                         let child_lp = self.child_link_path(value, stripe_link_path, &key_str);
                         let (el, node) = build_retained_node(value, handle, &child_lp);
                         self.items.insert(insert_pos, (key_str, node));
+                        self.rebuild_index();
                         tx.unbounded_send(VecDiff::InsertAt {
                             index: insert_pos,
                             value: el,
@@ -915,8 +915,9 @@ impl KeyedItems {
                 }
                 KeyedDiff::Remove { key } => {
                     let key_str = key.0.clone();
-                    if let Some(idx) = self.find_index(&key_str) {
+                    if let Some(&idx) = self.key_to_index.get(&key_str) {
                         self.items.remove(idx);
+                        self.rebuild_index();
                         tx.unbounded_send(VecDiff::RemoveAt { index: idx }).ok();
                     }
                 }
@@ -925,13 +926,21 @@ impl KeyedItems {
     }
 
     fn find_index(&self, key: &str) -> Option<usize> {
-        self.items.iter().position(|(k, _)| k.as_ref() == key)
+        self.key_to_index.get(key).copied()
+    }
+
+    /// Rebuild the key → index HashMap after structural changes (insert/remove).
+    fn rebuild_index(&mut self) {
+        self.key_to_index.clear();
+        for (i, (k, _)) in self.items.iter().enumerate() {
+            self.key_to_index.insert(k.clone(), i);
+        }
     }
 
     /// Extract link path from item's __link_path__ field, or construct from key.
     fn child_link_path(&self, value: &Value, stripe_link_path: &str, key: &str) -> String {
         get_fields(value)
-            .and_then(|f| f.get("__link_path__" as &str))
+            .and_then(|f| f.get(LINK_PATH_FIELD as &str))
             .and_then(|v| v.as_text())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("{}.items.{}", stripe_link_path, key))
@@ -1508,7 +1517,7 @@ fn build_retained_label(
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
     let effective_link = fields
-        .get("__link_path__" as &str)
+        .get(LINK_PATH_FIELD as &str)
         .and_then(|v| v.as_text())
         .map(|s| s.to_string())
         .unwrap_or_else(|| link_path.to_string());
@@ -1597,7 +1606,7 @@ fn build_retained_text_input(
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
     let effective_link = fields
-        .get("__link_path__" as &str)
+        .get(LINK_PATH_FIELD as &str)
         .and_then(|v| v.as_text())
         .map(|s| s.to_string())
         .unwrap_or_else(|| link_path.to_string());
@@ -1737,7 +1746,7 @@ fn build_retained_checkbox(
 ) -> (RawElOrText, RetainedNode) {
     let vm = Mutable::new(full_value.clone());
     let effective_link = fields
-        .get("__link_path__" as &str)
+        .get(LINK_PATH_FIELD as &str)
         .and_then(|v| v.as_text())
         .map(|s| s.to_string())
         .unwrap_or_else(|| link_path.to_string());
@@ -2118,7 +2127,7 @@ impl RetainedNode {
 
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = fields
-                        .get("__link_path__" as &str)
+                        .get(LINK_PATH_FIELD as &str)
                         .and_then(|v| v.as_text())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| link_path.to_string());
@@ -2147,7 +2156,7 @@ impl RetainedNode {
                 value.set_neq(new_value.clone());
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = fields
-                        .get("__link_path__" as &str)
+                        .get(LINK_PATH_FIELD as &str)
                         .and_then(|v| v.as_text())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| link_path.to_string());
@@ -2161,7 +2170,7 @@ impl RetainedNode {
                 value.set_neq(new_value.clone());
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = fields
-                        .get("__link_path__" as &str)
+                        .get(LINK_PATH_FIELD as &str)
                         .and_then(|v| v.as_text())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| link_path.to_string());

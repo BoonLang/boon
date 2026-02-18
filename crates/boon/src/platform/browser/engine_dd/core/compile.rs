@@ -23,6 +23,7 @@ use crate::parser::{
 use super::types::{
     BroadcastHandlerFn, CollectionSpec, DataflowGraph, InputId, InputKind, InputSpec,
     KeyedListOutput, ListKey, SideEffectKind, VarId,
+    LIST_TAG, LINK_PATH_FIELD, HOVER_PATH_FIELD, HOVERED_FIELD, ROUTER_INPUT, PASSED_VAR,
 };
 use super::value::Value;
 
@@ -384,7 +385,7 @@ impl Compiler {
                 }
                 Alias::WithPassed { extra_parts } => {
                     // Look up __passed in local scope
-                    let passed = local_scope.get("__passed")
+                    let passed = local_scope.get(PASSED_VAR)
                         .ok_or_else(|| "PASSED not available in this context".to_string())?;
                     let mut val = passed.clone();
                     for part in extra_parts {
@@ -404,7 +405,7 @@ impl Compiler {
                     fields.insert(Arc::from(format!("{:04}", i)), val);
                 }
                 Ok(Value::Tagged {
-                    tag: Arc::from("List"),
+                    tag: Arc::from(LIST_TAG),
                     fields: Arc::new(fields),
                 })
             }
@@ -633,7 +634,7 @@ impl Compiler {
                     fields.insert(Arc::from(format!("{:04}", i)), val);
                 }
                 Value::Tagged {
-                    tag: Arc::from("List"),
+                    tag: Arc::from(LIST_TAG),
                     fields: Arc::new(fields),
                 }
             }
@@ -671,11 +672,11 @@ impl Compiler {
                                     .unwrap_or(false);
                                 if has_hovered_link {
                                     let hover_state = local_scope.values()
-                                        .find_map(|v| v.get_field("__hovered"))
+                                        .find_map(|v| v.get_field(HOVERED_FIELD))
                                         .cloned()
                                         .unwrap_or(Value::tag("False"));
                                     hover_path = local_scope.values()
-                                        .find_map(|v| v.get_field("__hover_path__").and_then(|p| p.as_text().map(|s| s.to_string())));
+                                        .find_map(|v| v.get_field(HOVER_PATH_FIELD).and_then(|p| p.as_text().map(|s| s.to_string())));
                                     let el_val = el_val.update_field("hovered", hover_state);
                                     let el_val = Self::replace_links_with_defaults(&el_val);
                                     elem_scope.insert("element".to_string(), el_val);
@@ -695,7 +696,7 @@ impl Compiler {
                         }
                         // Inject __hover_path__ for the bridge
                         if let Some(ref path) = hover_path {
-                            fields.insert(Arc::from("__hover_path__"), Value::text(path.as_str()));
+                            fields.insert(Arc::from(HOVER_PATH_FIELD), Value::text(path.as_str()));
                         }
                         Value::Tagged {
                             tag: Arc::from(tag),
@@ -768,7 +769,7 @@ impl Compiler {
             if arg_name == "PASS" {
                 if let Some(ref val_expr) = arg.node.value {
                     let val = self.eval_static_tolerant(val_expr, local_scope);
-                    fn_scope.insert("__passed".to_string(), val);
+                    fn_scope.insert(PASSED_VAR.to_string(), val);
                 }
                 continue;
             }
@@ -936,12 +937,12 @@ impl Compiler {
                 if has_hovered_link {
                     // Look for __hovered state from any scope variable (from list item)
                     let hover_state = local_scope.values()
-                        .find_map(|v| v.get_field("__hovered"))
+                        .find_map(|v| v.get_field(HOVERED_FIELD))
                         .cloned()
                         .unwrap_or(Value::tag("False"));
                     // Look for __hover_path__ from any scope variable
                     hover_path = local_scope.values()
-                        .find_map(|v| v.get_field("__hover_path__").and_then(|p| p.as_text().map(|s| s.to_string())));
+                        .find_map(|v| v.get_field(HOVER_PATH_FIELD).and_then(|p| p.as_text().map(|s| s.to_string())));
                     // Replace hovered with actual hover state
                     let el_val = el_val.update_field("hovered", hover_state);
                     let el_val = Self::replace_links_with_defaults(&el_val);
@@ -962,7 +963,7 @@ impl Compiler {
         }
         // Inject __hover_path__ for the bridge to extract
         if let Some(ref path) = hover_path {
-            fields.insert(Arc::from("__hover_path__"), Value::text(path.as_str()));
+            fields.insert(Arc::from(HOVER_PATH_FIELD), Value::text(path.as_str()));
         }
         Ok(Value::Tagged {
             tag: Arc::from(tag),
@@ -1009,7 +1010,7 @@ impl Compiler {
             if arg_name == "PASS" {
                 if let Some(ref val_expr) = arg.node.value {
                     let val = self.eval_static_with_scope(val_expr, local_scope)?;
-                    fn_scope.insert("__passed".to_string(), val);
+                    fn_scope.insert(PASSED_VAR.to_string(), val);
                 }
                 continue;
             }
@@ -1065,7 +1066,7 @@ impl Compiler {
                             .unwrap_or(0.0) as usize;
 
                         if let Value::Tagged { tag, fields } = &from_val {
-                            if tag.as_ref() == "List" {
+                            if tag.as_ref() == LIST_TAG {
                                 let items: Vec<&Value> = fields.values().collect();
                                 if count < items.len() {
                                     return Ok(items[count].clone());
@@ -1085,7 +1086,7 @@ impl Compiler {
                             fields.insert(Arc::from(format!("{:04}", i)), Value::Unit);
                         }
                         Ok(Value::Tagged {
-                            tag: Arc::from("List"),
+                            tag: Arc::from(LIST_TAG),
                             fields: Arc::new(fields),
                         })
                     }
@@ -1254,7 +1255,7 @@ impl Compiler {
                                         .cloned()
                                         .unwrap_or(Value::Unit);
                                 }
-                                val.get_field("__link_path__")
+                                val.get_field(LINK_PATH_FIELD)
                                     .and_then(|v| v.as_text())
                                     .map(|s| s.to_string())
                             } else {
@@ -1270,7 +1271,7 @@ impl Compiler {
                     Alias::WithPassed { extra_parts } => {
                         // LINK { PASSED.store.elements.item_input }
                         // Resolve PASSED to get the actual link path
-                        let passed = local_scope.get("__passed");
+                        let passed = local_scope.get(PASSED_VAR);
                         if let Some(passed_val) = passed {
                             let mut val = passed_val.clone();
                             for part in extra_parts {
@@ -1279,7 +1280,7 @@ impl Compiler {
                                     .unwrap_or(Value::Unit);
                             }
                             // The resolved value might be an object with __link_path__
-                            val.get_field("__link_path__")
+                            val.get_field(LINK_PATH_FIELD)
                                 .and_then(|v| v.as_text())
                                 .map(|s| s.to_string())
                                 .or_else(|| val.as_text().map(|s| s.to_string()))
@@ -1296,7 +1297,7 @@ impl Compiler {
                 if let Value::Tagged { tag, fields } = from_val {
                     let mut new_fields = (*fields).clone();
                     new_fields.insert(Arc::from("press_link"), Value::text(&*press_path));
-                    new_fields.insert(Arc::from("__link_path__"), Value::text(link_path.as_str()));
+                    new_fields.insert(Arc::from(LINK_PATH_FIELD), Value::text(link_path.as_str()));
                     Ok(Value::Tagged { tag, fields: Arc::new(new_fields) })
                 } else {
                     Ok(from_val)
@@ -1343,7 +1344,7 @@ impl Compiler {
                                     fields.insert(Arc::from(format!("{:04}", i)), s.clone());
                                 }
                                 Ok(Value::Tagged {
-                                    tag: Arc::from("List"),
+                                    tag: Arc::from(LIST_TAG),
                                     fields: Arc::new(fields),
                                 })
                             }
@@ -1868,7 +1869,7 @@ impl<'a> GraphBuilder<'a> {
                     p.as_slice() == ["Router", "route"]
                 } =>
             {
-                let input_id = self.add_input(InputKind::Router, Some("__router".to_string()));
+                let input_id = self.add_input(InputKind::Router, Some(ROUTER_INPUT.to_string()));
                 let var = VarId::new(name);
                 self.collections.insert(var.clone(), CollectionSpec::Input(input_id));
                 self.reactive_vars.insert(name.to_string(), var.clone());
@@ -3153,7 +3154,7 @@ impl<'a> GraphBuilder<'a> {
                 // Inject __link_path__ for LINK variables (top-level buttons, filter links, etc.)
                 for (nested_path, full_path) in &link_injections {
                     store_value = set_nested_field(&store_value, nested_path, Value::object([
-                        ("__link_path__", Value::text(full_path.as_str())),
+                        (LINK_PATH_FIELD, Value::text(full_path.as_str())),
                     ]));
                 }
 
@@ -3163,7 +3164,7 @@ impl<'a> GraphBuilder<'a> {
                     let fields_snapshot = fields.clone();
                     for (field_name, field_val) in fields_snapshot.iter() {
                         if let Value::Tagged { tag, fields: list_fields } = field_val {
-                            if tag.as_ref() == "List" {
+                            if tag.as_ref() == LIST_TAG {
                                 let list_path = format!("store.{}", field_name);
                                 let new_list_fields: BTreeMap<Arc<str>, Value> = list_fields.iter()
                                     .map(|(key, item)| {
@@ -3336,13 +3337,13 @@ impl<'a> GraphBuilder<'a> {
             match path_strs.as_slice() {
                 ["Router", "route"] => {
                     // Router/route() is an input that receives route change events
-                    let input_id = self.add_input(InputKind::Router, Some("__router".to_string()));
-                    let router_var = self.fresh_var("__router");
+                    let input_id = self.add_input(InputKind::Router, Some(ROUTER_INPUT.to_string()));
+                    let router_var = self.fresh_var(ROUTER_INPUT);
                     self.collections.insert(
                         router_var.clone(),
                         CollectionSpec::Input(input_id),
                     );
-                    self.reactive_vars.insert("__router".to_string(), router_var.clone());
+                    self.reactive_vars.insert(ROUTER_INPUT.to_string(), router_var.clone());
                     return Ok(router_var);
                 }
                 _ => {}
@@ -3884,7 +3885,7 @@ impl<'a> GraphBuilder<'a> {
                             fields.insert(Arc::from(part.as_str()), passed_val);
                             passed_val = Value::Object(Arc::new(fields));
                         }
-                        scope.insert("__passed".to_string(), passed_val);
+                        scope.insert(PASSED_VAR.to_string(), passed_val);
                         compiler.eval_static_with_scope(&pred_expr, &scope)
                             .and_then(|v| Ok(v.as_bool().unwrap_or(false)))
                             .unwrap_or(false)
@@ -4478,7 +4479,7 @@ impl<'a> GraphBuilder<'a> {
     /// Build a keyed list pipeline for lists with per-item events (wildcard).
     ///
     /// Instead of a monolithic HoldState holding the entire list, this creates:
-    /// LiteralList → AppendNewKeyed → ListAppend → KeyedHoldState → AssembleList
+    /// LiteralList → AppendNewKeyed → ListAppend → KeyedHoldState
     /// with MapToKeyed for wildcard event demuxing and per-item transform.
     fn build_keyed_list_holdstate(
         &mut self,
@@ -4500,7 +4501,7 @@ impl<'a> GraphBuilder<'a> {
 
         // Decompose initial list into (ListKey, Value) pairs
         let initial_items: Vec<(ListKey, Value)> = if let Value::Tagged { ref tag, ref fields } = effective_initial {
-            if tag.as_ref() == "List" {
+            if tag.as_ref() == LIST_TAG {
                 fields.iter().map(|(k, v)| (ListKey::new(k.as_ref()), v.clone())).collect()
             } else { Vec::new() }
         } else { Vec::new() };
@@ -4793,7 +4794,7 @@ impl<'a> GraphBuilder<'a> {
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
                             state.update_field(
-                                "__hovered",
+                                HOVERED_FIELD,
                                 if hovered { Value::tag("True") } else { Value::tag("False") },
                             )
                         }
@@ -4826,18 +4827,13 @@ impl<'a> GraphBuilder<'a> {
                     if count == 0 {
                         Value::empty_list()
                     } else {
-                        // Stub list with N placeholder items — just enough for
-                        // List/is_empty() and List/count() to return correct results.
-                        // Actual item rendering flows via keyed diffs.
+                        // Single placeholder — O(1) regardless of list size.
+                        // Just enough for List/is_empty() to return False.
+                        // Actual count comes from ListCount DD operator; items via keyed diffs.
                         let mut fields = std::collections::BTreeMap::new();
-                        for i in 0..count {
-                            fields.insert(
-                                Arc::from(format!("{:04}", i).as_str()),
-                                Value::Unit,
-                            );
-                        }
+                        fields.insert(Arc::from("0000"), Value::Unit);
                         Value::Tagged {
-                            tag: Arc::from("List"),
+                            tag: Arc::from(LIST_TAG),
                             fields: Arc::new(fields),
                         }
                     }
@@ -5096,10 +5092,6 @@ impl<'a> GraphBuilder<'a> {
             Some(CollectionSpec::ListRemove { list, .. }) => self.has_initial_value(list),
             Some(CollectionSpec::MapToKeyed { .. }) => false, // Event stream, no initial value
             Some(CollectionSpec::AppendNewKeyed { .. }) => false, // Event stream, no initial value
-            Some(CollectionSpec::AssembleList(source)) => self.has_initial_value(source),
-            Some(CollectionSpec::KeyedConcat(sources)) => {
-                sources.iter().any(|s| self.has_initial_value(s))
-            }
             None => false,
         }
     }
@@ -5327,10 +5319,10 @@ fn inject_item_link_paths_with_key(item: &Value, list_path: &str, key: &str) -> 
 
     // Inject hover path for per-item hover (element.hovered).
     // Preserve existing __hovered state (set by wildcard HoverChange events).
-    if item.get_field("__hovered").is_none() {
-        result = result.update_field("__hovered", Value::tag("False"));
+    if item.get_field(HOVERED_FIELD).is_none() {
+        result = result.update_field(HOVERED_FIELD, Value::tag("False"));
     }
-    result = result.update_field("__hover_path__", Value::text(format!("{}.hovered", item_path).as_str()));
+    result = result.update_field(HOVER_PATH_FIELD, Value::text(format!("{}.hovered", item_path).as_str()));
 
     // If the item has todo_elements, inject link paths
     if let Some(todo_elements) = item.get_field("todo_elements") {
@@ -5340,7 +5332,7 @@ fn inject_item_link_paths_with_key(item: &Value, list_path: &str, key: &str) -> 
                 let link_path = format!("{}.todo_elements.{}", item_path, el_name);
                 new_elements = new_elements.update_field(
                     el_name.as_ref(),
-                    Value::object([("__link_path__", Value::text(link_path.as_str()))]),
+                    Value::object([(LINK_PATH_FIELD, Value::text(link_path.as_str()))]),
                 );
             }
         }
@@ -5559,7 +5551,7 @@ impl Compiler {
                     item_templates.push((format!("{:04}", i), tmpl));
                 }
                 Ok(DocTemplate::Tagged {
-                    tag: "List".to_string(),
+                    tag: LIST_TAG.to_string(),
                     fields: item_templates,
                 })
             }

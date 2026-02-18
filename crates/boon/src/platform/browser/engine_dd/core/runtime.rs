@@ -393,29 +393,6 @@ where
                 ))
             }
 
-            CollectionSpec::AssembleList(source) => {
-                let keyed_coll = collections
-                    .get(source)
-                    .expect("AssembleList source not found")
-                    .as_keyed();
-                AnyCollection::Scalar(operators::assemble_list(keyed_coll))
-            }
-
-            CollectionSpec::KeyedConcat(sources) => {
-                let mut result = collections
-                    .get(&sources[0])
-                    .expect("KeyedConcat first source not found")
-                    .as_keyed()
-                    .clone();
-                for src in &sources[1..] {
-                    let other = collections
-                        .get(src)
-                        .expect("KeyedConcat source not found")
-                        .as_keyed();
-                    result = result.concat(other);
-                }
-                AnyCollection::Keyed(result)
-            }
         };
 
         collections.insert(var_id.clone(), any_collection);

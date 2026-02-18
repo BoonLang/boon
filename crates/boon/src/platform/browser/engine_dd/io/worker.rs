@@ -19,6 +19,7 @@ use zoon::*;
 use super::super::core::runtime;
 use super::super::core::types::{
     DataflowGraph, InputId, InputKind, KeyedDiff, LinkId, ListKey, SideEffectKind,
+    LIST_TAG, ROUTER_INPUT,
 };
 use super::super::core::value::Value;
 
@@ -178,7 +179,7 @@ impl DdWorkerHandle {
                 let persisted_items = super::persistence::load_hold_state(sk, hn)
                     .map(|v| {
                         if let Value::Tagged { ref tag, ref fields } = v {
-                            if tag.as_ref() == "List" {
+                            if tag.as_ref() == LIST_TAG {
                                 return fields.iter()
                                     .map(|(k, v)| (ListKey::new(k.as_ref()), v.clone()))
                                     .collect();
@@ -257,7 +258,7 @@ impl DdWorkerHandle {
         // This ensures Router-derived collections have data at the same timestamp
         // as LiteralList/KeyedHoldState initial data, so DD joins can match them.
         if has_router_input {
-            if let Some(input_id) = inner.link_path_to_input.get("__router") {
+            if let Some(input_id) = inner.link_path_to_input.get(ROUTER_INPUT) {
                 let path = web_sys::window()
                     .and_then(|w| w.location().pathname().ok())
                     .unwrap_or_else(|| "/".to_string());
@@ -357,7 +358,7 @@ impl DdWorkerHandle {
             }
             Event::RouterChange { path } => {
                 // Router events map to the __router input with the route text as value
-                ("__router".to_string(), Value::text(path))
+                (ROUTER_INPUT.to_string(), Value::text(path))
             }
         };
 
