@@ -412,10 +412,6 @@ fn extract_padding_from_fields(fields: &Fields) -> Option<Padding<'static>> {
     }
 }
 
-fn extract_padding(value: &Value) -> Option<Padding<'static>> {
-    extract_padding_from_fields(get_fields(value)?)
-}
-
 /// Extract Background from element fields' style.
 fn extract_background_from_fields(fields: &Fields) -> Option<Background<'static>> {
     let style = get_style_obj(fields)?;
@@ -438,10 +434,6 @@ fn extract_background_from_fields(fields: &Fields) -> Option<Background<'static>
     } else {
         None
     }
-}
-
-fn extract_background(value: &Value) -> Option<Background<'static>> {
-    extract_background_from_fields(get_fields(value)?)
 }
 
 /// Extract background color from a Value (for signal closures).
@@ -473,10 +465,6 @@ fn extract_rounded_corners_from_fields(fields: &Fields) -> Option<RoundedCorners
         .get("rounded_corners")
         .and_then(|v| v.as_number())
         .map(|n| RoundedCorners::all(n as u32))
-}
-
-fn extract_rounded_corners(value: &Value) -> Option<RoundedCorners> {
-    extract_rounded_corners_from_fields(get_fields(value)?)
 }
 
 /// Extract Transform from element fields' style.
@@ -562,64 +550,6 @@ fn extract_outline(value: &Value) -> Option<Outline> {
     extract_outline_from_fields(get_fields(value)?)
 }
 
-/// Extract Shadows from element fields' style.
-fn extract_shadows_from_fields(fields: &Fields) -> Option<Vec<Shadow>> {
-    let style = get_style_obj(fields)?;
-    if let Some(Value::Tagged {
-        tag,
-        fields: list_fields,
-    }) = style.get("shadows")
-    {
-        if tag.as_ref() == LIST_TAG {
-            let mut shadows = Vec::new();
-            for item in list_fields.values() {
-                if let Value::Object(shadow_obj) = item {
-                    let x = shadow_obj
-                        .get("x")
-                        .and_then(|v| v.as_number())
-                        .unwrap_or(0.0) as i32;
-                    let y = shadow_obj
-                        .get("y")
-                        .and_then(|v| v.as_number())
-                        .unwrap_or(0.0) as i32;
-                    let blur = shadow_obj
-                        .get("blur")
-                        .and_then(|v| v.as_number())
-                        .unwrap_or(0.0) as u32;
-                    let spread = shadow_obj
-                        .get("spread")
-                        .and_then(|v| v.as_number())
-                        .unwrap_or(0.0) as i32;
-                    let inset = shadow_obj
-                        .get("direction")
-                        .and_then(|v| v.as_tag())
-                        .map(|t| t == "Inwards")
-                        .unwrap_or(false);
-                    let color_css = shadow_obj
-                        .get("color")
-                        .and_then(value_to_css_color);
-                    let mut shadow = Shadow::new().x(x).y(y).blur(blur).spread(spread);
-                    if inset {
-                        shadow = shadow.inner();
-                    }
-                    if let Some(css) = color_css {
-                        shadow = shadow.color(css);
-                    }
-                    shadows.push(shadow);
-                }
-            }
-            if !shadows.is_empty() {
-                return Some(shadows);
-            }
-        }
-    }
-    None
-}
-
-fn extract_shadows(value: &Value) -> Option<Vec<Shadow>> {
-    extract_shadows_from_fields(get_fields(value)?)
-}
-
 /// Extract Borders from element fields' style.
 fn extract_border_side(side_obj: &Fields) -> Option<Border> {
     let width = side_obj
@@ -667,10 +597,6 @@ fn extract_borders_from_fields(fields: &Fields) -> Option<Borders<'static>> {
     } else {
         None
     }
-}
-
-fn extract_borders(value: &Value) -> Option<Borders<'static>> {
-    extract_borders_from_fields(get_fields(value)?)
 }
 
 /// Extract AlignContent from element fields' style.
@@ -955,10 +881,6 @@ impl KeyedItems {
         }
     }
 
-    fn find_index(&self, key: &str) -> Option<usize> {
-        self.key_to_index.get(key).copied()
-    }
-
     /// Extract link path from item's __link_path__ field, or construct from key.
     fn child_link_path(&self, value: &Value, stripe_link_path: &str, key: &str) -> String {
         get_fields(value)
@@ -1162,6 +1084,17 @@ fn build_retained_tagged(
     }
 }
 
+/// Create a hover change handler for Zoon's `.on_hovered_change()`.
+fn make_hover_handler(handle_ref: DdWorkerHandle, hover_link: Option<String>) -> impl FnMut(bool) {
+    move |hovered| {
+        if let Some(ref path) = hover_link {
+            if !path.is_empty() {
+                handle_ref.inject_dd_event(Event::HoverChange { link_path: path.clone(), hovered });
+            }
+        }
+    }
+}
+
 fn build_retained_button(
     fields: &Fields,
     full_value: &Value,
@@ -1213,17 +1146,7 @@ fn build_retained_button(
                 }
             }
         })
-        .on_hovered_change({
-            let handle_ref = handle.clone_ref();
-            let hover_link = hover_link.clone();
-            move |hovered| {
-                if let Some(ref path) = hover_link {
-                    if !path.is_empty() {
-                        handle_ref.inject_dd_event(Event::HoverChange { link_path: path.clone(), hovered });
-                    }
-                }
-            }
-        });
+        .on_hovered_change(make_hover_handler(handle.clone_ref(), hover_link.clone()));
 
     (
         el.unify(),
@@ -1551,17 +1474,7 @@ fn build_retained_label(
                 }
             }
         })
-        .on_hovered_change({
-            let handle_ref = handle.clone_ref();
-            let hover_link = hover_link.clone();
-            move |hovered| {
-                if let Some(ref path) = hover_link {
-                    if !path.is_empty() {
-                        handle_ref.inject_dd_event(Event::HoverChange { link_path: path.clone(), hovered });
-                    }
-                }
-            }
-        });
+        .on_hovered_change(make_hover_handler(handle.clone_ref(), hover_link.clone()));
 
     (
         el.unify(),

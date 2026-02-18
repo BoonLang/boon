@@ -37,12 +37,6 @@ pub enum CompiledProgram {
     Dataflow { graph: DataflowGraph },
 }
 
-/// A binding from a LINK path to a DD input.
-pub struct LinkBinding {
-    pub link_id: super::types::LinkId,
-    pub input_id: InputId,
-}
-
 /// Operations collected from a `LIST {} |> List/append(...) |> List/remove(...)` chain.
 enum ListChainOp<'a> {
     /// `List/append(item: source_expr)`
