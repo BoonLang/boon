@@ -444,6 +444,28 @@ fn extract_background(value: &Value) -> Option<Background<'static>> {
     extract_background_from_fields(get_fields(value)?)
 }
 
+/// Extract background color from a Value (for signal closures).
+fn extract_bg_color(value: &Value) -> Option<String> {
+    let fields = get_fields(value)?;
+    let style = get_style_obj(fields)?;
+    let bg = match style.get("background") {
+        Some(Value::Object(bg)) => bg,
+        _ => return None,
+    };
+    bg.get("color").and_then(value_to_css_color)
+}
+
+/// Extract background URL from a Value (for signal closures).
+fn extract_bg_url(value: &Value) -> Option<String> {
+    let fields = get_fields(value)?;
+    let style = get_style_obj(fields)?;
+    let bg = match style.get("background") {
+        Some(Value::Object(bg)) => bg,
+        _ => return None,
+    };
+    bg.get("url").and_then(|v| v.as_text()).map(|s| s.to_string())
+}
+
 /// Extract RoundedCorners from element fields' style.
 fn extract_rounded_corners_from_fields(fields: &Fields) -> Option<RoundedCorners> {
     let style = get_style_obj(fields)?;
@@ -1165,24 +1187,8 @@ fn build_retained_button(
         .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
         .s(Height::with_signal_self(vm.signal_cloned().map(|v| extract_height(&v))))
         .s(Background::new()
-            .color_signal(vm.signal_cloned().map(|v| {
-                let fields = get_fields(&v)?;
-                let style = get_style_obj(fields)?;
-                let bg = match style.get("background") {
-                    Some(Value::Object(bg)) => bg,
-                    _ => return None,
-                };
-                bg.get("color").and_then(value_to_css_color)
-            }))
-            .url_signal(vm.signal_cloned().map(|v| {
-                let fields = get_fields(&v)?;
-                let style = get_style_obj(fields)?;
-                let bg = match style.get("background") {
-                    Some(Value::Object(bg)) => bg,
-                    _ => return None,
-                };
-                bg.get("url").and_then(|v| v.as_text()).map(|s| s.to_string())
-            })))
+            .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v)))
+            .url_signal(vm.signal_cloned().map(|v| extract_bg_url(&v))))
         .s(RoundedCorners::all_signal(vm.signal_cloned().map(|v| {
             get_fields(&v)
                 .and_then(|f| get_style_obj(f))
@@ -1298,24 +1304,8 @@ fn build_retained_stripe(
         .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
         .s(Height::with_signal_self(vm.signal_cloned().map(|v| extract_height(&v))))
         .s(Background::new()
-            .color_signal(vm.signal_cloned().map(|v| {
-                let fields = get_fields(&v)?;
-                let style = get_style_obj(fields)?;
-                let bg = match style.get("background") {
-                    Some(Value::Object(bg)) => bg,
-                    _ => return None,
-                };
-                bg.get("color").and_then(value_to_css_color)
-            }))
-            .url_signal(vm.signal_cloned().map(|v| {
-                let fields = get_fields(&v)?;
-                let style = get_style_obj(fields)?;
-                let bg = match style.get("background") {
-                    Some(Value::Object(bg)) => bg,
-                    _ => return None,
-                };
-                bg.get("url").and_then(|v| v.as_text()).map(|s| s.to_string())
-            })))
+            .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v)))
+            .url_signal(vm.signal_cloned().map(|v| extract_bg_url(&v))))
         .s(RoundedCorners::all_signal(vm.signal_cloned().map(|v| {
             get_fields(&v)
                 .and_then(|f| get_style_obj(f))
@@ -1420,15 +1410,7 @@ fn build_retained_stack(
         .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
         .s(Height::with_signal_self(vm.signal_cloned().map(|v| extract_height(&v))))
         .s(Background::new()
-            .color_signal(vm.signal_cloned().map(|v| {
-                let fields = get_fields(&v)?;
-                let style = get_style_obj(fields)?;
-                let bg = match style.get("background") {
-                    Some(Value::Object(bg)) => bg,
-                    _ => return None,
-                };
-                bg.get("color").and_then(value_to_css_color)
-            })))
+            .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v))))
         .layers_signal_vec(VecDiffStreamSignalVec(layers_rx));
 
     (
@@ -1471,15 +1453,7 @@ fn build_retained_container(
         .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
         .s(Height::with_signal_self(vm.signal_cloned().map(|v| extract_height(&v))))
         .s(Background::new()
-            .color_signal(vm.signal_cloned().map(|v| {
-                let fields = get_fields(&v)?;
-                let style = get_style_obj(fields)?;
-                let bg = match style.get("background") {
-                    Some(Value::Object(bg)) => bg,
-                    _ => return None,
-                };
-                bg.get("color").and_then(value_to_css_color)
-            })))
+            .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v))))
         .s(RoundedCorners::all_signal(vm.signal_cloned().map(|v| {
             get_fields(&v)
                 .and_then(|f| get_style_obj(f))
@@ -1650,15 +1624,7 @@ fn build_retained_text_input(
         .s(Font::with_signal_self(vm.signal_cloned().map(|v| extract_font(&v))))
         .s(Width::with_signal_self(vm.signal_cloned().map(|v| extract_width(&v))))
         .s(Background::new()
-            .color_signal(vm.signal_cloned().map(|v| {
-                let fields = get_fields(&v)?;
-                let style = get_style_obj(fields)?;
-                let bg = match style.get("background") {
-                    Some(Value::Object(bg)) => bg,
-                    _ => return None,
-                };
-                bg.get("color").and_then(value_to_css_color)
-            })))
+            .color_signal(vm.signal_cloned().map(|v| extract_bg_color(&v))))
         .update_raw_el({
             let dom_el_ref = dom_el.clone();
             let initial_text = text.clone();

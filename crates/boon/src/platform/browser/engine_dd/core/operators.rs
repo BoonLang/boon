@@ -320,28 +320,26 @@ where
 
                         // Process list items first
                         for ((key, (_, value)), ts, diff) in list_diffs {
-                            let value_clone = value.clone();
                             if diff > 0 {
-                                items.insert(key.clone(), value);
-                            } else {
-                                items.remove(&key);
-                            }
-                            // Emit/retract based on current filter
-                            if let Some(ref fv) = current_filter {
-                                let was_emitted = last_emitted.get(&key).copied().unwrap_or(false);
-                                if diff > 0 {
-                                    let item = items.get(&key).unwrap();
-                                    let passes = predicate(item, fv);
+                                let passes = current_filter.as_ref()
+                                    .map(|fv| predicate(&value, fv));
+                                items.insert(key.clone(), value.clone());
+                                if let Some(passes) = passes {
                                     if passes {
-                                        session.give(((key.clone(), item.clone()), ts, 1));
+                                        session.give(((key.clone(), value), ts, 1));
                                         last_emitted.insert(key, true);
                                     } else {
                                         last_emitted.insert(key, false);
                                     }
-                                } else if was_emitted {
-                                    // Item removed — retract old emitted value
-                                    session.give(((key.clone(), value_clone), ts, -1));
-                                    last_emitted.remove(&key);
+                                }
+                            } else {
+                                items.remove(&key);
+                                if current_filter.is_some() {
+                                    let was_emitted = last_emitted.get(&key).copied().unwrap_or(false);
+                                    if was_emitted {
+                                        session.give(((key.clone(), value), ts, -1));
+                                        last_emitted.remove(&key);
+                                    }
                                 }
                             }
                         }
@@ -558,13 +556,12 @@ where
                         for ((key, (_, value)), ts, diff) in events {
                             if diff > 0 {
                                 if let Some(current) = states.get(&key) {
-                                    let old = current.clone();
-                                    let new_val = transform(&old, &value);
+                                    let new_val = transform(current, &value);
                                     if new_val == Value::Unit {
-                                        states.remove(&key);
+                                        let old = states.remove(&key).unwrap();
                                         session.give(((key, old), ts, -1isize));
-                                    } else if new_val != old {
-                                        session.give(((key.clone(), old), ts, -1isize));
+                                    } else if new_val != *current {
+                                        session.give(((key.clone(), current.clone()), ts, -1isize));
                                         session.give(((key.clone(), new_val.clone()), ts, 1isize));
                                         states.insert(key, new_val);
                                     }
