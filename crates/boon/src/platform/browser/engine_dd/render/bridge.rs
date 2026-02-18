@@ -13,9 +13,11 @@
 //! - **Static**: Single render, no signals needed.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
+
+use indexmap::IndexMap;
 
 use futures_channel::mpsc;
 use pin_project::pin_project;
@@ -660,7 +662,7 @@ fn extract_self_align(value: &Value) -> Option<Align> {
 /// Returns a closure suitable for `update_raw_el`.
 fn apply_zoon_style_signals<T: RawEl>(
     raw_el: T,
-    vm: &Mutable<Value>,
+    vm: &Mutable<Arc<Value>>,
 ) -> T {
     raw_el
         .style_signal("padding", vm.signal_cloned().map(|v| {
@@ -815,18 +817,16 @@ fn css_border_side(value: &Value, side: &str) -> Option<String> {
 ///
 /// Items are ordered by ListKey (sorted). Updates from keyed diffs
 /// target individual items by key without scanning the entire list.
+/// Uses IndexMap for O(1) key lookup with O(1) position queries.
 struct KeyedItems {
-    /// Items ordered by key: (key_str, retained_node).
-    items: Vec<(Arc<str>, RetainedNode)>,
-    /// O(1) key → index lookup.
-    key_to_index: HashMap<Arc<str>, usize>,
+    /// Items ordered by key, with O(1) key→index lookup via IndexMap.
+    items: IndexMap<Arc<str>, RetainedNode>,
 }
 
 impl KeyedItems {
     fn new() -> Self {
         KeyedItems {
-            items: Vec::new(),
-            key_to_index: HashMap::new(),
+            items: IndexMap::new(),
         }
     }
 
@@ -842,23 +842,18 @@ impl KeyedItems {
             match diff {
                 KeyedDiff::Upsert { key, value } => {
                     let key_str = key.0.clone();
-                    if let Some(&idx) = self.key_to_index.get(&key_str) {
-                        // Update existing item in place (O(1) — HashMap lookup + Mutable set)
-                        let child_lp = self.child_link_path(value, stripe_link_path, &key_str);
-                        self.items[idx].1.update(value, handle, &child_lp);
+                    if let Some(node) = self.items.get_mut(&key_str) {
+                        // Update existing item in place (O(1) — IndexMap lookup + Mutable set)
+                        let child_lp = Self::child_link_path(value, stripe_link_path, &key_str);
+                        node.update(value, handle, &child_lp);
                     } else {
-                        // New item — insert at sorted position
-                        let insert_pos = self.items.iter()
-                            .position(|(k, _)| k.as_ref() > key_str.as_ref())
+                        // New item — find sorted insertion position via binary search on keys
+                        let insert_pos = self.items.keys()
+                            .position(|k| k.as_ref() > key_str.as_ref())
                             .unwrap_or(self.items.len());
-                        let child_lp = self.child_link_path(value, stripe_link_path, &key_str);
+                        let child_lp = Self::child_link_path(value, stripe_link_path, &key_str);
                         let (el, node) = build_retained_node(value, handle, &child_lp);
-                        // Increment indices of items shifted right by the insert
-                        for (_, idx) in self.key_to_index.iter_mut() {
-                            if *idx >= insert_pos { *idx += 1; }
-                        }
-                        self.key_to_index.insert(key_str.clone(), insert_pos);
-                        self.items.insert(insert_pos, (key_str, node));
+                        self.items.shift_insert(insert_pos, key_str, node);
                         tx.unbounded_send(VecDiff::InsertAt {
                             index: insert_pos,
                             value: el,
@@ -867,13 +862,8 @@ impl KeyedItems {
                 }
                 KeyedDiff::Remove { key } => {
                     let key_str = key.0.clone();
-                    if let Some(&idx) = self.key_to_index.get(&key_str) {
-                        self.items.remove(idx);
-                        self.key_to_index.remove(&key_str);
-                        // Decrement indices of items shifted left by the removal
-                        for (_, i) in self.key_to_index.iter_mut() {
-                            if *i > idx { *i -= 1; }
-                        }
+                    if let Some(idx) = self.items.get_index_of(&key_str) {
+                        self.items.shift_remove_index(idx);
                         tx.unbounded_send(VecDiff::RemoveAt { index: idx }).ok();
                     }
                 }
@@ -882,7 +872,7 @@ impl KeyedItems {
     }
 
     /// Extract link path from item's __link_path__ field, or construct from key.
-    fn child_link_path(&self, value: &Value, stripe_link_path: &str, key: &str) -> String {
+    fn child_link_path(value: &Value, stripe_link_path: &str, key: &str) -> String {
         get_fields(value)
             .and_then(|f| f.get(LINK_PATH_FIELD))
             .and_then(|v| v.as_text())
@@ -905,11 +895,11 @@ enum RetainedNode {
         text: Mutable<String>,
     },
     Button {
-        value: Mutable<Value>,
+        value: Mutable<Arc<Value>>,
         link_path: Rc<RefCell<String>>,
     },
     Stripe {
-        value: Mutable<Value>,
+        value: Mutable<Arc<Value>>,
         items: Vec<RetainedNode>,
         items_tx: mpsc::UnboundedSender<VecDiff<RawElOrText>>,
         link_path: Rc<RefCell<String>>,
@@ -917,35 +907,35 @@ enum RetainedNode {
         keyed_items: Option<KeyedItems>,
     },
     Stack {
-        value: Mutable<Value>,
+        value: Mutable<Arc<Value>>,
         layers: Vec<RetainedNode>,
         layers_tx: mpsc::UnboundedSender<VecDiff<RawElOrText>>,
     },
     Container {
-        value: Mutable<Value>,
+        value: Mutable<Arc<Value>>,
         child: Option<Box<RetainedNode>>,
         child_tx: mpsc::UnboundedSender<VecDiff<RawElOrText>>,
     },
     TextInput {
-        value: Mutable<Value>,
+        value: Mutable<Arc<Value>>,
         link_path: Rc<RefCell<String>>,
         dom_element: Rc<RefCell<Option<web_sys::HtmlInputElement>>>,
     },
     Checkbox {
-        value: Mutable<Value>,
+        value: Mutable<Arc<Value>>,
         link_path: Rc<RefCell<String>>,
     },
     Label {
-        value: Mutable<Value>,
+        value: Mutable<Arc<Value>>,
         link_path: Rc<RefCell<String>>,
     },
     Paragraph {
-        value: Mutable<Value>,
+        value: Mutable<Arc<Value>>,
         contents: Vec<RetainedNode>,
         contents_tx: mpsc::UnboundedSender<VecDiff<RawElOrText>>,
     },
     Link {
-        value: Mutable<Value>,
+        value: Mutable<Arc<Value>>,
         link_path: Rc<RefCell<String>>,
     },
     Document {
@@ -1101,7 +1091,7 @@ fn build_retained_button(
     handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
-    let vm = Mutable::new(full_value.clone());
+    let vm = Mutable::new(Arc::new(full_value.clone()));
     let effective_link = extract_effective_link(fields, link_path);
     let link_ref = Rc::new(RefCell::new(effective_link.clone()));
     let hover_link = extract_hover_link_path(fields, link_path);
@@ -1163,7 +1153,7 @@ fn build_retained_stripe(
     handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
-    let vm = Mutable::new(full_value.clone());
+    let vm = Mutable::new(Arc::new(full_value.clone()));
     let (items_tx, items_rx) = mpsc::unbounded();
     let effective_link = extract_effective_link(fields, link_path);
     let link_ref = Rc::new(RefCell::new(effective_link));
@@ -1309,7 +1299,7 @@ fn build_retained_stack(
     handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
-    let vm = Mutable::new(full_value.clone());
+    let vm = Mutable::new(Arc::new(full_value.clone()));
     let (layers_tx, layers_rx) = mpsc::unbounded();
 
     let layer_values = extract_sorted_list_items(fields, "layers");
@@ -1352,7 +1342,7 @@ fn build_retained_container(
     handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
-    let vm = Mutable::new(full_value.clone());
+    let vm = Mutable::new(Arc::new(full_value.clone()));
     let (child_tx, child_rx) = mpsc::unbounded();
 
     let mut retained_child = None;
@@ -1412,7 +1402,7 @@ fn build_retained_label(
     handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
-    let vm = Mutable::new(full_value.clone());
+    let vm = Mutable::new(Arc::new(full_value.clone()));
     let effective_link = fields
         .get(LINK_PATH_FIELD)
         .and_then(|v| v.as_text())
@@ -1491,7 +1481,7 @@ fn build_retained_text_input(
     handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
-    let vm = Mutable::new(full_value.clone());
+    let vm = Mutable::new(Arc::new(full_value.clone()));
     let effective_link = fields
         .get(LINK_PATH_FIELD)
         .and_then(|v| v.as_text())
@@ -1623,7 +1613,7 @@ fn build_retained_checkbox(
     handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
-    let vm = Mutable::new(full_value.clone());
+    let vm = Mutable::new(Arc::new(full_value.clone()));
     let effective_link = fields
         .get(LINK_PATH_FIELD)
         .and_then(|v| v.as_text())
@@ -1753,7 +1743,7 @@ fn build_retained_paragraph(
     handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
-    let vm = Mutable::new(full_value.clone());
+    let vm = Mutable::new(Arc::new(full_value.clone()));
     let (contents_tx, contents_rx) = mpsc::unbounded();
 
     let content_values = extract_sorted_list_items(fields, "contents");
@@ -1798,7 +1788,7 @@ fn build_retained_link(
     handle: &DdWorkerHandle,
     link_path: &str,
 ) -> (RawElOrText, RetainedNode) {
-    let vm = Mutable::new(full_value.clone());
+    let vm = Mutable::new(Arc::new(full_value.clone()));
     let effective_link = extract_effective_link(fields, link_path);
     let link_ref = Rc::new(RefCell::new(effective_link));
 
@@ -1905,7 +1895,7 @@ impl RetainedNode {
             }
 
             RetainedNode::Button { value, link_path: lp } => {
-                value.set_neq(new_value.clone());
+                value.set_neq(Arc::new(new_value.clone()));
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = extract_effective_link(fields, link_path);
                 }
@@ -1918,7 +1908,7 @@ impl RetainedNode {
                 link_path: lp,
                 keyed_items,
             } => {
-                value.set_neq(new_value.clone());
+                value.set_neq(Arc::new(new_value.clone()));
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = extract_effective_link(fields, link_path);
                     // Keyed Stripes: items come via apply_keyed_diffs, skip positional diff.
@@ -1935,7 +1925,7 @@ impl RetainedNode {
                 layers,
                 layers_tx,
             } => {
-                value.set_neq(new_value.clone());
+                value.set_neq(Arc::new(new_value.clone()));
                 if let Some(fields) = get_fields(new_value) {
                     let new_layers = extract_sorted_list_items(fields, "layers");
                     diff_children(layers, layers_tx, &new_layers, handle, link_path, "layers");
@@ -1947,7 +1937,7 @@ impl RetainedNode {
                 child,
                 child_tx,
             } => {
-                value.set_neq(new_value.clone());
+                value.set_neq(Arc::new(new_value.clone()));
                 if let Some(fields) = get_fields(new_value) {
                     let new_child = fields.get("child");
                     match (child.as_mut(), new_child) {
@@ -2002,7 +1992,7 @@ impl RetainedNode {
                     .unwrap_or("")
                     .to_string();
 
-                value.set_neq(new_value.clone());
+                value.set_neq(Arc::new(new_value.clone()));
 
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = fields
@@ -2032,7 +2022,7 @@ impl RetainedNode {
                 value,
                 link_path: lp,
             } => {
-                value.set_neq(new_value.clone());
+                value.set_neq(Arc::new(new_value.clone()));
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = fields
                         .get(LINK_PATH_FIELD)
@@ -2046,7 +2036,7 @@ impl RetainedNode {
                 value,
                 link_path: lp,
             } => {
-                value.set_neq(new_value.clone());
+                value.set_neq(Arc::new(new_value.clone()));
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = fields
                         .get(LINK_PATH_FIELD)
@@ -2061,7 +2051,7 @@ impl RetainedNode {
                 contents,
                 contents_tx,
             } => {
-                value.set_neq(new_value.clone());
+                value.set_neq(Arc::new(new_value.clone()));
                 if let Some(fields) = get_fields(new_value) {
                     let new_contents = extract_sorted_list_items(fields, "contents");
                     diff_children(
@@ -2076,7 +2066,7 @@ impl RetainedNode {
             }
 
             RetainedNode::Link { value, link_path: lp } => {
-                value.set_neq(new_value.clone());
+                value.set_neq(Arc::new(new_value.clone()));
                 if let Some(fields) = get_fields(new_value) {
                     *lp.borrow_mut() = extract_effective_link(fields, link_path);
                 }
