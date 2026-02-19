@@ -7,11 +7,12 @@ async function updateStatus() {
   const apiStatus = document.getElementById('api-status');
   const pageUrl = document.getElementById('page-url');
   const engineInfo = document.getElementById('engine-info');
+  const portInfo = document.getElementById('port-info');
 
   // Check WebSocket connection by trying to send a message
   try {
-    // Get tabs with localhost:8083
-    const tabs = await chrome.tabs.query({ url: 'http://localhost:8083/*' });
+    // Find playground tabs on any localhost port
+    const tabs = await chrome.tabs.query({ url: 'http://localhost/*' });
 
     if (tabs.length === 0) {
       wsDot.className = 'status-dot disconnected';
@@ -19,11 +20,23 @@ async function updateStatus() {
       apiDot.className = 'status-dot disconnected';
       apiStatus.textContent = 'No Playground tab';
       pageUrl.textContent = '-';
+      if (portInfo) portInfo.textContent = 'No tab detected';
       return;
     }
 
-    const tab = tabs[0];
+    // Prefer active tab, then most recently accessed
+    const tab = tabs.find(t => t.active) || tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
     pageUrl.textContent = tab.url;
+
+    // Show detected ports
+    if (portInfo) {
+      const portMatch = tab.url && tab.url.match(/localhost:(\d+)/);
+      if (portMatch) {
+        const pgPort = parseInt(portMatch[1], 10);
+        const wsPort = pgPort + 1141;
+        portInfo.textContent = `Playground: ${pgPort}, WS: ${wsPort}`;
+      }
+    }
 
     // Check if boonPlayground API is available
     try {
@@ -95,8 +108,39 @@ async function updateStatus() {
   }
 }
 
+// WS port override management
+function setupWsPortOverride() {
+  const wsPortInput = document.getElementById('ws-port-override');
+  const wsPortSave = document.getElementById('ws-port-save');
+  const wsPortInfo = document.getElementById('ws-port-info');
+
+  if (!wsPortInput || !wsPortSave || !wsPortInfo) return;
+
+  // Load current override
+  chrome.storage.local.get('wsPortOverride', (result) => {
+    if (result.wsPortOverride) {
+      wsPortInput.value = result.wsPortOverride;
+      wsPortInfo.textContent = `Override active: port ${result.wsPortOverride}`;
+    }
+  });
+
+  wsPortSave.addEventListener('click', () => {
+    const value = wsPortInput.value.trim();
+    if (value === '' || value === '0') {
+      chrome.storage.local.remove('wsPortOverride');
+      wsPortInfo.textContent = 'Auto: playground_port + 1141';
+    } else {
+      chrome.storage.local.set({ wsPortOverride: parseInt(value, 10) });
+      wsPortInfo.textContent = `Override active: port ${value}`;
+    }
+  });
+}
+
 // Update status on load
-document.addEventListener('DOMContentLoaded', updateStatus);
+document.addEventListener('DOMContentLoaded', () => {
+  updateStatus();
+  setupWsPortOverride();
+});
 
 // Refresh button
 document.getElementById('refresh-btn').addEventListener('click', updateStatus);

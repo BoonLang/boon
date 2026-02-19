@@ -225,7 +225,7 @@ See `docs/VISUAL_DEBUGGING.md` for the complete workflow guide.
 
 To work on multiple features simultaneously (each with its own mzoon + browser), create jj workspaces with unique ports.
 
-**Port allocation:**
+**Port convention:** `ws_port = playground_port + 1141`
 
 | Workspace | Playground | WebSocket |
 |-----------|-----------|-----------|
@@ -242,16 +242,15 @@ To work on multiple features simultaneously (each with its own mzoon + browser),
    jj workspace add ~/repos/boon_workspaces/<name> --name <name>
    ```
 
-2. **Update ports** in the new workspace (4 files):
+2. **Update the playground port** — only ONE file needs changing:
    - `playground/MoonZoon.toml` — change `port` (lines 1 and 8)
-   - `tools/extension/background.js` — change `WS_URL` port (line 4) and all `localhost:8083` references
-   - `tools/extension/popup.js` — change `localhost:8083` reference
-   - `tools/extension/manifest.json` — change `localhost:8083` in `host_permissions` and `matches`
 
-3. **Commit the port changes** so they don't pollute feature work:
+   Everything else auto-derives: the Chrome extension detects the playground port from the tab URL and derives the WebSocket port using the convention `ws_port = playground_port + 1141`. The `boon-tools` CLI auto-reads the port from `MoonZoon.toml`.
+
+3. **Commit the port change** so it doesn't pollute feature work:
    ```bash
    cd ~/repos/boon_workspaces/<name>
-   jj commit -m "Configure workspace ports: playground <port>, WS <ws-port>"
+   jj commit -m "Configure workspace port: playground <port>"
    ```
 
 4. **Launch the workspace:**
@@ -259,17 +258,18 @@ To work on multiple features simultaneously (each with its own mzoon + browser),
    # Terminal 1: mzoon
    cd ~/repos/boon_workspaces/<name>/playground && makers mzoon start &
 
-   # Terminal 2: WS server
-   cd ~/repos/boon_workspaces/<name>/tools && cargo run --release -- server start --port <ws-port> --watch ./extension
+   # Terminal 2: WS server (port auto-detected from MoonZoon.toml)
+   cd ~/repos/boon_workspaces/<name>/tools && cargo run --release -- server start --watch ./extension
 
-   # Terminal 3: browser
-   cd ~/repos/boon_workspaces/<name>/tools && cargo run --release -- browser launch --playground-port <port>
+   # Terminal 3: browser (ports auto-detected)
+   cd ~/repos/boon_workspaces/<name>/tools && cargo run --release -- browser launch
    ```
 
 **Notes:**
 - Chrome profiles are per-workspace automatically (resolved relative to repo root)
 - All workspaces share the same jj repo — `jj log` from any workspace shows all commits
-- The default workspace at `~/repos/boon` stays on ports 8083/9224
+- The Chrome extension is port-agnostic — it works with any localhost port, no editing needed
+- `.mcp.json` is the same across all workspaces (ports auto-detected from CWD)
 
 ## Architecture
 

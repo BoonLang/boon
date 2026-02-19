@@ -1,5 +1,6 @@
 mod commands;
 mod mcp;
+mod port_config;
 mod ws_server;
 
 use anyhow::Result;
@@ -34,16 +35,16 @@ enum Commands {
         #[command(subcommand)]
         action: ExecAction,
 
-        /// Server port
-        #[arg(short, long, default_value = "9224")]
-        port: u16,
+        /// WebSocket server port (auto-detected from MoonZoon.toml if omitted)
+        #[arg(short, long)]
+        port: Option<u16>,
     },
 
     /// Run MCP server for Claude Code integration (stdio JSON-RPC)
     Mcp {
-        /// WebSocket server port to connect to
-        #[arg(long, default_value = "9224")]
-        port: u16,
+        /// WebSocket server port (auto-detected from MoonZoon.toml if omitted)
+        #[arg(long)]
+        port: Option<u16>,
     },
 
     /// Compare two images using SSIM (Structural Similarity Index)
@@ -103,13 +104,13 @@ enum Commands {
 enum BrowserAction {
     /// Launch Chromium with Boon extension pre-loaded
     Launch {
-        /// Playground server port
-        #[arg(long, default_value = "8083")]
-        playground_port: u16,
+        /// Playground server port (auto-detected from MoonZoon.toml if omitted)
+        #[arg(long)]
+        playground_port: Option<u16>,
 
-        /// WebSocket server port
-        #[arg(long, default_value = "9224")]
-        ws_port: u16,
+        /// WebSocket server port (auto-detected from MoonZoon.toml if omitted)
+        #[arg(long)]
+        ws_port: Option<u16>,
 
         /// Run in headless mode
         #[arg(long)]
@@ -139,9 +140,9 @@ enum BrowserAction {
 enum ServerAction {
     /// Start the WebSocket server
     Start {
-        /// Port to listen on
-        #[arg(short, long, default_value = "9224")]
-        port: u16,
+        /// Port to listen on (auto-detected from MoonZoon.toml if omitted)
+        #[arg(short, long)]
+        port: Option<u16>,
 
         /// Watch directory for extension hot reload (default: auto-detect)
         #[arg(short, long)]
@@ -396,9 +397,29 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Auto-detect ports from MoonZoon.toml
+    let ports = port_config::detect_ports();
+    match &ports.source {
+        port_config::PortSource::MoonZoonToml(path) => {
+            eprintln!(
+                "[boon-tools] Auto-detected ports from {}: playground={}, ws={}",
+                path.display(),
+                ports.playground_port,
+                ports.ws_port
+            );
+        }
+        port_config::PortSource::Default => {
+            eprintln!(
+                "[boon-tools] Using default ports: playground={}, ws={}",
+                ports.playground_port, ports.ws_port
+            );
+        }
+    }
+
     match cli.command {
         Commands::Server { action } => match action {
             ServerAction::Start { port, watch, no_watch } => {
+                let ws_port = port.unwrap_or(ports.ws_port);
                 let rt = tokio::runtime::Runtime::new()?;
 
                 // Determine watch path: explicit > auto-detect > none
@@ -417,23 +438,25 @@ fn main() -> Result<()> {
                     println!("Hot-reload disabled (use --watch to specify directory)");
                 }
 
-                rt.block_on(ws_server::start_server(port, watch_path.as_deref()))?;
+                rt.block_on(ws_server::start_server(ws_port, watch_path.as_deref()))?;
             }
         },
 
         Commands::Browser { action } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(handle_browser(action))?;
+            rt.block_on(handle_browser(action, &ports))?;
         }
 
         Commands::Exec { action, port } => {
+            let ws_port = port.unwrap_or(ports.ws_port);
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(handle_exec(action, port))?;
+            rt.block_on(handle_exec(action, ws_port, ports.playground_port))?;
         }
 
         Commands::Mcp { port } => {
+            let ws_port = port.unwrap_or(ports.ws_port);
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(mcp::run_mcp_server(port));
+            rt.block_on(mcp::run_mcp_server(ws_port, ports.playground_port));
         }
 
         Commands::PixelDiff {
@@ -469,7 +492,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_browser(action: BrowserAction) -> Result<()> {
+async fn handle_browser(action: BrowserAction, ports: &port_config::PortConfig) -> Result<()> {
     use commands::browser;
 
     match action {
@@ -482,13 +505,14 @@ async fn handle_browser(action: BrowserAction) -> Result<()> {
             timeout,
         } => {
             let opts = browser::LaunchOptions {
-                playground_port,
-                ws_port,
+                playground_port: playground_port.unwrap_or(ports.playground_port),
+                ws_port: ws_port.unwrap_or(ports.ws_port),
                 headless,
                 keep_open,
                 browser_path: browser,
             };
 
+            let resolved_ws_port = opts.ws_port;
             let mut child = browser::launch_browser(opts)?;
 
             if keep_open {
@@ -498,7 +522,7 @@ async fn handle_browser(action: BrowserAction) -> Result<()> {
             } else {
                 // Wait for extension to connect
                 let timeout_duration = std::time::Duration::from_secs(timeout);
-                browser::wait_for_extension_connection(ws_port, timeout_duration).await?;
+                browser::wait_for_extension_connection(resolved_ws_port, timeout_duration).await?;
                 println!("Browser ready. Press Ctrl+C to terminate.");
 
                 // Wait for the browser process
@@ -526,7 +550,7 @@ async fn handle_browser(action: BrowserAction) -> Result<()> {
     Ok(())
 }
 
-async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
+async fn handle_exec(action: ExecAction, port: u16, playground_port: u16) -> Result<()> {
     use ws_server::send_command_to_server;
 
     match action {
@@ -876,6 +900,7 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
 
             let opts = TestOptions {
                 port,
+                playground_port,
                 filter,
                 interactive,
                 screenshot_on_fail,
@@ -898,6 +923,7 @@ async fn handle_exec(action: ExecAction, port: u16) -> Result<()> {
 
             let opts = SmokeOptions {
                 port,
+                playground_port,
                 filter,
                 no_launch,
             };

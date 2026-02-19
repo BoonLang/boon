@@ -103,6 +103,23 @@
     <div id="engine-info" class="info">Unknown</div>
   </div>
 
+  <div class="section">
+    <div class="section-title">Ports</div>
+    <div id="port-info" class="info">Detecting...</div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">WS Port Override</div>
+    <div style="display: flex; gap: 8px; align-items: center;">
+      <input id="ws-port-override" type="number" placeholder="auto"
+             style="flex:1; padding: 6px 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 12px;">
+      <button id="ws-port-save" style="width: auto; margin-top: 0; padding: 6px 12px; font-size: 12px;">Save</button>
+    </div>
+    <div id="ws-port-info" class="info" style="margin-top: 6px; font-size: 11px;">
+      Auto: playground_port + 1141
+    </div>
+  </div>
+
   <button id="refresh-btn">Refresh Status</button>
 
   <script src="popup.js"></script>

@@ -14,6 +14,7 @@ use super::expected::{matches_inline, ExpectedSpec, MatchMode, ParsedAction};
 /// Options for test-examples command
 pub struct TestOptions {
     pub port: u16,
+    pub playground_port: u16,
     pub filter: Option<String>,
     pub interactive: bool,
     pub screenshot_on_fail: bool,
@@ -25,6 +26,7 @@ pub struct TestOptions {
 /// Options for smoke-examples command
 pub struct SmokeOptions {
     pub port: u16,
+    pub playground_port: u16,
     pub filter: Option<String>,
     pub no_launch: bool,
 }
@@ -154,8 +156,8 @@ fn find_boon_root() -> Option<PathBuf> {
     None
 }
 
-/// Check if the playground dev server (mzoon) is running on port 8083
-async fn is_playground_running() -> bool {
+/// Check if the playground dev server (mzoon) is running
+async fn is_playground_running(playground_port: u16) -> bool {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
@@ -164,14 +166,14 @@ async fn is_playground_running() -> bool {
         Err(_) => return false,
     };
 
-    match client.get("http://localhost:8083").send().await {
+    match client.get(format!("http://localhost:{}", playground_port)).send().await {
         Ok(response) => response.status().is_success(),
         Err(_) => false,
     }
 }
 
 /// Start the playground dev server (mzoon) in background
-async fn start_playground_server() -> Result<()> {
+async fn start_playground_server(playground_port: u16) -> Result<()> {
     use std::process::Command as StdCommand;
 
     let boon_root = find_boon_root()
@@ -207,7 +209,7 @@ async fn start_playground_server() -> Result<()> {
             io::stdout().flush().ok();
 
             while start.elapsed() < timeout {
-                if is_playground_running().await {
+                if is_playground_running(playground_port).await {
                     println!(" ready!");
                     return Ok(());
                 }
@@ -277,16 +279,16 @@ pub struct SetupState {
 /// Ensure WebSocket server is running and browser extension is connected.
 /// Will start server and launch browser if needed.
 /// Returns SetupState indicating what was started (for cleanup).
-async fn ensure_browser_connection(port: u16) -> Result<SetupState> {
+async fn ensure_browser_connection(port: u16, playground_port: u16) -> Result<SetupState> {
     let mut setup = SetupState { started_mzoon: false };
 
     // Step 0: Ensure playground (mzoon) is running
-    if !is_playground_running().await {
-        println!("Playground server not running on port 8083.");
-        start_playground_server().await?;
+    if !is_playground_running(playground_port).await {
+        println!("Playground server not running on port {}.", playground_port);
+        start_playground_server(playground_port).await?;
         setup.started_mzoon = true;
     } else {
-        println!("Playground server running on port 8083.");
+        println!("Playground server running on port {}.", playground_port);
     }
 
     // Step 1: Check initial status
@@ -342,7 +344,7 @@ async fn ensure_browser_connection(port: u16) -> Result<SetupState> {
         println!("Browser extension not connected, launching Chromium...");
 
         let opts = browser::LaunchOptions {
-            playground_port: 8083,
+            playground_port,
             ws_port: port,
             headless: false,
             keep_open: true,  // Don't block waiting
@@ -362,8 +364,8 @@ async fn ensure_browser_connection(port: u16) -> Result<SetupState> {
                     Err(e) => {
                         anyhow::bail!(
                             "Browser launched but extension connection timed out: {}\n\
-                            Check that the playground is running at localhost:8083",
-                            e
+                            Check that the playground is running at localhost:{}",
+                            e, playground_port
                         );
                     }
                 }
@@ -433,8 +435,8 @@ async fn ensure_browser_connection(port: u16) -> Result<SetupState> {
 
         anyhow::bail!(
             "Playground API not ready after {} retries. \
-            Make sure the playground is running at localhost:8083",
-            max_retries
+            Make sure the playground is running at localhost:{}",
+            max_retries, playground_port
         );
     }
 
@@ -442,15 +444,15 @@ async fn ensure_browser_connection(port: u16) -> Result<SetupState> {
 }
 
 /// Kill mzoon server we started (port-based, like `makers kill`)
-fn kill_mzoon_server() {
+fn kill_mzoon_server(playground_port: u16) {
     use std::process::Command as StdCommand;
 
     println!("Stopping mzoon server we started...");
 
-    // Find the process LISTENING on port 8083 (not browsers connecting to it)
+    // Find the process LISTENING on the playground port (not browsers connecting to it)
     // This matches the approach in playground/Makefile.toml [tasks.kill]
     let pid_output = StdCommand::new("lsof")
-        .args(["-ti:8083", "-sTCP:LISTEN"])
+        .args([&format!("-ti:{}", playground_port), "-sTCP:LISTEN"])
         .output();
 
     if let Ok(output) = pid_output {
@@ -461,14 +463,14 @@ fn kill_mzoon_server() {
                 let _ = StdCommand::new("kill")
                     .args(["-TERM", &pid.to_string()])
                     .output();
-                println!("Sent TERM signal to server on port 8083 (PID: {})", pid);
+                println!("Sent TERM signal to server on port {} (PID: {})", playground_port, pid);
 
                 // Wait for graceful shutdown
                 std::thread::sleep(std::time::Duration::from_secs(2));
 
                 // Check if still running and force kill if needed
                 let still_running = StdCommand::new("lsof")
-                    .args(["-ti:8083", "-sTCP:LISTEN"])
+                    .args([&format!("-ti:{}", playground_port), "-sTCP:LISTEN"])
                     .output()
                     .map(|o| !o.stdout.is_empty())
                     .unwrap_or(false);
@@ -490,14 +492,14 @@ fn kill_mzoon_server() {
 pub async fn run_tests(opts: TestOptions) -> Result<Vec<TestResult>> {
     // Pre-flight check: ensure WebSocket server and browser extension are ready
     // This will auto-start the server and launch browser if needed
-    let setup = ensure_browser_connection(opts.port).await?;
+    let setup = ensure_browser_connection(opts.port, opts.playground_port).await?;
 
     // Run tests and ensure cleanup happens even on error
     let result = run_tests_inner(&opts).await;
 
     // Cleanup: if we started mzoon, kill it
     if setup.started_mzoon {
-        kill_mzoon_server();
+        kill_mzoon_server(opts.playground_port);
     }
 
     result
@@ -1737,10 +1739,10 @@ const BUILTIN_EXAMPLES: &[&str] = &[
 
 /// Smoke-run built-in examples: select, run, wait, check for panics
 pub async fn run_builtin_smoke(opts: SmokeOptions) -> Result<Vec<TestResult>> {
-    let setup = ensure_browser_connection(opts.port).await?;
+    let setup = ensure_browser_connection(opts.port, opts.playground_port).await?;
     let result = run_smoke_inner(&opts).await;
     if setup.started_mzoon {
-        kill_mzoon_server();
+        kill_mzoon_server(opts.playground_port);
     }
     result
 }

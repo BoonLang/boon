@@ -128,9 +128,10 @@ pub struct LaunchOptions {
 
 impl Default for LaunchOptions {
     fn default() -> Self {
+        let ports = crate::port_config::detect_ports();
         Self {
-            playground_port: 8083,
-            ws_port: 9224,
+            playground_port: ports.playground_port,
+            ws_port: ports.ws_port,
             headless: false,
             keep_open: false,
             browser_path: None,

@@ -1,7 +1,11 @@
 // Boon Browser Control - Background Service Worker
 // Connects to WebSocket server and routes commands to content script
 
-const WS_URL = 'ws://127.0.0.1:9224';
+// Port convention: WS port = playground port + 1141
+const WS_PORT_OFFSET = 1141;
+const DEFAULT_PLAYGROUND_PORT = 8083;
+const DEFAULT_WS_PORT = DEFAULT_PLAYGROUND_PORT + WS_PORT_OFFSET; // 9224
+
 let ws = null;
 let reconnectTimer = null;
 let contentPort = null;
@@ -10,6 +14,71 @@ let pendingRequests = new Map();
 // Exponential backoff for reconnection
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY = 30000; // 30 seconds max
+
+// Dynamic port detection
+let activePlaygroundPort = null;
+let activeWsPort = null;
+
+function extractPortFromUrl(url) {
+  const match = url && url.match(/^http:\/\/localhost:(\d+)/);
+  return match ? parseInt(match[1], 10) : null;
+}
+
+function isPlaygroundUrl(url) {
+  return url && /^http:\/\/localhost:\d+/.test(url);
+}
+
+function deriveWsPort(playgroundPort) {
+  return playgroundPort + WS_PORT_OFFSET;
+}
+
+// Get WS URL: check storage override, then derive from playground port, then default
+async function getWsUrl() {
+  // 1. Check chrome.storage for manual override
+  try {
+    const stored = await chrome.storage.local.get('wsPortOverride');
+    if (stored.wsPortOverride) {
+      const port = parseInt(stored.wsPortOverride, 10);
+      if (!isNaN(port) && port > 0 && port < 65536) {
+        return `ws://127.0.0.1:${port}`;
+      }
+    }
+  } catch (e) {
+    // storage not available, fall through
+  }
+
+  // 2. Derive from detected playground port
+  if (activePlaygroundPort) {
+    return `ws://127.0.0.1:${deriveWsPort(activePlaygroundPort)}`;
+  }
+
+  // 3. Fall back to default
+  return `ws://127.0.0.1:${DEFAULT_WS_PORT}`;
+}
+
+// Restore persisted playground port (survives service worker restarts)
+async function restorePersistedPort() {
+  try {
+    const stored = await chrome.storage.session.get('activePlaygroundPort');
+    if (stored.activePlaygroundPort) {
+      activePlaygroundPort = stored.activePlaygroundPort;
+      activeWsPort = deriveWsPort(activePlaygroundPort);
+      console.log(`[Boon] Restored persisted playground port: ${activePlaygroundPort}, WS: ${activeWsPort}`);
+    }
+  } catch (e) {
+    // session storage not available
+  }
+}
+
+async function persistPlaygroundPort(port) {
+  activePlaygroundPort = port;
+  activeWsPort = deriveWsPort(port);
+  try {
+    await chrome.storage.session.set({ activePlaygroundPort: port });
+  } catch (e) {
+    // session storage not available
+  }
+}
 
 // ============ CDP INFRASTRUCTURE ============
 // Chrome DevTools Protocol for trusted events (isTrusted: true)
@@ -657,16 +726,17 @@ function safeSend(message) {
 }
 
 // Connect to WebSocket server
-function connect() {
+async function connect() {
   // Check both CONNECTING and OPEN states to avoid race conditions
   if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
     return;
   }
 
-  console.log('[Boon] Connecting to WebSocket server...');
+  const wsUrl = await getWsUrl();
+  console.log(`[Boon] Connecting to WebSocket server at ${wsUrl}...`);
 
   try {
-    ws = new WebSocket(WS_URL);
+    ws = new WebSocket(wsUrl);
   } catch (e) {
     console.error('[Boon] WebSocket constructor error:', e);
     scheduleReconnect();
@@ -736,15 +806,14 @@ async function handleCommand(id, command) {
   const type = command.type;
 
   try {
-    // Get the active tab with localhost:8083
+    // Get the active tab with any localhost playground
     // Use cached tab ID if valid, otherwise find and cache a new one
     let tab = null;
 
     if (cachedPlaygroundTabId !== null) {
       try {
         tab = await chrome.tabs.get(cachedPlaygroundTabId);
-        // Verify the tab is still on localhost:8083
-        if (!tab.url || !tab.url.startsWith('http://localhost:8083')) {
+        if (!isPlaygroundUrl(tab.url)) {
           console.log('[Boon] Cached tab no longer on playground, finding new tab');
           cachedPlaygroundTabId = null;
           tab = null;
@@ -758,13 +827,24 @@ async function handleCommand(id, command) {
     }
 
     if (tab === null) {
-      const tabs = await chrome.tabs.query({ url: 'http://localhost:8083/*' });
+      const tabs = await chrome.tabs.query({ url: 'http://localhost/*' });
       if (tabs.length === 0) {
-        return { type: 'error', message: 'No Boon Playground tab found' };
+        return { type: 'error', message: 'No Boon Playground tab found on localhost' };
       }
       // Prefer the most recently accessed tab, or the active one
       tab = tabs.find(t => t.active) || tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
       cachedPlaygroundTabId = tab.id;
+
+      // Update active playground port for WS derivation
+      const detectedPort = extractPortFromUrl(tab.url);
+      if (detectedPort && detectedPort !== activePlaygroundPort) {
+        console.log(`[Boon] Detected playground port: ${detectedPort}, WS port: ${deriveWsPort(detectedPort)}`);
+        await persistPlaygroundPort(detectedPort);
+        // Reconnect WS if port changed
+        if (ws) { ws.close(); ws = null; }
+        connect();
+      }
+
       console.log(`[Boon] Selected playground tab ${tab.id} (${tabs.length} tabs found)`);
     }
 
@@ -3432,7 +3512,7 @@ async function registerEarlyConsoleCapture() {
 
     await chrome.scripting.registerContentScripts([{
       id: 'boon-console-capture',
-      matches: ['http://localhost:8083/*'],
+      matches: ['http://localhost/*'],
       js: ['console-capture.js'],
       runAt: 'document_start',
       world: 'MAIN'
@@ -3443,8 +3523,28 @@ async function registerEarlyConsoleCapture() {
   }
 }
 
+// Monitor tab activations to detect playground port changes
+chrome.tabs.onActivated.addListener(async (activeInfo) => {
+  try {
+    const tab = await chrome.tabs.get(activeInfo.tabId);
+    const port = extractPortFromUrl(tab.url);
+    if (port && port !== activePlaygroundPort) {
+      console.log(`[Boon] Tab activated with playground port ${port}, WS port: ${deriveWsPort(port)}`);
+      await persistPlaygroundPort(port);
+      // Reconnect WS if port changed
+      if (ws) { ws.close(); ws = null; }
+      connect();
+    }
+  } catch (e) {
+    // Tab may have been closed
+  }
+});
+
 // Initialize on service worker load
 console.log('[Boon] Service worker loading...');
-connect();
+// Restore persisted port before connecting
+restorePersistedPort().then(() => {
+  connect();
+});
 registerEarlyConsoleCapture();
 setupKeepAliveAlarm();

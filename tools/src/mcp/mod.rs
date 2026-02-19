@@ -85,7 +85,7 @@ fn find_extension_dir() -> Option<PathBuf> {
 
 /// Run the MCP server (stdio-based)
 /// Automatically starts the WebSocket server and optionally launches browser
-pub async fn run_mcp_server(ws_port: u16) {
+pub async fn run_mcp_server(ws_port: u16, playground_port: u16) {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -136,7 +136,7 @@ pub async fn run_mcp_server(ws_port: u16) {
             }
         };
 
-        let response = handle_request(request, ws_port).await;
+        let response = handle_request(request, ws_port, playground_port).await;
 
         let response_json = serde_json::to_string(&response).unwrap();
         eprintln!("[MCP] Sending: {}", response_json);
@@ -146,7 +146,7 @@ pub async fn run_mcp_server(ws_port: u16) {
     }
 }
 
-async fn handle_request(request: McpRequest, ws_port: u16) -> McpResponse {
+async fn handle_request(request: McpRequest, ws_port: u16, playground_port: u16) -> McpResponse {
     let id = request.id.unwrap_or(Value::Null);
 
     match request.method.as_str() {
@@ -179,7 +179,7 @@ async fn handle_request(request: McpRequest, ws_port: u16) -> McpResponse {
             let tool_name = request.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let arguments = request.params.get("arguments").cloned().unwrap_or(json!({}));
 
-            match call_tool(tool_name, arguments, ws_port).await {
+            match call_tool(tool_name, arguments, ws_port, playground_port).await {
                 Ok(result) => McpResponse {
                     jsonrpc: "2.0".to_string(),
                     id,
@@ -337,7 +337,7 @@ fn get_tools() -> Vec<Tool> {
         },
         Tool {
             name: "boon_launch_browser".to_string(),
-            description: "Launch Chromium browser with the Boon extension pre-loaded. Opens the playground at localhost:8083. The browser will automatically connect to the WebSocket server.".to_string(),
+            description: "Launch Chromium browser with the Boon extension pre-loaded. Opens the playground at the auto-detected port. The browser will automatically connect to the WebSocket server.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -687,10 +687,10 @@ fn find_boon_root() -> Option<PathBuf> {
     None
 }
 
-async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, String> {
+async fn call_tool(name: &str, args: Value, ws_port: u16, playground_port: u16) -> Result<String, String> {
     // Handle playground status check (no WebSocket)
     if name == "boon_playground_status" {
-        return check_playground_status().await;
+        return check_playground_status(playground_port).await;
     }
 
     // Handle playground start (no WebSocket)
@@ -955,7 +955,7 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
         }
 
         let opts = browser::LaunchOptions {
-            playground_port: 8083,
+            playground_port,
             ws_port,
             headless,
             keep_open: true,  // Don't block waiting
@@ -973,8 +973,8 @@ async fn call_tool(name: &str, args: Value, ws_port: u16) -> Result<String, Stri
                     )),
                     Err(e) => Ok(format!(
                         "Browser launched (PID: {}) but extension connection timed out: {}\n\
-                        Check that the playground is running at localhost:8083",
-                        child.id(), e
+                        Check that the playground is running at localhost:{}",
+                        child.id(), e, playground_port
                     )),
                 }
             }
@@ -1307,24 +1307,24 @@ async fn send_ws_command_with_reconnect(ws_port: u16, command: Command) -> Resul
 }
 
 /// Check if the playground dev server is running and healthy
-async fn check_playground_status() -> Result<String, String> {
+async fn check_playground_status(playground_port: u16) -> Result<String, String> {
     use std::process::Command as StdCommand;
 
     let mut status = String::new();
 
-    // Check if port 8083 is listening
+    // Check if playground port is listening
     let port_check = StdCommand::new("sh")
-        .args(["-c", "lsof -i :8083 2>/dev/null | grep LISTEN | head -5"])
+        .args(["-c", &format!("lsof -i :{} 2>/dev/null | grep LISTEN | head -5", playground_port)])
         .output();
 
     match port_check {
         Ok(output) if !output.stdout.is_empty() => {
-            status.push_str("Port 8083: LISTENING\n");
+            status.push_str(&format!("Port {}: LISTENING\n", playground_port));
             let processes = String::from_utf8_lossy(&output.stdout);
             status.push_str(&format!("Processes:\n{}\n", processes));
         }
         _ => {
-            status.push_str("Port 8083: NOT LISTENING\n");
+            status.push_str(&format!("Port {}: NOT LISTENING\n", playground_port));
             status.push_str("Playground server is not running.\n");
             status.push_str("Start with: cd playground && makers mzoon start\n");
             return Ok(status);
@@ -1337,7 +1337,7 @@ async fn check_playground_status() -> Result<String, String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    match client.get("http://localhost:8083").send().await {
+    match client.get(format!("http://localhost:{}", playground_port)).send().await {
         Ok(response) => {
             status.push_str(&format!("HTTP Status: {}\n", response.status()));
 
