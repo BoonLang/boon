@@ -30,6 +30,8 @@ zoon = { git = "https://github.com/MoonZoon/MoonZoon", rev = "19c6cf6b4d07cd27be
 # Enable `sink` feature for Sender to implement Sink trait (required for async .send())
 futures-channel = { version = "0.3", features = ["sink"] }
 
+smallvec = "1"
+
 # Differential Dataflow engine dependencies (optional, used with engine-dd feature)
 # timely 0.26 removes deprecated InputSession, fixes progress tracking
 # differential-dataflow 0.19 updated for timely 0.26

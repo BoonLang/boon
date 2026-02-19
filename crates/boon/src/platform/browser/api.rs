@@ -1981,7 +1981,7 @@ fn clear_source_storage_for_items(items: &[ActorHandle]) {
 
     // Clear each source storage key
     for key in source_keys {
-        zoon::println!("[DEBUG] List/clear: Clearing source storage key: {}", key);
+        if LOG_DEBUG { zoon::println!("[DEBUG] List/clear: Clearing source storage key: {}", key); }
         local_storage().remove(&key);
     }
 }

@@ -27,6 +27,7 @@ use zoon::{WebStorage, local_storage};
 use zoon::futures_util::SinkExt;
 
 use std::cell::Cell;
+use smallvec::SmallVec;
 
 // --- Performance Metrics ---
 //
@@ -144,6 +145,60 @@ pub mod metrics {
         PERSISTENCE_WRITES.store(0, Ordering::Relaxed);
     }
 }
+
+// --- Channel Capacity Constants (A3) ---
+//
+// Named constants for all NamedChannel and mpsc::channel capacities.
+// Grouped by component for easy tuning.
+
+// Value actor channels (used by create_actor_complete, create_actor_with_initial_value, create_lazy_actor_complete)
+const VALUE_ACTOR_MESSAGE_CAPACITY: usize = 16;
+const VALUE_ACTOR_SUBSCRIPTION_CAPACITY: usize = 32;
+const VALUE_ACTOR_DIRECT_STORE_CAPACITY: usize = 64;
+const VALUE_ACTOR_QUERY_CAPACITY: usize = 8;
+const VALUE_ACTOR_SUBSCRIBER_CAPACITY: usize = 32;
+
+// Lazy value actor
+const LAZY_ACTOR_REQUEST_CAPACITY: usize = 16;
+
+// List channels
+const LIST_CHANGE_CAPACITY: usize = 64;
+const LIST_CHANGE_SUBSCRIBER_CAPACITY: usize = 32;
+const LIST_DIFF_QUERY_CAPACITY: usize = 16;
+const LIST_DIFF_SUBSCRIBER_CAPACITY: usize = 32;
+
+// Infrastructure channels
+const CONSTRUCT_STORAGE_INSERTER_CAPACITY: usize = 32;
+const CONSTRUCT_STORAGE_GETTER_CAPACITY: usize = 32;
+const CALL_RECORDER_CAPACITY: usize = 64;
+const OUTPUT_VALVE_SUBSCRIPTION_CAPACITY: usize = 32;
+const OUTPUT_VALVE_IMPULSE_CAPACITY: usize = 1;
+const LINK_VALUE_CAPACITY: usize = 128;
+const REFERENCE_CONNECTOR_INSERTER_CAPACITY: usize = 64;
+const REFERENCE_CONNECTOR_GETTER_CAPACITY: usize = 64;
+const LINK_CONNECTOR_INSERTER_CAPACITY: usize = 64;
+const LINK_CONNECTOR_GETTER_CAPACITY: usize = 64;
+const PASS_THROUGH_OPS_CAPACITY: usize = 32;
+const PASS_THROUGH_GETTER_CAPACITY: usize = 32;
+const PASS_THROUGH_SENDER_GETTER_CAPACITY: usize = 32;
+const VIRTUAL_FILESYSTEM_REQUEST_CAPACITY: usize = 32;
+const FORWARDING_VALUE_CAPACITY: usize = 64;
+
+// Module loader
+pub const MODULE_LOADER_REQUEST_CAPACITY: usize = 16;
+
+// Bridge DOM event channels
+pub const BRIDGE_HOVER_CAPACITY: usize = 2;
+pub const BRIDGE_PRESS_EVENT_CAPACITY: usize = 8;
+pub const BRIDGE_TEXT_CHANGE_CAPACITY: usize = 16;
+pub const BRIDGE_KEY_DOWN_CAPACITY: usize = 32;
+pub const BRIDGE_BLUR_CAPACITY: usize = 8;
+pub const BRIDGE_FOCUS_CAPACITY: usize = 8;
+
+// Bridge pending event buffer caps
+pub const BRIDGE_PENDING_KEY_DOWN_CAP: usize = 64;
+pub const BRIDGE_PENDING_BLUR_CAP: usize = 16;
+pub const BRIDGE_PENDING_FOCUS_CAP: usize = 16;
 
 // --- Lamport Clock ---
 //
@@ -452,19 +507,8 @@ impl<T> NamedChannel<T> {
     }
 }
 
-/// Debug flag to log when ValueActors, Variables, and other constructs are dropped,
-/// and when their internal loops end. This is useful for debugging premature drop issues
-/// where subscriptions fail with "receiver is gone" errors.
-///
-/// When enabled, prints messages like:
-/// - "Dropped: {construct_info}" - when a construct is deallocated
-/// - "Loop ended {construct_info}" - when a ValueActor's internal loop exits
-///
-/// Common drop-related issues in the engine:
-/// - Subscriber dropped before all events are processed
-/// - ValueActor dropped while subscriptions are still active
-/// - Extra owned data not properly keeping actors alive
-const LOG_DROPS_AND_LOOP_ENDS: bool = false;
+/// Debug flag to trace actor flow: stream subscriptions, value broadcasts,
+/// loop starts/ends, and migration forwarding.
 const LOG_ACTOR_FLOW: bool = false;
 
 /// Master debug logging flag for the engine.
@@ -967,9 +1011,6 @@ impl BackpressureCoordinator {
                 }
             }
 
-            if LOG_DROPS_AND_LOOP_ENDS {
-                zoon::println!("Loop ended: BackpressureCoordinator");
-            }
         });
 
         Self {
@@ -1074,7 +1115,7 @@ impl LazyValueActor {
         source_stream: S,
     ) -> Self {
         let construct_info = Arc::new(construct_info);
-        let (request_tx, request_rx) = NamedChannel::new("lazy_value_actor.requests", 16);
+        let (request_tx, request_rx) = NamedChannel::new("lazy_value_actor.requests", LAZY_ACTOR_REQUEST_CAPACITY);
 
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
@@ -1161,9 +1202,6 @@ impl LazyValueActor {
             }
         }
 
-        if LOG_DROPS_AND_LOOP_ENDS {
-            zoon::println!("LazyValueActor loop ended: {}", construct_info);
-        }
     }
 
     /// Subscribe to this lazy actor's values.
@@ -1188,13 +1226,6 @@ impl LazyValueActor {
     }
 }
 
-impl Drop for LazyValueActor {
-    fn drop(&mut self) {
-        if LOG_DROPS_AND_LOOP_ENDS {
-            zoon::println!("Dropped LazyValueActor: {}", self.construct_info);
-        }
-    }
-}
 
 /// Subscription to a LazyValueActor.
 ///
@@ -1414,7 +1445,7 @@ impl VirtualFilesystem {
 
     /// Create a VirtualFilesystem pre-populated with files
     pub fn with_files(initial_files: HashMap<String, String>) -> Self {
-        let (tx, mut rx) = NamedChannel::new("virtual_filesystem.requests", 32);
+        let (tx, mut rx) = NamedChannel::new("virtual_filesystem.requests", VIRTUAL_FILESYSTEM_REQUEST_CAPACITY);
 
         let actor_loop = ActorLoop::new(async move {
             let mut files: HashMap<String, String> = initial_files;
@@ -1603,8 +1634,8 @@ pub struct ConstructStorage {
 impl ConstructStorage {
     pub fn new(states_local_storage_key: impl Into<Cow<'static, str>>) -> Self {
         let states_local_storage_key = states_local_storage_key.into();
-        let (state_inserter_sender, mut state_inserter_receiver) = NamedChannel::new("construct_storage.inserter", 32);
-        let (state_getter_sender, mut state_getter_receiver) = NamedChannel::new("construct_storage.getter", 32);
+        let (state_inserter_sender, mut state_inserter_receiver) = NamedChannel::new("construct_storage.inserter", CONSTRUCT_STORAGE_INSERTER_CAPACITY);
+        let (state_getter_sender, mut state_getter_receiver) = NamedChannel::new("construct_storage.getter", CONSTRUCT_STORAGE_GETTER_CAPACITY);
         Self {
             state_inserter_sender,
             state_getter_sender,
@@ -1636,10 +1667,11 @@ impl ConstructStorage {
                             dirty = true;
                         },
                         (persistence_id, state_sender) = state_getter_receiver.select_next_some() => {
-                            // @TODO Cheaper cloning? Replace get with remove?
-                            // Note: reads always see up-to-date in-memory state, even before flush
+                            // C4: Use remove() instead of get().cloned() to avoid cloning
+                            // serde_json::Value. Each state is loaded once during restore,
+                            // and ongoing saves will re-insert if needed.
                             let key = persistence_id.to_string();
-                            let state = states.get(&key).cloned();
+                            let state = states.remove(&key);
                             if state_sender.send(state).is_err() {
                                 zoon::eprintln!("Failed to send state from construct storage");
                             }
@@ -2051,7 +2083,7 @@ impl ActorContext {
             parser::Scope::Nested(existing) => format!("{}:{}", existing, scope_id),
         };
         // Use static name for channel - the actual scope identity is in self.scope
-        let (call_recorder, receiver) = NamedChannel::new("call_recorder", 64);
+        let (call_recorder, receiver) = NamedChannel::new("call_recorder", CALL_RECORDER_CAPACITY);
         (
             Self {
                 scope: parser::Scope::Nested(new_prefix),
@@ -2099,12 +2131,12 @@ pub struct ActorOutputValveSignal {
 impl ActorOutputValveSignal {
     pub fn new(impulse_stream: impl Stream<Item = ()> + 'static) -> Self {
         let (impulse_sender_sender, mut impulse_sender_receiver) =
-            NamedChannel::new("output_valve.subscriptions", 32);
+            NamedChannel::new("output_valve.subscriptions", OUTPUT_VALVE_SUBSCRIPTION_CAPACITY);
         Self {
             impulse_sender_sender,
             actor_loop: ActorLoop::new(async move {
                 let mut impulse_stream = pin!(impulse_stream.fuse());
-                let mut impulse_senders = Vec::<mpsc::Sender<()>>::new();
+                let mut impulse_senders = SmallVec::<[mpsc::Sender<()>; 4]>::new();
                 loop {
                     select! {
                         impulse = impulse_stream.next() => {
@@ -2124,7 +2156,7 @@ impl ActorOutputValveSignal {
     }
 
     pub fn stream(&self) -> impl Stream<Item = ()> {
-        let (impulse_sender, impulse_receiver) = mpsc::channel(1);
+        let (impulse_sender, impulse_receiver) = mpsc::channel(OUTPUT_VALVE_IMPULSE_CAPACITY);
         if let Err(error) = self.impulse_sender_sender.try_send(impulse_sender) {
             zoon::eprintln!("Failed to subscribe to actor output valve signal: {error:#}");
         }
@@ -2350,7 +2382,7 @@ impl Variable {
         let actor_construct_info =
             ConstructInfo::new(actor_id.clone(), persistence, "Link variable value actor")
                 .complete(ConstructType::ValueActor);
-        let (link_value_sender, link_value_receiver) = NamedChannel::new("link.values", 128);
+        let (link_value_sender, link_value_receiver) = NamedChannel::new("link.values", LINK_VALUE_CAPACITY);
         // Capture the scope before actor_context is moved
         let scope = actor_context.scope.clone();
         let scope_id = actor_context.scope_id();
@@ -2489,13 +2521,6 @@ impl Variable {
     }
 }
 
-impl Drop for Variable {
-    fn drop(&mut self) {
-        if LOG_DROPS_AND_LOOP_ENDS {
-            zoon::println!("Dropped: {}", self.construct_info);
-        }
-    }
-}
 
 // --- VariableOrArgumentReference ---
 
@@ -2749,9 +2774,9 @@ pub struct ReferenceConnector {
 impl ReferenceConnector {
     pub fn new() -> Self {
         let (referenceable_inserter_sender, referenceable_inserter_receiver) =
-            NamedChannel::new("reference_connector.inserter", 64);
+            NamedChannel::new("reference_connector.inserter", REFERENCE_CONNECTOR_INSERTER_CAPACITY);
         let (referenceable_getter_sender, referenceable_getter_receiver) =
-            NamedChannel::new("reference_connector.getter", 64);
+            NamedChannel::new("reference_connector.getter", REFERENCE_CONNECTOR_GETTER_CAPACITY);
         Self {
             referenceable_inserter_sender,
             referenceable_getter_sender,
@@ -2812,9 +2837,6 @@ impl ReferenceConnector {
                 }
                 // Explicitly drop the referenceables to ensure actors are cleaned up
                 drop(referenceables);
-                if LOG_DROPS_AND_LOOP_ENDS {
-                    zoon::println!("ReferenceConnector loop ended - all actors dropped");
-                }
             }),
         }
     }
@@ -2877,9 +2899,9 @@ pub struct LinkConnector {
 impl LinkConnector {
     pub fn new() -> Self {
         let (link_inserter_sender, link_inserter_receiver) =
-            NamedChannel::new("link_connector.inserter", 64);
+            NamedChannel::new("link_connector.inserter", LINK_CONNECTOR_INSERTER_CAPACITY);
         let (link_getter_sender, link_getter_receiver) =
-            NamedChannel::new("link_connector.getter", 64);
+            NamedChannel::new("link_connector.getter", LINK_CONNECTOR_GETTER_CAPACITY);
         Self {
             link_inserter_sender,
             link_getter_sender,
@@ -2940,9 +2962,6 @@ impl LinkConnector {
                 }
                 // Explicitly drop the links to ensure channels are cleaned up
                 drop(links);
-                if LOG_DROPS_AND_LOOP_ENDS {
-                    zoon::println!("LinkConnector loop ended - all links dropped");
-                }
             }),
         }
     }
@@ -3020,10 +3039,10 @@ enum PassThroughOp {
 
 impl PassThroughConnector {
     pub fn new() -> Self {
-        let (op_sender, op_receiver) = NamedChannel::new("pass_through.ops", 32);
-        let (getter_sender, getter_receiver) = NamedChannel::new("pass_through.getter", 32);
+        let (op_sender, op_receiver) = NamedChannel::new("pass_through.ops", PASS_THROUGH_OPS_CAPACITY);
+        let (getter_sender, getter_receiver) = NamedChannel::new("pass_through.getter", PASS_THROUGH_GETTER_CAPACITY);
         let (sender_getter_sender, sender_getter_receiver) =
-            NamedChannel::new("pass_through.sender_getter", 32);
+            NamedChannel::new("pass_through.sender_getter", PASS_THROUGH_SENDER_GETTER_CAPACITY);
 
         Self {
             op_sender,
@@ -3094,9 +3113,6 @@ impl PassThroughConnector {
                 }
 
                 drop(pass_throughs);
-                if LOG_DROPS_AND_LOOP_ENDS {
-                    zoon::println!("PassThroughConnector loop ended");
-                }
             }),
         }
     }
@@ -3833,9 +3849,6 @@ struct ChannelKeepalive {
 impl Drop for OwnedActor {
     fn drop(&mut self) {
         inc_metric!(ACTORS_DROPPED);
-        if LOG_DROPS_AND_LOOP_ENDS {
-            zoon::println!("Dropped: {}", self.construct_info);
-        }
     }
 }
 
@@ -4112,7 +4125,7 @@ impl ActorHandle {
             return lazy_delegate.clone().stream().boxed_local();
         }
 
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(VALUE_ACTOR_SUBSCRIBER_CAPACITY);
         if LOG_ACTOR_FLOW { zoon::println!("[FLOW] stream() on {:?} → sending subscription (v0)", self.actor_id); }
         self.subscription_sender.send_or_drop(SubscriptionSetup {
             sender: tx,
@@ -4129,7 +4142,7 @@ impl ActorHandle {
         }
 
         let current_version = self.version();
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(VALUE_ACTOR_SUBSCRIBER_CAPACITY);
         self.subscription_sender.send_or_drop(SubscriptionSetup {
             sender: tx,
             starting_version: current_version,
@@ -4206,12 +4219,12 @@ fn create_actor_arc_info<S: Stream<Item = Value> + 'static>(
     scope_id: ScopeId,
 ) -> ActorHandle {
     inc_metric!(ACTORS_CREATED);
-    let (message_sender, message_receiver) = NamedChannel::new("value_actor.messages", 16);
+    let (message_sender, message_receiver) = NamedChannel::new("value_actor.messages", VALUE_ACTOR_MESSAGE_CAPACITY);
     let current_version = Arc::new(AtomicU64::new(0));
 
-    let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.subscriptions", 32);
-    let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new("value_actor.direct_store", 64);
-    let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.queries", 8);
+    let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.subscriptions", VALUE_ACTOR_SUBSCRIPTION_CAPACITY);
+    let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new("value_actor.direct_store", VALUE_ACTOR_DIRECT_STORE_CAPACITY);
+    let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.queries", VALUE_ACTOR_QUERY_CAPACITY);
 
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
     let ready_signal = ready_rx.shared();
@@ -4227,7 +4240,7 @@ fn create_actor_arc_info<S: Stream<Item = Value> + 'static>(
         async move {
             if LOG_ACTOR_FLOW { zoon::println!("[FLOW] Actor loop STARTED: {construct_info}"); }
             let mut value_history = ValueHistory::new(64);
-            let mut subscribers: Vec<mpsc::Sender<Value>> = Vec::new();
+            let mut subscribers: SmallVec<[mpsc::Sender<Value>; 4]> = SmallVec::new();
             let mut stream_ever_produced = false;
             let mut stream_ended = false;
             let mut ready_tx = Some(ready_tx);
@@ -4389,10 +4402,6 @@ fn create_actor_arc_info<S: Stream<Item = Value> + 'static>(
                     }
                 }
             }
-
-            if LOG_DROPS_AND_LOOP_ENDS {
-                zoon::println!("Loop ended {construct_info}");
-            }
         }
     });
 
@@ -4441,12 +4450,12 @@ pub fn create_actor_with_initial_value<S: Stream<Item = Value> + 'static>(
     inc_metric!(ACTORS_CREATED);
     let value_stream = value_stream.inner;
     let construct_info = Arc::new(construct_info.complete(ConstructType::ValueActor));
-    let (message_sender, message_receiver) = NamedChannel::new("value_actor.initial.messages", 16);
+    let (message_sender, message_receiver) = NamedChannel::new("value_actor.initial.messages", VALUE_ACTOR_MESSAGE_CAPACITY);
     let current_version = Arc::new(AtomicU64::new(1));
 
-    let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.initial.subscriptions", 32);
-    let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new("value_actor.initial.direct_store", 64);
-    let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.initial.queries", 8);
+    let (subscription_sender, subscription_receiver) = NamedChannel::new("value_actor.initial.subscriptions", VALUE_ACTOR_SUBSCRIPTION_CAPACITY);
+    let (direct_store_sender, direct_store_receiver) = NamedChannel::<Value>::new("value_actor.initial.direct_store", VALUE_ACTOR_DIRECT_STORE_CAPACITY);
+    let (stored_value_query_sender, stored_value_query_receiver) = NamedChannel::new("value_actor.initial.queries", VALUE_ACTOR_QUERY_CAPACITY);
 
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
     ready_tx.send(()).ok();
@@ -4463,7 +4472,7 @@ pub fn create_actor_with_initial_value<S: Stream<Item = Value> + 'static>(
                 history.add(1, initial_value);
                 history
             };
-            let mut subscribers: Vec<mpsc::Sender<Value>> = Vec::new();
+            let mut subscribers: SmallVec<[mpsc::Sender<Value>; 4]> = SmallVec::new();
             let mut stream_ever_produced = true;
             let mut stream_ended = false;
 
@@ -4547,10 +4556,6 @@ pub fn create_actor_with_initial_value<S: Stream<Item = Value> + 'static>(
                     }
                 }
             }
-
-            if LOG_DROPS_AND_LOOP_ENDS {
-                zoon::println!("Loop ended {construct_info}");
-            }
         }
     });
 
@@ -4595,7 +4600,7 @@ pub fn create_actor_forwarding(
     persistence_id: parser::PersistenceId,
     scope_id: ScopeId,
 ) -> (ActorHandle, NamedChannel<Value>) {
-    let (sender, receiver) = NamedChannel::new("forwarding.values", 64);
+    let (sender, receiver) = NamedChannel::new("forwarding.values", FORWARDING_VALUE_CAPACITY);
     let handle = create_actor(
         construct_info,
         actor_context,
@@ -4661,11 +4666,11 @@ pub fn create_actor_lazy<S: Stream<Item = Value> + 'static>(
 
     let construct_info = Arc::new(construct_info);
     // Dummy channels (not used — lazy_delegate handles subscriptions)
-    let (message_sender, _message_receiver) = NamedChannel::new("value_actor.lazy.messages", 16);
+    let (message_sender, _message_receiver) = NamedChannel::new("value_actor.lazy.messages", VALUE_ACTOR_MESSAGE_CAPACITY);
     let current_version = Arc::new(AtomicU64::new(0));
-    let (subscription_sender, _subscription_receiver) = NamedChannel::<SubscriptionSetup>::new("value_actor.lazy.subscriptions", 32);
-    let (direct_store_sender, _direct_store_receiver) = NamedChannel::new("value_actor.lazy.direct_store", 64);
-    let (stored_value_query_sender, _stored_value_query_receiver) = NamedChannel::new("value_actor.lazy.queries", 8);
+    let (subscription_sender, _subscription_receiver) = NamedChannel::<SubscriptionSetup>::new("value_actor.lazy.subscriptions", VALUE_ACTOR_SUBSCRIPTION_CAPACITY);
+    let (direct_store_sender, _direct_store_receiver) = NamedChannel::new("value_actor.lazy.direct_store", VALUE_ACTOR_DIRECT_STORE_CAPACITY);
+    let (stored_value_query_sender, _stored_value_query_receiver) = NamedChannel::new("value_actor.lazy.queries", VALUE_ACTOR_QUERY_CAPACITY);
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
     drop(ready_tx);
     let ready_signal = ready_rx.shared();
@@ -5573,13 +5578,6 @@ impl Object {
     }
 }
 
-impl Drop for Object {
-    fn drop(&mut self) {
-        if LOG_DROPS_AND_LOOP_ENDS {
-            zoon::println!("Dropped: {}", self.construct_info);
-        }
-    }
-}
 
 // --- TaggedObject ---
 
@@ -5717,13 +5715,6 @@ impl TaggedObject {
     }
 }
 
-impl Drop for TaggedObject {
-    fn drop(&mut self) {
-        if LOG_DROPS_AND_LOOP_ENDS {
-            zoon::println!("Dropped: {}", self.construct_info);
-        }
-    }
-}
 
 // --- Text ---
 
@@ -5836,15 +5827,35 @@ impl Text {
     pub fn text(&self) -> &str {
         &self.text
     }
-}
 
-impl Drop for Text {
-    fn drop(&mut self) {
-        if LOG_DROPS_AND_LOOP_ENDS {
-            zoon::println!("Dropped: {}", self.construct_info);
-        }
+    /// Create a Value using a pre-built ConstructInfoComplete.
+    /// Avoids ConstructInfo::new() → complete() allocation chain.
+    /// Used for hot paths in bridge.rs where the same event type is created repeatedly.
+    pub fn new_value_cached(
+        construct_info: ConstructInfoComplete,
+        idempotency_key: ValueIdempotencyKey,
+        text: impl Into<Cow<'static, str>>,
+    ) -> Value {
+        Value::Text(
+            Arc::new(Self { construct_info, text: text.into() }),
+            ValueMetadata::new(idempotency_key),
+        )
+    }
+
+    /// Create a Value with cached info and a pre-captured Lamport timestamp.
+    pub fn new_value_cached_with_lamport_time(
+        construct_info: ConstructInfoComplete,
+        idempotency_key: ValueIdempotencyKey,
+        lamport_time: u64,
+        text: impl Into<Cow<'static, str>>,
+    ) -> Value {
+        Value::Text(
+            Arc::new(Self { construct_info, text: text.into() }),
+            ValueMetadata::with_lamport_time(idempotency_key, lamport_time),
+        )
     }
 }
+
 
 // --- Tag ---
 
@@ -5957,15 +5968,35 @@ impl Tag {
     pub fn tag(&self) -> &str {
         &self.tag
     }
-}
 
-impl Drop for Tag {
-    fn drop(&mut self) {
-        if LOG_DROPS_AND_LOOP_ENDS {
-            zoon::println!("Dropped: {}", self.construct_info);
-        }
+    /// Create a Value using a pre-built ConstructInfoComplete.
+    /// Avoids ConstructInfo::new() → complete() allocation chain.
+    /// Used for hot paths in bridge.rs where the same event type is created repeatedly.
+    pub fn new_value_cached(
+        construct_info: ConstructInfoComplete,
+        idempotency_key: ValueIdempotencyKey,
+        tag: impl Into<Cow<'static, str>>,
+    ) -> Value {
+        Value::Tag(
+            Arc::new(Self { construct_info, tag: tag.into() }),
+            ValueMetadata::new(idempotency_key),
+        )
+    }
+
+    /// Create a Value with cached info and a pre-captured Lamport timestamp.
+    pub fn new_value_cached_with_lamport_time(
+        construct_info: ConstructInfoComplete,
+        idempotency_key: ValueIdempotencyKey,
+        lamport_time: u64,
+        tag: impl Into<Cow<'static, str>>,
+    ) -> Value {
+        Value::Tag(
+            Arc::new(Self { construct_info, tag: tag.into() }),
+            ValueMetadata::with_lamport_time(idempotency_key, lamport_time),
+        )
     }
 }
+
 
 // --- Number ---
 
@@ -6066,13 +6097,6 @@ impl Number {
     }
 }
 
-impl Drop for Number {
-    fn drop(&mut self) {
-        if LOG_DROPS_AND_LOOP_ENDS {
-            zoon::println!("Dropped: {}", self.construct_info);
-        }
-    }
-}
 
 // --- List ---
 
@@ -6122,7 +6146,7 @@ impl List {
     ) -> Self {
         let construct_info = Arc::new(construct_info.complete(ConstructType::List));
         let (change_sender_sender, mut change_sender_receiver) =
-            NamedChannel::<NamedChannel<ListChange>>::new("list.change_subscribers", 32);
+            NamedChannel::<NamedChannel<ListChange>>::new("list.change_subscribers", LIST_CHANGE_SUBSCRIBER_CAPACITY);
 
         // Version tracking for push-pull architecture
         let current_version = Arc::new(AtomicU64::new(0));
@@ -6130,11 +6154,11 @@ impl List {
 
         // Channel for diff subscriber registration (bounded channels)
         let (notify_sender_sender, notify_sender_receiver) =
-            NamedChannel::<mpsc::Sender<()>>::new("list.diff_subscribers", 32);
+            NamedChannel::<mpsc::Sender<()>>::new("list.diff_subscribers", LIST_DIFF_SUBSCRIBER_CAPACITY);
 
         // Channel for diff history queries (actor-owned, no RefCell)
         let (diff_query_sender, diff_query_receiver) =
-            NamedChannel::<DiffHistoryQuery>::new("list.diff_queries", 16);
+            NamedChannel::<DiffHistoryQuery>::new("list.diff_queries", LIST_DIFF_QUERY_CAPACITY);
 
         let actor_loop = ActorLoop::new({
             let construct_info = construct_info.clone();
@@ -6154,15 +6178,15 @@ impl List {
                 let mut change_stream = pin!(change_stream.fuse());
                 let mut notify_sender_receiver = pin!(notify_sender_receiver.fuse());
                 let mut diff_query_receiver = pin!(diff_query_receiver.fuse());
-                let mut change_senders = Vec::<NamedChannel<ListChange>>::new();
+                let mut change_senders = SmallVec::<[NamedChannel<ListChange>; 4]>::new();
                 // Diff subscriber notification senders (bounded channels)
-                let mut notify_senders: Vec<mpsc::Sender<()>> = Vec::new();
+                let mut notify_senders: SmallVec<[mpsc::Sender<()>; 4]> = SmallVec::new();
                 let mut list: Option<Vec<ActorHandle>> = None;
                 // Cached Arc slice for sending Replace without re-cloning the Vec each time.
                 // Invalidated when `list` is mutated via `apply_to_vec`.
                 let mut list_arc_cache: Option<Arc<[ActorHandle]>> = None;
                 // Queue for subscribers that register before list is initialized
-                let mut pending_subscribers: Vec<NamedChannel<ListChange>> = Vec::new();
+                let mut pending_subscribers: SmallVec<[NamedChannel<ListChange>; 2]> = SmallVec::new();
                 loop {
                     select! {
                         // Handle diff history queries
@@ -6288,9 +6312,6 @@ impl List {
                             }
                         }
                     }
-                }
-                if LOG_DROPS_AND_LOOP_ENDS {
-                    zoon::println!("Loop ended {construct_info}");
                 }
                 drop(extra_owned_data);
             }
@@ -6452,7 +6473,7 @@ impl List {
     /// Callers should use `.clone().stream()` if they need to retain a reference.
     pub fn stream(self: Arc<Self>) -> ListSubscription {
         // ListChange events use bounded channel with backpressure - keeps senders that are just full
-        let (change_sender, change_receiver) = NamedChannel::new("list.changes", 64);
+        let (change_sender, change_receiver) = NamedChannel::new("list.changes", LIST_CHANGE_CAPACITY);
         if let Err(error) = self.change_sender_sender.try_send(change_sender) {
             zoon::eprintln!("Failed to subscribe to {}: {error:#}", self.construct_info);
         }
@@ -6574,10 +6595,13 @@ impl List {
                                         })
                                         .collect();
 
-                                    let restored_change = ListChange::Replace { items: Arc::from(items.clone()) };
+                                    // C4: Build Arc first, then derive Vec from it to avoid double allocation
+                                    let items_arc: Arc<[ActorHandle]> = Arc::from(items);
+                                    let current_items = items_arc.to_vec();
+                                    let restored_change = ListChange::Replace { items: items_arc };
                                     return Some((
                                         restored_change,
-                                        PersistState::Restored { pid, change_stream, current_items: items, ctx, actor_ctx, cid },
+                                        PersistState::Restored { pid, change_stream, current_items, ctx, actor_ctx, cid },
                                     ));
                                 }
                             } else if loaded_items.is_some() && LOG_DEBUG {
@@ -6606,9 +6630,12 @@ impl List {
                             if let Some(change) = change_stream.next().await {
                                 if matches!(&change, ListChange::Replace { .. }) {
                                     // Skip source's Replace, emit our restored items instead
+                                    // C4: Build Arc first, derive Vec from it to avoid clone
+                                    let items_arc: Arc<[ActorHandle]> = Arc::from(current_items);
+                                    let running_items = items_arc.to_vec();
                                     Some((
-                                        ListChange::Replace { items: Arc::from(current_items.clone()) },
-                                        PersistState::Running { pid, change_stream, current_items, ctx, actor_ctx, cid },
+                                        ListChange::Replace { items: items_arc },
+                                        PersistState::Running { pid, change_stream, current_items: running_items, ctx, actor_ctx, cid },
                                     ))
                                 } else {
                                     // Non-Replace change, process normally
@@ -6852,13 +6879,6 @@ impl List {
     }
 }
 
-impl Drop for List {
-    fn drop(&mut self) {
-        if LOG_DROPS_AND_LOOP_ENDS {
-            zoon::println!("Dropped: {}", self.construct_info);
-        }
-    }
-}
 
 // --- ListSubscription ---
 
@@ -6920,6 +6940,14 @@ pub enum ListDiff {
 
 // --- DiffHistory ---
 
+/// Default maximum number of diffs to keep in history ring buffer.
+const DIFF_HISTORY_MAX_ENTRIES: usize = 1500;
+/// Default snapshot threshold: prefer snapshot over diffs if catching up
+/// requires more than this fraction of the current list length.
+const DIFF_HISTORY_SNAPSHOT_THRESHOLD: f64 = 0.5;
+/// Minimum entries to retain even when adaptive trimming is active.
+const DIFF_HISTORY_MIN_ENTRIES: usize = 32;
+
 /// Configuration for diff history ring buffer.
 pub struct DiffHistoryConfig {
     /// Maximum number of diffs to keep before oldest are dropped
@@ -6931,8 +6959,8 @@ pub struct DiffHistoryConfig {
 impl Default for DiffHistoryConfig {
     fn default() -> Self {
         Self {
-            max_entries: 1500,
-            snapshot_threshold: 0.5, // Snapshot if catching up > 50% of list
+            max_entries: DIFF_HISTORY_MAX_ENTRIES,
+            snapshot_threshold: DIFF_HISTORY_SNAPSHOT_THRESHOLD,
         }
     }
 }
@@ -6948,6 +6976,9 @@ pub struct DiffHistory {
     oldest_version: u64,
     /// Current version (incremented on each change)
     current_version: u64,
+    /// Oldest subscriber version seen in recent get_update_since calls.
+    /// Used for adaptive trimming: entries older than this are unlikely needed.
+    oldest_subscriber_version: Option<u64>,
     /// Configuration
     config: DiffHistoryConfig,
 }
@@ -6959,6 +6990,7 @@ impl DiffHistory {
             current_snapshot: Vec::new(),
             oldest_version: 0,
             current_version: 0,
+            oldest_subscriber_version: None,
             config,
         }
     }
@@ -6998,8 +7030,18 @@ impl DiffHistory {
         // Store diff
         self.diffs.push_back((self.current_version, Arc::new(diff)));
 
-        // Trim old diffs if over capacity
-        while self.diffs.len() > self.config.max_entries {
+        // Adaptive trimming: use subscriber lag to determine effective capacity.
+        // If we know the oldest active subscriber, keep only entries since that version
+        // (but at least DIFF_HISTORY_MIN_ENTRIES to handle new subscribers).
+        let effective_max = if let Some(oldest_sub) = self.oldest_subscriber_version {
+            let needed = self.current_version.saturating_sub(oldest_sub);
+            let needed_usize = usize::try_from(needed).unwrap_or(usize::MAX);
+            needed_usize.max(DIFF_HISTORY_MIN_ENTRIES).min(self.config.max_entries)
+        } else {
+            self.config.max_entries
+        };
+
+        while self.diffs.len() > effective_max {
             if let Some((version, _)) = self.diffs.pop_front() {
                 self.oldest_version = version;
             }
@@ -7007,7 +7049,13 @@ impl DiffHistory {
     }
 
     /// Get optimal update for subscriber at given version.
-    pub fn get_update_since(&self, subscriber_version: u64) -> ValueUpdate {
+    pub fn get_update_since(&mut self, subscriber_version: u64) -> ValueUpdate {
+        // Track oldest subscriber version for adaptive trimming
+        self.oldest_subscriber_version = Some(match self.oldest_subscriber_version {
+            Some(prev) => prev.min(subscriber_version),
+            None => subscriber_version,
+        });
+
         if subscriber_version >= self.current_version {
             return ValueUpdate::Current;
         }
@@ -7261,11 +7309,12 @@ pub enum ListBindingOperation {
 
 /// A sortable key extracted from a Value for use in List/sort_by.
 /// Supports comparison of Numbers, Text, and Tags.
+/// Uses Cow<'static, str> to avoid allocations for static tag/text values.
 #[derive(Clone, Debug)]
 pub enum SortKey {
     Number(f64),
-    Text(String),
-    Tag(String),
+    Text(Cow<'static, str>),
+    Tag(Cow<'static, str>),
     /// Fallback for unsupported types - sorts last
     Unsupported,
 }
@@ -7275,8 +7324,20 @@ impl SortKey {
     pub fn from_value(value: &Value) -> Self {
         match value {
             Value::Number(num, _) => SortKey::Number(num.number()),
-            Value::Text(text, _) => SortKey::Text(text.text().to_string()),
-            Value::Tag(tag, _) => SortKey::Tag(tag.tag().to_string()),
+            Value::Text(text, _) => {
+                // Reuse Cow directly when the Text has a borrowed static str
+                match &text.text {
+                    Cow::Borrowed(s) => SortKey::Text(Cow::Borrowed(s)),
+                    Cow::Owned(s) => SortKey::Text(Cow::Owned(s.clone())),
+                }
+            }
+            Value::Tag(tag, _) => {
+                // Reuse Cow directly when the Tag has a borrowed static str
+                match &tag.tag {
+                    Cow::Borrowed(s) => SortKey::Tag(Cow::Borrowed(s)),
+                    Cow::Owned(s) => SortKey::Tag(Cow::Owned(s.clone())),
+                }
+            }
             Value::Flushed(inner, _) => SortKey::from_value(inner),
             _ => SortKey::Unsupported,
         }
@@ -7332,6 +7393,44 @@ impl Ord for SortKey {
             (SortKey::Unsupported, SortKey::Unsupported) => Ordering::Equal,
         }
     }
+}
+
+/// B5: Compute incremental Remove+InsertAt operations to transform
+/// old_sorted_indices into new_sorted_indices.
+/// Both arrays map sorted positions to item indices.
+/// Walks through target positions and moves misplaced items.
+fn compute_sort_diff(
+    items: &[ActorHandle],
+    old_order: &[usize],
+    new_order: &[usize],
+) -> Vec<ListChange> {
+    let mut changes = Vec::new();
+    let mut current = old_order.to_vec();
+
+    for target_pos in 0..new_order.len() {
+        if current[target_pos] == new_order[target_pos] {
+            continue;
+        }
+
+        // Find the target item in current order
+        let item_idx = new_order[target_pos];
+        let current_pos = current.iter().position(|&x| x == item_idx)
+            .expect("Bug: item missing from current sorted order");
+
+        // Remove from current position
+        let item = &items[item_idx];
+        changes.push(ListChange::Remove { id: item.persistence_id() });
+        current.remove(current_pos);
+
+        // Insert at target position
+        changes.push(ListChange::InsertAt {
+            index: target_pos,
+            item: item.clone(),
+        });
+        current.insert(target_pos, item_idx);
+    }
+
+    changes
 }
 
 impl ListBindingFunction {
@@ -8694,23 +8793,37 @@ impl ListBindingFunction {
                 }).collect();
 
                 // A3: Coalesce to batch all synchronously-available predicate updates
+                // B4: Track true_count/evaluated_count for O(1) every/any evaluation
+                let total = item_predicates.len();
                 coalesce(stream::select_all(predicate_streams))
                     .scan(
-                        vec![None::<bool>; item_predicates.len()],
-                        move |states, batch| {
-                            // A3: Process entire batch of predicate updates at once
+                        (vec![None::<bool>; total], 0usize, 0usize), // (states, true_count, evaluated_count)
+                        move |(states, true_count, evaluated_count), batch| {
+                            // Process entire batch of predicate updates at once
                             for (idx, is_true) in batch {
                                 if idx < states.len() {
+                                    match states[idx] {
+                                        None => {
+                                            // First evaluation of this predicate
+                                            *evaluated_count += 1;
+                                            if is_true { *true_count += 1; }
+                                        }
+                                        Some(was_true) => {
+                                            // Update existing predicate
+                                            if was_true && !is_true { *true_count -= 1; }
+                                            if !was_true && is_true { *true_count += 1; }
+                                        }
+                                    }
                                     states[idx] = Some(is_true);
                                 }
                             }
 
-                            let all_evaluated = states.iter().all(|r| r.is_some());
-                            if all_evaluated {
+                            if *evaluated_count == total {
+                                // O(1) check instead of O(N) scan
                                 let result = if is_every {
-                                    states.iter().all(|r| r == &Some(true))
+                                    *true_count == total
                                 } else {
-                                    states.iter().any(|r| r == &Some(true))
+                                    *true_count > 0
                                 };
                                 future::ready(Some(Some(result)))
                             } else {
@@ -8910,42 +9023,66 @@ impl ListBindingFunction {
                     key_actor.clone().stream().map(move |value| (idx, item.clone(), value))
                 }).collect();
 
+                // B5: Incremental sort using BTreeMap for O(log n) key updates.
+                // State: (items, key_values, sorted_tree, prev_sorted_indices, unevaluated_count)
+                // BTreeMap key: (SortKey, usize) where usize is original index for stable tie-breaking.
+                // BTreeMap value: usize (index into items vec).
+                let item_count = item_keys.len();
                 coalesce(stream::select_all(key_streams))
                     .scan(
-                        item_keys.iter().map(|(item, _)| (item.clone(), None::<SortKey>)).collect::<Vec<_>>(),
-                        move |states, batch| {
-                            // A3: Process entire batch of key updates at once
-                            for (idx, item, value) in batch {
-                                // Extract sortable key from value
-                                let sort_key = SortKey::from_value(&value);
-                                if idx < states.len() {
-                                    states[idx] = (item, Some(sort_key));
+                        (
+                            item_keys.iter().map(|(item, _)| item.clone()).collect::<Vec<_>>(),
+                            vec![None::<SortKey>; item_count],
+                            std::collections::BTreeMap::<(SortKey, usize), usize>::new(),
+                            Vec::<usize>::new(), // prev_sorted_indices
+                            item_count,          // unevaluated_count
+                        ),
+                        move |(items, key_values, sorted_tree, prev_sorted, unevaluated), batch| {
+                            // Update keys in BTreeMap
+                            for (idx, _item, value) in batch {
+                                let new_key = SortKey::from_value(&value);
+                                if idx < key_values.len() {
+                                    // Remove old key from tree if it existed
+                                    if let Some(old_key) = key_values[idx].take() {
+                                        sorted_tree.remove(&(old_key, idx));
+                                    } else {
+                                        // First evaluation of this key
+                                        *unevaluated = unevaluated.saturating_sub(1);
+                                    }
+                                    // Insert new key
+                                    sorted_tree.insert((new_key.clone(), idx), idx);
+                                    key_values[idx] = Some(new_key);
                                 }
                             }
 
-                            // If all items have key results, emit sorted list
-                            let all_evaluated = states.iter().all(|(_, result)| result.is_some());
-                            if all_evaluated {
-                                // Sort by key, preserving original order for equal keys (stable sort)
-                                let mut indexed_items: Vec<_> = states.iter().enumerate()
-                                    .map(|(orig_idx, (item, key))| (orig_idx, item.clone(), key.clone().unwrap()))
+                            // Wait until all items have evaluated keys
+                            if *unevaluated > 0 {
+                                return future::ready(Some(None));
+                            }
+
+                            // Read sorted order from BTreeMap (already in order)
+                            let new_sorted: Vec<usize> = sorted_tree.values().copied().collect();
+
+                            if prev_sorted.is_empty() {
+                                // First evaluation - emit Replace
+                                let sorted_items: Vec<ActorHandle> = new_sorted.iter()
+                                    .map(|&idx| items[idx].clone())
                                     .collect();
-                                indexed_items.sort_by(|(orig_a, _, key_a), (orig_b, _, key_b)| {
-                                    match key_a.cmp(key_b) {
-                                        std::cmp::Ordering::Equal => orig_a.cmp(orig_b), // stable sort
-                                        other => other,
-                                    }
-                                });
-                                let sorted: Vec<ActorHandle> = indexed_items.into_iter()
-                                    .map(|(_, item, _)| item)
-                                    .collect();
-                                future::ready(Some(Some(ListChange::Replace { items: Arc::from(sorted) })))
-                            } else {
+                                *prev_sorted = new_sorted;
+                                future::ready(Some(Some(vec![ListChange::Replace { items: Arc::from(sorted_items) }])))
+                            } else if *prev_sorted == new_sorted {
+                                // No change in sorted order
                                 future::ready(Some(None))
+                            } else {
+                                // B5: Compute incremental Remove+InsertAt operations
+                                let changes = compute_sort_diff(items, prev_sorted, &new_sorted);
+                                *prev_sorted = new_sorted;
+                                future::ready(Some(Some(changes)))
                             }
                         }
                     )
                     .filter_map(future::ready)
+                    .flat_map(|changes| stream::iter(changes))
                     .boxed_local()
             })
         });

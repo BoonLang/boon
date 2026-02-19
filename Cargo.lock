@@ -141,6 +141,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_json_any_key",
+ "smallvec",
  "timely",
  "ulid",
  "wasm-bindgen-test",

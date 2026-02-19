@@ -418,6 +418,7 @@ dependencies = [
  "pin-project",
  "serde",
  "serde_json_any_key",
+ "smallvec 1.15.1",
  "timely",
  "ulid",
  "zoon",

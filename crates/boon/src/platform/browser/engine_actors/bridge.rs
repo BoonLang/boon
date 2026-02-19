@@ -5,10 +5,34 @@ use zoon::futures_util::stream::LocalBoxStream;
 use zoon::*;
 
 use super::engine::{
-    ActorContext, ActorHandle, ActorLoop, ConstructContext, ConstructInfo, ListChange, LOG_DEBUG, NamedChannel, Object,
+    ActorContext, ActorHandle, ActorLoop, ConstructContext, ConstructInfo, ConstructInfoComplete,
+    ConstructType, ListChange, LOG_DEBUG, NamedChannel, Object,
     ScopeId, TaggedObject, TimestampedEvent, TypedStream, Value, ValueIdempotencyKey, Variable,
     Text as EngineText, Tag as EngineTag, create_actor, switch_map, inc_metric,
+    BRIDGE_PENDING_KEY_DOWN_CAP, BRIDGE_PENDING_BLUR_CAP, BRIDGE_PENDING_FOCUS_CAP,
+    BRIDGE_HOVER_CAPACITY, BRIDGE_PRESS_EVENT_CAPACITY, BRIDGE_TEXT_CHANGE_CAPACITY,
+    BRIDGE_KEY_DOWN_CAPACITY, BRIDGE_BLUR_CAPACITY, BRIDGE_FOCUS_CAPACITY,
 };
+
+// --- Cached ConstructInfoComplete for hot bridge paths ---
+// These avoid repeated ConstructInfo::new() → complete() allocations
+// for high-frequency events. Each ConstructInfo::new() allocates an
+// Arc<Vec<Cow<str>>> for the id. Caching here means cloning is just
+// an Arc refcount bump.
+
+thread_local! {
+    // Hover tag values (most frequent - every mouse move in/out)
+    static HOVER_TAG_INFO: ConstructInfoComplete =
+        ConstructInfo::new("hovered", None, "Hovered state").complete(ConstructType::Tag);
+
+    // Change event text value (per keystroke)
+    static CHANGE_EVENT_TEXT_INFO: ConstructInfoComplete =
+        ConstructInfo::new("text_input::change_event::text_value", None, "change text value").complete(ConstructType::Text);
+
+    // Key down event tag value (per keystroke)
+    static KEY_DOWN_EVENT_TAG_INFO: ConstructInfoComplete =
+        ConstructInfo::new("text_input::key_down_event::key_value", None, "key_down key value").complete(ConstructType::Tag);
+}
 use crate::parser;
 
 /// Convert a Boon tag name to a Zoon Tag.
@@ -694,7 +718,7 @@ fn element_stripe(
     construct_context: ConstructContext,
 ) -> impl Element {
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
-    let (hovered_sender, mut hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("element.hovered", 2);
+    let (hovered_sender, mut hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("element.hovered", BRIDGE_HOVER_CAPACITY);
 
     // Set up hovered link if element field exists with hovered property
     // Access element through settings, like other properties (style, direction, etc.)
@@ -729,9 +753,8 @@ fn element_stripe(
                     new_sender = hovered_stream.next() => {
                         if let Some(sender) = new_sender {
                             // Send initial hover state (false) when link is established
-                            let initial_hover_value = EngineTag::new_value(
-                                ConstructInfo::new("stripe::hovered::initial", None, "Initial stripe hovered state"),
-                                construct_context.clone(),
+                            let initial_hover_value = EngineTag::new_value_cached(
+                                HOVER_TAG_INFO.with(|info| info.clone()),
                                 ValueIdempotencyKey::new(),
                                 "False",
                             );
@@ -749,9 +772,8 @@ fn element_stripe(
                             inc_metric!(HOVER_EVENTS_EMITTED);
                             last_hover_state = Some(event.data);
                             let hover_tag = if event.data { "True" } else { "False" };
-                            let event_value = EngineTag::new_value_with_lamport_time(
-                                ConstructInfo::new("stripe::hovered", None, "Stripe hovered state"),
-                                construct_context.clone(),
+                            let event_value = EngineTag::new_value_cached_with_lamport_time(
+                                HOVER_TAG_INFO.with(|info| info.clone()),
                                 ValueIdempotencyKey::new(),
                                 event.lamport_time,
                                 hover_tag,
@@ -2143,8 +2165,8 @@ fn element_button(
     construct_context: ConstructContext,
 ) -> impl Element {
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
-    let (press_event_sender, mut press_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("button.press_event", 8);
-    let (hovered_sender, mut hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("button.hovered", 2);
+    let (press_event_sender, mut press_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("button.press_event", BRIDGE_PRESS_EVENT_CAPACITY);
+    let (hovered_sender, mut hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("button.hovered", BRIDGE_HOVER_CAPACITY);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -2191,9 +2213,8 @@ fn element_button(
                     new_sender = hovered_stream.next() => {
                         if let Some(sender) = new_sender {
                             // Send initial hover state (false) when link is established
-                            let initial_hover_value = EngineTag::new_value(
-                                ConstructInfo::new("button::hovered::initial", None, "Initial button hovered state"),
-                                construct_context.clone(),
+                            let initial_hover_value = EngineTag::new_value_cached(
+                                HOVER_TAG_INFO.with(|info| info.clone()),
                                 ValueIdempotencyKey::new(),
                                 "False",
                             );
@@ -2224,9 +2245,8 @@ fn element_button(
                             inc_metric!(HOVER_EVENTS_EMITTED);
                             last_hover_state = Some(event.data);
                             let hover_tag = if event.data { "True" } else { "False" };
-                            let event_value = EngineTag::new_value_with_lamport_time(
-                                ConstructInfo::new("button::hovered", None, "Button hovered state"),
-                                construct_context.clone(),
+                            let event_value = EngineTag::new_value_cached_with_lamport_time(
+                                HOVER_TAG_INFO.with(|info| info.clone()),
                                 ValueIdempotencyKey::new(),
                                 event.lamport_time,
                                 hover_tag,
@@ -2808,10 +2828,10 @@ fn element_text_input(
     // Separate channels for each event type.
     // TimestampedEvent captures Lamport time at DOM callback, ensuring correct ordering
     // even when select! processes events out of order.
-    let (change_event_sender, mut change_event_receiver) = NamedChannel::<TimestampedEvent<String>>::new("text_input.change", 16);
-    let (key_down_event_sender, mut key_down_event_receiver) = NamedChannel::<TimestampedEvent<String>>::new("text_input.key_down", 32);
-    let (blur_event_sender, mut blur_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("text_input.blur", 8);
-    let (focus_event_sender, mut focus_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("text_input.focus", 8);
+    let (change_event_sender, mut change_event_receiver) = NamedChannel::<TimestampedEvent<String>>::new("text_input.change", BRIDGE_TEXT_CHANGE_CAPACITY);
+    let (key_down_event_sender, mut key_down_event_receiver) = NamedChannel::<TimestampedEvent<String>>::new("text_input.key_down", BRIDGE_KEY_DOWN_CAPACITY);
+    let (blur_event_sender, mut blur_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("text_input.blur", BRIDGE_BLUR_CAPACITY);
+    let (focus_event_sender, mut focus_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("text_input.focus", BRIDGE_FOCUS_CAPACITY);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -2871,6 +2891,14 @@ fn element_text_input(
     // Helper to create change event value with captured Lamport timestamp
     fn create_change_event_value(construct_context: &ConstructContext, text: String, lamport_time: u64, scope_id: ScopeId) -> Value {
         inc_metric!(CHANGE_EVENTS_CONSTRUCTED);
+        // C1: Use cached ConstructInfoComplete for the inner text value
+        // to avoid ConstructInfo::new() allocation on every keystroke
+        let text_value = EngineText::new_value_cached_with_lamport_time(
+            CHANGE_EVENT_TEXT_INFO.with(|info| info.clone()),
+            ValueIdempotencyKey::new(),
+            lamport_time,
+            text,
+        );
         Object::new_value_with_lamport_time(
             ConstructInfo::new("text_input::change_event", None, "TextInput change event"),
             construct_context.clone(),
@@ -2883,13 +2911,7 @@ fn element_text_input(
                 create_actor(
                     ConstructInfo::new("text_input::change_event::text_actor", None, "change text actor"),
                     ActorContext::default(),
-                    TypedStream::infinite(stream::once(future::ready(EngineText::new_value_with_lamport_time(
-                        ConstructInfo::new("text_input::change_event::text_value", None, "change text value"),
-                        construct_context.clone(),
-                        ValueIdempotencyKey::new(),
-                        lamport_time,
-                        text,
-                    ))).chain(stream::pending())),
+                    TypedStream::infinite(stream::once(future::ready(text_value)).chain(stream::pending())),
                     parser::PersistenceId::new(),
                     scope_id,
                 ),
@@ -2903,6 +2925,13 @@ fn element_text_input(
     // Only contains 'key', no 'text' - text should be obtained from the change event using LATEST
     fn create_key_down_event_value(construct_context: &ConstructContext, key: String, lamport_time: u64, scope_id: ScopeId) -> Value {
         inc_metric!(KEYDOWN_EVENTS_CONSTRUCTED);
+        // C1: Use cached ConstructInfoComplete for the inner tag value
+        let tag_value = EngineTag::new_value_cached_with_lamport_time(
+            KEY_DOWN_EVENT_TAG_INFO.with(|info| info.clone()),
+            ValueIdempotencyKey::new(),
+            lamport_time,
+            key,
+        );
         Object::new_value_with_lamport_time(
             ConstructInfo::new("text_input::key_down_event", None, "TextInput key_down event"),
             construct_context.clone(),
@@ -2916,13 +2945,7 @@ fn element_text_input(
                     create_actor(
                         ConstructInfo::new("text_input::key_down_event::key_actor", None, "key_down key actor"),
                         ActorContext::default(),
-                        TypedStream::infinite(stream::once(future::ready(EngineTag::new_value_with_lamport_time(
-                            ConstructInfo::new("text_input::key_down_event::key_value", None, "key_down key value"),
-                            construct_context.clone(),
-                            ValueIdempotencyKey::new(),
-                            lamport_time,
-                            key,
-                        ))).chain(stream::pending())),
+                        TypedStream::infinite(stream::once(future::ready(tag_value)).chain(stream::pending())),
                         parser::PersistenceId::new(),
                         scope_id,
                     ),
@@ -3028,7 +3051,7 @@ fn element_text_input(
                             sender.send_or_drop(event_value);
                         } else {
                             if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering focus event (sender not ready)"); }
-                            if pending_focus_events.len() < 16 {
+                            if pending_focus_events.len() < BRIDGE_PENDING_FOCUS_CAP {
                                 pending_focus_events.push(event);
                             }
                         }
@@ -3066,9 +3089,9 @@ fn element_text_input(
                                 if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LINK send FAILED - channel closed or full!"); }
                             }
                         } else {
-                            // Buffer event until sender is ready (bounded to 64)
+                            // Buffer event until sender is ready (bounded)
                             if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering key_down event (sender not ready)"); }
-                            if pending_key_down_events.len() < 64 {
+                            if pending_key_down_events.len() < BRIDGE_PENDING_KEY_DOWN_CAP {
                                 pending_key_down_events.push(event);
                             }
                         }
@@ -3086,9 +3109,9 @@ fn element_text_input(
                             );
                             sender.send_or_drop(event_value);
                         } else {
-                            // Buffer event until sender is ready (bounded to 16)
+                            // Buffer event until sender is ready (bounded)
                             if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering blur event (sender not ready)"); }
-                            if pending_blur_events.len() < 16 {
+                            if pending_blur_events.len() < BRIDGE_PENDING_BLUR_CAP {
                                 pending_blur_events.push(event);
                             }
                         }
@@ -3416,7 +3439,7 @@ fn element_checkbox(
     construct_context: ConstructContext,
 ) -> impl Element {
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
-    let (click_event_sender, mut click_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("checkbox.click", 8);
+    let (click_event_sender, mut click_event_receiver) = NamedChannel::<TimestampedEvent<()>>::new("checkbox.click", BRIDGE_PRESS_EVENT_CAPACITY);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -3609,8 +3632,8 @@ fn element_label(
     construct_context: ConstructContext,
 ) -> impl Element {
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
-    let (double_click_sender, mut double_click_receiver) = NamedChannel::<TimestampedEvent<()>>::new("double_click.event", 8);
-    let (hovered_sender, _hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("double_click.hovered", 2);
+    let (double_click_sender, mut double_click_receiver) = NamedChannel::<TimestampedEvent<()>>::new("double_click.event", BRIDGE_PRESS_EVENT_CAPACITY);
+    let (hovered_sender, _hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("double_click.hovered", BRIDGE_HOVER_CAPACITY);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -3662,9 +3685,8 @@ fn element_label(
                     new_sender = hovered_stream.next() => {
                         if let Some(sender) = new_sender {
                             // Send initial hover state (false) when link is established
-                            let initial_hover_value = EngineTag::new_value(
-                                ConstructInfo::new("label::hovered::initial", None, "Initial label hovered state"),
-                                construct_context.clone(),
+                            let initial_hover_value = EngineTag::new_value_cached(
+                                HOVER_TAG_INFO.with(|info| info.clone()),
                                 ValueIdempotencyKey::new(),
                                 "False",
                             );
@@ -3904,7 +3926,7 @@ fn element_link(
     construct_context: ConstructContext,
 ) -> impl Element {
     // TimestampedEvent captures Lamport time at DOM callback for consistent ordering
-    let (hovered_sender, mut hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("link.hovered", 2);
+    let (hovered_sender, mut hovered_receiver) = NamedChannel::<TimestampedEvent<bool>>::new("link.hovered", BRIDGE_HOVER_CAPACITY);
 
     let element_variable = tagged_object.expect_variable("element");
 
@@ -3927,9 +3949,8 @@ fn element_link(
                 select! {
                     sender = hovered_stream.select_next_some() => {
                         // Send initial hover state (false) when link is established
-                        let initial_hover_value = EngineTag::new_value(
-                            ConstructInfo::new("link::hovered::initial", None, "Initial link hovered state"),
-                            construct_context.clone(),
+                        let initial_hover_value = EngineTag::new_value_cached(
+                            HOVER_TAG_INFO.with(|info| info.clone()),
                             ValueIdempotencyKey::new(),
                             "False",
                         );
@@ -3946,9 +3967,8 @@ fn element_link(
                             inc_metric!(HOVER_EVENTS_EMITTED);
                             last_hover_state = Some(event.data);
                             let hover_tag = if event.data { "True" } else { "False" };
-                            let event_value = EngineTag::new_value_with_lamport_time(
-                                ConstructInfo::new("link::hovered", None, "Link hovered state"),
-                                construct_context.clone(),
+                            let event_value = EngineTag::new_value_cached_with_lamport_time(
+                                HOVER_TAG_INFO.with(|info| info.clone()),
                                 ValueIdempotencyKey::new(),
                                 event.lamport_time,
                                 hover_tag,

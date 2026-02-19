@@ -12,22 +12,6 @@ use zoon::futures_util::future;
 use zoon::futures_util::stream::{self, LocalBoxStream};
 use zoon::{Stream, StreamExt, SinkExt, mpsc, Task, TaskHandle};
 
-/// Yields control to the executor, allowing other tasks to run.
-/// This is a simple implementation that returns Pending once and schedules a wake.
-async fn yield_once() {
-    use std::task::Poll;
-    let mut yielded = false;
-    std::future::poll_fn(|cx| {
-        if yielded {
-            Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }).await
-}
-
 use crate::parser::{
     Persistence, PersistenceId, PersistenceStatus, Scope, SourceCode, Span, span_at, static_expression, lexer, parser, resolve_references, Token, Spanned,
 };
@@ -581,6 +565,33 @@ impl EvaluationState {
         self.function_registry.get(name)
     }
 
+    /// Create a merged function registry snapshot for sub-evaluations (THEN/WHEN/WHILE).
+    /// Avoids cloning the parent snapshot when there are no local functions to merge.
+    pub fn merged_registry_snapshot(
+        &self,
+        ctx: &EvaluationContext,
+    ) -> Arc<HashMap<String, StaticFunctionDefinition>> {
+        inc_metric!(REGISTRY_CLONES);
+        if self.function_registry.is_empty() {
+            // Common case: no local functions, just reuse the parent snapshot
+            if let Some(ref snapshot) = ctx.function_registry_snapshot {
+                inc_metric!(REGISTRY_CLONE_ENTRIES, snapshot.len() as u64);
+                return Arc::clone(snapshot);
+            }
+            return Arc::new(HashMap::new());
+        }
+        // Merge: clone parent + insert local overrides
+        let mut merged = ctx.function_registry_snapshot
+            .as_ref()
+            .map(|s| (**s).clone())
+            .unwrap_or_default();
+        for (name, def) in &self.function_registry {
+            merged.insert(name.clone(), def.clone());
+        }
+        inc_metric!(REGISTRY_CLONE_ENTRIES, merged.len() as u64);
+        Arc::new(merged)
+    }
+
     /// Allocate a new result slot.
     pub fn alloc_slot(&mut self) -> SlotId {
         inc_metric!(SLOTS_ALLOCATED);
@@ -822,17 +833,7 @@ fn schedule_expression(
         static_expression::Expression::Then { body } => {
             // THEN creates an actor that evaluates body at runtime for each piped value
             // We can build it immediately since the body is evaluated lazily
-            // Merge context's snapshot (top-level functions) with state's registry (local functions)
-            inc_metric!(REGISTRY_CLONES);
-            let mut merged_registry = ctx.function_registry_snapshot
-                .as_ref()
-                .map(|s| (**s).clone())
-                .unwrap_or_default();
-            for (name, def) in &state.function_registry {
-                merged_registry.insert(name.clone(), def.clone());
-            }
-            inc_metric!(REGISTRY_CLONE_ENTRIES, merged_registry.len() as u64);
-            let registry_snapshot = Arc::new(merged_registry);
+            let registry_snapshot = state.merged_registry_snapshot(&ctx);
             let actor = build_then_actor(
                 *body,
                 span,
@@ -845,17 +846,7 @@ fn schedule_expression(
         }
 
         static_expression::Expression::When { arms } => {
-            // Merge context's snapshot (top-level functions) with state's registry (local functions)
-            inc_metric!(REGISTRY_CLONES);
-            let mut merged_registry = ctx.function_registry_snapshot
-                .as_ref()
-                .map(|s| (**s).clone())
-                .unwrap_or_default();
-            for (name, def) in &state.function_registry {
-                merged_registry.insert(name.clone(), def.clone());
-            }
-            inc_metric!(REGISTRY_CLONE_ENTRIES, merged_registry.len() as u64);
-            let registry_snapshot = Arc::new(merged_registry);
+            let registry_snapshot = state.merged_registry_snapshot(&ctx);
             let actor = build_when_actor(
                 arms,
                 span,
@@ -868,17 +859,7 @@ fn schedule_expression(
         }
 
         static_expression::Expression::While { arms } => {
-            // Merge context's snapshot (top-level functions) with state's registry (local functions)
-            inc_metric!(REGISTRY_CLONES);
-            let mut merged_registry = ctx.function_registry_snapshot
-                .as_ref()
-                .map(|s| (**s).clone())
-                .unwrap_or_default();
-            for (name, def) in &state.function_registry {
-                merged_registry.insert(name.clone(), def.clone());
-            }
-            inc_metric!(REGISTRY_CLONE_ENTRIES, merged_registry.len() as u64);
-            let registry_snapshot = Arc::new(merged_registry);
+            let registry_snapshot = state.merged_registry_snapshot(&ctx);
             let actor = build_while_actor(
                 arms,
                 span,
@@ -2126,51 +2107,21 @@ fn process_work_item(
 
         WorkItem::BuildThen { piped_slot: _, body, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
-            // Merge context's snapshot (top-level functions) with state's registry (local functions)
-            inc_metric!(REGISTRY_CLONES);
-            let mut merged_registry = ctx.function_registry_snapshot
-                .as_ref()
-                .map(|s| (**s).clone())
-                .unwrap_or_default();
-            for (name, def) in &state.function_registry {
-                merged_registry.insert(name.clone(), def.clone());
-            }
-            inc_metric!(REGISTRY_CLONE_ENTRIES, merged_registry.len() as u64);
-            let registry_snapshot = Arc::new(merged_registry);
+            let registry_snapshot = state.merged_registry_snapshot(&ctx);
             let actor = build_then_actor(*body, span, persistence, persistence_id, ctx, registry_snapshot)?;
             state.store(result_slot, actor);
         }
 
         WorkItem::BuildWhen { piped_slot: _, arms, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
-            // Merge context's snapshot (top-level functions) with state's registry (local functions)
-            inc_metric!(REGISTRY_CLONES);
-            let mut merged_registry = ctx.function_registry_snapshot
-                .as_ref()
-                .map(|s| (**s).clone())
-                .unwrap_or_default();
-            for (name, def) in &state.function_registry {
-                merged_registry.insert(name.clone(), def.clone());
-            }
-            inc_metric!(REGISTRY_CLONE_ENTRIES, merged_registry.len() as u64);
-            let registry_snapshot = Arc::new(merged_registry);
+            let registry_snapshot = state.merged_registry_snapshot(&ctx);
             let actor = build_when_actor(arms, span, persistence, persistence_id, ctx, registry_snapshot)?;
             state.store(result_slot, actor);
         }
 
         WorkItem::BuildWhile { piped_slot: _, arms, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
-            // Merge context's snapshot (top-level functions) with state's registry (local functions)
-            inc_metric!(REGISTRY_CLONES);
-            let mut merged_registry = ctx.function_registry_snapshot
-                .as_ref()
-                .map(|s| (**s).clone())
-                .unwrap_or_default();
-            for (name, def) in &state.function_registry {
-                merged_registry.insert(name.clone(), def.clone());
-            }
-            inc_metric!(REGISTRY_CLONE_ENTRIES, merged_registry.len() as u64);
-            let registry_snapshot = Arc::new(merged_registry);
+            let registry_snapshot = state.merged_registry_snapshot(&ctx);
             let actor = build_while_actor(arms, span, persistence, persistence_id, ctx, registry_snapshot)?;
             state.store(result_slot, actor);
         }
@@ -5285,7 +5236,7 @@ impl Default for ModuleLoader {
 
 impl ModuleLoader {
     pub fn new(base_dir: impl Into<String>) -> Self {
-        let (tx, mut rx) = NamedChannel::new("module_loader.requests", 16);
+        let (tx, mut rx) = NamedChannel::new("module_loader.requests", MODULE_LOADER_REQUEST_CAPACITY);
         let initial_base_dir = base_dir.into();
 
         let actor_loop = ActorLoop::new(async move {

@@ -19,6 +19,14 @@ pub struct TestOptions {
     pub screenshot_on_fail: bool,
     pub verbose: bool,
     pub examples_dir: Option<PathBuf>,
+    pub no_launch: bool,
+}
+
+/// Options for smoke-examples command
+pub struct SmokeOptions {
+    pub port: u16,
+    pub filter: Option<String>,
+    pub no_launch: bool,
 }
 
 /// Result of a single test
@@ -1700,6 +1708,125 @@ async fn check_server_connection(port: u16) -> Result<ServerStatus> {
             anyhow::bail!("Unexpected response from status check")
         }
     }
+}
+
+/// Built-in playground examples to smoke-test
+const BUILTIN_EXAMPLES: &[&str] = &[
+    "counter",
+    "interval",
+    "todo_mvc",
+    "shopping_list",
+    "hello_world",
+    "fibonacci",
+    "latest",
+    "then",
+    "when",
+    "while",
+    "counter_hold",
+    "interval_hold",
+    "complex_counter",
+    "text_interpolation_update",
+    "list_map_block",
+    "list_retain_count",
+    "list_retain_reactive",
+    "list_retain_remove",
+    "list_object_state",
+    "list_map_external_dep",
+    "minimal",
+];
+
+/// Smoke-run built-in examples: select, run, wait, check for panics
+pub async fn run_builtin_smoke(opts: SmokeOptions) -> Result<Vec<TestResult>> {
+    let setup = ensure_browser_connection(opts.port).await?;
+    let result = run_smoke_inner(&opts).await;
+    if setup.started_mzoon {
+        kill_mzoon_server();
+    }
+    result
+}
+
+async fn run_smoke_inner(opts: &SmokeOptions) -> Result<Vec<TestResult>> {
+    let mut examples: Vec<&str> = BUILTIN_EXAMPLES.to_vec();
+
+    if let Some(ref filter) = opts.filter {
+        examples.retain(|name| name.contains(filter.as_str()));
+        if examples.is_empty() {
+            println!("No built-in examples match filter '{}'", filter);
+            return Ok(vec![]);
+        }
+    }
+
+    println!("Boon Smoke Tests");
+    println!("================\n");
+    println!("Running {} example(s)...\n", examples.len());
+
+    let mut results = Vec::new();
+
+    for name in &examples {
+        let start = Instant::now();
+
+        // Select example
+        let select_response = send_command_to_server(
+            opts.port,
+            WsCommand::SelectExample { name: format!("{}.bn", name) },
+        ).await?;
+
+        if let WsResponse::Error { message } = select_response {
+            results.push(TestResult {
+                name: name.to_string(),
+                passed: false,
+                skipped: None,
+                duration: start.elapsed(),
+                error: Some(format!("SelectExample failed: {}", message)),
+                actual_output: None,
+                expected_output: None,
+                steps: vec![],
+            });
+            println!("  [FAIL] {} ({:.0?}) - select failed", name, start.elapsed());
+            continue;
+        }
+
+        // Wait for rendering
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Check console for panics/errors
+        let console_response = send_command_to_server(opts.port, WsCommand::GetConsole).await?;
+        let has_panic = match &console_response {
+            WsResponse::Console { messages } => {
+                messages.iter().any(|m| {
+                    m.level == "error" && (m.text.contains("panicked") || m.text.contains("unreachable"))
+                })
+            }
+            _ => false,
+        };
+
+        let passed = !has_panic;
+        let error = if has_panic {
+            Some("Runtime panic detected in console".to_string())
+        } else {
+            None
+        };
+
+        let status = if passed { "[PASS]" } else { "[FAIL]" };
+        println!("  {} {} ({:.0?})", status, name, start.elapsed());
+
+        results.push(TestResult {
+            name: name.to_string(),
+            passed,
+            skipped: None,
+            duration: start.elapsed(),
+            error,
+            actual_output: None,
+            expected_output: None,
+            steps: vec![],
+        });
+    }
+
+    println!("\n================");
+    let passed = results.iter().filter(|r| r.passed).count();
+    println!("{}/{} passed", passed, results.len());
+
+    Ok(results)
 }
 
 /// Find examples directory relative to cwd or tools directory
