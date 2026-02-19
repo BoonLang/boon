@@ -46,7 +46,7 @@ use crate::parser::PersistenceId;
 /// >
 /// ```
 pub fn function_document_new(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -89,7 +89,7 @@ pub fn function_document_new(
 /// ) -> ELEMENT_STRIPE
 /// ```
 pub fn function_element_stripe(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -203,7 +203,7 @@ pub fn function_element_stripe(
 /// ) -> ELEMENT_CONTAINER
 /// ```
 pub fn function_element_container(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -292,7 +292,7 @@ pub fn function_element_container(
 /// ) -> ELEMENT_STACK
 /// ```
 pub fn function_element_stack(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -385,7 +385,7 @@ pub fn function_element_stack(
 /// ) -> ELEMENT_BUTTON
 /// ```
 pub fn function_element_button(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -421,7 +421,7 @@ pub fn function_element_button(
         actor_context.clone(),
         TypedStream::infinite(event_stream.chain(stream::pending())),
         PersistenceId::new(),
-    );
+    ).into();
 
     TaggedObject::new_constant(
         ConstructInfo::new(
@@ -519,7 +519,7 @@ pub fn function_element_button(
 /// ) -> ELEMENT_TEXT_INPUT
 /// ```
 pub fn function_element_text_input(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -558,7 +558,7 @@ pub fn function_element_text_input(
         actor_context.clone(),
         TypedStream::infinite(event_stream.chain(stream::pending())),
         PersistenceId::new(),
-    );
+    ).into();
 
     TaggedObject::new_constant(
         ConstructInfo::new(
@@ -703,7 +703,7 @@ pub fn function_element_text_input(
 /// ) -> ELEMENT_CHECKBOX
 /// ```
 pub fn function_element_checkbox(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -742,7 +742,7 @@ pub fn function_element_checkbox(
         actor_context.clone(),
         TypedStream::infinite(event_stream.chain(stream::pending())),
         PersistenceId::new(),
-    );
+    ).into();
 
     TaggedObject::new_constant(
         ConstructInfo::new(
@@ -861,7 +861,7 @@ pub fn function_element_checkbox(
 /// ) -> ELEMENT_LABEL
 /// ```
 pub fn function_element_label(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -898,7 +898,7 @@ pub fn function_element_label(
         actor_context.clone(),
         TypedStream::infinite(event_stream.chain(stream::pending())),
         PersistenceId::new(),
-    );
+    ).into();
 
     TaggedObject::new_constant(
         ConstructInfo::new(
@@ -993,7 +993,7 @@ pub fn function_element_label(
 /// ) -> ELEMENT_PARAGRAPH
 /// ```
 pub fn function_element_paragraph(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1086,7 +1086,7 @@ pub fn function_element_paragraph(
 /// ) -> ELEMENT_LINK
 /// ```
 pub fn function_element_link(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1200,7 +1200,7 @@ pub fn function_element_link(
 /// Math/sum(increment<Number>) -> Number
 /// ``````
 pub fn function_math_sum(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1294,7 +1294,7 @@ pub fn function_math_sum(
 /// Timer/interval(duration<Duration[seconds<Number> | milliseconds<Number>]>) -> []
 /// ```
 pub fn function_timer_interval(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1344,7 +1344,7 @@ pub fn function_timer_interval(
 
 /// Text/empty constant
 pub fn function_text_empty(
-    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    _arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1360,7 +1360,7 @@ pub fn function_text_empty(
 
 /// Text/space constant - returns a single space character " "
 pub fn function_text_space(
-    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    _arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1376,7 +1376,7 @@ pub fn function_text_space(
 
 /// Text/trim(text) -> Text
 pub fn function_text_trim(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1402,7 +1402,7 @@ pub fn function_text_trim(
 /// Text/is_empty(text) -> Tag (True/False)
 /// Deduplicated: only emits when the result actually changes
 pub fn function_text_is_empty(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1437,7 +1437,7 @@ pub fn function_text_is_empty(
 /// Text/is_not_empty(text) -> Tag (True/False)
 /// Deduplicated: only emits when the result actually changes
 pub fn function_text_is_not_empty(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1473,7 +1473,7 @@ pub fn function_text_is_not_empty(
 
 /// Bool/not(value) -> Tag (True/False)
 pub fn function_bool_not(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1500,7 +1500,7 @@ pub fn function_bool_not(
 /// Bool/toggle(value, when) -> Tag (True/False)
 /// Toggles the boolean value each time 'when' stream produces a value
 pub fn function_bool_toggle(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1548,7 +1548,7 @@ pub fn function_bool_toggle(
 /// Bool/or(this, that) -> Tag (True/False)
 /// Returns True if either this or that is True
 pub fn function_bool_or(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1599,7 +1599,7 @@ pub fn function_bool_or(
 /// Checks if the piped list is empty
 /// Deduplicated: only emits when the result actually changes
 pub fn function_list_is_empty(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1615,7 +1615,7 @@ pub fn function_list_is_empty(
     }).flat_map(move |list| {
         let construct_context = construct_context.clone();
         let function_call_id = function_call_id.clone();
-        list.stream().scan((Vec::<Arc<ValueActor>>::new(), None::<bool>), move |(items, last_result), change| {
+        list.stream().scan((Vec::<ActorHandle>::new(), None::<bool>), move |(items, last_result), change| {
             change.apply_to_vec(items);
             let current_result = items.is_empty();
 
@@ -1640,7 +1640,7 @@ pub fn function_list_is_empty(
 /// Returns the count of items in the list
 /// Deduplicated: only emits when the count actually changes
 pub fn function_list_count(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1656,7 +1656,7 @@ pub fn function_list_count(
     }).flat_map(move |list| {
         let construct_context = construct_context.clone();
         let function_call_id = function_call_id.clone();
-        list.stream().scan((Vec::<Arc<ValueActor>>::new(), None::<usize>), move |(items, last_count), change| {
+        list.stream().scan((Vec::<ActorHandle>::new(), None::<usize>), move |(items, last_count), change| {
             change.apply_to_vec(items);
             let current_count = items.len();
 
@@ -1680,7 +1680,7 @@ pub fn function_list_count(
 /// Checks if the piped list is not empty (inverse of List/is_empty)
 /// Deduplicated: only emits when the result actually changes
 pub fn function_list_is_not_empty(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1696,7 +1696,7 @@ pub fn function_list_is_not_empty(
     }).flat_map(move |list| {
         let construct_context = construct_context.clone();
         let function_call_id = function_call_id.clone();
-        list.stream().scan((Vec::<Arc<ValueActor>>::new(), None::<bool>), move |(items, last_result), change| {
+        list.stream().scan((Vec::<ActorHandle>::new(), None::<bool>), move |(items, last_result), change| {
             change.apply_to_vec(items);
             let current_result = !items.is_empty();
 
@@ -1720,7 +1720,7 @@ pub fn function_list_is_not_empty(
 /// List/append(item: value) -> List
 /// Appends an item to the list when the item stream produces a value
 pub fn function_list_append(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     _construct_context: ConstructContext,
@@ -1775,7 +1775,7 @@ pub fn function_list_append(
                 actor_context_for_append.clone(),
                 constant(value),
                 PersistenceId::new(),
-            );
+            ).into();
             TaggedChange::FromAppend(ListChange::Push { item: new_item_actor })
         });
 
@@ -1834,7 +1834,7 @@ pub fn function_list_append(
 /// List/clear(on: stream) -> List
 /// Clears all items from the list when the trigger stream emits any value
 pub fn function_list_clear(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -1875,12 +1875,12 @@ pub fn function_list_clear(
 
         // Track items so we can clear their source storage on Clear
         // State: (has_received_first, has_pending_clear, tracked_items)
-        type TrackedItems = Vec<Arc<ValueActor>>;
+        type TrackedItems = Vec<ActorHandle>;
 
         // Merge both streams, use scan for proper ordering
         stream::select(list_changes, clear_changes)
             .scan(
-                (false, false, Vec::<Arc<ValueActor>>::new()),
+                (false, false, Vec::<ActorHandle>::new()),
                 |state, tagged_change| {
                     let (has_received_first, has_pending_clear, tracked_items) = state;
 
@@ -1889,7 +1889,7 @@ pub fn function_list_clear(
                             // Update tracked items based on the change
                             match &change {
                                 ListChange::Replace { items } => {
-                                    *tracked_items = items.clone();
+                                    *tracked_items = items.to_vec();
                                 }
                                 ListChange::Push { item } => {
                                     tracked_items.push(item.clone());
@@ -1962,7 +1962,7 @@ pub fn function_list_clear(
 
 /// Clear recorded calls storage for all items that have source origins.
 /// Called when List/clear triggers to ensure items don't restore on next Run.
-fn clear_source_storage_for_items(items: &[Arc<ValueActor>]) {
+fn clear_source_storage_for_items(items: &[ActorHandle]) {
     use std::collections::HashSet;
     use zoon::{local_storage, WebStorage};
 
@@ -1985,7 +1985,7 @@ fn clear_source_storage_for_items(items: &[Arc<ValueActor>]) {
 /// Merges a list of streams, emitting whenever any stream produces a value
 /// Returns the value from the stream that most recently produced
 pub fn function_list_latest(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -2003,7 +2003,7 @@ pub fn function_list_latest(
         let function_call_id = function_call_id.clone();
 
         // Subscribe to list changes and maintain current items
-        list.stream().scan(Vec::<Arc<ValueActor>>::new(), move |items, change| {
+        list.stream().scan(Vec::<ActorHandle>::new(), move |items, change| {
             change.apply_to_vec(items);
             // Return current items for merging
             future::ready(Some(items.clone()))
@@ -2031,7 +2031,7 @@ fn get_current_pathname() -> String {
 /// Returns the current route/URL path as a reactive stream
 /// Updates whenever the URL changes (via popstate event)
 pub fn function_router_route(
-    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    _arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -2092,7 +2092,7 @@ thread_local! {
 /// Router/go_to(route) -> []
 /// Navigates to the specified route using browser history API
 pub fn function_router_go_to(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -2136,7 +2136,7 @@ pub fn function_router_go_to(
 
 /// Ulid/generate() -> Text
 pub fn function_ulid_generate(
-    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    _arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -2220,7 +2220,7 @@ fn resolve_value_for_log(value: Value, timeout_ms: u32) -> Pin<Box<dyn Future<Ou
 
 /// Async function to get value from a ValueActor for logging with timeout.
 /// Returns `?` if no value arrives within the timeout.
-fn resolve_actor_value_for_log(actor: Arc<ValueActor>, timeout_ms: u32) -> Pin<Box<dyn Future<Output = String>>> {
+fn resolve_actor_value_for_log(actor: ActorHandle, timeout_ms: u32) -> Pin<Box<dyn Future<Output = String>>> {
     Box::pin(async move {
         use zoon::futures_util::StreamExt;
 
@@ -2255,7 +2255,7 @@ async fn resolve_value_for_log_with_timeout(value: Value, timeout_ms: u32) -> St
 /// - 'label': Text label for the log message
 /// - 'timeout': Duration[seconds: N] or Duration[milliseconds: N] for nested value resolution
 /// Returns LogOptions with defaults if fields are not present.
-async fn extract_log_options_from_with(with_actor: Arc<ValueActor>) -> LogOptions {
+async fn extract_log_options_from_with(with_actor: ActorHandle) -> LogOptions {
     use zoon::futures_util::StreamExt;
 
     let mut options = LogOptions::default();
@@ -2306,7 +2306,7 @@ async fn extract_log_options_from_with(with_actor: Arc<ValueActor>) -> LogOption
 /// - label: Text label for the log message
 /// - timeout: Duration[milliseconds: N] or Duration[seconds: N] for nested value resolution
 pub fn function_log_info(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     _function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     _construct_context: ConstructContext,
@@ -2316,7 +2316,7 @@ pub fn function_log_info(
     let with_actor = arguments.get(1).cloned();
 
     // Create a bounded channel for log requests - actor model compliant pattern
-    let (log_sender, log_receiver) = mpsc::channel::<(Value, Option<Arc<ValueActor>>)>(16);
+    let (log_sender, log_receiver) = mpsc::channel::<(Value, Option<ActorHandle>)>(16);
 
     // Create an ActorLoop that processes log messages
     let log_actor = ActorLoop::new(async move {
@@ -2354,7 +2354,7 @@ pub fn function_log_info(
                 } else {
                     // Input stream ended - keep actor alive with pending
                     let _keep_alive = &actor;
-                    future::pending::<Option<(Value, (LocalBoxStream<'static, Value>, mpsc::Sender<(Value, Option<Arc<ValueActor>>)>, Option<ActorLoop>))>>().await
+                    future::pending::<Option<(Value, (LocalBoxStream<'static, Value>, mpsc::Sender<(Value, Option<ActorHandle>)>, Option<ActorLoop>))>>().await
                 }
             }
         }
@@ -2369,7 +2369,7 @@ pub fn function_log_info(
 /// - label: Text label for the error message
 /// - timeout: Duration[milliseconds: N] or Duration[seconds: N] for nested value resolution
 pub fn function_log_error(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     _function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     _construct_context: ConstructContext,
@@ -2379,7 +2379,7 @@ pub fn function_log_error(
     let with_actor = arguments.get(1).cloned();
 
     // Create a bounded channel for log requests - actor model compliant pattern
-    let (log_sender, log_receiver) = mpsc::channel::<(Value, Option<Arc<ValueActor>>)>(16);
+    let (log_sender, log_receiver) = mpsc::channel::<(Value, Option<ActorHandle>)>(16);
 
     // Create an ActorLoop that processes log messages
     let log_actor = ActorLoop::new(async move {
@@ -2417,7 +2417,7 @@ pub fn function_log_error(
                 } else {
                     // Input stream ended - keep actor alive with pending
                     let _keep_alive = &actor;
-                    future::pending::<Option<(Value, (LocalBoxStream<'static, Value>, mpsc::Sender<(Value, Option<Arc<ValueActor>>)>, Option<ActorLoop>))>>().await
+                    future::pending::<Option<(Value, (LocalBoxStream<'static, Value>, mpsc::Sender<(Value, Option<ActorHandle>)>, Option<ActorLoop>))>>().await
                 }
             }
         }
@@ -2429,7 +2429,7 @@ pub fn function_log_error(
 /// Build/succeed() -> Tag (Success)
 /// Returns a successful build result
 pub fn function_build_succeed(
-    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    _arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -2446,7 +2446,7 @@ pub fn function_build_succeed(
 /// Build/fail(error) -> Tag (Failure)
 /// Returns a failed build result (placeholder - logging to be implemented)
 pub fn function_build_fail(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -2474,7 +2474,7 @@ pub fn function_build_fail(
 /// Creates a new scene for DOM rendering (stub - passes through to Document/new behavior)
 /// @TODO: Implement proper scene management when needed
 pub fn function_scene_new(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -2513,7 +2513,7 @@ pub fn function_scene_new(
 /// Theme/background_color() -> Text
 /// Returns the current theme background color (stub)
 pub fn function_theme_background_color(
-    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    _arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -2530,7 +2530,7 @@ pub fn function_theme_background_color(
 /// Theme/text_color() -> Text
 /// Returns the current theme text color (stub)
 pub fn function_theme_text_color(
-    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    _arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -2547,7 +2547,7 @@ pub fn function_theme_text_color(
 /// Theme/accent_color() -> Text
 /// Returns the current theme accent color (stub)
 pub fn function_theme_accent_color(
-    _arguments: Arc<Vec<Arc<ValueActor>>>,
+    _arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -2566,7 +2566,7 @@ pub fn function_theme_accent_color(
 /// File/read_text(path) -> Text
 /// Reads text content from a file at the given path
 pub fn function_file_read_text(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -2599,7 +2599,7 @@ pub fn function_file_read_text(
 /// File/write_text(path, content) -> Tag (Success/Failure)
 /// Writes text content to a file at the given path
 pub fn function_file_write_text(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -2641,7 +2641,7 @@ pub fn function_file_write_text(
 /// # Implementation
 /// Uses `stream::unfold()` for a pure demand-driven stream (no Task spawn).
 pub fn function_stream_skip(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     _function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     _construct_context: ConstructContext,
@@ -2652,7 +2652,7 @@ pub fn function_stream_skip(
 
     // State type for unfold
     type FusedSub = stream::Fuse<LocalBoxStream<'static, Value>>;
-    type InitialState = (Option<FusedSub>, Option<FusedSub>, Arc<ValueActor>, Arc<ValueActor>, usize, usize, bool, Vec<Value>);
+    type InitialState = (Option<FusedSub>, Option<FusedSub>, ActorHandle, ActorHandle, usize, usize, bool, Vec<Value>);
 
     // Defer subscription to inside async unfold
     let initial_state: InitialState = (
@@ -2755,7 +2755,7 @@ pub fn function_stream_skip(
 /// # Implementation
 /// Uses `stream::unfold()` for a pure demand-driven stream (no Task spawn).
 pub fn function_stream_take(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     _function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     _construct_context: ConstructContext,
@@ -2766,7 +2766,7 @@ pub fn function_stream_take(
 
     // State type for unfold
     type FusedSub = stream::Fuse<LocalBoxStream<'static, Value>>;
-    type TakeState = (Option<FusedSub>, Option<FusedSub>, Arc<ValueActor>, Arc<ValueActor>, usize, usize, bool, Vec<Value>);
+    type TakeState = (Option<FusedSub>, Option<FusedSub>, ActorHandle, ActorHandle, usize, usize, bool, Vec<Value>);
 
     // Defer subscription to inside async unfold
     let initial_state: TakeState = (
@@ -2864,7 +2864,7 @@ pub fn function_stream_take(
 /// Stream/distinct() -> Stream<Value>
 /// Suppresses consecutive duplicate values.
 pub fn function_stream_distinct(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -2893,7 +2893,7 @@ pub fn function_stream_distinct(
 /// Initial pulses are emitted synchronously via stream::iter() to ensure HOLD + Stream/pulses
 /// patterns work correctly without race conditions.
 pub fn function_stream_pulses(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -2940,7 +2940,7 @@ pub fn function_stream_pulses(
 /// # Implementation
 /// Uses `stream::unfold()` for a pure demand-driven stream (no Task spawn).
 pub fn function_stream_debounce(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     _function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     _construct_context: ConstructContext,
@@ -2975,7 +2975,7 @@ pub fn function_stream_debounce(
 
     // State type for unfold
     type FusedSub = stream::Fuse<LocalBoxStream<'static, Value>>;
-    type DebounceState = (Option<FusedSub>, Option<FusedSub>, Arc<ValueActor>, Arc<ValueActor>, Option<Value>, f64);
+    type DebounceState = (Option<FusedSub>, Option<FusedSub>, ActorHandle, ActorHandle, Option<Value>, f64);
 
     let initial_state: DebounceState = (
         None, // input_stream - deferred
@@ -3060,7 +3060,7 @@ pub fn function_stream_debounce(
 /// Directory/entries(path) -> List<Text>
 /// Returns a list of file/directory names in the given directory
 pub fn function_directory_entries(
-    arguments: Arc<Vec<Arc<ValueActor>>>,
+    arguments: Arc<Vec<ActorHandle>>,
     function_call_id: ConstructId,
     _function_call_persistence_id: PersistenceId,
     construct_context: ConstructContext,
@@ -3077,7 +3077,7 @@ pub fn function_directory_entries(
                 _ => String::new(),
             };
             let entries = construct_context.virtual_fs.list_directory(&path).await;
-            let entry_actors: Vec<Arc<ValueActor>> = entries
+            let entry_actors: Vec<ActorHandle> = entries
                 .into_iter()
                 .enumerate()
                 .map(|(i, entry)| {

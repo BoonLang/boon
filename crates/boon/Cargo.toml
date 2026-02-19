@@ -56,5 +56,11 @@ engine-both = ["engine-actors", "engine-dd"]
 # `cargo build --no-default-features --features engine-actors`
 debug-channels = []
 
+# Performance instrumentation counters for the actors engine.
+# When enabled, atomic counters track key operations (actor lifecycle, list changes,
+# bridge events, evaluator slots, persistence writes). Use dump_metrics_to_console()
+# to log counters. Compiles to zero overhead when disabled.
+actors-metrics = ["engine-actors"]
+
 # CLI platform support with serde_json for output formatting
 cli = ["dep:serde_json"]

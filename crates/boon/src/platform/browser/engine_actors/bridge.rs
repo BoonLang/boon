@@ -5,9 +5,9 @@ use zoon::futures_util::stream::LocalBoxStream;
 use zoon::*;
 
 use super::engine::{
-    ActorContext, ActorLoop, ConstructContext, ConstructInfo, ListChange, LOG_DEBUG, NamedChannel, Object,
+    ActorContext, ActorHandle, ActorLoop, ConstructContext, ConstructInfo, ListChange, LOG_DEBUG, NamedChannel, Object,
     TaggedObject, TimestampedEvent, TypedStream, Value, ValueActor, ValueIdempotencyKey, Variable,
-    Text as EngineText, Tag as EngineTag, switch_map,
+    Text as EngineText, Tag as EngineTag, switch_map, inc_metric,
 };
 use crate::parser;
 
@@ -723,6 +723,7 @@ fn element_stripe(
         async move {
             let mut hovered_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut hovered_stream = hovered_stream.fuse();
+            let mut last_hover_state: Option<bool> = None;
             loop {
                 select! {
                     new_sender = hovered_stream.next() => {
@@ -735,11 +736,18 @@ fn element_stripe(
                                 "False",
                             );
                             sender.send_or_drop(initial_hover_value);
+                            last_hover_state = Some(false);
                             hovered_link_value_sender = Some(sender);
                         }
                     }
                     event = hovered_receiver.select_next_some() => {
+                        if last_hover_state == Some(event.data) {
+                            inc_metric!(HOVER_EVENTS_DEDUPED);
+                            continue;
+                        }
                         if let Some(sender) = hovered_link_value_sender.as_ref() {
+                            inc_metric!(HOVER_EVENTS_EMITTED);
+                            last_hover_state = Some(event.data);
                             let hover_tag = if event.data { "True" } else { "False" };
                             let event_value = EngineTag::new_value_with_lamport_time(
                                 ConstructInfo::new("stripe::hovered", None, "Stripe hovered state"),
@@ -1027,7 +1035,7 @@ fn element_stripe(
         .filter_map(|value| async move {
                 if let Value::List(list, _) = &value {
                     let mut shadows: Vec<Shadow> = Vec::new();
-                    // Get all items from the list (snapshot returns (ItemId, Arc<ValueActor>) pairs)
+                    // Get all items from the list (snapshot returns (ItemId, ActorHandle) pairs)
                     let snapshot = list.snapshot().await;
                     for (_item_id, actor) in snapshot {
                         let item = actor.current_value().await;
@@ -1249,7 +1257,7 @@ fn element_stripe(
         )
         .filter_map(|value| async move {
             if let Value::List(list, _) = &value {
-                // Get all items from list (snapshot returns (ItemId, Arc<ValueActor>) pairs)
+                // Get all items from list (snapshot returns (ItemId, ActorHandle) pairs)
                 let snapshot = list.snapshot().await;
                 let mut families: Vec<FontFamily<'static>> = Vec::new();
                 for (_item_id, actor) in snapshot {
@@ -2172,6 +2180,7 @@ fn element_button(
             let mut hovered_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut press_event_object_value_version = 0u64;
             let mut hovered_stream = hovered_stream.fuse();
+            let mut last_hover_state: Option<bool> = None;
             loop {
                 select! {
                     new_press_link_value_sender = press_stream.next() => {
@@ -2189,6 +2198,7 @@ fn element_button(
                                 "False",
                             );
                             sender.send_or_drop(initial_hover_value);
+                            last_hover_state = Some(false);
                             hovered_link_value_sender = Some(sender);
                         }
                     }
@@ -2206,7 +2216,13 @@ fn element_button(
                         }
                     }
                     event = hovered_receiver.select_next_some() => {
+                        if last_hover_state == Some(event.data) {
+                            inc_metric!(HOVER_EVENTS_DEDUPED);
+                            continue;
+                        }
                         if let Some(sender) = hovered_link_value_sender.as_ref() {
+                            inc_metric!(HOVER_EVENTS_EMITTED);
+                            last_hover_state = Some(event.data);
                             let hover_tag = if event.data { "True" } else { "False" };
                             let event_value = EngineTag::new_value_with_lamport_time(
                                 ConstructInfo::new("button::hovered", None, "Button hovered state"),
@@ -2854,6 +2870,7 @@ fn element_text_input(
 
     // Helper to create change event value with captured Lamport timestamp
     fn create_change_event_value(construct_context: &ConstructContext, text: String, lamport_time: u64) -> Value {
+        inc_metric!(CHANGE_EVENTS_CONSTRUCTED);
         Object::new_value_with_lamport_time(
             ConstructInfo::new("text_input::change_event", None, "TextInput change event"),
             construct_context.clone(),
@@ -2874,7 +2891,7 @@ fn element_text_input(
                         text,
                     ))).chain(stream::pending())),
                     parser::PersistenceId::new(),
-                ),
+                ).into(),
                 parser::PersistenceId::default(),
                 parser::Scope::Root,
             )],
@@ -2884,6 +2901,7 @@ fn element_text_input(
     // Helper to create key_down event value with captured Lamport timestamp
     // Only contains 'key', no 'text' - text should be obtained from the change event using LATEST
     fn create_key_down_event_value(construct_context: &ConstructContext, key: String, lamport_time: u64) -> Value {
+        inc_metric!(KEYDOWN_EVENTS_CONSTRUCTED);
         Object::new_value_with_lamport_time(
             ConstructInfo::new("text_input::key_down_event", None, "TextInput key_down event"),
             construct_context.clone(),
@@ -2905,7 +2923,7 @@ fn element_text_input(
                             key,
                         ))).chain(stream::pending())),
                         parser::PersistenceId::new(),
-                    ),
+                    ).into(),
                     parser::PersistenceId::default(),
                     parser::Scope::Root,
                 ),
@@ -2921,11 +2939,14 @@ fn element_text_input(
             let mut key_down_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut blur_link_value_sender: Option<NamedChannel<Value>> = None;
             let mut focus_link_value_sender: Option<NamedChannel<Value>> = None;
+            let mut last_change_text: Option<String> = None;
 
             // RACE CONDITION FIX: Buffer events that arrive before sender is ready.
             // When switching examples quickly, DOM events can arrive before the Boon
             // LINK subscription is established. Without buffering, these events are lost.
-            let mut pending_change_events: Vec<TimestampedEvent<String>> = Vec::new();
+            // Change events use Option (keep-latest) since only the final text matters.
+            // Key/blur/focus use bounded Vecs since ordering matters.
+            let mut pending_change_event: Option<TimestampedEvent<String>> = None;
             let mut pending_key_down_events: Vec<TimestampedEvent<String>> = Vec::new();
             let mut pending_blur_events: Vec<TimestampedEvent<()>> = Vec::new();
             let mut pending_focus_events: Vec<TimestampedEvent<()>> = Vec::new();
@@ -2936,8 +2957,8 @@ fn element_text_input(
                     result = change_stream.next() => {
                         if let Some(sender) = result {
                             if LOG_DEBUG { zoon::println!("[EVENT:TextInput] change_link_value_sender READY"); }
-                            // Flush any buffered events first
-                            for buffered_event in pending_change_events.drain(..) {
+                            // Flush the latest buffered change event (only most recent matters)
+                            if let Some(buffered_event) = pending_change_event.take() {
                                 if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Flushing buffered change event: lamport={}", buffered_event.lamport_time); }
                                 sender.send_or_drop(create_change_event_value(&construct_context, buffered_event.data, buffered_event.lamport_time));
                             }
@@ -3004,7 +3025,9 @@ fn element_text_input(
                             sender.send_or_drop(event_value);
                         } else {
                             if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering focus event (sender not ready)"); }
-                            pending_focus_events.push(event);
+                            if pending_focus_events.len() < 16 {
+                                pending_focus_events.push(event);
+                            }
                         }
                     }
                     // TimestampedEvent carries Lamport time captured at DOM callback
@@ -3016,12 +3039,18 @@ fn element_text_input(
                                 event.lamport_time,
                                 change_link_value_sender.is_some());
                         }
+                        // Dedup: skip if text hasn't changed since last emission
+                        if last_change_text.as_ref() == Some(&event.data) {
+                            inc_metric!(CHANGE_EVENTS_DEDUPED);
+                            continue;
+                        }
+                        last_change_text = Some(event.data.clone());
                         if let Some(sender) = change_link_value_sender.as_ref() {
                             sender.send_or_drop(create_change_event_value(&construct_context, event.data, event.lamport_time));
                         } else {
-                            // Buffer event until sender is ready
+                            // Buffer latest event until sender is ready (keep-latest, lossy)
                             if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering change event (sender not ready)"); }
-                            pending_change_events.push(event);
+                            pending_change_event = Some(event);
                         }
                     }
                     event = key_down_event_receiver.select_next_some() => {
@@ -3034,9 +3063,11 @@ fn element_text_input(
                                 if LOG_DEBUG { zoon::println!("[EVENT:TextInput] LINK send FAILED - channel closed or full!"); }
                             }
                         } else {
-                            // Buffer event until sender is ready
+                            // Buffer event until sender is ready (bounded to 64)
                             if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering key_down event (sender not ready)"); }
-                            pending_key_down_events.push(event);
+                            if pending_key_down_events.len() < 64 {
+                                pending_key_down_events.push(event);
+                            }
                         }
                     }
                     event = blur_event_receiver.select_next_some() => {
@@ -3052,9 +3083,11 @@ fn element_text_input(
                             );
                             sender.send_or_drop(event_value);
                         } else {
-                            // Buffer event until sender is ready
+                            // Buffer event until sender is ready (bounded to 16)
                             if LOG_DEBUG { zoon::println!("[EVENT:TextInput] Buffering blur event (sender not ready)"); }
-                            pending_blur_events.push(event);
+                            if pending_blur_events.len() < 16 {
+                                pending_blur_events.push(event);
+                            }
                         }
                     }
                 }
@@ -3885,6 +3918,7 @@ fn element_link(
         let construct_context = construct_context.clone();
         async move {
             let mut hovered_link_value_sender: Option<NamedChannel<Value>> = None;
+            let mut last_hover_state: Option<bool> = None;
 
             loop {
                 select! {
@@ -3897,10 +3931,17 @@ fn element_link(
                             "False",
                         );
                         sender.send_or_drop(initial_hover_value);
+                        last_hover_state = Some(false);
                         hovered_link_value_sender = Some(sender);
                     }
                     event = hovered_receiver.select_next_some() => {
+                        if last_hover_state == Some(event.data) {
+                            inc_metric!(HOVER_EVENTS_DEDUPED);
+                            continue;
+                        }
                         if let Some(sender) = hovered_link_value_sender.as_ref() {
+                            inc_metric!(HOVER_EVENTS_EMITTED);
+                            last_hover_state = Some(event.data);
                             let hover_tag = if event.data { "True" } else { "False" };
                             let event_value = EngineTag::new_value_with_lamport_time(
                                 ConstructInfo::new("link::hovered", None, "Link hovered state"),
@@ -4029,16 +4070,16 @@ where
 /// Tracks the list state internally to convert identity-based Remove to index-based RemoveAt.
 fn list_change_to_vec_diff_stream(
     change_stream: impl Stream<Item = ListChange>,
-) -> impl Stream<Item = VecDiff<Arc<ValueActor>>> {
+) -> impl Stream<Item = VecDiff<ActorHandle>> {
     use futures_signals::signal_vec::VecDiff;
 
     change_stream.scan(
-        Vec::<Arc<ValueActor>>::new(),
+        Vec::<ActorHandle>::new(),
         move |items, change| {
             let vec_diff = match change {
                 ListChange::Replace { items: new_items } => {
-                    *items = new_items.clone();
-                    VecDiff::Replace { values: new_items }
+                    *items = new_items.to_vec();
+                    VecDiff::Replace { values: new_items.to_vec() }
                 }
                 ListChange::InsertAt { index, item } => {
                     if index <= items.len() {

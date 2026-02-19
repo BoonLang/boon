@@ -2059,7 +2059,7 @@ impl Playground {
             None,
         );
         drop(source_code);
-        if let Some((object, construct_context, _registry, _module_loader, reference_connector, link_connector, pass_through_connector)) = evaluation_result {
+        if let Some((object, construct_context, _registry, _module_loader, reference_connector, link_connector, pass_through_connector, root_scope_guard)) = evaluation_result {
             El::new()
                 .s(Width::fill())
                 .s(Height::fill())
@@ -2068,11 +2068,14 @@ impl Playground {
                     construct_context,
                 ))
                 .after_remove(move |_| {
-                    // Drop object first, then drop connectors to trigger actor cleanup
+                    // Drop object first, then drop connectors to trigger actor cleanup.
+                    // The root_scope_guard is dropped last to recursively destroy all
+                    // registry scopes and their actors.
                     drop(object);
                     drop(reference_connector);
                     drop(link_connector);
                     drop(pass_through_connector);
+                    drop(root_scope_guard);
                 })
                 .unify()
         } else {

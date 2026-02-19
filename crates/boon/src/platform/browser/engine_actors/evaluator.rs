@@ -48,7 +48,7 @@ use super::engine::*;
 /// - Each nested Variable handles its own persistence
 /// - Restoring complex structures from JSON would lose Variable references
 fn create_variable_persistence_stream(
-    source_actor: Arc<ValueActor>,
+    source_actor: ActorHandle,
     storage: Arc<ConstructStorage>,
     persistence_id: PersistenceId,
     scope: Scope,
@@ -250,7 +250,7 @@ impl EvaluationContext {
     }
 
     /// Create a derived context with piped value set.
-    pub fn with_piped(&self, piped: Arc<ValueActor>) -> Self {
+    pub fn with_piped(&self, piped: ActorHandle) -> Self {
         self.with_actor_context(ActorContext {
             piped: Some(piped),
             ..self.actor_context.clone()
@@ -258,7 +258,7 @@ impl EvaluationContext {
     }
 
     /// Create a derived context with passed value set.
-    pub fn with_passed(&self, passed: Arc<ValueActor>) -> Self {
+    pub fn with_passed(&self, passed: ActorHandle) -> Self {
         self.with_actor_context(ActorContext {
             passed: Some(passed),
             ..self.actor_context.clone()
@@ -266,7 +266,7 @@ impl EvaluationContext {
     }
 
     /// Create a derived context with additional parameters.
-    pub fn with_parameters(&self, params: HashMap<String, Arc<ValueActor>>) -> Self {
+    pub fn with_parameters(&self, params: HashMap<String, ActorHandle>) -> Self {
         let mut new_params = self.actor_context.parameters.clone();
         new_params.extend(params);
         self.with_actor_context(ActorContext {
@@ -508,7 +508,7 @@ pub struct ObjectVariableData {
     /// For referenced fields, holds a pre-created forwarding actor and its sender.
     /// This allows the actor to be registered with ReferenceConnector before
     /// the field expression is evaluated, fixing forward reference race conditions.
-    pub forwarding_actor: Option<(Arc<ValueActor>, NamedChannel<Value>)>,
+    pub forwarding_actor: Option<(ActorHandle, NamedChannel<Value>)>,
     /// True if the value expression has changed since last run.
     /// Used to skip restoration from storage when code has changed.
     pub value_changed: bool,
@@ -519,9 +519,9 @@ pub struct EvaluationState {
     /// Work queue (LIFO for depth-first evaluation).
     work_queue: Vec<WorkItem>,
 
-    /// Results storage - maps slot IDs to completed ValueActors.
-    /// If a slot is not in the map, it means SKIP (no value).
-    results: HashMap<SlotId, Arc<ValueActor>>,
+    /// Results storage - indexed by SlotId for O(1) access.
+    /// None means SKIP (no value). Vec grows as slots are allocated.
+    results: Vec<Option<ActorHandle>>,
 
     /// Next available slot ID.
     next_slot: SlotId,
@@ -541,7 +541,7 @@ impl EvaluationState {
     pub fn new() -> Self {
         Self {
             work_queue: Vec::new(),
-            results: HashMap::new(),
+            results: Vec::new(),
             next_slot: 0,
             function_registry: HashMap::new(),
             forwarding_loops: Vec::new(),
@@ -552,7 +552,7 @@ impl EvaluationState {
     pub fn with_functions(functions: HashMap<String, StaticFunctionDefinition>) -> Self {
         Self {
             work_queue: Vec::new(),
-            results: HashMap::new(),
+            results: Vec::new(),
             next_slot: 0,
             function_registry: functions,
             forwarding_loops: Vec::new(),
@@ -582,19 +582,23 @@ impl EvaluationState {
 
     /// Allocate a new result slot.
     pub fn alloc_slot(&mut self) -> SlotId {
+        inc_metric!(SLOTS_ALLOCATED);
         let slot = self.next_slot;
         self.next_slot += 1;
+        self.results.push(None);
         slot
     }
 
     /// Store a result in a slot.
-    pub fn store(&mut self, slot: SlotId, actor: Arc<ValueActor>) {
-        self.results.insert(slot, actor);
+    pub fn store(&mut self, slot: SlotId, actor: ActorHandle) {
+        let idx = usize::try_from(slot).expect("SlotId should fit in usize");
+        self.results[idx] = Some(actor);
     }
 
     /// Get a result from a slot. Returns None if the slot was SKIP (not stored).
-    pub fn get(&self, slot: SlotId) -> Option<Arc<ValueActor>> {
-        self.results.get(&slot).cloned()
+    pub fn get(&self, slot: SlotId) -> Option<ActorHandle> {
+        let idx = usize::try_from(slot).ok()?;
+        self.results.get(idx).and_then(|opt| opt.clone())
     }
 
     /// Push work item onto the queue.
@@ -618,7 +622,7 @@ impl EvaluationState {
 pub fn evaluate_expression(
     expression: static_expression::Spanned<static_expression::Expression>,
     ctx: EvaluationContext,
-) -> Result<Option<Arc<ValueActor>>, String> {
+) -> Result<Option<ActorHandle>, String> {
     let mut state = EvaluationState::new();
     let final_slot = state.alloc_slot();
 
@@ -818,6 +822,7 @@ fn schedule_expression(
             // THEN creates an actor that evaluates body at runtime for each piped value
             // We can build it immediately since the body is evaluated lazily
             // Merge context's snapshot (top-level functions) with state's registry (local functions)
+            inc_metric!(REGISTRY_CLONES);
             let mut merged_registry = ctx.function_registry_snapshot
                 .as_ref()
                 .map(|s| (**s).clone())
@@ -825,6 +830,7 @@ fn schedule_expression(
             for (name, def) in &state.function_registry {
                 merged_registry.insert(name.clone(), def.clone());
             }
+            inc_metric!(REGISTRY_CLONE_ENTRIES, merged_registry.len() as u64);
             let registry_snapshot = Arc::new(merged_registry);
             let actor = build_then_actor(
                 *body,
@@ -839,6 +845,7 @@ fn schedule_expression(
 
         static_expression::Expression::When { arms } => {
             // Merge context's snapshot (top-level functions) with state's registry (local functions)
+            inc_metric!(REGISTRY_CLONES);
             let mut merged_registry = ctx.function_registry_snapshot
                 .as_ref()
                 .map(|s| (**s).clone())
@@ -846,6 +853,7 @@ fn schedule_expression(
             for (name, def) in &state.function_registry {
                 merged_registry.insert(name.clone(), def.clone());
             }
+            inc_metric!(REGISTRY_CLONE_ENTRIES, merged_registry.len() as u64);
             let registry_snapshot = Arc::new(merged_registry);
             let actor = build_when_actor(
                 arms,
@@ -860,6 +868,7 @@ fn schedule_expression(
 
         static_expression::Expression::While { arms } => {
             // Merge context's snapshot (top-level functions) with state's registry (local functions)
+            inc_metric!(REGISTRY_CLONES);
             let mut merged_registry = ctx.function_registry_snapshot
                 .as_ref()
                 .map(|s| (**s).clone())
@@ -867,6 +876,7 @@ fn schedule_expression(
             for (name, def) in &state.function_registry {
                 merged_registry.insert(name.clone(), def.clone());
             }
+            inc_metric!(REGISTRY_CLONE_ENTRIES, merged_registry.len() as u64);
             let registry_snapshot = Arc::new(merged_registry);
             let actor = build_while_actor(
                 arms,
@@ -988,6 +998,7 @@ fn schedule_expression(
                         ctx.actor_context.clone(),
                         var_persistence_id,
                     );
+                    let actor: ActorHandle = actor.into();
                     // Store in object_locals for local resolution
                     object_locals.insert(var_span, actor.clone());
                     // Also register with ReferenceConnector for backward compatibility
@@ -1095,6 +1106,7 @@ fn schedule_expression(
                         ctx.actor_context.clone(),
                         var_persistence_id,
                     );
+                    let actor: ActorHandle = actor.into();
                     // Store in object_locals for local resolution
                     object_locals.insert(var_span, actor.clone());
                     // Also register with ReferenceConnector for backward compatibility
@@ -1194,6 +1206,7 @@ fn schedule_expression(
                         ctx.actor_context.clone(),
                         var_persistence_id,
                     );
+                    let actor: ActorHandle = actor.into();
                     // Store in object_locals for local resolution
                     object_locals.insert(var_span, actor.clone());
                     // Also register with ReferenceConnector for backward compatibility
@@ -1363,6 +1376,7 @@ fn schedule_expression(
                                 ctx.actor_context.clone(),
                                 PersistenceId::new(),
                             );
+                            let forwarding_actor: ActorHandle = forwarding_actor.into();
                             // Store in arg_locals for local resolution
                             // This prevents overwrites when same function is called multiple times
                             arg_locals.insert(arg_span, forwarding_actor.clone());
@@ -1508,7 +1522,7 @@ fn schedule_expression(
                 ctx.actor_context,
                 TypedStream::infinite(stream::pending::<Value>()),
                 persistence_id,
-            );
+            ).into();
             state.store(result_slot, actor);
         }
 
@@ -1857,7 +1871,7 @@ fn process_work_item(
                         ctx.actor_context.clone(),
                         TypedStream::infinite(persistence_stream),
                         var_persistence_id,
-                    ));
+                    )).into();
 
                     Variable::new_arc(
                         ConstructInfo::new(
@@ -2027,7 +2041,7 @@ fn process_work_item(
                         ctx.actor_context.clone(),
                         TypedStream::infinite(persistence_stream),
                         var_persistence_id,
-                    ));
+                    )).into();
 
                     Variable::new_arc(
                         ConstructInfo::new(
@@ -2107,6 +2121,7 @@ fn process_work_item(
         WorkItem::BuildThen { piped_slot: _, body, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
             // Merge context's snapshot (top-level functions) with state's registry (local functions)
+            inc_metric!(REGISTRY_CLONES);
             let mut merged_registry = ctx.function_registry_snapshot
                 .as_ref()
                 .map(|s| (**s).clone())
@@ -2114,6 +2129,7 @@ fn process_work_item(
             for (name, def) in &state.function_registry {
                 merged_registry.insert(name.clone(), def.clone());
             }
+            inc_metric!(REGISTRY_CLONE_ENTRIES, merged_registry.len() as u64);
             let registry_snapshot = Arc::new(merged_registry);
             let actor = build_then_actor(*body, span, persistence, persistence_id, ctx, registry_snapshot)?;
             state.store(result_slot, actor);
@@ -2122,6 +2138,7 @@ fn process_work_item(
         WorkItem::BuildWhen { piped_slot: _, arms, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
             // Merge context's snapshot (top-level functions) with state's registry (local functions)
+            inc_metric!(REGISTRY_CLONES);
             let mut merged_registry = ctx.function_registry_snapshot
                 .as_ref()
                 .map(|s| (**s).clone())
@@ -2129,6 +2146,7 @@ fn process_work_item(
             for (name, def) in &state.function_registry {
                 merged_registry.insert(name.clone(), def.clone());
             }
+            inc_metric!(REGISTRY_CLONE_ENTRIES, merged_registry.len() as u64);
             let registry_snapshot = Arc::new(merged_registry);
             let actor = build_when_actor(arms, span, persistence, persistence_id, ctx, registry_snapshot)?;
             state.store(result_slot, actor);
@@ -2137,6 +2155,7 @@ fn process_work_item(
         WorkItem::BuildWhile { piped_slot: _, arms, span, persistence, ctx, result_slot } => {
             let persistence_id = persistence.as_ref().expect("persistence should be set by resolver").id;
             // Merge context's snapshot (top-level functions) with state's registry (local functions)
+            inc_metric!(REGISTRY_CLONES);
             let mut merged_registry = ctx.function_registry_snapshot
                 .as_ref()
                 .map(|s| (**s).clone())
@@ -2144,6 +2163,7 @@ fn process_work_item(
             for (name, def) in &state.function_registry {
                 merged_registry.insert(name.clone(), def.clone());
             }
+            inc_metric!(REGISTRY_CLONE_ENTRIES, merged_registry.len() as u64);
             let registry_snapshot = Arc::new(merged_registry);
             let actor = build_while_actor(arms, span, persistence, persistence_id, ctx, registry_snapshot)?;
             state.store(result_slot, actor);
@@ -2191,7 +2211,7 @@ fn process_work_item(
                     ActorContext::default(),
                     TypedStream::infinite(value_stream),
                     PersistenceId::new(),
-                ));
+                )).into();
                 state.store(result_slot, wrapper);
             } else {
                 // No Object (block has no variables) - just use output directly
@@ -2317,10 +2337,10 @@ fn process_work_item(
                 let connector_for_stream: Option<Arc<PassThroughConnector>> = new_ctx.try_pass_through_connector().map(|c| c.clone());
 
                 // Oneshot channel to pass the pass_through_actor to the forwarder for registration
-                let (actor_tx, actor_rx) = oneshot::channel::<Arc<ValueActor>>();
+                let (actor_tx, actor_rx) = oneshot::channel::<ActorHandle>();
 
                 // Oneshot channel to pass forwarder actor for storage on re-evaluation
-                let (forwarder_tx, forwarder_rx) = oneshot::channel::<Arc<ValueActor>>();
+                let (forwarder_tx, forwarder_rx) = oneshot::channel::<ActorHandle>();
 
                 // Get subscription scope to check if our context is still active
                 // When WHILE switches arms, the old arm's scope is cancelled
@@ -2390,7 +2410,7 @@ fn process_work_item(
                 });
 
                 // Create forwarder actor - this does the actual forwarding work
-                let forwarder_actor = ValueActor::new_arc(
+                let forwarder_actor: ActorHandle = ValueActor::new_arc(
                     ConstructInfo::new(
                         "LinkSetter forwarder",
                         expr.persistence.clone(),
@@ -2399,7 +2419,7 @@ fn process_work_item(
                     new_ctx.actor_context.clone(),
                     TypedStream::infinite(forwarder_stream.chain(stream::pending())),
                     PersistenceId::new(),
-                );
+                ).into();
 
                 // Send forwarder to async setup for storage on re-evaluation
                 if forwarder_tx.send(forwarder_actor.clone()).is_err() {
@@ -2407,9 +2427,8 @@ fn process_work_item(
                 }
 
                 // Create pass-through actor that emits from the channel
-                // Keep forwarder_actor alive via inputs
                 let pass_through_stream = value_rx.chain(stream::pending());
-                let pass_through_actor = ValueActor::new_arc_with_inputs(
+                let pass_through_actor: ActorHandle = ValueActor::new_arc(
                     ConstructInfo::new(
                         "LinkSetter stable pass-through",
                         expr.persistence.clone(),
@@ -2418,8 +2437,7 @@ fn process_work_item(
                     new_ctx.actor_context.clone(),
                     TypedStream::infinite(pass_through_stream),
                     PersistenceId::new(),
-                    vec![forwarder_actor],
-                );
+                ).into();
 
                 // Send actor to forwarder for registration (if first evaluation)
                 if actor_tx.send(pass_through_actor.clone()).is_err() {
@@ -2443,12 +2461,19 @@ fn process_work_item(
 
                 // Merge: on first eval, relay_stream is empty (no existing actor), so pass_through emits.
                 // On re-eval, relay_stream forwards from existing actor.
+                // Capture forwarder_actor to keep it alive — without this, the forwarder's
+                // task is cancelled when the local variable goes out of scope, and the
+                // value_tx channel closes before any values reach pass_through_actor.
+                let forwarder_keepalive = forwarder_actor;
                 let merged_stream = stream::select(
                     pass_through_actor.clone().stream(),
                     relay_stream,
-                );
+                ).map(move |v| {
+                    let _ = &forwarder_keepalive;
+                    v
+                });
 
-                let result_actor = ValueActor::new_arc_with_inputs(
+                let result_actor = ValueActor::new_arc(
                     ConstructInfo::new(
                         "LinkSetter result (pass-through or relay)",
                         expr.persistence.clone(),
@@ -2457,8 +2482,7 @@ fn process_work_item(
                     new_ctx.actor_context.clone(),
                     TypedStream::infinite(merged_stream.chain(stream::pending())),
                     PersistenceId::new(),
-                    vec![pass_through_actor],
-                );
+                ).into();
 
                 state.store(result_slot, result_actor);
             } else {
@@ -2469,7 +2493,7 @@ fn process_work_item(
 
         WorkItem::CallFunction { path, arg_slots, passed_slot: _, passed_context, use_piped_for_builtin, span, persistence, mut ctx, result_slot } => {
             // Collect arguments that have values (empty slots are ignored)
-            let args: Vec<(String, Arc<ValueActor>)> = arg_slots.iter()
+            let args: Vec<(String, ActorHandle)> = arg_slots.iter()
                 .filter_map(|(name, slot)| {
                     state.get(*slot).map(|actor| (name.clone(), actor))
                 })
@@ -2498,6 +2522,7 @@ fn process_work_item(
                             list_append_storage_key: ctx.actor_context.list_append_storage_key,
                             recording_counter: ctx.actor_context.recording_counter,
                             subscription_time: ctx.actor_context.subscription_time,
+                            registry_scope_id: ctx.actor_context.registry_scope_id,
                         },
                         reference_connector: ctx.reference_connector,
                         link_connector: ctx.link_connector,
@@ -2541,7 +2566,7 @@ fn process_work_item(
                             async move { Some(value) }
                         })),
                         persistence.map(|p| p.id).unwrap_or_else(PersistenceId::new),
-                    );
+                    ).into();
                     state.store(result_slot, wrapper);
                 } else {
                     state.store(result_slot, actor);
@@ -2600,7 +2625,7 @@ fn process_work_item(
                     ctx.actor_context.clone(),
                     TypedStream::infinite(persistence_stream),
                     persistence_id,
-                ));
+                )).into();
 
                 state.store(result_slot, persisted_actor);
             }
@@ -2616,9 +2641,9 @@ fn create_binary_op_actor(
     construct_info: ConstructInfo,
     construct_context: ConstructContext,
     actor_context: ActorContext,
-    a: Arc<ValueActor>,
-    b: Arc<ValueActor>,
-) -> Arc<ValueActor> {
+    a: ActorHandle,
+    b: ActorHandle,
+) -> ActorHandle {
     match op {
         BinaryOpKind::Add => ArithmeticCombinator::new_add(construct_info, construct_context, actor_context, a, b),
         BinaryOpKind::Subtract => ArithmeticCombinator::new_subtract(construct_info, construct_context, actor_context, a, b),
@@ -2640,8 +2665,8 @@ fn evaluate_alias_immediate(
     persistence: Option<Persistence>,
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
-) -> Result<Arc<ValueActor>, String> {
-    type BoxedFuture = Pin<Box<dyn std::future::Future<Output = Arc<ValueActor>>>>;
+) -> Result<ActorHandle, String> {
+    type BoxedFuture = Pin<Box<dyn std::future::Future<Output = ActorHandle>>>;
 
     let root_value_actor: BoxedFuture = match &alias {
         static_expression::Alias::WithPassed { extra_parts: _ } => {
@@ -2705,7 +2730,7 @@ fn build_then_actor(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
     function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
-) -> Result<Arc<ValueActor>, String> {
+) -> Result<ActorHandle, String> {
     let piped = ctx.actor_context.piped.clone()
         .ok_or("THEN requires a piped value")?;
 
@@ -2754,7 +2779,7 @@ fn build_then_actor(
                 permit.acquire().await;
             }
 
-            let value_actor = ValueActor::new_arc(
+            let value_actor: ActorHandle = ValueActor::new_arc(
                 ConstructInfo::new(
                     "THEN input value".to_string(),
                     None,
@@ -2763,7 +2788,7 @@ fn build_then_actor(
                 actor_context_clone.clone(),
                 constant(value),
                 PersistenceId::new(),
-            );
+            ).into();
 
             // CRITICAL FIX: Freeze parameters for SNAPSHOT semantics.
             // When THEN body references `state` (from HOLD), we want the CURRENT value at the
@@ -2780,7 +2805,7 @@ fn build_then_actor(
             // - We create a "frozen" actor for each parameter with just the current value
             // - Body subscribes to this frozen actor, gets only the current value
             // - Computation uses the correct current state
-            let mut frozen_parameters: HashMap<String, Arc<ValueActor>> = HashMap::new();
+            let mut frozen_parameters: HashMap<String, ActorHandle> = HashMap::new();
             for (name, actor) in actor_context_clone.parameters.iter() {
                 // Create a constant actor from the current stored value (async)
                 if let Ok(current_value) = actor.current_value().await {
@@ -2793,7 +2818,7 @@ fn build_then_actor(
                         actor_context_clone.clone(),
                         constant(current_value),
                         PersistenceId::new(),
-                    );
+                    ).into();
                     frozen_parameters.insert(name.clone(), frozen_actor);
                 } else {
                     // No value yet, keep original actor
@@ -2824,6 +2849,7 @@ fn build_then_actor(
                 // THEN body uses snapshot semantics for variables - don't filter stale values
                 // The filtering should only happen on the piped stream, not all variable refs
                 subscription_time: None,
+                registry_scope_id: actor_context_clone.registry_scope_id,
             };
 
             let new_ctx = EvaluationContext {
@@ -2860,7 +2886,8 @@ fn build_then_actor(
                     let value_actor_keepalive = value_actor.clone();
                     let context_keepalive = new_actor_context.clone();
                     let hold_callback_for_map = hold_callback_clone.clone();
-                    let result_stream = stream::once(result_actor.value())
+                    let result_actor_for_value = result_actor.clone();
+                    let result_stream = stream::once(async move { result_actor_for_value.value().await })
                         .filter_map(move |v| {
                             // Prevent drop: these are captured by the `move` closure and live as long as the stream combinator
                             let _result_actor_keepalive = &result_actor_keepalive;
@@ -2927,7 +2954,6 @@ fn build_then_actor(
         Box::pin(stream)
     };
 
-    // Keep the piped actor alive by including it in inputs
     // Use lazy actor construction when in HOLD body context for sequential state updates
     if ctx.actor_context.use_lazy_actors {
         Ok(ValueActor::new_arc_lazy(
@@ -2938,10 +2964,9 @@ fn build_then_actor(
             ).complete(ConstructType::ValueActor),
             flattened_stream,
             persistence_id,
-            vec![piped],  // Keep piped actor alive
-        ))
+        ).into())
     } else {
-        Ok(ValueActor::new_arc_with_inputs(
+        Ok(ValueActor::new_arc(
             ConstructInfo::new(
                 format!("PersistenceId: {persistence_id}"),
                 persistence,
@@ -2950,8 +2975,7 @@ fn build_then_actor(
             ctx.actor_context,
             TypedStream::infinite(flattened_stream),
             persistence_id,
-            vec![piped],  // Keep piped actor alive
-        ))
+        ).into())
     }
 }
 
@@ -2963,7 +2987,7 @@ fn build_when_actor(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
     function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
-) -> Result<Arc<ValueActor>, String> {
+) -> Result<ActorHandle, String> {
     let piped = ctx.actor_context.piped.clone()
         .ok_or("WHEN requires a piped value")?;
 
@@ -3015,7 +3039,7 @@ fn build_when_actor(
                 // Use async pattern matching to properly extract bindings from Objects
                 if let Some(bindings) = match_pattern(&arm.pattern, &value).await {
                     if LOG_DEBUG { zoon::println!("[WHEN] Pattern MATCHED: {:?}", arm.pattern); }
-                    let value_actor = ValueActor::new_arc(
+                    let value_actor: ActorHandle = ValueActor::new_arc(
                         ConstructInfo::new(
                             "WHEN input value".to_string(),
                             None,
@@ -3024,12 +3048,12 @@ fn build_when_actor(
                         actor_context_clone.clone(),
                         constant(value.clone()),
                         PersistenceId::new(),
-                    );
+                    ).into();
 
                     // CRITICAL FIX: Freeze parameters for SNAPSHOT semantics (same as THEN).
                     // When WHEN body references `state` (from HOLD), we want the CURRENT value at the
                     // time of body evaluation, not all historical values from the reactive subscription.
-                    let mut frozen_parameters: HashMap<String, Arc<ValueActor>> = HashMap::new();
+                    let mut frozen_parameters: HashMap<String, ActorHandle> = HashMap::new();
                     for (name, actor) in actor_context_clone.parameters.iter() {
                         if let Ok(current_value) = actor.current_value().await {
                             let frozen_actor = ValueActor::new_arc(
@@ -3041,7 +3065,7 @@ fn build_when_actor(
                                 actor_context_clone.clone(),
                                 constant(current_value),
                                 PersistenceId::new(),
-                            );
+                            ).into();
                             frozen_parameters.insert(name.clone(), frozen_actor);
                         } else {
                             frozen_parameters.insert(name.clone(), actor.clone());
@@ -3060,7 +3084,7 @@ fn build_when_actor(
                             actor_context_clone.clone(),
                             constant(bound_value),
                             PersistenceId::new(),
-                        );
+                        ).into();
                         parameters.insert(name, bound_actor);
                     }
 
@@ -3087,6 +3111,7 @@ fn build_when_actor(
                         // WHEN body uses snapshot semantics for variables - don't filter stale values
                         // The filtering should only happen on the piped stream, not all variable refs
                         subscription_time: None,
+                        registry_scope_id: actor_context_clone.registry_scope_id,
                     };
 
                     let new_ctx = EvaluationContext {
@@ -3107,7 +3132,8 @@ fn build_when_actor(
                             // making it impossible to accidentally create ongoing subscriptions.
                             // This is critical for WHEN bodies which should produce exactly ONE value per input.
                             let result_actor_keepalive = result_actor.clone();
-                            let result_stream = stream::once(result_actor.value())
+                            let result_actor_for_value = result_actor.clone();
+                            let result_stream = stream::once(async move { result_actor_for_value.value().await })
                                 .filter_map(|v| future::ready(v.ok()))
                                 .map(move |mut result_value| {
                                     // Prevent drop: captured by `move` closure, lives as long as stream combinator
@@ -3161,8 +3187,7 @@ fn build_when_actor(
         Box::pin(stream)
     };
 
-    // Keep the piped actor alive by including it in inputs
-    Ok(ValueActor::new_arc_with_inputs(
+    Ok(ValueActor::new_arc(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -3171,8 +3196,7 @@ fn build_when_actor(
         ctx.actor_context,
         TypedStream::infinite(flattened_stream),
         persistence_id,
-        vec![piped],  // Keep piped actor alive
-    ))
+    ).into())
 }
 
 /// Build a WHILE actor (continuous processing while pattern matches).
@@ -3183,7 +3207,7 @@ fn build_while_actor(
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
     function_registry_snapshot: Arc<HashMap<String, StaticFunctionDefinition>>,
-) -> Result<Arc<ValueActor>, String> {
+) -> Result<ActorHandle, String> {
     let piped = ctx.actor_context.piped.clone()
         .ok_or("WHILE requires a piped value")?;
 
@@ -3239,7 +3263,16 @@ fn build_while_actor(
                 let arm_scope = Arc::new(SubscriptionScope::new());
                 let scope_guard = ScopeGuard::new(arm_scope.clone());
 
-                let value_actor = ValueActor::new_arc(
+                // Create a registry scope for this arm - all actors created within
+                // will be destroyed when the arm switches (ScopeDestroyGuard dropped)
+                let arm_registry_scope = actor_context_clone.registry_scope_id.map(|parent_scope| {
+                    let scope_id = REGISTRY.with(|reg: &std::cell::RefCell<ActorRegistry>| {
+                        reg.borrow_mut().create_scope(Some(parent_scope))
+                    });
+                    (scope_id, ScopeDestroyGuard::new(scope_id))
+                });
+
+                let value_actor: ActorHandle = ValueActor::new_arc(
                     ConstructInfo::new(
                         "WHILE input value".to_string(),
                         None,
@@ -3248,7 +3281,7 @@ fn build_while_actor(
                     actor_context_clone.clone(),
                     constant(value),
                     PersistenceId::new(),
-                );
+                ).into();
 
                 let mut parameters = actor_context_clone.parameters.clone();
                 for (name, bound_value) in bindings {
@@ -3261,7 +3294,7 @@ fn build_while_actor(
                         actor_context_clone.clone(),
                         constant(bound_value),
                         PersistenceId::new(),
-                    );
+                    ).into();
                     parameters.insert(name, bound_actor);
                 }
 
@@ -3312,6 +3345,9 @@ fn build_while_actor(
                     recording_counter: actor_context_clone.recording_counter.clone(),
                     // WHILE is streaming context - don't filter stale values, accept all
                     subscription_time: None,
+                    // Use the arm's registry scope (if available) so actors are owned by this arm
+                    registry_scope_id: arm_registry_scope.as_ref().map(|(id, _)| *id)
+                        .or(actor_context_clone.registry_scope_id),
                 };
 
                 let new_ctx = EvaluationContext {
@@ -3328,16 +3364,20 @@ fn build_while_actor(
                 match evaluate_expression(arm.body.clone(), new_ctx) {
                     Ok(Some(result_actor)) => {
                         // Use stream() for continuous streaming semantics
-                        // Wrap the stream to keep scope_guard alive - when this stream is dropped
-                        // (by switch_map switching to new arm), the guard is dropped, cancelling scope
+                        // Wrap the stream to keep scope_guard and scope_destroy_guard alive -
+                        // when this stream is dropped (by switch_map switching to new arm),
+                        // both guards are dropped: scope_guard cancels subscriptions,
+                        // scope_destroy_guard destroys registry scope and all its actors
                         let body_stream = result_actor.stream();
-                        stream::unfold((body_stream, Some(scope_guard)), |(mut s, guard)| async move {
-                            s.next().await.map(|v| (v, (s, guard)))
+                        stream::unfold((body_stream, Some(scope_guard), arm_registry_scope), |(mut s, guard, reg_scope)| async move {
+                            s.next().await.map(|v| (v, (s, guard, reg_scope)))
                         }).boxed_local()
                     }
                     Ok(None) => {
                         // SKIP - scope_guard dropped here, scope cancelled immediately
+                        // arm_registry_scope guard also dropped, destroying the scope
                         drop(scope_guard);
+                        drop(arm_registry_scope);
                         stream::empty().boxed_local()
                     }
                     Err(_e) => {
@@ -3352,8 +3392,7 @@ fn build_while_actor(
         }).flatten()
     });
 
-    // Keep the piped actor alive by including it in inputs
-    Ok(ValueActor::new_arc_with_inputs(
+    Ok(ValueActor::new_arc(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -3362,8 +3401,7 @@ fn build_while_actor(
         ctx.actor_context,
         TypedStream::infinite(stream),
         persistence_id,
-        vec![piped],  // Keep piped actor alive
-    ))
+    ).into())
 }
 
 /// Asynchronously extract a field value from a Value following a path of field names.
@@ -3417,7 +3455,7 @@ fn build_field_access_actor(
     persistence: Option<Persistence>,
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
-) -> Result<Arc<ValueActor>, String> {
+) -> Result<ActorHandle, String> {
     let piped = ctx.actor_context.piped.clone()
         .ok_or("FieldAccess requires a piped value")?;
 
@@ -3470,8 +3508,7 @@ fn build_field_access_actor(
         });
     }
 
-    // Keep the piped actor alive by including it in inputs
-    Ok(ValueActor::new_arc_with_inputs(
+    Ok(ValueActor::new_arc(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -3480,8 +3517,7 @@ fn build_field_access_actor(
         ctx.actor_context,
         TypedStream::infinite(value_stream),
         persistence_id,
-        vec![piped],
-    ))
+    ).into())
 }
 
 /// Build a HOLD actor (stateful accumulator).
@@ -3492,14 +3528,14 @@ fn build_field_access_actor(
 /// CRITICAL: The state is NOT self-reactive - changes to state don't
 /// trigger re-evaluation of body. Only external events trigger updates.
 fn build_hold_actor(
-    initial_actor: Arc<ValueActor>,
+    initial_actor: ActorHandle,
     state_param: String,
     body: static_expression::Spanned<static_expression::Expression>,
     span: Span,
     persistence: Option<Persistence>,
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
-) -> Result<Option<Arc<ValueActor>>, String> {
+) -> Result<Option<ActorHandle>, String> {
     // Apply scope to persistence_id so HOLDs inside user-defined functions
     // get unique storage keys for each call site
     let persistence_id = persistence_id.in_scope(&ctx.actor_context.scope);
@@ -3566,7 +3602,7 @@ fn build_hold_actor(
     );
 
     // Create state actor - initial value will come through the stream asynchronously
-    let state_actor = ValueActor::new_arc(
+    let state_actor: ActorHandle = ValueActor::new_arc(
         ConstructInfo::new(
             format!("Hold state actor for {state_param}"),
             None,
@@ -3575,7 +3611,7 @@ fn build_hold_actor(
         ctx.actor_context.clone(),
         TypedStream::infinite(state_stream),
         PersistenceId::new(),
-    );
+    ).into();
 
     // Bind the state parameter in the context so body can reference it
     let mut body_parameters = ctx.actor_context.parameters.clone();
@@ -3631,6 +3667,7 @@ fn build_hold_actor(
         recording_counter: ctx.actor_context.recording_counter.clone(),
         // Inherit parent's subscription_time - HOLD body is streaming context
         subscription_time: ctx.actor_context.subscription_time,
+        registry_scope_id: ctx.actor_context.registry_scope_id,
     };
 
     // Create new context for body evaluation
@@ -3707,7 +3744,7 @@ fn build_hold_actor(
     // Clone contexts before they're moved into output
     let construct_context_for_initial = ctx.construct_context.clone();
     let actor_context_for_initial = ctx.actor_context.clone();
-    let output = ValueActor::new_arc_with_inputs(
+    let output: ActorHandle = ValueActor::new_arc(
         ConstructInfo::new(
             format!("PersistenceId: {persistence_id}"),
             persistence,
@@ -3716,8 +3753,7 @@ fn build_hold_actor(
         ctx.actor_context,
         TypedStream::infinite(output_stream),
         persistence_id,
-        vec![body_result.clone(), initial_actor.clone()],
-    );
+    ).into();
 
     // NOTE: We do NOT copy body_result's history here anymore.
     // The state_update_stream (below) will emit those values when polled, and it calls
@@ -3734,7 +3770,7 @@ fn build_hold_actor(
     //
     // Use AtomicBool instead of Rc<RefCell<bool>> for lock-free flag.
     let is_first_input = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let output_weak_for_initial = Arc::downgrade(&output);
+    let output_weak_for_initial = output.keepalive().map(|arc| Arc::downgrade(&arc));
     let initial_stream = initial_actor.clone().stream().then(move |value| {
         let is_first_input = is_first_input.clone();
         let output_weak = output_weak_for_initial.clone();
@@ -3758,7 +3794,7 @@ fn build_hold_actor(
                         ValueIdempotencyKey::new(),
                         actor_context,
                     );
-                    if let Some(output) = output_weak.upgrade() {
+                    if let Some(output) = output_weak.as_ref().and_then(|w| w.upgrade()) {
                         output.store_value_directly(restored_value);
                     }
                     // Don't save - we just loaded this value
@@ -3766,7 +3802,7 @@ fn build_hold_actor(
                 }
                 // No stored state, this is truly the first value
                 // Store to output and save
-                if let Some(output) = output_weak.upgrade() {
+                if let Some(output) = output_weak.as_ref().and_then(|w| w.upgrade()) {
                     output.store_value_directly(value.clone());
                 }
                 let json = value.to_json().await;
@@ -3778,7 +3814,7 @@ fn build_hold_actor(
                 }
                 // Store value directly to output
                 // Use weak reference to avoid circular reference
-                if let Some(output) = output_weak.upgrade() {
+                if let Some(output) = output_weak.as_ref().and_then(|w| w.upgrade()) {
                     output.store_value_directly(value.clone());
                 }
                 // Save reset state to storage
@@ -3792,10 +3828,10 @@ fn build_hold_actor(
 
     // Modify state_update_stream to also store values directly to output
     // IMPORTANT: Use Weak<ValueActor> to avoid circular reference!
-    let output_weak_for_update = Arc::downgrade(&output);
+    let output_weak_for_update = output.keepalive().map(|arc| Arc::downgrade(&arc));
     let state_update_stream = state_update_stream.map(move |value| {
         // Use weak reference to avoid circular reference
-        if let Some(output) = output_weak_for_update.upgrade() {
+        if let Some(output) = output_weak_for_update.as_ref().and_then(|w| w.upgrade()) {
             output.store_value_directly(value.clone());
         }
         value
@@ -3833,9 +3869,9 @@ fn build_text_literal_actor(
     persistence: Option<Persistence>,
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
-) -> Result<Arc<ValueActor>, String> {
+) -> Result<ActorHandle, String> {
     // Collect all parts - literals as constant streams, interpolations as variable lookups
-    let mut part_actors: Vec<(bool, Arc<ValueActor>)> = Vec::new();
+    let mut part_actors: Vec<(bool, ActorHandle)> = Vec::new();
     // Collect actor loops to keep forwarding tasks alive
     let mut forwarding_loops: Vec<ActorLoop> = Vec::new();
 
@@ -3883,6 +3919,7 @@ fn build_text_literal_actor(
                         ctx.actor_context.clone(),
                         PersistenceId::new(),
                     );
+                    let base_ref_actor: ActorHandle = base_ref_actor.into();
 
                     let actor_loop = ActorLoop::new(async move {
                         let actor = ref_connector.referenceable(ref_span_copy).await;
@@ -3914,6 +3951,7 @@ fn build_text_literal_actor(
                             ctx.actor_context.clone(),
                             PersistenceId::new(),
                         );
+                        let field_actor: ActorHandle = field_actor.into();
 
                         let actor_loop = ActorLoop::new(async move {
                             // First, wait for base actor to have a value so we can navigate to the field
@@ -3927,7 +3965,7 @@ fn build_text_literal_actor(
                             };
 
                             // Navigate through the field path to find the final value actor
-                            let mut current_value_actor: Option<Arc<ValueActor>> = None;
+                            let mut current_value_actor: Option<ActorHandle> = None;
 
                             // For intermediate fields, we need to resolve them
                             let mut current_obj_value = base_value;
@@ -4093,7 +4131,7 @@ fn build_text_literal_actor(
             ctx.actor_context,
             TypedStream::infinite(text_value_stream),
             persistence_id,
-        ))
+        ).into())
     }
 }
 
@@ -4104,7 +4142,7 @@ fn build_link_setter_actor(
     persistence: Option<Persistence>,
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
-) -> Result<Arc<ValueActor>, String> {
+) -> Result<ActorHandle, String> {
     // Link setter creates an actor that subscribes to the aliased value
     // and emits Link values that can be used to set up connections
 
@@ -4132,7 +4170,7 @@ fn build_link_setter_actor(
         ctx.actor_context,
         TypedStream::infinite(stream),
         persistence_id,
-    ))
+    ).into())
 }
 
 /// Traverse an alias path and return the LINK sender at the end of the path.
@@ -4265,7 +4303,7 @@ fn build_list_binding_function(
     persistence: Option<Persistence>,
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
-) -> Result<Option<Arc<ValueActor>>, String> {
+) -> Result<Option<ActorHandle>, String> {
     let operation = match path_strs[1].as_str() {
         "map" => ListBindingOperation::Map,
         "retain" => ListBindingOperation::Retain,
@@ -4354,7 +4392,7 @@ fn build_list_append_with_recording(
     persistence: Option<Persistence>,
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
-) -> Result<Option<Arc<ValueActor>>, String> {
+) -> Result<Option<ActorHandle>, String> {
     if LOG_DEBUG {
         zoon::println!("[DEBUG] build_list_append_with_recording called");
         zoon::println!("[DEBUG] persistence: {:?}, persistence_id: {}", persistence.is_some(), persistence_id);
@@ -4426,7 +4464,7 @@ fn build_list_append_with_recording(
 
     // Replay stored calls to restore list items
     // Each call creates an item by evaluating the function with stored inputs
-    let mut restored_items: Vec<Arc<ValueActor>> = Vec::new();
+    let mut restored_items: Vec<ActorHandle> = Vec::new();
     if !stored_calls.is_empty() {
         if LOG_DEBUG { zoon::println!("[DEBUG] Restoring {} items from stored calls", stored_calls.len()); }
         for (index, recorded_call) in stored_calls.iter().enumerate() {
@@ -4444,7 +4482,7 @@ fn build_list_append_with_recording(
                 zoon::eprintln!("[DEBUG] Failed to restore input for item {}", index);
                 continue;
             };
-            let input_actor = ValueActor::new_arc(
+            let input_actor: ActorHandle = ValueActor::new_arc(
                 ConstructInfo::new(
                     format!("restored_input_{}", index),
                     None,
@@ -4453,7 +4491,7 @@ fn build_list_append_with_recording(
                 ctx.actor_context.clone(),
                 constant(input_value),
                 PersistenceId::new(),
-            );
+            ).into();
 
             // 2. Look up the function in registry
             let function_path = recorded_call.path.join("/");
@@ -4504,7 +4542,7 @@ fn build_list_append_with_recording(
                         Box::pin(item_actor.stream()),
                         PersistenceId::new(),
                         origin,
-                    );
+                    ).into();
                     restored_items.push(wrapped_item);
                 }
                 Ok(None) => {
@@ -4564,7 +4602,7 @@ fn build_list_append_with_recording(
             constant(value),
             PersistenceId::new(),
             origin,
-        );
+        ).into();
         TaggedChange::FromAppend(ListChange::Push { item: new_item_actor })
     });
 
@@ -4662,7 +4700,7 @@ fn build_list_append_with_recording(
         ctx.actor_context.clone(),
         result_stream,
         persistence_id,
-    );
+    ).into();
 
     Ok(Some(result_actor))
 }
@@ -4672,20 +4710,20 @@ fn build_list_append_with_recording(
 /// Returns `Ok(None)` if the function body is SKIP.
 fn call_function(
     path: Vec<String>,
-    args: Vec<(String, Arc<ValueActor>)>,
+    args: Vec<(String, ActorHandle)>,
     span: Span,
     persistence: Option<Persistence>,
     persistence_id: PersistenceId,
     ctx: EvaluationContext,
     use_piped_for_builtin: bool,
     function_registry: &HashMap<String, StaticFunctionDefinition>,
-) -> Result<Option<Arc<ValueActor>>, String> {
+) -> Result<Option<ActorHandle>, String> {
     let full_path = path.join("/");
 
     // Convert args to a map (for user-defined functions)
-    let mut arg_map: HashMap<String, Arc<ValueActor>> = HashMap::new();
+    let mut arg_map: HashMap<String, ActorHandle> = HashMap::new();
     // Also keep positional list (for builtin functions)
-    let mut positional_args: Vec<Arc<ValueActor>> = Vec::new();
+    let mut positional_args: Vec<ActorHandle> = Vec::new();
     for (name, actor) in args {
         positional_args.push(actor.clone());
         arg_map.insert(name, actor);
@@ -4763,7 +4801,7 @@ fn call_function(
                 }
 
                 // Create a constant actor for this specific piped value
-                let value_actor = ValueActor::new_arc(
+                let value_actor: ActorHandle = ValueActor::new_arc(
                     ConstructInfo::new(
                         "piped function input".to_string(),
                         None,
@@ -4772,7 +4810,7 @@ fn call_function(
                     ctx_for_closure.actor_context.clone(),
                     constant(piped_value),
                     PersistenceId::new(),
-                );
+                ).into();
 
                 // Bind the constant value actor to the parameter
                 let mut params = parameters_for_closure.clone();
@@ -4811,6 +4849,7 @@ fn call_function(
                     recording_counter: ctx_for_closure.actor_context.recording_counter.clone(),
                     // Inherit subscription_time - function bodies should respect caller's filtering
                     subscription_time: ctx_for_closure.actor_context.subscription_time,
+                    registry_scope_id: ctx_for_closure.actor_context.registry_scope_id,
                 };
 
                 let new_ctx = EvaluationContext {
@@ -4829,7 +4868,7 @@ fn call_function(
                     Ok(Some(result_actor)) => {
                         // Use value() for type-safe single-value semantics (like THEN does)
                         let result_stream: Pin<Box<dyn Stream<Item = Value>>> =
-                            Box::pin(stream::once(result_actor.value()).filter_map(|v| async { v.ok() }));
+                            Box::pin(stream::once(async move { result_actor.value().await }).filter_map(|v| async { v.ok() }));
                         result_stream
                     }
                     Ok(None) => {
@@ -4853,7 +4892,7 @@ fn call_function(
                 ctx.actor_context.clone(),
                 TypedStream::infinite(result_stream),
                 persistence_id,
-            );
+            ).into();
 
             return Ok(Some(wrapper_actor));
         }
@@ -4861,7 +4900,7 @@ fn call_function(
         // No piped value or no parameter to bind - evaluate immediately (original behavior)
         // Collect argument actors to keep them alive for the duration of the function result
         // Note: we collect from parameters which now contains the arg_map values
-        let arg_actors: Vec<Arc<ValueActor>> = parameters.values().cloned().collect();
+        let arg_actors: Vec<ActorHandle> = parameters.values().cloned().collect();
 
         // Create a nested scope using the function call's persistence_id.
         // This ensures that HOLDs inside the function body get unique persistence IDs
@@ -4895,6 +4934,7 @@ fn call_function(
             recording_counter: ctx.actor_context.recording_counter.clone(),
             // Inherit subscription_time - function bodies should respect caller's filtering
             subscription_time: ctx.actor_context.subscription_time,
+            registry_scope_id: ctx.actor_context.registry_scope_id,
         };
 
         let new_ctx = EvaluationContext {
@@ -4913,8 +4953,8 @@ fn call_function(
         // If we have argument actors, wrap the result to keep them alive
         match result {
             Ok(Some(result_actor)) if !arg_actors.is_empty() => {
-                // Create a wrapper actor that keeps argument actors alive
-                let wrapper = ValueActor::new_arc_with_inputs(
+                // Create a wrapper actor that forwards the result
+                let wrapper: ActorHandle = ValueActor::new_arc(
                     ConstructInfo::new(
                         format!("PersistenceId: {persistence_id}"),
                         persistence,
@@ -4923,8 +4963,7 @@ fn call_function(
                     ctx.actor_context,
                     TypedStream::infinite(result_actor.stream()),
                     persistence_id,
-                    arg_actors,  // Keep argument actors alive
-                );
+                ).into();
                 return Ok(Some(wrapper));
             }
             _ => return result,
@@ -4974,6 +5013,7 @@ fn call_function(
                 recording_counter: ctx.actor_context.recording_counter.clone(),
                 // Inherit subscription_time - builtin function calls should respect caller's filtering
                 subscription_time: ctx.actor_context.subscription_time,
+                registry_scope_id: ctx.actor_context.registry_scope_id,
             };
 
             Ok(Some(FunctionCall::new_arc_value_actor(
@@ -5435,7 +5475,7 @@ pub fn evaluate(
 ) -> Result<(Arc<Object>, ConstructContext), String> {
     let function_registry = FunctionRegistry::new();
     let module_loader = ModuleLoader::default();
-    let (obj, ctx, _, _, _, _, _) = evaluate_with_registry(
+    let (obj, ctx, _, _, _, _, _, _) = evaluate_with_registry(
         source_code,
         expressions,
         states_local_storage_key,
@@ -5457,10 +5497,12 @@ pub fn evaluate(
 /// - `Arc<ReferenceConnector>`: Connector for variable references (MUST be dropped when done!)
 /// - `Arc<LinkConnector>`: Connector for LINK variables (MUST be dropped when done!)
 /// - `Arc<PassThroughConnector>`: Connector for LINK pass-throughs (MUST be dropped when done!)
+/// - `ScopeDestroyGuard`: Guard for the root registry scope (destroys all actor scopes on drop)
 ///
-/// IMPORTANT: The ReferenceConnector, LinkConnector, and PassThroughConnector
+/// IMPORTANT: The ReferenceConnector, LinkConnector, PassThroughConnector, and ScopeDestroyGuard
 /// MUST be dropped when the program is finished (e.g., when switching examples) to allow actors
-/// to be cleaned up. These connectors hold strong references to all top-level actors.
+/// to be cleaned up. The connectors hold strong references to all top-level actors, and the
+/// ScopeDestroyGuard recursively destroys all registry scopes and their actors.
 pub fn evaluate_with_registry(
     source_code: SourceCode,
     expressions: Vec<static_expression::Spanned<static_expression::Expression>>,
@@ -5468,12 +5510,19 @@ pub fn evaluate_with_registry(
     virtual_fs: VirtualFilesystem,
     mut function_registry: FunctionRegistry,
     module_loader: ModuleLoader,
-) -> Result<(Arc<Object>, ConstructContext, FunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>, Arc<PassThroughConnector>), String> {
+) -> Result<(Arc<Object>, ConstructContext, FunctionRegistry, ModuleLoader, Arc<ReferenceConnector>, Arc<LinkConnector>, Arc<PassThroughConnector>, ScopeDestroyGuard), String> {
     let construct_context = ConstructContext {
         construct_storage: Arc::new(ConstructStorage::new(states_local_storage_key)),
         virtual_fs,
     };
-    let actor_context = ActorContext::default();
+    // Create root scope in the actor registry for deterministic lifetime management
+    let root_scope_id = REGISTRY.with(|reg: &std::cell::RefCell<ActorRegistry>| {
+        reg.borrow_mut().create_scope(None)
+    });
+    let actor_context = ActorContext {
+        registry_scope_id: Some(root_scope_id),
+        ..ActorContext::default()
+    };
     let reference_connector = Arc::new(ReferenceConnector::new());
     let link_connector = Arc::new(LinkConnector::new());
     let pass_through_connector = Arc::new(PassThroughConnector::new());
@@ -5539,7 +5588,8 @@ pub fn evaluate_with_registry(
         construct_context.clone(),
         evaluated_variables?,
     );
-    Ok((root_object, construct_context, function_registry, module_loader, reference_connector, link_connector, pass_through_connector))
+    let root_scope_guard = ScopeDestroyGuard::new(root_scope_id);
+    Ok((root_object, construct_context, function_registry, module_loader, reference_connector, link_connector, pass_through_connector, root_scope_guard))
 }
 
 /// Evaluates a static variable into a Variable.
@@ -5657,7 +5707,7 @@ pub fn evaluate_static_expression(
     link_connector: Arc<LinkConnector>,
     pass_through_connector: Arc<PassThroughConnector>,
     source_code: SourceCode,
-) -> Result<Arc<ValueActor>, String> {
+) -> Result<ActorHandle, String> {
     evaluate_static_expression_with_registry(
         static_expr,
         construct_context,
@@ -5681,7 +5731,7 @@ pub fn evaluate_static_expression_with_registry(
     pass_through_connector: Arc<PassThroughConnector>,
     source_code: SourceCode,
     function_registry_snapshot: Option<Arc<FunctionRegistry>>,
-) -> Result<Arc<ValueActor>, String> {
+) -> Result<ActorHandle, String> {
     // Use the provided registry or create an empty one
     let registry = function_registry_snapshot
         .map(|snap| (*snap).clone())
@@ -5713,7 +5763,7 @@ fn static_spanned_expression_into_value_actor(
     function_registry: &FunctionRegistry,
     module_loader: ModuleLoader,
     source_code: SourceCode,
-) -> Result<Arc<ValueActor>, String> {
+) -> Result<ActorHandle, String> {
     // Create snapshot from function registry for nested evaluations
     let snapshot = if function_registry.is_empty() {
         None
@@ -5745,7 +5795,7 @@ fn static_function_call_path_to_definition(
     span: Span,
 ) -> Result<
     impl Fn(
-        Arc<Vec<Arc<ValueActor>>>,
+        Arc<Vec<ActorHandle>>,
         ConstructId,
         PersistenceId,
         ConstructContext,
@@ -5941,7 +5991,7 @@ fn static_function_call_path_to_definition(
 }
 
 /// Match result containing bindings if match succeeded
-type PatternBindings = HashMap<String, Arc<ValueActor>>;
+type PatternBindings = HashMap<String, ActorHandle>;
 
 /// Spawn an actor that stores recorded calls to localStorage.
 /// Each recorded call represents an item added to a list (e.g., new_todo() call).
